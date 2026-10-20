@@ -1,7 +1,7 @@
 //! REST adapter for the existing request dispatcher. Command records are ephemeral and
 //! bounded; subscribe before dispatch so even an immediately completed command is retained.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -21,12 +21,13 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     CommandCaller, CommandValue, DaemonEvent, Message, PrincipalRef, Request as RpcRequest, Response as RpcResponse, ResponseResult,
 };
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 use tokio::sync::{
     broadcast::{self, error::RecvError},
     mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore,
 };
+use tokio::{task::JoinHandle, time::Instant};
 use uuid::Uuid;
 
 use super::{CallerAuth, RouterState};
@@ -41,6 +42,7 @@ const RECORD_LIMIT: usize = 1024;
 const MAX_WAIT: f64 = 300.0;
 const MAX_STEPS: usize = 256;
 const MAX_PROGRESS_BYTES: usize = 256 * 1024;
+const UNKNOWN_RETENTION: Duration = Duration::from_secs(300);
 
 pub(super) struct Commands {
     router: RemoteCommandRouter,
@@ -48,7 +50,7 @@ pub(super) struct Commands {
     socket_path: PathBuf,
     records: Mutex<BTreeMap<Uuid, Record>>,
     capacity: Arc<Semaphore>,
-    completion_order: Arc<AtomicU64>,
+    eviction_sequence: Arc<AtomicU64>,
 }
 
 struct Record {
@@ -56,20 +58,47 @@ struct Record {
     command_id: Option<u64>,
     owner: CommandCaller,
     state: watch::Receiver<CommandState>,
+    collector: Option<JoinHandle<()>>,
+}
+
+impl Drop for Record {
+    fn drop(&mut self) {
+        // Evicting an uncertain record must not leave an orphan event collector.
+        // It deliberately does not cancel the underlying daemon execution.
+        if let Some(collector) = &self.collector {
+            collector.abort();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RetainedStep {
+    event: DaemonEvent,
+    encoded_bytes: usize,
+}
+
+impl Serialize for RetainedStep {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.event.serialize(serializer)
+    }
 }
 
 #[derive(Clone, Serialize)]
 struct CommandState {
     id: Uuid,
     state: &'static str,
-    steps: Vec<DaemonEvent>,
+    steps: VecDeque<RetainedStep>,
     outcome: Option<CommandValue>,
     progress_truncated: bool,
     observation_error: Option<String>,
     #[serde(skip)]
     progress_bytes: usize,
     #[serde(skip)]
-    finished_order: Option<u64>,
+    eviction_order: Option<u64>,
+    #[serde(skip)]
+    unknown_since: Option<Instant>,
+    #[serde(skip)]
+    collector_closed: bool,
 }
 
 impl Commands {
@@ -80,16 +109,20 @@ impl Commands {
             socket_path,
             records: Mutex::new(BTreeMap::new()),
             capacity: Arc::new(Semaphore::new(RECORD_LIMIT)),
-            completion_order: Arc::new(AtomicU64::new(0)),
+            eviction_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
     async fn reserve(&self) -> Result<OwnedSemaphorePermit, &'static str> {
+        self.reserve_at(Instant::now()).await
+    }
+
+    async fn reserve_at(&self, now: Instant) -> Result<OwnedSemaphorePermit, &'static str> {
         let mut records = self.records.lock().await;
         if self.capacity.available_permits() == 0 {
             let oldest = records
                 .iter()
-                .filter_map(|(id, record)| record.state.borrow().finished_order.map(|order| (*id, order)))
+                .filter_map(|(id, record)| record.state.borrow().evictable_order(now).map(|order| (*id, order)))
                 .min_by_key(|(_, order)| *order);
             if let Some((id, _)) = oldest {
                 records.remove(&id);
@@ -351,7 +384,8 @@ pub(super) async fn handle(
             _ => return encoding.error(StatusCode::BAD_REQUEST, "wait must be between 0 and 300 seconds"),
         };
         if wait > 0.0 {
-            let _ = tokio::time::timeout(Duration::from_secs_f64(wait), receiver.wait_for(|s| s.state != "running")).await;
+            let _ =
+                tokio::time::timeout(Duration::from_secs_f64(wait), receiver.wait_for(|s| s.outcome.is_some() || s.collector_closed)).await;
         }
         return encoding.render(StatusCode::OK, receiver.borrow().clone());
     }
@@ -432,16 +466,14 @@ pub(super) async fn handle(
             RpcResponse::QueryResult { value, .. } => (None, Some(value)),
             _ => return encoding.error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected execute response"),
         };
-        let initial = CommandState::new(id, outcome, &commands.completion_order);
+        let initial = CommandState::new(id, outcome, &commands.eviction_sequence);
         let (sender, receiver) = watch::channel(initial);
-        commands
-            .records
-            .lock()
-            .await
-            .insert(id, Record { _permit: permit.expect("execute reserves capacity"), command_id, owner: caller, state: receiver });
-        if let Some(command_id) = command_id {
-            tokio::spawn(collect_progress(events, command_id, sender, commands.completion_order.clone()));
-        }
+        let collector =
+            command_id.map(|command_id| tokio::spawn(collect_progress(events, command_id, sender, commands.eviction_sequence.clone())));
+        commands.records.lock().await.insert(
+            id,
+            Record { _permit: permit.expect("execute reserves capacity"), command_id, owner: caller, state: receiver, collector },
+        );
         let url = format!("/v1/commands/{id}");
         let mut response = encoding.render(StatusCode::ACCEPTED, json!({"id": id, "command_id": command_id, "url": url}));
         response.headers_mut().insert(header::LOCATION, url.parse().expect("UUID URL"));
@@ -459,15 +491,37 @@ pub(super) async fn handle(
 
 impl CommandState {
     fn new(id: Uuid, outcome: Option<CommandValue>, order: &AtomicU64) -> Self {
+        let outcome_is_terminal = outcome.is_some();
         Self {
             id,
             state: if outcome.is_some() { "finished" } else { "running" },
-            steps: Vec::new(),
-            finished_order: outcome.as_ref().map(|_| order.fetch_add(1, Ordering::Relaxed)),
+            steps: VecDeque::new(),
+            eviction_order: outcome.as_ref().map(|_| order.fetch_add(1, Ordering::Relaxed)),
             outcome,
             progress_truncated: false,
             observation_error: None,
             progress_bytes: 0,
+            unknown_since: None,
+            collector_closed: outcome_is_terminal,
+        }
+    }
+
+    fn observation_lost(&mut self, message: String, closed: bool, order: &AtomicU64) {
+        self.state = "unknown";
+        self.progress_truncated = true;
+        self.observation_error = Some(message);
+        self.collector_closed = closed;
+        // Repeated lag must not keep extending retention indefinitely.
+        self.unknown_since.get_or_insert_with(Instant::now);
+        self.eviction_order.get_or_insert_with(|| order.fetch_add(1, Ordering::Relaxed));
+    }
+
+    fn evictable_order(&self, now: Instant) -> Option<u64> {
+        let expired = self.unknown_since.is_some_and(|since| now.saturating_duration_since(since) >= UNKNOWN_RETENTION);
+        if self.outcome.is_some() || self.collector_closed || expired {
+            self.eviction_order
+        } else {
+            None
         }
     }
 
@@ -478,12 +532,12 @@ impl CommandState {
             return;
         }
         while self.steps.len() >= MAX_STEPS || self.progress_bytes + size > MAX_PROGRESS_BYTES {
-            let removed = self.steps.remove(0);
-            self.progress_bytes -= serde_json::to_vec(&removed).expect("previously serialized event").len();
+            let removed = self.steps.pop_front().expect("retained history exceeds a limit");
+            self.progress_bytes -= removed.encoded_bytes;
             self.progress_truncated = true;
         }
         self.progress_bytes += size;
-        self.steps.push(event);
+        self.steps.push_back(RetainedStep { event, encoded_bytes: size });
     }
 }
 
@@ -498,10 +552,11 @@ async fn collect_progress(
             Ok(event) => event,
             Err(error) => {
                 sender.send_modify(|s| {
-                    // Lost observations say nothing about the execution's actual outcome.
-                    s.state = "unknown";
-                    s.progress_truncated = true;
-                    s.observation_error = Some(format!("command progress unavailable: {error}; do not retry blindly"));
+                    s.observation_lost(
+                        format!("command progress unavailable: {error}; do not retry blindly"),
+                        matches!(error, RecvError::Closed),
+                        &order,
+                    )
                 });
                 match error {
                     RecvError::Lagged(_) => continue,
@@ -514,7 +569,10 @@ async fn collect_progress(
                 sender.send_modify(|s| {
                     s.state = "finished";
                     s.outcome = Some(result);
-                    s.finished_order = Some(order.fetch_add(1, Ordering::Relaxed));
+                    s.eviction_order = Some(order.fetch_add(1, Ordering::Relaxed));
+                    s.observation_error = None;
+                    s.unknown_since = None;
+                    s.collector_closed = true;
                 });
                 break;
             }
@@ -1051,17 +1109,17 @@ mod tests {
         for n in 0..RECORD_LIMIT {
             let id = Uuid::from_u128((RECORD_LIMIT - n) as u128);
             let permit = h.commands.reserve().await.unwrap();
-            let (_, receiver) = watch::channel(CommandState::new(id, None, &h.commands.completion_order));
+            let (_, receiver) = watch::channel(CommandState::new(id, None, &h.commands.eviction_sequence));
             h.commands
                 .records
                 .lock()
                 .await
-                .insert(id, Record { _permit: permit, command_id: Some(n as u64), owner: user(), state: receiver });
+                .insert(id, Record { _permit: permit, command_id: Some(n as u64), owner: user(), state: receiver, collector: None });
         }
         assert!(h.commands.reserve().await.is_err());
         let oldest_id = Uuid::from_u128(RECORD_LIMIT as u128);
         for id in [oldest_id, Uuid::from_u128(1)] {
-            let (sender, receiver) = watch::channel(CommandState::new(id, Some(CommandValue::Cancelled), &h.commands.completion_order));
+            let (sender, receiver) = watch::channel(CommandState::new(id, Some(CommandValue::Cancelled), &h.commands.eviction_sequence));
             h.commands.records.lock().await.get_mut(&id).unwrap().state = receiver;
             drop(sender);
         }
@@ -1091,6 +1149,8 @@ mod tests {
         events.send(finished()).unwrap();
         task.await.unwrap();
         assert_eq!(state.borrow().state, "finished");
+        assert!(state.borrow().observation_error.is_none());
+        assert!(state.borrow().unknown_since.is_none());
         assert!(matches!(state.borrow().outcome, Some(CommandValue::Cancelled)));
 
         let (events, receiver) = broadcast::channel(1);
@@ -1099,6 +1159,8 @@ mod tests {
         collect_progress(receiver, 77, sender, order).await;
         assert_eq!(state.borrow().state, "unknown");
         assert!(state.borrow().outcome.is_none());
+        assert!(state.borrow().collector_closed);
+        assert!(state.borrow().evictable_order(Instant::now()).is_some());
     }
 
     // Generated histories span empty, count/byte boundaries, oversized individual updates,
@@ -1131,9 +1193,13 @@ mod tests {
     async fn cancel_after_unobserved_completion_is_conflict() {
         let h = Harness::new().await;
         let id = Uuid::new_v4();
-        let (_, receiver) = watch::channel(CommandState::new(id, None, &h.commands.completion_order));
+        let (_, receiver) = watch::channel(CommandState::new(id, None, &h.commands.eviction_sequence));
         let permit = h.commands.reserve().await.unwrap();
-        h.commands.records.lock().await.insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state: receiver });
+        h.commands
+            .records
+            .lock()
+            .await
+            .insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state: receiver, collector: None });
         for cbor in [false, true] {
             let reply = h.call("DELETE", &format!("/v1/commands/{id}"), None, cbor, CallerAuth::Bearer).await;
             assert_eq!(reply.0, StatusCode::CONFLICT);
@@ -1147,10 +1213,10 @@ mod tests {
         let h = Harness::new().await;
         let id = Uuid::new_v4();
         let (events, receiver) = broadcast::channel(4);
-        let (sender, state) = watch::channel(CommandState::new(id, None, &h.commands.completion_order));
+        let (sender, state) = watch::channel(CommandState::new(id, None, &h.commands.eviction_sequence));
         let permit = h.commands.reserve().await.unwrap();
-        h.commands.records.lock().await.insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state });
-        let task = tokio::spawn(collect_progress(receiver, 77, sender, h.commands.completion_order.clone()));
+        h.commands.records.lock().await.insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state, collector: None });
+        let task = tokio::spawn(collect_progress(receiver, 77, sender, h.commands.eviction_sequence.clone()));
         let url = format!("/v1/commands/{id}");
         let running = h.call("GET", &format!("{url}?wait=0.001"), None, false, CallerAuth::Bearer).await;
         assert_eq!(running.1["state"], "running");
@@ -1195,6 +1261,125 @@ mod tests {
             request.extensions_mut().insert(CallerAuth::Bearer);
             assert_eq!(h.router.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
         }
+    }
+
+    // Unknown records retain a bounded recovery window. At full capacity, the grace
+    // boundary releases the oldest uncertain slot and aborts its orphan collector.
+    #[tokio::test]
+    async fn unknown_records_expire_and_eviction_stops_collectors() {
+        let h = Harness::new().await;
+        let now = Instant::now();
+        let (events, _) = broadcast::channel(1);
+        let mut first_state = None;
+        for n in 0..RECORD_LIMIT {
+            let id = Uuid::from_u128((RECORD_LIMIT - n) as u128);
+            let permit = h.commands.reserve_at(now).await.unwrap();
+            let mut state = CommandState::new(id, None, &h.commands.eviction_sequence);
+            state.observation_lost("lost completion".into(), false, &h.commands.eviction_sequence);
+            state.unknown_since = Some(now);
+            state.observation_lost("another lag".into(), false, &h.commands.eviction_sequence);
+            assert_eq!(state.unknown_since, Some(now), "repeated lag cannot extend retention");
+            let (sender, receiver) = watch::channel(state);
+            if n == 0 {
+                first_state = Some(receiver.clone());
+            }
+            let collector =
+                Some(tokio::spawn(collect_progress(events.subscribe(), n as u64, sender, h.commands.eviction_sequence.clone())));
+            h.commands
+                .records
+                .lock()
+                .await
+                .insert(id, Record { _permit: permit, command_id: Some(n as u64), owner: user(), state: receiver, collector });
+        }
+        assert!(h.commands.reserve_at(now + UNKNOWN_RETENTION - Duration::from_nanos(1)).await.is_err());
+        let permit = h.commands.reserve_at(now + UNKNOWN_RETENTION).await.unwrap();
+        assert!(!h.commands.records.lock().await.contains_key(&Uuid::from_u128(RECORD_LIMIT as u128)));
+        assert_eq!(h.commands.records.lock().await.len(), RECORD_LIMIT - 1);
+        let mut first_state = first_state.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), first_state.changed()).await.unwrap().is_err(),
+            "eviction must abort the collector and close its watch sender"
+        );
+        assert!(first_state.borrow().outcome.is_none(), "eviction cannot invent an execution outcome");
+        drop(permit);
+    }
+
+    // A transient unknown state is not a terminal long-poll condition. Wait through it,
+    // recover the real outcome, and clear the observation error in both encodings.
+    #[tokio::test]
+    async fn transient_unknown_waits_for_actual_completion() {
+        for cbor in [false, true] {
+            let h = Harness::new().await;
+            let id = Uuid::new_v4();
+            let mut state = CommandState::new(id, None, &h.commands.eviction_sequence);
+            state.observation_lost("transient lag".into(), false, &h.commands.eviction_sequence);
+            let (sender, receiver) = watch::channel(state);
+            let observer = sender.clone();
+            let (events, input) = broadcast::channel(4);
+            let collector = Some(tokio::spawn(collect_progress(input, 77, sender, h.commands.eviction_sequence.clone())));
+            let permit = h.commands.reserve().await.unwrap();
+            h.commands
+                .records
+                .lock()
+                .await
+                .insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state: receiver, collector });
+            let url = format!("/v1/commands/{id}?wait=2");
+            let mut request = Box::pin(h.call("GET", &url, None, cbor, CallerAuth::Bearer));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        reply = &mut request => panic!("unknown returned before completion: {}", reply.1),
+                        () = tokio::task::yield_now() => {},
+                    }
+                    if observer.receiver_count() > 1 {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            events.send(finished()).unwrap();
+            let reply = request.await;
+            assert_eq!(reply.1["state"], "finished");
+            assert_eq!(reply.1["outcome"], serde_json::to_value(CommandValue::Cancelled).unwrap());
+            assert!(reply.1["observation_error"].is_null());
+            assert_eq!(reply.1["progress_truncated"], true);
+        }
+    }
+
+    // A closed observer cannot recover, so it is immediately evictable and releases
+    // long polls without pretending the underlying execution has a known outcome.
+    #[tokio::test]
+    async fn closed_unknown_is_evictable_and_releases_wait() {
+        let h = Harness::new().await;
+        let id = Uuid::new_v4();
+        let (sender, receiver) = watch::channel(CommandState::new(id, None, &h.commands.eviction_sequence));
+        let (events, input) = broadcast::channel(1);
+        drop(events);
+        collect_progress(input, 77, sender, h.commands.eviction_sequence.clone()).await;
+        assert!(receiver.borrow().evictable_order(Instant::now()).is_some());
+        let permit = h.commands.reserve().await.unwrap();
+        h.commands
+            .records
+            .lock()
+            .await
+            .insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state: receiver, collector: None });
+        let url = format!("/v1/commands/{id}?wait=300");
+        let reply = tokio::time::timeout(Duration::from_secs(1), h.call("GET", &url, None, true, CallerAuth::Bearer)).await.unwrap();
+        assert_eq!(reply.1["state"], "unknown");
+        assert!(reply.1["outcome"].is_null());
+        assert!(reply.1["observation_error"].is_string());
+    }
+
+    // Cached byte accounting and the deque are private: each retained step keeps the
+    // existing event wire shape and never exposes its cached size or wrapper object.
+    #[test]
+    fn retained_step_keeps_event_wire_shape() {
+        let event = step("wire contract".into());
+        let expected = serde_json::to_value(&event).unwrap();
+        let retained = RetainedStep { event, encoded_bytes: 999 };
+        assert_eq!(serde_json::to_value(retained).unwrap(), expected);
     }
 
     // Generated operation sequences cover repeated cancellation, empty/positive waits,

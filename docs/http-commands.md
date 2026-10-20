@@ -55,7 +55,8 @@ A command record contains `id`, `state`, retained `steps`, `outcome`,
 `progress_truncated`, and `observation_error`. Progress retains the newest 256
 updates within 256 KiB of JSON-encoded event data. Older or individually oversized
 updates are dropped and `progress_truncated` becomes true. GET therefore clones
-only a bounded progress history. JSON clients must handle ADR 0063's integer
+only a bounded progress history. The internal deque caches each update's encoded
+size, so trimming neither shifts the entire history nor re-encodes old events. JSON clients must handle ADR 0063's integer
 wrappers wherever numeric fields occur; clients wanting native integers can
 negotiate CBOR.
 
@@ -64,15 +65,22 @@ underlying daemon execution for event correlation (null for a synchronous query)
 Queries also return 202, with their result already retained in the record.
 `wait` is between 0 and 300 seconds and returns the current record. Concurrent waiters are supported. Cancelling a
 finished command returns 409. Records survive HTTP disconnection but not daemon
-restart. At most 1,024 records are retained, evicting the oldest completed record
-first as needed. If active or pending commands occupy all capacity, submissions
-receive 409.
+restart. At most 1,024 records are retained, evicting the oldest eligible record
+as needed. Completed records become eligible in completion order. An unknown
+record with a closed collector is immediately
+evictable. An unknown record whose collector can still recover becomes eligible
+for capacity eviction 300 seconds after its first lost observation; repeated lag
+does not extend that window. Eviction stops the event collector and releases its
+record slot, but never cancels the underlying execution or invents its outcome.
+If active or pending commands occupy all capacity, submissions receive 409.
 Lost observations report `state: "unknown"` and an `observation_error`, without
 fabricating an execution outcome. A lagged receiver continues consuming; a later
 finish event recovers the real outcome. A closed receiver leaves the outcome
-unknown. Waits return on completion, observation uncertainty, or their deadline;
-wait expiry does not terminate execution and later requests can still see its
-outcome. Never blindly retry an execution whose observations were lost.
+unknown. Unknown is non-terminal while its collector remains live: waits stay
+open for a recovered outcome until their deadline or collector closure. Recovery
+clears the stale observation error and preserves the progress-truncation flag.
+Wait expiry does not terminate execution; later requests can still see its outcome
+while the record remains retained. Never blindly retry an execution whose observations were lost.
 Cancellation of an existing record whose execution just finished returns 409,
 even if the HTTP collector has not observed that completion yet.
 
