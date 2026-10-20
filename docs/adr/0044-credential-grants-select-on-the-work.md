@@ -184,21 +184,26 @@ The vessel end follows [ADR 0069](0069-an-agent-inside-every-vessel.md), which r
 - The in-vessel agent carries all outbound traffic. Software that honours `HTTPS_PROXY` uses it directly. Everything else is redirected inside the guest to the agent, which recovers the hostname and issues an ordinary `CONNECT hostname:port`.
 - The host proxy therefore only ever sees CONNECT on the vessel's listener: it runs explicit mode only. #3262's "transparent mode" lives inside the guest, not on the host.
 - The guest trusts the proxy's CA through one combined trust bundle, exposed through the variables in P1.
+- ADR 0069's "TLS interception only for hosts where the proxy swaps credentials" is superseded by P4a: under enforced egress the proxy decrypts all HTTPS.
 
 Host-direct placement should shrink to a minimum. Cloud sandboxes use the controlling host's proxy by default (ADR 0069). A nearer proxy, or the same rules in the provider's own proxy, can be configured later.
 
-### P4a. Egress levels and two layers of enforcement ([#3263](https://github.com/flotilla-org/flotilla/issues/3263))
+### P4a. Egress policy is data; the default allows a normal workflow ([#3263](https://github.com/flotilla-org/flotilla/issues/3263), revised 2026-10-20)
 
-- **Default reach** is read-only public web: port 443, GET and HEAD only, no request bodies, no credential attached, and every request logged with its convoy.
-- **Writes** go only to the named services in the convoy's reach (forge, model provider, registries), each with its swapped credential.
-- **Always denied:**
-  - private ranges (LAN, docker0, the host);
-  - the metadata endpoint;
-  - bare-IP connections;
-  - other ports;
-  - DNS other than flotilla's resolver.
-- **Two layers:** the network layer, which the vessel can't change, and the HTTP layer, which is the proxy. The in-vessel agent forwards and never enforces. A provider that can't enforce declares itself advisory, and placement refuses a charter that requires enforced egress.
-- **Refusals** name the destination and the command to ask with. The request becomes a proposal record, approval extends reach by readmission, and everything is audited. An approval request is a Message addressed to a role, and each request kind declares the lowest tier that may decide it. There is no self-approval ([#3277](https://github.com/flotilla-org/flotilla/issues/3277)).
+The principle: strict egress must be **possible**, and a normal workflow must never be made **impossible**. Flotilla does not lock projects into a restrictive default before anything has run.
+
+- **The proxy decrypts all HTTPS** under enforced egress, because it can apply no rule to traffic it can't read. Hosts that refuse an intercepted connection are named exceptions in the policy.
+- **Policy is data.** Each project or charter chooses its egress policy. Changing a policy never needs a flotilla upgrade (the pluggable-policy direction on #1928).
+- **The shipped default is permissive:**
+  - any method to public HTTPS;
+  - no credential attached;
+  - every request logged with its convoy.
+
+  Real credentials go only to the named services in the convoy's reach (forge, model provider, registries).
+- **Always denied, in every policy:** private ranges (LAN, docker0, the host) and the cloud metadata endpoint. These protect the host and its credentials. Bare-IP connections, other ports and DNS other than flotilla's resolver are policy choices, not fixed denials.
+- **Stricter levels are opt-in.** A charter can choose GET and HEAD only, an allowlist, or an allowlist plus a logged or screened fetch tool. #3263 had GET and HEAD only as the starting default; that default is withdrawn.
+- **Two layers.** The network layer is set by the host, and the vessel can't change it. The HTTP layer is the proxy. The in-vessel agent forwards and never enforces. A provider that can't enforce declares itself advisory, and placement refuses a charter that requires enforced egress.
+- **Refusals** name the destination and the command to ask with. The request becomes a proposal record, approval extends reach by readmission, and everything is audited. An approval request is a Message addressed to a role. Each request kind declares the lowest tier that may decide it, and there is no self-approval ([#3277](https://github.com/flotilla-org/flotilla/issues/3277)).
 
 ### P5. The proxy is flotilla's own process, controlled declaratively
 
@@ -209,7 +214,6 @@ Host-direct placement should shrink to a minimum. Cloud sandboxes use the contro
 - **Open:**
   - whether a control document is per vessel or per agent;
   - how credentials reach the proxy and are refreshed there. §5's delivery-lifetime rules (refresh without gaps, surfacing persistent failure, never degrading to anonymous) apply to the proxy as the holder;
-  - **which hosts' TLS the proxy intercepts.** ADR 0069 intercepts only hosts where the proxy swaps credentials. But P4a's read-only default (GET and HEAD only, no bodies) can only be enforced on traffic the proxy can read, so as written it can't hold for other hosts;
   - **how forge writes are attributed.** Refusing a GraphQL mutation that the proxy can't attribute to an action the crew may take comes from #3312's outline and the #3125 research, not from a ruling.
 
 ### Consequences
