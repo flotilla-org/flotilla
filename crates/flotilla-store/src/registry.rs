@@ -1314,6 +1314,8 @@ async fn patch_status_typed<T: Resource>(
     Err(ResourceError::conflict(name, "status patch retry budget exhausted"))
 }
 
+// Raw watch setup preserves the backend read deadline. Continuous consumers own
+// retry and cancellation; interactive callers must receive a bounded refusal.
 async fn watch_typed<T: Resource>(
     backend: &ResourceBackend,
     namespace: &str,
@@ -1334,12 +1336,12 @@ async fn watch_typed<T: Resource>(
             (resource_version, generation, Vec::new(), start)
         }
         None => {
-            let listed = crate::retry_store_read(|| resolver.list()).await?;
+            let listed = resolver.list().await?;
             let initial = listed.items.iter().map(|object| watch_event_value("ADDED", object)).collect::<Result<Vec<_>, _>>()?;
             (listed.resource_version.clone(), listed.generation.clone(), initial, WatchStart::resuming_from(&listed))
         }
     };
-    let watch = crate::retry_store_read(|| resolver.watch(start.clone())).await?;
+    let watch = resolver.watch(start).await?;
     let stream_generation = watch.generation().map(ToOwned::to_owned).or(generation);
     let stream = watch.map(|event| event.and_then(|event| typed_watch_event_value(&event))).boxed();
     Ok(DynamicResourceWatch {
@@ -1358,9 +1360,11 @@ async fn watch_typed_including_replicas<T: Resource>(
     namespace: &str,
 ) -> Result<DynamicResourceWatch, ResourceError> {
     let resolver = backend.including_replicas::<T>(namespace);
-    let stream =
-        crate::retry_store_read(|| resolver.watch()).await?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed();
-    let initial = crate::retry_store_read(|| resolver.list())
+    // Subscribe before listing to cover the handoff. WatchChannel is bounded
+    // (256 events); overflow reports WatchExpired rather than growing a queue.
+    let stream = resolver.watch().await?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed();
+    let initial = resolver
+        .list()
         .await?
         .items
         .iter()
@@ -1382,11 +1386,9 @@ async fn watch_typed_replica_sources<T: Resource>(
     namespace: &str,
 ) -> Result<DynamicResourceWatch, ResourceError> {
     let resolver = backend.including_replicas::<T>(namespace);
-    let stream = crate::retry_store_read(|| resolver.watch_sources())
-        .await?
-        .map(|event| event.and_then(|event| read_watch_event_value(&event)))
-        .boxed();
-    let mut initial = crate::retry_store_read(|| resolver.list_sources())
+    let stream = resolver.watch_sources().await?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed();
+    let mut initial = resolver
+        .list_sources()
         .await?
         .items
         .iter()
@@ -1396,7 +1398,7 @@ async fn watch_typed_replica_sources<T: Resource>(
     // race either read are replayed afterwards with their original sync stamp.
     // Receivers compare those stamps, not arrival order: an older fence cannot
     // remove a newer recreation, including when it appears later in this batch.
-    for deleted in crate::retry_store_read(|| backend.list_replica_deletions_raw(crate::ResourceKind::of::<T>(), namespace)).await? {
+    for deleted in backend.list_replica_deletions_raw(crate::ResourceKind::of::<T>(), namespace).await? {
         let event = ReadWatchEvent::<T>::DeletedByName {
             tombstone: crate::ResourceTombstone {
                 name: deleted.name,

@@ -142,3 +142,12 @@ cargo test -p flotilla-store-sqlite --locked --lib busy_writer_does_not_restart 
 ```
 
 The operator owns the post-roll b5 dummy-fleet load run, per the corrected brief.
+
+Raw registry watch setup preserves SQLite's bounded read deadline. The routed
+continuous watch consumer owns busy retry under its cancellation token; failed
+setup drops its partial stream before retrying. Subscribe-before-list handoffs
+use bounded `WatchChannel` rings (256 events per local/replica stream), and lag
+returns `WatchExpired` rather than allocating an unbounded queue. A real SQLite
+writer-pressure test failed before this separation and now checks the raw API
+returns store-busy within three seconds. Prolonged retry observability is tracked
+separately in #3615.

@@ -54,6 +54,38 @@ mod read_pressure_contract {
         time::Duration,
     };
 
+    // Raw request APIs return the real store deadline instead of inheriting the
+    // indefinite retry policy owned by continuous consumers. Real SQLite is
+    // needed here because the regression crosses its two-second read deadline.
+    #[tokio::test]
+    async fn raw_registry_watch_returns_busy_before_request_timeout() {
+        let sqlite = SqliteBackend::open_in_memory().unwrap();
+        let backend = ResourceBackend::new(sqlite.clone());
+        let writer = sqlite.writer_for_test();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let blocked = tokio::spawn(async move {
+            writer
+                .call(move |_| {
+                    entered_tx.send(()).unwrap();
+                    let _ = release_rx.blocking_recv();
+                    Ok::<_, ResourceError>(())
+                })
+                .await
+                .unwrap();
+        });
+        entered_rx.await.unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_secs(3), flotilla_store::watch_resource_kind(&backend, "flotilla", "Convoy")).await;
+        release_tx.send(()).unwrap();
+        blocked.await.unwrap();
+        match result {
+            Ok(Err(error)) => assert!(error.is_store_busy(), "{error}"),
+            Ok(Ok(_)) => panic!("blocked read unexpectedly succeeded"),
+            Err(_) => panic!("raw watch retried beyond the store read deadline"),
+        }
+    }
+
     struct Reconcile(Arc<AtomicUsize>);
     impl Reconciler for Reconcile {
         type Resource = Convoy;

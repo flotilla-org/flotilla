@@ -42,8 +42,10 @@ pub async fn run_resource_watch_command(context: ResourceWatchCommandContext) ->
         }),
         Err(message) => return CommandValue::Error { message },
     };
-    let setup = async {
-        match (context.replica_sources, context.include_replicas, start) {
+    // This routed continuous consumer owns retry; raw registry APIs keep their
+    // bounded read deadline. Cancellation below also drops any partial setup.
+    let setup = flotilla_store::retry_store_read(|| async {
+        match (context.replica_sources, context.include_replicas, start.clone()) {
             (true, _, Some(_)) => Err(ResourceError::invalid("replica-source watches do not support cursor resume")),
             (true, _, None) => watch_resource_kind_replica_sources(&context.backend, &context.namespace, &context.kind).await,
             (false, true, Some(_)) => Err(ResourceError::invalid("include-replicas watches do not support cursor resume")),
@@ -51,7 +53,7 @@ pub async fn run_resource_watch_command(context: ResourceWatchCommandContext) ->
             (false, false, Some(start)) => watch_resource_kind_from(&context.backend, &context.namespace, &context.kind, start).await,
             (false, false, None) => watch_resource_kind(&context.backend, &context.namespace, &context.kind).await,
         }
-    };
+    });
     let result = tokio::select! {
         biased;
         _ = context.token.cancelled() => return CommandValue::Cancelled,
