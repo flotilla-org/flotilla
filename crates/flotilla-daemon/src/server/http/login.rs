@@ -1,0 +1,113 @@
+//! Browser login (ADR 0065): the daemon mints a one-time code for a Unix-socket caller, and
+//! visiting the login URL on the TCP listener exchanges it for a session cookie. Codes and
+//! sessions live in memory, so a restart ends them, as it replaces the file token.
+
+use std::{collections::HashMap, sync::Arc, sync::Mutex};
+
+use axum::http::{header, HeaderMap};
+use chrono::{DateTime, Utc};
+use flotilla_resources::Clock;
+use sha2::{Digest, Sha256};
+
+/// The browser session cookie's name. The TCP listener alone reads it.
+pub(in crate::server) const SESSION_COOKIE: &str = "flotilla_session";
+/// How long a minted login code may be redeemed.
+pub(in crate::server) const LOGIN_CODE_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::minutes(2);
+/// Unredeemed codes kept at once; minting more evicts the oldest.
+const PENDING_CODE_LIMIT: usize = 32;
+
+/// A non-secret handle for one browser session, for logs and caller identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::server) struct SessionId(u64);
+
+pub(in crate::server) struct LoginCode {
+    pub code: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Secrets are held only as SHA-256 digests, so a lookup's timing depends on the digest of
+/// the presented value, never on how much of a stored secret it shares.
+type Digested = [u8; 32];
+
+pub(in crate::server) struct LoginStore {
+    clock: Arc<dyn Clock>,
+    state: Mutex<LoginState>,
+}
+
+#[derive(Default)]
+struct LoginState {
+    codes: HashMap<Digested, DateTime<Utc>>,
+    sessions: HashMap<Digested, SessionId>,
+    next_session: u64,
+}
+
+impl LoginStore {
+    pub(in crate::server) fn new(clock: Arc<dyn Clock>) -> Self {
+        Self { clock, state: Mutex::new(LoginState::default()) }
+    }
+
+    /// A fresh single-use code, valid for [`LOGIN_CODE_LIFETIME`].
+    pub(in crate::server) fn mint_code(&self) -> Result<LoginCode, String> {
+        let code = random_secret()?;
+        let now = self.clock.now();
+        let expires_at = now + LOGIN_CODE_LIFETIME;
+        let mut state = self.state.lock().expect("login state lock");
+        state.codes.retain(|_, expiry| *expiry > now);
+        if state.codes.len() >= PENDING_CODE_LIMIT {
+            if let Some(oldest) = state.codes.iter().min_by_key(|(_, expiry)| **expiry).map(|(digest, _)| *digest) {
+                state.codes.remove(&oldest);
+            }
+        }
+        state.codes.insert(digest(&code), expires_at);
+        Ok(LoginCode { code, expires_at })
+    }
+
+    /// Exchange a code for a session cookie value. A code is consumed by its first use,
+    /// whether or not it was still valid, so a second use is always refused.
+    pub(in crate::server) fn redeem(&self, code: &str) -> Result<Option<(SessionId, String)>, String> {
+        let now = self.clock.now();
+        let mut state = self.state.lock().expect("login state lock");
+        match state.codes.remove(&digest(code)) {
+            Some(expires_at) if expires_at > now => {
+                let token = random_secret()?;
+                let id = SessionId(state.next_session);
+                state.next_session += 1;
+                state.sessions.insert(digest(&token), id);
+                Ok(Some((id, token)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The session named by the request's cookie. A request carrying more than one session
+    /// cookie is ambiguous and authenticates as none.
+    pub(in crate::server) fn session(&self, headers: &HeaderMap) -> Option<SessionId> {
+        let mut values = headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(';'))
+            .filter_map(|pair| pair.trim().strip_prefix(SESSION_COOKIE)?.strip_prefix('='));
+        let value = values.next()?;
+        if values.next().is_some() {
+            return None;
+        }
+        self.state.lock().expect("login state lock").sessions.get(&digest(value)).copied()
+    }
+}
+
+/// The `Set-Cookie` value for a new session. No `Secure`: the loopback listener is plain HTTP.
+pub(in crate::server) fn session_cookie(token: &str) -> String {
+    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/")
+}
+
+fn digest(secret: &str) -> Digested {
+    Sha256::digest(secret.as_bytes()).into()
+}
+
+/// 256 random bits as lowercase hex.
+pub(in crate::server) fn random_secret() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|error| format!("generate login secret: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}

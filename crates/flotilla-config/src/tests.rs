@@ -433,6 +433,18 @@ fn checkout_removal_concurrency_defaults_to_two_and_accepts_positive_limits() {
     );
 }
 
+// Existing daemon.toml files predate [http]; they load with no TCP listener.
+#[test]
+fn http_listener_is_optional_and_off_by_default() {
+    let config: DaemonConfig = toml::from_str("host_name = \"my-host\"").expect("pre-[http] daemon config");
+    assert_eq!(config.http, HttpListenerConfig::default());
+    assert_eq!(config.http.listen, None);
+    let config: DaemonConfig = toml::from_str("[http]\nlisten = \"127.0.0.1:7878\"").expect("[http] daemon config");
+    assert_eq!(config.http.listen.as_deref(), Some("127.0.0.1:7878"));
+    let config: DaemonConfig = toml::from_str("[http]").expect("empty [http] table");
+    assert_eq!(config.http.listen, None);
+}
+
 #[test]
 fn load_daemon_manifest_directory() {
     let dir = tempdir().unwrap();

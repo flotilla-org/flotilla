@@ -76,6 +76,9 @@ sha2 = { workspace = true }
 hmac = "0.12"
 bytes = { workspace = true }
 http = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+getrandom = { version = "0.2", default-features = false, features = ["std"] }
+subtle = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -95,6 +98,9 @@ flotilla-orchestration-testkit = { path = "../flotilla-orchestration-testkit" }
 flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
 bytes = { workspace = true }
 flotilla-core = { path = "../flotilla-core" }
 flotilla-client = { path = "../flotilla-client" }

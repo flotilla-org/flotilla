@@ -23,10 +23,19 @@ use crate::{
     DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH,
 };
 
-pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeout_secs: u64) -> Result<(), String> {
+/// `http_listen` overrides `daemon.toml`'s `[http] listen`.
+pub async fn run(
+    socket_path: &Path,
+    config_dir: &Path,
+    state_dir: &Path,
+    timeout_secs: u64,
+    http_listen: Option<&str>,
+) -> Result<(), String> {
     let lifecycle = DaemonLifecycle::begin(state_dir)?;
     let config = Arc::new(ConfigStore::new(DaemonHostPath::new(config_dir), DaemonHostPath::new(state_dir)));
     let daemon_config = config.load_daemon_config()?;
+    // Refuse a non-loopback listener before doing anything else (ADR 0065).
+    let http_listen = http_listen.or(daemon_config.http.listen.as_deref()).map(crate::server::resolve_http_listen).transpose()?;
 
     // Hardcoded directives are appended after RUST_LOG and take precedence,
     // so these noisy crates stay at INFO even if RUST_LOG sets them to DEBUG.
@@ -49,6 +58,9 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
     let file_layer = tracing_subscriber::fmt::layer().json().with_ansi(false).with_writer(file_appender);
     init_daemon_tracing(tracing_subscriber::registry().with(filter).with(stderr_layer).with(file_layer))?;
     raise_file_descriptor_limit();
+    if let Some(address) = http_listen {
+        tracing::warn!(%address, "the HTTP listener is declared but not yet served; serving it waits on rigging#21");
+    }
 
     let timeout = if timeout_secs == 0 { Duration::from_secs(u64::MAX) } else { Duration::from_secs(timeout_secs) };
 
@@ -142,10 +154,31 @@ mod tests {
         // SAFETY: the file owns this descriptor for the rest of the test.
         assert_eq!(unsafe { libc::flock(lifecycle.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0, "hold lifecycle lock");
 
-        let error = run(&socket_path, &config_dir, &state_dir, 0).await.expect_err("competing daemon must lose lifecycle lock");
+        let error = run(&socket_path, &config_dir, &state_dir, 0, None).await.expect_err("competing daemon must lose lifecycle lock");
 
         assert!(error.contains("another flotillad process holds the lifecycle lock"), "unexpected error: {error}");
         assert_eq!(std::fs::read_to_string(&socket_path).expect("live socket stand-in survives"), "owned by live daemon");
+    }
+
+    // The refusal comes before logging or any listener, so a failed start leaves nothing behind.
+    // The flag wins over daemon.toml: a loopback config cannot rescue a non-loopback flag.
+    #[tokio::test]
+    async fn daemon_refuses_to_start_on_a_non_loopback_http_address() {
+        for (config, flag, refused) in
+            [("10.1.2.3:7878", None, "10.1.2.3:7878"), ("127.0.0.1:7878", Some("[2001:db8::1]:7878"), "[2001:db8::1]:7878")]
+        {
+            let temp = TempDir::new().expect("tempdir");
+            let state_dir = temp.path().join("state");
+            let config_dir = temp.path().join("config");
+            std::fs::create_dir_all(&config_dir).expect("create config dir");
+            std::fs::write(config_dir.join("daemon.toml"), format!("[http]\nlisten = \"{config}\"\n")).expect("write daemon.toml");
+            let socket_path = config_dir.join("run/flotilla.sock");
+
+            let error = run(&socket_path, &config_dir, &state_dir, 0, flag).await.expect_err("non-loopback listener must refuse start");
+
+            assert!(error.contains(refused) && error.contains("not loopback"), "unexpected error: {error}");
+            assert!(!socket_path.exists(), "a refused start binds nothing");
+        }
     }
 
     #[test]

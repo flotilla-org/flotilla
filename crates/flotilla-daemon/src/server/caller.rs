@@ -9,7 +9,7 @@ use flotilla_protocol::{CallerCrew, CommandCaller, EnvironmentId, PrincipalRef};
 use flotilla_resources::Environment;
 use flotilla_store::StoreQuery;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PeerCredential {
     pid: Option<u32>,
     uid: u32,

@@ -80,7 +80,9 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
         Some(SubCommand::Daemon(DaemonArgs { command: Some(DaemonSubCommand::DevMode { command }), .. })) => {
             run_daemon_dev_mode(&cli, command).await
         }
-        Some(SubCommand::Daemon(DaemonArgs { command: None, timeout })) => run_daemon(&cli, timeout).await,
+        Some(SubCommand::Daemon(DaemonArgs { command: None, timeout, http_listen })) => {
+            run_daemon(&cli, timeout, http_listen.as_deref()).await
+        }
         Some(SubCommand::Status) => run_status(&cli, format).await,
         Some(SubCommand::Watch) => run_watch(&cli, format).await,
         Some(SubCommand::Wait(WaitArgs { leaves, namespace, fresher_than, timeout })) => {

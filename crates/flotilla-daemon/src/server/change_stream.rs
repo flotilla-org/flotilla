@@ -31,6 +31,68 @@ pub(super) async fn serve<W: AsyncWrite + Unpin>(
     once: bool,
 ) -> Result<(), String> {
     writer.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.flotilla.log+cbor\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.map_err(|e| e.to_string())?;
+    frames(service, after, clock, once, &mut ChunkedWriter(writer)).await?;
+    writer.write_all(b"0\r\n\r\n").await.map_err(|error| error.to_string())
+}
+
+pub(super) const CONTENT_TYPE: &str = "application/vnd.flotilla.log+cbor";
+
+/// Router seam: the same frames as [`serve`], delivered as a response body. A consumer that
+/// stops reading for [`IO_DEADLINE`] fails the stream, as it does on the raw writer.
+pub(super) fn body(
+    service: Arc<Service>,
+    after: Option<u64>,
+    clock: Arc<dyn flotilla_resources::Clock>,
+    once: bool,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
+    let (mut tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(QUEUED_FRAMES);
+    tokio::spawn(async move {
+        let sent = frames(service, after, clock, once, &mut tx).await;
+        if let Err(error) = sent {
+            // Abort the body rather than end it cleanly, so the client sees a failed stream.
+            let _ = tx.send(Err(std::io::Error::other(error))).await;
+        }
+    });
+    futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) })
+}
+
+/// Where [`frames`] delivers each encoded frame; an error ends the stream.
+trait FrameSink {
+    async fn emit(&mut self, frame: Vec<u8>) -> Result<(), String>;
+}
+
+struct ChunkedWriter<'a, W>(&'a mut W);
+
+impl<W: AsyncWrite + Unpin> FrameSink for ChunkedWriter<'_, W> {
+    async fn emit(&mut self, frame: Vec<u8>) -> Result<(), String> {
+        let writer = &mut *self.0;
+        let chunk = async {
+            writer.write_all(format!("{:x}\r\n", frame.len()).as_bytes()).await?;
+            writer.write_all(&frame).await?;
+            writer.write_all(b"\r\n").await?;
+            writer.flush().await
+        };
+        tokio::time::timeout(IO_DEADLINE, chunk).await.map_err(|_| "stream consumer stalled".to_owned())?.map_err(|error| error.to_string())
+    }
+}
+
+impl FrameSink for mpsc::Sender<Result<bytes::Bytes, std::io::Error>> {
+    async fn emit(&mut self, frame: Vec<u8>) -> Result<(), String> {
+        tokio::time::timeout(IO_DEADLINE, self.send(Ok(frame.into())))
+            .await
+            .map_err(|_| "stream consumer stalled".to_owned())?
+            .map_err(|_| "stream consumer closed".to_owned())
+    }
+}
+
+/// Snapshot, then keepalives every [`CADENCE`]; with `once`, returns after the first round.
+async fn frames(
+    service: Arc<Service>,
+    after: Option<u64>,
+    clock: Arc<dyn flotilla_resources::Clock>,
+    once: bool,
+    sink: &mut impl FrameSink,
+) -> Result<(), String> {
     let mut cursor = after;
     loop {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(QUEUED_FRAMES);
@@ -38,27 +100,24 @@ pub(super) async fn serve<W: AsyncWrite + Unpin>(
         let at = Timestamp::from_datetime(&clock.now());
         let task =
             tokio::task::spawn_blocking(move || source.serve(cursor, at, |frame| tx.blocking_send(frame.to_vec()).map_err(transport)));
-        // A writer error drops rx. The blocking worker may finish its current read/encode,
+        // An emit error drops rx. The blocking worker may finish its current read/encode,
         // then exits when blocking_send observes the closed, two-frame bounded channel.
         while let Some(frame) = rx.recv().await {
-            let chunk = async {
-                writer.write_all(format!("{:x}\r\n", frame.len()).as_bytes()).await?;
-                writer.write_all(&frame).await?;
-                writer.write_all(b"\r\n").await?;
-                writer.flush().await
-            };
-            tokio::time::timeout(IO_DEADLINE, chunk)
-                .await
-                .map_err(|_| "stream consumer stalled".to_owned())?
-                .map_err(|error| error.to_string())?;
+            sink.emit(frame).await?;
         }
         cursor = Some(task.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?);
         if once {
-            writer.write_all(b"0\r\n\r\n").await.map_err(|error| error.to_string())?;
             return Ok(());
         }
         tokio::time::sleep(CADENCE).await;
     }
+}
+
+/// One encoded point read, as the record route's body.
+pub(super) async fn query_record(service: Arc<Service>, kind: &str, name: &str, now: Timestamp) -> Result<Vec<u8>, String> {
+    let kind = KindCode(Code::parse(kind).map_err(|e| e.to_string())?);
+    let name = name.to_owned();
+    tokio::task::spawn_blocking(move || service.query(kind, &name, now)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
 }
 
 pub(super) async fn record<W: AsyncWrite + Unpin>(
@@ -68,20 +127,12 @@ pub(super) async fn record<W: AsyncWrite + Unpin>(
     name: &str,
     now: Timestamp,
 ) -> Result<(), String> {
-    let kind = KindCode(Code::parse(kind).map_err(|e| e.to_string())?);
-    let name = name.to_owned();
-    let bytes = tokio::task::spawn_blocking(move || service.query(kind, &name, now))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+    let bytes = query_record(service, kind, name, now).await?;
     tokio::time::timeout(IO_DEADLINE, async {
         writer
             .write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.flotilla.log+cbor\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    bytes.len()
-                )
-                .as_bytes(),
+                format!("HTTP/1.1 200 OK\r\nContent-Type: {CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len())
+                    .as_bytes(),
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -440,6 +491,17 @@ mod tests {
         assert!(matches!(kinds.as_slice(), [Frame::Begin { .. }, Frame::End { .. }, Frame::Keepalive { .. }]));
         task.abort();
     }
+    // The router's body carries the same frames as the raw writer, one per chunk, and a
+    // `once` stream ends cleanly after its first round.
+    #[tokio::test]
+    async fn router_seam_sends_the_same_frames_and_ends_once() {
+        let store_dir = tempfile::tempdir().expect("dir");
+        let service = Arc::new(Service::open(&store_dir.path().join("store.sqlite"), "home", KindRegistry::new()).expect("store"));
+        let chunks: Vec<_> = body(service, None, Arc::new(flotilla_resources::SystemClock), true).collect().await;
+        let frames = chunks.into_iter().map(|chunk| Frame::decode(&chunk.expect("chunk")).expect("frame")).collect::<Vec<_>>();
+        assert!(matches!(frames.as_slice(), [Frame::Begin { .. }, Frame::End { .. }, Frame::Keepalive { .. }]), "{frames:?}");
+    }
+
     // A routed miss is exactly one encoded point query to the home. Even an absent result
     // retains remote provenance and the age of the home time that served it.
     #[tokio::test]

@@ -5,6 +5,7 @@ mod client_connection;
 mod environment_connection;
 pub mod environment_sockets;
 mod environment_supervision;
+mod http;
 mod peer_connection;
 pub mod peer_runtime;
 pub mod remote_commands;
@@ -283,6 +284,11 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
         Some(config.state_dir().as_path().join("peers")),
     );
     Ok(handle)
+}
+
+/// Resolve the declared loopback HTTP listen address, refusing a non-loopback one (ADR 0065).
+pub(crate) fn resolve_http_listen(spec: &str) -> Result<std::net::SocketAddr, String> {
+    http::ListenAddress::resolve(spec).map(|address| address.bind_address())
 }
 
 /// The daemon server that listens on a Unix socket and dispatches requests

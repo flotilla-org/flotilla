@@ -150,6 +150,9 @@ pub struct DaemonArgs {
     /// Idle timeout in seconds (0 = no timeout)
     #[arg(long, default_value = "300")]
     pub timeout: u64,
+    /// Loopback HTTP listen address (host:port), overriding daemon.toml's `[http] listen`
+    #[arg(long)]
+    pub http_listen: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -1413,7 +1416,14 @@ mod tests {
         assert!(matches!(cli.command, Some(SubCommand::Daemon(DaemonArgs { command: Some(DaemonSubCommand::Stop), .. }))));
 
         let foreground = Cli::try_parse_from(["flotilla", "daemon", "--timeout", "0"]).expect("foreground daemon should still parse");
-        assert!(matches!(foreground.command, Some(SubCommand::Daemon(DaemonArgs { command: None, timeout: 0 }))));
+        assert!(matches!(foreground.command, Some(SubCommand::Daemon(DaemonArgs { command: None, timeout: 0, http_listen: None }))));
+
+        let listening =
+            Cli::try_parse_from(["flotilla", "daemon", "--http-listen", "127.0.0.1:7878"]).expect("daemon --http-listen should parse");
+        assert!(matches!(
+            listening.command,
+            Some(SubCommand::Daemon(DaemonArgs { command: None, http_listen: Some(ref address), .. })) if address == "127.0.0.1:7878"
+        ));
 
         let dev_mode = Cli::try_parse_from(["flotilla", "daemon", "dev-mode", "enable"]).expect("daemon dev-mode enable should parse");
         assert!(matches!(
