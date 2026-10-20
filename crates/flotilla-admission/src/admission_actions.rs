@@ -145,10 +145,15 @@ impl AdmissionActions<'_> {
                 self.events.finish(id, empty_identity, result);
                 return Ok(id);
             }
-            if let Err(message) = self.admission.check_local_free_space_floor().await {
-                let result = CommandValue::Error { message };
-                self.events.finish(id, empty_identity, result);
-                return Ok(id);
+            // An adopted checkout is on this host, and adoption writes its
+            // record before placement is known, so check this host first.
+            let adopts_checkout = adopted_checkout.is_some();
+            if adopts_checkout {
+                if let Err(message) = self.admission.check_local_free_space_floor().await {
+                    let result = CommandValue::Error { message };
+                    self.events.finish(id, empty_identity, result);
+                    return Ok(id);
+                }
             }
             // Use the admission transaction before checking identity or writing
             // adopted checkout resources. A duplicate must have no side effects.
@@ -346,6 +351,12 @@ impl AdmissionActions<'_> {
                 },
                 None => None,
             };
+            if !adopts_checkout {
+                if let Err(message) = self.admission.check_admitting_host_floor(placement_decision.iter()).await {
+                    self.events.finish(id, empty_identity, CommandValue::Error { message });
+                    return Ok(id);
+                }
+            }
             if let Err(message) = self.admission.check_remote_placement_free_space_floor(&namespace, placement_decision.as_ref()).await {
                 self.events.finish(id, empty_identity, CommandValue::Error { message });
                 return Ok(id);

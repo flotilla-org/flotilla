@@ -595,3 +595,45 @@ async fn capability_admission_places_on_agentless_ssh_hosts_only_when_pinned() {
         .expect_err("pinning does not let an agentless SSH host run an agent it lacks");
     assert!(refused.contains("agent adapter `codex`"), "{refused}");
 }
+
+struct NearlyFullDisk;
+
+impl flotilla_provider_runtime::available_space::AvailableSpaceProbe for NearlyFullDisk {
+    fn measure(&self, _path: &std::path::Path) -> Option<u64> {
+        Some(1024 * 1024 * 1024)
+    }
+}
+
+#[tokio::test]
+async fn admitting_host_floor_gates_only_work_that_lands_on_it() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"nearly-full-admitter\"\n").expect("daemon config");
+    let mut discovery = fake_discovery(false);
+    discovery.available_space_probe = Arc::new(NearlyFullDisk);
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::new("udder"),
+        ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let local = daemon.local_host_id().expect("host id").to_string();
+    let decision = |host: &str| PlacementDecision {
+        policy_name: format!("host-direct-{host}"),
+        target_host: PlacementTargetHost { reference: flotilla_protocol::CanonicalHostId::resolved(host), display_name: host.into() },
+        minimal_alternatives: Vec::new(),
+        escalation_reason: None,
+        refused_candidates: Vec::new(),
+        viable_not_selected: Vec::new(),
+        allocation: None,
+    };
+    let remote = decision("b1");
+    let here = decision(&local);
+
+    daemon.admission.check_admitting_host_floor([&remote]).await.expect("remote work is judged by its target's floor");
+    let refused = daemon.admission.check_admitting_host_floor([&remote, &here]).await.expect_err("a vessel lands on the admitter");
+    assert!(refused.contains("below the 20.0 GiB floor"), "{refused}");
+    daemon.admission.check_admitting_host_floor([]).await.expect_err("work without a placement decision defaults to the admitter");
+}
