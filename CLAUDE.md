@@ -165,7 +165,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-admission` | Convoy admission, standing-convoy reconciliation, vessel placement projection, placement planning, project operations and composed-image planning; host orchestration through owned ports |
 | `flotilla-crew` | Crew operations and actions, capability cards, the leaf engine, the decision log, charter notifications, review bundles, and the Vessel, TerminalSession and Convoy reconcilers; host collaborators through owned ports |
 | `flotilla-core` | Refresh and `InProcessDaemon` composition root; implements admission, crew and observation ports |
-| `flotilla-protocol` | Commands, self-describing query rows (flotilla-schema), provider snapshots, events and envelopes; no storage backend |
+| `flotilla-protocol` | Commands, self-describing query rows and shared table vocabulary (flotilla-schema), provider snapshots, events and envelopes; no storage backend |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
 | `flotilla-config` | Host-local config files (`config.toml`, `daemon.toml`, `hosts.toml`, observation roots, open views), provider preference values, default checkout path and bounded log files |
 | `flotilla-daemon-api` | `DaemonHandle` and event publication interfaces, query subscription token, build identity and lifecycle lock file |

@@ -12,6 +12,7 @@ pub mod remote_commands;
 mod replication;
 mod request_dispatch;
 mod shared;
+mod tables;
 
 pub use http::{HookEndpoint, HookLaunch};
 

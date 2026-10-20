@@ -32,13 +32,17 @@ pub(in crate::server) enum CallerAuth {
 impl CallerAuth {
     /// The refusal for a caller that does not act as the user: an environment or an
     /// anonymous caller.
-    pub(super) fn refusal_unless_user(&self) -> Option<Response> {
+    pub(super) fn user_refusal(&self) -> Option<(StatusCode, &'static str)> {
         match self {
             Self::Socket(_) | Self::Bearer | Self::Session(_) => None,
-            Self::Environment { .. } => Some(refusal(StatusCode::FORBIDDEN, "this route is not available to an environment")),
-            Self::Hook(_) => Some(refusal(StatusCode::FORBIDDEN, "a hook token reaches only the hook routes")),
-            Self::Anonymous => Some(unauthenticated()),
+            Self::Environment { .. } => Some((StatusCode::FORBIDDEN, "this route is not available to an environment")),
+            Self::Hook(_) => Some((StatusCode::FORBIDDEN, "a hook token reaches only the hook routes")),
+            Self::Anonymous => Some((StatusCode::UNAUTHORIZED, "authentication required")),
         }
+    }
+    pub(super) fn refusal_unless_user(&self) -> Option<Response> {
+        self.user_refusal()
+            .map(|(status, message)| if status == StatusCode::UNAUTHORIZED { unauthenticated() } else { refusal(status, message) })
     }
 
     /// The refusal for an anonymous caller, or a hook token outside the hook routes.

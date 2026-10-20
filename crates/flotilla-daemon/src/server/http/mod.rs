@@ -12,10 +12,14 @@ mod hook_tests;
 mod hooks;
 mod login;
 mod resource_api;
+mod table_api;
+#[cfg(test)]
+mod table_tests;
 mod tcp;
 #[cfg(test)]
 mod tests;
 mod unix;
+mod wire;
 
 use std::sync::{Arc, OnceLock};
 
@@ -58,6 +62,7 @@ pub(in crate::server) struct HttpRouter {
     daemon: Option<Arc<InProcessDaemon>>,
     /// Where hook routes record agent state; without it they answer 503.
     agent_state_store: Option<flotilla_agent::SharedAgentStateStore>,
+    table_store: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
     logins: Arc<LoginStore>,
     /// The TCP listener's origin, for login URLs; unset when no TCP listener is declared.
     #[builder(default)]
@@ -100,6 +105,7 @@ impl HttpRouter {
             agent_state_store: Some(Arc::clone(daemon.agent_state_store())),
             commands: None,
             daemon: Some(daemon),
+            table_store: None,
             logins,
             tcp_origin,
             change_stream_deadline: super::change_stream::CONSUMER_DEADLINE,
@@ -119,6 +125,9 @@ impl HttpRouter {
     pub(in crate::server) fn into_router(self) -> Router {
         Router::new()
             .route(HELLO_PATH, get(hello))
+            .route("/tables", get(table_api::list))
+            .route("/tables/{table}", get(table_api::describe))
+            .route("/tables/{table}/rows", get(table_api::rows))
             .route(LOGIN_CODES_PATH, post(mint_login_code))
             .route(LOGIN_PATH, get(login))
             .route(LOGOUT_PATH, post(logout))

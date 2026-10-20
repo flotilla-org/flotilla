@@ -57,6 +57,32 @@ pub fn state_data(set: &TableSet, position: usize) -> Vec<(&str, Vec<&str>, Vec<
         .collect()
 }
 
+/// Markdown for a non-stored table, without inventing a stored kind or backend columns.
+pub fn render_table_view(table: &Table) -> String {
+    fn cell(value: impl ToString) -> String {
+        value.to_string().replace('|', "\\|").replace('\n', " ")
+    }
+    let table = table.with_natural_references();
+    let mut out = format!(
+        "## {}\n\n| Field | Type | Required | Categories | Reference | Properties |\n|---|---|---|---|---|---|\n",
+        cell(&table.name)
+    );
+    for column in table.key.iter().chain(&table.columns) {
+        writeln!(
+            out,
+            "| `{}` | {} | {} | {} | {} | {} |",
+            cell(&column.name),
+            cell(format!("{:?}", column.ty)),
+            !column.nullable,
+            cell(column.categories.iter().map(|(value, name)| format!("{value}: {name}")).collect::<Vec<_>>().join(", ")),
+            cell(column.reference.as_deref().unwrap_or("")),
+            cell(serde_json::to_string(&column.properties).expect("column properties"))
+        )
+        .expect("write string");
+    }
+    out
+}
+
 /// The view of `sets` as Markdown: a summary table of every table, then the wide tables, then the
 /// label-plus-data states (when any).
 pub fn render_view<'a>(sets: impl IntoIterator<Item = &'a TableSet>) -> String {

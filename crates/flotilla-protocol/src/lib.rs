@@ -694,3 +694,6 @@ pub struct RepoDelta {
 mod tests;
 
 pub use query::ForgeBudgetRow;
+
+/// Self-describing tables, shared by the HTTP and surface carriers.
+pub mod table;

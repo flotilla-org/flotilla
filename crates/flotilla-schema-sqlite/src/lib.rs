@@ -57,3 +57,6 @@ pub use shared::schema_ddl;
 pub use store::{
     AboutCursor, AboutPage, Applied, Loaded, Read, ResourceId, Snapshot, Stamp, Store, StoreOptions, Write, MAX_CHANGES_PAGE_BYTES,
 };
+
+mod table_read;
+pub use table_read::{TableFilter, TableRead};
