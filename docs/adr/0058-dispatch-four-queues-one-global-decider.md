@@ -54,3 +54,34 @@ field endpoint. Per-ticket polling would multiply ready/live cardinality by the
 field changes update cached REST items without refetching unchanged native graph
 details. Live convoy reads select projects and nonterminal phases before decode,
 so retained history does not increase accounting work.
+
+## 2026-10-20 amendment: budgets, capacity pools and vessel leases
+
+The owner's environment and placement grill of 2026-10-20 supersedes the
+reservation language above, in line with
+[ADR 0064](0064-primitives-model-resources-records-gated-machines-inboxes.md)
+("Admission grants a cap, never a reservation" and "Admission grants a capacity
+budget").
+
+- **Admission grants a budget; it reserves nothing.** "All first-stage resource
+  users must hold reservations" is replaced. Admission refuses only a convoy
+  whose first stage could never fit, judged against declared capacity, not
+  current free capacity. Waiting convoys still hold no capacity.
+- **Placement holds capacity, as vessel leases.** Queue 4 is a placement queue
+  per **capacity pool**, not per host: a host's compute and disk, or a provider
+  account's quota. Each pool has one authoritative daemon, which keeps its
+  ledger and grants leases. A vessel may draw on several pools; its
+  environment's capability declaration names them. A lease lasts until the
+  vessel is Gone. "Reservation" is retired as a term.
+- **"No half-admission" is dropped** from the governor guarantees. A budget is
+  not a promise that every first-stage vessel starts at once; vessels that do
+  not fit wait in placement order.
+- **Dynamic providers are placement candidates.** A cloud sandbox or agent
+  cloud session provider counts when the convoy is permitted to use it: credits
+  remain, or (later) its predicted cost fits the budget. What happens to work
+  that is permitted in principle but short of budget, for example a queue
+  waiting for a raised account allowance or approved spend, is open.
+- The ledger dimensions listed above (memory, scratch disk, CPU, slots) stand,
+  now per pool. What admission needs on the admitting host itself, versus what
+  an environment consumes on each pool, is for the capacity grill under #3303.
+- #2786 is renamed from per-host reservation ledgers to per-pool vessel leases.

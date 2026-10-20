@@ -147,3 +147,21 @@ Rules:
 In drydock's vocabulary, a configured "provider instance" is simply a *provider*, usually named after its service, and the code is a *provider module* (ADR 0070's API-review amendment).
 
 Providers may also run out of process, in a language host behind drydock's adaptor protocol ([ADR 0070](0070-drydock-out-of-process-environment-adaptors.md)). In flotilla they appear through one adaptor-client provider that implements this seam by calling a language host, and that is selected like any other configured instance. One conformance suite runs against in-process and out-of-process providers alike. The seam traits and the built-in providers move into drydock after the seam refactor (#3483) lands.
+
+### Capacity pools and provider addresses (2026-10-20 grill)
+
+The owner's environment and placement grill separated three things that "host" used to mean together: the capacity a vessel draws on, the daemon that controls a provider, and the place a provider is found.
+
+- **A capacity pool** is what a ledger is keyed by: a host's compute and disk, or a provider account's quota. Each pool has one authoritative daemon that grants vessel leases from it ([ADR 0058, dispatch](0058-dispatch-four-queues-one-global-decider.md), 2026-10-20 amendment).
+  - A provider's capability declaration names the pools its environments draw on. A host-direct or Docker environment draws on its host. A cloud sandbox draws on its account, and may also draw a little on the controlling host, which the capacity grill (#3303) is to model.
+  - This refines "the advertising host is the controlling host" above: the controlling host holds the credential, but it is not the pool. An agentless SSH host is its own pool, controlled by its owning daemon.
+  - "Host" may later split into pool, controller and place. A "cloud" Host run on Workers and Durable Objects would control providers with no environment of its own.
+- **An Environment stores a qualified provider address:** a place plus the provider instance, in [ADR 0066](0066-addresses-name-things-by-natural-key.md) segments. Examples:
+  - `host:b1/provider:host-direct` (an agentless SSH host);
+  - `host:udder/provider:docker`;
+  - `account:namespace-lab/provider:namespace` (a cloud account).
+  The address is copied from the vessel's lease when the Environment is created.
+- **The controller is resolved, never stored.** The place's replicated record (a Host, or the account's record) says which daemon controls it, so moving control changes no Environment. Failover, such as a disconnected host reaching a cloud account through another controller, hangs off this resolution later and is not designed here.
+- **`provider_for_environment` becomes one address-to-registry resolution** (#3521), replacing today's split between the local registry and agentless SSH profiles. The old `host_direct.host_ref` and similar host fields fold into the address at the generated-table move (#3108), with the schema review; until then they are read alongside it.
+- **A drydock provider's name is the instance segment.** Its place is the account that its `credential_reference` identifies ([ADR 0070](0070-drydock-out-of-process-environment-adaptors.md), 2026-10-20 amendment).
+- Placement policies say how a crew runs, not where (#3394). The address is a placement *result*, recorded on the Environment, not a policy input.

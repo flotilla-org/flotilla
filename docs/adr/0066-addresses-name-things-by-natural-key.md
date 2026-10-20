@@ -149,9 +149,21 @@ For those kinds a shim never actually becomes removable, and the roll-time live 
 - **There is no `work` kind.**
   - `ConvoyStatus.work` is the convoy's per-vessel progress record, and `crew_work` holds per-role progress. Neither is a thing of its own.
   - A condition on a crew's progress addresses the role: `project:P/convoy:C/role:coder .phase == Done`. This replaces `work/<convoy>/<vessel> .crew.<role>.phase == Done`.
-- **Usage is a small root kind: `usage:<provider>/account:<account>`.**
+- **Usage is a small root kind: `usage:<provider>/account:<account>`.** *(Superseded 2026-10-20 by §9: the account is the root, and usage belongs to it.)*
   - It is a host- or account-level fact, not owned by a project or forge.
   - Its expected main user is a scheduler checking capacity before a vessel is deployed. Wait conditions on it, which the condition machinery already supports, are a secondary use.
+
+### 9. Places and providers (owner grill, 2026-10-20)
+
+An Environment names its provider by a qualified address ([ADR 0058, environment providers](0058-environment-providers-own-lifecycle-and-runtime-capabilities.md), 2026-10-20 section). That needs three kinds the enum does not have yet.
+
+- **`host:<host>`** is a root kind naming a Host by its record name. It is a place: somewhere providers are found, with a replicated record saying which daemon controls it. The record name may be an opaque host ID, so surfaces resolve it to the Host's display name when they show an address; examples here use display names.
+- **`account:<account>`** becomes a root kind, naming a provider account as a place by its fleet-unique identity label (for example `namespace-lab`). Its capacity pool and its usage are facts about the same account, so the account is the key for both.
+  - This supersedes §8's `usage:<provider>/account:<account>` form. Usage is part of the account; if it needs an address of its own, it is a sub-resource under the account rather than a root.
+  - Wait conditions on usage already use the §8 form (`LeafAddress::Usage`). They keep it until usage observation is remodelled under the account, and the move then follows §6's re-encode step.
+- **`provider:<instance>`** sits under a place and names a configured provider instance there: `host:b1/provider:host-direct`, `account:namespace-lab/provider:namespace`. Under drydock the instance is the drydock provider's name.
+
+Adding these is a deliberate parser change, as §4 requires.
 
 ## Consequences
 
