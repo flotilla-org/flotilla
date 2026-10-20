@@ -542,9 +542,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     let paths = reach.prepare_session(&ReachTarget::from(profile)).await?;
                     apply_reach_environment(&mut env, &spec.env_ref, &paths, profile.env_bag.find_env_var("PATH"));
                 }
-                None => {
-                    warn!(environment = %spec.env_ref, "agentless session launched without a daemon socket server; crew hooks cannot reach the daemon")
-                }
+                // As for contained provisioning: a crew that cannot reach the
+                // daemon must not start silently without hooks or settlement.
+                None => return Err("EnvironmentSocketUnavailable: agentless sessions require a crew socket server".to_string()),
             }
         }
         // Crews rebuild one checkout across edits, rebases and review fixes. Set this explicitly: Cargo turns
@@ -654,10 +654,15 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let (Some(profile), Some(reach)) = (self.state.agentless_ssh.get(&spec.env_ref), &self.state.agentless_reach) else {
             return Ok(None);
         };
-        // Also restarts the forward for sessions that outlived a controller restart.
-        let health = reach.ensure_forward(&ReachTarget::from(profile)).await?;
-        let reason = health.borrow().unreachable_reason();
-        Ok(reason)
+        // Also restarts the forward for sessions that outlived a controller
+        // restart. A forward that cannot even start is a reason, not a log line.
+        match reach.ensure_forward(&ReachTarget::from(profile)).await {
+            Ok(health) => {
+                let reason = health.borrow().unreachable_reason();
+                Ok(reason)
+            }
+            Err(error) => Ok(Some(format!("daemon forward unavailable: {error}"))),
+        }
     }
 
     async fn observe_attention(&self, session_id: &str, spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {

@@ -96,7 +96,12 @@ struct FakeHost {
     forward: Current,
     uname: String,
     fail_prepare: AtomicBool,
+    /// The reverse listener never appears (sshd slow or refusing).
+    socket_hidden: AtomicBool,
+    fail_uname: AtomicBool,
     installed: AtomicBool,
+    /// Staged files made executable, which alone may be published.
+    executable: StdMutex<Vec<String>>,
     calls: StdMutex<Vec<Vec<String>>>,
     writes: StdMutex<Vec<(PathBuf, PathBuf)>>,
 }
@@ -107,7 +112,10 @@ impl FakeHost {
             forward: Arc::clone(&ssh.current),
             uname: uname.into(),
             fail_prepare: AtomicBool::new(false),
+            socket_hidden: AtomicBool::new(false),
+            fail_uname: AtomicBool::new(false),
             installed: AtomicBool::new(false),
+            executable: StdMutex::new(Vec::new()),
             calls: StdMutex::new(Vec::new()),
             writes: StdMutex::new(Vec::new()),
         }
@@ -129,13 +137,24 @@ impl CommandRunner for FakeHost {
         match (cmd, args.first().copied()) {
             ("sh", _) if self.fail_prepare.load(Ordering::SeqCst) => Err("mkdir: permission denied".into()),
             ("sh", _) => Ok(String::new()),
+            ("test", Some("-S")) if self.socket_hidden.load(Ordering::SeqCst) => Err(String::new()),
             ("test", Some("-S")) if self.forward.lock().expect("forward").as_ref().is_some_and(|alive| alive.load(Ordering::SeqCst)) => {
                 Ok(String::new())
             }
             ("test", Some("-x")) if self.installed.load(Ordering::SeqCst) => Ok(String::new()),
             ("test", _) => Err(String::new()),
+            ("uname", _) if self.fail_uname.load(Ordering::SeqCst) => Err("ssh: connection reset".into()),
             ("uname", _) => Ok(format!("{}\n", self.uname)),
             ("chmod", _) => {
+                self.executable.lock().expect("executable").push(args[1].to_string());
+                Ok(String::new())
+            }
+            ("mv", _) => {
+                // Publication by rename: only a complete, executable file.
+                if !self.executable.lock().expect("executable").iter().any(|path| path == args[2]) {
+                    return Err(format!("published {} before it was executable", args[2]));
+                }
+                assert!(args[3].ends_with("/flotilla"));
                 self.installed.store(true, Ordering::SeqCst);
                 Ok(String::new())
             }
@@ -153,6 +172,8 @@ impl CommandRunner for FakeHost {
     }
 
     async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        // A real copy takes time; let a concurrent launch interleave here.
+        tokio::time::sleep(Duration::from_millis(5)).await;
         self.writes.lock().expect("writes").push((source.to_path_buf(), destination.to_path_buf()));
         Ok(())
     }
@@ -350,9 +371,12 @@ async fn cli_delivery_follows_the_host_platform() {
 
     let platform_build = harness_with(foreign.0, Release::new(&[foreign.1]));
     let paths = platform_build.reach.prepare_session(&platform_build.target).await.expect("platform build");
-    let (source, destination) = platform_build.host.writes().pop().expect("installed");
+    let (source, staged) = platform_build.host.writes().pop().expect("installed");
     assert!(source.ends_with(format!("platforms/{}/bin/flotilla", foreign.1)));
-    assert_eq!(destination, paths.cli_directory.join("flotilla"));
+    assert_eq!(staged.parent(), Some(paths.cli_directory.as_path()), "staged beside the published path");
+    let published = platform_build.host.calls().into_iter().find(|call| call[0] == "mv").expect("published by rename");
+    assert_eq!(published[3], staged.to_string_lossy());
+    assert_eq!(Path::new(&published[4]), paths.cli_directory.join("flotilla"));
     assert_eq!(paths.cli_directory, Path::new("/home/crew/.local/state/flotilla/agentless-cli/gen_7_abc"));
 
     let same_platform = harness();
@@ -413,4 +437,64 @@ fn session_environment_points_at_the_forward_and_cli() {
     assert_eq!(get(&env, "KEEP"), ["1"]);
     apply_reach_environment(&mut env, "host-direct-b1", &paths, Some("/ignored"));
     assert_eq!(get(&env, "PATH"), ["/cli:/usr/bin"], "an explicit session PATH is kept, and the CLI is prepended once");
+}
+
+// Review #3621: retiring while the forward is still opening stops the ssh
+// client explicitly and removes the remote socket, without relying on the
+// runner's kill-on-drop.
+#[tokio::test]
+async fn retire_while_opening_kills_ssh_and_removes_the_remote_socket() {
+    let harness = harness();
+    harness.host.socket_hidden.store(true, Ordering::SeqCst);
+    harness.reach.ensure_forward(&harness.target).await.expect("supervising");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while harness.ssh.spawns().is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("ssh spawned");
+    let alive = harness.ssh.current.lock().expect("current").clone().expect("forward process");
+    harness.reach.retire(&harness.target.environment).await.expect("retire");
+    assert!(!alive.load(Ordering::SeqCst), "the opening ssh client is killed");
+    let remote = reverse_spec(&harness.ssh.spawns()[0]).split_once(':').expect("spec").0.to_string();
+    assert!(harness.host.calls().iter().any(|call| call[0] == "rm" && call.last() == Some(&remote)));
+}
+
+// Review #3621: a late observation of a torn-down Environment's session cannot
+// resurrect its forward or socket.
+#[tokio::test]
+async fn retired_environment_is_not_resurrected() {
+    let harness = harness();
+    harness.reach.prepare_session(&harness.target).await.expect("up");
+    harness.reach.retire(&harness.target.environment).await.expect("retire");
+    let error = harness.reach.ensure_forward(&harness.target).await.expect_err("tombstoned");
+    assert!(error.contains("torn down"), "{error}");
+    assert!(harness.reach.prepare_session(&harness.target).await.is_err());
+    assert_eq!(harness.ssh.spawns().len(), 1, "no second forward");
+    assert_eq!(harness.reach.health(&harness.target.environment).await, None);
+}
+
+// Review #3621: concurrent launches install the CLI once, publishing only a
+// complete executable by rename.
+#[tokio::test]
+async fn concurrent_launches_install_the_cli_once() {
+    let harness = harness();
+    let (first, second) = tokio::join!(harness.reach.prepare_session(&harness.target), harness.reach.prepare_session(&harness.target));
+    assert_eq!(first.expect("first"), second.expect("second"));
+    assert_eq!(harness.host.writes().len(), 1);
+    assert_eq!(harness.host.calls().iter().filter(|call| call[0] == "mv").count(), 1);
+    assert_eq!(harness.ssh.spawns().len(), 1);
+}
+
+// Review #3621: a transient probe failure keeps the last known platform.
+#[tokio::test]
+async fn platform_survives_a_transient_probe_failure() {
+    let harness = harness();
+    harness.host.fail_uname.store(true, Ordering::SeqCst);
+    assert!(harness.reach.platform(&harness.target).await.expect_err("never probed").contains("connection reset"));
+    harness.host.fail_uname.store(false, Ordering::SeqCst);
+    let known = harness.reach.platform(&harness.target).await.expect("probed");
+    harness.host.fail_uname.store(true, Ordering::SeqCst);
+    assert_eq!(harness.reach.platform(&harness.target).await.expect("remembered"), known);
 }

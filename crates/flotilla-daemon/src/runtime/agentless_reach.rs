@@ -8,7 +8,7 @@
 //! `tender::ssh` helper; it never forwards the main daemon socket.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -264,11 +264,24 @@ pub(crate) struct AgentlessReach {
     cli: CliSource,
     timing: ForwardTiming,
     forwards: Mutex<HashMap<EnvironmentId, Forward>>,
+    /// Tombstones for torn-down Environments: a late observation of one of
+    /// their sessions must not resurrect the forward or its socket.
+    retired: Mutex<HashSet<EnvironmentId>>,
+    /// Serialises CLI installation, so concurrent launches never race one path.
+    installing: Mutex<()>,
+    /// Last successfully probed platform per Environment. A host's platform
+    /// does not change under a running controller, so a transient probe
+    /// failure keeps the known value instead of flapping readiness.
+    platforms: Mutex<HashMap<EnvironmentId, HostPlatform>>,
 }
 
 impl Drop for AgentlessReach {
     fn drop(&mut self) {
+        // Dropped at daemon shutdown, where nothing can await retirement: the
+        // aborted supervisors drop their ssh clients, which the process runner
+        // spawns kill-on-drop. The remote socket is removed before the next dial.
         for forward in self.forwards.get_mut().values() {
+            let _ = forward.stop.send(true);
             forward.task.abort();
         }
     }
@@ -276,11 +289,31 @@ impl Drop for AgentlessReach {
 
 impl AgentlessReach {
     pub(crate) fn new(local: Arc<dyn CommandRunner>, sockets: EnvironmentSocketService, cli: CliSource, timing: ForwardTiming) -> Self {
-        Self { local, sockets, cli, timing, forwards: Mutex::new(HashMap::new()) }
+        Self {
+            local,
+            sockets,
+            cli,
+            timing,
+            forwards: Mutex::new(HashMap::new()),
+            retired: Mutex::new(HashSet::new()),
+            installing: Mutex::new(()),
+            platforms: Mutex::new(HashMap::new()),
+        }
     }
 
     pub(crate) fn cli(&self) -> &CliSource {
         &self.cli
+    }
+
+    /// The host's platform, probed once and then remembered.
+    pub(crate) async fn platform(&self, target: &ReachTarget) -> Result<HostPlatform, String> {
+        match HostPlatform::probe(target.remote.as_ref()).await {
+            Ok(platform) => {
+                self.platforms.lock().await.insert(target.environment.clone(), platform.clone());
+                Ok(platform)
+            }
+            Err(error) => self.platforms.lock().await.get(&target.environment).cloned().ok_or(error),
+        }
     }
 
     /// Prepare a session launch: install the CLI, then start the forward and
@@ -290,9 +323,12 @@ impl AgentlessReach {
         let paths = target.paths(&self.cli)?;
         self.install_cli(target, &paths).await?;
         let mut health = self.ensure_forward(target).await?;
-        let outcome = tokio::time::timeout(self.timing.open_timeout, health.wait_for(|health| *health != ForwardHealth::Starting))
+        // Outlast the supervisor's own attempt budget, so its specific reason
+        // (rather than a bare timeout) reaches the launch error.
+        let budget = self.timing.open_timeout * 2;
+        let outcome = tokio::time::timeout(budget, health.wait_for(|health| *health != ForwardHealth::Starting))
             .await
-            .map_err(|_| format!("daemon forward to {} did not open within {:?}", target.destination, self.timing.open_timeout))?
+            .map_err(|_| format!("daemon forward to {} did not open within {budget:?}", target.destination))?
             .map_err(|_| "daemon forward supervisor stopped".to_string())?
             .clone();
         match outcome {
@@ -306,6 +342,9 @@ impl AgentlessReach {
     /// the forward for sessions that outlived it.
     pub(crate) async fn ensure_forward(&self, target: &ReachTarget) -> Result<watch::Receiver<ForwardHealth>, String> {
         let mut forwards = self.forwards.lock().await;
+        if self.retired.lock().await.contains(&target.environment) {
+            return Err(format!("environment {} has been torn down", target.environment));
+        }
         if let Some(forward) = forwards.get(&target.environment) {
             if !forward.task.is_finished() {
                 return Ok(forward.health.clone());
@@ -335,7 +374,11 @@ impl AgentlessReach {
     /// Environment teardown: stop the forward, which removes its remote
     /// socket, and retire the local environment socket.
     pub(crate) async fn retire(&self, environment: &EnvironmentId) -> Result<(), String> {
-        let forward = self.forwards.lock().await.remove(environment);
+        let forward = {
+            let mut forwards = self.forwards.lock().await;
+            self.retired.lock().await.insert(environment.clone());
+            forwards.remove(environment)
+        };
         if let Some(forward) = forward {
             let _ = forward.stop.send(true);
             if tokio::time::timeout(self.timing.open_timeout, forward.task).await.is_err() {
@@ -346,26 +389,39 @@ impl AgentlessReach {
     }
 
     async fn install_cli(&self, target: &ReachTarget, paths: &ReachPaths) -> Result<(), String> {
+        let _installing = self.installing.lock().await;
         let remote = target.remote.as_ref();
         let installed = paths.cli_directory.join("flotilla");
         let installed_text = installed.to_string_lossy();
         if remote.run("test", &["-x", &installed_text], Path::new("/"), &ChannelLabel::Default).await.is_ok() {
             return Ok(());
         }
-        let platform = HostPlatform::probe(remote).await?;
+        let platform = self.platform(target).await?;
         let source = self.cli.for_platform(&platform)?;
         remote
             .run("mkdir", &["-p", &paths.cli_directory.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
             .await
             .map_err(|error| format!("create flotilla CLI directory on {}: {error}", target.destination))?;
-        remote
-            .write_file_from(&source, &installed)
-            .await
-            .map_err(|error| format!("install flotilla CLI on {}: {error}", target.destination))?;
-        remote
-            .run("chmod", &["755", &installed_text], Path::new("/"), &ChannelLabel::Default)
-            .await
-            .map_err(|error| format!("make flotilla CLI executable on {}: {error}", target.destination))?;
+        // Running crews exec this path: publish a complete, executable file by
+        // rename, never a partly written or not-yet-executable one.
+        let staged = paths.cli_directory.join(format!(".flotilla-{}", uuid::Uuid::new_v4()));
+        let staged_text = staged.to_string_lossy();
+        let published = async {
+            remote.write_file_from(&source, &staged).await.map_err(|error| format!("copy: {error}"))?;
+            remote
+                .run("chmod", &["755", &staged_text], Path::new("/"), &ChannelLabel::Default)
+                .await
+                .map_err(|error| format!("chmod: {error}"))?;
+            remote
+                .run("mv", &["-f", "--", &staged_text, &installed_text], Path::new("/"), &ChannelLabel::Default)
+                .await
+                .map_err(|error| format!("publish: {error}"))
+        }
+        .await;
+        if let Err(error) = published {
+            let _ = remote.run("rm", &["-f", "--", &staged_text], Path::new("/"), &ChannelLabel::Default).await;
+            return Err(format!("install flotilla CLI on {}: {error}", target.destination));
+        }
         info!(destination = %target.destination, %platform, source = %source.display(), "installed flotilla CLI on agentless host");
         Ok(())
     }
@@ -417,6 +473,15 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
     let _ = stop.wait_for(|stop| *stop).await;
 }
 
+/// Stop a forward on retirement: kill the ssh client explicitly (rather than
+/// relying on the runner's kill-on-drop) and remove the remote socket it bound.
+async fn retire_child(child: &mut Box<dyn CommandProcess>, target: &ReachTarget, remote_socket: &Path) {
+    let _ = child.kill().await;
+    let socket = remote_socket.to_string_lossy();
+    let _ = target.remote.run("rm", &["-f", "--", &socket], Path::new("/"), &ChannelLabel::Default).await;
+    info!(environment = %target.environment, "daemon forward retired");
+}
+
 async fn supervise(
     local: Arc<dyn CommandRunner>,
     target: ReachTarget,
@@ -428,51 +493,56 @@ async fn supervise(
 ) {
     let mut backoff = timing.initial_backoff;
     let environment = &target.environment;
+    let args = tender::ssh::reverse_forwarding_arguments(&target.destination, &remote_socket, &local_socket);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     loop {
-        let attempt = async {
-            prepare_remote_socket(target.remote.as_ref(), &remote_socket).await?;
-            let args = tender::ssh::reverse_forwarding_arguments(&target.destination, &remote_socket, &local_socket);
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            let mut child = local
-                .spawn_long_lived("ssh", &args, Path::new("/"), &ChannelLabel::Default)
-                .await
-                .map_err(|error| format!("spawn ssh forward: {error}"))?;
-            if let Err(error) = wait_for_remote_socket(target.remote.as_ref(), &remote_socket, &mut child, timing).await {
-                let _ = child.kill().await;
-                return Err(error);
-            }
-            Ok::<_, String>(child)
-        };
-        let attempt = tokio::select! {
-            attempt = attempt => attempt,
+        // Only steps that own no process are cancelled by retirement; once
+        // ssh is spawned, this loop holds it and stops it explicitly.
+        let prepared = tokio::select! {
+            prepared = prepare_remote_socket(target.remote.as_ref(), &remote_socket) => prepared,
             _ = stopped(&mut stop) => return,
         };
-        let down = match attempt {
-            Ok(mut child) => {
-                info!(%environment, destination = %target.destination, "daemon forward up");
-                health.send_replace(ForwardHealth::Up);
-                backoff = timing.initial_backoff;
-                loop {
-                    tokio::select! {
+        let down = match prepared {
+            Err(error) => error,
+            Ok(()) => match local.spawn_long_lived("ssh", &args, Path::new("/"), &ChannelLabel::Default).await {
+                Err(error) => format!("spawn ssh forward: {error}"),
+                Ok(mut child) => {
+                    let listening = tokio::select! {
+                        listening = wait_for_remote_socket(target.remote.as_ref(), &remote_socket, &mut child, timing) => listening,
                         _ = stopped(&mut stop) => {
-                            let _ = child.kill().await;
-                            let socket = remote_socket.to_string_lossy();
-                            let _ = target.remote.run("rm", &["-f", "--", &socket], Path::new("/"), &ChannelLabel::Default).await;
-                            info!(%environment, "daemon forward retired");
+                            retire_child(&mut child, &target, &remote_socket).await;
                             return;
                         }
-                        _ = tokio::time::sleep(timing.liveness_interval) => match child.try_wait() {
-                            Ok(None) => {}
-                            Ok(Some(status)) => break format!("ssh forward exited ({status})"),
-                            Err(error) => {
-                                let _ = child.kill().await;
-                                break format!("ssh forward unobservable: {error}");
+                    };
+                    match listening {
+                        Err(error) => {
+                            let _ = child.kill().await;
+                            error
+                        }
+                        Ok(()) => {
+                            info!(%environment, destination = %target.destination, "daemon forward up");
+                            health.send_replace(ForwardHealth::Up);
+                            backoff = timing.initial_backoff;
+                            loop {
+                                tokio::select! {
+                                    _ = stopped(&mut stop) => {
+                                        retire_child(&mut child, &target, &remote_socket).await;
+                                        return;
+                                    }
+                                    _ = tokio::time::sleep(timing.liveness_interval) => match child.try_wait() {
+                                        Ok(None) => {}
+                                        Ok(Some(status)) => break format!("ssh forward exited ({status})"),
+                                        Err(error) => {
+                                            let _ = child.kill().await;
+                                            break format!("ssh forward unobservable: {error}");
+                                        }
+                                    },
+                                }
                             }
-                        },
+                        }
                     }
                 }
-            }
-            Err(error) => error,
+            },
         };
         warn!(%environment, destination = %target.destination, reason = %down, ?backoff, "daemon forward down; re-establishing");
         health.send_replace(ForwardHealth::Down(down));

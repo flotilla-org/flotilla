@@ -86,6 +86,12 @@ pub(super) fn claims_from_peer(peer: Option<PeerCredential>) -> HashMap<String, 
 /// The kernel peer evidence an environment socket may use. A forwarded
 /// socket's peer is the controller's own ssh client: neither its credentials
 /// nor its environment identify a crew, so only placement and in-band claims do.
+///
+/// Trust boundary: crews placed on one agentless host share its account, and
+/// any process of that account can reach the owner-only forwarded socket and
+/// claim any crew placed in that Environment (never one placed elsewhere).
+/// They are mutually trusted, exactly as crews are on a host-direct daemon
+/// host. With several crews and no claims, identity is ambiguous and refused.
 pub(super) fn reach_evidence(reach: SocketReach, peer: Option<PeerCredential>) -> Option<PeerCredential> {
     match reach {
         SocketReach::Mounted => peer,

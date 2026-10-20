@@ -120,6 +120,12 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
     let local_host_id = daemon.local_host_id().expect("local host ID").to_string();
     let host_id = "ssh-test-host";
     let environment_id = EnvironmentId::new(format!("host-direct-{host_id}"));
+    // #3618: the session's crews reach the daemon through a forward to a short
+    // runtime directory, with the controller's CLI delivered beside it.
+    let runtime_dir = flotilla_test_support::TestSocketDir::new();
+    let own_cli = temp.path().join("controller-bin/flotilla");
+    fs::create_dir_all(own_cli.parent().expect("cli dir")).expect("cli dir");
+    fs::write(&own_cli, "#!/bin/sh\n").expect("controller cli");
     let commands = Arc::new(StdMutex::new(Vec::new()));
     let runner: Arc<dyn CommandRunner> = Arc::new(SshProvisioningRecordingRunner { commands: Arc::clone(&commands) });
     daemon
@@ -160,6 +166,8 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         destination: "crew@beaufort.example".to_string(),
         env_bag: EnvironmentBag::new()
             .with(EnvironmentAssertion::env_var("HOME", temp.path().display().to_string()))
+            .with(EnvironmentAssertion::env_var("XDG_RUNTIME_DIR", runtime_dir.path().display().to_string()))
+            .with(EnvironmentAssertion::env_var("PATH", "/usr/bin:/bin"))
             .with(EnvironmentAssertion::env_var("FLOTILLA_PROBE_MODELS", ""))
             .with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
         runner,
@@ -207,7 +215,13 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
             local_host_id.clone(),
             format!("host-direct-{local_host_id}"),
         )
-        .with_agentless_ssh(vec![profile]),
+        .with_agentless_ssh(vec![profile])
+        .with_agentless_reach(Some(Arc::new(AgentlessReach::new(
+            Arc::new(ListeningSsh),
+            test_socket_service(temp.path()),
+            CliSource::new(Ok(own_cli.clone()), "gen-1"),
+            ForwardTiming::default(),
+        )))),
     );
     // The SSH host's host-direct Environment resolves to the provider in the
     // SSH environment's registry, not the owner's.
@@ -261,6 +275,13 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         let ensured = pool.ensured.lock().await;
         assert_eq!(ensured.len(), 1);
         assert_eq!(ensured[0].cwd.as_path(), worktree_path.as_path());
+        let env = |name: &str| ensured[0].env_vars.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
+        let socket = env("FLOTILLA_DAEMON_SOCKET").expect("forwarded daemon socket");
+        assert!(socket.starts_with(&runtime_dir.path().display().to_string()), "{socket}");
+        assert_eq!(env("FLOTILLA_ENVIRONMENT_ID").as_deref(), Some(environment_id.as_str()));
+        let path = env("PATH").expect("PATH");
+        let cli_directory = path.split(':').next().expect("CLI directory");
+        assert!(Path::new(cli_directory).join("flotilla").is_file(), "CLI delivered to {cli_directory}");
         let commands = commands.lock().expect("command log");
         assert!(commands.iter().any(|command| command == "git"));
         assert!(commands.iter().any(|command| command == "mv"));
@@ -270,13 +291,28 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 
+use super::agentless_reach::{AgentlessReach, CliSource, ForwardTiming, HostPlatform};
+use crate::server::environment_sockets::{EnvironmentSocketRegistry, EnvironmentSocketService};
+
+/// A real environment-socket service whose accept loop holds connections open.
+fn test_socket_service(state: &Path) -> EnvironmentSocketService {
+    EnvironmentSocketService::new(
+        Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
+        DaemonHostPath::new(state.join("env")),
+        |listener, _, _| {
+            tokio::spawn(async move {
+                let _listener = listener;
+                std::future::pending::<()>().await
+            })
+        },
+    )
+}
+
 // #3618: a host whose platform has no flotilla CLI in the controller's
 // generation is refused at placement with the reason; a host on the
 // controller's own platform is served by the controller's CLI.
 #[tokio::test]
 async fn agentless_host_without_a_platform_cli_is_refused_at_placement() {
-    use super::agentless_reach::{AgentlessReach, CliSource, ForwardTiming, HostPlatform};
-    use crate::server::environment_sockets::{EnvironmentSocketRegistry, EnvironmentSocketService};
     let controller = HostPlatform::controller();
     let controller_uname = format!(
         "{} {}\n",
@@ -284,16 +320,7 @@ async fn agentless_host_without_a_platform_cli_is_refused_at_placement() {
         if controller.os == "macos" && controller.arch == "aarch64" { "arm64" } else { controller.arch.as_str() }
     );
     let state = TempDir::new().expect("state");
-    let sockets = EnvironmentSocketService::new(
-        Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
-        DaemonHostPath::new(state.path().join("env")),
-        |listener, _, _| {
-            tokio::spawn(async move {
-                let _listener = listener;
-                std::future::pending::<()>().await
-            })
-        },
-    );
+    let sockets = test_socket_service(state.path());
     let reach = AgentlessReach::new(
         Arc::new(ProcessCommandRunner),
         sockets,
@@ -319,4 +346,13 @@ async fn agentless_host_without_a_platform_cli_is_refused_at_placement() {
     let (conditions, cli_available) = super::discovery::agentless_reach_conditions(&reach, &profile(&controller_uname)).await;
     assert!(cli_available, "{conditions:?}");
     assert!(conditions.is_empty(), "no forward has been dialled, so none is reported down");
+
+    // Review #3621: a platform never probed successfully (an ssh blip) is
+    // diagnostic and does not refuse placement.
+    let mut blip = profile("unused");
+    blip.environment_id = EnvironmentId::new("host-direct-b2");
+    blip.runner = Arc::new(DiscoveryMockRunner::builder().build());
+    let (conditions, cli_available) = super::discovery::agentless_reach_conditions(&reach, &blip).await;
+    assert!(cli_available);
+    assert!(matches!(conditions.as_slice(), [condition] if condition.reason == "PlatformUnknown" && !condition.blocks_readiness()));
 }

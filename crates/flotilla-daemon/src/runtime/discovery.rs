@@ -34,7 +34,7 @@ use tracing::{debug, warn};
 
 use crate::fulfilment_probe::{probe_kind, DetectionTarget};
 
-use super::agentless_reach::{AgentlessReach, HostPlatform};
+use super::agentless_reach::{AgentlessReach, ReachTarget};
 use super::seed::{
     empty_meta, ensure_default_policies, ensure_host_direct_environment_exists, kind_belongs_to_host, migrate_live_placement_policies,
 };
@@ -307,11 +307,13 @@ pub(super) async fn apply_agentless_ssh_observation(
 /// forward is diagnostic only: running crews keep working and it is re-dialled.
 pub(super) async fn agentless_reach_conditions(reach: &AgentlessReach, ssh: &AgentlessSshProfile) -> (Vec<HostCondition>, bool) {
     let mut conditions = Vec::new();
-    let cli = match HostPlatform::probe(ssh.runner.as_ref()).await {
-        Ok(platform) => reach.cli().for_platform(&platform).map(|_| ()).map_err(|error| ("NoPlatformBuild", error)),
-        Err(error) => Err(("PlatformUnknown", error)),
+    // A platform probe that has never succeeded is diagnostic only: a transient
+    // ssh blip must not refuse placement. Launch re-checks before installing.
+    let (cli, blocks_readiness) = match reach.platform(&ReachTarget::from(ssh)).await {
+        Ok(platform) => (reach.cli().for_platform(&platform).map(|_| ()).map_err(|error| ("NoPlatformBuild", error)), true),
+        Err(error) => (Err(("PlatformUnknown", error)), false),
     };
-    let cli_available = cli.is_ok();
+    let cli_available = cli.is_ok() || !blocks_readiness;
     if let Err((reason, message)) = cli {
         conditions.push(
             HostCondition::builder()
@@ -320,6 +322,7 @@ pub(super) async fn agentless_reach_conditions(reach: &AgentlessReach, ssh: &Age
                 .reason(reason)
                 .message(message)
                 .observed_at(Utc::now())
+                .blocks_readiness(blocks_readiness)
                 .blocks_forge_observation(false)
                 .build(),
         );
