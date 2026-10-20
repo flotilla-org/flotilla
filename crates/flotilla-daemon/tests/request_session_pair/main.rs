@@ -3875,7 +3875,7 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
                 .build()],
             stall_nudges: Default::default(),
             supervision: None,
-            exit: None,
+            exit: (name == "stalled-work").then(flotilla_resources::ExitDeclaration::standard_table),
             turn_delivery: Default::default(),
         };
         convoys
