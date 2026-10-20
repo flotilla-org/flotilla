@@ -485,7 +485,9 @@ impl DaemonServer {
         let peer_resource_socket_dir = config.state_dir().as_path().join("peers");
         let logins = Arc::new(http::LoginStore::new(daemon.clock_for_scenarios()));
         let tcp_origin = http::ListenerOrigin::default();
-        let http_router = http::HttpRouter::for_daemon(Arc::clone(&daemon), Arc::clone(&logins), tcp_origin.clone()).into_router();
+        let http_router = http::HttpRouter::for_daemon(Arc::clone(&daemon), Arc::clone(&logins), tcp_origin.clone())
+            .with_commands(remote_command_router.clone(), shutdown_request_tx.clone(), socket_path.clone())
+            .into_router();
         let state_dir = config.state_dir().as_path().to_path_buf();
         Ok(Self {
             daemon,

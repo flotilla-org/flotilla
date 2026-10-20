@@ -2025,6 +2025,7 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-capability-contract",
+ "flotilla-cbor",
  "flotilla-change-request",
  "flotilla-charter",
  "flotilla-client",

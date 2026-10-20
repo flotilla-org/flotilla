@@ -5723,7 +5723,7 @@ async fn failed_connection_tasks_are_reaped() {
     assert!(tasks.is_empty());
 }
 
-async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
+pub(super) async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     let (_tmp, daemon) = empty_daemon().await;
     let backend = daemon.resource_backend();
     let convoys = backend.using::<Convoy>("flotilla");

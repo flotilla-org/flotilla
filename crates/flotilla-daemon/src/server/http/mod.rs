@@ -9,6 +9,7 @@ mod auth;
 #[cfg(test)]
 mod hook_tests;
 mod hooks;
+mod commands;
 mod login;
 mod resource_api;
 mod tcp;
@@ -52,6 +53,8 @@ pub(in crate::server) const LOGOUT_PATH: &str = "/logout";
 #[derive(bon::Builder)]
 pub(in crate::server) struct HttpRouter {
     backend: ResourceBackend,
+    #[builder(skip)]
+    commands: Option<commands::Commands>,
     daemon: Option<Arc<InProcessDaemon>>,
     /// Where hook routes record agent state; without it they answer 503.
     agent_state_store: Option<flotilla_agent::SharedAgentStateStore>,
@@ -95,11 +98,22 @@ impl HttpRouter {
         Self {
             backend: daemon.resource_backend(),
             agent_state_store: Some(Arc::clone(daemon.agent_state_store())),
+            commands: None,
             daemon: Some(daemon),
             logins,
             tcp_origin,
             change_stream_deadline: super::change_stream::CONSUMER_DEADLINE,
         }
+    }
+
+    pub(in crate::server) fn with_commands(
+        mut self,
+        router: super::remote_commands::RemoteCommandRouter,
+        shutdown: tokio::sync::mpsc::UnboundedSender<()>,
+        socket_path: std::path::PathBuf,
+    ) -> Self {
+        self.commands = Some(commands::Commands::new(router, shutdown, socket_path));
+        self
     }
 
     pub(in crate::server) fn into_router(self) -> Router {
@@ -109,6 +123,16 @@ impl HttpRouter {
             .route(LOGIN_PATH, get(login))
             .route(LOGOUT_PATH, post(logout))
             .route(hooks::CLAUDE_CODE_HOOK_ROUTE, post(hooks::claude_code))
+            .route("/v1/commands", axum::routing::any(commands::handle))
+            .route("/v1/commands/{id}", axum::routing::any(commands::handle))
+            .route("/v1/status", axum::routing::any(commands::handle))
+            .route("/v1/topology", axum::routing::any(commands::handle))
+            .route("/v1/repos", axum::routing::any(commands::handle))
+            .route("/v1/repos/refresh", axum::routing::any(commands::handle))
+            .route("/v1/artifacts", axum::routing::any(commands::handle))
+            .route("/v1/artifacts/content", axum::routing::any(commands::handle))
+            .route("/v1/shutdown", axum::routing::any(commands::handle))
+            .route("/v1/events/replay", axum::routing::any(commands::handle))
             .fallback(resource_api)
             .with_state(RouterState(Arc::new(self)))
             .layer(middleware::from_fn(caller_from_listener))
