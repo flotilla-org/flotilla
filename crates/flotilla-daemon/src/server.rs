@@ -575,7 +575,7 @@ impl DaemonServer {
             Some(listen) => {
                 let listener = http::TcpListener::bind(listen, &self.state_dir, Arc::clone(&self.logins)).await?;
                 self.tcp_origin.set(listener.origin().to_owned());
-                self.hook_endpoint.set(listener.origin(), listener.hook_key().clone());
+                self.hook_endpoint.publish(&listener);
                 Some(listener)
             }
             None => None,

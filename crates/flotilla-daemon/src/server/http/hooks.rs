@@ -14,6 +14,11 @@
 //! under the old one is refused, and crews relaunched afterwards get new tokens. Running
 //! crews' hooks fail (non-blocking, so the agent continues) until they relaunch.
 //!
+//! The hook URL is fixed into each crew's settings at launch, so the endpoint exists only
+//! when the listen address names a fixed, non-zero port; with port 0 every start binds a
+//! different port, and launches keep command hooks. Changing the configured port (and
+//! restarting) strands running host-direct crews' hooks the same way until they relaunch.
+//!
 //! Claude Code reports a refused or unreachable HTTP hook as a non-blocking error and has
 //! no fallback to command hooks. A settings policy that restricts HTTP hook URLs (such as
 //! `allowedHttpHookUrls`) must admit the listener's origin, or those sessions' hook-driven
@@ -39,7 +44,7 @@ use flotilla_protocol::{AgentHarness, AgentHookEvent, AgentHookTerminalRef};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use super::{auth, CallerAuth, RouterState};
+use super::{auth, tcp::TcpListener, CallerAuth, RouterState};
 use crate::server::request_dispatch::{handle_agent_hook, HookIdentityPolicy};
 
 /// The hook routes' prefix; a harness and event follow.
@@ -178,6 +183,17 @@ impl std::fmt::Debug for HookEndpoint {
 }
 
 impl HookEndpoint {
+    /// Serve hooks on `listener` when its configured port is fixed. A port-0 listener
+    /// binds a different port at each start, so a hook URL fixed into a crew's settings
+    /// would go dead at the next restart; without an endpoint, launches keep command hooks.
+    pub(in crate::server) fn publish(&self, listener: &TcpListener) {
+        if listener.has_fixed_port() {
+            self.set(listener.origin(), listener.hook_key().clone());
+        } else {
+            tracing::info!(origin = listener.origin(), "HTTP listen port is 0, so host-direct Claude Code crews keep command hooks");
+        }
+    }
+
     pub(in crate::server) fn set(&self, origin: &str, key: HookKey) {
         let _ = self.0.set((origin.trim_end_matches('/').to_owned(), key));
     }
