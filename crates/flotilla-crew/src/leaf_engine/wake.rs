@@ -486,6 +486,7 @@ impl ReconcilerWake {
                 }
                 // Without an exit declaration this convoy is standing: its
                 // roles never owe settlement claims, even after assignment.
+                // A missing workflow snapshot likewise declares no exit.
                 if status.workflow_snapshot.as_ref().and_then(|snapshot| snapshot.exit.as_ref()).is_some() {
                     for (vessel, crew) in &status.crew_work {
                         for (role, work) in crew {

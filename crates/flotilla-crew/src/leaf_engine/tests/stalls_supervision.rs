@@ -1835,3 +1835,32 @@ fn settlement_claim_arming_respects_exit_and_pending_promises(tc: hegel::TestCas
         }
     });
 }
+
+// #3572: explicit stalls do not make standing roles owe settlement claims.
+// A missing workflow snapshot also declares no exit and must remain exempt.
+#[tokio::test]
+async fn standing_stalled_and_snapshot_less_roles_have_no_settlement_obligation() {
+    // Glue: pin the two no-exit representations and the explicit-stall branch
+    // through the same in-memory subscription derivation as the property above.
+    for (phase, missing_snapshot) in [(CrewWorkPhase::Stalled, false), (CrewWorkPhase::Working, true), (CrewWorkPhase::Stalled, true)] {
+        let (backend, wake, _) = idle_nudge_scenario().await;
+        update_convoy(&backend, "stalled-work", |status| {
+            if missing_snapshot {
+                status.workflow_snapshot = None;
+            } else {
+                status.workflow_snapshot.as_mut().expect("workflow").exit = None;
+            }
+            let work = status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap();
+            work.phase = phase;
+            work.task_assigned = true;
+        })
+        .await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.unwrap())]);
+        wake.sync_rows("flotilla", &objects).await.expect("sync");
+        assert!(
+            wake.subscriptions.inner.rows.lock().await.values().all(|row| !matches!(row.maker, LeafMaker::Actor { .. })),
+            "phase={phase:?}, missing_snapshot={missing_snapshot}"
+        );
+    }
+}
