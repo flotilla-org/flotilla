@@ -1,25 +1,36 @@
 //! `flotilla web`: browser access to the daemon's loopback HTTP listener (ADR 0065).
 
+#[cfg(unix)]
 use std::{path::Path, time::Duration};
 
 use color_eyre::{eyre::eyre, Result};
 use flotilla_cli::cli::args::{Cli, WebSubCommand};
 
 /// The router path that mints one-time login codes; only the main Unix socket may call it.
+#[cfg(unix)]
 const LOGIN_CODES_PATH: &str = "/v1/web/login-codes";
+#[cfg(unix)]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) async fn run_web_command(cli: &Cli, command: WebSubCommand) -> Result<()> {
     match command {
         WebSubCommand::Login => {
             cli.require_local_daemon("web login")?;
-            println!("{}", mint_login_url(&cli.socket_path()).await?);
-            Ok(())
+            #[cfg(unix)]
+            {
+                println!("{}", mint_login_url(&cli.socket_path()).await?);
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                Err(eyre!("web login mints its code over a local Unix daemon socket, which this platform does not host"))
+            }
         }
     }
 }
 
 /// Ask the daemon over its Unix socket for a one-time login URL on its HTTP listener.
+#[cfg(unix)]
 async fn mint_login_url(socket: &Path) -> Result<String> {
     let client = rigging_tls::client_builder()
         .unix_socket(socket)
