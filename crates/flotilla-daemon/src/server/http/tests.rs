@@ -249,6 +249,8 @@ async fn login_code_is_single_use_and_expires() {
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
     assert_eq!(reply.headers[header::LOCATION], "/");
     assert_eq!(reply.headers[header::CACHE_CONTROL], "no-store");
+    // The code never leaves the login request: no referrer, and the redirect names only `/`.
+    assert_eq!(reply.headers[header::REFERRER_POLICY], "no-referrer");
     let cookie = reply.headers[header::SET_COOKIE].to_str().expect("cookie");
     let (pair, attributes) = cookie.split_once("; ").expect("cookie attributes");
     assert!(pair.strip_prefix("flotilla_session=").is_some_and(|value| value.len() == 64 && value != login), "{cookie}");

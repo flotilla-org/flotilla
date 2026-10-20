@@ -87,6 +87,8 @@ impl LoginStore {
                 let id = SessionId(state.next_session);
                 state.next_session += 1;
                 state.sessions.retain(|_, (_, expiry)| *expiry > now);
+                // Ids follow creation order and lifetimes are absolute, so the lowest id is the
+                // session that expires first. A sliding lifetime would need eviction by expiry.
                 if state.sessions.len() >= SESSION_LIMIT {
                     if let Some(oldest) = state.sessions.iter().min_by_key(|(_, (id, _))| id.0).map(|(digest, _)| *digest) {
                         state.sessions.remove(&oldest);
