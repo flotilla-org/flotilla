@@ -1659,7 +1659,7 @@ async fn claim_less_working_crew_stalls_with_actor_evidence() {
     }
 }
 
-// Launching a claim-less standing role makes it Working, but does not assign
+// Launching a claim-less role makes it Working, but does not assign
 // a task. Even repeated idle observations beyond grace must create no actor row.
 #[tokio::test]
 async fn freshly_launched_claim_less_role_stays_unjudged() {
@@ -1769,4 +1769,69 @@ async fn resumed_explicit_stall_without_claim_still_owes_a_report() {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
     }
     assert!(convoys.get("stalled-work").await.unwrap().status.unwrap().stalled.is_some());
+}
+
+// #3572: standing convoys never owe settlement claims. For ordinary convoys,
+// terminal promises alone owe nothing; tasks and completion conditions still do.
+#[hegel::test]
+fn settlement_claim_arming_respects_exit_and_pending_promises(tc: hegel::TestCase) {
+    use flotilla_resources::promises::{Promise, PromiseKind, PromiseSource, PromiseState};
+    use hegel::generators as gs;
+    // Generate duplicate promise counts, including an empty history. Pin every
+    // state and obligation combination so each eligibility boundary is exercised.
+    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        for standing in [false, true] {
+            for state in [PromiseState::Open, PromiseState::Submitted, PromiseState::Kept, PromiseState::Retracted] {
+                for (task, completion) in [(false, false), (true, false), (false, true)] {
+                    let (backend, wake, delivery) = idle_nudge_scenario().await;
+                    update_convoy(&backend, "stalled-work", |status| {
+                        let snapshot = status.workflow_snapshot.as_mut().expect("workflow");
+                        snapshot.exit = if standing { None } else { Some(ExitDeclaration::standard_table()) };
+                        let member = &mut snapshot.vessels[0].crew[0];
+                        member.promises.clear();
+                        if !completion {
+                            member.completion_conditions.clear();
+                        }
+                        status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().task_assigned = task;
+                        status.promises.entry("work".into()).or_default().insert(
+                            "coder".into(),
+                            (0..count)
+                                .map(|i| Promise {
+                                    id: format!("pr-{i}"),
+                                    vessel: "work".into(),
+                                    role: "coder".into(),
+                                    source: PromiseSource::Crew,
+                                    kind: PromiseKind::Pr,
+                                    state,
+                                    retraction_reason: None,
+                                    submissions: Vec::new(),
+                                })
+                                .collect(),
+                        );
+                    })
+                    .await;
+                    let convoys = backend.using::<Convoy>("flotilla");
+                    let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.unwrap())]);
+                    wake.sync_rows("flotilla", &objects).await.expect("sync");
+                    let expected =
+                        !standing && (task || completion || (count > 0 && matches!(state, PromiseState::Open | PromiseState::Submitted)));
+                    let armed = wake.subscriptions.inner.rows.lock().await.values().any(|row| matches!(row.maker, LeafMaker::Actor { .. }));
+                    assert_eq!(
+                        armed, expected,
+                        "standing={standing}, state={state:?}, count={count}, task={task}, completion={completion}"
+                    );
+                    if !expected {
+                        let now = Utc::now();
+                        for second in [0, 60, 120, 1800] {
+                            observe_actor(&backend, &wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
+                        }
+                        assert!(delivery.requests.lock().unwrap().is_empty(), "no settlement nudge without an obligation");
+                        assert!(convoys.get("stalled-work").await.unwrap().status.unwrap().stalled.is_none());
+                    }
+                }
+            }
+        }
+    });
 }

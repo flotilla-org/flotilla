@@ -266,7 +266,7 @@ async fn project_supervision_case(governors: &[(&str, u64, ConvoyPhase)]) -> (Re
                     cascade: None,
                     stall_nudges: Default::default(),
                     supervision: None,
-                    exit: None,
+                    exit: Some(ExitDeclaration::standard_table()),
                     turn_delivery: Default::default(),
                     vessels: vec![flotilla_resources::VesselRequirement::builder()
                         .name("work".into())

@@ -485,8 +485,13 @@ impl ReconcilerWake {
                     }
                 }
                 for (vessel, crew) in &status.crew_work {
+                    // Without an exit declaration this convoy is standing: its
+                    // roles never owe settlement claims, even after assignment.
+                    if status.workflow_snapshot.as_ref().and_then(|snapshot| snapshot.exit.as_ref()).is_none() {
+                        continue;
+                    }
                     for (role, work) in crew {
-                        let owes_promise = !flotilla_resources::promises::owned(status, vessel, role).is_empty();
+                        let owes_promise = !flotilla_resources::promises::pending(status, vessel, role).is_empty();
                         let owes_claim = owes_promise
                             || status.workflow_snapshot.as_ref().is_some_and(|snapshot| {
                                 snapshot.vessels.iter().any(|requirement| {
