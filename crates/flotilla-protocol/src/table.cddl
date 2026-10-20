@@ -1,0 +1,13 @@
+; ADR 0067, shared by HTTP and surface carriers. CBOR sequence: * message.
+message = table / rows / synced / upsert / delete / progress / resync / count
+row = {* tstr => any}
+key = [* any] ; canonical deterministic CBOR tuple; natural keys only
+schema = {fields: [* {* tstr => any}], primaryKey: [* tstr], * tstr => any}
+table = {type: "table", table: tstr, schema: schema, incarnation: tstr, sequence: uint}
+rows = {type: "rows", rows: [* row], sequence: uint, partial: bool, cursor: tstr / null}
+synced = {type: "synced", sequence: uint}
+upsert = {type: "upsert", key: key, row: row, sequence: uint}
+delete = {type: "delete", key: key, sequence: uint}
+progress = {type: "progress", sequence: uint}
+resync = {type: "resync", reason: tstr}
+count = {type: "count", count: uint, estimate: bool, sequence: uint}

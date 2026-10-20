@@ -73,6 +73,7 @@ impl Layout {
     /// Starts a kind: the root table is named by the snake_case kind name.
     pub fn root(kind: &str, code: KindCode) -> Layout {
         let root = Table {
+            properties: Default::default(),
             name: snake_case(kind),
             role: TableRole::Root,
             parent: None,
@@ -289,6 +290,7 @@ impl Layout {
         owner.add_role("key");
         owner.add_role("ref");
         let table = Table {
+            properties: Default::default(),
             name: Layout::join(&parent.name, field),
             role,
             parent: Some(parent_index),

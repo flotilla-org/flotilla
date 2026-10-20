@@ -131,6 +131,20 @@ struct Runtime {
 }
 
 impl Store {
+    /// Read one described table with predicates applied in SQLite. Natural identities
+    /// replace owner ids; interned strings and object bytes are resolved in the query.
+    pub fn table_read(&self, home: &str, name: &str, filters: &[crate::TableFilter]) -> Result<crate::TableRead, StoreError> {
+        if name.ends_with(".log") {
+            crate::table_read::read_log(&self.conn, &self.runtime.kinds, home, name, filters)
+        } else {
+            crate::table_read::read(&self.conn, &self.runtime.kinds, home, name, filters)
+        }
+    }
+    /// Counts of observed state transitions, scoped to one registered kind and home.
+    pub fn observed_edges(&self, kind: &str, home: &str, name: Option<&str>) -> Result<Vec<(String, String, u64)>, StoreError> {
+        crate::table_read::observed(&self.conn, kind, home, name)
+    }
+
     pub fn open(conn: Connection, home: &str, kinds: KindRegistry) -> Result<Store, StoreError> {
         Store::open_with(conn, home, kinds, StoreOptions::default())
     }

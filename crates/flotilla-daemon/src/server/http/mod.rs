@@ -7,11 +7,15 @@
 
 mod auth;
 mod commands;
+mod derived_tables;
 #[cfg(test)]
 mod hook_tests;
 mod hooks;
 mod login;
 mod resource_api;
+mod table_api;
+#[cfg(test)]
+mod table_tests;
 mod tcp;
 #[cfg(test)]
 mod tests;
@@ -58,6 +62,7 @@ pub(in crate::server) struct HttpRouter {
     daemon: Option<Arc<InProcessDaemon>>,
     /// Where hook routes record agent state; without it they answer 503.
     agent_state_store: Option<flotilla_agent::SharedAgentStateStore>,
+    table_store: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
     logins: Arc<LoginStore>,
     /// The TCP listener's origin, for login URLs; unset when no TCP listener is declared.
     #[builder(default)]
@@ -100,6 +105,7 @@ impl HttpRouter {
             agent_state_store: Some(Arc::clone(daemon.agent_state_store())),
             commands: None,
             daemon: Some(daemon),
+            table_store: None,
             logins,
             tcp_origin,
             change_stream_deadline: super::change_stream::CONSUMER_DEADLINE,
@@ -255,6 +261,19 @@ async fn resource_api(
         return refused;
     }
     let target = request.uri().path_and_query().map_or_else(|| request.uri().path().to_owned(), |target| target.as_str().to_owned());
+    if request.uri().path() == "/tables" || request.uri().path().starts_with("/tables/") {
+        if request.method() != axum::http::Method::GET {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let accept = request.headers().get(header::ACCEPT).and_then(|value| value.to_str().ok()).unwrap_or("");
+        return table_api::respond(
+            &target,
+            accept,
+            state.backend.clone(),
+            state.table_store.clone().or_else(|| state.daemon.as_ref().and_then(|daemon| daemon.decided_store().ok())),
+        )
+        .await;
+    }
     let reply = resource_api::respond(request.method().as_str(), &target, state.backend.clone(), state.daemon.as_ref()).await;
     render(reply, state.change_stream_deadline).await
 }

@@ -448,6 +448,7 @@ mod tests {
                     edges: vec![],
                     edge_names: vec![],
                     tables: vec![flotilla_schema::Table {
+                        properties: Default::default(),
                         name: "test_record".into(),
                         role: flotilla_schema::TableRole::Root,
                         parent: None,

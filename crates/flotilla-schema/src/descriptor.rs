@@ -79,6 +79,8 @@ pub enum TableRole {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Table {
+    /// Semantic extensions, keyed by field name (roles, units, titles and query capabilities).
+    pub properties: std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
     pub name: String,
     pub role: TableRole,
     pub parent: Option<usize>,

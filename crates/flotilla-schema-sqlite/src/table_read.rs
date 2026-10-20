@@ -1,0 +1,197 @@
+//! Natural-value reads for self-describing tables. The SQL boundary validates every
+//! identifier and comparison before preparing a statement, and applies all predicates.
+use crate::StoreError;
+use flotilla_schema::{quote_ident, ColumnDef, ColumnType, KindRegistry, Table, Value};
+use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
+use std::collections::BTreeMap;
+
+pub struct TableRead {
+    pub descriptor: Table,
+    pub rows: Vec<BTreeMap<String, Value>>,
+    pub sequence: u64,
+}
+/// A comparison on a described field. Values remain logical, never store-local ids.
+pub struct TableFilter {
+    pub field: String,
+    pub operator: String,
+    pub value: Value,
+}
+
+pub(crate) fn read(
+    conn: &Connection,
+    kinds: &KindRegistry,
+    home: &str,
+    name: &str,
+    filters: &[TableFilter],
+) -> Result<TableRead, StoreError> {
+    let set = kinds
+        .iter()
+        .find(|set| set.tables.iter().any(|table| table.name == name))
+        .ok_or_else(|| StoreError::Stream("unknown table".into()))?;
+    let source = set.tables.iter().find(|table| table.name == name).expect("table found");
+    let mut table = source.clone();
+    let mut key = vec![
+        ColumnDef { name: "resource.home".into(), ty: ColumnType::Text, nullable: false },
+        ColumnDef { name: "resource.name".into(), ty: ColumnType::Text, nullable: false },
+    ];
+    key.extend(table.key.clone());
+    table.key = key;
+    table.own_key += 2;
+    let owner = if source.parent.is_none() { "id" } else { "owner" };
+    let mut expressions = vec![
+        "(SELECT s FROM strings WHERE id=i.home) AS \"resource.home\"".into(),
+        "(SELECT s FROM strings WHERE id=i.name) AS \"resource.name\"".into(),
+    ];
+    for column in source.key.iter().chain(&source.columns) {
+        let value = format!("t.{}", quote_ident(&column.name));
+        let expression = match column.ty {
+            ColumnType::Interned(_) => format!("(SELECT s FROM strings WHERE id={value})"),
+            ColumnType::Ref => format!("(SELECT s FROM strings WHERE id=(SELECT name FROM resource_identity WHERE id={value}))"),
+            ColumnType::Frozen => format!("(SELECT bytes FROM objects WHERE hash={value})"),
+            _ => value,
+        };
+        expressions.push(format!("{expression} AS {}", quote_ident(&column.name)));
+    }
+    let base = format!(
+        "SELECT {} FROM {} t JOIN resource_identity i ON i.id=t.{} WHERE i.home=(SELECT id FROM strings WHERE domain=? AND s=?)",
+        expressions.join(","),
+        quote_ident(name),
+        quote_ident(owner)
+    );
+    let columns: Vec<_> = table.key.iter().chain(&table.columns).collect();
+    let mut arguments = vec![SqlValue::Text(flotilla_schema::HOME_DOMAIN.to_string()), SqlValue::Text(home.into())];
+    let mut clauses = vec![];
+    for filter in filters {
+        let column =
+            columns.iter().find(|column| column.name == filter.field).ok_or_else(|| StoreError::Stream("unknown filter field".into()))?;
+        if !["==", "!=", "<", "<=", ">", ">="].contains(&filter.operator.as_str())
+            || matches!(column.ty, ColumnType::Frozen | ColumnType::Cbor | ColumnType::Blob)
+        {
+            return Err(StoreError::Stream("unsupported filter".into()));
+        }
+        let valid = match (&column.ty, &filter.value) {
+            (_, Value::Null) => column.nullable,
+            (ColumnType::Integer | ColumnType::Timestamp, Value::Int(_)) => true,
+            (ColumnType::Bool, Value::Int(value)) => matches!(value, 0 | 1),
+            (ColumnType::Text | ColumnType::Interned(_) | ColumnType::Ref, Value::Text(_) | Value::Str(_)) => true,
+            (ColumnType::Code(codes), Value::Text(value)) => codes.iter().any(|code| code.as_str() == value),
+            _ => false,
+        };
+        if !valid {
+            return Err(StoreError::Stream("filter type mismatch".into()));
+        }
+        let value = match &filter.value {
+            Value::Null => SqlValue::Null,
+            Value::Int(value) => SqlValue::Integer(*value),
+            Value::Text(value) | Value::Str(value) => SqlValue::Text(value.clone()),
+            _ => return Err(StoreError::Stream("filter type mismatch".into())),
+        };
+        let operator = if matches!(filter.value, Value::Null) {
+            match filter.operator.as_str() {
+                "==" => "IS",
+                "!=" => "IS NOT",
+                _ => return Err(StoreError::Stream("unsupported null comparison".into())),
+            }
+        } else {
+            &filter.operator
+        };
+        clauses.push(format!("{} {} ?", quote_ident(&filter.field), operator));
+        arguments.push(value);
+    }
+    let sql =
+        format!("SELECT * FROM ({base}){}", if clauses.is_empty() { String::new() } else { format!(" WHERE {}", clauses.join(" AND ")) });
+    let tx = conn.unchecked_transaction()?;
+    let sequence = tx.query_row(
+        "SELECT coalesce((SELECT last FROM home_sequence WHERE home=(SELECT id FROM strings WHERE domain=? AND s=?)),0)",
+        [flotilla_schema::HOME_DOMAIN.as_str(), home],
+        |row| row.get(0),
+    )?;
+    let rows = {
+        let mut statement = tx.prepare(&sql)?;
+        let mapped = statement.query_map(params_from_iter(arguments), |row| {
+            columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    let value = match row.get::<_, SqlValue>(index)? {
+                        SqlValue::Null => Value::Null,
+                        SqlValue::Integer(value) => Value::Int(value),
+                        SqlValue::Text(value) => Value::Text(value),
+                        SqlValue::Blob(value) => Value::Blob(value),
+                        SqlValue::Real(_) => return Err(rusqlite::Error::InvalidQuery),
+                    };
+                    Ok((column.name.clone(), value))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()
+        })?;
+        mapped.collect::<Result<Vec<_>, _>>()?
+    };
+    tx.commit()?;
+    Ok(TableRead { descriptor: table, rows, sequence })
+}
+
+pub(crate) fn observed(conn: &Connection, kind: &str, home: &str, name: Option<&str>) -> Result<Vec<(String, String, u64)>, StoreError> {
+    let mut statement=conn.prepare("SELECT v.\"from\",v.\"to\",count(*) FROM log_view v WHERE v.kind=? AND v.home=? AND v.cause='edge' AND (? IS NULL OR v.name=?) GROUP BY v.\"from\",v.\"to\"")?;
+    let edges = statement
+        .query_map(rusqlite::params![kind, home, name, name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(edges)
+}
+
+pub(crate) fn read_log(
+    conn: &Connection,
+    kinds: &KindRegistry,
+    home: &str,
+    name: &str,
+    filters: &[TableFilter],
+) -> Result<TableRead, StoreError> {
+    let root = name.strip_suffix(".log").ok_or_else(|| StoreError::Stream("unknown log table".into()))?;
+    let set = kinds.iter().find(|set| set.tables[0].name == root).ok_or_else(|| StoreError::Stream("unknown log kind".into()))?;
+    let descriptor = set.log_table();
+    let mut clauses = vec!["kind=?".to_owned(), "home=?".to_owned()];
+    let mut values = vec![SqlValue::Text(set.code.to_string()), SqlValue::Text(home.into())];
+    for filter in filters {
+        if !descriptor.key.iter().chain(&descriptor.columns).any(|column| column.name == filter.field)
+            || !["==", "!=", "<", "<=", ">", ">="].contains(&filter.operator.as_str())
+        {
+            return Err(StoreError::Stream("unsupported log filter".into()));
+        }
+        let field = if filter.field == "sequence" { "home_seq" } else { &filter.field };
+        clauses.push(format!("{} {} ?", quote_ident(field), filter.operator));
+        values.push(match &filter.value {
+            Value::Text(value) => SqlValue::Text(value.clone()),
+            Value::Int(value) => SqlValue::Integer(*value),
+            _ => return Err(StoreError::Stream("log filter type mismatch".into())),
+        });
+    }
+    let tx = conn.unchecked_transaction()?;
+    let sequence = tx.query_row(
+        "SELECT coalesce((SELECT last FROM home_sequence WHERE home=(SELECT id FROM strings WHERE domain=? AND s=?)),0)",
+        [flotilla_schema::HOME_DOMAIN.as_str(), home],
+        |row| row.get(0),
+    )?;
+    let rows = {
+        let sql = format!("SELECT home,home_seq,name,cause,edge,\"from\",\"to\",at FROM log_view WHERE {}", clauses.join(" AND "));
+        let mut statement = tx.prepare(&sql)?;
+        let mapped = statement.query_map(params_from_iter(values), |row| {
+            descriptor
+                .key
+                .iter()
+                .chain(&descriptor.columns)
+                .enumerate()
+                .map(|(index, column)| {
+                    let value = match row.get::<_, SqlValue>(index)? {
+                        SqlValue::Null => Value::Null,
+                        SqlValue::Text(value) => Value::Text(value),
+                        SqlValue::Integer(value) => Value::Int(value),
+                        _ => return Err(rusqlite::Error::InvalidQuery),
+                    };
+                    Ok((column.name.clone(), value))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()
+        })?;
+        mapped.collect::<Result<Vec<_>, _>>()?
+    };
+    tx.commit()?;
+    Ok(TableRead { descriptor, rows, sequence })
+}
