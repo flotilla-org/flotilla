@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use serde::{Deserialize, Serialize};
@@ -138,13 +138,13 @@ impl TransportRouter {
     /// refused by the session's running build.
     pub fn candidates(&self, operation: Operation, target: &DeliveryTarget) -> Vec<TransportId> {
         let policy = self.config.operations.get(&operation);
-        let refused = self.unsupported.lock().expect("unsupported transports lock poisoned");
+        let refused = self.refused();
         let mut offered: Vec<TransportId> = Vec::new();
         for offer in self.declaration(operation, target).transports {
             let live = target.live_shapes.as_ref().is_none_or(|shapes| shapes.contains(&offer.shape));
             let registered = self.transport(&offer.transport).is_some();
             let denied = policy.is_some_and(|policy| policy.deny.contains(&offer.transport));
-            let unsupported = target.session.as_ref().is_some_and(|session| refused.contains(&(session.clone(), offer.transport.clone())));
+            let unsupported = session_key(target, None).is_some_and(|session| refused.contains(&(session, offer.transport.clone())));
             if live && registered && !denied && !unsupported && !offered.contains(&offer.transport) {
                 offered.push(offer.transport);
             }
@@ -185,11 +185,13 @@ impl TransportRouter {
             attempt.submission.transport = Some(id.clone());
             let reason = match transport.submit(&attempt).await {
                 TransportOutcome::Unsupported { reason } => {
-                    let mut refused = self.unsupported.lock().expect("unsupported transports lock poisoned");
+                    let mut refused = self.refused();
                     if refused.len() >= UNSUPPORTED_MEMORY {
                         refused.clear();
                     }
-                    refused.insert((delivery.submission.session.clone(), id.clone()));
+                    if let Some(session) = session_key(&delivery.target, Some(&delivery.submission)) {
+                        refused.insert((session, id.clone()));
+                    }
                     reason
                 }
                 TransportOutcome::NotSubmitted { reason } => reason,
@@ -244,6 +246,12 @@ impl TransportRouter {
         }
     }
 
+    /// The refused set survives a poisoning panic: its entries are plain
+    /// values, and losing delivery over them would be worse than reading them.
+    fn refused(&self) -> MutexGuard<'_, BTreeSet<(String, TransportId)>> {
+        self.unsupported.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn transport(&self, id: &TransportId) -> Option<&Arc<dyn AgentTransport>> {
         self.transports.iter().find(|transport| transport.id() == *id)
     }
@@ -258,4 +266,10 @@ impl TransportRouter {
             None => self.primary(delivery.operation, &delivery.target),
         }
     }
+}
+
+/// The session a refusal is remembered under: the target's live session, the
+/// one `candidates` filters on, else the recorded submission's.
+fn session_key(target: &DeliveryTarget, submission: Option<&SubmissionRef>) -> Option<String> {
+    target.session.clone().or_else(|| submission.map(|submission| submission.session.clone()))
 }

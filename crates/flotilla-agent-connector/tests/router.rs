@@ -338,3 +338,27 @@ fn unconfirmed_fails_over_only_when_configuration_accepts_a_repeat() {
         }
     }
 }
+
+// Behaviour: a refusal is remembered under the session `candidates` filters
+// on (the target's live session), even when the recorded submission names a
+// different one, so it takes effect on the next delivery.
+#[test]
+fn refusal_is_keyed_by_the_target_session() {
+    let calls: Calls = Default::default();
+    let router = TransportRouter::new()
+        .with_connector(
+            "harness",
+            Arc::new(Offers(vec![TransportOffer::new("keystroke-guarded", TUI_SHAPE), TransportOffer::new(KEYSTROKE, TUI_SHAPE)])),
+        )
+        .with_transport(Arc::new(ScriptedTransport {
+            id: "keystroke-guarded".into(),
+            outcome: TransportOutcome::Unsupported { reason: "old build".into() },
+            calls: calls.clone(),
+        }))
+        .with_transport(Arc::new(ScriptedTransport { id: KEYSTROKE.into(), outcome: TransportOutcome::Pending, calls: calls.clone() }));
+    let mut first = delivery("live", "one");
+    first.submission.session = "recorded".into();
+    block_on(router.submit(&first));
+    assert_eq!(router.candidates(Operation::NewTurn, &target("live")), [TransportId::new(KEYSTROKE)]);
+    assert_eq!(router.candidates(Operation::NewTurn, &target("other")).len(), 2);
+}
