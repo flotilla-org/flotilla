@@ -14,7 +14,7 @@
 
 use crate::{
     code::Code,
-    descriptor::{CodeNames, ColumnDef, ColumnType, Expansion, FieldColumns, Guard, Index, Table, TableRole, TableSet, When},
+    descriptor::{ColumnDef, ColumnType, Expansion, FieldColumns, Guard, Index, Table, TableRole, TableSet, When},
     value::KindCode,
 };
 
@@ -80,13 +80,20 @@ impl Layout {
             key: Vec::new(),
             own_key: 0,
             columns: Vec::new(),
+            generated: Vec::new(),
             guards: Vec::new(),
             enums: Vec::new(),
-            codes: Vec::new(),
             fields: Vec::new(),
             field_aliases: Vec::new(),
             aliases: Vec::new(),
         };
+        let mut id = ColumnDef::new("id", ColumnType::Ref, false);
+        id.reference = Some("resource_identity".into());
+        id.add_role("key");
+        id.add_role("ref");
+        let mut version = ColumnDef::new("version", ColumnType::Integer, false);
+        version.add_role("sequence");
+        let root = Table { generated: vec![id, version], ..root };
         Layout {
             set: TableSet {
                 kind: kind.to_owned(),
@@ -98,6 +105,13 @@ impl Layout {
             },
             frames: vec![Frame::new(0)],
         }
+    }
+
+    /// Starts a table description without any columns or identity supplied by a store.
+    pub fn description(name: &str) -> Layout {
+        let mut layout = Self::root(name, KindCode::new("query"));
+        layout.set.tables[0].generated.clear();
+        layout
     }
 
     /// Joins a column prefix and a field name with `_`; either may be empty.
@@ -122,7 +136,16 @@ impl Layout {
         let table = &mut self.set.tables[frame.table];
         table.aliases.extend(frame.old_names(name).into_iter().map(|old| (old, name.to_owned())));
         if frame.key_mode {
-            table.key.push(ColumnDef { name: name.to_owned(), ty, nullable: false });
+            let mut column = ColumnDef::new(name, ty, false);
+            column.add_role("key");
+            if column.ty == ColumnType::Ref {
+                column.add_role("ref");
+                column.reference = Some("resource_identity".into());
+            }
+            if column.ty == ColumnType::Timestamp {
+                column.add_role("time");
+            }
+            table.key.push(column);
             table.own_key += 1;
             return;
         }
@@ -136,18 +159,49 @@ impl Layout {
             }
             None => !required,
         };
-        table.columns.push(ColumnDef { name: name.to_owned(), ty, nullable });
+        let mut column = ColumnDef::new(name, ty, nullable);
+        match column.ty {
+            ColumnType::Ref => {
+                column.add_role("ref");
+                column.reference = Some("resource_identity".into());
+            }
+            ColumnType::Timestamp => column.add_role("time"),
+            _ => {}
+        }
+        table.columns.push(column);
     }
 
     /// Declares a code column: `codes` and the variants' Rust `names`, in the same order, become its
     /// CHECK and its rows of the `codes` table.
     pub fn code(&mut self, name: &str, codes: &[Code], names: &[&str], required: bool) {
         debug_assert_eq!(codes.len(), names.len(), "one name per code");
-        let column = if name.is_empty() { "value" } else { name };
-        let table = self.frames.last().expect("layout has a current table").table;
-        let names = codes.iter().zip(names).map(|(code, name)| (*code, (*name).to_owned())).collect();
-        self.set.tables[table].codes.push(CodeNames { column: column.to_owned(), names });
-        self.column(name, ColumnType::Code(codes.to_vec()), required);
+        self.categories(name, codes.iter().zip(names).map(|(code, name)| (code.to_string(), (*name).to_owned())).collect(), required);
+    }
+
+    /// Declares an enum, including non-storage sources whose values are not short storage codes.
+    pub fn categories(&mut self, name: &str, categories: Vec<(String, String)>, required: bool) {
+        self.column(name, ColumnType::Code(categories.iter().map(|(code, _)| code.clone()).collect()), required);
+        self.last_column().categories = categories;
+    }
+
+    fn last_column(&mut self) -> &mut ColumnDef {
+        let frame = self.frames.last().expect("current table");
+        let table = &mut self.set.tables[frame.table];
+        if frame.key_mode { table.key.last_mut() } else { table.columns.last_mut() }.expect("column declared")
+    }
+
+    /// Adds an open semantic field property to the column just declared.
+    pub fn property(&mut self, name: &str, value: serde_json::Value) {
+        self.last_column().properties.insert(name.into(), value);
+    }
+
+    /// Adds meaning at the point that generates a column, never by matching its name.
+    pub fn role(&mut self, role: &str) {
+        self.last_column().add_role(role);
+    }
+
+    pub fn reference(&mut self, table: &str) {
+        self.last_column().reference = Some(table.into());
     }
 
     /// Declares the current table's own key: columns declared inside `f` become key columns.
@@ -188,6 +242,11 @@ impl Layout {
         if scope.columns.is_empty() {
             return;
         }
+        // A query can contain an optional struct with only optional fields. Description
+        // has no codec needing to distinguish absent from present-but-empty in that case.
+        if scope.required.is_empty() && self.set.tables[0].generated.is_empty() {
+            return;
+        }
         let first = scope.required.first().cloned().unwrap_or_else(|| {
             panic!("an optional value needs a required column to mark its presence; its columns are {:?}", scope.columns)
         });
@@ -220,9 +279,13 @@ impl Layout {
             .enumerate()
             .map(|(position, column)| {
                 let name = if position < inherited { column.name.clone() } else { Layout::join(&parent.field, &column.name) };
-                ColumnDef { name, ty: column.ty.clone(), nullable: false }
+                ColumnDef { name, ..column.clone() }
             })
             .collect();
+        let mut owner = ColumnDef::new("owner", ColumnType::Ref, false);
+        owner.reference = Some(self.set.tables[0].name.clone());
+        owner.add_role("key");
+        owner.add_role("ref");
         let table = Table {
             name: Layout::join(&parent.name, field),
             role,
@@ -231,9 +294,9 @@ impl Layout {
             key,
             own_key: 0,
             columns: Vec::new(),
+            generated: if self.set.tables[0].generated.is_empty() { Vec::new() } else { vec![owner] },
             guards: Vec::new(),
             enums: Vec::new(),
-            codes: Vec::new(),
             fields: Vec::new(),
             field_aliases,
             aliases: Vec::new(),
@@ -319,7 +382,7 @@ impl Layout {
     /// (the code carries it as `T`, not `Option<T>`) are non-null and every column of the other
     /// datums is null. `datums` are the datums in declaration order and `carried` holds the indexes
     /// of those this code carries. A code constraining nothing emits no CHECK.
-    pub fn tag_guard(&mut self, tag: &str, code: Code, datums: &[DatumColumns], carried: &[(usize, bool)]) {
+    pub fn tag_guard(&mut self, tag: &str, code: impl ToString, datums: &[DatumColumns], carried: &[(usize, bool)]) {
         let mut required = Vec::new();
         let mut absent = Vec::new();
         for (index, datum) in datums.iter().enumerate() {
@@ -333,7 +396,7 @@ impl Layout {
             return;
         }
         let table = self.frame().table;
-        let guard = Guard { column: tag.to_owned(), when: When::Is(code), required, absent, otherwise: Vec::new() };
+        let guard = Guard { column: tag.to_owned(), when: When::Is(code.to_string()), required, absent, otherwise: Vec::new() };
         self.set.tables[table].guards.push(guard);
     }
 
@@ -390,129 +453,4 @@ pub fn snake_case(name: &str) -> String {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{snake_case, DatumColumns, Layout};
-    use crate::{
-        code::Code,
-        descriptor::{ColumnDef, ColumnType, Guard, TableRole},
-        value::KindCode,
-    };
-
-    #[test]
-    fn kind_names_become_snake_case_tables() {
-        assert_eq!(snake_case("Message"), "message");
-        assert_eq!(snake_case("TerminalSession"), "terminal_session");
-        assert_eq!(snake_case("HTTPRoute"), "http_route");
-        assert_eq!(snake_case("ResolvedHTTP"), "resolved_http");
-        assert_eq!(snake_case("Ipv4Address"), "ipv4_address");
-        assert_eq!(snake_case("snake_already"), "snake_already");
-        assert_eq!(Layout::root("TerminalSession", KindCode::new("ts")).finish().tables[0].name, "terminal_session");
-    }
-
-    // Behaviour: an element's unnamed column is `value`, so a field named `value` beside it in
-    // the same table is a duplicate the descriptor refuses rather than a silent collision.
-    #[test]
-    fn a_field_named_like_the_element_column_is_refused() {
-        let mut layout = Layout::root("Note", KindCode::new("no"));
-        layout.table("items", TableRole::Child, |layout| {
-            layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
-            layout.column("", ColumnType::Text, true);
-            layout.column("value", ColumnType::Text, true);
-        });
-        assert!(matches!(layout.finish().validate(), Err(crate::DescriptorError::DuplicateColumn { column, .. }) if column == "value"));
-    }
-
-    // Behaviour (#3392 G5): an optional value is present when its first required column is
-    // non-null; a value of several columns gets one presence CHECK, a single column none. Inside a
-    // scope a required column is nullable, and closing a scope adds its columns (not as required)
-    // to the enclosing one, so an absent outer value nulls an inner value's columns too.
-    #[test]
-    fn optional_values_are_present_by_their_first_required_column() {
-        let mut layout = Layout::root("Edge", KindCode::new("ed"));
-        layout.optional(|layout| {
-            layout.column("hold_note", ColumnType::Text, false);
-            layout.column("hold_by", ColumnType::Text, true);
-            layout.optional(|layout| layout.column("hold_until", ColumnType::Timestamp, true));
-            layout.column("hold_at", ColumnType::Timestamp, true);
-        });
-        layout.optional(|layout| layout.column("watermark", ColumnType::Timestamp, true));
-        let set = layout.finish();
-        let root = &set.tables[0];
-        assert!(root.columns.iter().all(|column| column.nullable));
-        let checks: Vec<String> = root.guards.iter().map(Guard::check).collect();
-        assert_eq!(
-            checks,
-            ["CASE WHEN \"hold_by\" IS NOT NULL THEN \"hold_at\" IS NOT NULL \
-              ELSE \"hold_note\" IS NULL AND \"hold_until\" IS NULL AND \"hold_at\" IS NULL END"]
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "needs a required column")]
-    fn an_optional_value_without_a_required_column_is_refused() {
-        let mut layout = Layout::root("Edge", KindCode::new("ed"));
-        layout.optional(|layout| layout.column("note", ColumnType::Text, false));
-    }
-
-    // Behaviour (#3392 G5, G6): one CHECK per code of a tag column requires the data the code
-    // carries as `T` and nulls the data it lacks; data it carries as `Option<T>` is unconstrained,
-    // and a code constraining nothing emits no CHECK.
-    #[test]
-    fn tag_guards_require_carried_data_and_null_the_rest() {
-        let mut layout = Layout::root("Edge", KindCode::new("ed"));
-        let (a, b) = (Code::new("a"), Code::new("b"));
-        layout.column("tag", ColumnType::Code(vec![a, b]), true);
-        let datums = [
-            layout.scope(|layout| layout.column("tag_by", ColumnType::Text, true)),
-            layout.scope(|layout| layout.optional(|layout| layout.column("tag_at", ColumnType::Timestamp, true))),
-        ];
-        assert_eq!(datums[1], DatumColumns { columns: vec!["tag_at".into()], required: vec![] });
-        let at_required = Layout::required_of(|layout| layout.column("tag_at", ColumnType::Timestamp, true));
-        let datums = [datums[0].clone(), DatumColumns { required: at_required, ..datums[1].clone() }];
-        layout.tag_guard("tag", a, &datums, &[(0, true), (1, true)]);
-        layout.tag_guard("tag", b, &datums, &[(1, false)]);
-        layout.tag_guard("tag", Code::new("c"), &datums, &[(0, false), (1, false)]);
-        let checks: Vec<String> = layout.finish().tables[0].guards.iter().map(Guard::check).collect();
-        assert_eq!(
-            checks,
-            [
-                "CASE WHEN \"tag\" = 'a' THEN \"tag_by\" IS NOT NULL AND \"tag_at\" IS NOT NULL END",
-                "CASE WHEN \"tag\" = 'b' THEN \"tag_by\" IS NULL END",
-            ]
-        );
-    }
-
-    // Behaviour (DESIGN naming): a child table is `<parent>_<field>`; its key is the ancestors' own
-    // keys renamed `<ancestor field>_<column>` followed by its own key. Scopes stay with their table.
-    #[test]
-    fn nested_tables_inherit_renamed_keys() {
-        let mut layout = Layout::root("Convoy", KindCode::new("cv"));
-        layout.column("state", ColumnType::Integer, true);
-        layout.scope(|layout| {
-            layout.table("deliverables", TableRole::Records, |layout| {
-                layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
-                layout.column("title", ColumnType::Text, true);
-                layout.table("evidence", TableRole::History, |layout| {
-                    layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
-                    layout.column("", ColumnType::Text, true);
-                });
-            });
-        });
-        let set = layout.finish();
-        let names: Vec<&str> = set.tables.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["convoy", "convoy_deliverables", "convoy_deliverables_evidence"]);
-        let deliverables = &set.tables[1];
-        assert_eq!(deliverables.parent, Some(0));
-        assert_eq!(deliverables.columns, [ColumnDef { name: "title".into(), ty: ColumnType::Text, nullable: false }]);
-        let evidence = &set.tables[2];
-        let key: Vec<&str> = evidence.key.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(key, ["deliverables_pos", "pos"]);
-        assert_eq!(evidence.own_key, 1);
-        assert_eq!(evidence.parent_key().len(), 1);
-        assert_eq!(evidence.columns[0].name, "value");
-        assert!(set.tables[0].guards.is_empty());
-    }
 }

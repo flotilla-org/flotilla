@@ -879,6 +879,13 @@ class BuildGraphContract(unittest.TestCase):
 
 
 class LayerContract(unittest.TestCase):
+    def test_protocol_descriptors_keep_the_graph_storage_free(self):
+        # ADR 0067: enumerate the allowed descriptor stack and both SQLite C entry points.
+        descriptor_tree = "flotilla-protocol v0.1|\nflotilla-schema v0.1|\nflotilla-schema-derive v0.1|\nflotilla-build-features-types v0.1|"
+        self.assertEqual(c_free_violations("flotilla-protocol", tree_features(descriptor_tree)), [])
+        for dependency in ("rusqlite", "libsqlite3-sys"):
+            self.assertTrue(c_free_violations("flotilla-protocol", tree_features(descriptor_tree + f"\n{dependency} v1|bundled")))
+
     def test_named_base_graphs_reject_c_dependencies(self):
         # Contract 1: exhaust the five base crates and representative SQLite,
         # TLS and future C compiler drivers, including duplicate tree contexts.

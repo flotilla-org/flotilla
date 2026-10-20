@@ -4,12 +4,15 @@
 //! required), a datum that is `T` under one label and `Option<T>` under another (#3392 ruling G5),
 //! and a label that carries no data.
 
+use flotilla_schema_sqlite::GuardSql;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_schema::{
-    render_ddl, Code, ColumnType, Condition, DecodeError, Decoder, Edge, EdgeError, EdgeEvent, EdgeParts, EdgeRow, EdgeSet, Encoder,
-    FieldColumns, Kind, LabelCheck, Labelled, RowEdit, RowPath, Rows, State, StateData, Stored, TableRole, Timestamp, Value,
+    Code, ColumnType, Condition, DecodeError, Decoder, Edge, EdgeError, EdgeEvent, EdgeParts, EdgeRow, EdgeSet, Encoder, FieldColumns,
+    Kind, LabelCheck, Labelled, RowEdit, RowPath, Rows, State, StateData, Stored, TableRole, Timestamp, Value,
 };
+use flotilla_schema_sqlite::render_ddl;
 use hegel::{generators as gs, TestCase};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
@@ -186,7 +189,7 @@ fn a_label_state_is_one_label_column_and_shared_data() {
         [
             column("queue", ColumnType::Interned(flotilla_schema::Code::new("qu")), false),
             column("title", ColumnType::Text, false),
-            column("state", ColumnType::Code(vec![Code::new("c1"), Code::new("c2"), Code::new("c3")]), false),
+            column("state", ColumnType::Code(vec!["c1".to_owned(), "c2".to_owned(), "c3".to_owned()]), false),
             column("state_since", ColumnType::Timestamp, false),
             column("priority", ColumnType::Integer, true),
             column("owner", ColumnType::Interned(flotilla_schema::Code::new("wr")), true),

@@ -410,6 +410,7 @@ macro_rules! records_adapter {
                 layout.table(name, $role, |layout| {
                     layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
                     layout.column(RECORD_VERSION, ColumnType::Integer, true);
+                    layout.role("sequence");
                     T::layout_row(layout);
                 });
             }

@@ -87,7 +87,7 @@ impl FieldAttr {
 }
 
 fn store_attrs(attrs: &[Attribute]) -> impl Iterator<Item = &Attribute> {
-    attrs.iter().filter(|attr| attr.path().is_ident("store"))
+    attrs.iter().filter(|attr| attr.path().is_ident("store") || attr.path().is_ident("shape"))
 }
 
 fn path_name(path: &syn::Path) -> String {
@@ -97,6 +97,20 @@ fn path_name(path: &syn::Path) -> String {
 pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
     let mut parsed = TypeAttrs { kind: None, code: None, indexes: Vec::new(), labels: None, state: None, edges: None };
     for attr in store_attrs(attrs) {
+        if attr.path().is_ident("shape") {
+            attr.parse_nested_meta(|meta| {
+                let name = path_name(&meta.path);
+                if !["child", "intern", "flatten", "code"].contains(&name.as_str()) {
+                    return Err(
+                        meta.error("shape attributes are child, intern, flatten and code; storage attributes belong in #[store(...)]")
+                    );
+                }
+                if meta.input.peek(syn::Token![=]) {
+                    let _: LitStr = meta.value()?.parse()?;
+                }
+                Ok(())
+            })?;
+        }
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
             match name.as_str() {
@@ -150,6 +164,20 @@ pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
 pub(crate) fn field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
     let mut found = FieldAttrs { shape: None, alias: None, domain: None };
     for attr in store_attrs(attrs) {
+        if attr.path().is_ident("shape") {
+            attr.parse_nested_meta(|meta| {
+                let name = path_name(&meta.path);
+                if !["child", "intern", "flatten", "code"].contains(&name.as_str()) {
+                    return Err(
+                        meta.error("shape attributes are child, intern, flatten and code; storage attributes belong in #[store(...)]")
+                    );
+                }
+                if meta.input.peek(syn::Token![=]) {
+                    let _: LitStr = meta.value()?.parse()?;
+                }
+                Ok(())
+            })?;
+        }
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
             if name == "alias" {
@@ -195,6 +223,20 @@ pub(crate) fn field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
 pub(crate) fn variant_code(attrs: &[Attribute]) -> syn::Result<Option<(String, Span)>> {
     let mut code = None;
     for attr in store_attrs(attrs) {
+        if attr.path().is_ident("shape") {
+            attr.parse_nested_meta(|meta| {
+                let name = path_name(&meta.path);
+                if !["child", "intern", "flatten", "code"].contains(&name.as_str()) {
+                    return Err(
+                        meta.error("shape attributes are child, intern, flatten and code; storage attributes belong in #[store(...)]")
+                    );
+                }
+                if meta.input.peek(syn::Token![=]) {
+                    let _: LitStr = meta.value()?.parse()?;
+                }
+                Ok(())
+            })?;
+        }
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
             if name != "code" {

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
+#[derive(flotilla_schema::Describe)]
 pub struct CanonicalHostId(String);
 
 impl CanonicalHostId {
@@ -37,41 +38,44 @@ impl fmt::Display for CanonicalHostId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct PlacementTargetHost {
     #[serde(rename = "ref")]
     pub reference: CanonicalHostId,
     pub display_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct PlacementRefusal {
     pub policy_name: String,
     pub target_host: PlacementTargetHost,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct PlacementViableCandidate {
     pub policy_name: String,
     pub target_host: PlacementTargetHost,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct PlacementDecision {
     pub policy_name: String,
     pub target_host: PlacementTargetHost,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[shape(child)]
     pub minimal_alternatives: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalation_reason: Option<String>,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[shape(child)]
     pub refused_candidates: Vec<PlacementRefusal>,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[shape(child)]
     pub viable_not_selected: Vec<PlacementViableCandidate>,
     /// Live inputs and the allocation judgement frozen at admission.
     /// Absent in previous-generation records (ADR 0047).
@@ -79,9 +83,10 @@ pub struct PlacementDecision {
     pub allocation: Option<FulfilmentAllocation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct FulfilmentAllocation {
     pub chosen_kind: String,
+    #[shape(child)]
     pub candidates: Vec<FulfilmentAllocationCandidate>,
     /// Why admission used reserved platform capacity without escalation.
     /// Absent in previous-generation convoy statuses (ADR 0047).
@@ -89,7 +94,7 @@ pub struct FulfilmentAllocation {
     pub reservation_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct FulfilmentAllocationCandidate {
     pub kind: String,
     pub host: String,
@@ -116,7 +121,7 @@ mod tests {
 
 /// Limits actually configured at provisioning or terminal launch; absence means
 /// unknown, rather than unlimited. These are configuration facts, not usage.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct ConfiguredResourceLimits {
     /// Hard CPU quota, independent of relative scheduling weight.
     pub cpus: Option<usize>,

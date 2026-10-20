@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_schema::{
-    Code, DecodeError, Decoder, Element, EncodeError, Encoder, Frozen, Hash, Identity, Kind, KindCode, Records, Row, Stored, TableRole,
+    DecodeError, Decoder, Element, EncodeError, Encoder, Frozen, Hash, Identity, Kind, KindCode, Records, Row, Stored, TableRole,
     Timestamp, Value, When,
 };
 use hegel::{generators as gs, TestCase};
@@ -232,9 +232,9 @@ fn tables_follow_the_naming_and_key_rules() {
     assert_eq!(
         guards,
         [
-            ("tag", &When::Is(Code::new("c1")), &value[..], &none[..]),
-            ("tag", &When::Is(Code::new("c2")), &none[..], &value[..]),
-            ("tag", &When::Is(Code::new("c3")), &none[..], &value[..]),
+            ("tag", &When::Is("c1".into()), &value[..], &none[..]),
+            ("tag", &When::Is("c2".into()), &none[..], &value[..]),
+            ("tag", &When::Is("c3".into()), &none[..], &value[..]),
         ],
         "one CHECK per variant; a datum holding a table has no columns to check"
     );
@@ -343,4 +343,16 @@ fn generic_parts_are_elements() {
     assert_eq!(<Attempt<Phase> as Element>::TABLES, 0);
     assert_eq!(<Deliverable as Element>::TABLES, 2, "evidence and its meta");
     assert_eq!(<Edge<Ident> as Element>::TABLES, 0);
+}
+
+// ADR 0067: append-only row stamps carry sequence meaning because the derive generates them;
+// a normal field called version (in Gate) keeps its ordinary meaning.
+#[test]
+fn generated_record_stamps_have_sequence_roles() {
+    let set = Plan::table_set();
+    for table in set.tables.iter().filter(|table| matches!(table.role, TableRole::Records | TableRole::History)) {
+        assert_eq!(table.columns[0].properties["roles"], serde_json::json!(["sequence"]));
+    }
+    let gates = set.tables.iter().find(|table| table.name == "plan_steps_gates").unwrap();
+    assert!(gates.columns.iter().find(|column| column.name == "version").unwrap().properties.is_empty());
 }

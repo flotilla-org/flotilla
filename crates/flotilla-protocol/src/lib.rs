@@ -83,7 +83,7 @@ impl fmt::Display for NodeId {
 }
 
 /// Stable reference to the human principal whose attention Flotilla may route.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct PrincipalRef {
     pub namespace: String,
     pub name: String,

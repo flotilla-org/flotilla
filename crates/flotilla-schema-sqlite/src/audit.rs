@@ -16,9 +16,9 @@ pub fn audit_domains(conn: &Connection, kinds: &KindRegistry) -> Result<(), Stor
         let sql = format!(
             "SELECT EXISTS (SELECT 1 FROM {} AS t LEFT JOIN strings AS s ON s.id = t.{} \
                  WHERE t.{} IS NOT NULL AND (s.id IS NULL OR s.domain != ?1))",
-            flotilla_schema::quote_ident(table),
-            flotilla_schema::quote_ident(column),
-            flotilla_schema::quote_ident(column),
+            crate::quote_ident(table),
+            crate::quote_ident(column),
+            crate::quote_ident(column),
         );
         if conn.query_row(&sql, [domain.as_str()], |row| row.get::<_, bool>(0))? {
             return Err(StoreError::Corrupt { table: table.to_owned(), column: column.to_owned() });

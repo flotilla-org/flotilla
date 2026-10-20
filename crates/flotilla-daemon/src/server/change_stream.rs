@@ -456,7 +456,7 @@ mod tests {
                         columns: vec![],
                         guards: vec![],
                         enums: vec![],
-                        codes: vec![],
+                        generated: vec![],
                         fields: vec![],
                         field_aliases: vec![],
                         aliases: vec![],

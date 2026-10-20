@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{provider_data::IssueSource, LeafAddress};
 
 /// Identity shared by convoy links, leaves and relay observations.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct Subject {
     pub kind: SubjectKind,
     pub source: IssueSource,
@@ -12,6 +12,7 @@ pub struct Subject {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum SubjectKind {
     ChangeRequest,
     Issue,
@@ -19,6 +20,7 @@ pub enum SubjectKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum Relationship {
     WorksOn,
     Produces,

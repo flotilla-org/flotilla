@@ -1,6 +1,7 @@
 //! The shared tables every kind's tables reference.
 
-use flotilla_schema::{quote_ident, render_ddl_with, render_views, DdlMode, KindRegistry, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD};
+use crate::{quote_ident, render_ddl_with, render_views, DdlMode, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD};
+use flotilla_schema::KindRegistry;
 use rusqlite::{Connection, OptionalExtension};
 
 /// `strings` interns names and interned columns; `resource_identity` holds every resource's

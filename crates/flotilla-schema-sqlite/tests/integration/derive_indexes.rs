@@ -1,8 +1,7 @@
 //! Derived indexes: the descriptor entry, its DDL and the typed query constructors.
 
-use flotilla_schema::{
-    render_ddl, Code, Condition, EncodeError, Identity, Index, IndexQuery, Kind, KindCode, Ref, State, Stored, TableSet, Value,
-};
+use flotilla_schema::{Code, Condition, EncodeError, Identity, Index, IndexQuery, Kind, KindCode, Ref, State, Stored, TableSet, Value};
+use flotilla_schema_sqlite::render_ddl;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 enum Phase {

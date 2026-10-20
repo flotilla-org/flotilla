@@ -5,6 +5,7 @@ use tracing::warn;
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
+#[derive(flotilla_schema::Describe)]
 pub struct HostName(String);
 
 impl HostName {

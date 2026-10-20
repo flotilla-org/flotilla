@@ -1,8 +1,9 @@
 use std::{env, fs, path::Path};
 
 use flotilla_engine_store::registry;
-use flotilla_schema::{render_view, DdlMode};
+use flotilla_schema::render_view;
 use flotilla_schema_sqlite::schema_ddl;
+use flotilla_schema_sqlite::DdlMode;
 
 fn check(file: &str, actual: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots").join(file);

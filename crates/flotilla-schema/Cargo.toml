@@ -3,9 +3,10 @@ name = "flotilla-schema"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
-description = "Backend-neutral storage schema: descriptors, DDL rendering, logical rows and the kind registry"
+description = "Backend-neutral storage schema: descriptors, logical rows and the kind registry"
 
 [dependencies]
+serde_json = { workspace = true }
 flotilla-address = { path = "../flotilla-address" }
 flotilla-cbor = { path = "../flotilla-cbor" }
 flotilla-schema-derive = { path = "../flotilla-schema-derive" }
@@ -16,7 +17,6 @@ thiserror = "2"
 
 [dev-dependencies]
 hegeltest = { workspace = true }
-serde_json = { workspace = true }
 trybuild = "1"
 # Test-only feature anchor (docs/measurements/2747-build-graph.md): hegeltest reaches smallvec
 # through parking_lot; select the features the base layer already uses.

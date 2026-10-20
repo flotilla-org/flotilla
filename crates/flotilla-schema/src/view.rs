@@ -6,7 +6,7 @@
 
 use std::fmt::Write;
 
-use crate::descriptor::{Table, TableRole, TableSet, RESERVED_CHILD_COLUMNS, RESERVED_ROOT_COLUMNS};
+use crate::descriptor::{Table, TableRole, TableSet};
 
 /// A table wider than this many columns is called out for review.
 pub const WIDE: usize = 30;
@@ -14,10 +14,7 @@ pub const WIDE: usize = 30;
 /// The columns a table has in the backend: the root's `id` and `version`, or a nested table's
 /// `owner` and key, plus the descriptor's columns (a records or history table's stamp included).
 pub fn column_count(table: &Table) -> usize {
-    match table.role {
-        TableRole::Root => RESERVED_ROOT_COLUMNS.len() + table.columns.len(),
-        _ => RESERVED_CHILD_COLUMNS.len() + table.key.len() + table.columns.len(),
-    }
+    table.generated.len() + table.key.len() + table.columns.len()
 }
 
 /// Columns that exist because a data enum was expanded into its row, by the enum's tag column: the

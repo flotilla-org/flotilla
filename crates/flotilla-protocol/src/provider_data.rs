@@ -51,7 +51,7 @@ pub struct ChangeRequest {
     pub provider_display_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub enum ChangeRequestStatus {
     Open,
     Draft,
@@ -70,13 +70,13 @@ impl std::fmt::Display for ChangeRequestStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct IssueSource {
     pub service: String,
     pub scope: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct IssueRef {
     pub source: IssueSource,
     pub id: String,
@@ -99,20 +99,23 @@ impl IssueRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum IssueState {
     Open,
     Closed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct Issue {
     pub reference: IssueRef,
     pub title: String,
     pub body: Option<String>,
     pub state: IssueState,
+    #[shape(child)]
     pub labels: Vec<String>,
     #[serde(default)]
     #[builder(default)]
+    #[shape(child)]
     pub assignees: Vec<String>,
     /// When the external source last changed the issue.
     pub as_of: DateTime<Utc>,

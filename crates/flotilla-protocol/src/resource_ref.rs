@@ -7,7 +7,7 @@ use crate::host::HostName;
 /// Fully-qualified reference to a resource (or one of its subresources),
 /// optionally pinned to the host whose store holds it. Rows in query result
 /// sets are keyed by this.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct ResourceRef {
     pub api_version: String,
     pub kind: String,

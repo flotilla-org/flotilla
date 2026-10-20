@@ -2,11 +2,10 @@
 
 use std::{collections::BTreeSet, ops::Range};
 
-use crate::{
-    code::Code,
-    ddl::{quote_ident, VIEW_SUFFIX},
-    value::KindCode,
-};
+use crate::{code::Code, value::KindCode};
+
+/// Reserved suffix of the backend's readable views.
+pub const VIEW_SUFFIX: &str = "_view";
 
 /// Schema object names of the shared tables and their indexes; no kind table or index may take one.
 pub const SHARED_NAMES: &[&str] = &[
@@ -82,13 +81,12 @@ pub struct Table {
     /// How many trailing `key` columns are this table's own key.
     pub own_key: usize,
     pub columns: Vec<ColumnDef>,
+    /// Columns supplied by the storage layout (empty for describe-only sources).
+    pub generated: Vec<ColumnDef>,
     /// Tag and presence guards, in the order they were declared; each renders as one table CHECK.
     pub guards: Vec<Guard>,
     /// The data enums expanded into this table's columns, outermost and nested.
     pub enums: Vec<Expansion>,
-    /// Each code column's codes with their Rust names, in column order (key columns included):
-    /// the rows of the `codes` table, which the readable views join (#3392 ruling D4).
-    pub codes: Vec<CodeNames>,
     /// The column-shaped fields of the struct whose rows this table holds, in declaration order:
     /// the unit an edge sets (`Edge::set`), and the columns a spec edit may not change (`state`).
     /// Empty for tables of primitive and enum elements, which have no named fields.
@@ -129,7 +127,7 @@ impl FieldColumns {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum When {
     /// The controlling column holds this code: one label of a state, or one variant of a data enum.
-    Is(Code),
+    Is(String),
     /// The controlling column is not null: an optional value is present. Its controlling column is
     /// the value's first required column, so presence needs no flag of its own (#3392 ruling G5).
     Present,
@@ -158,61 +156,12 @@ pub struct Guard {
     pub otherwise: Vec<String>,
 }
 
-impl Guard {
-    /// `CASE WHEN <cond> THEN <required> IS NOT NULL AND <absent> IS NULL [ELSE <otherwise> IS
-    /// NULL] END`. A CASE without a match is null, which a CHECK accepts.
-    pub fn check(&self) -> String {
-        self.check_with(" ")
-    }
-
-    /// The CHECK with `separator` before `THEN`, `ELSE` and each term, for readable DDL.
-    pub fn check_with(&self, separator: &str) -> String {
-        let and = format!("{separator}AND ");
-        let required = self.required.iter().map(|name| format!("{} IS NOT NULL", quote_ident(name)));
-        let absent = self.absent.iter().map(|name| format!("{} IS NULL", quote_ident(name)));
-        let then = conjunction(required.chain(absent), &and);
-        let column = quote_ident(&self.column);
-        let condition = match &self.when {
-            When::Is(code) => format!("{column} = {}", code_literal(*code)),
-            When::Present => format!("{column} IS NOT NULL"),
-        };
-        let mut out = format!("CASE WHEN {condition}{separator}THEN {then}");
-        if !self.otherwise.is_empty() {
-            let otherwise = conjunction(self.otherwise.iter().map(|name| format!("{} IS NULL", quote_ident(name))), &and);
-            out.push_str(&format!("{separator}ELSE {otherwise}"));
-        }
-        out.push_str(&format!("{separator}END"));
-        out
-    }
-}
-
-/// A code as an SQL string literal. Codes hold only letters, digits and `_`, so need no escaping.
-pub fn code_literal(code: Code) -> String {
-    format!("'{code}'")
-}
-
 /// The columns a data enum expands into in one table: its tag and every column its variants'
 /// data declares, nested enums and optional values included. Recorded for the schema view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expansion {
     pub tag: String,
     pub columns: Vec<String>,
-}
-
-/// One code column's codes and the Rust names of the variants that carry them, ascending by code.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CodeNames {
-    pub column: String,
-    pub names: Vec<(Code, String)>,
-}
-
-fn conjunction(terms: impl Iterator<Item = String>, and: &str) -> String {
-    let terms: Vec<String> = terms.collect();
-    if terms.is_empty() {
-        "1".to_owned()
-    } else {
-        terms.join(and)
-    }
 }
 
 impl Table {
@@ -227,18 +176,42 @@ pub struct ColumnDef {
     pub name: String,
     pub ty: ColumnType,
     pub nullable: bool,
+    /// Enum values and their Rust variant names (ascending code order for stored enums).
+    pub categories: Vec<(String, String)>,
+    /// Logical target table of a reference; identities without a static kind target
+    /// the shared resource identity table.
+    pub reference: Option<String>,
+    /// Open semantic properties. Structural roles live in `roles` as an array of strings.
+    pub properties: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl ColumnDef {
+    pub fn new(name: impl Into<String>, ty: ColumnType, nullable: bool) -> Self {
+        Self { name: name.into(), ty, nullable, categories: Vec::new(), reference: None, properties: Default::default() }
+    }
+
+    pub fn add_role(&mut self, role: &str) {
+        let roles = self.properties.entry("roles".into()).or_insert_with(|| serde_json::json!([]));
+        let roles = roles.as_array_mut().expect("roles is an array");
+        if !roles.iter().any(|value| value.as_str() == Some(role)) {
+            roles.push(role.into());
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnType {
     Integer,
+    /// Floating-point values in describe-only sources; Stored does not implement a codec for them.
+    Number,
     Bool,
     Text,
     Blob,
     /// Microseconds since the Unix epoch.
     Timestamp,
-    /// A stable enum code (short text), restricted to the listed codes.
-    Code(Vec<Code>),
+    /// An enum value, restricted to the listed strings. Stored derives validate short explicit
+    /// codes; describe-only sources retain their existing (possibly longer) enum values.
+    Code(Vec<String>),
     /// An id in `strings`, whose row must carry this domain.
     Interned(Code),
     /// An id in `resource_identity`.
@@ -282,16 +255,6 @@ impl Condition {
             Condition::In { column, .. } | Condition::NotNull { column } => column,
         }
     }
-
-    pub fn sql(&self) -> String {
-        match self {
-            Condition::In { column, codes } => {
-                let codes: Vec<String> = codes.iter().copied().map(code_literal).collect();
-                format!("{} IN ({})", quote_ident(column), codes.join(", "))
-            }
-            Condition::NotNull { column } => format!("{} IS NOT NULL", quote_ident(column)),
-        }
-    }
 }
 
 impl Index {
@@ -303,15 +266,6 @@ impl Index {
     /// The index key: `eq` columns, then `order` columns.
     pub fn columns(&self) -> impl Iterator<Item = &str> {
         self.eq.iter().chain(&self.order).map(String::as_str)
-    }
-
-    /// The predicate's terms joined by `AND`; `None` for a full index.
-    pub fn predicate_sql(&self) -> Option<String> {
-        if self.predicate.is_empty() {
-            None
-        } else {
-            Some(self.predicate.iter().map(Condition::sql).collect::<Vec<_>>().join(" AND "))
-        }
     }
 }
 
@@ -375,9 +329,10 @@ impl TableSet {
     /// nullable column the predicate does not require, or whose predicate cannot hold as written.
     pub fn validate(&self) -> Result<(), DescriptorError> {
         let kind = || self.kind.clone();
+        let stored = self.tables.first().is_some_and(|table| !table.generated.is_empty());
         let mut names = BTreeSet::new();
         for name in self.object_names() {
-            if SHARED_NAMES.contains(&name.as_str()) {
+            if stored && SHARED_NAMES.contains(&name.as_str()) {
                 return Err(DescriptorError::ReservedName { kind: kind(), name });
             }
             if !names.insert(name.clone()) {
@@ -390,11 +345,14 @@ impl TableSet {
         for table in &self.tables {
             let mut columns = BTreeSet::new();
             let (reserved, data) = match table.role {
-                TableRole::Root => (RESERVED_ROOT_COLUMNS, &table.columns[..]),
-                TableRole::Child | TableRole::State => (RESERVED_CHILD_COLUMNS, &table.columns[..]),
+                TableRole::Root => (if stored { RESERVED_ROOT_COLUMNS } else { &[] }, &table.columns[..]),
+                TableRole::Child | TableRole::State => (if stored { RESERVED_CHILD_COLUMNS } else { &[] }, &table.columns[..]),
                 TableRole::Records | TableRole::History => {
-                    let stamp = ColumnDef { name: RECORD_VERSION.to_owned(), ty: ColumnType::Integer, nullable: false };
-                    if table.columns.first() != Some(&stamp) {
+                    if !table
+                        .columns
+                        .first()
+                        .is_some_and(|column| column.name == RECORD_VERSION && column.ty == ColumnType::Integer && !column.nullable)
+                    {
                         return Err(DescriptorError::MissingStamp { kind: kind(), table: table.name.clone() });
                     }
                     (RESERVED_RECORD_COLUMNS, &table.columns[1..])
@@ -442,12 +400,12 @@ impl TableSet {
 
     /// The root's state field, whose labels an edge's `from` and `to` name, and its label codes:
     /// `None` unless the kind has exactly one root state.
-    pub fn edge_state(&self) -> Option<(&FieldColumns, &[Code])> {
+    pub fn edge_state(&self) -> Option<(&FieldColumns, Vec<Code>)> {
         let root = &self.tables[0];
         let mut labels = root.fields.iter().filter(|field| field.is_label());
         let (field, None) = (labels.next()?, labels.next()) else { return None };
         match &root.columns[field.columns.start].ty {
-            ColumnType::Code(codes) => Some((field, codes)),
+            ColumnType::Code(codes) => Some((field, codes.iter().map(|code| Code::parse(code)).collect::<Result<_, _>>().ok()?)),
             _ => None,
         }
     }
@@ -481,7 +439,7 @@ impl TableSet {
             let def = column(condition.column())?;
             match condition {
                 Condition::In { column, codes } => match &def.ty {
-                    ColumnType::Code(allowed) if !codes.is_empty() && codes.iter().all(|code| allowed.contains(code)) => {}
+                    ColumnType::Code(allowed) if !codes.is_empty() && codes.iter().all(|code| allowed.contains(&code.to_string())) => {}
                     _ => return Err(IndexProblem::Codes(column.clone())),
                 },
                 Condition::NotNull { column } if !def.nullable => return Err(IndexProblem::NotNullable(column.clone())),
@@ -531,5 +489,47 @@ impl TableSet {
             }
         }
         out
+    }
+}
+
+impl TableSet {
+    /// The shared event table as seen for this kind. Structural roles are declared here,
+    /// alongside the columns, rather than inferred by a viewer from their names.
+    /// This describes the existing log; it does not add a per-kind stored table.
+    pub fn log_table(&self) -> Table {
+        let mut layout = crate::Layout::description("Log");
+        layout.key(|layout| {
+            layout.column("home", ColumnType::Interned(crate::HOME_DOMAIN), true);
+            layout.column("home_seq", ColumnType::Integer, true);
+            layout.role("sequence");
+        });
+        layout.column("resource", ColumnType::Ref, false);
+        layout.reference(&self.tables[0].name);
+        layout.column("prev_seq", ColumnType::Integer, true);
+        layout.role("sequence");
+        layout.categories(
+            "cause",
+            [("create", "Create"), ("edit", "Edit"), ("edge", "Edge"), ("delete", "Delete"), ("expunge", "Expunge")]
+                .map(|(value, name)| (value.into(), name.into()))
+                .into(),
+            true,
+        );
+        layout.categories(
+            "edge",
+            self.edges.iter().zip(&self.edge_names).map(|(code, name)| (code.to_string(), name.clone())).collect(),
+            false,
+        );
+        let labels = self.edge_state().map(|(field, _)| self.tables[0].columns[field.columns.start].categories.clone()).unwrap_or_default();
+        layout.categories("from", labels.clone(), false);
+        layout.role("transition-from");
+        layout.categories("to", labels, false);
+        layout.role("transition-to");
+        layout.column("about", ColumnType::Ref, false);
+        layout.column("writer", ColumnType::Interned(crate::WRITER_DOMAIN), true);
+        layout.column("at", ColumnType::Timestamp, true);
+        layout.column("payload", ColumnType::Cbor, false);
+        layout.column("effect", ColumnType::Cbor, true);
+        layout.column("topic", ColumnType::Text, true);
+        layout.finish().tables.remove(0)
     }
 }

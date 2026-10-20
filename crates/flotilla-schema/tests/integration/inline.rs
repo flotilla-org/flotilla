@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{Code, ColumnType, DecodeError, Decoder, EncodeError, Encoder, Kind, Stored, Value, INLINE_LIMITS};
+use flotilla_schema::{ColumnType, DecodeError, Decoder, EncodeError, Encoder, Kind, Stored, Value, INLINE_LIMITS};
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
@@ -62,10 +62,10 @@ fn cbor_fields_are_one_column_of_canonical_cbor(tc: TestCase) {
     assert_eq!(
         columns,
         [
-            ("shape", &ColumnType::Code(vec![Code::new("c1")]), false),
+            ("shape", &ColumnType::Code(vec!["c1".to_owned()]), false),
             ("args", &ColumnType::Cbor, false),
             ("maybe", &ColumnType::Cbor, false),
-            ("variant", &ColumnType::Code(vec![Code::new("c1"), Code::new("c2")]), false),
+            ("variant", &ColumnType::Code(vec!["c1".to_owned(), "c2".to_owned()]), false),
             ("variant_args", &ColumnType::Cbor, true),
         ]
     );
