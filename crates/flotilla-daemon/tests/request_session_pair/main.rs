@@ -3543,7 +3543,9 @@ async fn lagging_start_placement_scenario(explicit: bool, destination_holds_cred
         let CommandValue::Error { message } = result else {
             panic!("expected credential refusal: {result:?}");
         };
-        if destination_has_capacity {
+        // Preparation decides placement before the destination's own floor
+        // can be judged, so a missing credential is reported first.
+        if !destination_holds_credential {
             assert!(message.contains("does not hold"), "{message}");
         } else {
             assert!(message.contains("below the 1000000.0 GiB floor"), "{message}");
