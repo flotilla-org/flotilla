@@ -188,6 +188,16 @@ pub trait Resource: Send + Sync + 'static {
     /// keep one event so lagging watchers relist instead of replaying history.
     const EVENT_HISTORY: crate::EventHistory = Self::REPLICATION_CLASS.event_history();
 
+    /// Opt into observation selection across local and replicated copies.
+    /// `None` keeps local-first reads. For observed subjects, a missing status
+    /// ranks below every status; observation time and authority break ties.
+    fn replica_read_rank(_object: &ResourceObject<Self>) -> Option<(Option<DateTime<Utc>>, &str)>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     /// Opt in to sibling validation at the authoritative write boundary.
     const VALIDATE_NAMESPACE_SPEC: bool = false;
 

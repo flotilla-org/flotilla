@@ -130,6 +130,24 @@ impl<T: Resource> ReplicaReadResolver<T> {
     }
 
     pub async fn get(&self, name: &str) -> Result<ReadResourceObject<T>, ResourceError> {
+        let selected = self.get_local_first(name).await?;
+        if T::replica_read_rank(&selected.object).is_none() {
+            return Ok(selected);
+        }
+        // Observed subjects may have a demanded, status-less local placeholder.
+        // Use the same rank as watch inventories and leaf evaluation.
+        self.get_all(name)
+            .await?
+            .items
+            .into_iter()
+            .max_by(|left, right| {
+                (T::replica_read_rank(&left.object), matches!(left.provenance, ResourceProvenance::Local))
+                    .cmp(&(T::replica_read_rank(&right.object), matches!(right.provenance, ResourceProvenance::Local)))
+            })
+            .ok_or_else(|| ResourceError::not_found(name))
+    }
+
+    async fn get_local_first(&self, name: &str) -> Result<ReadResourceObject<T>, ResourceError> {
         if T::REPLICATION_CLASS == crate::ReplicationClass::None {
             return self
                 .backend
@@ -165,7 +183,7 @@ impl<T: Resource> ReplicaReadResolver<T> {
     pub async fn get_all(&self, name: &str) -> Result<ReadResourceList<T>, ResourceError> {
         // These classes have at most one visible copy for a name.
         if T::REPLICATION_CLASS == crate::ReplicationClass::None || T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
-            return match self.get(name).await {
+            return match self.get_local_first(name).await {
                 Ok(item) => Ok(ReadResourceList { items: vec![item] }),
                 Err(ResourceError::NotFound { .. }) => Ok(ReadResourceList { items: Vec::new() }),
                 Err(error) => Err(error),

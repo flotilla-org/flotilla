@@ -352,12 +352,12 @@ impl IssueRefresher {
         // A former owner can still hold its local copy after another host has
         // claimed the subject. Prefer the freshest observation across copies;
         // an exact tie is resolved deterministically by authority name.
-        let record = records.get_all(&name).await.map_err(|error| error.to_string())?.items.into_iter().max_by_key(|item| {
-            (
-                item.object.status.as_ref().map_or(item.object.metadata.creation_timestamp, |status| status.state.observed_at),
-                item.object.spec.observing_authority.clone(),
-                matches!(item.provenance, ResourceProvenance::Local),
-            )
+        let record = records.get_all(&name).await.map_err(|error| error.to_string())?.items.into_iter().max_by(|left, right| {
+            (<Issue as flotilla_resources::Resource>::replica_read_rank(&left.object), matches!(left.provenance, ResourceProvenance::Local))
+                .cmp(&(
+                    <Issue as flotilla_resources::Resource>::replica_read_rank(&right.object),
+                    matches!(right.provenance, ResourceProvenance::Local),
+                ))
         });
         let Some(record) = record else {
             if !create_missing {
