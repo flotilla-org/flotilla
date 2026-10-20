@@ -75,7 +75,9 @@ impl ListenAddress {
     }
 
     /// The `Host` values the listener bound at `port` answers: the configured address,
-    /// `localhost`, and the loopback literal of the bound address family.
+    /// `localhost`, and the loopback literal of the bound address family. `localhost` is
+    /// accepted even when it resolves to the other family first and so cannot reach this
+    /// listener; such a request never arrives, and every accepted name is loopback.
     pub(in crate::server) fn allowed_hosts(&self, port: u16) -> Vec<String> {
         let literal = if self.bind.is_ipv4() { "127.0.0.1" } else { "[::1]" };
         let mut hosts = Vec::new();

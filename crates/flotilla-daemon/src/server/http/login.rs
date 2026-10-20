@@ -1,6 +1,7 @@
 //! Browser login (ADR 0065): the daemon mints a one-time code for a Unix-socket caller, and
 //! visiting the login URL on the TCP listener exchanges it for a session cookie. Codes and
-//! sessions live in memory, so a restart ends them, as it replaces the file token.
+//! sessions live in memory, so a restart ends them, as it replaces the file token. A session
+//! also ends after [`SESSION_LIFETIME`] or at logout, and at most [`SESSION_LIMIT`] are live.
 
 use std::{collections::HashMap, sync::Arc, sync::Mutex};
 
@@ -15,6 +16,10 @@ pub(in crate::server) const SESSION_COOKIE: &str = "flotilla_session";
 pub(in crate::server) const LOGIN_CODE_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::minutes(2);
 /// Unredeemed codes kept at once; minting more evicts the oldest.
 const PENDING_CODE_LIMIT: usize = 32;
+/// How long a browser session lasts, however actively it is used.
+pub(in crate::server) const SESSION_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::hours(12);
+/// Live sessions kept at once; a new login evicts the oldest.
+pub(in crate::server) const SESSION_LIMIT: usize = 16;
 
 /// A non-secret handle for one browser session, for logs and caller identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -37,7 +42,7 @@ pub(in crate::server) struct LoginStore {
 #[derive(Default)]
 struct LoginState {
     codes: HashMap<Digested, DateTime<Utc>>,
-    sessions: HashMap<Digested, SessionId>,
+    sessions: HashMap<Digested, (SessionId, DateTime<Utc>)>,
     next_session: u64,
 }
 
@@ -72,33 +77,55 @@ impl LoginStore {
                 let token = random_secret()?;
                 let id = SessionId(state.next_session);
                 state.next_session += 1;
-                state.sessions.insert(digest(&token), id);
+                state.sessions.retain(|_, (_, expiry)| *expiry > now);
+                if state.sessions.len() >= SESSION_LIMIT {
+                    if let Some(oldest) = state.sessions.iter().min_by_key(|(_, (id, _))| id.0).map(|(digest, _)| *digest) {
+                        state.sessions.remove(&oldest);
+                    }
+                }
+                state.sessions.insert(digest(&token), (id, now + SESSION_LIFETIME));
                 Ok(Some((id, token)))
             }
             _ => Ok(None),
         }
     }
 
-    /// The session named by the request's cookie. A request carrying more than one session
-    /// cookie is ambiguous and authenticates as none.
+    /// The live session named by the request's cookie. A request carrying more than one
+    /// session cookie is ambiguous and authenticates as none.
     pub(in crate::server) fn session(&self, headers: &HeaderMap) -> Option<SessionId> {
-        let mut values = headers
-            .get_all(header::COOKIE)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(';'))
-            .filter_map(|pair| pair.trim().strip_prefix(SESSION_COOKIE)?.strip_prefix('='));
-        let value = values.next()?;
-        if values.next().is_some() {
-            return None;
-        }
-        self.state.lock().expect("login state lock").sessions.get(&digest(value)).copied()
+        let value = session_cookie_value(headers)?;
+        let now = self.clock.now();
+        let state = self.state.lock().expect("login state lock");
+        state.sessions.get(&digest(value)).filter(|(_, expiry)| *expiry > now).map(|(id, _)| *id)
+    }
+
+    /// End a session; its cookie authenticates nothing afterwards.
+    pub(in crate::server) fn end(&self, session: SessionId) {
+        self.state.lock().expect("login state lock").sessions.retain(|_, (id, _)| *id != session);
     }
 }
 
+fn session_cookie_value(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().strip_prefix(SESSION_COOKIE)?.strip_prefix('='));
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
 /// The `Set-Cookie` value for a new session. No `Secure`: the loopback listener is plain HTTP.
+/// No `Max-Age` either, so the browser drops it when it closes; the daemon enforces
+/// [`SESSION_LIFETIME`] whatever the browser keeps.
 pub(in crate::server) fn session_cookie(token: &str) -> String {
     format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/")
+}
+
+/// The `Set-Cookie` value that clears the session cookie at logout.
+pub(in crate::server) fn cleared_session_cookie() -> String {
+    format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
 }
 
 fn digest(secret: &str) -> Digested {

@@ -20,7 +20,10 @@ use flotilla_store_memory::InMemoryBackend;
 use hegel::generators as gs;
 use tower::ServiceExt;
 
-use super::{login::LOGIN_CODE_LIFETIME, CallerAuth, HttpRouter, ListenAddress, LoginStore, TcpPolicy, TokenDigest};
+use super::{
+    login::{LOGIN_CODE_LIFETIME, SESSION_LIFETIME, SESSION_LIMIT},
+    CallerAuth, HttpRouter, ListenAddress, LoginStore, TcpPolicy, TokenDigest,
+};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const ORIGIN: &str = "http://127.0.0.1:7878";
@@ -290,6 +293,59 @@ async fn session_cookie_over_a_unix_socket_is_ignored() {
     assert_eq!(daemon.call(environment(), with_cookie(get(resources))).await.status, StatusCode::FORBIDDEN);
     assert_eq!(daemon.call(environment(), with_cookie(post("/v1/web/login-codes"))).await.status, StatusCode::FORBIDDEN);
     assert_eq!(daemon.call(CallerAuth::Socket(None), with_cookie(post("/v1/web/login-codes"))).await.status, StatusCode::CREATED);
+}
+
+// A session ends at its lifetime, at logout, or when newer logins push it past the cap;
+// logging in again from a session yields a fresh session, never a change of privilege.
+#[tokio::test]
+async fn sessions_expire_end_at_logout_and_are_capped() {
+    let daemon = Incarnation::new();
+    let tcp = daemon.tcp("127.0.0.1:7878", &[]);
+    let hello = |cookie: &str| tcp_request(Method::GET, "/v1/hello", &[HOST, ("cookie", cookie)]);
+    let session_of = |cookie: &str| daemon.logins.session(&HeaderMap::from_iter([(header::COOKIE, cookie.parse().expect("cookie"))]));
+
+    let expiring = daemon.login_cookie().await;
+    daemon.clock.advance(SESSION_LIFETIME - chrono::TimeDelta::seconds(1));
+    assert_eq!(tcp_call(&tcp, hello(&expiring)).await.status, StatusCode::OK, "within its lifetime");
+    daemon.clock.advance(chrono::TimeDelta::seconds(1));
+    assert_eq!(tcp_call(&tcp, hello(&expiring)).await.status, StatusCode::UNAUTHORIZED, "past its lifetime");
+
+    let first = daemon.login_cookie().await;
+    let mut cookies = Vec::new();
+    for _ in 1..SESSION_LIMIT {
+        cookies.push(daemon.login_cookie().await);
+    }
+    assert!(session_of(&first).is_some(), "the cap holds {SESSION_LIMIT} sessions");
+    cookies.push(daemon.login_cookie().await);
+    assert!(session_of(&first).is_none(), "the oldest session is evicted past the cap");
+    assert!(cookies.iter().all(|cookie| session_of(cookie).is_some()));
+
+    let current = cookies.last().expect("a live session").clone();
+    let session = session_of(&current).expect("session");
+    let minted = daemon.call(CallerAuth::Socket(None), post("/v1/web/login-codes")).await;
+    let login = minted.json()["url"].as_str().expect("url").strip_prefix(ORIGIN).expect("origin").to_owned();
+    let relogin = tcp_call(&tcp, tcp_request(Method::GET, &login, &[HOST, ("cookie", &current)])).await;
+    assert_eq!(relogin.status, StatusCode::SEE_OTHER);
+    let fresh = relogin.headers[header::SET_COOKIE].to_str().expect("cookie").split(';').next().expect("pair").to_owned();
+    assert_ne!(session_of(&fresh), Some(session), "a new login is a new session");
+    assert_eq!(
+        tcp_call(&tcp, tcp_request(Method::POST, "/v1/web/login-codes", &[HOST, ("cookie", &fresh), ("origin", ORIGIN)])).await.status,
+        StatusCode::FORBIDDEN,
+        "a session still cannot mint"
+    );
+
+    assert_eq!(
+        tcp_call(&tcp, tcp_request(Method::POST, "/logout", &[HOST, ("cookie", &current)])).await.status,
+        StatusCode::FORBIDDEN,
+        "logout without Origin"
+    );
+    let logout = tcp_call(&tcp, tcp_request(Method::POST, "/logout", &[HOST, ("cookie", &current), ("origin", ORIGIN)])).await;
+    assert_eq!(logout.status, StatusCode::NO_CONTENT);
+    assert_eq!(logout.headers[header::SET_COOKIE], "flotilla_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    assert_eq!(tcp_call(&tcp, hello(&current)).await.status, StatusCode::UNAUTHORIZED, "logged out");
+    assert_eq!(tcp_call(&tcp, hello(&fresh)).await.status, StatusCode::OK, "other sessions survive");
+    assert_eq!(tcp_call(&tcp, tcp_request(Method::POST, "/logout", &[HOST, BEARER])).await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(daemon.call(CallerAuth::Socket(None), post("/logout")).await.status, StatusCode::BAD_REQUEST);
 }
 
 // Codes and sessions live in memory: a cookie from one incarnation authenticates nothing

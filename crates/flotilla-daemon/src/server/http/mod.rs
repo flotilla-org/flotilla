@@ -4,8 +4,9 @@
 //! backend) and needs no listener: tests drive it with `tower::ServiceExt::oneshot`.
 
 // Production serves only the startup address check until rigging#21 lets the listeners serve
-// this router; then the main socket, environment sockets and TCP listener use it all.
-#![cfg_attr(not(test), allow(dead_code, unused_imports))]
+// this router; then the main socket, environment sockets and TCP listener use it all. Remove
+// this allow in the wiring change that completes #3248.
+#![cfg_attr(not(test), allow(dead_code))]
 
 mod auth;
 mod login;
@@ -33,12 +34,15 @@ use futures::StreamExt;
 pub(in crate::server) use auth::CallerAuth;
 pub(in crate::server) use login::LoginStore;
 use resource_api::Reply;
+// The TCP listener's policy is applied once rigging#21 serves the router (#3248).
+#[cfg_attr(not(test), allow(unused_imports))]
 pub(in crate::server) use tcp::{ListenAddress, TcpPolicy, TokenDigest};
 
 /// Login and hello paths; everything else falls through to the resource API.
 pub(in crate::server) const HELLO_PATH: &str = "/v1/hello";
 pub(in crate::server) const LOGIN_CODES_PATH: &str = "/v1/web/login-codes";
 pub(in crate::server) const LOGIN_PATH: &str = "/login";
+pub(in crate::server) const LOGOUT_PATH: &str = "/logout";
 
 /// What the router serves from. Production supplies the daemon; resource-handler tests may
 /// supply only a backend.
@@ -65,6 +69,7 @@ impl HttpRouter {
             .route(HELLO_PATH, get(hello))
             .route(LOGIN_CODES_PATH, post(mint_login_code))
             .route(LOGIN_PATH, get(login))
+            .route(LOGOUT_PATH, post(logout))
             .fallback(resource_api)
             .with_state(RouterState(Arc::new(self)))
     }
@@ -140,6 +145,23 @@ async fn login(
         Ok(None) => auth::refusal(StatusCode::UNAUTHORIZED, "login code is invalid, used or expired"),
         Err(error) => auth::refusal(StatusCode::INTERNAL_SERVER_ERROR, &error),
     }
+}
+
+/// End the caller's browser session and clear its cookie. Only a session can log out; the
+/// TCP policy requires the listener's Origin on this cookie-authenticated POST.
+async fn logout(State(RouterState(state)): State<RouterState>, Extension(caller): Extension<CallerAuth>) -> Response {
+    let session = match caller {
+        CallerAuth::Session(session) => session,
+        CallerAuth::Anonymous => return auth::unauthenticated(),
+        _ => return auth::refusal(StatusCode::BAD_REQUEST, "only a browser session can log out"),
+    };
+    state.logins.end(session);
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    match HeaderValue::from_str(&login::cleared_session_cookie()) {
+        Ok(cookie) => response.headers_mut().insert(header::SET_COOKIE, cookie),
+        Err(_) => return auth::refusal(StatusCode::INTERNAL_SERVER_ERROR, "invalid session cookie"),
+    };
+    response
 }
 
 /// The resource API, with its paths, query parameters, statuses and bodies unchanged.
