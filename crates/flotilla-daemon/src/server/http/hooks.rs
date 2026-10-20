@@ -8,6 +8,16 @@
 //! state directory, so it outlives flotillad restarts that replace the listener's file
 //! token, as running crews do. It authenticates only these routes, and only for its own
 //! terminal: the caller's identity comes from the token, never from the request body.
+//!
+//! Tokens do not expire. To rotate the key, stop flotillad, delete `http/hook-key` beneath
+//! its state directory and start it again: a fresh key is created, every token minted
+//! under the old one is refused, and crews relaunched afterwards get new tokens. Running
+//! crews' hooks fail (non-blocking, so the agent continues) until they relaunch.
+//!
+//! Claude Code reports a refused or unreachable HTTP hook as a non-blocking error and has
+//! no fallback to command hooks. A settings policy that restricts HTTP hook URLs (such as
+//! `allowedHttpHookUrls`) must admit the listener's origin, or those sessions' hook-driven
+//! state stops updating.
 
 use std::{
     io::{self, Write},
@@ -48,32 +58,44 @@ const MAC_CONTEXT: &[u8] = b"flotilla-agent-hook-v1";
 pub(in crate::server) struct HookKey([u8; 32]);
 
 impl HookKey {
-    /// Read the key from `directory`, or create it there (mode 0600, written to a temporary
-    /// file and renamed into place). The directory must already be private.
+    /// Read the key from `directory`, or create it there (mode 0600). The directory must
+    /// already be private. The lifecycle lock already keeps a second flotillad off this
+    /// state directory, but creation does not rely on it: the key is staged in a temporary
+    /// file and published with a hard link, which never replaces an existing key, so
+    /// concurrent creators all end up with the one key that landed.
     pub(in crate::server) fn load_or_create(directory: &Path) -> Result<Self, String> {
         let path = directory.join(HOOK_KEY_FILE);
-        match std::fs::read_to_string(&path) {
-            Ok(existing) => {
-                return Self::decode(existing.trim_ascii_end()).ok_or_else(|| format!("hook key {} is malformed", path.display()))
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("read hook key {}: {error}", path.display())),
+        if let Some(existing) = Self::read(&path)? {
+            return Ok(existing);
         }
         let key = Self::generate()?;
         let encoded: String = key.0.iter().map(|byte| format!("{byte:02x}")).collect();
         let staged = directory.join(format!(".{HOOK_KEY_FILE}.{}", uuid::Uuid::new_v4()));
-        let written = std::fs::OpenOptions::new()
+        let published = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&staged)
             .and_then(|mut file| file.write_all(encoded.as_bytes()).and_then(|()| file.sync_all()))
-            .and_then(|()| std::fs::rename(&staged, &path));
-        if let Err(error) = written {
-            let _ = std::fs::remove_file(&staged);
-            return Err(format!("write hook key {}: {error}", path.display()));
+            .and_then(|()| std::fs::hard_link(&staged, &path));
+        let _ = std::fs::remove_file(&staged);
+        match published {
+            Ok(()) => Ok(key),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Self::read(&path)?.ok_or_else(|| format!("hook key {} vanished after creation", path.display()))
+            }
+            Err(error) => Err(format!("write hook key {}: {error}", path.display())),
         }
-        Ok(key)
+    }
+
+    fn read(path: &Path) -> Result<Option<Self>, String> {
+        match std::fs::read_to_string(path) {
+            Ok(existing) => {
+                Self::decode(existing.trim_ascii_end()).map(Some).ok_or_else(|| format!("hook key {} is malformed", path.display()))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("read hook key {}: {error}", path.display())),
+        }
     }
 
     fn generate() -> Result<Self, String> {

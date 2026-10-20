@@ -484,3 +484,20 @@ async fn hook_tokens_are_bound_to_their_terminal_and_survive_restarts() {
 fn no_listener_means_no_hook_endpoint() {
     assert_eq!(HookEndpoint::default().claude_code_launch(NAMESPACE, CODER), None);
 }
+
+// Concurrent creators of the hook key all end up holding the one key that landed on disk,
+// so none of them mints tokens the next start refuses.
+#[test]
+fn concurrent_hook_key_creation_agrees_on_one_key() {
+    let directory = tempfile::tempdir().expect("key directory");
+    let terminal = terminal(CODER);
+    let tokens: Vec<String> = std::thread::scope(|scope| {
+        let creators: Vec<_> =
+            (0..8).map(|_| scope.spawn(|| HookKey::load_or_create(directory.path()).expect("hook key").mint(&terminal))).collect();
+        creators.into_iter().map(|creator| creator.join().expect("creator")).collect()
+    });
+    let reloaded = HookKey::load_or_create(directory.path()).expect("reload").mint(&terminal);
+    assert!(tokens.iter().all(|token| token == &reloaded), "every creator holds the published key");
+    let leftovers: Vec<_> = std::fs::read_dir(directory.path()).expect("list").map(|entry| entry.expect("entry").file_name()).collect();
+    assert_eq!(leftovers, [std::ffi::OsString::from(HOOK_KEY_FILE)], "no staged files remain");
+}
