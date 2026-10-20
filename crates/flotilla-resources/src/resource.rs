@@ -193,6 +193,7 @@ pub trait Resource: Send + Sync + 'static {
 
     /// Rank observed subjects: missing status sorts last, then observation time
     /// and authority. Shared selection adds local preference on an exact tie.
+    /// Status-less copies tie on time; their creation timestamps intentionally do not participate.
     fn replica_read_rank(_object: &ResourceObject<Self>) -> (Option<DateTime<Utc>>, &str)
     where
         Self: Sized,

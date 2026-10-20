@@ -846,6 +846,18 @@ fn empty_queued_batches_preserve_attention_cleanup(tc: hegel::TestCase) {
     });
 }
 
+async fn demand_placeholder_spec<T: flotilla_resources::Resource>(
+    home: &ResourceBackend,
+    name: &str,
+    demand: impl std::future::Future<Output = Result<(), String>>,
+) -> T::Spec {
+    demand.await.unwrap();
+    let local = home.using::<T>("flotilla").get(name).await.unwrap();
+    // Demand must create a placeholder without inventing observed evidence.
+    assert!(local.status.is_none(), "demand creates an empty local placeholder");
+    local.spec
+}
+
 async fn publish_remote_observation<T: flotilla_resources::Resource>(
     home: &ResourceBackend,
     observer: &ResourceBackend,
@@ -981,11 +993,8 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
                     flotilla_resources::address::stored_issue_address("github.com", "flotilla-org/flotilla", 3556, &[]).unwrap(),
                 )
                 .unwrap();
-                issues.demand(id, key, None).await.unwrap();
+                let mut spec = demand_placeholder_spec::<Issue>(&home, &name, issues.demand(id, key, None)).await;
                 observed_at = if newer_placeholder { base + chrono::Duration::seconds(1) } else { Utc::now() };
-                let local = home.using::<Issue>("flotilla").get(&name).await.unwrap();
-                assert!(local.status.is_none(), "demand creates an empty local placeholder");
-                let mut spec = local.spec;
                 spec.observing_authority = "observer".into();
                 let observed = publish_remote_observation::<Issue>(
                     &home,
@@ -1009,11 +1018,8 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
                     flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 3556, &[]).unwrap(),
                 )
                 .unwrap();
-                refresher.demand(id, key, None).await.unwrap();
+                let mut spec = demand_placeholder_spec::<ChangeRequest>(&home, &name, refresher.demand(id, key, None)).await;
                 observed_at = if newer_placeholder { base + chrono::Duration::seconds(1) } else { Utc::now() };
-                let local = home.using::<ChangeRequest>("flotilla").get(&name).await.unwrap();
-                assert!(local.status.is_none(), "demand creates an empty local placeholder");
-                let mut spec = local.spec;
                 spec.observing_authority = "observer".into();
                 let observed = publish_remote_observation::<ChangeRequest>(
                     &home,
