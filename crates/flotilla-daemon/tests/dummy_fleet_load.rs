@@ -23,6 +23,12 @@
 //! `FLOTILLA_LOAD_TRACE=1` records controller errors/restarts and slow Message
 //! receipt timestamps, including the durable submission instant, to stderr.
 //!
+//! `FLOTILLA_LOAD_PRIMITIVES=true` adds `[primitives]` to each home's
+//! `daemon.toml`, so Message runs on the ADR 0064 engine (#3317), and seeds the
+//! designated fleet project its roles live under. Turn delivery is then timed
+//! from each engine Message's creation entry to the AgentSession receipt edge
+//! about it, followed on the decided store's log.
+//!
 //! `FLOTILLA_LOAD_MAX_RESIDENT_GIB` stops admitting convoys once the process
 //! holds that much memory, so a plan the host cannot hold reports how far it
 //! got. Progress lines every 30 s survive a run the host kills.
@@ -62,9 +68,12 @@ use flotilla_load_driver::{ConvoyObservation, ConvoyState, FleetTarget, HomeSamp
 use flotilla_observation::forge_observation::NO_READY_FORGE_OBSERVER;
 use flotilla_protocol::{commands::CommandValue, CommandAction, HostName};
 use flotilla_resources::{
-    Checkout, Convoy, ConvoyPhase, Forge, Host, InputMeta, Message, PlacementPolicy, ReadWatchEvent, Repository, ResourceProvenance,
-    TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
+    Checkout, Convoy, ConvoyPhase, FleetDesignation, FleetDesignationSpec, Forge, Host, InputMeta, Message, PlacementPolicy, Project,
+    ProjectSpec, ReadWatchEvent, Repository, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
+    FLEET_DESIGNATION_NAME,
 };
+use flotilla_schema::{Cause, Code, KindCode};
+use flotilla_schema_sqlite::stream::{Frame, Service};
 use flotilla_store::{
     load_metrics::{LatencyHistogram, ReplicationLoadMetrics},
     ResourceBackend,
@@ -122,7 +131,8 @@ fn state_of(phase: ConvoyPhase) -> ConvoyState {
 async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, admissions: Admissions) -> Home {
     let config_dir = root.join(format!("home-{index}"));
     std::fs::create_dir_all(&config_dir).expect("config dir");
-    std::fs::write(config_dir.join("daemon.toml"), format!("machine_id = \"load-{index}\"\n\n[dummy_fleet]\n{dummy_fleet}"))
+    let switch = if load_primitives() { "[primitives]\n" } else { "" };
+    std::fs::write(config_dir.join("daemon.toml"), format!("machine_id = \"load-{index}\"\n\n{switch}[dummy_fleet]\n{dummy_fleet}"))
         .expect("daemon.toml");
     let config = Arc::new(ConfigStore::with_base(config_dir));
     let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
@@ -146,15 +156,43 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, adm
     let options = RuntimeOptions { namespace: NAMESPACE.into(), ..RuntimeOptions::default() };
     let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime");
     let backend = daemon.resource_backend();
-    seed(&backend, &fleet.config().forge_service_url).await;
+    seed(&backend, &fleet.config().forge_service_url, daemon.message_primitives().is_some()).await;
     let view = Arc::new(HomeView::default());
     watch_convoys(&backend, Arc::clone(&view), admissions).await;
     watch_messages(&backend, Arc::clone(&view)).await;
+    if let Some(primitives) = daemon.message_primitives() {
+        watch_engine_messages(Arc::clone(primitives.service()), Arc::clone(&view));
+    }
     let port = DaemonCommandPort::new(&(Arc::clone(&daemon) as Arc<dyn DaemonHandle>));
     Home { daemon, fleet, runtime, store, database, port, replication: Arc::default(), view }
 }
 
-async fn seed(backend: &ResourceBackend, forge_service_url: &str) {
+async fn seed(backend: &ResourceBackend, forge_service_url: &str, primitives: bool) {
+    if primitives {
+        // The engine path's fleet roles live under the designated project.
+        backend
+            .clone()
+            .using::<Project>(NAMESPACE)
+            .create(
+                &InputMeta::builder().name("fleet".to_string()).build(),
+                &ProjectSpec::builder()
+                    .display_name("Fleet".to_string())
+                    .default_workflow_ref(CrewMix::Coder.workflow_name().to_string())
+                    .repositories(Vec::new())
+                    .build(),
+            )
+            .await
+            .expect("fleet project");
+        backend
+            .clone()
+            .definitions::<FleetDesignation>(NAMESPACE)
+            .create(
+                &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
+                &FleetDesignationSpec { project: "fleet".into(), image_cache: None },
+            )
+            .await
+            .expect("fleet designation");
+    }
     let host = backend.clone().using::<Host>(NAMESPACE).list().await.expect("hosts").items.into_iter().next().expect("local host");
     let forge = catalog::forge(forge_service_url);
     backend
@@ -262,6 +300,55 @@ async fn watch_messages(backend: &ResourceBackend, view: Arc<HomeView>) {
                         delivered_at = %receipt.delivered_at, latency_ms = latency.num_milliseconds(), "load slow message receipt");
                 }
             }
+        }
+    });
+}
+
+/// Time each engine Message (`[primitives]`) from its creation entry to the
+/// AgentSession receipt edge about it, following the decided store's log as a
+/// peer does, so the measurement never lists the replica.
+fn watch_engine_messages(service: Arc<Service>, view: Arc<HomeView>) {
+    const MESSAGE: KindCode = KindCode(Code::new("ms"));
+    const RECEIVE: Code = Code::new("rv");
+    tokio::spawn(async move {
+        let mut cursor = None;
+        let mut created = HashMap::new();
+        loop {
+            let round = tokio::task::spawn_blocking({
+                let service = Arc::clone(&service);
+                move || {
+                    let mut frames = Vec::new();
+                    let now = flotilla_schema::Timestamp::from_datetime(&Utc::now());
+                    let next = service.serve(cursor, now, |bytes| {
+                        frames.push(Frame::decode(bytes)?);
+                        Ok(())
+                    })?;
+                    Ok::<_, flotilla_schema_sqlite::StoreError>((next, frames))
+                }
+            })
+            .await
+            .expect("engine log round");
+            let (next, frames) = round.expect("engine log");
+            cursor = Some(next);
+            for frame in frames {
+                let Frame::Change(event) = frame else { continue };
+                match (&event.cause, &event.about) {
+                    (Cause::Create, _) if event.kind == MESSAGE => {
+                        created.insert(event.identity(), event.at);
+                    }
+                    (Cause::Edge { edge, .. }, Some(message)) if *edge == RECEIVE => {
+                        if let Some(at) = created.remove(message) {
+                            let micros = event.at.since(at).max(0);
+                            view.turn_delivery.record(Duration::from_micros(micros as u64));
+                            if micros >= 5_000_000 {
+                                tracing::info!(name = %message.name, latency_ms = micros / 1000, "load slow engine message receipt");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     });
 }
@@ -451,6 +538,10 @@ fn load_long_runner_turns() -> u32 {
     env_or("FLOTILLA_LOAD_LONG_RUNNER_TURNS", 5)
 }
 
+fn load_primitives() -> bool {
+    env_or("FLOTILLA_LOAD_PRIMITIVES", false)
+}
+
 fn catalog_forge_url() -> String {
     flotilla_config::dummy_fleet::DEFAULT_DUMMY_FORGE_SERVICE_URL.to_string()
 }
@@ -590,6 +681,16 @@ async fn load_baseline() {
     report.metadata.insert("source_status".into(), source_status);
     report.metadata.insert("source_diff".into(), source_diff);
     report.metadata.insert("dummy_fleet".into(), dummy_fleet_settings());
+    report.metadata.insert("primitives".into(), load_primitives().to_string());
+    report.metadata.insert(
+        "turn_delivery_definition".into(),
+        if load_primitives() {
+            "engine Message creation entry -> AgentSession Receive edge about it (decided store log)"
+        } else {
+            "old-store Message creation_timestamp -> status.resolved_receiver.delivered_at"
+        }
+        .into(),
+    );
     report.metadata.insert("effective_dummy_config".into(), format!("{:?}", fleet.homes[0].fleet.config()));
     report.metadata.insert("host_load_start".into(), load_start.trim().into());
     report
