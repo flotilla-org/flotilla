@@ -1217,7 +1217,7 @@ fn roll_up_crew_work_outcome(
         let all_done = crew.values().all(|state| state.phase == CrewWorkPhase::Done);
         let any_stalled = crew.values().any(|state| state.phase == CrewWorkPhase::Stalled);
         let next_phase = match (work_state.phase, all_done, any_stalled) {
-            (WorkPhase::Running | WorkPhase::Stalled, true, _) => Some(WorkPhase::Complete),
+            (phase, true, _) if !phase.is_terminal() => Some(WorkPhase::Complete),
             (WorkPhase::Running, false, true) => Some(WorkPhase::Stalled),
             (WorkPhase::Stalled, false, false) | (WorkPhase::Complete, false, false) => Some(WorkPhase::Running),
             _ => None,

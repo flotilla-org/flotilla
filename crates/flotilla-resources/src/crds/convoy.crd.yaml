@@ -330,7 +330,7 @@ spec:
                       completion_authority:
                         oneOf:
                           - type: string
-                            enum: [CrewRollup, HumanOverride, Unattributed]
+                            enum: [CrewRollup, HumanOverride, Promises, Unattributed]
                           - type: object
                             required: [Principal]
                             properties:

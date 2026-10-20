@@ -11,9 +11,9 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery::DiscoveryRuntime;
 use flotilla_dummy_fleet::{CrewCommandPort, DaemonCommandPort, DummyFleet};
-use flotilla_protocol::{commands::CommandValue, query::CrewCommandContext, CommandAction};
+use flotilla_protocol::{commands::CommandValue, CommandAction};
 use flotilla_provisioning::reconcilers::ForgeDefaultBranchResolver;
-use flotilla_resources::{Convoy, TerminalAttentionState, Vessel};
+use flotilla_resources::TerminalAttentionState;
 use flotilla_store::ResourceBackend;
 use tracing::warn;
 
@@ -49,19 +49,6 @@ struct DaemonCrewPort {
 
 #[async_trait]
 impl CrewCommandPort for DaemonCrewPort {
-    async fn completion_ready(&self, context: &CrewCommandContext) -> Result<bool, String> {
-        let namespace = context.namespace.as_deref().ok_or("missing namespace")?;
-        let convoy = context.convoy.as_deref().ok_or("missing convoy")?;
-        let vessel_ref = context.vessel_ref.as_deref().ok_or("missing vessel")?;
-        let role = context.role.as_deref().ok_or("missing role")?;
-        let vessel = self.backend.clone().using::<Vessel>(namespace).get(vessel_ref).await.map_err(|e| e.to_string())?;
-        let convoy = self.backend.clone().using::<Convoy>(namespace).get(convoy).await.map_err(|e| e.to_string())?;
-        Ok(convoy
-            .status
-            .as_ref()
-            .is_some_and(|status| flotilla_resources::promises::pending(status, &vessel.spec.vessel_name, role).is_empty()))
-    }
-
     async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
         self.commands.execute(action).await
     }

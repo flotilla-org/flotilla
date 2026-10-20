@@ -1116,6 +1116,9 @@ pub struct LandingTurn {
 
 impl LandingEntry {
     pub fn reason(&self) -> String {
+        if self.claims.is_empty() {
+            return "crew promises kept or retracted".into();
+        }
         self.claims
             .iter()
             .map(|claim| {
@@ -1587,6 +1590,7 @@ pub enum WorkCompletionAuthority {
     #[default]
     CrewRollup,
     HumanOverride,
+    Promises,
     Principal(PrincipalRef),
     Unattributed,
 }
@@ -1614,8 +1618,8 @@ pub struct CrewWorkState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_follow_up: Option<flotilla_protocol::ResourceRef>,
     pub phase: CrewWorkPhase,
-    /// Authority that terminalized this role on convoy abandonment.
-    /// Defaults to crew rollup, matching vessel work. Keep this default while
+    /// Authority for this role's terminal state, including promise settlement
+    /// and convoy abandonment. Defaults to crew rollup, matching vessel work. Keep this default while
     /// serialization omits CrewRollup; it also decodes prior records (ADR 0047).
     #[builder(default)]
     #[serde(default, skip_serializing_if = "WorkCompletionAuthority::is_crew_rollup")]
@@ -1662,9 +1666,9 @@ pub struct CrewWorkState {
     /// producers migrate onto the evidence-backed protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_evidence: Option<SettlementClaimEvidence>,
-    /// Last refused settlement claim. The default decodes previous-generation
-    /// statuses and can be removed one fleet roll after this field lands.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Decode retired refusal records for one generation after #3586.
+    /// Never write them; promise settlement has no claim refusal path.
+    #[serde(default, skip_serializing)]
     pub completion_refusal: Option<CrewCompletionRefusal>,
 }
 
@@ -1893,6 +1897,11 @@ pub enum ConvoyStatusPatch {
         authority: WorkCompletionAuthority,
         reason: String,
     },
+    DeriveCrewDone {
+        vessel: String,
+        role: String,
+        at: DateTime<Utc>,
+    },
     MarkCrewCompleted {
         vessel: String,
         role: String,
@@ -1903,13 +1912,6 @@ pub enum ConvoyStatusPatch {
         decision_ledger_digest: Option<String>,
         completed_while_crew_active: bool,
         forced_by: Option<PrincipalRef>,
-    },
-    RefuseCrewCompletion {
-        vessel: String,
-        role: String,
-        expectation: String,
-        causes: Vec<CrewCompletionRefusalCause>,
-        message: Option<String>,
     },
     MarkCrewFailed {
         vessel: String,
@@ -2372,6 +2374,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.finished_at = Some(*finished_at);
                 let actor = match authority {
                     WorkCompletionAuthority::CrewRollup => "crew rollup".to_string(),
+                    WorkCompletionAuthority::Promises => "promises".to_string(),
                     WorkCompletionAuthority::HumanOverride => "human override".to_string(),
                     WorkCompletionAuthority::Principal(principal) => principal.name.clone(),
                     WorkCompletionAuthority::Unattributed => "unattributed".to_string(),
@@ -2391,6 +2394,34 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
                 clear_operator_pending_brief(status);
             }
+            Self::DeriveCrewDone { vessel, role, at } => {
+                if status.phase.is_terminal() {
+                    return;
+                }
+                let held = promises::owned(status, vessel, role);
+                if held.is_empty() || held.iter().any(|promise| !promise.state.terminal()) {
+                    return;
+                }
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    if state.phase.is_terminal() {
+                        // Promise settlement may precede recovery from Pending or
+                        // Interrupted. Enter Landing once the convoy becomes Active.
+                        if state.phase == CrewWorkPhase::Done && state.completion_authority == WorkCompletionAuthority::Promises {
+                            enter_landing_if_completion_claims_settled(status, *at);
+                        }
+                        return;
+                    }
+                    state.phase = CrewWorkPhase::Done;
+                    state.completion_authority = WorkCompletionAuthority::Promises;
+                    state.finished_at = None;
+                    state.message = None;
+                    state.completion_turn = None;
+                    state.completion_refusal = None;
+                }
+                clear_nudge_budget(status, vessel, role);
+                clear_stall_for_crew(status, vessel, role);
+                enter_landing_if_completion_claims_settled(status, *at);
+            }
             Self::MarkCrewCompleted {
                 vessel,
                 role,
@@ -2402,7 +2433,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 completed_while_crew_active,
                 forced_by,
             } => {
-                if !promises::pending(status, vessel, role).is_empty() {
+                if forced_by.is_none() && !promises::pending(status, vessel, role).is_empty() {
                     return;
                 }
                 clear_nudge_budget(status, vessel, role);
@@ -2443,35 +2474,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
                 clear_stall_for_crew(status, vessel, role);
                 enter_landing_if_completion_claims_settled(status, *finished_at);
-            }
-            Self::RefuseCrewCompletion { vessel, role, expectation, causes, message } => {
-                clear_nudge_budget(status, vessel, role);
-                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
-                    let new_expectation = state.completion_refusal.as_ref().is_none_or(|prior| prior.expectation != *expectation);
-                    let consecutive_count = state
-                        .completion_refusal
-                        .as_ref()
-                        .filter(|prior| prior.expectation == *expectation)
-                        .map_or(1, |prior| prior.consecutive_count.saturating_add(1));
-                    state.completion_refusal = Some(
-                        CrewCompletionRefusal::builder()
-                            .expectation(expectation.clone())
-                            .causes(causes.clone())
-                            .consecutive_count(consecutive_count)
-                            .maybe_message(message.clone())
-                            .build(),
-                    );
-                    if new_expectation
-                        && status.stalled.as_ref().is_some_and(|stalled| {
-                            stalled.leaves.iter().any(|leaf| {
-                                matches!(&leaf.address, LeafAddress::Work { work, .. } if work == vessel)
-                                    && leaf.field_path == format!(".crew.{role}.phase")
-                            })
-                        })
-                    {
-                        status.stalled = None;
-                    }
-                }
             }
             Self::MarkCrewFailed { vessel, role, finished_at, message } => {
                 if let Some(work) = status.work.get_mut(vessel) {
@@ -2883,20 +2885,23 @@ fn preceding_turn(status: &ConvoyStatus, vessel: &str, role: &str, claimed_at: D
         .map(|(_, turn)| turn)
 }
 
-fn enter_landing_if_completion_claims_settled(status: &mut ConvoyStatus, entered_at: DateTime<Utc>) {
+fn ready_for_landing(status: &ConvoyStatus) -> bool {
     if status.phase != ConvoyPhase::Active || status.work.is_empty() {
-        return;
+        return false;
     }
 
-    let all_work_claimed_complete = status.work.iter().all(|(work, state)| {
+    status.work.iter().all(|(work, state)| {
         state.phase == WorkPhase::Complete
             || (state.completion_authority == WorkCompletionAuthority::CrewRollup
                 && status
                     .crew_work
                     .get(work)
                     .is_some_and(|crew| !crew.is_empty() && crew.values().all(|member| member.phase == CrewWorkPhase::Done)))
-    });
-    if all_work_claimed_complete {
+    })
+}
+
+fn enter_landing_if_completion_claims_settled(status: &mut ConvoyStatus, entered_at: DateTime<Utc>) {
+    if ready_for_landing(status) {
         // Preserve the prior entry while work is reopened; a new completion
         // edge replaces it and starts a fresh event/settlement receipt.
         status.landing_entry = Some(LandingEntry {
@@ -2908,19 +2913,30 @@ fn enter_landing_if_completion_claims_settled(status: &mut ConvoyStatus, entered
                     let mut claims = Vec::new();
                     if work.completion_authority == WorkCompletionAuthority::CrewRollup {
                         if let Some(crew) = status.crew_work.get(vessel) {
-                            claims.extend(crew.iter().filter(|(_, member)| member.phase == CrewWorkPhase::Done).map(|(role, member)| {
-                                LandingClaim {
-                                    vessel: vessel.clone(),
-                                    role: role.clone(),
-                                    claimed_at: member.finished_at,
-                                    message: member.message.clone(),
-                                    completed_while_crew_active: member.completed_while_crew_active,
-                                    preceding_turn: member.completion_turn.clone(),
-                                }
-                            }));
+                            claims.extend(
+                                crew.iter()
+                                    .filter(|(_, member)| {
+                                        member.phase == CrewWorkPhase::Done
+                                            && member.completion_authority != WorkCompletionAuthority::Promises
+                                    })
+                                    .map(|(role, member)| LandingClaim {
+                                        vessel: vessel.clone(),
+                                        role: role.clone(),
+                                        claimed_at: member.finished_at,
+                                        message: member.message.clone(),
+                                        completed_while_crew_active: member.completed_while_crew_active,
+                                        preceding_turn: member.completion_turn.clone(),
+                                    }),
+                            );
                         }
                     }
-                    if claims.is_empty() {
+                    let derived = work.completion_authority == WorkCompletionAuthority::CrewRollup
+                        && status.crew_work.get(vessel).is_some_and(|crew| {
+                            crew.values().any(|member| {
+                                member.phase == CrewWorkPhase::Done && member.completion_authority == WorkCompletionAuthority::Promises
+                            })
+                        });
+                    if claims.is_empty() && !derived {
                         claims.push(LandingClaim {
                             vessel: vessel.clone(),
                             role: WORK_OVERRIDE_ROLE.to_string(),

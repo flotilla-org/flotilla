@@ -322,7 +322,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             assert!(message.is_none());
             let messages = backend.using::<flotilla_resources::Message>("flotilla");
             let nudge = messages.list().await.expect("nudges").items.remove(0);
-            assert!(nudge.spec.body.contains("You owe a settlement claim for work/coder"));
+            assert!(nudge.spec.body.contains("You owe deliverables for work/coder"));
             assert!(matches!(nudge.spec.expectation, flotilla_resources::MessageExpectation::Outcome { .. }));
             assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
             for (cooldown_seconds, desired_rung) in [(1, StallRung::Nudge), (2, StallRung::Operator)] {

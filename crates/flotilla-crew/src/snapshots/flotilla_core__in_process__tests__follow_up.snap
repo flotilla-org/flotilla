@@ -1,7 +1,7 @@
 ---
-source: crates/flotilla-core/src/in_process/tests.rs
+source: crates/flotilla-crew/src/crew_ops/tests.rs
 expression: "frame_crew_message(&sender, \"Example message.\")"
 ---
-[operator robert · follow-up brief · reply by running `crew complete`]
+[operator robert · follow-up brief · submit your deliverables; your part ends when your promises are kept]
 
 Example message.

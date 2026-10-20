@@ -1190,7 +1190,7 @@ impl RemoteCommandRouter {
 
     async fn finish_crew_completion(&self, completion: PendingCrewCompletionRoute, result: &CommandValue) {
         match result {
-            CommandValue::Ok | CommandValue::Error { .. } => {
+            CommandValue::Ok | CommandValue::CrewCompletionAdvisory { .. } | CommandValue::Error { .. } => {
                 if let Err(error) = self.daemon.clear_crew_completion_pending(&completion.namespace, &completion.session_name).await {
                     tracing::warn!(session = %completion.session_name, %error, "failed to clear acknowledged crew completion");
                 }

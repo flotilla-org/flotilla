@@ -1321,6 +1321,13 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::CrewEscalated { receiver } => format!("escalated to {receiver}"),
         CommandValue::CrewEscalationRefused { rung, reason } => format!("escalation refused at {rung} rung: {reason}"),
         CommandValue::CrewFollowUpDelivered => flotilla_protocol::commands::CREW_FOLLOW_UP_INSTRUCTION.to_string(),
+        CommandValue::CrewCompletionAdvisory { pending } => {
+            if pending.is_empty() {
+                "Your part ends when your promises are kept or retracted.".into()
+            } else {
+                format!("Pending promises:\n{}", pending.join("\n"))
+            }
+        }
         CommandValue::CrewCompletionWaiting { reason, retry_at } => format!("crew completion waiting until {retry_at}: {reason}"),
         CommandValue::ResourceReconciled { message, .. } => message.clone(),
         CommandValue::ConvoyBriefDelivered { displaced: Some(displaced) } => {

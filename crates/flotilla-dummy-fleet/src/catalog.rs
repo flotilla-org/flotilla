@@ -53,13 +53,24 @@ impl CrewMix {
         let repository = DUMMY_REPOSITORY.to_string();
         let (vessel, crew) = match self {
             Self::Coder => ("implement", vec![crew("coder", CrewScript::Coder { reviewer: None, repository })]),
-            Self::CoderReviewer => (
-                "implement",
-                vec![
-                    crew("coder", CrewScript::Coder { reviewer: Some("reviewer".into()), repository }),
-                    crew("reviewer", CrewScript::Responder { reply_to: "coder".into() }),
-                ],
-            ),
+            Self::CoderReviewer => {
+                // A review request retains the coder's PR responsibility.
+                // Same-vessel handoff transfers promises; use a separate review
+                // vessel for the peer's own ledger and review responsibility.
+                return WorkflowTemplateSpec::builder()
+                    .exit(ExitDeclaration::standard_table())
+                    .vessels(vec![
+                        VesselRequirement::builder()
+                            .name("implement".into())
+                            .crew(vec![crew("coder", CrewScript::Coder { reviewer: Some("review:reviewer".into()), repository })])
+                            .build(),
+                        VesselRequirement::builder()
+                            .name("review".into())
+                            .crew(vec![crew("reviewer", CrewScript::Responder { reply_to: "implement:coder".into() })])
+                            .build(),
+                    ])
+                    .build();
+            }
             Self::CoderSupervisor => {
                 return WorkflowTemplateSpec::builder()
                     .exit(ExitDeclaration::standard_table())
@@ -75,13 +86,21 @@ impl CrewMix {
                     ])
                     .build();
             }
-            Self::LongRunner => (
-                "govern",
-                vec![
-                    crew("governor", CrewScript::Governor { aide: "aide".into(), turns: long_runner_turns }),
-                    crew("aide", CrewScript::Responder { reply_to: "governor".into() }),
-                ],
-            ),
+            Self::LongRunner => {
+                return WorkflowTemplateSpec::builder()
+                    .exit(ExitDeclaration::standard_table())
+                    .vessels(vec![
+                        VesselRequirement::builder()
+                            .name("govern".into())
+                            .crew(vec![crew("governor", CrewScript::Governor { aide: "assist:aide".into(), turns: long_runner_turns })])
+                            .build(),
+                        VesselRequirement::builder()
+                            .name("assist".into())
+                            .crew(vec![crew("aide", CrewScript::Responder { reply_to: "govern:governor".into() })])
+                            .build(),
+                    ])
+                    .build();
+            }
         };
         WorkflowTemplateSpec::builder()
             .exit(ExitDeclaration::standard_table())
@@ -93,6 +112,8 @@ impl CrewMix {
 fn crew(role: &str, script: CrewScript) -> CrewSpec {
     CrewSpec::builder()
         .role(role.to_string())
+        .deliverer(matches!(&script, CrewScript::Coder { .. }))
+        .promises(vec![flotilla_resources::TemplatePromise::decision_ledger(role)])
         .source(CrewSource::Agent {
             selector: Selector { capability: "coding".into(), adapter: Some(DUMMY_AGENT_ADAPTER.into()), model: None },
             prompt: Some(format!("Dummy crew `{role}`.\n{SCRIPT_LINE_PREFIX} {}", script.render())),
@@ -175,7 +196,7 @@ mod tests {
         let vessel = workflow.vessels.iter().find(|vessel| vessel.name == "supervise").expect("supervisor vessel");
         assert!(vessel.starts_eagerly(0));
         assert_eq!(vessel.crew[0].role, "governor");
-        assert!(vessel.crew[0].promises.is_empty());
+        assert_eq!(vessel.crew[0].promises, vec![flotilla_resources::TemplatePromise::decision_ledger("governor")]);
         assert!(vessel.crew[0].completion_conditions.is_empty());
         let CrewSource::Agent { prompt: Some(prompt), .. } = &vessel.crew[0].source else { panic!("agent prompt") };
         assert!(matches!(CrewScript::from_brief(prompt, 1).unwrap(), CrewScript::Responder { .. }));

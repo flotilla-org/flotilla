@@ -49,7 +49,7 @@ pub struct CliListResponse {
 }
 
 pub const CREW_FOLLOW_UP_INSTRUCTION: &str =
-    "Completion received, but a follow-up brief was delivered. Address it and run `flotilla crew complete` again when done.";
+    "A follow-up brief was delivered. Address it and submit your deliverables; your part ends when your promises are kept.";
 #[cfg(test)]
 use crate::{qualified_path::HostId, EnvironmentId};
 
@@ -1278,7 +1278,7 @@ impl Command {
             CommandAction::ConvoyWithdrawPendingBrief { .. } => "Withdrawing pending convoy brief...",
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
             CommandAction::CrewPromise { .. } => "Updating crew promises...",
-            CommandAction::CrewComplete { .. } => "Completing crew work...",
+            CommandAction::CrewComplete { .. } => "Inspecting crew promises...",
             CommandAction::CrewFail { .. } => "Failing crew work...",
             CommandAction::CrewStall { .. } => "Stalling crew work...",
             CommandAction::CrewSupervise { .. } => "Supervising crew work...",
@@ -1387,6 +1387,10 @@ pub enum CommandValue {
     },
     Ok,
     CrewFollowUpDelivered,
+    /// Advisory only: promise settlement is reconciled independently.
+    CrewCompletionAdvisory {
+        pending: Vec<String>,
+    },
     /// The named receiver admitted the next supervision obligation.
     CrewEscalated {
         receiver: String,
@@ -1858,6 +1862,7 @@ mod tests {
         let cases = vec![
             CommandValue::Ok,
             CommandValue::CrewFollowUpDelivered,
+            CommandValue::CrewCompletionAdvisory { pending: vec!["template/pr: waiting on PR merge".into()] },
             CommandValue::CrewCompletionWaiting {
                 reason: "GitHub secondary limit".into(),
                 retry_at: "2026-10-03T09:21:59Z".parse().expect("retry deadline"),

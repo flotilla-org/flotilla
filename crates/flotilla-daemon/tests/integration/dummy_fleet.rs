@@ -278,9 +278,15 @@ async fn a_lone_coder_keeps_its_change_request_promise_and_lands() {
     let snapshot = fleet.deliver("lone-coder", CrewMix::Coder).await;
     assert_eq!((snapshot.crews_completed, snapshot.change_requests_opened, snapshot.crews_failed), (1, 1, 0));
     let convoy = fleet.convoy("lone-coder").await.expect("convoy");
-    let promises = convoy.status.expect("status").promises;
-    let promise = promises.get("implement").and_then(|roles| roles.get("coder")).and_then(|promises| promises.first()).expect("pr promise");
+    let status = convoy.status.expect("status");
+    let promises = &status.promises["implement"]["coder"];
+    let promise = promises.iter().find(|p| p.kind == flotilla_resources::promises::PromiseKind::Pr).expect("pr promise");
     assert_eq!(promise.state, flotilla_resources::promises::PromiseState::Kept);
+    assert_eq!(promise.id, "template/pr");
+    assert_eq!(promise.source, flotilla_resources::promises::PromiseSource::Template);
+    let done = &status.crew_work["implement"]["coder"];
+    assert_eq!(done.completion_authority, flotilla_resources::WorkCompletionAuthority::Promises);
+    assert!(done.finished_at.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -289,6 +295,11 @@ async fn a_reviewed_coder_lands_after_its_reviewer_answers() {
     let snapshot = fleet.deliver("reviewed-coder", CrewMix::CoderReviewer).await;
     assert_eq!(snapshot.crews_completed, 2, "{snapshot:?}");
     assert_eq!(snapshot.turns_received, 2, "the review request and its answer are delivered turns: {snapshot:?}");
+    let status = fleet.convoy("reviewed-coder").await.unwrap().status.unwrap();
+    let pr = status.promises["implement"]["coder"].iter().find(|p| p.kind == flotilla_resources::promises::PromiseKind::Pr).unwrap();
+    assert_eq!(pr.id, "template/pr");
+    assert_eq!(pr.state, flotilla_resources::promises::PromiseState::Kept);
+    assert!(status.crew_work.values().flat_map(|crew| crew.values()).all(|work| work.phase == CrewWorkPhase::Done));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -359,12 +370,18 @@ async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
     let fleet = DummyDaemon::start(SCENARIO_AGENT, "").await;
     let workflows = fleet.backend().using::<WorkflowTemplate>(NAMESPACE);
     let workflow = workflows.get(CrewMix::LongRunner.workflow_name()).await.expect("workflow");
+    // Isolate the legacy same-vessel hand-back path. Normal peer tasks retain
+    // their separate responsibilities on distinct vessels in the load catalog.
+    let mut same_vessel = CrewMix::LongRunner.workflow(0);
+    let mut aide = same_vessel.vessels.pop().unwrap();
+    same_vessel.vessels[0].crew.append(&mut aide.crew);
+    for crew in &mut same_vessel.vessels[0].crew {
+        if let flotilla_resources::CrewSource::Agent { prompt: Some(prompt), .. } = &mut crew.source {
+            *prompt = prompt.replace("assist:aide", "aide").replace("govern:governor", "governor");
+        }
+    }
     workflows
-        .update(
-            &InputMeta::builder().name(workflow.metadata.name.clone()).build(),
-            &workflow.metadata.resource_version,
-            &CrewMix::LongRunner.workflow(0),
-        )
+        .update(&InputMeta::builder().name(workflow.metadata.name.clone()).build(), &workflow.metadata.resource_version, &same_vessel)
         .await
         .expect("zero-task governor");
     fleet.dispatch("late-handoff", CrewMix::LongRunner).await;
@@ -406,13 +423,25 @@ async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
         })
         .await;
     assert_eq!(handed_off, CommandValue::Ok);
-    fleet.execute(CommandAction::CrewComplete { context, message: None, disposition: None, decision_ledger_ref: None, force: false }).await;
+    // The artificial sender is HandedBack, a terminal phase excluded from
+    // derived Done. Keep this legacy handoff fixture's explicit operator override.
+    assert_eq!(
+        fleet
+            .execute_as_operator(CommandAction::CrewComplete {
+                context,
+                message: None,
+                disposition: None,
+                decision_ledger_ref: None,
+                force: true,
+            })
+            .await,
+        CommandValue::Ok
+    );
     let landed = fleet.wait_for_phase("late-handoff", ConvoyPhase::Landed).await;
     assert_eq!(fleet.fleet.snapshot().turns_received, before.turns_received + 1, "the reopened governor receives the handoff turn");
-    assert!(
-        landed.status.expect("status").crew_work["govern"]["governor"].finished_at
-            > convoy.status.expect("status").crew_work["govern"]["governor"].finished_at,
-        "the governor reports again after the handoff"
+    assert_eq!(
+        landed.status.expect("status").crew_work["govern"]["governor"].completion_authority,
+        flotilla_resources::WorkCompletionAuthority::Promises
     );
 }
 

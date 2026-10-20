@@ -135,7 +135,7 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
     for (vessel, role, operation) in declarations {
         flotilla_resources::promises::apply(&mut promised, &vessel, &role, &operation);
     }
-    assert_eq!(flotilla_resources::promises::pending(&promised, "work", "coder"), vec!["template/decision-ledger"]);
+    assert_eq!(flotilla_resources::promises::pending(&promised, "work", "coder"), vec!["template/pr", "template/decision-ledger"]);
     assert_eq!(flotilla_resources::promises::pending(&promised, "work", "reviewer"), vec!["template/decision-ledger"]);
     assert!(missing.iter().any(|expectation| matches!(expectation, UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, .. } if subject.starts_with("cr/"))));
     // #2211: a bound PR with no observation carries its typed identity, not a prose hint.
@@ -157,7 +157,7 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
     ) {
         patch.apply(&mut promised);
     }
-    assert!(flotilla_resources::promises::pending(&promised, "work", "coder").is_empty());
+    assert_eq!(flotilla_resources::promises::pending(&promised, "work", "coder"), vec!["template/pr"]);
     assert_eq!(flotilla_resources::promises::pending(&promised, "work", "reviewer"), vec!["template/decision-ledger"]);
     let mut unbound = convoy.clone();
     unbound.spec.change_request = None;
@@ -3614,11 +3614,15 @@ fn settlement_transition(patch: Option<ConvoyStatusPatch>) -> Option<ConvoyStatu
 }
 
 // ADR 0061 / #2979: the first merged PR must not settle a three-PR crew.
-// Duplicate claims remain refused after each partial merge; landing retains all
-// promise states and submission evidence, even when observations are collected.
+// Duplicate reconciliation cannot settle after a partial merge; Landing retains
+// all promise states and submission evidence without any completion command.
 #[hegel::test]
 fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
     use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission};
+    // Span settlement before launch, during active work, and after interruption.
+    let envelope = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2));
+    let interrupted = envelope == 1;
+    let pending = envelope == 2;
     let duplicates = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -3627,8 +3631,16 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
         let mut workflow = implement_review_workflow_spec();
         workflow.vessels[0].crew.retain(|crew| crew.role == "coder");
         workflow.vessels[0].crew[0].completion_conditions.clear();
+        workflow.vessels[0].crew[0].promises.clear();
+        workflow.vessels[0].crew[0].deliverer = false;
         let mut status = ConvoyStatus {
-            phase: ConvoyPhase::Active,
+            phase: if pending {
+                ConvoyPhase::Pending
+            } else if interrupted {
+                ConvoyPhase::Interrupted
+            } else {
+                ConvoyPhase::Active
+            },
             observed_workflow_ref: Some("review-and-fix".into()),
             workflow_snapshot: Some(WorkflowSnapshot {
                 cascade: None,
@@ -3638,10 +3650,32 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
                 turn_delivery: workflow.turn_delivery,
                 vessels: workflow.vessels,
             }),
-            work: BTreeMap::from([("work".into(), flotilla_resources::WorkState::builder().phase(WorkPhase::Running).build())]),
+            work: BTreeMap::from([(
+                "work".into(),
+                flotilla_resources::WorkState::builder()
+                    .phase(if pending {
+                        WorkPhase::Ready
+                    } else if interrupted {
+                        WorkPhase::Interrupted
+                    } else {
+                        WorkPhase::Running
+                    })
+                    .build(),
+            )]),
             crew_work: BTreeMap::from([(
                 "work".into(),
-                BTreeMap::from([("coder".into(), flotilla_resources::CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                BTreeMap::from([(
+                    "coder".into(),
+                    flotilla_resources::CrewWorkState::builder()
+                        .phase(if pending {
+                            CrewWorkPhase::Pending
+                        } else if interrupted {
+                            CrewWorkPhase::Interrupted
+                        } else {
+                            CrewWorkPhase::Working
+                        })
+                        .build(),
+                )]),
             )]),
             ..Default::default()
         };
@@ -3702,7 +3736,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
             )
             .await
             .unwrap();
-            for _ in 0..3 {
+            for _ in 0..16 {
                 let current = convoys.get("three-pr").await.unwrap();
                 let prepared = reconciler.prepare(&current).await.unwrap();
                 if let Some(patch) = reconciler.reconcile(&current, &prepared, timestamp(55)).patch {
@@ -3713,25 +3747,18 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
             let promises = &current.status.as_ref().unwrap().promises["work"]["coder"];
             assert_eq!(promises.iter().filter(|p| p.state == PromiseState::Kept).count(), number as usize);
             for _ in 0..duplicates {
-                flotilla_store::apply_status_patch(
-                    &convoys,
-                    "three-pr",
-                    &external_patches::mark_crew_completed_with_context(
-                        "work".into(),
-                        "coder".into(),
-                        timestamp(60),
-                        None,
-                        None,
-                        None,
-                        Some("ledger-digest".into()),
-                        true,
-                        None,
-                    ),
-                )
-                .await
-                .unwrap();
                 let current = convoys.get("three-pr").await.unwrap();
-                assert_eq!(current.status.as_ref().unwrap().phase, if number == 3 { ConvoyPhase::Landing } else { ConvoyPhase::Active });
+                let prepared = reconciler.prepare(&current).await.unwrap();
+                if let Some(patch) = reconciler.reconcile(&current, &prepared, timestamp(55)).patch {
+                    flotilla_store::apply_status_patch(&convoys, "three-pr", &patch).await.unwrap();
+                }
+                let current = convoys.get("three-pr").await.unwrap();
+                let phase = current.status.as_ref().unwrap().phase;
+                if number < 3 {
+                    assert_eq!(phase, if interrupted { ConvoyPhase::Interrupted } else { ConvoyPhase::Active });
+                } else {
+                    assert!(matches!(phase, ConvoyPhase::Landing | ConvoyPhase::Landed));
+                }
                 let evidence = evaluate_landing_settlement(
                     &current,
                     &BTreeMap::new(),

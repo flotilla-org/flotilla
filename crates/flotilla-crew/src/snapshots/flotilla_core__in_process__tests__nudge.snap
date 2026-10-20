@@ -1,7 +1,7 @@
 ---
-source: crates/flotilla-core/src/in_process/tests.rs
+source: crates/flotilla-crew/src/crew_ops/tests.rs
 expression: "frame_crew_message(&sender, \"Example message.\")"
 ---
-[flotilla · nudge · reply by running `crew complete` or `crew stall`]
+[flotilla · nudge · submit your deliverables or report a stall]
 
 Example message.

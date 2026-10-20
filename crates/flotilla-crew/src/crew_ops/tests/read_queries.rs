@@ -195,8 +195,8 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
         let reads = assert_flat_reads([0, 32], |unrelated| request_reads(request, unrelated as u64)).await;
         reads.assert_within(&budget, request);
         if request == "complete" {
-            assert_eq!(reads.calls("ChangeRequest", Query), 1);
-            assert_eq!(reads.calls("Artifact", Query), 1);
+            assert_eq!(reads.calls("ChangeRequest", Query), 0);
+            assert_eq!(reads.calls("Artifact", Query), 0);
         }
     }
 }
@@ -204,7 +204,7 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
 // Completion evidence prefers a local Artifact over the same name from any
 // replica origin. Query ordering must not change the durable ledger digest.
 #[tokio::test]
-async fn completion_prefers_local_artifact_evidence() {
+async fn completion_advisory_does_not_write_claim_evidence() {
     let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
     create_vessel(&backend).await;
     let name = flotilla_resources::address::record_name(
@@ -242,7 +242,7 @@ async fn completion_prefers_local_artifact_evidence() {
         .expect("replica artifact");
     crew.complete(&command_context(), None, None, Some("https://example.test/ledger".into()), false, None).await.expect("complete");
     let convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
-    assert_eq!(convoy.status.expect("status").crew_work["work"]["coder"].decision_ledger_digest.as_deref(), Some("local-digest"));
+    assert!(convoy.status.expect("status").crew_work["work"]["coder"].decision_ledger_digest.is_none());
 }
 
 // A completion waiting for the per-convoy lock must observe the caller's

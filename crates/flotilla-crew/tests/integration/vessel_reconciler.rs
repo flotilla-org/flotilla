@@ -2413,7 +2413,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     assert!(brief.content.contains("- `coder`: active"));
     assert!(brief.content.contains("- `reviewer`: latent"));
     assert!(brief.content.contains("flotilla crew reviewer handoff --message"));
-    assert!(brief.content.contains("flotilla crew complete"));
+    assert!(brief.content.contains("flotilla crew submit"));
     assert!(brief.content.contains("- Minted credential repository scope:"));
     assert!(brief.content.contains(&format!("  - `github-app`:\n    - `{repo_ref}` — {REPO_URL}")));
     assert!(brief.content.contains("park the verified commit"));

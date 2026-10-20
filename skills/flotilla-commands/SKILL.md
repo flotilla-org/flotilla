@@ -56,11 +56,12 @@ explicit `--promise` submissions to bind that PR to the intended declarations;
 all promises for the merged PR become kept.
 
 Retract your own crew-sourced promise with
-`flotilla crew retract --promise IDENTIFIER --reason REASON`. Retraction of a
-workflow- or dispatch-sourced promise proposes retraction through a stall for
-its supplier to decide. Inspect `convoy list` counts and `convoy explain` history.
+`flotilla crew retract --promise IDENTIFIER --reason REASON` while it has no
+submissions. Once anything has been submitted, or for a template or dispatch
+promise, retraction proposes a stall for the supplier to decide.
 
-`crew complete` is a separate settlement claim and needs no deliverable
-reference. It refuses while any of your promises is open or submitted. After a
-PR merges, continue the remaining promises; submit the ledger and complete only
-when every promise is kept or retracted.
+Deliverers receive a template `pr` promise at admission. Submit your PR and
+ledger; your part ends when every promise is kept or retracted. A role holding
+no promises is never automatically Done. `crew complete` is advisory for one
+generation: it discovers PR URLs in its message and reports pending promises
+without claiming completion or refusing. `--force` remains the operator override.

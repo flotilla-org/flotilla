@@ -116,39 +116,6 @@ fn missing_turn_hook_is_visible_and_recovers(tc: hegel::TestCase) {
     });
 }
 
-// #2211: typed causes and PR identity select remedies regardless of explanation wording.
-#[hegel::test]
-fn refusal_remedies_ignore_explanation_wording(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-
-    // Cover both remedies, empty/legacy cause lists, duplicates, combined causes,
-    // misleading old matcher phrases, and PR numbers across the u64 boundaries.
-    let number = tc.draw(gs::integers::<u64>());
-    let variant = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
-    let conflict =
-        CrewCompletionRefusalCause::ConflictingChangeRequest { service: "github.com".into(), scope: "owner/repo".into(), number };
-    let missing =
-        CrewCompletionRefusalCause::MissingChangeRequestObservation { service: "forge.example".into(), scope: "other/repo".into(), number };
-    let causes = match variant {
-        0 => vec![],
-        1 => vec![conflict.clone()],
-        2 => vec![missing.clone()],
-        3 => vec![missing, conflict.clone()],
-        _ => vec![conflict.clone(), conflict],
-    };
-    let expected = match variant {
-        0 => "Resolve the unmet expectation".to_string(),
-        2 => format!("PR #{number} has no observation yet"),
-        _ => format!("PR #{number} is conflicting"),
-    };
-    for text in ["", "different human explanation", "no federated observation; could not observe PR 42; cr/github.com/owner/repo/42"] {
-        let refusal = CrewCompletionRefusal::builder().expectation(text.into()).causes(causes.clone()).consecutive_count(1).build();
-        let brief = super::refusal_nudge_brief(&refusal);
-        assert!(brief.contains(&expected), "{brief}");
-        assert!(brief.contains("flotilla crew complete"));
-    }
-}
-
 // A real crew stall resolves the supervision topic through an unoccupied
 // parent and publishes exactly one intent to the fleet's declared holder.
 #[tokio::test]
@@ -252,10 +219,10 @@ async fn subscribed_fleet_holder_receives_stall_through_empty_parent() {
     assert_eq!(requests[0].role, "guide");
 }
 
-// #2211: both typed remedies survive durable status restoration and reach an
-// idle crew even when the explanation omits all former matcher phrases.
+// #3586: decoded legacy refusals neither customize nudges nor escalate, even
+// at the former refusal threshold. Normal actor inactivity policy still applies.
 #[tokio::test]
-async fn stored_refusal_nudges_use_typed_causes_after_restore() {
+async fn stored_refusals_do_not_change_nudges_after_restore() {
     for (cause, remedy) in [
         (
             CrewCompletionRefusalCause::ConflictingChangeRequest { service: "github.com".into(), scope: "owner/repo".into(), number: 42 },
@@ -278,11 +245,15 @@ async fn stored_refusal_nudges_use_typed_causes_after_restore() {
             CrewCompletionRefusal::builder()
                 .expectation("Presentation wording changed".into())
                 .causes(vec![cause])
-                .consecutive_count(1)
+                .consecutive_count(2)
                 .build(),
         );
-        let stored = serde_json::to_vec(&status).expect("store status");
-        let restored = serde_json::from_slice(&stored).expect("restore status");
+        // Construct the previous writer's shape: the new writer omits refusals.
+        let mut stored = serde_json::to_value(&status).expect("store status");
+        stored["crew_work"]["work"]["coder"]["completion_refusal"] =
+            serde_json::to_value(&status.crew_work["work"]["coder"].completion_refusal).unwrap();
+        let restored: flotilla_resources::ConvoyStatus = serde_json::from_value(stored).expect("restore status");
+        assert!(restored.crew_work["work"]["coder"].completion_refusal.is_some());
         convoys.update_status("stalled-work", &convoy.metadata.resource_version, &restored).await.expect("persist refusal");
         let start = Utc::now();
         for second in [0, 60, 120, 180] {
@@ -290,8 +261,8 @@ async fn stored_refusal_nudges_use_typed_causes_after_restore() {
         }
         let requests = delivery.requests.lock().expect("deliveries");
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].brief.contains(remedy), "{}", requests[0].brief);
-        assert!(requests[0].brief.contains("Presentation wording changed"));
+        assert!(!requests[0].brief.contains(remedy), "{}", requests[0].brief);
+        assert!(!requests[0].brief.contains("Presentation wording changed"));
     }
 }
 

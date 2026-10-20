@@ -7,16 +7,17 @@ ledger from a file the daemon can read. Keep it outside the repository. Head it
 first. Include at least one decision.
 
 ```sh
+flotilla crew submit --kind pr --reference PR_URL
 flotilla artifact put --kind decision-ledger /tmp/decision-ledger.md
 flotilla convoy CONVOY explain
-flotilla crew complete
 ```
 
-Run completion as the final act after the ledger is accepted and every promise
-is kept or retracted. Submit PR references with `crew submit`; PR promises remain
-submitted until merge. Continue remaining promises after each merge. Completion
-carries no deliverable reference. Supply `--disposition` only when the brief declares a settlement
-answer. Use [settlement order](pr-shepherding.md#settlement-order) for the rationale.
+Submit PR references with `crew submit`; PR promises remain submitted until
+merge. Continue remaining promises after each merge. Your part ends when every
+promise is kept or retracted. A role holding no promises is never automatically
+Done. `crew complete` is advisory: it discovers PR URLs and reports pending
+promises, and `--force` remains the operator override.
+Use [settlement order](pr-shepherding.md#settlement-order) for the rationale.
 
 As the named supervisor, resume the exact stalled obligation with guidance:
 

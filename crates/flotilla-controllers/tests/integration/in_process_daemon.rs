@@ -9463,7 +9463,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
 }
 
 #[tokio::test]
-async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
+async fn crew_completion_advisory_does_not_claim_or_consume_a_follow_up() {
     let (_temp, _repo, daemon) = daemon_for_cwd().await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -9569,80 +9569,12 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
         )
         .await
         .expect("dispatch first completion");
-    assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::CrewFollowUpDelivered);
-
-    let convoy = convoys.get("turn-boundary").await.expect("read convoy");
-    let status = convoy.status.expect("convoy status");
-    assert!(status.pending_brief().is_none());
-    assert_eq!(status.phase, ConvoyPhase::Active);
-    assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-    assert_eq!(status.crew_work["work"]["coder"].superseded_claims[0].disposition.as_deref(), Some("satisfied"));
-    let session = sessions.get("coder-session").await.expect("read crew session");
-    let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("crew session should be agent-backed") };
-    assert!(message.is_none());
-    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.unwrap().items;
-    assert_eq!(records.len(), 1, "completion must not manufacture a second delivery");
-    assert_eq!(records[0].spec.body, "Begin the follow-up turn");
-    assert_eq!(
-        records[0].status.as_ref().unwrap().phase,
-        flotilla_resources::MessagePhase::Accepted,
-        "completion is not input acceptance evidence"
-    );
-    assert!(status.crew_work["work"]["coder"].pending_follow_up.is_none());
-    assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("Begin the follow-up turn"));
-    assert_eq!(status.crew_work["work"]["coder"].superseded_claims[0].message.as_deref(), Some("first turn complete"));
-    assert_eq!(
-        status.crew_work["work"]["coder"].superseded_claims[0].decision_ledger_ref.as_deref(),
-        Some("https://example.test/pull/1#decision-ledger")
-    );
-    let explanation = daemon
-        .execute_query(
-            Command::builder()
-                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: "turn-boundary".to_string() })
-                .build(),
-            uuid::Uuid::new_v4(),
-        )
-        .await
-        .expect("explain convoy");
-    let CommandValue::ConvoyExplanation(explanation) = explanation else { panic!("expected convoy explanation") };
-    assert!(explanation.decision_ledgers.iter().any(|ledger| ledger.superseded
-        && ledger.comment_url.as_deref() == Some("https://example.test/pull/1#decision-ledger")
-        && ledger.message.as_deref() == Some("first turn complete")));
-    let second_id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context,
-                    message: Some("second turn complete".to_string()),
-                    disposition: None,
-                    decision_ledger_ref: Some("https://example.test/pull/1#second-ledger".to_string()),
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect("dispatch second completion");
-    assert_eq!(recv_command_finished(&mut events, second_id).await, CommandValue::Ok);
-    let status = convoys.get("turn-boundary").await.expect("read settled convoy").status.expect("status");
-    assert_eq!(status.phase, ConvoyPhase::Landing);
-    assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
-    let stall_error = daemon
-        .crew_stall_internal(
-            &flotilla_protocol::CrewCommandContext {
-                crew_id: None,
-                namespace: Some("flotilla".to_string()),
-                convoy: Some("turn-boundary".to_string()),
-                vessel_ref: Some("work-vessel".to_string()),
-                role: Some("coder".to_string()),
-            },
-            flotilla_protocol::StallReason::Scope,
-            None,
-            "settlement waits for the change request to merge".to_string(),
-        )
-        .await
-        .expect_err("completed crew cannot stall during landing");
-    assert!(stall_error.contains("already complete") && stall_error.contains("change request"), "{stall_error}");
-    assert_eq!(convoys.get("turn-boundary").await.expect("read convoy after stall").status.expect("status after stall"), status);
+    assert!(matches!(recv_command_finished(&mut events, command_id).await, CommandValue::CrewCompletionAdvisory { .. }));
+    let status = convoys.get("turn-boundary").await.unwrap().status.unwrap();
+    let crew = &status.crew_work["work"]["coder"];
+    assert_eq!(crew.phase, flotilla_resources::CrewWorkPhase::Working);
+    assert!(crew.superseded_claims.is_empty());
+    assert!(crew.finished_at.is_none());
 }
 
 #[tokio::test]
@@ -9691,7 +9623,7 @@ async fn convoy_explain_reports_completed_work_without_a_crew_claim() {
 }
 
 #[tokio::test]
-async fn crew_completion_without_a_decision_ledger_is_refused() {
+async fn crew_completion_reports_pending_promises_without_a_refusal() {
     let (_temp, _repo, daemon) = daemon_for_cwd().await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -9744,8 +9676,14 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
         .await
         .expect("create vessel");
 
+    let admitted = convoys.get("missing-ledger").await.unwrap();
+    for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], admitted.status.as_ref().unwrap()) {
+        apply_status_patch(&convoys, "missing-ledger", &flotilla_resources::ConvoyStatusPatch::Promise { vessel, role, operation })
+            .await
+            .unwrap();
+    }
     let before = convoys.get("missing-ledger").await.expect("read convoy before refusal").status.expect("convoy status before refusal");
-    let error = daemon
+    let advisory = daemon
         .crew_complete_with_disposition_internal(
             &flotilla_protocol::CrewCommandContext {
                 crew_id: None,
@@ -9759,16 +9697,18 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
             None,
         )
         .await
-        .expect_err("refuse completion without a ledger");
-    assert!(error.contains("template/decision-ledger"), "{error}");
+        .expect("advisory exits successfully");
+    assert!(
+        matches!(advisory, CommandValue::CrewCompletionAdvisory { ref pending }
+        if pending.iter().any(|p| p.contains("template/decision-ledger"))),
+        "{advisory:?}"
+    );
 
     let status = convoys.get("missing-ledger").await.expect("read convoy").status.expect("convoy status");
     assert_eq!(status.phase, before.phase);
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-    assert!(status.crew_work["work"]["coder"]
-        .completion_refusal
-        .as_ref()
-        .is_some_and(|refusal| { refusal.consecutive_count == 1 && refusal.expectation.contains("decision-ledger") }));
+    assert!(status.crew_work["work"]["coder"].completion_refusal.is_none());
+    assert!(status.stalled.is_none());
 
     let operator = flotilla_protocol::PrincipalRef { namespace: "flotilla".to_string(), name: "operator".to_string() };
     let mut events = daemon.subscribe();
@@ -9794,11 +9734,11 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
         .await
         .expect("dispatch forced completion");
     let forced = recv_command_finished(&mut events, command_id).await;
-    assert!(matches!(forced, CommandValue::Error { ref message } if message.contains("template/decision-ledger")), "{forced:?}");
+    assert_eq!(forced, CommandValue::Ok);
     let status = convoys.get("missing-ledger").await.unwrap().status.unwrap();
-    assert_eq!(status.phase, ConvoyPhase::Active);
-    assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-    assert!(status.crew_work["work"]["coder"].completion_override.is_none());
+    assert_eq!(status.phase, ConvoyPhase::Landing);
+    assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
+    assert_eq!(status.crew_work["work"]["coder"].completion_override.as_ref().unwrap().principal, operator);
 }
 
 async fn run_identity_command(daemon: &InProcessDaemon, action: CommandAction, selector: RepoSelector) -> CommandValue {
@@ -10416,6 +10356,7 @@ async fn explicit_convoy_name_survives_failed_branch_generation() {
 // preserving the accepted claim all the way through the ordinary reconciler.
 #[tokio::test]
 async fn convoy_resume_milliseconds_after_complete_still_lands() {
+    use flotilla_resources::StatusPatch;
     use flotilla_store::controller::Reconciler;
     let (_temp, _repo, daemon) = daemon_for_cwd().await;
     let backend = daemon.resource_backend();
@@ -10472,27 +10413,26 @@ async fn convoy_resume_milliseconds_after_complete_still_lands() {
         .await
         .unwrap();
     let mut events = daemon.subscribe();
-    let complete_id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: flotilla_protocol::CrewCommandContext {
-                        crew_id: None,
-                        namespace: Some("flotilla".into()),
-                        convoy: Some("claimed-resume".into()),
-                        vessel_ref: Some("claimed-resume-vessel".into()),
-                        role: Some("coder".into()),
-                    },
-                    message: Some("accepted completion".into()),
-                    disposition: None,
-                    decision_ledger_ref: Some("https://example.test/pull/1#decision-ledger".into()),
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(recv_command_finished(&mut events, complete_id).await, CommandValue::Ok);
+    let mut current = convoys.get("claimed-resume").await.unwrap();
+    let status = current.status.as_mut().unwrap();
+    flotilla_resources::promises::apply(
+        status,
+        "work",
+        "coder",
+        &flotilla_resources::promises::PromiseOperation::Declare {
+            id: "finished".into(),
+            kind: flotilla_resources::promises::PromiseKind::Pr,
+            source: flotilla_resources::promises::PromiseSource::Crew,
+        },
+    );
+    flotilla_resources::promises::apply(
+        status,
+        "work",
+        "coder",
+        &flotilla_resources::promises::PromiseOperation::Retract { id: "finished".into(), reason: "No PR needed".into() },
+    );
+    flotilla_resources::promises::next_completion(status, chrono::Utc::now()).unwrap().apply(status);
+    convoys.update_status("claimed-resume", &current.metadata.resource_version, status).await.unwrap();
     let claimed = convoys.get("claimed-resume").await.unwrap().status.unwrap();
     assert_eq!(claimed.phase, ConvoyPhase::Landing);
     tokio::time::sleep(Duration::from_millis(1)).await;
