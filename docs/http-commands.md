@@ -25,7 +25,8 @@ existing allowlist and project supervision restrictions.
 POST commands take the command directly, without the framed Execute envelope.
 Other request bodies contain the framed request's parameters without a kind tag.
 Artifact put/get keep the existing daemon-side source/destination path behavior;
-TCP callers cannot use either path operation. Artifact body upload is not offered.
+TCP callers cannot use either path operation. Unix user downloads rely on router
+authentication and need no surface connection. Artifact body upload is not offered.
 Repository mutations acknowledge the existing asynchronous daemon operation.
 
 Bodies default to JSON. `Content-Type: application/cbor` selects the stack's safe

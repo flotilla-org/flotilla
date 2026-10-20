@@ -113,7 +113,7 @@ impl Encoding {
     fn render(self, status: StatusCode, value: impl Serialize) -> Response {
         let mut value = match serde_json::to_value(value) {
             Ok(value) => value,
-            Err(error) => return auth::refusal(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+            Err(error) => return self.error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         };
         let result = match self {
             Self::Cbor => flotilla_cbor::to_vec(&value, &flotilla_cbor::Limits { max_message: 16 * 1024 * 1024, ..Default::default() })
@@ -128,7 +128,7 @@ impl Encoding {
             Ok((content_type, bytes)) => {
                 (status, [(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "no-store")], bytes).into_response()
             }
-            Err(error) => auth::refusal(StatusCode::INTERNAL_SERVER_ERROR, &error),
+            Err(error) => self.error(StatusCode::INTERNAL_SERVER_ERROR, error),
         }
     }
 
@@ -379,6 +379,7 @@ pub(super) async fn handle(
         QuerySubscriptions::default(),
         caller.clone(),
     );
+    let dispatcher = if transport_bound { dispatcher } else { dispatcher.with_authenticated_user() };
     let mut response = dispatcher.dispatch(0, rpc).await;
     if let Some(project) = scope {
         environment_supervision::scope_response(&mut response, &caller.crew.as_ref().expect("authorized crew").namespace, &project);
@@ -490,6 +491,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::blob_store::{BlobStore, TieredBlobStore};
     use crate::server::http::{HttpRouter, ListenerOrigin, LoginStore};
     use crate::server::tests::placed_crew_daemon;
 
@@ -497,6 +499,7 @@ mod tests {
         _temp: tempfile::TempDir,
         router: Router,
         shutdown: tokio::sync::mpsc::UnboundedReceiver<()>,
+        blobs: Arc<TieredBlobStore>,
     }
 
     impl Harness {
@@ -519,13 +522,14 @@ mod tests {
         fn from_daemon(temp: tempfile::TempDir, daemon: Arc<InProcessDaemon>) -> Self {
             let manager = Arc::new(Mutex::new(crate::peer::PeerManager::new(daemon.node_id().clone())));
             let remote = crate::server::build_remote_command_router(&daemon, &manager);
-            remote.install_blob_store(Arc::new(crate::blob_store::TieredBlobStore::new(temp.path(), vec![]))).unwrap();
+            let blobs = Arc::new(TieredBlobStore::new(temp.path(), vec![]));
+            remote.install_blob_store(blobs.clone()).unwrap();
             let (shutdown, receiver) = tokio::sync::mpsc::unbounded_channel();
             let router =
                 HttpRouter::for_daemon(daemon.clone(), Arc::new(LoginStore::new(daemon.clock_for_scenarios())), ListenerOrigin::default())
                     .with_commands(remote, shutdown, temp.path().join("daemon.sock"))
                     .into_router();
-            Self { _temp: temp, router, shutdown: receiver }
+            Self { _temp: temp, router, shutdown: receiver, blobs }
         }
 
         async fn call(
@@ -760,6 +764,22 @@ mod tests {
         }
     }
 
+    // An outcome outside the CBOR profile is a daemon error, but the refusal itself
+    // still uses the negotiated encoding so a CBOR-only client can read it.
+    #[tokio::test]
+    async fn encoding_faults_keep_the_negotiated_error_body() {
+        let mut nested = Value::Null;
+        for _ in 0..65 {
+            nested = json!([nested]);
+        }
+        let response = Encoding::Cbor.render(StatusCode::OK, nested);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/cbor");
+        let bytes = to_bytes(response.into_body(), COMMAND_LIMIT).await.unwrap();
+        let error: Value = flotilla_cbor::from_slice(&bytes, &Default::default()).unwrap();
+        assert!(error["message"].as_str().unwrap().contains("depth-limit"));
+    }
+
     // Glue: the legacy dispatcher's string error vocabulary maps to HTTP status classes.
     #[test]
     fn dispatcher_error_status_classes() {
@@ -773,6 +793,25 @@ mod tests {
             ("store unavailable", StatusCode::INTERNAL_SERVER_ERROR),
         ] {
             assert_eq!(error_status(message), status, "{message}");
+        }
+    }
+
+    // Authenticated Unix users can retrieve artifact bytes without creating a surface
+    // session. The daemon still writes to an absolute path, through its environment runner.
+    #[tokio::test]
+    async fn unix_user_artifact_get_uses_router_identity() {
+        let h = Harness::new().await;
+        let digest = h.blobs.put(b"artifact contents").await.unwrap();
+        for cbor in [false, true] {
+            let destination = h._temp.path().join(if cbor { "cbor-output" } else { "json-output" });
+            let query = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("reference", digest.as_str())
+                .append_pair("destination_path", destination.to_str().unwrap())
+                .finish();
+            let reply = h.call("GET", &format!("/v1/artifacts/content?{query}"), None, cbor, CallerAuth::Socket(None)).await;
+            assert_eq!(reply.0, StatusCode::OK, "{}", reply.1);
+            assert_eq!(reply.1["size"], 17);
+            assert_eq!(tokio::fs::read(destination).await.unwrap(), b"artifact contents");
         }
     }
 

@@ -49,6 +49,7 @@ pub(super) struct RequestDispatcher<'a> {
     query_subscriptions: QuerySubscriptions,
     caller: CommandCaller,
     hook_identity_policy: HookIdentityPolicy,
+    authenticated_user: bool,
 }
 
 impl<'a> RequestDispatcher<'a> {
@@ -86,7 +87,15 @@ impl<'a> RequestDispatcher<'a> {
             query_subscriptions,
             caller,
             hook_identity_policy: HookIdentityPolicy::NativeSession,
+            authenticated_user: false,
         }
+    }
+
+    /// The HTTP router authenticates a user independently of a surface connection.
+    /// Framed callers retain their existing connected-principal requirement.
+    pub(super) fn with_authenticated_user(mut self) -> Self {
+        self.authenticated_user = true;
+        self
     }
 
     /// Environment transport hooks cannot alias another native agent session.
@@ -249,7 +258,9 @@ impl<'a> RequestDispatcher<'a> {
                     .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
                 (runner, absolute_crew_path(&destination_path, &session.spec.cwd))
             } else {
-                self.daemon.principal_for_surface(self.session_id)?.ok_or("artifact get requires a connected operator principal")?;
+                if !self.authenticated_user {
+                    self.daemon.principal_for_surface(self.session_id)?.ok_or("artifact get requires a connected operator principal")?;
+                }
                 if !destination_path.is_absolute() {
                     return Err("operator artifact destination must be absolute".to_string());
                 }
