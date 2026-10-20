@@ -14,7 +14,7 @@ use axum::{
     body::to_bytes,
     extract::{Request, State},
     http::{header, Method, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
     Extension,
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
@@ -150,88 +150,9 @@ impl Commands {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Encoding {
-    Json,
-    Cbor,
-}
-
-impl Encoding {
-    fn response(headers: &axum::http::HeaderMap) -> Result<Self, &'static str> {
-        // Honor quality weights, including an explicit q=0 exclusion.
-        let Some(accept) = headers.get(header::ACCEPT) else { return Ok(Self::Json) };
-        let accept = accept.to_str().map_err(|_| "invalid Accept header")?;
-        let mut json_quality = None::<f32>;
-        let mut cbor_quality = None::<f32>;
-        for entry in accept.split(',') {
-            let mut parts = entry.trim().split(';');
-            let media = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
-            let quality = parts
-                .find_map(|p| p.split_once('=').filter(|(name, _)| name.trim().eq_ignore_ascii_case("q")).map(|(_, value)| value.trim()))
-                .unwrap_or("1")
-                .parse::<f32>()
-                .map_err(|_| "invalid Accept quality")?;
-            if !quality.is_finite() || !(0.0..=1.0).contains(&quality) {
-                return Err("invalid Accept quality");
-            }
-            match media.as_str() {
-                "application/json" => json_quality = Some(quality),
-                "application/cbor" => cbor_quality = Some(quality),
-                "*/*" | "application/*" => {
-                    json_quality.get_or_insert(quality);
-                    cbor_quality.get_or_insert(quality);
-                }
-                _ => {}
-            }
-        }
-        let jq = json_quality.unwrap_or(0.0);
-        let cq = cbor_quality.unwrap_or(0.0);
-        if cq > 0.0 && cq > jq {
-            Ok(Self::Cbor)
-        } else if jq > 0.0 {
-            Ok(Self::Json)
-        } else {
-            Err("Accept must allow application/json or application/cbor")
-        }
-    }
-
-    fn render(self, status: StatusCode, value: impl Serialize) -> Response {
-        let mut value = match serde_json::to_value(value) {
-            Ok(value) => value,
-            Err(error) => return self.error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-        };
-        let result = match self {
-            Self::Cbor => flotilla_cbor::to_vec(&value, &flotilla_cbor::Limits { max_message: 16 * 1024 * 1024, ..Default::default() })
-                .map(|bytes| ("application/cbor", bytes))
-                .map_err(|e| e.to_string()),
-            Self::Json => {
-                large_integers(&mut value);
-                serde_json::to_vec(&value).map(|bytes| ("application/json", bytes)).map_err(|e| e.to_string())
-            }
-        };
-        match result {
-            Ok((content_type, bytes)) => {
-                (status, [(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "no-store")], bytes).into_response()
-            }
-            Err(error) => self.error(StatusCode::INTERNAL_SERVER_ERROR, error),
-        }
-    }
-
-    fn error(self, status: StatusCode, message: impl AsRef<str>) -> Response {
-        self.render(status, json!({"message": message.as_ref()}))
-    }
-}
-
-fn large_integers(value: &mut Value) {
-    const SAFE: u64 = (1 << 53) - 1;
-    match value {
-        Value::Number(n) if n.as_u64().is_some_and(|n| n > SAFE) => *value = json!({"u64": n.to_string()}),
-        Value::Number(n) if n.as_i64().is_some_and(|n| n < -(SAFE as i64)) => *value = json!({"i64": n.to_string()}),
-        Value::Array(values) => values.iter_mut().for_each(large_integers),
-        Value::Object(values) => values.values_mut().for_each(large_integers),
-        _ => {}
-    }
-}
+#[cfg(test)]
+use super::wire::large_integers;
+use super::wire::Encoding;
 
 // The route determines the request kind; callers cannot select a different operation
 // through a body tag. GET/DELETE control requests have a zero-byte body limit.
@@ -260,18 +181,13 @@ pub(super) async fn handle(
     let encoding = match Encoding::response(request.headers()) {
         Ok(encoding) => encoding,
         Err(error) => {
-            // Even a malformed quality value can identify the requested error encoding.
-            let cbor = request.headers().get(header::ACCEPT).and_then(|v| v.to_str().ok()).is_some_and(|v| {
-                v.split(',').any(|range| range.split(';').next().unwrap_or_default().trim().eq_ignore_ascii_case("application/cbor"))
-            });
-            return if cbor { Encoding::Cbor } else { Encoding::Json }.error(StatusCode::NOT_ACCEPTABLE, error);
+            return Encoding::error_encoding(request.headers()).error_code(StatusCode::NOT_ACCEPTABLE, "unsupported_format", error)
         }
     };
     if matches!(authenticated, CallerAuth::Anonymous) {
-        let mut response = encoding.error(StatusCode::UNAUTHORIZED, "authentication required");
-        response.headers_mut().insert(header::WWW_AUTHENTICATE, axum::http::HeaderValue::from_static("Bearer"));
-        return response;
+        return encoding.error(StatusCode::UNAUTHORIZED, "authentication required");
     }
+
     let Some(daemon) = state.daemon.as_ref() else {
         return encoding.error(StatusCode::SERVICE_UNAVAILABLE, "daemon is unavailable");
     };

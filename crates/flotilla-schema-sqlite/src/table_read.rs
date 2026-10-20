@@ -48,26 +48,36 @@ pub(crate) fn read(
         .iter()
         .find_map(|set| set.tables.iter().find(|table| table.name == name))
         .ok_or_else(|| StoreError::Stream("unknown table".into()))?;
-    let mut table = source.clone();
+    let mut table = source.with_natural_references();
     let mut key = vec![ColumnDef::new("resource.home", ColumnType::Text, false), ColumnDef::new("resource.name", ColumnType::Text, false)];
     for column in &mut key {
         column.add_role("key");
     }
     key.extend(table.key.clone());
     table.key = key;
-    table.own_key += 2;
     let owner = if source.parent.is_none() { "id" } else { "owner" };
     let mut expressions = vec![
         "(SELECT s FROM strings WHERE id=i.home) AS \"resource.home\"".into(),
         "(SELECT s FROM strings WHERE id=i.name) AS \"resource.name\"".into(),
     ];
-    for column in source.key.iter().chain(&source.columns) {
-        let value = format!("t.{}", quote_ident(&column.name));
-        let expression = match column.ty {
-            ColumnType::Interned(_) => format!("(SELECT s FROM strings WHERE id={value})"),
-            ColumnType::Ref => format!("(SELECT s FROM strings WHERE id=(SELECT name FROM resource_identity WHERE id={value}))"),
-            ColumnType::Frozen => format!("(SELECT bytes FROM objects WHERE hash={value})"),
-            _ => value,
+    for column in table.key.iter().skip(2).chain(&table.columns) {
+        let original = source.key.iter().chain(&source.columns).find(|original| original.name == column.name);
+        let expression = if let Some(original) = original {
+            let value = format!("t.{}", quote_ident(&original.name));
+            match original.ty {
+                ColumnType::Interned(_) => format!("(SELECT s FROM strings WHERE id={value})"),
+                ColumnType::Ref => format!("(SELECT s FROM strings WHERE id=(SELECT name FROM resource_identity WHERE id={value}))"),
+                ColumnType::Frozen => format!("(SELECT bytes FROM objects WHERE hash={value})"),
+                _ => value,
+            }
+        } else {
+            if let Some(reference) = column.name.strip_suffix(".home") {
+                format!("(SELECT s FROM strings WHERE id=(SELECT home FROM resource_identity WHERE id=t.{}))", quote_ident(reference))
+            } else if let Some(reference) = column.name.strip_suffix(".kind") {
+                format!("(SELECT kind FROM resource_identity WHERE id=t.{})", quote_ident(reference))
+            } else {
+                return Err(StoreError::Stream("unknown reference component".into()));
+            }
         };
         expressions.push(format!("{expression} AS {}", quote_ident(&column.name)));
     }

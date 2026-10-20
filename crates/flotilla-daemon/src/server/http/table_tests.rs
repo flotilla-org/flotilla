@@ -73,6 +73,15 @@ fn decode(bytes: &[u8], cbor: bool) -> Vec<Message> {
     }
     messages
 }
+async fn error_body(response: axum::response::Response) -> serde_json::Value {
+    let cbor = response.headers().get("content-type").is_some_and(|value| value == "application/cbor");
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    if cbor {
+        flotilla_cbor::from_slice(&bytes, &Default::default()).unwrap()
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    }
+}
 async fn messages(router: &Router, path: &str, cbor: bool) -> Vec<Message> {
     let response = call(router, path, cbor).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -191,6 +200,7 @@ struct TableSample {
     text: String,
     number: i64,
     bytes: Vec<u8>,
+    reference: Option<flotilla_schema::Ref<TableSample>>,
     #[store(child)]
     tags: Vec<String>,
 }
@@ -202,14 +212,35 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
     let directory = tempfile::tempdir().unwrap();
     let mut registry = flotilla_schema::KindRegistry::new();
     registry.register::<TableSample>().unwrap();
-    let service = Arc::new(flotilla_schema_sqlite::stream::Service::open(&directory.path().join("table.db"), "home", registry).unwrap());
+    let database = directory.path().join("table.db");
+    let mut remote_registry = flotilla_schema::KindRegistry::new();
+    remote_registry.register::<TableSample>().unwrap();
+    let mut remote =
+        flotilla_schema_sqlite::Store::open(rusqlite::Connection::open(&database).unwrap(), "remote", remote_registry).unwrap();
+    let mut write = remote.write().unwrap();
+    write
+        .insert(
+            "one",
+            &TableSample { text: "remote target".into(), number: 99, bytes: vec![], reference: None, tags: vec![] },
+            &flotilla_schema::Origin::new("test", flotilla_schema::Timestamp(1)),
+        )
+        .unwrap();
+    write.commit().unwrap();
+    drop(remote);
+    let service = Arc::new(flotilla_schema_sqlite::stream::Service::open(&database, "home", registry).unwrap());
     service
         .with_store(|store| {
             let mut write = store.write()?;
             for (name, text, number) in [("one", "match", 1), ("two", "other", 2)] {
                 write.insert(
                     name,
-                    &TableSample { text: text.into(), number, bytes: vec![0, 255, 1], tags: vec!["tag".into()] },
+                    &TableSample {
+                        text: text.into(),
+                        number,
+                        bytes: vec![0, 255, 1],
+                        reference: Some(flotilla_schema::Ref::new("one", "remote")),
+                        tags: vec!["tag".into()],
+                    },
                     &flotilla_schema::Origin::new("test", flotilla_schema::Timestamp(1)),
                 )?;
             }
@@ -250,7 +281,27 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
     let path = "/tables/table_sample/rows?where=.text%20%3D%3D%20match&count=exact";
     let json = messages(&router, path, false).await;
     assert_eq!(json, messages(&router, path, true).await);
-    assert!(json.iter().any(|message|matches!(message,Message::Rows{rows,..} if rows.len()==1&&rows[0]["text"]=="match"&&rows[0]["resource.name"]=="one"&&rows[0]["number"]==1&&rows[0]["bytes"]=="AP8B")));
+    assert!(json.iter().any(|message|matches!(message,Message::Rows{rows,..} if rows.len()==1&&rows[0]["text"]=="match"&&rows[0]["resource.name"]=="one"&&rows[0]["number"]==1&&rows[0]["bytes"]=="AP8B"&&rows[0]["reference.home"]=="remote"&&rows[0]["reference"]=="one")));
+    let projected = messages(&router, "/tables/table_sample/rows?columns=reference", true).await;
+    assert!(projected
+        .iter()
+        .any(|message| matches!(message,Message::Rows{rows,..}if rows[0]["reference.home"]=="remote"&&rows[0]["reference"]=="one")));
+    let target = messages(&router, "/tables/table_sample/rows?namespace=remote&where=.resource.name%20%3D%3D%20one", false).await;
+    assert!(target.iter().any(|message|matches!(message,Message::Rows{rows,..}if rows.len()==1&&rows[0]["text"]=="remote target"&&rows[0]["resource.home"]=="remote")));
+    let ranged = messages(
+        &router,
+        "/tables/table_sample/rows?where=.number%20%3E%3D%201&where=.number%20%3C%3D%202&where=.number%20%21%3D%201",
+        false,
+    )
+    .await;
+    assert!(ranged.iter().any(|message| matches!(message,Message::Rows{rows,..}if rows.len()==1&&rows[0]["number"]==2)));
+    let log_range = messages(&router, "/tables/table_sample.log/rows?where=.sequence%20%3E%200", true).await;
+    assert!(log_range.iter().any(|message| matches!(message,Message::Rows{rows,..}if !rows.is_empty())));
+    let schema = call(&router, "/tables/table_sample", false).await;
+    let schema: serde_json::Value = serde_json::from_slice(&to_bytes(schema.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert!(schema["foreignKeys"].as_array().unwrap().iter().any(|fk| fk["fields"] == json!(["reference.home", "reference"])
+        && fk["reference"]["fields"] == json!(["resource.home", "resource.name"])
+        && fk["reference"]["resource"] == "table_sample"));
     for cbor in [false, true] {
         let child = messages(&router, "/tables/table_sample_tags/rows", cbor).await;
         assert!(child.iter().any(|message| matches!(message,Message::Rows{rows,..} if rows.len()==2&&rows[0]["value"]=="tag")));
@@ -271,7 +322,7 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
         ] {
             let response = call(&router, path, cbor).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
-            let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+            let body = error_body(response).await;
             assert_eq!(body["code"], code, "{path}");
         }
     }
@@ -369,7 +420,7 @@ async fn table_request_errors_and_content_negotiation_are_explicit() {
     ] {
         let response = call(&router, &format!("/tables/convoys/rows?{query}"), false).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+        let body = error_body(response).await;
         assert_eq!(body["code"], code);
     }
     let response = call(&router, "/tables/convoys?format=markdown", false).await;
@@ -383,6 +434,19 @@ async fn table_request_errors_and_content_negotiation_are_explicit() {
         .unwrap();
     request.extensions_mut().insert(CallerAuth::Bearer);
     assert_eq!(router.clone().oneshot(request).await.unwrap().headers()["content-type"], "application/x-ndjson");
+    for (accept, status, media) in [
+        ("Application/CBOR-SEQ; q = 0.5, application/json; q=0", StatusCode::OK, "application/cbor-seq"),
+        ("application/x-ndjson;q=0, application/json;q=1", StatusCode::OK, "application/json"),
+        ("application/json;q=no", StatusCode::NOT_ACCEPTABLE, "application/json"),
+        ("Application/CBOR-SEQ; q = no", StatusCode::NOT_ACCEPTABLE, "application/cbor"),
+    ] {
+        let mut request = Request::builder().uri("/tables/convoys/rows").header("accept", accept).body(Body::empty()).unwrap();
+        request.extensions_mut().insert(CallerAuth::Bearer);
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers()["content-type"], media);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
     let response = call(&router, "/tables/convoys/rows?format=arrow", false).await;
     assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
 }
@@ -436,7 +500,7 @@ async fn resource_version_sort_is_explicitly_unsupported() {
     let router = router(backend);
     let response = call(&router, "/tables/convoys/rows?namespace=test&sort=metadata.resourceVersion", false).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    let body = error_body(response).await;
     assert_eq!(body["code"], "unsupported_sort");
     let response = call(&router, "/tables/convoys", false).await;
     let schema: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap();

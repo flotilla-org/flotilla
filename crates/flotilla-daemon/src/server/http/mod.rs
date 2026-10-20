@@ -7,7 +7,6 @@
 
 mod auth;
 mod commands;
-mod derived_tables;
 #[cfg(test)]
 mod hook_tests;
 mod hooks;
@@ -20,6 +19,7 @@ mod tcp;
 #[cfg(test)]
 mod tests;
 mod unix;
+mod wire;
 
 use std::sync::{Arc, OnceLock};
 
@@ -125,6 +125,9 @@ impl HttpRouter {
     pub(in crate::server) fn into_router(self) -> Router {
         Router::new()
             .route(HELLO_PATH, get(hello))
+            .route("/tables", get(table_api::list))
+            .route("/tables/{table}", get(table_api::describe))
+            .route("/tables/{table}/rows", get(table_api::rows))
             .route(LOGIN_CODES_PATH, post(mint_login_code))
             .route(LOGIN_PATH, get(login))
             .route(LOGOUT_PATH, post(logout))
@@ -261,19 +264,6 @@ async fn resource_api(
         return refused;
     }
     let target = request.uri().path_and_query().map_or_else(|| request.uri().path().to_owned(), |target| target.as_str().to_owned());
-    if request.uri().path() == "/tables" || request.uri().path().starts_with("/tables/") {
-        if request.method() != axum::http::Method::GET {
-            return StatusCode::METHOD_NOT_ALLOWED.into_response();
-        }
-        let accept = request.headers().get(header::ACCEPT).and_then(|value| value.to_str().ok()).unwrap_or("");
-        return table_api::respond(
-            &target,
-            accept,
-            state.backend.clone(),
-            state.table_store.clone().or_else(|| state.daemon.as_ref().and_then(|daemon| daemon.decided_store().ok())),
-        )
-        .await;
-    }
     let reply = resource_api::respond(request.method().as_str(), &target, state.backend.clone(), state.daemon.as_ref()).await;
     render(reply, state.change_stream_deadline).await
 }

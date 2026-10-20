@@ -21,11 +21,27 @@ use flotilla_state_machines::{
 /// The kinds the `[primitives]` switch moves: Message, and the minimal
 /// AgentSession its receipts are written on. Codes are the production
 /// registry's (`flotilla_state_machines::kinds`), never reassigned here.
+pub struct MachineRegistry {
+    pub kinds: KindRegistry,
+    pub diagrams: std::collections::BTreeMap<String, String>,
+}
+/// One registration pairs each decided kind with its machine rendering.
+pub fn machine_registry() -> Result<MachineRegistry, RegistryError> {
+    let mut kinds = KindRegistry::new();
+    let mut diagrams = std::collections::BTreeMap::new();
+    macro_rules! register {
+        ($machine:ty) => {{
+            kinds.register::<Resource<$machine>>()?;
+            let set = kinds.iter().find(|set| set.code == Resource::<$machine>::CODE).expect("registered kind");
+            diagrams.insert(set.kind.clone(), <$machine>::definition().mermaid(flotilla_state_machines::Diagram::Full));
+        }};
+    }
+    register!(Message);
+    register!(AgentSession);
+    Ok(MachineRegistry { kinds, diagrams })
+}
 pub fn registry() -> Result<KindRegistry, RegistryError> {
-    let mut registry = KindRegistry::new();
-    registry.register::<Resource<Message>>()?;
-    registry.register::<Resource<AgentSession>>()?;
-    Ok(registry)
+    Ok(machine_registry()?.kinds)
 }
 
 fn refused(error: impl std::error::Error + Send + Sync + 'static) -> LogError {
@@ -206,5 +222,17 @@ impl Log<Message> for MessageLog {
         event: &EdgeEventOf<Message>,
     ) -> Result<Version, LogError> {
         <StoreLog as Log<Message>>::edge(&mut self.inner, previous, next, event)
+    }
+}
+
+#[cfg(test)]
+mod machine_registry_tests {
+    #[test]
+    fn every_registered_kind_has_its_machine_diagram() {
+        let registry = super::machine_registry().unwrap();
+        assert_eq!(registry.diagrams.len(), registry.kinds.iter().count());
+        for kind in registry.kinds.iter() {
+            assert!(registry.diagrams[&kind.kind].contains("stateDiagram"));
+        }
     }
 }

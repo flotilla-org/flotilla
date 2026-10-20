@@ -45,7 +45,7 @@ keeps the body open for `upsert`, `delete`, `progress`, and count changes.
 - Repeated `where` parameters are ANDed and use ADR 0066's condition grammar,
   for example `.metadata.name == example` or
   `.metadata.labels."flotilla.work/project" == flotilla` (URL encode these).
-  Today's generic resource tier pushes down equality on declared indexed fields
+  Today's generic resource tier pushes down equality on declared queryable fields
   and labels. Other operators and unindexed columns return `unsupported_filter`;
   unknown columns and incompatible literals have separate errors. No filter is
   implemented by listing and filtering in the router.
@@ -90,3 +90,38 @@ prove use of the resource-store query API separately. Blob cells render as base6
 strings in both carriers. CBOR and frozen object cells decode to their native JSON
 values before either carrier encodes them. These blob/object columns cannot be
 sorted or filtered.
+
+
+Conditions are parsed into a neutral ordered list before a source lowers them. The
+resource source supports equality; the decided source advertises and lowers `==`,
+`!=`, `<`, `<=`, `>` and `>=` on scalar fields. Repeated fields remain separate
+clauses, so `.number >= 1` and `.number <= 5` form a range. Bounded log reads can
+use `.sequence > 500` without enabling cursor-based log paging.
+
+Reference columns use schema-level `foreignKeys`. Each typed reference returns its
+name plus a companion `<field>.home`; together these name the target table's full
+`(resource.home, resource.name)` key. Untyped identity references also include
+`<field>.kind`. Projecting a reference includes its key companions. The same-name
+row on another home remains distinguishable. There is no field-level `reference`
+extension. Markdown reads the descriptor directly, including semantic properties.
+
+The HTTP routes are three axum GET routes over `server::tables::TableSource`. The
+carrier-neutral module owns paging, projection and live diffs for both sources.
+Source errors after the initial snapshot produce `resync` in-band and a bounded
+resnapshot attempt, rather than silently truncating the body. Changes outside the
+projection do not emit an upsert. Diagram renderings come from the engine-store
+machine registration, which pairs a kind with its diagram once.
+
+Commands and tables share Accept negotiation, error rendering, no-store headers and
+CBOR limits. Media types are case-insensitive, whitespace around `q =` is accepted,
+and invalid qualities or excluded formats return 406. Errors use the negotiated
+JSON/CBOR encoding with `code` and `message`. JSON integers outside the browser-safe
+range use the shared `{u64: "..."}` / `{i64: "..."}` profile; CBOR retains full 64-bit
+integer values. The table protocol decoder accepts tagged envelope integers.
+
+Cell profile decision for this version: cells and schemas remain JSON-shaped in
+both carriers, including base64 blob strings. Native CBOR byte-string cells would
+require a versioned profile, rather than silently changing #3249's frozen frame
+contents. WebSocket request/subscription ids belong in that carrier's envelope,
+not in each table message. Deferred optional model and validation work is tracked
+in #3614; scale work, including observed-diagram aggregation, is tracked in #3601.

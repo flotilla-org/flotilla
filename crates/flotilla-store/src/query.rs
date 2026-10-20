@@ -156,15 +156,6 @@ fn suppress_default() -> bool {
     true
 }
 impl StoreQuery {
-    /// A pushed-down selection that cannot match any row, including after ANDing clauses.
-    pub fn none() -> Self {
-        Self { field_values: BTreeMap::from([("metadata.name".into(), vec![])]), ..Self::default() }
-    }
-    /// An empty membership selector makes the entire conjunction unsatisfiable.
-    pub fn selects_none(&self) -> bool {
-        self.field_values.values().any(Vec::is_empty)
-    }
-
     pub fn with_replicas(mut self) -> Self {
         self.include_replicas = true;
         self

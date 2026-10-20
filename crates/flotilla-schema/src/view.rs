@@ -59,15 +59,24 @@ pub fn state_data(set: &TableSet, position: usize) -> Vec<(&str, Vec<&str>, Vec<
 
 /// Markdown for a non-stored table, without inventing a stored kind or backend columns.
 pub fn render_table_view(table: &Table) -> String {
-    let mut out = format!("## {}\n\n| Field | Type | Required |\n|---|---|---|\n", table.name);
-    let schema = table.frictionless();
-    for field in schema["fields"].as_array().expect("descriptor fields") {
+    fn cell(value: impl ToString) -> String {
+        value.to_string().replace('|', "\\|").replace('\n', " ")
+    }
+    let table = table.with_natural_references();
+    let mut out = format!(
+        "## {}\n\n| Field | Type | Required | Categories | Reference | Properties |\n|---|---|---|---|---|---|\n",
+        cell(&table.name)
+    );
+    for column in table.key.iter().chain(&table.columns) {
         writeln!(
             out,
-            "| `{}` | {} | {} |",
-            field["name"].as_str().unwrap_or_default(),
-            field["type"].as_str().unwrap_or_default(),
-            field["constraints"]["required"]
+            "| `{}` | {} | {} | {} | {} | {} |",
+            cell(&column.name),
+            cell(format!("{:?}", column.ty)),
+            !column.nullable,
+            cell(column.categories.iter().map(|(value, name)| format!("{value}: {name}")).collect::<Vec<_>>().join(", ")),
+            cell(column.reference.as_deref().unwrap_or("")),
+            cell(serde_json::to_string(&column.properties).expect("column properties"))
         )
         .expect("write string");
     }
