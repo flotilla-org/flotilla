@@ -3,7 +3,10 @@
 //! sessions live in memory, so a restart ends them, as it replaces the file token. A session
 //! also ends after [`SESSION_LIFETIME`] or at logout, and at most [`SESSION_LIMIT`] are live.
 
-use std::{collections::HashMap, sync::Arc, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 
 use axum::http::{header, HeaderMap};
 use chrono::{DateTime, Utc};
@@ -51,12 +54,18 @@ impl LoginStore {
         Self { clock, state: Mutex::new(LoginState::default()) }
     }
 
+    /// Every critical section leaves the maps consistent, so a poisoned lock is still usable;
+    /// recovering it keeps one panicked request from failing every later login.
+    fn state(&self) -> MutexGuard<'_, LoginState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// A fresh single-use code, valid for [`LOGIN_CODE_LIFETIME`].
     pub(in crate::server) fn mint_code(&self) -> Result<LoginCode, String> {
         let code = random_secret()?;
         let now = self.clock.now();
         let expires_at = now + LOGIN_CODE_LIFETIME;
-        let mut state = self.state.lock().expect("login state lock");
+        let mut state = self.state();
         state.codes.retain(|_, expiry| *expiry > now);
         if state.codes.len() >= PENDING_CODE_LIMIT {
             if let Some(oldest) = state.codes.iter().min_by_key(|(_, expiry)| **expiry).map(|(digest, _)| *digest) {
@@ -71,7 +80,7 @@ impl LoginStore {
     /// whether or not it was still valid, so a second use is always refused.
     pub(in crate::server) fn redeem(&self, code: &str) -> Result<Option<(SessionId, String)>, String> {
         let now = self.clock.now();
-        let mut state = self.state.lock().expect("login state lock");
+        let mut state = self.state();
         match state.codes.remove(&digest(code)) {
             Some(expires_at) if expires_at > now => {
                 let token = random_secret()?;
@@ -95,13 +104,13 @@ impl LoginStore {
     pub(in crate::server) fn session(&self, headers: &HeaderMap) -> Option<SessionId> {
         let value = session_cookie_value(headers)?;
         let now = self.clock.now();
-        let state = self.state.lock().expect("login state lock");
+        let state = self.state();
         state.sessions.get(&digest(value)).filter(|(_, expiry)| *expiry > now).map(|(id, _)| *id)
     }
 
     /// End a session; its cookie authenticates nothing afterwards.
     pub(in crate::server) fn end(&self, session: SessionId) {
-        self.state.lock().expect("login state lock").sessions.retain(|_, (id, _)| *id != session);
+        self.state().sessions.retain(|_, (id, _)| *id != session);
     }
 }
 
@@ -137,4 +146,26 @@ pub(in crate::server) fn random_secret() -> Result<String, String> {
     let mut bytes = [0_u8; 32];
     getrandom::getrandom(&mut bytes).map_err(|error| format!("generate login secret: {error}"))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A request that panicked while holding the lock leaves login usable for the next one.
+    #[test]
+    fn a_poisoned_lock_still_serves_logins() {
+        let store = Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock)));
+        let poisoner = Arc::clone(&store);
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner.state.lock().expect("unpoisoned");
+            panic!("a request panics while holding the login lock");
+        })
+        .join();
+        assert!(panicked.is_err() && store.state.is_poisoned());
+        let code = store.mint_code().expect("mint after poisoning");
+        let (_, token) = store.redeem(&code.code).expect("redeem").expect("valid code");
+        let headers = HeaderMap::from_iter([(header::COOKIE, format!("{SESSION_COOKIE}={token}").parse().expect("cookie"))]);
+        assert!(store.session(&headers).is_some());
+    }
 }
