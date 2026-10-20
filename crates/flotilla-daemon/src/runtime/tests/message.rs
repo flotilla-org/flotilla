@@ -303,7 +303,8 @@ async fn held_turn_is_revalidated_at_actual_input_boundary() {
 // Once its task is gone, polling the durable intent never types it again.
 #[tokio::test(start_paused = true)]
 async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_never_types() {
-    use flotilla_messaging::{MessageBatch, MessageTransport, MessageTransportOutcome};
+    use flotilla_agent_connector::{AgentTransport, Delivery, Operation, TransportOutcome};
+    use flotilla_messaging::{delivery_target, submission_ref};
     use flotilla_resources::MessageSubmission;
     const ID: &str = "message-crew";
     let temp = TempDir::new().expect("tempdir");
@@ -347,20 +348,20 @@ async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_neve
             profile.host_direct_environment_name(),
         )),
     };
-    let batch = MessageBatch::builder()
-        .id("batch".into())
-        .holder(holder)
-        .submission(
-            MessageSubmission::builder()
+    let batch = Delivery {
+        operation: Operation::NewTurn,
+        target: delivery_target(&holder),
+        submission: submission_ref(
+            &MessageSubmission::builder()
                 .batch_id("batch".into())
                 .crew_id("crew".into())
                 .session(ID.into())
                 .started_at(Utc::now())
                 .members(vec!["a".into(), "b".into(), "c".into()])
                 .build(),
-        )
-        .text("first\nsecond\nthird".into())
-        .build();
+        ),
+        text: "first\nsecond\nthird".into(),
+    };
     for name in &batch.submission.members {
         backend
             .using::<flotilla_resources::Message>(NAMESPACE)
@@ -376,7 +377,7 @@ async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_neve
             .await
             .expect("record batch member");
     }
-    assert_eq!(MessageTransport::submit(&runtime, &batch).await, MessageTransportOutcome::Pending);
+    assert_eq!(AgentTransport::submit(&runtime, &batch).await, TransportOutcome::Pending);
     // Unrelated hook/tool activity while the task owns input cannot invent
     // receipt, even with fresh Working evidence after submission began.
     let holder = sessions.get(ID).await.expect("pending holder");
@@ -391,14 +392,15 @@ async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_neve
     });
     status.last_tool_activity_at = Some(activity_at);
     let holder = sessions.update_status(ID, &holder.metadata.resource_version, &status).await.expect("unrelated activity");
-    let observation = MessageTransport::observe(&runtime, &holder, Some(&batch.submission)).await.expect("pending observation");
+    let observation =
+        AgentTransport::observe(&runtime, &delivery_target(&holder), Some(&batch.submission)).await.expect("pending observation");
     assert!(!observation.ready && !observation.working && observation.evidence.is_none());
     sessions.update_status(ID, &holder.metadata.resource_version, &original).await.expect("restore holder observation");
     let mut accepted = false;
     for _ in 0..30 {
         tokio::time::advance(Duration::from_millis(200)).await;
         tokio::task::yield_now().await;
-        if matches!(MessageTransport::poll(&runtime, &batch).await, MessageTransportOutcome::Accepted { .. }) {
+        if matches!(AgentTransport::poll(&runtime, &batch).await, TransportOutcome::Accepted { .. }) {
             accepted = true;
             break;
         }
@@ -406,7 +408,7 @@ async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_neve
     assert!(accepted, "stable Working establishes acceptance");
     assert_eq!(pool.inner.delivered.lock().await.as_slice(), &[(ID.to_string(), batch.text.clone(), true)]);
     // With no retained task, a restart can observe evidence but never submit.
-    assert!(matches!(MessageTransport::poll(&runtime, &batch).await, MessageTransportOutcome::Unconfirmed { .. }));
+    assert!(matches!(AgentTransport::poll(&runtime, &batch).await, TransportOutcome::Unconfirmed { .. }));
     assert_eq!(pool.inner.delivered.lock().await.len(), 1);
     for name in &batch.submission.members {
         backend.using::<flotilla_resources::Message>(NAMESPACE).delete(name).await.expect("retire direct transport fixtures");
@@ -448,7 +450,7 @@ async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_neve
             .build();
         inbox.accept(&empty_meta(&format!("replicated-{index}")), &intent, Utc::now()).await.expect("receiver-home intent");
     }
-    inbox.reconcile_delivery(&runtime, Utc::now()).await.expect("await replication");
+    inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("await replication");
     assert_eq!(pool.inner.delivered.lock().await.len(), 1, "no turn without replicated convoy context");
     backend
         .replica_writer::<Convoy>(NodeId::new("message-sender"), NAMESPACE)
@@ -456,12 +458,12 @@ async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_neve
         .await
         .expect("replicate authority");
     refresh_message_test_attention(&runtime, &backend, ID).await;
-    inbox.reconcile_delivery(&runtime, Utc::now()).await.expect("batch submission");
+    inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("batch submission");
     for _ in 0..40 {
         tokio::time::advance(Duration::from_millis(200)).await;
         tokio::task::yield_now().await;
         refresh_message_test_attention(&runtime, &backend, ID).await;
-        inbox.reconcile_delivery(&runtime, Utc::now()).await.expect("acceptance observation");
+        inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("acceptance observation");
         if backend
             .using::<flotilla_resources::Message>(NAMESPACE)
             .list()
@@ -599,7 +601,7 @@ async fn hookless_composer_delivers_review_and_supervisor_turns_with_or_without_
             ] {
                 pool.inner.set_captured_screen(ID, screen).await;
                 refresh_message_test_attention(&runtime, &backend, ID).await;
-                inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("non-boundary observation");
+                inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("non-boundary observation");
                 tokio::time::advance(Duration::from_millis(200)).await;
                 tokio::task::yield_now().await;
                 assert!(pool.inner.delivered.lock().await.is_empty(), "active turns and drafts must retain all input");
@@ -614,7 +616,7 @@ async fn hookless_composer_delivers_review_and_supervisor_turns_with_or_without_
                 tokio::time::advance(Duration::from_millis(200)).await;
                 tokio::task::yield_now().await;
                 refresh_message_test_attention(&runtime, &backend, ID).await;
-                inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("delivery observation");
+                inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("delivery observation");
                 if backend
                     .using::<flotilla_resources::Message>(NAMESPACE)
                     .list()
@@ -631,7 +633,7 @@ async fn hookless_composer_delivers_review_and_supervisor_turns_with_or_without_
             assert_eq!(records.len(), 3);
             assert!(records.iter().all(|message| message.status.as_ref().is_some_and(|status| status.phase.has_delivery_evidence())));
             pool.inner.set_captured_screen(ID, COMPOSER).await;
-            inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("repeat receipt");
+            inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("repeat receipt");
             let delivered = pool.inner.delivered.lock().await;
             assert_eq!(delivered.len(), 1, "all three upgraded inputs share one turn");
             let text = &delivered[0].1;
@@ -829,12 +831,12 @@ async fn held_pool_delivery_scenario(mode: &str) {
     messages.update_status("held-turn", &record.metadata.resource_version, &held).await.expect("submission evidence");
     let inbox = runtime.state.daemon.message_inbox(NAMESPACE).await;
     refresh_message_test_attention(&runtime, &backend, "agent").await;
-    inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("observe idle while held");
+    inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("observe idle while held");
     let observed = sessions.get("agent").await.expect("idle holder");
     assert_eq!(observed.status.as_ref().expect("holder status").attention.as_ref().expect("attention").state, TerminalAttentionState::Idle);
     // Capturing a baseline is not evidence that input was consumed.
     refresh_message_test_attention(&runtime, &backend, "agent").await;
-    inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("observe unchanged idle output");
+    inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("observe unchanged idle output");
     let messages = backend.using::<flotilla_resources::Message>(NAMESPACE);
     let held = messages.list().await.expect("held inbox").items;
     assert_eq!(held.len(), 1);
@@ -898,7 +900,7 @@ async fn held_pool_delivery_scenario(mode: &str) {
             if mode.starts_with("native") && matches!(event, "session-start" | "subagent-stop" | "stop") {
                 let holder = sessions.get("agent").await.expect("holder");
                 if holder.status.as_ref().unwrap().last_hook_working_at.is_none() {
-                    inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("observe held");
+                    inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("observe held");
                     assert!(
                         !messages.get("held-turn").await.unwrap().status.unwrap().phase.has_delivery_evidence(),
                         "{event} must leave input held"
@@ -953,7 +955,7 @@ async fn held_pool_delivery_scenario(mode: &str) {
         pool.observations.store(100, Ordering::SeqCst);
         refresh_message_test_attention(&runtime, &backend, "agent").await;
     }
-    inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("observe late acceptance evidence");
+    inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("observe late acceptance evidence");
     let accepted = messages.list().await.expect("accepted inbox").items;
     assert!(accepted[0].status.as_ref().expect("receipt status").phase.has_delivery_evidence());
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
@@ -1095,7 +1097,8 @@ async fn message_batch_owns_its_task_until_the_receiver_releases_it() {
 // the recorded receiver settles a held submission, without a Working hook.
 #[tokio::test]
 async fn codex_idle_hook_confirms_held_submission() {
-    use flotilla_messaging::MessageTransport;
+    use flotilla_agent_connector::AgentTransport;
+    use flotilla_messaging::{delivery_target, submission_ref};
     use flotilla_resources::MessageSubmission;
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"codex-hook-test\"\n").expect("daemon config");
@@ -1158,7 +1161,8 @@ async fn codex_idle_hook_confirms_held_submission() {
         sessions.update_status("codex-held", &current.metadata.resource_version, &status).await.expect("hook evidence");
         // Observe through the pre-update snapshot too: the runtime must consult
         // the durable receiver generation before trusting a newly arriving hook.
-        let observed = MessageTransport::observe(&runtime, &holder, Some(&submission)).await.expect("observe hold");
+        let observed =
+            AgentTransport::observe(&runtime, &delivery_target(&holder), Some(&submission_ref(&submission))).await.expect("observe hold");
         assert_eq!(observed.evidence.is_some(), expected, "{adapter} {source:?} offset {offset} session {session} crew {crew}");
         if session != submission.session || crew != submission.crew_id {
             assert!(!observed.ready && !observed.working, "replacement attention cannot confirm or release old input");

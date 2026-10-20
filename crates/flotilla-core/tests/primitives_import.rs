@@ -59,6 +59,7 @@ fn delivered() -> ResolvedMessageReceiver {
         session: "session-1".into(),
         delivered_at: at(20),
         evidence: "turn confirmed".into(),
+        transport: None,
     }
 }
 

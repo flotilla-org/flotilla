@@ -154,6 +154,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-change-request` | Forge-neutral change-request tracker and observation-source traits, observation decoding and branch-absence observer |
 | `flotilla-issue-tracker` | Forge-neutral source-addressed issue-provider trait, mission-field decoding and provider contract |
 | `flotilla-agent` | Agent harness adapters and registry, crew brief rendering, hook parsing and installation, agent state store, process-exit receipts |
+| `flotilla-agent-connector` | The traits a harness connector implements (session shapes and launch, hook parsing, state readings marked native or inferred, per-operation and per-version transport declarations), value types, state arbitration and the `TransportRouter` that picks one agent transport per delivery; no resource types or store (#2951, #3545) |
 | `flotilla-dummy-fleet` | Load-testing dummies installed behind `daemon.toml` `[dummy_fleet]`: scripted crews in an in-process terminal pool and agent adapter, a dummy VCS, a dummy forge's change-request tracker, and the workflow/policy catalog (#3206); the dummy environment provider lives in `flotilla-environment` |
 | `flotilla-fake-forge` | Rehearsal-only fake Forgejo service (#3374): one shared in-memory forge behind the strict Forgejo API the providers use, an HTTPS admin API for scenario drivers, seed generation and the in-process `HttpClient` the provider contract tests run against |
 | `flotilla-discovery` | Static factory-list assembly, default detector lists, detector runs, provider discovery, host-scoped provider cache, `ProviderRegistry`, provider status, and environment management (`EnvironmentManager` behind the `Environments` and `EnvironmentLifecycle` ports) |
@@ -184,7 +185,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-engine-store` | The engine's storage port: `Log` over `flotilla-schema-sqlite` (creation through `insert`, edges through `apply_edge`, one transaction per write), Message admission in the create transaction, `ReceiptLog` from `Read::about`, and the `[primitives]` switch's kind registry (Message and AgentSession) with its DDL snapshot (#3317) |
 | `flotilla-inbox-testkit` | Dev-only shared inbox scenarios, generated claim interleavings and Message race adapter, generic over backend factories |
 | `flotilla-quint-testkit` | Dev-only shared ITF parser, graph walker, trace/stream helpers and Message race mapping for engine and inbox adapters |
-| `flotilla-messaging` | Resource-backed inbox admission, delivery, retention, conditions and receiver/role routing |
+| `flotilla-messaging` | Resource-backed inbox admission, delivery through the agent-connector `TransportRouter`, retention, conditions and receiver/role routing |
 | `flotilla-store` | Object-safe `Store`, typed resolvers, replica/watch machinery, store queries, generic request snapshots and merged definition-catalog reads, and the generic controller runtime || `flotilla-store-memory` | In-memory storage and observed replicas; no native persistence dependencies |
 | `flotilla-store-sqlite` | SQLite persistence, schema, transactions and decode quarantine |
 | `flotilla-store-http` | Kubernetes-isomorphic HTTP storage client |

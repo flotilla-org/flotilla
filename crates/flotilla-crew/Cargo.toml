@@ -33,6 +33,7 @@ uuid = { workspace = true, features = ["v4"] }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+flotilla-agent-connector = { path = "../flotilla-agent-connector" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-forge-github = { path = "../flotilla-forge-github" }
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }

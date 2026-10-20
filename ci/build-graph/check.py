@@ -14,7 +14,7 @@ C_FREE_BASE = frozenset({
     "flotilla-daemon-api", "flotilla-relay-protocol",
     "flotilla-resources", "flotilla-client", "flotilla-store", "flotilla-store-memory",
     "flotilla-config", "flotilla-messaging", "flotilla-schema", "flotilla-schema-derive",
-    "flotilla-state-machines",
+    "flotilla-state-machines", "flotilla-agent-connector",
 })
 # Shrink this explicit exemption list with the ADR 0060 step 3 store split.
 # Manifest uses TLS; TUI no longer reaches core or store, but still reaches TLS
@@ -41,6 +41,16 @@ DISCOVERY_FORBIDDEN = (
     "flotilla-core", "flotilla-credentials", "flotilla-controllers", "flotilla-daemon",
     "flotilla-store", "flotilla-observation", *sorted(CAPABILITY_CRATES),
 )
+# #2951 ruling 2, #3545: the harness connector contract holds traits and value types only.
+# It never reaches resource types or a store, so connectors stay below the store stack.
+AGENT_CONNECTOR = "flotilla-agent-connector"
+AGENT_CONNECTOR_FORBIDDEN = (
+    "flotilla-resources", "flotilla-store", "flotilla-store-memory", "flotilla-store-sqlite", "flotilla-store-http",
+    "flotilla-engine-store", "flotilla-schema-sqlite",
+)
+# #2951 ruling 6: terminal adapters speak terminal values, not resource records.
+# Direct edges only: discovery-api still reaches resources through flotilla-config.
+TERMINAL_FORBIDDEN = ("flotilla-resources",)
 # #3320: the storage derive stack, lowest first. Each may depend in production only on
 # flotilla-address (#3392 G1: references outside the store are addresses), flotilla-cbor,
 # the schema crates below it and the build-feature anchors.
@@ -128,6 +138,12 @@ def violations(metadata):
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store", "flotilla-observation", *sorted(CAPABILITY_CRATES)):
             if component in packages and target in packages and reaches(component, target):
                 errors.append(f"{component}: must not depend on {target}, directly or transitively")
+    for target in AGENT_CONNECTOR_FORBIDDEN:
+        if AGENT_CONNECTOR in packages and target in packages and reaches(AGENT_CONNECTOR, target):
+            errors.append(f"{AGENT_CONNECTOR}: must not depend on {target}, directly or transitively")
+    for target in TERMINAL_FORBIDDEN:
+        if "flotilla-terminal" in packages and target in production["flotilla-terminal"]:
+            errors.append(f"flotilla-terminal: must not depend directly on {target}")
     for target in DISCOVERY_FORBIDDEN:
         if DISCOVERY in packages and target in packages and reaches(DISCOVERY, target):
             errors.append(f"{DISCOVERY}: must not depend on {target}, directly or transitively")

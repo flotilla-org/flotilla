@@ -358,7 +358,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         &self,
         name: &str,
         spec: &TerminalSessionSpec,
-        tags: &[flotilla_resources::TerminalSessionTag],
+        tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         let registry = self.registry_for_env(&spec.env_ref)?;
         let pool = registry

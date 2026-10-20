@@ -11,7 +11,6 @@ cleat-environment-contract = []
 [dependencies]
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-protocol = { path = "../flotilla-protocol" }
-flotilla-resources = { path = "../flotilla-resources" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 async-trait.workspace = true

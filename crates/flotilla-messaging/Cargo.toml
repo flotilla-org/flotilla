@@ -14,6 +14,7 @@ skip-no-sandbox-tests = []
 flotilla-store = { path = "../flotilla-store" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-agent-connector = { path = "../flotilla-agent-connector" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true }

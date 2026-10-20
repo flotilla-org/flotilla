@@ -193,6 +193,10 @@ pub struct ResolvedMessageReceiver {
     pub session: String,
     pub delivered_at: DateTime<Utc>,
     pub evidence: String,
+    /// The agent transport that delivered (ADR 0059 §4), such as `keystroke`.
+    /// Absent on receipts written before the transport router (#3545).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -250,6 +254,11 @@ pub struct MessageSubmission {
     pub output_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_since: Option<DateTime<Utc>>,
+    /// The agent transport the router chose for this batch; polls and
+    /// observations go back to it. Absent on submissions recorded before the
+    /// transport router (#3545), which poll the session's first offered transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

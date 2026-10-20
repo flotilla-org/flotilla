@@ -2547,7 +2547,7 @@ impl flotilla_crew::reconcilers::terminal_session::TerminalRuntime for RunningTe
         &self,
         name: &str,
         _spec: &flotilla_resources::TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<flotilla_crew::reconcilers::terminal_session::TerminalRuntimeState, String> {
         Ok(flotilla_crew::reconcilers::terminal_session::TerminalRuntimeState::builder()
             .session_id(format!("session-{name}"))

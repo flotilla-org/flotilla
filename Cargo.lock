@@ -1210,6 +1210,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-agent-connector"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-base",
+ "flotilla-build-features-types",
+ "hegeltest",
+ "serde",
+ "smallvec",
+]
+
+[[package]]
 name = "flotilla-ai-utility"
 version = "0.1.0"
 dependencies = [
@@ -1924,6 +1938,7 @@ dependencies = [
  "chrono",
  "flotilla-address",
  "flotilla-agent",
+ "flotilla-agent-connector",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -1987,6 +2002,7 @@ dependencies = [
  "flotilla-address",
  "flotilla-admission",
  "flotilla-agent",
+ "flotilla-agent-connector",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -2618,6 +2634,7 @@ dependencies = [
  "async-trait",
  "bon",
  "chrono",
+ "flotilla-agent-connector",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -3325,7 +3342,6 @@ dependencies = [
  "flotilla-protocol",
  "flotilla-provider-runtime",
  "flotilla-replay-testkit",
- "flotilla-resources",
  "hegeltest",
  "libc",
  "serde",

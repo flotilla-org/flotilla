@@ -1,0 +1,28 @@
+# #2951 ruling 2: the traits a harness connector implements, value types and
+# the transport router. No resource types and no store (ci/build-graph/check.py).
+[package]
+name = "flotilla-agent-connector"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+hegeltest = { workspace = true }
+
+[lints]
+workspace = true
+
+# Keep native library features stable across build and test commands.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }
+
+# hegeltest reaches smallvec; select the base layer's features for it.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+smallvec = { version = "1", default-features = false, features = ["const_generics", "const_new"] }

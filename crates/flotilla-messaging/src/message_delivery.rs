@@ -4,8 +4,10 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use flotilla_agent_connector::{
+    Delivery, DeliveryTarget, HarnessRef, Operation, Routed, SubmissionRef, TransportId, TransportOutcome, TransportRouter,
+};
 
 use crate::{
     apply_status_patch,
@@ -24,30 +26,8 @@ use crate::{
 // Bound adapter calls independently of admission.
 const TRANSPORT_CALL_BOUND: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MessageObservation {
-    pub ready: bool,
-    pub working: bool,
-    pub evidence: Option<String>,
-    pub output_digest: Option<String>,
-    pub waiting_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MessageTransportOutcome {
-    Pending,
-    Accepted { evidence: String },
-    NotSubmitted { reason: String },
-    Unconfirmed { reason: String },
-}
-
-#[derive(Debug, Clone, bon::Builder)]
-pub struct MessageBatch {
-    pub id: String,
-    pub holder: ResourceObject<TerminalSession>,
-    pub submission: MessageSubmission,
-    pub text: String,
-}
+/// Every Message delivery is a new turn for its receiver.
+const MESSAGE_OPERATION: Operation = Operation::NewTurn;
 
 /// Evidence and members for one transport attempt, shared by initial and held outcomes.
 struct DeliveryAttempt<'a> {
@@ -56,23 +36,32 @@ struct DeliveryAttempt<'a> {
     submission: &'a MessageSubmission,
 }
 
-/// The transport owns readiness and evidence. Polling an existing submission
-/// must never type its text again, even after adapter or daemon restart.
-#[async_trait]
-pub trait MessageTransport: Send + Sync {
-    async fn observe(
-        &self,
-        holder: &ResourceObject<TerminalSession>,
-        submission: Option<&MessageSubmission>,
-    ) -> Result<MessageObservation, String>;
-    async fn submit(&self, batch: &MessageBatch) -> MessageTransportOutcome;
-    async fn poll(&self, batch: &MessageBatch) -> MessageTransportOutcome;
-    /// Forget exactly this batch's transport bookkeeping after durable receipt.
-    /// This must not type input or modify the terminal's composer.
-    async fn release(&self, _batch: &MessageBatch) {}
-    /// Drop bookkeeping for explicitly closed batches, without terminal input.
-    /// Partial closure must leave an unresolved batch intact.
-    async fn release_closed(&self, _messages: &[ResourceObject<Message>]) {}
+/// The holder as the transport router sees it: values, not the terminal record.
+pub fn delivery_target(holder: &ResourceObject<TerminalSession>) -> DeliveryTarget {
+    let status = holder.status.as_ref();
+    let crew = status.and_then(|status| status.crew.as_ref());
+    DeliveryTarget {
+        namespace: holder.metadata.namespace.clone(),
+        holder: holder.metadata.name.clone(),
+        session: status.and_then(|status| status.session_id.clone()),
+        crew_id: crew.map(|crew| crew.id.clone()),
+        // The running harness version and live shapes are not recorded yet
+        // (#3568): every offered shape stays eligible at any version.
+        harness: crew.map(|crew| HarnessRef::new(crew.adapter.clone(), None)),
+        live_shapes: None,
+    }
+}
+
+/// The durable submission as the transport router sees it.
+pub fn submission_ref(submission: &MessageSubmission) -> SubmissionRef {
+    SubmissionRef {
+        batch_id: submission.batch_id.clone(),
+        crew_id: submission.crew_id.clone(),
+        session: submission.session.clone(),
+        started_at: submission.started_at,
+        members: submission.members.clone(),
+        transport: submission.transport.clone().map(TransportId::new),
+    }
 }
 
 impl MessageInbox {
@@ -111,7 +100,7 @@ impl MessageInbox {
     /// pass may contain many groups: holder changes refresh on the next pass.
     /// Cleanup may temporarily retain or remove a gate using that older evidence;
     /// the next pass repairs it from current holders and active Messages.
-    pub async fn reconcile_delivery(&self, transport: &dyn MessageTransport, now: DateTime<Utc>) -> Result<(), ResourceError> {
+    pub async fn reconcile_delivery(&self, router: &TransportRouter, now: DateTime<Utc>) -> Result<(), ResourceError> {
         let _delivery = self.delivery.lock().await;
         {
             let _admission = self.admission.lock().await;
@@ -124,7 +113,7 @@ impl MessageInbox {
         let mut messages = self.messages.query(&MessageQuery::active()).await?;
         if messages.is_empty() {
             self.cleanup_delivery_gates(None, now).await?;
-            tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.release_closed(&messages)).await.ok();
+            tokio::time::timeout(TRANSPORT_CALL_BOUND, router.release_closed()).await.ok();
             return Ok(());
         }
         let snapshot = self.load_delivery_receivers(&messages).await?;
@@ -275,11 +264,10 @@ impl MessageInbox {
             }
         }
         for (_, (holder, pending)) in groups {
-            self.deliver_group(receivers, transport, &holder, &pending, &messages, now).await?;
+            self.deliver_group(receivers, router, &holder, &pending, &messages, now).await?;
         }
         self.cleanup_delivery_gates(Some(receivers), now).await?;
-        let current = self.messages.query(&MessageQuery::active()).await?;
-        tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.release_closed(&current)).await.ok();
+        tokio::time::timeout(TRANSPORT_CALL_BOUND, router.release_closed()).await.ok();
         Ok(())
     }
 
@@ -454,7 +442,7 @@ impl MessageInbox {
     async fn deliver_group(
         &self,
         receivers: &MessageReceiverSnapshot,
-        transport: &dyn MessageTransport,
+        router: &TransportRouter,
         holder: &ResourceObject<TerminalSession>,
         pending: &[ResourceObject<Message>],
         all: &[ResourceObject<Message>],
@@ -472,28 +460,32 @@ impl MessageInbox {
             }
             return Ok(());
         }
-        let observation = match tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.observe(holder, existing.as_ref()))
-            .await
-            .unwrap_or_else(|_| Err("transport observation timed out".into()))
-        {
-            Ok(observation) => observation,
-            Err(error) => {
-                if let Some(submission) = &existing {
-                    let held: Vec<_> =
-                        pending.iter().filter(|message| submission.members.contains(&message.metadata.name)).cloned().collect();
-                    if now.signed_duration_since(submission.started_at) >= DELIVERY_HOLD_FOR {
-                        self.failed(receivers, &held, &error, true, now).await?;
-                        return Ok(());
+        let target = delivery_target(holder);
+        let existing_ref = existing.as_ref().map(submission_ref);
+        let (planned, observation) =
+            match tokio::time::timeout(TRANSPORT_CALL_BOUND, router.observe(MESSAGE_OPERATION, &target, existing_ref.as_ref()))
+                .await
+                .unwrap_or_else(|_| Err("transport observation timed out".into()))
+            {
+                Ok(observation) => observation,
+                Err(error) => {
+                    if let Some(submission) = &existing {
+                        let held: Vec<_> =
+                            pending.iter().filter(|message| submission.members.contains(&message.metadata.name)).cloned().collect();
+                        if now.signed_duration_since(submission.started_at) >= DELIVERY_HOLD_FOR {
+                            self.failed(receivers, &held, &error, true, now).await?;
+                            return Ok(());
+                        }
+                        for message in pending {
+                            self.wait(message, MessagePhase::Deliverable, &format!("held while observing acceptance: {error}"), now)
+                                .await?;
+                        }
+                    } else {
+                        self.failed(receivers, pending, &error, false, now).await?;
                     }
-                    for message in pending {
-                        self.wait(message, MessagePhase::Deliverable, &format!("held while observing acceptance: {error}"), now).await?;
-                    }
-                } else {
-                    self.failed(receivers, pending, &error, false, now).await?;
+                    return Ok(());
                 }
-                return Ok(());
-            }
-        };
+            };
         if let Some(mut submission) = existing {
             for message in pending.iter().filter(|message| !submission.members.contains(&message.metadata.name)) {
                 self.wait(message, MessagePhase::Deliverable, &format!("waiting behind recorded batch {}", submission.batch_id), now)
@@ -515,7 +507,7 @@ impl MessageInbox {
             {
                 // Recover a partially persisted batch receipt without polling or resubmitting.
                 self.accepted(receivers, &members, &receiver).await?;
-                release(transport, &batch(holder, &members, submission.clone())).await;
+                release(router, &delivery(holder, &members, submission.clone())).await;
                 self.clear_signal(receivers, &members[0]).await?;
                 return Ok(());
             }
@@ -553,10 +545,11 @@ impl MessageInbox {
                             .session(submission.session.clone())
                             .delivered_at(now)
                             .evidence(evidence)
+                            .maybe_transport(submission.transport.clone())
                             .build(),
                     )
                     .await?;
-                    release(transport, &batch(holder, &members, submission.clone())).await;
+                    release(router, &delivery(holder, &members, submission.clone())).await;
                     self.clear_signal(receivers, &members[0]).await?;
                     return Ok(());
                 }
@@ -573,16 +566,16 @@ impl MessageInbox {
                 self.failed(receivers, &members, "recorded receiver session changed before acceptance was established", true, now).await?;
                 return Ok(());
             }
-            let batch = batch(holder, &members, submission.clone());
-            let outcome = tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.poll(&batch))
+            let delivery = delivery(holder, &members, submission.clone());
+            let outcome = tokio::time::timeout(TRANSPORT_CALL_BOUND, router.poll(&delivery))
                 .await
-                .unwrap_or_else(|_| MessageTransportOutcome::Unconfirmed { reason: "transport receipt poll timed out".into() });
-            if matches!(outcome, MessageTransportOutcome::Pending | MessageTransportOutcome::Unconfirmed { .. })
+                .unwrap_or_else(|_| TransportOutcome::Unconfirmed { reason: "transport receipt poll timed out".into() });
+            if matches!(outcome, TransportOutcome::Pending | TransportOutcome::Unconfirmed { .. })
                 && now.signed_duration_since(submission.started_at) >= DELIVERY_HOLD_FOR
             {
                 self.failed(receivers, &members, "submission acceptance remained unresolved past the hold bound", true, now).await?;
             } else {
-                self.outcome(receivers, DeliveryAttempt { members: &members, holder, submission: &submission }, transport, outcome, now)
+                self.outcome(receivers, DeliveryAttempt { members: &members, holder, submission: &submission }, router, outcome, now)
                     .await?;
             }
             return Ok(());
@@ -629,6 +622,9 @@ impl MessageInbox {
             .started_at(now)
             .members(pending.iter().map(|message| message.metadata.name.clone()).collect())
             .maybe_output_digest(observation.output_digest)
+            // Recorded with the intent: the transport that just observed readiness
+            // is the one the router tries first, so recovery polls it.
+            .transport(planned.0)
             .build();
         let admission = self.admission.lock().await;
         // The observation was outside admission. A successor or an operator
@@ -654,24 +650,44 @@ impl MessageInbox {
             self.write(message, &status).await?;
         }
         drop(admission);
-        let batch = batch(holder, pending, submission.clone());
-        let outcome = tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.submit(&batch)).await.unwrap_or_else(|_| {
-            MessageTransportOutcome::Unconfirmed { reason: "transport submission timed out; input may have been accepted".into() }
-        });
-        self.outcome(receivers, DeliveryAttempt { members: pending, holder, submission: &submission }, transport, outcome, now).await
+        let mut submission = submission;
+        let routed = tokio::time::timeout(TRANSPORT_CALL_BOUND, router.submit(&delivery(holder, pending, submission.clone())))
+            .await
+            // A timeout cannot say which transport was in flight. Any earlier
+            // failover moved past a transport that definitely did not deliver, so
+            // the planned transport stays recorded: recovery observes and polls it
+            // without resubmitting, and holds the batch for an operator past the
+            // hold bound if a later transport took it.
+            .unwrap_or_else(|_| Routed {
+                transport: submission.transport.clone().map(TransportId::new),
+                outcome: TransportOutcome::Unconfirmed { reason: "transport submission timed out; input may have been accepted".into() },
+                failovers: Vec::new(),
+            });
+        for failover in &routed.failovers {
+            tracing::info!(batch = %submission.batch_id, transport = %failover.transport, reason = %failover.reason, "message delivery failed over");
+        }
+        let used = routed.transport.map(|transport| transport.0);
+        if used != submission.transport {
+            // A failover moved the batch: polls and the receipt follow the transport used.
+            submission.transport = used;
+            if !matches!(routed.outcome, TransportOutcome::NotSubmitted { .. }) {
+                self.record_submission(pending, &submission).await?;
+            }
+        }
+        self.outcome(receivers, DeliveryAttempt { members: pending, holder, submission: &submission }, router, routed.outcome, now).await
     }
 
     async fn outcome(
         &self,
         receivers: &MessageReceiverSnapshot,
         attempt: DeliveryAttempt<'_>,
-        transport: &dyn MessageTransport,
-        outcome: MessageTransportOutcome,
+        router: &TransportRouter,
+        outcome: TransportOutcome,
         now: DateTime<Utc>,
     ) -> Result<(), ResourceError> {
         let DeliveryAttempt { members, holder, submission } = attempt;
         match outcome {
-            MessageTransportOutcome::Accepted { evidence } if !evidence.is_empty() => {
+            TransportOutcome::Accepted { evidence } if !evidence.is_empty() => {
                 self.accepted(
                     receivers,
                     members,
@@ -681,18 +697,23 @@ impl MessageInbox {
                         .session(submission.session.clone())
                         .delivered_at(now)
                         .evidence(evidence)
+                        .maybe_transport(submission.transport.clone())
                         .build(),
                 )
                 .await?;
-                release(transport, &batch(holder, members, submission.clone())).await;
+                release(router, &delivery(holder, members, submission.clone())).await;
                 self.clear_signal(receivers, &members[0]).await
             }
-            MessageTransportOutcome::NotSubmitted { reason } => self.failed(receivers, members, &reason, false, now).await,
-            MessageTransportOutcome::Unconfirmed { reason } => {
+            // The router answers an exhausted fallback as not submitted; an
+            // unsupported refusal that reaches here wrote nothing either.
+            TransportOutcome::NotSubmitted { reason } | TransportOutcome::Unsupported { reason } => {
+                self.failed(receivers, members, &reason, false, now).await
+            }
+            TransportOutcome::Unconfirmed { reason } => {
                 self.failed(receivers, members, &format!("held pending acceptance evidence: {reason}"), true, now).await
             }
-            MessageTransportOutcome::Pending => Ok(()),
-            MessageTransportOutcome::Accepted { .. } => {
+            TransportOutcome::Pending => Ok(()),
+            TransportOutcome::Accepted { .. } => {
                 self.failed(receivers, members, "transport supplied an empty acceptance receipt", true, now).await
             }
         }
@@ -771,6 +792,19 @@ impl MessageInbox {
                 .is_some_and(|submission| crate::delivery_hold::delivery_hold_overdue(submission.started_at, now));
             if held && (!ambiguous || overdue) && member.metadata.name == members[0].metadata.name {
                 self.signal(receivers, &current, now).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrites the recorded submission on members still holding this batch.
+    async fn record_submission(&self, members: &[ResourceObject<Message>], submission: &MessageSubmission) -> Result<(), ResourceError> {
+        for member in members {
+            let current = self.messages.get(&member.metadata.name).await?;
+            let mut status = status_for(&current);
+            if status.submission.as_ref().is_some_and(|recorded| recorded.batch_id == submission.batch_id) {
+                status.submission = Some(submission.clone());
+                self.write(&current, &status).await?;
             }
         }
         Ok(())
@@ -910,9 +944,9 @@ fn status_for(message: &ResourceObject<Message>) -> MessageStatus {
     })
 }
 
-fn batch(holder: &ResourceObject<TerminalSession>, members: &[ResourceObject<Message>], submission: MessageSubmission) -> MessageBatch {
+fn delivery(holder: &ResourceObject<TerminalSession>, members: &[ResourceObject<Message>], submission: MessageSubmission) -> Delivery {
     let text = members.iter().map(|message| frame_message(&message.spec)).collect::<Vec<_>>().join("\n\n");
-    MessageBatch::builder().id(submission.batch_id.clone()).holder(holder.clone()).submission(submission).text(text).build()
+    Delivery { operation: MESSAGE_OPERATION, target: delivery_target(holder), submission: submission_ref(&submission), text }
 }
 
 fn header_value(value: &str) -> String {
@@ -975,9 +1009,9 @@ pub fn frame_message(spec: &MessageSpec) -> String {
     format!("[from {sender} ({relation}){suffix}]\n\n{}", spec.body)
 }
 
-async fn release(transport: &dyn MessageTransport, batch: &MessageBatch) {
+async fn release(router: &TransportRouter, delivery: &Delivery) {
     // Receipt is already durable. A stuck bookkeeping release cannot reopen it.
-    let _ = tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.release(batch)).await;
+    let _ = tokio::time::timeout(TRANSPORT_CALL_BOUND, router.release(delivery)).await;
 }
 
 #[cfg(test)]
@@ -1146,7 +1180,7 @@ mod framing_tests {
             .started_at(DateTime::UNIX_EPOCH)
             .members(members.iter().map(|message| message.metadata.name.clone()).collect())
             .build();
-        let rendered = batch(&holder, &members, submission);
+        let rendered = delivery(&holder, &members, submission);
         assert_eq!(rendered.text, "[from the operator (supervisor)]\n\nContinue the work.\n\n[from flotilla (system) · turn rules]\n\nComplete this turn.\n\n[from work/reviewer (peer) · re PR #2920 · reply expected]\n\nPlease address the review.");
         assert_eq!(rendered.submission.members, vec!["message-0", "message-1", "message-2"]);
     }

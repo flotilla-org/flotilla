@@ -177,29 +177,32 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     // after its turn boundary only the latest card is submitted, once.
     struct Transport {
         working: AtomicBool,
-        submitted: Mutex<Vec<flotilla_messaging::MessageBatch>>,
+        submitted: Mutex<Vec<flotilla_agent_connector::Delivery>>,
     }
     #[async_trait]
-    impl flotilla_messaging::MessageTransport for Transport {
+    impl flotilla_agent_connector::AgentTransport for Transport {
+        fn id(&self) -> flotilla_agent_connector::TransportId {
+            flotilla_agent_connector::KEYSTROKE.into()
+        }
         async fn observe(
             &self,
-            _: &ResourceObject<ResourceTerminalSession>,
-            _: Option<&flotilla_resources::MessageSubmission>,
-        ) -> Result<flotilla_messaging::MessageObservation, String> {
+            _: &flotilla_agent_connector::DeliveryTarget,
+            _: Option<&flotilla_agent_connector::SubmissionRef>,
+        ) -> Result<flotilla_agent_connector::TransportObservation, String> {
             let working = self.working.load(Ordering::SeqCst);
-            Ok(flotilla_messaging::MessageObservation {
+            Ok(flotilla_agent_connector::TransportObservation {
                 ready: !working,
                 working,
                 evidence: Some("terminal boundary".into()),
                 ..Default::default()
             })
         }
-        async fn submit(&self, batch: &flotilla_messaging::MessageBatch) -> flotilla_messaging::MessageTransportOutcome {
+        async fn submit(&self, batch: &flotilla_agent_connector::Delivery) -> flotilla_agent_connector::TransportOutcome {
             self.submitted.lock().await.push(batch.clone());
-            flotilla_messaging::MessageTransportOutcome::Accepted { evidence: "accepted".into() }
+            flotilla_agent_connector::TransportOutcome::Accepted { evidence: "accepted".into() }
         }
-        async fn poll(&self, _: &flotilla_messaging::MessageBatch) -> flotilla_messaging::MessageTransportOutcome {
-            flotilla_messaging::MessageTransportOutcome::Accepted { evidence: "accepted".into() }
+        async fn poll(&self, _: &flotilla_agent_connector::Delivery) -> flotilla_agent_connector::TransportOutcome {
+            flotilla_agent_connector::TransportOutcome::Accepted { evidence: "accepted".into() }
         }
     }
     let session = sessions.get("session").await.expect("session");
@@ -222,13 +225,14 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
         )
         .await
         .expect("running holder");
-    let transport = Transport { working: AtomicBool::new(true), submitted: Mutex::new(Vec::new()) };
+    let transport = Arc::new(Transport { working: AtomicBool::new(true), submitted: Mutex::new(Vec::new()) });
+    let router = flotilla_agent_connector::TransportRouter::new().with_transport(transport.clone());
     let inbox = flotilla_messaging::MessageInbox::new(backend, "flotilla");
-    inbox.reconcile_delivery(&transport, Utc::now()).await.expect("busy holder");
+    inbox.reconcile_delivery(&router, Utc::now()).await.expect("busy holder");
     assert!(transport.submitted.lock().await.is_empty());
     transport.working.store(false, Ordering::SeqCst);
-    inbox.reconcile_delivery(&transport, Utc::now()).await.expect("turn boundary");
-    inbox.reconcile_delivery(&transport, Utc::now()).await.expect("idempotent receipt");
+    inbox.reconcile_delivery(&router, Utc::now()).await.expect("turn boundary");
+    inbox.reconcile_delivery(&router, Utc::now()).await.expect("idempotent receipt");
     let submitted = transport.submitted.lock().await;
     assert_eq!(submitted.len(), 1);
     // The latest revision is traceable through the submission and stored subject, not a JSON header (#2923).
@@ -287,6 +291,7 @@ async fn previous_generation_gets_full_card_once_then_delivered_deltas() {
         session: "terminal".into(),
         delivered_at: Utc::now(),
         evidence: "in-memory transport receipt".into(),
+        transport: None,
     });
     messages.update_status(&all[0].metadata.name, &all[0].metadata.resource_version, &status).await.expect("receipt");
     let second = "## Your capabilities\n### Credentials\n- known\n- added\n";

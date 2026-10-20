@@ -494,18 +494,6 @@ pub struct TerminalAttention {
     pub source: TerminalAttentionSource,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalSessionTag {
-    pub key: String,
-    pub value: String,
-}
-
-impl TerminalSessionTag {
-    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
-        Self { key: key.into(), value: value.into() }
-    }
-}
-
 impl TerminalAttention {
     // Replica refreshes run every 30 seconds. Leave room for observation
     // persistence, replication, and a delayed refresh before expiring it.
