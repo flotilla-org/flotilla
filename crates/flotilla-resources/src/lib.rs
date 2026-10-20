@@ -185,7 +185,8 @@ pub use manifest_root::{
 };
 pub use placement_policy::{
     DockerCheckoutStrategy, DockerImagePullPolicy, DockerImageSource, DockerPerVesselPlacementPolicySpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, PlacementPolicy, PlacementPolicySpec, DOCKER_POLICY_NAME_PREFIX,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, PlacementPolicy, PlacementPolicySpec, ProviderRequirements,
+    DOCKER_POLICY_NAME_PREFIX,
 };
 pub use platform::Platform;
 pub use prepared_snapshot::{content_hash, is_prepared_snapshot, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND};

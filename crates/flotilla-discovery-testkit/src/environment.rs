@@ -1,12 +1,22 @@
 //! Common declarations for injected contained test environments. Lifecycle state,
 //! command boundaries and adapter-specific capabilities belong to each fixture.
-pub use flotilla_environment::environment::{EnvironmentClass, EnvironmentInput, ProviderCapabilities, ProviderKind};
+pub use flotilla_environment::environment::{EnvironmentClass, EnvironmentInput, ProviderCapabilities, ProviderKind, ProviderReadiness};
 
 pub fn injected_kind() -> ProviderKind {
     ProviderKind::new(EnvironmentClass::Dummy, "injected")
 }
 pub fn injected_capabilities() -> ProviderCapabilities {
     ProviderCapabilities {
+        material_modes: vec![
+            flotilla_environment::environment::MaterialMode::Frozen,
+            flotilla_environment::environment::MaterialMode::Pushed,
+            flotilla_environment::environment::MaterialMode::Shared,
+        ],
+        checkout_strategies: vec![
+            flotilla_environment::environment::CheckoutStrategy::HostWorktree,
+            flotilla_environment::environment::CheckoutStrategy::HostClone,
+            flotilla_environment::environment::CheckoutStrategy::CloneInVessel,
+        ],
         workspace_root: "/workspace".into(),
         reference_root: Some("/ref/repo".into()),
         receives_host_tools: true,
@@ -19,6 +29,15 @@ pub fn injected_capabilities() -> ProviderCapabilities {
 #[macro_export]
 macro_rules! injected_environment_provider {
     () => {
+        fn detect_readiness<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = $crate::environment::ProviderReadiness> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { $crate::environment::ProviderReadiness::Ready })
+        }
         fn kind(&self) -> $crate::environment::ProviderKind {
             $crate::environment::injected_kind()
         }
@@ -42,4 +61,19 @@ macro_rules! injected_environment_handle {
             self.container_name().unwrap_or_else(|| self.id().as_str())
         }
     };
+}
+
+/// Declared provider facts for in-memory admission fixtures. No process probes
+/// run: these fixtures model a ready host-direct and contained endpoint.
+pub fn ready_placement_advertisements() -> Vec<flotilla_environment::environment::ProviderAdvertisement> {
+    [EnvironmentClass::HostDirect, EnvironmentClass::Container]
+        .into_iter()
+        .enumerate()
+        .map(|(index, class)| flotilla_environment::environment::ProviderAdvertisement {
+            instance: format!("fixture-{index}"),
+            kind: Some(ProviderKind::new(class, "fixture")),
+            capabilities: injected_capabilities(),
+            readiness: ProviderReadiness::Ready,
+        })
+        .collect()
 }

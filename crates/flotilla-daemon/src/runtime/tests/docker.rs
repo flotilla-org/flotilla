@@ -30,10 +30,13 @@ async fn local_profile_does_not_advertise_docker_without_interior_cleat() {
         Arc::new(flotilla_terminal::passthrough::PassthroughTerminalPool),
     );
 
-    let profile = build_local_profile(&daemon, &registry).expect("local profile");
+    let profile = build_local_profile(&daemon, &registry).await.expect("local profile");
 
     assert_eq!(profile.docker_pool, "cleat");
     assert!(!profile.docker_available, "a host must not advertise contained placement until it can deliver interior cleat");
+    // Missing host tools are advertised as an instance-owned readiness reason.
+    assert!(matches!(&profile.environment_providers[0].readiness,
+        flotilla_protocol::provider::ProviderReadiness::MissingTool { reason } if reason.contains("cleat")));
 }
 
 #[tokio::test]
@@ -867,7 +870,14 @@ async fn fresh_contained_admission_resolves_legacy_literal_and_refuses_literal_t
                     ready: true,
                     heartbeat_at: Some(Utc::now()),
                     admission_free_space_floor_bytes: Some(0),
-                    capabilities: BTreeMap::from([("docker".into(), json!(true)), ("os".into(), json!("linux"))]),
+                    capabilities: BTreeMap::from([
+                        (
+                            flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                            serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                        ),
+                        ("docker".into(), json!(true)),
+                        ("os".into(), json!("linux")),
+                    ]),
                     ..Default::default()
                 },
             )

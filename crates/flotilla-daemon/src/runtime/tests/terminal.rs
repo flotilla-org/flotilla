@@ -157,7 +157,7 @@ async fn convoy_holds_and_recovers_when_terminal_pool_is_transiently_unavailable
 
     let initial = daemon_with_transient_terminal_pool(Arc::clone(&config), backend.clone(), Arc::clone(&pool)).await;
     let registry = probe_local_provider_registry(&initial, &config).await.expect("initial provider registry");
-    let profile = build_local_profile(&initial, &registry).expect("initial profile");
+    let profile = build_local_profile(&initial, &registry).await.expect("initial profile");
     register_startup_resources(&initial, NAMESPACE, &profile).await.expect("initial startup resources");
 
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
@@ -316,7 +316,7 @@ async fn starting_agent_replaces_a_pool_session_left_by_a_previous_daemon_runtim
     let current_socket = temp.path().join("current-daemon.sock");
     daemon.set_daemon_socket_path(current_socket.clone()).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
-    let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
+    let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
     let state = Arc::new(ControllerRuntimeState::new(
         Arc::clone(&daemon),
         config,
@@ -405,7 +405,7 @@ async fn terminal_teardown_kills_a_persisted_session_after_runtime_restart() {
     let config = Arc::new(ConfigStore::with_base(config_path));
     let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
-    let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
+    let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
     let runtime = TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -449,7 +449,7 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
     let config = Arc::new(ConfigStore::with_base(config_path));
     let (daemon, pool) = crew_daemon(Arc::clone(&config)).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
-    let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
+    let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
     let central = temp.path().join(".config/flotilla/credentials/codex-central/auth.json");
     std::fs::create_dir_all(central.parent().expect("central credential directory")).expect("central credential directory");
     std::fs::write(&central, "{\"tokens\":{\"access_token\":\"access-token-one\"}}").expect("central auth");
@@ -558,7 +558,7 @@ async fn terminal_teardown_skips_a_session_absent_from_the_pool() {
     let config = Arc::new(ConfigStore::with_base(config_path));
     let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
-    let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
+    let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
     let runtime = TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
             Arc::clone(&daemon),

@@ -427,7 +427,15 @@ pub(super) async fn create_host_direct_placement(
             &host.metadata.name,
             &host.metadata.resource_version,
             &HostStatus {
-                capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),
+                capabilities: [
+                    (
+                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                    ),
+                    (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters)),
+                ]
+                .into_iter()
+                .collect(),
                 heartbeat_at: Some(Utc::now()),
                 ready: true,
                 ..HostStatus::default()
@@ -517,6 +525,10 @@ pub(super) async fn create_docker_placement(
             &HostStatus {
                 capabilities: [
                     (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials)),
+                    (
+                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                    ),
                     ("docker".to_string(), serde_json::json!(true)),
                     ("os".to_string(), serde_json::json!("linux")),
                 ]

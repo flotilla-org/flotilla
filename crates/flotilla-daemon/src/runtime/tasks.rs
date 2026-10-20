@@ -318,6 +318,7 @@ pub(super) fn spawn_local_fulfilment_probe_task(
         let scratch = scratch.clone();
         let observations = observations.clone();
         async move {
+            observations.record_provider_advertisements(super::discovery::observe_provider_advertisements(&providers).await).await;
             let discovery = daemon.discovery_runtime();
             let hosts = daemon.resource_backend().using::<Host>(&namespace);
             let status = hosts.get(&profile.host_id).await.ok().and_then(|host| host.status).unwrap_or_default();

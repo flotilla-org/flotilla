@@ -57,7 +57,14 @@ pub(super) struct RuntimeHealth {
 #[derive(Clone, Default)]
 pub(super) struct HostObservations {
     blob_store: Option<Arc<TieredBlobStore>>,
+    provider_advertisements: Arc<tokio::sync::RwLock<Option<ProviderObservation>>>,
     fulfilment_facts: Arc<tokio::sync::RwLock<Option<BTreeMap<String, FulfilmentFacts>>>>,
+}
+
+#[derive(Clone)]
+struct ProviderObservation {
+    at: tokio::time::Instant,
+    providers: Vec<flotilla_protocol::provider::ProviderAdvertisement>,
 }
 
 impl std::fmt::Debug for HostObservations {
@@ -77,6 +84,23 @@ impl HostObservations {
             Some(store) => Some(store.status().await),
             None => None,
         }
+    }
+
+    pub(super) async fn record_provider_advertisements(&self, providers: Vec<flotilla_protocol::provider::ProviderAdvertisement>) {
+        *self.provider_advertisements.write().await = Some(ProviderObservation { at: tokio::time::Instant::now(), providers });
+    }
+
+    async fn provider_advertisements(&self) -> Option<Vec<flotilla_protocol::provider::ProviderAdvertisement>> {
+        let observed = self.provider_advertisements.read().await;
+        let observation = observed.as_ref()?;
+        let mut providers = observation.providers.clone();
+        if observation.at.elapsed() >= Duration::from_secs(flotilla_resources::HEARTBEAT_READY_TTL_SECS as u64) {
+            for provider in &mut providers {
+                provider.readiness =
+                    flotilla_protocol::provider::ProviderReadiness::Unknown { reason: "provider readiness observation expired".into() };
+            }
+        }
+        Some(providers)
     }
 
     /// The facts most recently observed by this process, if any pass has completed.
@@ -458,6 +482,9 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
         conditions.push(condition);
     }
     let mut capabilities = host_capabilities(&summary, profile, &held_credentials, &credential_expiry);
+    if let Some(providers) = runtime_health.host_observations.provider_advertisements().await {
+        capabilities.insert(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers));
+    }
     if let Some(snapshot) = crate::resource_limits::io_pressure_snapshot().await {
         capabilities.insert("io_pressure".to_string(), snapshot);
     }
@@ -817,4 +844,29 @@ pub(super) fn spawn_controller_loop_watchdog(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod provider_readiness_tests {
+    use super::*;
+    use flotilla_protocol::provider::{ProviderAdvertisement, ProviderReadiness};
+
+    // Re-observation publishes credential loss, and an expired sample never
+    // keeps a cloud instance ready. Generate both sides of the freshness boundary.
+    #[hegel::test]
+    fn refreshed_and_expired_provider_readiness_fails_closed(tc: hegel::TestCase) {
+        let age = tc.draw(hegel::generators::integers::<u64>().min_value(59).max_value(61));
+        tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
+            let observations = HostObservations::default();
+            let mut provider =
+                ProviderAdvertisement { instance: "cloud".into(), readiness: ProviderReadiness::Ready, ..Default::default() };
+            observations.record_provider_advertisements(vec![provider.clone()]).await;
+            tokio::time::advance(Duration::from_secs(age)).await;
+            let current = observations.provider_advertisements().await.unwrap();
+            assert_eq!(current[0].readiness == ProviderReadiness::Ready, age < 60);
+            provider.readiness = ProviderReadiness::MissingCredential { reason: "account token removed".into() };
+            observations.record_provider_advertisements(vec![provider.clone()]).await;
+            assert_eq!(observations.provider_advertisements().await.unwrap()[0].readiness, provider.readiness);
+        });
+    }
 }

@@ -137,6 +137,8 @@ mod tests {
         let created = policies.get("host-direct-shared").await.expect("registered policy");
         let mut operator_spec = created.spec.clone();
         operator_spec.priority = 73;
+        operator_spec.provider_requirements =
+            Some(flotilla_resources::ProviderRequirements { instance: Some("operator-instance".into()), ..Default::default() });
         policies
             .write_spec(
                 &WriterIdentity::operator(),
@@ -152,6 +154,8 @@ mod tests {
             reconcile_registered_policy(&backend, NAMESPACE, "host-direct-shared", &host_direct(pool, host))
                 .await
                 .expect("registration cycle");
+            // Registration preserves operator requirements across topology refreshes.
+            assert_eq!(policies.get("host-direct-shared").await.unwrap().spec.provider_requirements, operator_spec.provider_requirements);
             assert_eq!(
                 policies.get("host-direct-shared").await.expect("registered policy").spec.priority,
                 73,

@@ -18,6 +18,7 @@ pub mod output;
 pub mod path_context;
 pub mod peer;
 mod placement;
+pub mod provider;
 pub mod provider_data;
 mod provisioning_target;
 pub mod qualified_path;

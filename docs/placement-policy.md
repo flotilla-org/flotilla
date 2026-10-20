@@ -83,3 +83,41 @@ After every host's Docker policies switch, retire execution of the old worktree
 strategy in a follow-up. Keep its enum variant readable for one generation under
 ADR 0047. Managed Clone garbage collection and host-direct changes are outside
 this rollout.
+
+## Provider requirements
+
+Each vessel is placed using its own crew needs and its selected policy. Policies
+can optionally constrain the host's advertised provider instances:
+
+```yaml
+provider_requirements:
+  class: container
+  material_modes: [frozen, pushed]
+  checkout_strategy: host_clone
+  egress_enforcement: enforced
+```
+
+Use `instance: <configured-name>` to pin a specific instance instead of a class,
+or combine both as constraints. All requirements must hold. Host checkout
+strategies additionally require Shared material; explicitly requesting another
+strategy cannot remove that requirement. `egress_enforcement: enforced` requires
+an enforcing provider; `advisory` or an omitted requirement accepts either.
+Selection filters readiness and capabilities and refuses multiple matches. It
+does not rank providers. Admission freezes the selected instance separately for
+each vessel, and provisioning uses that identity.
+
+Without this optional field, existing policies derive class and checkout from
+their execution inputs. The existing provider-instance metadata label remains
+accepted. A conflicting field and label refuses admission. Readiness is observed
+on the advertising host; for cloud providers that host controls the sandbox and
+must have its credential. Readiness is re-probed periodically; stale local samples
+become Unknown, including when the observation task stops. Missing readiness in an old advertisement is Unknown
+and fails closed. Refusals identify the host, instance and missing capability or
+readiness reason, for example `feta: firecracker ready but no Shared material`.
+Docker reports its Linux and host-tool requirements as provider readiness;
+admission no longer reads host-wide Docker or OS booleans.
+
+The out-of-repo authors are `robert/fleet-ops` (`placement/<Host ID>.yaml`), legacy
+project-map placement manifests, and operator-authored host-local policies.
+Existing authors may omit `provider_requirements`; no companion manifest changes
+are required. Roll every host before relying on the new readiness declarations.

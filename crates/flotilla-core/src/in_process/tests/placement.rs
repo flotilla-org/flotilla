@@ -108,6 +108,10 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
             &host.metadata.resource_version,
             &HostStatus {
                 capabilities: [
+                    (
+                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                    ),
                     (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["claude-code"])),
                     (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["claude-max"])),
                     ("docker".to_string(), serde_json::json!(true)),
@@ -211,10 +215,26 @@ async fn placement_decision_prefers_local_home_copy_over_same_name_replica() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let hosts = backend.using::<ResourceHost>("flotilla");
     for host in ["local-host", "replica-host"] {
-        hosts
+        let object = hosts
             .create(&test_meta(host), &HostSpec { display_name: host.to_string(), connection: Default::default(), ..HostSpec::default() })
             .await
             .expect("placement host");
+        hosts
+            .update_status(
+                host,
+                &object.metadata.resource_version,
+                &HostStatus {
+                    capabilities: [(
+                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
     }
 
     backend
@@ -320,6 +340,10 @@ async fn agentless_ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
             &host.metadata.resource_version,
             &HostStatus {
                 capabilities: BTreeMap::from([
+                    (
+                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                    ),
                     (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!([])),
                     ("agentless".to_string(), serde_json::json!(true)),
                     ("transport".to_string(), serde_json::json!("ssh")),
@@ -385,7 +409,15 @@ async fn default_placement_prefers_local_host_referenced_by_display_name() {
             &local.metadata.name,
             &local.metadata.resource_version,
             &HostStatus {
-                capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
+                capabilities: [
+                    (
+                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                    ),
+                    (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
+                ]
+                .into_iter()
+                .collect(),
                 heartbeat_at: Some(Utc::now()),
                 ready: true,
                 ..HostStatus::default()

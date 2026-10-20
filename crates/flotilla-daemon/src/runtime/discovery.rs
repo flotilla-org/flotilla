@@ -104,7 +104,7 @@ pub(super) async fn discover_agentless_ssh_profile(
         .to_string();
     let available_pools = registry.terminal_pools.iter().map(|(description, _)| description.implementation.clone()).collect();
     let provisioning = LocalProvisioningProfile {
-        environment_providers: registry.environment_providers.advertisements(),
+        environment_providers: observe_provider_advertisements(&registry).await,
         host_id,
         display_name: direct.display_name.unwrap_or_else(|| environment_id.to_string()),
         repo_default_dir: format!("{home}/{DEFAULT_REPO_DIR_SUFFIX}"),
@@ -253,9 +253,22 @@ pub(super) async fn apply_agentless_ssh_observation(
     } else {
         BTreeMap::new()
     };
+    let providers = match daemon.environment_registry_for_environment(&ssh.environment_id) {
+        Some(registry) => observe_provider_advertisements(&registry).await,
+        None => profile
+            .environment_providers
+            .iter()
+            .cloned()
+            .map(|mut provider| {
+                provider.readiness =
+                    flotilla_protocol::provider::ProviderReadiness::Unknown { reason: "controlling host registry unavailable".into() };
+                provider
+            })
+            .collect(),
+    };
     let status = HostStatus {
         capabilities: BTreeMap::from([
-            (flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.to_string(), json!(profile.environment_providers)),
+            (flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.to_string(), json!(providers)),
             (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
             (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(held_credentials)),
             (CREDENTIAL_EXPIRY_CAPABILITY.to_string(), json!(credential_expiry)),
@@ -311,7 +324,7 @@ pub(super) async fn probe_local_provider_registry(
     Ok(Arc::new(daemon.discovery_runtime().factories.probe_all(&local_bag, config, &probe_root, runner).await))
 }
 
-pub(super) fn build_local_profile(
+pub(super) async fn build_local_profile(
     daemon: &Arc<InProcessDaemon>,
     local_registry: &ProviderRegistry,
 ) -> Result<LocalProvisioningProfile, String> {
@@ -330,8 +343,8 @@ pub(super) fn build_local_profile(
     let docker_pool = "cleat".to_string();
     // General provisioning availability follows per_vessel capability data:
     // dummy brings its own crew runtime, while other instances need host cleat.
-    // This retains the historical docker_available admission fact until admission
-    // moves. Stored-Docker recovery in environments.rs/state.rs is deliberately
+    // This retains the legacy seed-policy availability flag. Admission uses
+    // individual advertisements. Stored-Docker recovery in environments.rs/state.rs is deliberately
     // narrower because it reads docker_container_id. Remove that legacy-input
     // bridge and its recovery filters together at the generated-table move (#3108).
     let docker_available = local_registry.environment_providers.iter().any(|(_, provider)| {
@@ -340,7 +353,7 @@ pub(super) fn build_local_profile(
     let available_agent_adapters = local_registry.agent_adapters.ids().map(ToString::to_string).collect();
 
     Ok(LocalProvisioningProfile {
-        environment_providers: local_registry.environment_providers.advertisements(),
+        environment_providers: observe_provider_advertisements(local_registry).await,
         host_id,
         display_name: daemon.host_name().to_string(),
         repo_default_dir,
@@ -350,6 +363,28 @@ pub(super) fn build_local_profile(
         available_agent_adapters,
         docker_available,
     })
+}
+
+/// Re-observe prerequisites on the controlling host, including credential loss.
+pub(super) async fn observe_provider_advertisements(
+    registry: &ProviderRegistry,
+) -> Vec<flotilla_protocol::provider::ProviderAdvertisement> {
+    registry
+        .environment_providers
+        .advertisements()
+        .await
+        .into_iter()
+        .map(|mut provider| {
+            if provider.readiness == flotilla_protocol::provider::ProviderReadiness::Ready
+                && provider.capabilities.receives_host_tools
+                && !registry.terminal_pools.contains_key("cleat")
+            {
+                provider.readiness =
+                    flotilla_protocol::provider::ProviderReadiness::MissingTool { reason: "cleat required for host tool injection".into() };
+            }
+            provider
+        })
+        .collect()
 }
 
 pub(super) struct FulfilmentProbeContext<'a> {

@@ -507,6 +507,10 @@ async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, h
             &HostStatus {
                 capabilities: [
                     (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials)),
+                    (
+                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                    ),
                     ("docker".to_string(), serde_json::json!(true)),
                     ("os".to_string(), serde_json::json!("linux")),
                 ]

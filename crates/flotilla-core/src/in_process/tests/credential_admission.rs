@@ -22,7 +22,7 @@ use flotilla_admission::convoy_admission::{
 use flotilla_agent::adapter::{AgentRequirement, CapabilityTable};
 
 #[tokio::test]
-async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selection() {
+async fn docker_placement_refuses_instance_readiness_before_selection() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -41,11 +41,16 @@ async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selectio
         .vessels(vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()])
         .build();
 
-    for (docker, os, missing) in [(false, "macos", "docker capability"), (true, "macos", "Linux host capability")] {
+    // Both pinned and default admission use instance readiness rather than
+    // host-wide Docker/OS booleans. Providers own prerequisite explanations.
+    for missing in ["runtime unavailable", "Linux host required"] {
         let host = hosts.get("kiwi").await.expect("host");
         let mut status = host.status.expect("status");
-        status.capabilities.insert("docker".to_string(), serde_json::json!(docker));
-        status.capabilities.insert("os".to_string(), serde_json::json!(os));
+        let mut providers = flotilla_discovery_testkit::environment::ready_placement_advertisements();
+        providers[1].readiness = flotilla_protocol::provider::ProviderReadiness::MissingTool { reason: missing.into() };
+        status.capabilities.insert(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers));
+        status.capabilities.insert("docker".into(), serde_json::json!(true));
+        status.capabilities.insert("os".into(), serde_json::json!("linux"));
         hosts.update_status("kiwi", &host.metadata.resource_version, &status).await.expect("update capability");
 
         for policy in [Some("docker-kiwi"), None] {
@@ -54,7 +59,7 @@ async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selectio
                 .resolve_convoy_placement("flotilla", None, &[], &workflow, policy, false)
                 .await
                 .expect_err("ineligible host must refuse admission");
-            assert!(error.contains("host `kiwi`"), "{error}");
+            assert!(error.contains("kiwi: fixture-1"), "{error}");
             assert!(error.contains(missing), "{error}");
         }
     }

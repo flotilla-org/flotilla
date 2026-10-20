@@ -22,3 +22,7 @@ macos| -p flotilla-credentials --locked --lib cancelled_host_image_operation_rem
 macos| -p flotilla-credentials --locked --lib registry_pull_admission_is_in_memory
 macos| -p flotilla-environment --locked --lib anonymous_config_owns_private_empty_directory
 macos| -p flotilla-client --locked --lib spawn_lock_tests::
+
+# Provider admission uses endpoint facts and stays independent of the build OS.
+all| -p flotilla-admission --locked --lib provider_placement::tests::
+all| -p flotilla-environment --locked --lib docker_readiness_reports_endpoint_host_requirements
