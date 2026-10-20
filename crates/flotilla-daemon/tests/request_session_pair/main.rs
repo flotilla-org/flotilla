@@ -3607,8 +3607,8 @@ async fn placement_host_capacity_scenario(hold_definitions: bool) {
     let follower = empty_daemon_named_with_floor("follower", Some(1_000_000)).await;
     seed_host_capacity(&follower, 0, 1_000_000 * 1024 * 1024 * 1024).await;
     follower.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
-    // Admission runs on the placement host. Hold definition replication so an
-    // origin-only Project deterministically reproduces #3599 instead of racing.
+    // Admission runs on the placement host. Holding definition replication
+    // verifies that admission needs neither definition replicated to the origin.
     let topology = if hold_definitions {
         spawn_in_memory_request_topology_with_replication_kinds(
             leader,
