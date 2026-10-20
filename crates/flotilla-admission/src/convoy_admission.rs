@@ -710,7 +710,6 @@ impl ConvoyAdmission {
         intent: &flotilla_protocol::ConvoyStartIntent,
         dispatching_principal_ref: &PrincipalRef,
     ) -> Result<(String, String, Option<ConvoyNaming>), String> {
-        self.check_local_free_space_floor().await?;
         let mut admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
         self.check_prepared_placement_floors(namespace, &admission).await?;
         let _admission_guard = self.lock().await;
@@ -764,6 +763,28 @@ impl ConvoyAdmission {
         .map_err(|error| format!("free-space check failed on host `{}`: {error}", self.host_name))
     }
 
+    /// The admitting daemon's own floor gates only work that lands on it; a
+    /// remote target is judged by the floor it publishes. Work with no
+    /// placement decision, or an unknown local identity, counts as local.
+    pub async fn check_admitting_host_floor<'a>(&self, decisions: impl IntoIterator<Item = &'a PlacementDecision>) -> Result<(), String> {
+        let local = self.canonical_local_host_id();
+        let mut decisions = decisions.into_iter().peekable();
+        let lands_here = decisions.peek().is_none()
+            || decisions.any(|decision| local.as_ref().is_none_or(|local| local == &decision.target_host.reference));
+        if lands_here {
+            self.check_local_free_space_floor().await?;
+        }
+        Ok(())
+    }
+
+    fn prepared_placement_decisions(admission: &PreparedConvoyAdmission) -> Vec<&PlacementDecision> {
+        if admission.vessel_placements.is_empty() {
+            admission.placement_decision.iter().collect()
+        } else {
+            admission.vessel_placements.values().map(|(_, decision)| decision).collect()
+        }
+    }
+
     pub fn admission_free_space_floor_bytes(&self) -> Result<u64, String> {
         let floor_gib = self.config.load_daemon_config()?.admission.free_space_floor_gib;
         crate::admission::free_space_floor_bytes(floor_gib)
@@ -778,6 +799,7 @@ impl ConvoyAdmission {
     }
 
     pub async fn check_prepared_placement_floors(&self, namespace: &str, admission: &PreparedConvoyAdmission) -> Result<(), String> {
+        self.check_admitting_host_floor(Self::prepared_placement_decisions(admission)).await?;
         let reads = self.reads(admission.evidence.clone());
         if admission.vessel_placements.is_empty() {
             reads.check_remote_placement_free_space_floor(namespace, admission.placement_decision.as_ref()).await?;
@@ -6407,7 +6429,6 @@ impl ConvoyAdmission {
                 Some(&ensure.spec.repositories),
             )
             .await?;
-        self.check_local_free_space_floor().await?;
         self.check_prepared_placement_floors(namespace, &admission).await?;
         if admission.workflow.exit.is_some() {
             return Err(format!(
