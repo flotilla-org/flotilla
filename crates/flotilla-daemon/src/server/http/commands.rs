@@ -1,6 +1,14 @@
 //! REST adapter for the existing request dispatcher. Command records are ephemeral and
 //! bounded; subscribe before dispatch so even an immediately completed command is retained.
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use axum::{
     body::to_bytes,
@@ -15,10 +23,13 @@ use flotilla_protocol::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{
+    broadcast::{self, error::RecvError},
+    mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore,
+};
 use uuid::Uuid;
 
-use super::{auth, CallerAuth, RouterState};
+use super::{CallerAuth, RouterState};
 use crate::server::{
     caller, client_connection::QuerySubscriptions, environment_connection, environment_supervision, remote_commands::RemoteCommandRouter,
     request_dispatch::RequestDispatcher,
@@ -28,17 +39,20 @@ const COMMAND_LIMIT: usize = 1024 * 1024;
 const SMALL_LIMIT: usize = 64 * 1024;
 const RECORD_LIMIT: usize = 1024;
 const MAX_WAIT: f64 = 300.0;
+const MAX_STEPS: usize = 256;
+const MAX_PROGRESS_BYTES: usize = 256 * 1024;
 
 pub(super) struct Commands {
     router: RemoteCommandRouter,
-    shutdown: tokio::sync::mpsc::UnboundedSender<()>,
+    shutdown: mpsc::UnboundedSender<()>,
     socket_path: PathBuf,
     records: Mutex<BTreeMap<Uuid, Record>>,
-    capacity: Arc<tokio::sync::Semaphore>,
+    capacity: Arc<Semaphore>,
+    completion_order: Arc<AtomicU64>,
 }
 
 struct Record {
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: OwnedSemaphorePermit,
     command_id: Option<u64>,
     owner: CommandCaller,
     state: watch::Receiver<CommandState>,
@@ -50,17 +64,38 @@ struct CommandState {
     state: &'static str,
     steps: Vec<DaemonEvent>,
     outcome: Option<CommandValue>,
+    progress_truncated: bool,
+    observation_error: Option<String>,
+    #[serde(skip)]
+    progress_bytes: usize,
+    #[serde(skip)]
+    finished_order: Option<u64>,
 }
 
 impl Commands {
-    pub(super) fn new(router: RemoteCommandRouter, shutdown: tokio::sync::mpsc::UnboundedSender<()>, socket_path: PathBuf) -> Self {
+    pub(super) fn new(router: RemoteCommandRouter, shutdown: mpsc::UnboundedSender<()>, socket_path: PathBuf) -> Self {
         Self {
             router,
             shutdown,
             socket_path,
             records: Mutex::new(BTreeMap::new()),
-            capacity: Arc::new(tokio::sync::Semaphore::new(RECORD_LIMIT)),
+            capacity: Arc::new(Semaphore::new(RECORD_LIMIT)),
+            completion_order: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    async fn reserve(&self) -> Result<OwnedSemaphorePermit, &'static str> {
+        let mut records = self.records.lock().await;
+        if self.capacity.available_permits() == 0 {
+            let oldest = records
+                .iter()
+                .filter_map(|(id, record)| record.state.borrow().finished_order.map(|order| (*id, order)))
+                .min_by_key(|(_, order)| *order);
+            if let Some((id, _)) = oldest {
+                records.remove(&id);
+            }
+        }
+        self.capacity.clone().try_acquire_owned().map_err(|_| "HTTP command record capacity is occupied by active or pending commands")
     }
 }
 
@@ -79,17 +114,16 @@ impl Encoding {
         let mut cbor_quality = None::<f32>;
         for entry in accept.split(',') {
             let mut parts = entry.trim().split(';');
-            let media = parts.next().unwrap_or_default().trim();
+            let media = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
             let quality = parts
-                .filter_map(|p| p.trim().strip_prefix("q="))
-                .next()
+                .find_map(|p| p.split_once('=').filter(|(name, _)| name.trim().eq_ignore_ascii_case("q")).map(|(_, value)| value.trim()))
                 .unwrap_or("1")
                 .parse::<f32>()
                 .map_err(|_| "invalid Accept quality")?;
             if !quality.is_finite() || !(0.0..=1.0).contains(&quality) {
                 return Err("invalid Accept quality");
             }
-            match media {
+            match media.as_str() {
                 "application/json" => json_quality = Some(quality),
                 "application/cbor" => cbor_quality = Some(quality),
                 "*/*" | "application/*" => {
@@ -175,7 +209,13 @@ pub(super) async fn handle(
 ) -> Response {
     let encoding = match Encoding::response(request.headers()) {
         Ok(encoding) => encoding,
-        Err(error) => return auth::refusal(StatusCode::NOT_ACCEPTABLE, error),
+        Err(error) => {
+            // Even a malformed quality value can identify the requested error encoding.
+            let cbor = request.headers().get(header::ACCEPT).and_then(|v| v.to_str().ok()).is_some_and(|v| {
+                v.split(',').any(|range| range.split(';').next().unwrap_or_default().trim().eq_ignore_ascii_case("application/cbor"))
+            });
+            return if cbor { Encoding::Cbor } else { Encoding::Json }.error(StatusCode::NOT_ACCEPTABLE, error);
+        }
     };
     if matches!(authenticated, CallerAuth::Anonymous) {
         let mut response = encoding.error(StatusCode::UNAUTHORIZED, "authentication required");
@@ -220,7 +260,7 @@ pub(super) async fn handle(
         .next()
         .unwrap_or_default()
         .trim()
-        .to_owned();
+        .to_ascii_lowercase();
     if limit > 0 && !matches!(content_type.as_str(), "application/json" | "application/cbor") {
         return encoding.error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "use application/json or application/cbor");
     }
@@ -303,7 +343,7 @@ pub(super) async fn handle(
             };
             return match commands.router.dispatch_cancel(command_id).await {
                 Ok(()) => encoding.render(StatusCode::ACCEPTED, json!({"id": id})),
-                Err(e) => encoding.error(error_status(&e), e),
+                Err(e) => encoding.error(cancel_status(&e, &receiver.borrow()), e),
             };
         }
         let wait = match query.get("wait").map(|v| v.parse::<f64>()).transpose() {
@@ -311,11 +351,11 @@ pub(super) async fn handle(
             _ => return encoding.error(StatusCode::BAD_REQUEST, "wait must be between 0 and 300 seconds"),
         };
         if wait > 0.0 {
-            let _ = tokio::time::timeout(Duration::from_secs_f64(wait), receiver.wait_for(|s| s.outcome.is_some())).await;
+            let _ = tokio::time::timeout(Duration::from_secs_f64(wait), receiver.wait_for(|s| s.state != "running")).await;
         }
         return encoding.render(StatusCode::OK, receiver.borrow().clone());
     }
-    let params = if limit == 0 {
+    let params = if limit == 0 || (kind == "remove_repo" && bytes.is_empty()) {
         serde_json::to_value(&query).expect("string map")
     } else if content_type == "application/cbor" {
         match flotilla_cbor::from_slice::<Value>(&bytes, &flotilla_cbor::Limits { max_message: limit, ..Default::default() }) {
@@ -357,20 +397,14 @@ pub(super) async fn handle(
     // Pending dispatches also consume capacity. Never hold the record lock across
     // dispatch: unrelated reads, cancellations and artifact requests must stay live.
     let permit = if kind == "execute" {
-        let mut records = commands.records.lock().await;
-        if commands.capacity.available_permits() == 0 {
-            if let Some(id) = records.iter().find(|(_, r)| r.state.borrow().outcome.is_some()).map(|(id, _)| *id) {
-                records.remove(&id);
-            }
-        }
-        match commands.capacity.clone().try_acquire_owned() {
+        match commands.reserve().await {
             Ok(permit) => Some(permit),
-            Err(_) => return encoding.error(StatusCode::CONFLICT, "too many active HTTP commands"),
+            Err(error) => return encoding.error(StatusCode::CONFLICT, error),
         }
     } else {
         None
     };
-    let mut events = daemon.subscribe();
+    let events = daemon.subscribe();
     let dispatcher = RequestDispatcher::new_with_caller(
         daemon,
         &commands.router,
@@ -398,7 +432,7 @@ pub(super) async fn handle(
             RpcResponse::QueryResult { value, .. } => (None, Some(value)),
             _ => return encoding.error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected execute response"),
         };
-        let initial = CommandState { id, state: if outcome.is_some() { "finished" } else { "running" }, steps: Vec::new(), outcome };
+        let initial = CommandState::new(id, outcome, &commands.completion_order);
         let (sender, receiver) = watch::channel(initial);
         commands
             .records
@@ -406,37 +440,7 @@ pub(super) async fn handle(
             .await
             .insert(id, Record { _permit: permit.expect("execute reserves capacity"), command_id, owner: caller, state: receiver });
         if let Some(command_id) = command_id {
-            tokio::spawn(async move {
-                loop {
-                    let event = match events.recv().await {
-                        Ok(event) => event,
-                        Err(error) => {
-                            sender.send_modify(|s| {
-                                s.state = "failed";
-                                s.outcome = Some(CommandValue::Error {
-                                    message: format!("command progress unavailable: {error}; do not retry blindly"),
-                                });
-                            });
-                            break;
-                        }
-                    };
-                    match event {
-                        DaemonEvent::CommandFinished { command_id: finished, result, .. } if finished == command_id => {
-                            sender.send_modify(|s| {
-                                s.state = "finished";
-                                s.outcome = Some(result);
-                            });
-                            break;
-                        }
-                        event @ DaemonEvent::CommandStepUpdate { command_id: updated, .. } if updated == command_id => {
-                            sender.send_modify(|s| {
-                                s.steps.push(event);
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-            });
+            tokio::spawn(collect_progress(events, command_id, sender, commands.completion_order.clone()));
         }
         let url = format!("/v1/commands/{id}");
         let mut response = encoding.render(StatusCode::ACCEPTED, json!({"id": id, "command_id": command_id, "url": url}));
@@ -453,25 +457,101 @@ pub(super) async fn handle(
     )
 }
 
+impl CommandState {
+    fn new(id: Uuid, outcome: Option<CommandValue>, order: &AtomicU64) -> Self {
+        Self {
+            id,
+            state: if outcome.is_some() { "finished" } else { "running" },
+            steps: Vec::new(),
+            finished_order: outcome.as_ref().map(|_| order.fetch_add(1, Ordering::Relaxed)),
+            outcome,
+            progress_truncated: false,
+            observation_error: None,
+            progress_bytes: 0,
+        }
+    }
+
+    fn push_step(&mut self, event: DaemonEvent) {
+        let size = serde_json::to_vec(&event).map_or(usize::MAX, |v| v.len());
+        if size > MAX_PROGRESS_BYTES {
+            self.progress_truncated = true;
+            return;
+        }
+        while self.steps.len() >= MAX_STEPS || self.progress_bytes + size > MAX_PROGRESS_BYTES {
+            let removed = self.steps.remove(0);
+            self.progress_bytes -= serde_json::to_vec(&removed).expect("previously serialized event").len();
+            self.progress_truncated = true;
+        }
+        self.progress_bytes += size;
+        self.steps.push(event);
+    }
+}
+
+async fn collect_progress(
+    mut events: broadcast::Receiver<DaemonEvent>,
+    command_id: u64,
+    sender: watch::Sender<CommandState>,
+    order: Arc<AtomicU64>,
+) {
+    loop {
+        let event = match events.recv().await {
+            Ok(event) => event,
+            Err(error) => {
+                sender.send_modify(|s| {
+                    // Lost observations say nothing about the execution's actual outcome.
+                    s.state = "unknown";
+                    s.progress_truncated = true;
+                    s.observation_error = Some(format!("command progress unavailable: {error}; do not retry blindly"));
+                });
+                match error {
+                    RecvError::Lagged(_) => continue,
+                    RecvError::Closed => break,
+                }
+            }
+        };
+        match event {
+            DaemonEvent::CommandFinished { command_id: finished, result, .. } if finished == command_id => {
+                sender.send_modify(|s| {
+                    s.state = "finished";
+                    s.outcome = Some(result);
+                    s.finished_order = Some(order.fetch_add(1, Ordering::Relaxed));
+                });
+                break;
+            }
+            event @ DaemonEvent::CommandStepUpdate { command_id: updated, .. } if updated == command_id => {
+                sender.send_modify(|s| s.push_step(event))
+            }
+            _ => {}
+        }
+    }
+}
+
+fn cancel_status(message: &str, state: &CommandState) -> StatusCode {
+    if state.outcome.is_some() || message == "no matching active command" || message.starts_with("unknown command") {
+        StatusCode::CONFLICT
+    } else {
+        error_status(message)
+    }
+}
+
+// TODO(#3584): carry typed dispatcher errors; provider prose is not a trustworthy error class.
 fn error_status(message: &str) -> StatusCode {
-    if message.contains("conflict")
-        || message.contains("already exists")
-        || message.contains("has finished")
-        || message.starts_with("field ownership refused")
+    if message.starts_with("resource conflict for ") || message.starts_with("field ownership refused") || message == "command has finished"
     {
         StatusCode::CONFLICT
-    } else if message.contains("requires")
-        || message.contains("Identity")
-        || message.contains("Denied")
+    } else if message.starts_with("CallerIdentity")
+        || message.starts_with("Environment")
         || message.starts_with("unauthorized:")
+        || message == "artifact put requires a calling crew session"
+        || message == "artifact get requires a connected operator principal"
     {
         StatusCode::FORBIDDEN
-    } else if message.contains("not found")
-        || message.contains("unknown command")
-        || (message.starts_with("no ") && message.contains(" matches "))
+    } else if message.starts_with("resource not found:")
+        || message.starts_with("unknown command")
+        || message.starts_with("no Repository matches ")
     {
         StatusCode::NOT_FOUND
-    } else if message.contains("invalid") || message.contains("must be") || message.contains("cannot") {
+    } else if message.starts_with("invalid resource:") || message == "operator artifact destination must be absolute" {
         StatusCode::BAD_REQUEST
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
@@ -498,8 +578,9 @@ mod tests {
     struct Harness {
         _temp: tempfile::TempDir,
         router: Router,
-        shutdown: tokio::sync::mpsc::UnboundedReceiver<()>,
+        shutdown: mpsc::UnboundedReceiver<()>,
         blobs: Arc<TieredBlobStore>,
+        commands: Arc<Commands>,
     }
 
     impl Harness {
@@ -524,12 +605,13 @@ mod tests {
             let remote = crate::server::build_remote_command_router(&daemon, &manager);
             let blobs = Arc::new(TieredBlobStore::new(temp.path(), vec![]));
             remote.install_blob_store(blobs.clone()).unwrap();
-            let (shutdown, receiver) = tokio::sync::mpsc::unbounded_channel();
-            let router =
+            let (shutdown, receiver) = mpsc::unbounded_channel();
+            let http =
                 HttpRouter::for_daemon(daemon.clone(), Arc::new(LoginStore::new(daemon.clock_for_scenarios())), ListenerOrigin::default())
-                    .with_commands(remote, shutdown, temp.path().join("daemon.sock"))
-                    .into_router();
-            Self { _temp: temp, router, shutdown: receiver, blobs }
+                    .with_commands(remote, shutdown, temp.path().join("daemon.sock"));
+            let commands = http.commands.as_ref().unwrap().clone();
+            let router = http.into_router();
+            Self { _temp: temp, router, shutdown: receiver, blobs, commands }
         }
 
         async fn call(
@@ -603,22 +685,32 @@ mod tests {
             ),
             ("GET", "/v1/artifacts/content?reference=artifact/missing&destination_path=/tmp/output.md", None, StatusCode::NOT_FOUND),
             ("POST", "/v1/events/replay", Some(json!({"last_seen":[]})), StatusCode::OK),
-            ("POST", "/v1/shutdown", None, StatusCode::OK),
         ] {
-            let mut h = Harness::new().await;
-            let other = Harness::new().await;
+            let h = Harness::new().await;
             let json_reply = h.call(method, path, body.clone(), false, CallerAuth::Socket(None)).await;
-            let cbor_h = if path.starts_with("/v1/repos") && method != "GET" { &other } else { &h };
-            let cbor_reply = cbor_h.call(method, path, body, true, CallerAuth::Socket(None)).await;
+            // Only mutations need a fresh daemon; read-only replies share the same
+            // incarnation so random node IDs do not obscure encoding equivalence.
+            let cbor_reply = if path.starts_with("/v1/repos") && method != "GET" {
+                Harness::new().await.call(method, path, body, true, CallerAuth::Socket(None)).await
+            } else {
+                h.call(method, path, body, true, CallerAuth::Socket(None)).await
+            };
             assert_eq!(json_reply.0, status, "{method} {path}: {}", json_reply.1);
             assert_eq!((json_reply.0, json_reply.1.clone()), (cbor_reply.0, cbor_reply.1), "{method} {path}");
             if path == "/v1/artifacts" && method == "POST" {
                 assert_eq!(json_reply.1["message"], "artifact put requires a calling crew session");
             }
-            if path == "/v1/shutdown" {
-                assert_eq!(h.shutdown.try_recv(), Ok(()));
-                assert_eq!(h.shutdown.try_recv(), Ok(()));
-            }
+        }
+    }
+
+    // Shutdown delegates exactly once per HTTP request, independently in each encoding.
+    #[tokio::test]
+    async fn unix_shutdown_signals_once_per_request() {
+        for cbor in [false, true] {
+            let mut h = Harness::new().await;
+            assert_eq!(h.call("POST", "/v1/shutdown", None, cbor, CallerAuth::Socket(None)).await.0, StatusCode::OK);
+            assert_eq!(h.shutdown.try_recv(), Ok(()));
+            assert!(h.shutdown.try_recv().is_err());
         }
     }
 
@@ -791,6 +883,8 @@ mod tests {
             ("resource not found: test", StatusCode::NOT_FOUND),
             ("no Repository matches 'missing'", StatusCode::NOT_FOUND),
             ("store unavailable", StatusCode::INTERNAL_SERVER_ERROR),
+            ("provider failed reading /tmp/requires-invalid-not found-conflict", StatusCode::INTERNAL_SERVER_ERROR),
+            ("resource not found: requires-invalid-conflict", StatusCode::NOT_FOUND),
         ] {
             assert_eq!(error_status(message), status, "{message}");
         }
@@ -887,6 +981,219 @@ mod tests {
                 HttpRequest::builder().method(method).uri(path).header(header::CONTENT_LENGTH, limit).body(Body::from(boundary)).unwrap();
             request.extensions_mut().insert(CallerAuth::Socket(None));
             assert_eq!(h.router.clone().oneshot(request).await.unwrap().status(), expected);
+        }
+    }
+
+    fn user() -> CommandCaller {
+        CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace("flotilla"), process: None, crew: None }
+    }
+
+    fn step(description: String) -> DaemonEvent {
+        DaemonEvent::CommandStepUpdate {
+            command_id: 77,
+            node_id: flotilla_protocol::NodeId::new("test"),
+            repo_identity: flotilla_daemon_api::action_support::empty_repo_identity(),
+            repo: None,
+            step_index: 0,
+            step_count: 1,
+            description,
+            status: flotilla_protocol::StepStatus::Started,
+        }
+    }
+
+    fn finished() -> DaemonEvent {
+        DaemonEvent::CommandFinished {
+            command_id: 77,
+            node_id: flotilla_protocol::NodeId::new("test"),
+            repo_identity: flotilla_daemon_api::action_support::empty_repo_identity(),
+            repo: None,
+            result: CommandValue::Cancelled,
+        }
+    }
+
+    // ADR 0065 gives token/session callers the same user authority as the main socket.
+    // Pin administrative routes explicitly, including shutdown, and shared user ownership.
+    #[tokio::test]
+    async fn tcp_user_policy_and_shared_operator_commands() {
+        let logins = LoginStore::new(Arc::new(flotilla_resources::SystemClock));
+        let code = logins.mint_code().unwrap();
+        let (session, _) = logins.redeem(&code.code).unwrap().unwrap();
+        for cbor in [false, true] {
+            for caller in [CallerAuth::Bearer, CallerAuth::Session(session)] {
+                let mut h = Harness::new().await;
+                for (method, path, body, expected) in [
+                    ("GET", "/v1/status", None, StatusCode::OK),
+                    ("DELETE", "/v1/repos?path=/missing", None, StatusCode::NOT_FOUND),
+                    ("POST", "/v1/repos/refresh", Some(json!({"repo":"/missing"})), StatusCode::NOT_FOUND),
+                    ("POST", "/v1/repos", Some(json!({"path":"/user-selected-path"})), StatusCode::CREATED),
+                    ("POST", "/v1/shutdown", None, StatusCode::OK),
+                ] {
+                    let reply = h.call(method, path, body, cbor, caller.clone()).await;
+                    assert_eq!(reply.0, expected, "{method} {path}: {}", reply.1);
+                }
+                assert_eq!(h.shutdown.try_recv(), Ok(()));
+            }
+            let h = Harness::new().await;
+            let accepted = h.call("POST", "/v1/commands", Some(watch_command()), cbor, CallerAuth::Bearer).await;
+            let url = accepted.1["url"].as_str().unwrap();
+            assert_eq!(h.call("GET", url, None, cbor, CallerAuth::Session(session)).await.0, StatusCode::OK);
+            assert_eq!(h.call("DELETE", url, None, cbor, CallerAuth::Socket(None)).await.0, StatusCode::ACCEPTED);
+            let final_state = h.call("GET", &format!("{url}?wait=1"), None, cbor, CallerAuth::Session(session)).await;
+            assert_eq!(final_state.1["state"], "finished");
+        }
+    }
+
+    // Full capacity rejects live work; when completions exist, completion order rather
+    // than UUID order selects eviction, including completions with a reserved permit.
+    #[tokio::test]
+    async fn record_capacity_evicts_oldest_completion() {
+        let h = Harness::new().await;
+        for n in 0..RECORD_LIMIT {
+            let id = Uuid::from_u128((RECORD_LIMIT - n) as u128);
+            let permit = h.commands.reserve().await.unwrap();
+            let (_, receiver) = watch::channel(CommandState::new(id, None, &h.commands.completion_order));
+            h.commands
+                .records
+                .lock()
+                .await
+                .insert(id, Record { _permit: permit, command_id: Some(n as u64), owner: user(), state: receiver });
+        }
+        assert!(h.commands.reserve().await.is_err());
+        let oldest_id = Uuid::from_u128(RECORD_LIMIT as u128);
+        for id in [oldest_id, Uuid::from_u128(1)] {
+            let (sender, receiver) = watch::channel(CommandState::new(id, Some(CommandValue::Cancelled), &h.commands.completion_order));
+            h.commands.records.lock().await.get_mut(&id).unwrap().state = receiver;
+            drop(sender);
+        }
+        let permit = h.commands.reserve().await.unwrap();
+        let records = h.commands.records.lock().await;
+        assert!(!records.contains_key(&oldest_id));
+        assert!(records.contains_key(&Uuid::from_u128(1)));
+        assert_eq!(records.len(), RECORD_LIMIT - 1);
+        drop(records);
+        drop(permit);
+    }
+
+    // Lagged/closed observations must never fabricate an execution outcome. A lagged
+    // observer keeps consuming and can recover the actual finish event later.
+    #[tokio::test]
+    async fn lagged_progress_is_unknown_then_recovers() {
+        let order = Arc::new(AtomicU64::new(0));
+        let (events, receiver) = broadcast::channel(1);
+        events.send(step("first".into())).unwrap();
+        events.send(step("second".into())).unwrap();
+        let (sender, mut state) = watch::channel(CommandState::new(Uuid::new_v4(), None, &order));
+        let task = tokio::spawn(collect_progress(receiver, 77, sender, order.clone()));
+        tokio::time::timeout(Duration::from_secs(1), state.wait_for(|s| s.state == "unknown")).await.unwrap().unwrap();
+        assert!(state.borrow().outcome.is_none());
+        assert!(state.borrow().progress_truncated);
+        assert!(state.borrow().observation_error.is_some());
+        events.send(finished()).unwrap();
+        task.await.unwrap();
+        assert_eq!(state.borrow().state, "finished");
+        assert!(matches!(state.borrow().outcome, Some(CommandValue::Cancelled)));
+
+        let (events, receiver) = broadcast::channel(1);
+        let (sender, state) = watch::channel(CommandState::new(Uuid::new_v4(), None, &order));
+        drop(events);
+        collect_progress(receiver, 77, sender, order).await;
+        assert_eq!(state.borrow().state, "unknown");
+        assert!(state.borrow().outcome.is_none());
+    }
+
+    // Generated histories span empty, count/byte boundaries, oversized individual updates,
+    // and repeated step indexes. Each retained suffix stays inside both limits.
+    #[hegel::test]
+    fn progress_history_is_bounded(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(MAX_STEPS + 5));
+        let length = tc.draw(gs::integers::<usize>().min_value(0).max_value(4096));
+        let mut state = CommandState::new(Uuid::nil(), None, &AtomicU64::new(0));
+        for _ in 0..count {
+            state.push_step(step("x".repeat(length)));
+            assert!(state.steps.len() <= MAX_STEPS);
+            assert!(state.progress_bytes <= MAX_PROGRESS_BYTES);
+        }
+        state.push_step(step("x".repeat(MAX_PROGRESS_BYTES + 1)));
+        assert!(state.progress_truncated);
+        assert!(state.progress_bytes <= MAX_PROGRESS_BYTES);
+        // Count and byte edges must both evict while preserving the newest event.
+        for _ in 0..MAX_STEPS + 1 {
+            state.push_step(step(String::new()));
+        }
+        assert_eq!(state.steps.len(), MAX_STEPS);
+        assert!(state.progress_truncated);
+    }
+
+    // Pin the scheduling boundary where the daemon has removed the active execution but
+    // the HTTP observer has not yet received completion. Existing resources conflict (409).
+    #[tokio::test]
+    async fn cancel_after_unobserved_completion_is_conflict() {
+        let h = Harness::new().await;
+        let id = Uuid::new_v4();
+        let (_, receiver) = watch::channel(CommandState::new(id, None, &h.commands.completion_order));
+        let permit = h.commands.reserve().await.unwrap();
+        h.commands.records.lock().await.insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state: receiver });
+        for cbor in [false, true] {
+            let reply = h.call("DELETE", &format!("/v1/commands/{id}"), None, cbor, CallerAuth::Bearer).await;
+            assert_eq!(reply.0, StatusCode::CONFLICT);
+        }
+    }
+
+    // Wait expiry is only a snapshot: an execution finishing later retains its real
+    // outcome at the same URL, without cancellation or replacing the record.
+    #[tokio::test]
+    async fn expired_wait_can_observe_later_completion() {
+        let h = Harness::new().await;
+        let id = Uuid::new_v4();
+        let (events, receiver) = broadcast::channel(4);
+        let (sender, state) = watch::channel(CommandState::new(id, None, &h.commands.completion_order));
+        let permit = h.commands.reserve().await.unwrap();
+        h.commands.records.lock().await.insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state });
+        let task = tokio::spawn(collect_progress(receiver, 77, sender, h.commands.completion_order.clone()));
+        let url = format!("/v1/commands/{id}");
+        let running = h.call("GET", &format!("{url}?wait=0.001"), None, false, CallerAuth::Bearer).await;
+        assert_eq!(running.1["state"], "running");
+        assert!(running.1["outcome"].is_null());
+        events.send(finished()).unwrap();
+        let done = h.call("GET", &format!("{url}?wait=1"), None, true, CallerAuth::Bearer).await;
+        assert_eq!(done.1["state"], "finished");
+        assert_eq!(done.1["outcome"], serde_json::to_value(CommandValue::Cancelled).unwrap());
+        task.await.unwrap();
+    }
+
+    // Media types ignore case and quality parameter whitespace. An invalid CBOR Accept
+    // still yields a CBOR-readable refusal; absent Content-Type remains the JSON default.
+    #[tokio::test]
+    async fn negotiation_normalizes_case_whitespace_and_errors() {
+        let h = Harness::new().await;
+        for (accept, status, media) in [
+            ("Application/JSON; q = 1", StatusCode::OK, "application/json"),
+            ("Application/CBOR; q = 1", StatusCode::OK, "application/cbor"),
+            ("Application/CBOR; q = invalid", StatusCode::NOT_ACCEPTABLE, "application/cbor"),
+        ] {
+            let mut request = HttpRequest::get("/v1/status").header(header::ACCEPT, accept).body(Body::empty()).unwrap();
+            request.extensions_mut().insert(CallerAuth::Bearer);
+            let response = h.router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], media);
+            if status == StatusCode::NOT_ACCEPTABLE {
+                let bytes = to_bytes(response.into_body(), SMALL_LIMIT).await.unwrap();
+                let error: Value = flotilla_cbor::from_slice(&bytes, &Default::default()).unwrap();
+                assert_eq!(error["message"], "invalid Accept quality");
+            }
+        }
+        for (media, bytes) in [
+            (None, serde_json::to_vec(&json!({"last_seen":[]})).unwrap()),
+            (Some("Application/CBOR"), flotilla_cbor::to_vec(&json!({"last_seen":[]}), &Default::default()).unwrap()),
+        ] {
+            let mut builder = HttpRequest::post("/v1/events/replay");
+            if let Some(media) = media {
+                builder = builder.header(header::CONTENT_TYPE, media);
+            }
+            let mut request = builder.body(Body::from(bytes)).unwrap();
+            request.extensions_mut().insert(CallerAuth::Bearer);
+            assert_eq!(h.router.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
         }
     }
 

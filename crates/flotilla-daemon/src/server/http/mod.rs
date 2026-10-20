@@ -54,7 +54,7 @@ pub(in crate::server) const LOGOUT_PATH: &str = "/logout";
 pub(in crate::server) struct HttpRouter {
     backend: ResourceBackend,
     #[builder(skip)]
-    commands: Option<commands::Commands>,
+    commands: Option<Arc<commands::Commands>>,
     daemon: Option<Arc<InProcessDaemon>>,
     /// Where hook routes record agent state; without it they answer 503.
     agent_state_store: Option<flotilla_agent::SharedAgentStateStore>,
@@ -112,7 +112,7 @@ impl HttpRouter {
         shutdown: tokio::sync::mpsc::UnboundedSender<()>,
         socket_path: std::path::PathBuf,
     ) -> Self {
-        self.commands = Some(commands::Commands::new(router, shutdown, socket_path));
+        self.commands = Some(Arc::new(commands::Commands::new(router, shutdown, socket_path)));
         self
     }
 
