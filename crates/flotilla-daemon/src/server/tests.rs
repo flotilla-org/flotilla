@@ -2104,7 +2104,13 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
             &remote_host_id,
             &remote_host.metadata.resource_version,
             &HostStatus {
-                capabilities: BTreeMap::from([(flotilla_resources::AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))]),
+                capabilities: BTreeMap::from([
+                    (
+                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                    ),
+                    (flotilla_resources::AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
+                ]),
                 fulfilment_facts: BTreeMap::from([(
                     format!("host-direct-{remote_host_id}"),
                     FulfilmentFacts {

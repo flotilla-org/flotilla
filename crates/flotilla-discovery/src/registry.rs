@@ -242,15 +242,21 @@ impl ProviderSet<dyn EnvironmentProvider> {
     }
 
     /// Host records carry this data in their existing capabilities map.
-    pub fn advertisements(&self) -> Vec<flotilla_environment::environment::ProviderAdvertisement> {
-        self.inner
-            .iter()
-            .map(|(instance, (_, provider))| flotilla_environment::environment::ProviderAdvertisement {
+    pub async fn advertisements(&self) -> Vec<flotilla_environment::environment::ProviderAdvertisement> {
+        let mut advertisements = Vec::new();
+        for (instance, (_, provider)) in &self.inner {
+            advertisements.push(flotilla_environment::environment::ProviderAdvertisement {
                 instance: instance.clone(),
                 kind: Some(provider.kind()),
                 capabilities: provider.capabilities(),
-            })
-            .collect()
+                readiness: tokio::time::timeout(std::time::Duration::from_secs(5), provider.detect_readiness()).await.unwrap_or_else(
+                    |_| flotilla_environment::environment::ProviderReadiness::Unknown {
+                        reason: "provider readiness probe timed out".into(),
+                    },
+                ),
+            });
+        }
+        advertisements
     }
 
     pub fn for_legacy_input(&self, kind: EnvironmentInput) -> Option<(&ProviderDescriptor, &Arc<dyn EnvironmentProvider>)> {
@@ -414,14 +420,14 @@ mod advertisement_tests {
 
     // Glue: advertisements copy each configured key, including aliases of the
     // same object, and retain the provider's independent class and declaration.
-    #[test]
-    fn advertisements_preserve_configured_instance_aliases() {
+    #[tokio::test]
+    async fn advertisements_preserve_configured_instance_aliases() {
         let provider: Arc<dyn EnvironmentProvider> = Arc::new(DummyEnvironmentProvider::new(Default::default()));
         let mut set = ProviderSet::<dyn EnvironmentProvider>::new();
         for instance in ["first", "second"] {
             set.insert(instance, ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "dummy"), provider.clone());
         }
-        let advertisements = set.advertisements();
+        let advertisements = set.advertisements().await;
         assert_eq!(advertisements.iter().map(|entry| entry.instance.as_str()).collect::<Vec<_>>(), ["first", "second"]);
         for entry in advertisements {
             assert_eq!(entry.kind.as_ref().unwrap().class, EnvironmentClass::Dummy);

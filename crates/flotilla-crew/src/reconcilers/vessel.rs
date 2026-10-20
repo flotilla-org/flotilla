@@ -1716,6 +1716,7 @@ fn environment_provider_labels(policy: &ResourceObject<PlacementPolicy>) -> BTre
         .metadata
         .labels
         .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
+        .or_else(|| policy.spec.provider_requirements.as_ref().and_then(|requirements| requirements.instance.as_ref()))
         .map(|instance| (ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.clone()))
         .into_iter()
         .collect();
@@ -1838,8 +1839,8 @@ mod tests {
     use flotilla_store::ResourceBackend;
 
     use super::{
-        checkout_name, checkout_placement_scope, configure_contained_tracking, environment_with_credentials, legible_waiting_for,
-        placement_strategy, PlacementStrategy, VesselReconciler,
+        checkout_name, checkout_placement_scope, configure_contained_tracking, environment_provider_labels, environment_with_credentials,
+        legible_waiting_for, placement_strategy, PlacementStrategy, VesselReconciler,
     };
 
     // #2682: deduplicate shared parents, retain every own-admin overlay, and
@@ -2043,6 +2044,31 @@ mod tests {
         assert_ne!(
             checkout_name("same-name", "flotilla", false, Some(&feta)),
             checkout_name("same-name", "flotilla", false, Some(&later_feta))
+        );
+    }
+
+    // Glue: a frozen per-vessel spec must carry its selected identity into
+    // Environment metadata even when snapshot metadata has no provider label.
+    #[tokio::test]
+    async fn frozen_spec_provider_identity_reaches_environment_metadata() {
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let spec = PlacementPolicySpec::builder()
+            .pool("cleat".into())
+            .provider_requirements(flotilla_resources::ProviderRequirements {
+                instance: Some("selected-instance".into()),
+                ..Default::default()
+            })
+            .build();
+        let policy = backend
+            .using::<PlacementPolicy>("flotilla")
+            .create(&InputMeta::builder().name("snapshot".into()).build(), &spec)
+            .await
+            .unwrap();
+        assert_eq!(
+            environment_provider_labels(&policy)
+                .get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
+                .map(String::as_str),
+            Some("selected-instance")
         );
     }
 

@@ -815,7 +815,7 @@ async fn daemon_startup_reaps_retained_landed_convoy_orphan() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let (initial, _) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
     let registry = probe_local_provider_registry(&initial, &config).await.expect("registry");
-    let profile = build_local_profile(&initial, &registry).expect("profile");
+    let profile = build_local_profile(&initial, &registry).await.expect("profile");
     let coordinator = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoys = coordinator.using::<Convoy>(NAMESPACE);
     let created =

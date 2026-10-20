@@ -201,7 +201,7 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool, refusals:
         ProviderDescriptor::named(ProviderCategory::TerminalPool, "message-probe"),
         pool.clone(),
     );
-    let profile = build_local_profile(&daemon, &registry).expect("cross-host Message fixture operation succeeds");
+    let profile = build_local_profile(&daemon, &registry).await.expect("cross-host Message fixture operation succeeds");
     ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("cross-host Message fixture operation succeeds");
     backend
         .using::<Convoy>(NAMESPACE)

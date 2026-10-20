@@ -265,6 +265,16 @@ pub(super) async fn ensure_default_policies(
             &docker_name,
             &PlacementPolicySpec::builder()
                 .pool(profile.docker_pool.clone())
+                .maybe_provider_requirements({
+                    // Seed the only per-vessel instance, including dummy fleets.
+                    // Multiple instances stay unpinned and admission fails closed.
+                    let mut providers = profile.environment_providers.iter().filter(|provider| provider.capabilities.per_vessel);
+                    let first = providers.next();
+                    first.filter(|_| providers.next().is_none()).map(|provider| flotilla_resources::ProviderRequirements {
+                        instance: Some(provider.instance.clone()),
+                        ..Default::default()
+                    })
+                })
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                     legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),

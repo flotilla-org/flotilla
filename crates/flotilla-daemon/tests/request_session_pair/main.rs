@@ -314,7 +314,15 @@ async fn seed_host_capacity(daemon: &Arc<InProcessDaemon>, free_bytes: u64, floo
             &host_id,
             &host.metadata.resource_version,
             &HostStatus {
-                capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
+                capabilities: [
+                    (
+                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                    ),
+                    (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
+                ]
+                .into_iter()
+                .collect(),
                 fulfilment_facts: BTreeMap::from([(format!("host-direct-{host_id}"), compatible_codex_facts())]),
                 heartbeat_at: Some(Utc::now()),
                 ready: true,
@@ -3643,6 +3651,24 @@ async fn placement_host_convoy_start_enforces_capacity_before_persistence() {
 
 #[tokio::test]
 async fn remote_docker_admission_fails_closed_without_target_capacity() {
+    remote_docker_admission_refusal_scenario(None).await;
+}
+
+// Admission refuses provider deficiencies at the target host through both
+// public start/create routes, before persisting a convoy. Generate all readiness,
+// missing-capability and ambiguity rows on the existing in-memory router harness.
+#[hegel::test]
+fn remote_provider_refusals_fail_closed(tc: hegel::TestCase) {
+    let case = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap()
+        .block_on(remote_docker_admission_refusal_scenario(Some(case)));
+}
+
+async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>) {
     let daemon = empty_daemon_named_with_floor("leader", Some(0)).await;
     let namespace = "flotilla";
     seed_trusted_remote_convoy_project(&daemon, namespace).await;
@@ -3662,6 +3688,10 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
             &HostStatus {
                 capabilities: [
                     (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
+                    (
+                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                    ),
                     ("docker".to_string(), serde_json::json!(true)),
                     ("os".to_string(), serde_json::json!("linux")),
                 ]
@@ -3705,6 +3735,44 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
         .await
         .expect("remote Docker kind");
 
+    let mut expected = "placement refused on host `remote-docker`: admission free-space floor is unavailable";
+    if let Some(case) = provider_case {
+        use flotilla_protocol::provider::{MaterialMode, ProviderReadiness};
+        let host = hosts.get("remote-docker-host").await.unwrap();
+        let mut status = host.status.unwrap();
+        let mut providers = flotilla_discovery_testkit::environment::ready_placement_advertisements();
+        match case {
+            0 => {
+                providers[1].readiness = ProviderReadiness::MissingCredential { reason: "sandbox token absent".into() };
+                expected = "missing credential: sandbox token absent";
+            }
+            1 => {
+                providers[1].readiness = ProviderReadiness::default();
+                expected = "readiness unknown";
+            }
+            2 => {
+                providers[1].capabilities.material_modes.retain(|mode| *mode != MaterialMode::Shared);
+                let policies = daemon.resource_backend().using::<PlacementPolicy>(namespace);
+                let policy = policies.get("remote-docker").await.unwrap();
+                let mut spec = policy.spec;
+                spec.provider_requirements = Some(flotilla_resources::ProviderRequirements {
+                    class: Some(flotilla_protocol::provider::EnvironmentClass::Container),
+                    material_modes: vec![MaterialMode::Shared],
+                    ..Default::default()
+                });
+                policies.update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &spec).await.unwrap();
+                expected = "ready but no Shared material";
+            }
+            _ => {
+                let mut other = providers[1].clone();
+                other.instance = "other".into();
+                providers.push(other);
+                expected = "ambiguous provider instances";
+            }
+        }
+        status.capabilities.insert(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers));
+        hosts.update_status("remote-docker-host", &host.metadata.resource_version, &status).await.unwrap();
+    }
     let mut events = daemon.subscribe();
     let command_id = daemon
         .execute(
@@ -3730,7 +3798,7 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
     let CommandValue::Error { message } = result else {
         panic!("expected missing-capacity refusal, got {result:?}");
     };
-    assert_eq!(message, "placement refused on host `remote-docker`: admission free-space floor is unavailable");
+    assert!(message.contains(expected), "{message}");
     assert!(
         matches!(daemon.resource_backend().using::<Convoy>(namespace).get("remote-docker-work").await, Err(ResourceError::NotFound { .. })),
         "missing remote Docker capacity must fail before convoy persistence"
@@ -3757,7 +3825,7 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
     let CommandValue::Error { message } = legacy_result else {
         panic!("expected legacy missing-capacity refusal, got {legacy_result:?}");
     };
-    assert_eq!(message, "placement refused on host `remote-docker`: admission free-space floor is unavailable");
+    assert!(message.contains(expected), "{message}");
     assert!(
         matches!(
             daemon.resource_backend().using::<Convoy>(namespace).get("legacy-remote-docker-work").await,

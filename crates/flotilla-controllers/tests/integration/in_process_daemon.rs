@@ -2080,6 +2080,10 @@ async fn create_test_contained_policy(backend: &flotilla_store::ResourceBackend,
             ..Default::default()
         },
     );
+    status.capabilities.insert(
+        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+    );
     status.capabilities.insert("docker".to_string(), serde_json::json!(true));
     status.capabilities.insert("os".to_string(), serde_json::json!("linux"));
     status.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
@@ -2700,7 +2704,15 @@ async fn create_test_host_direct_policy(
                         ..Default::default()
                     },
                 )]),
-                capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),
+                capabilities: [
+                    (
+                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                    ),
+                    (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters)),
+                ]
+                .into_iter()
+                .collect(),
                 heartbeat_at: Some(chrono::Utc::now()),
                 ready: true,
                 disk_free_bytes: Some(100 * 1024 * 1024 * 1024),

@@ -330,7 +330,7 @@ async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_neve
         ProviderDescriptor::named(ProviderCategory::TerminalPool, "hookless"),
         pool.clone(),
     );
-    let profile = build_local_profile(&daemon, &registry).expect("profile");
+    let profile = build_local_profile(&daemon, &registry).await.expect("profile");
     ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("environment");
     create_credential_test_session(&backend, ID, "message", "message-work", &profile.host_direct_environment_name()).await;
     let sessions = backend.using::<TerminalSession>(NAMESPACE);
@@ -523,7 +523,7 @@ async fn hookless_composer_delivers_review_and_supervisor_turns_with_or_without_
                 ProviderDescriptor::named(ProviderCategory::TerminalPool, "hookless"),
                 pool.clone(),
             );
-            let profile = build_local_profile(&daemon, &registry).expect("profile");
+            let profile = build_local_profile(&daemon, &registry).await.expect("profile");
             ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("environment");
             backend
                 .using::<Convoy>(NAMESPACE)
@@ -738,7 +738,7 @@ async fn held_pool_delivery_scenario(mode: &str) {
         ProviderDescriptor::named(ProviderCategory::TerminalPool, "held-probe"),
         pool.clone(),
     );
-    let profile = build_local_profile(&daemon, &registry).expect("profile");
+    let profile = build_local_profile(&daemon, &registry).await.expect("profile");
     ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("environment");
     backend
         .using::<Convoy>(NAMESPACE)

@@ -31,6 +31,7 @@ impl FieldOwnedResource for PlacementPolicy {
     const FIELD_OWNERSHIP: &'static [FieldOwnership] = &[
         FieldOwnership::new("spec.pool", WriterRole::ReconcileLoop),
         FieldOwnership::new("spec.priority", WriterRole::Operator),
+        FieldOwnership::new("spec.provider_requirements", WriterRole::Operator),
         FieldOwnership::new("spec.host_direct", WriterRole::ReconcileLoop),
         FieldOwnership::new("spec.docker_per_vessel", WriterRole::ReconcileLoop),
         FieldOwnership::new("spec.docker_per_vessel.host_ref", WriterRole::ReconcileLoop),
@@ -88,6 +89,10 @@ impl FieldOwnedResource for PlacementPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct PlacementPolicySpec {
     pub pool: String,
+    /// Optional data-only provider constraints. Old policies derive their
+    /// requirements from their checkout and execution inputs (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_requirements: Option<ProviderRequirements>,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "is_zero")]
     pub priority: i32,
@@ -306,4 +311,16 @@ mod image_source_tests {
         .expect("old fulfilment kind decodes");
         assert_eq!(kind.realisation, crate::FulfilmentRealisation::DockerPerVessel { image: None });
     }
+}
+
+/// All constraints are conjunctive. Enforcement is a minimum: advisory admits
+/// enforcing providers too. Selection fails closed when several instances match.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderRequirements {
+    pub instance: Option<String>,
+    pub class: Option<flotilla_protocol::provider::EnvironmentClass>,
+    pub material_modes: Vec<flotilla_protocol::provider::MaterialMode>,
+    pub checkout_strategy: Option<flotilla_protocol::provider::CheckoutStrategy>,
+    pub egress_enforcement: Option<flotilla_protocol::provider::EgressEnforcement>,
 }

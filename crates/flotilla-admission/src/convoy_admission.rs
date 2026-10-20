@@ -62,8 +62,8 @@ use crate::regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome};
 use crate::support::{
     authoritative_placement_host, check_placement_capacity, ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot,
     home_copy_wins_by_name, host_generation, is_agentless_ssh_host, placement_actuator_host_ref, placement_host_not_ready_reason,
-    placement_host_ref, placement_target_host, policy_targets_agentless_ssh, prepared_snapshot_name, unready_placement_refusal,
-    validate_docker_placement_host, AGENTLESS_SSH_PIN_ONLY,
+    placement_host_ref, placement_target_host, policy_targets_agentless_ssh, prepared_snapshot_name, resolve_placement_provider,
+    unready_placement_refusal, AGENTLESS_SSH_PIN_ONLY,
 };
 
 /// Routing uses replicated observations as hints; only admission may refuse on
@@ -2864,7 +2864,7 @@ impl AdmissionReadContext<'_> {
             .map_err(|error| error.to_string())?
             .items
             .is_empty();
-        let (placement, minimal_alternatives) = if has_kinds && !workflow.vessels.is_empty() {
+        let (placement, minimal_alternatives) = if !workflow.vessels.is_empty() {
             let mut first = None;
             let mut index = 0;
             while index < workflow.vessels.len() {
@@ -2926,21 +2926,33 @@ impl AdmissionReadContext<'_> {
                     Err(error) => {
                         return Err(format!(
                             "no fulfilment covers role `{}` need {}: {error}",
-                            vessel.crew[0].role,
+                            vessel.crew.first().map_or(vessel.name.as_str(), |crew| crew.role.as_str()),
                             needs.iter().map(ToString::to_string).collect::<Vec<_>>().join(" + ")
                         ));
                     }
                 };
                 if purpose == PlacementPurpose::Admission {
-                    resolve_and_validate_workflow_credentials_for_capability_admission(
-                        &self.backend,
-                        namespace,
-                        Some(project_ref),
-                        repositories,
-                        resolution.selected.as_ref(),
-                        &mut one,
-                    )
-                    .await?;
+                    if has_kinds {
+                        resolve_and_validate_workflow_credentials_for_capability_admission(
+                            &self.backend,
+                            namespace,
+                            Some(project_ref),
+                            repositories,
+                            resolution.selected.as_ref(),
+                            &mut one,
+                        )
+                        .await?;
+                    } else {
+                        resolve_and_validate_workflow_credentials(
+                            &self.backend,
+                            namespace,
+                            Some(project_ref),
+                            repositories,
+                            resolution.selected.as_ref(),
+                            &mut one,
+                        )
+                        .await?;
+                    }
                 }
                 if purpose == PlacementPurpose::Admission {
                     let (images, builds) =
@@ -3030,7 +3042,7 @@ impl AdmissionReadContext<'_> {
         let mut placement = match placement_policy {
             Some(policy) => {
                 let policy = required_admission_value(policy, "placement policy")?;
-                let resolved = self
+                let mut resolved = self
                     .backend
                     .clone()
                     .including_replicas::<PlacementPolicy>(namespace)
@@ -3039,7 +3051,7 @@ impl AdmissionReadContext<'_> {
                     .map(|source| source.object)
                     .map_err(|error| format!("placement policy {policy}: {error}"))?;
                 if purpose == PlacementPurpose::Admission {
-                    validate_docker_placement_host(&self.backend, namespace, &resolved).await?;
+                    resolve_placement_provider(&self.backend, namespace, &mut resolved).await?;
                 }
                 PlacementResolution {
                     selected: Some(resolved),
@@ -4101,14 +4113,14 @@ async fn decide_default_placement(
     let candidate_names = policies.iter().map(|policy| policy.metadata.name.clone()).collect::<Vec<_>>();
     let mut viable = Vec::new();
     let mut refused_candidates = Vec::new();
-    for policy in policies {
+    for mut policy in policies {
         let mut candidate_workflow = workflow.clone();
         // Only unpinned convoys reach default placement.
         let refusal = if policy_targets_agentless_ssh(backend, namespace, &policy).await {
             Some(AGENTLESS_SSH_PIN_ONLY.to_string())
         } else if purpose == PlacementPurpose::Routing {
             None
-        } else if let Err(reason) = validate_docker_placement_host(backend, namespace, &policy).await {
+        } else if let Err(reason) = resolve_placement_provider(backend, namespace, &mut policy).await {
             Some(reason)
         } else if let Err(reason) = validate_workflow_agent_adapters(backend, namespace, workflow, Some(&policy), false).await {
             Some(reason)
@@ -5872,6 +5884,124 @@ mod tests {
             let right = candidate("right", right.3, right.0, right.1, right.2);
             assert_eq!(placement_tiebreak.compare(&left, &right).is_lt(), left_wins, "{label}");
         }
+    }
+
+    // Placement matches every vessel's crew needs and policy independently.
+    // Reversing vessel order cannot lend one vessel's provider to another.
+    #[hegel::test]
+    fn distinct_vessel_needs_freeze_distinct_provider_instances(tc: hegel::TestCase) {
+        use flotilla_protocol::provider::{
+            CheckoutStrategy, EgressEnforcement, EnvironmentClass, MaterialMode, ProviderAdvertisement, ProviderCapabilities, ProviderKind,
+            ProviderReadiness,
+        };
+        use flotilla_resources::{HostSpec, HostStatus};
+        let reverse = tc.draw(hegel::generators::booleans());
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let fixture = handler_contract_fixture().await;
+            for platform in ["linux", "macos"] {
+                let host = fixture
+                    .backend
+                    .using::<ResourceHost>("flotilla")
+                    .create(
+                        &InputMeta::builder().name(platform.into()).build(),
+                        &HostSpec { display_name: platform.into(), ..Default::default() },
+                    )
+                    .await
+                    .unwrap();
+                let providers = vec![ProviderAdvertisement {
+                    instance: format!("{platform}-instance"),
+                    kind: Some(ProviderKind::new(EnvironmentClass::HostDirect, "fixture")),
+                    readiness: ProviderReadiness::Ready,
+                    capabilities: ProviderCapabilities {
+                        material_modes: vec![MaterialMode::Shared],
+                        checkout_strategies: vec![CheckoutStrategy::HostWorktree],
+                        egress_enforcement: EgressEnforcement::Enforced,
+                        ..Default::default()
+                    },
+                }];
+                fixture
+                    .backend
+                    .using::<ResourceHost>("flotilla")
+                    .update_status(
+                        platform,
+                        &host.metadata.resource_version,
+                        &HostStatus {
+                            capabilities: [(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers))]
+                                .into_iter()
+                                .collect(),
+                            heartbeat_at: Some(Utc::now()),
+                            ready: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let policy = PlacementPolicySpec::builder()
+                    .pool("passthrough".into())
+                    .host_direct(HostDirectPlacementPolicySpec {
+                        host_ref: platform.into(),
+                        checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                    })
+                    .provider_requirements(flotilla_resources::ProviderRequirements {
+                        class: Some(EnvironmentClass::HostDirect),
+                        egress_enforcement: Some(EgressEnforcement::Enforced),
+                        ..Default::default()
+                    })
+                    .build();
+                fixture
+                    .backend
+                    .using::<PlacementPolicy>("flotilla")
+                    .create(&InputMeta::builder().name(platform.into()).build(), &policy)
+                    .await
+                    .unwrap();
+                fixture
+                    .backend
+                    .using::<FulfilmentKind>("flotilla")
+                    .create(
+                        &InputMeta::builder().name(platform.into()).build(),
+                        &FulfilmentKindSpec::from_policy(&policy, platform).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut workflow = WorkflowTemplateSpec::builder()
+                .vessels(
+                    ["linux", "macos"]
+                        .into_iter()
+                        .map(|platform| {
+                            VesselRequirement::builder()
+                                .name(platform.into())
+                                .crew(vec![CrewSpec::builder()
+                                    .role(platform.into())
+                                    .source(CrewSource::Tool { command: "true".into() })
+                                    .needs(BTreeSet::from([CapabilityNeed::Platform(platform.into())]))
+                                    .build()])
+                                .build()
+                        })
+                        .collect(),
+                )
+                .build();
+            if reverse {
+                workflow.vessels.reverse();
+            }
+            let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".into()).build();
+            let context = PlacementContext {
+                namespace: "flotilla",
+                project_ref: "project",
+                repositories: &[],
+                intent: &intent,
+                purpose: PlacementPurpose::Admission,
+            };
+            let reads = fixture.owner.reads(fixture.backend.clone());
+            let (_, _, placements, _) = reads.decide_vessel_placements(&context, &mut workflow).await.unwrap();
+            for platform in ["linux", "macos"] {
+                assert_eq!(
+                    placements[platform].0.provider_requirements.as_ref().unwrap().instance.as_deref(),
+                    Some(format!("{platform}-instance").as_str())
+                );
+                assert_eq!(placements[platform].1.target_host.reference.as_str(), platform);
+            }
+        });
     }
 
     // ADR 0062: a workflow template leg's `needs` survive role expansion and

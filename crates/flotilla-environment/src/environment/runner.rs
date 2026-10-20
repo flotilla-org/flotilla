@@ -175,16 +175,20 @@ impl CommandRunner for DockerEnvironmentRunner {
 
 #[cfg(test)]
 mod tests {
-    use std::{future, os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
+    use std::{future, path::Path, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
+    #[cfg(unix)]
     use uuid::Uuid;
 
-    use super::{DockerEnvironmentRunner, CONTAINED_CODEX_HOME};
+    use super::DockerEnvironmentRunner;
+    #[cfg(unix)]
+    use super::CONTAINED_CODEX_HOME;
     use flotilla_provider_runtime::command_timeout_message;
     use flotilla_provider_runtime::ChannelLabel;
     use flotilla_provider_runtime::CommandOutput;
     use flotilla_provider_runtime::CommandRunner;
+    #[cfg(unix)]
     use flotilla_provider_runtime::ProcessCommandRunner;
     use flotilla_replay_testkit::testing::MockRunner;
     use flotilla_replay_testkit::testing::TimeoutOnlyRunner;
@@ -216,8 +220,10 @@ mod tests {
         assert_eq!(result.expect_err("deadline"), "zellij timed out after 500ms");
     }
 
+    #[cfg(unix)]
     struct DockerContainer(String);
 
+    #[cfg(unix)]
     impl Drop for DockerContainer {
         fn drop(&mut self) {
             let _ = std::process::Command::new("docker").args(["rm", "-f", &self.0]).output();
@@ -301,9 +307,12 @@ mod tests {
         assert!(calls[0].1.iter().all(|arg| arg != "/run/user/1000" && arg != "/host/state"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires Docker and the busybox:latest image"]
     async fn persistent_delivery_paths_work_in_a_real_non_root_container() {
+        use std::os::unix::fs::PermissionsExt;
+
         let container = DockerContainer(format!("flotilla-non-root-delivery-{}", Uuid::new_v4()));
         let codex_home = tempfile::tempdir().expect("Codex home mount source");
         std::fs::set_permissions(codex_home.path(), std::fs::Permissions::from_mode(0o777))

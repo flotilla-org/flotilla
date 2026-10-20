@@ -167,7 +167,7 @@ impl DaemonRuntime {
         .await;
 
         let local_registry = phase("probe_local_provider_registry", probe_local_provider_registry(&daemon, &config)).await?;
-        let profile = build_local_profile(&daemon, &local_registry)?;
+        let profile = build_local_profile(&daemon, &local_registry).await?;
         let host_direct_environment_name = host_direct_environment_name(&profile.host_id);
         let mut archive_roots = vec![CheckoutArchiveRoot {
             env_ref: host_direct_environment_name.clone(),
@@ -216,6 +216,8 @@ impl DaemonRuntime {
         let runtime_health = RuntimeHealth::default()
             .with_restart_history_dir(config.state_dir().as_path().to_path_buf())
             .with_blob_store(Arc::clone(&blob_store));
+        runtime_health.host_observations.record_provider_advertisements(profile.environment_providers.clone()).await;
+
         phase(
             "quarantine_undecodable_stored_objects",
             flotilla_store::quarantine_undecodable_stored_objects(&daemon.resource_backend(), &options.namespace),

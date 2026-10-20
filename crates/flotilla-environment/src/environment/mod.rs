@@ -304,6 +304,12 @@ pub trait EnvironmentProvider: Send + Sync {
     /// Descriptive identity only; callers must use capability data for behaviour.
     fn kind(&self) -> ProviderKind;
     fn capabilities(&self) -> ProviderCapabilities;
+    /// Current local readiness. Cloud providers must verify their credential on
+    /// this controlling host before returning Ready. Unknown fails closed.
+    async fn detect_readiness(&self) -> ProviderReadiness {
+        ProviderReadiness::default()
+    }
+
     /// Compatibility with unlabelled preceding-generation stored inputs only.
     /// New providers need no legacy input discriminator.
     fn legacy_input(&self) -> Option<EnvironmentInput> {
@@ -359,6 +365,12 @@ pub trait ProvisionedEnvironment: Send + Sync {
     fn backing_id(&self) -> &str;
     async fn observe(&self) -> ProviderObservation;
     fn capabilities(&self) -> ProviderCapabilities;
+    /// Current local readiness. Cloud providers must verify their credential on
+    /// this controlling host before returning Ready. Unknown fails closed.
+    async fn detect_readiness(&self) -> ProviderReadiness {
+        ProviderReadiness::default()
+    }
+
     fn id(&self) -> &EnvironmentId;
     fn image(&self) -> &ImageId;
     /// Immutable content digest of the image actually backing this environment.

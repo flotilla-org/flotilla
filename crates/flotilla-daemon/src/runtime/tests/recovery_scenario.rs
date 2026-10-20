@@ -15,7 +15,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
     assert!(local_registry.agent_adapters.get("codex").is_some());
     assert!(local_registry.agent_adapters.get("claude-code").is_some());
-    let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
+    let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
     let backend = daemon.resource_backend();
 
     register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("startup resources");
@@ -398,7 +398,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         convoys.watch(flotilla_resources::WatchStart::resuming_from(&listed_before_restart)).await.expect("watch convoy recovery");
     let (daemon, pool) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry after restart");
-    let profile = build_local_profile(&daemon, &local_registry).expect("local profile after restart");
+    let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile after restart");
     let surviving_sessions = terminals
         .list()
         .await

@@ -141,7 +141,12 @@ pub(super) async fn create_credential_test_session(backend: &ResourceBackend, na
 
 pub(super) fn manual_profile(host_id: &str, docker_available: bool) -> LocalProvisioningProfile {
     LocalProvisioningProfile {
-        environment_providers: Vec::new(),
+        environment_providers: flotilla_discovery_testkit::environment::ready_placement_advertisements()
+            .into_iter()
+            .filter(|provider| {
+                docker_available || provider.kind.as_ref().unwrap().class == flotilla_protocol::provider::EnvironmentClass::HostDirect
+            })
+            .collect(),
         host_id: host_id.to_string(),
         display_name: "kiwi".to_string(),
         repo_default_dir: "/Users/tester/dev/flotilla-repos".to_string(),

@@ -25,7 +25,19 @@ def main():
         # Refuse the Docker process boundary if reconciliation races admission.
         # CI may have Docker installed; this test must never launch a container.
         docker = release / 'bin/docker'
-        docker.write_text('#!/bin/sh\nif [ "$1" = --version ]; then echo "Docker version 24.0.0"; exit 0; fi\necho "pre-Docker admission test" >&2\nexit 1\n')
+        docker.write_text('''#!/bin/sh
+if [ "$#" -eq 1 ] && [ "$1" = --version ]; then
+    echo "Docker version 24.0.0"
+    exit 0
+fi
+# A read-only provider readiness probe is allowed; container launch is not.
+if [ "$#" -eq 3 ] && [ "$1" = info ] && [ "$2" = --format ] && [ "$3" = '{{json .}}' ]; then
+    echo '{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}'
+    exit 0
+fi
+echo "pre-Docker admission test" >&2
+exit 1
+''')
         docker.chmod(0o755)
         # Cleat's binary presence is required for Docker-capable admission.
         # Refuse the terminal process boundary; launch is covered by lifecycle fakes.

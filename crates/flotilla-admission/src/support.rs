@@ -18,7 +18,6 @@ use flotilla_resources::LifecycleAuthority;
 use flotilla_resources::ObservedCheckoutSpec as ResourceObservedCheckoutSpec;
 use flotilla_resources::PlacementPolicy;
 use flotilla_resources::PlacementPolicySpec;
-use flotilla_resources::Platform;
 use flotilla_resources::ProjectSpec;
 use flotilla_resources::ReadResourceObject;
 use flotilla_resources::Repository;
@@ -271,29 +270,33 @@ pub async fn policy_targets_agentless_ssh(backend: &ResourceBackend, namespace: 
         .is_some_and(|host| is_agentless_ssh_host(&host))
 }
 
-pub async fn validate_docker_placement_host(
+/// Validate and freeze one provider for this vessel's placement snapshot.
+pub async fn resolve_placement_provider(
     backend: &ResourceBackend,
     namespace: &str,
-    policy: &ResourceObject<PlacementPolicy>,
+    policy: &mut ResourceObject<PlacementPolicy>,
 ) -> Result<(), String> {
-    if policy.spec.docker_per_vessel.is_none() {
-        return Ok(());
-    }
+    use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
+    use flotilla_protocol::provider::ProviderAdvertisement;
     let target = placement_target_host(backend, namespace, policy).await?;
     let host = authoritative_placement_host(backend, namespace, &target, &policy.metadata.name).await?;
-    let capabilities = host.status.as_ref().map(|status| &status.capabilities);
-    if capabilities.and_then(|capabilities| capabilities.get("docker")) != Some(&serde_json::Value::Bool(true)) {
-        return Err(format!(
-            "placement `{}` host `{}` is missing docker capability required for Docker vessels",
-            policy.metadata.name, target.display_name
-        ));
-    }
-    if capabilities.and_then(|capabilities| capabilities.get("os")).and_then(serde_json::Value::as_str) != Some(Platform::Linux.as_str()) {
-        return Err(format!(
-            "placement `{}` host `{}` is missing Linux host capability required for daemon-adjacent injection",
-            policy.metadata.name, target.display_name
-        ));
-    }
+    let value = host
+        .status
+        .as_ref()
+        .and_then(|status| status.capabilities.get(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY))
+        .ok_or_else(|| format!("{}: provider advertisements not observed", target.display_name))?;
+    let providers: Vec<ProviderAdvertisement> = serde_json::from_value(value.clone())
+        .map_err(|error| format!("{}: invalid provider advertisements: {error}", target.display_name))?;
+    let selected = crate::provider_placement::match_provider(
+        &target.display_name,
+        &policy.spec,
+        policy.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
+        &providers,
+    )?;
+    // Specs are frozen per vessel; metadata is also retained for existing image
+    // cache and provisioning consumers that already use the identity label.
+    policy.spec.provider_requirements.get_or_insert_with(Default::default).instance = Some(selected.instance.clone());
+    policy.metadata.labels.insert(ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), selected.instance.clone());
     Ok(())
 }
 

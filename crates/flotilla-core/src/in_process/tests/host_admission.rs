@@ -154,6 +154,12 @@ async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() 
             &host_id,
             &host.metadata.resource_version,
             &HostStatus {
+                capabilities: [(
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                )]
+                .into_iter()
+                .collect(),
                 heartbeat_at: Some(Utc::now()),
                 ready: true,
                 fulfilment_facts: BTreeMap::from([(
@@ -265,6 +271,12 @@ async fn fulfilment_list_joins_host_facts_and_fleet_health_shows_local_kinds() {
             &host_id,
             &host.metadata.resource_version,
             &HostStatus {
+                capabilities: [(
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                )]
+                .into_iter()
+                .collect(),
                 heartbeat_at: Some(Utc::now()),
                 ready: true,
                 fulfilment_facts: BTreeMap::from([(
@@ -337,6 +349,12 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
             &host_id,
             &local.metadata.resource_version,
             &HostStatus {
+                capabilities: [(
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                )]
+                .into_iter()
+                .collect(),
                 disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
                 admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
                 ..HostStatus::default()
@@ -429,6 +447,12 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
             &host_id,
             &local.metadata.resource_version,
             &HostStatus {
+                capabilities: [(
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                )]
+                .into_iter()
+                .collect(),
                 disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
                 admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
                 ..HostStatus::default()
@@ -505,6 +529,12 @@ async fn capability_admission_places_on_agentless_ssh_hosts_only_when_pinned() {
             "ssh-host",
             &host.metadata.resource_version,
             &HostStatus {
+                capabilities: [(
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                )]
+                .into_iter()
+                .collect(),
                 heartbeat_at: Some(Utc::now()),
                 ready: true,
                 fulfilment_facts: BTreeMap::from([(

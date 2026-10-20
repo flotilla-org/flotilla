@@ -63,6 +63,22 @@ fn host_user() -> String {
 
 #[async_trait]
 impl EnvironmentProvider for DockerEnvironmentProvider {
+    async fn detect_readiness(&self) -> super::ProviderReadiness {
+        // Probe the provider endpoint's host, which can be reached over SSH.
+        if let Err(reason) = self.inner.runner.run("docker", &["--version"], Path::new("/"), &ChannelLabel::Default).await {
+            return super::ProviderReadiness::MissingTool { reason };
+        }
+        match self.inner.runner.run("uname", &["-s"], Path::new("/"), &ChannelLabel::Default).await {
+            Ok(os) if os.trim() == "Linux" => {
+                match self.inner.runner.run("docker", &["info", "--format", "{{json .}}"], Path::new("/"), &ChannelLabel::Default).await {
+                    Ok(_) => super::ProviderReadiness::Ready,
+                    Err(reason) => super::ProviderReadiness::Unknown { reason },
+                }
+            }
+            Ok(_) => super::ProviderReadiness::MissingTool { reason: "Linux host required for daemon-adjacent injection".into() },
+            Err(reason) => super::ProviderReadiness::Unknown { reason },
+        }
+    }
     fn kind(&self) -> super::ProviderKind {
         super::ProviderKind::new(super::EnvironmentClass::Container, "docker")
     }

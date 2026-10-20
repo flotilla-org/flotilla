@@ -190,8 +190,12 @@ async fn observation_recovers_after_provider_error() {
 fn advertisement_fields_default_when_omitted(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let (provider, _) = providers().remove(tc.draw(gs::integers::<usize>().min_value(0).max_value(2)));
-    let advertisement =
-        ProviderAdvertisement { instance: "configured".into(), kind: Some(provider.kind()), capabilities: provider.capabilities() };
+    let advertisement = ProviderAdvertisement {
+        instance: "configured".into(),
+        kind: Some(provider.kind()),
+        capabilities: provider.capabilities(),
+        readiness: ProviderReadiness::Ready,
+    };
     let mut value = serde_json::to_value(&advertisement).unwrap();
     let nested = tc.draw(gs::booleans());
     let object = if nested { value["capabilities"].as_object_mut().unwrap() } else { value.as_object_mut().unwrap() };
@@ -231,4 +235,40 @@ async fn host_and_dummy_retirement_is_observable_and_excluded_from_inventory() {
 fn omitted_advertisement_kind_stays_absent() {
     let decoded: ProviderAdvertisement = serde_json::from_str(r#"{"instance":"unadvertised"}"#).unwrap();
     assert_eq!(decoded.kind, None);
+}
+
+// Readiness probes the provider endpoint, not the daemon's build platform.
+// Generated boundary cases cover missing runtime, Linux, unsupported OS and
+// unknown platform; the runner stands in for the remote process boundary.
+#[hegel::test]
+fn docker_readiness_reports_endpoint_host_requirements(tc: hegel::TestCase) {
+    use flotilla_discovery_testkit::DiscoveryMockRunner;
+    use hegel::generators as gs;
+    let case = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("docker", &["--version"], if case == 0 { Err("runtime absent".into()) } else { Ok("Docker version".into()) })
+        .on_run(
+            "uname",
+            &["-s"],
+            match case {
+                1 | 4 => Ok("Linux\n".into()),
+                2 => Ok("Darwin\n".into()),
+                _ => Err("platform probe failed".into()),
+            },
+        )
+        .on_run(
+            "docker",
+            &["info", "--format", "{{json .}}"],
+            if case == 4 { Err("runtime socket denied".into()) } else { Ok("{}".into()) },
+        )
+        .build();
+    let provider = docker::DockerEnvironmentProvider::new(Arc::new(runner));
+    let readiness = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(provider.detect_readiness());
+    match case {
+        0 => assert!(matches!(readiness, ProviderReadiness::MissingTool { reason } if reason.contains("runtime absent"))),
+        1 => assert_eq!(readiness, ProviderReadiness::Ready),
+        2 => assert!(matches!(readiness, ProviderReadiness::MissingTool { reason } if reason.contains("Linux host"))),
+        3 => assert!(matches!(readiness, ProviderReadiness::Unknown { reason } if reason.contains("platform probe failed"))),
+        _ => assert!(matches!(readiness, ProviderReadiness::Unknown { reason } if reason.contains("runtime socket denied"))),
+    }
 }

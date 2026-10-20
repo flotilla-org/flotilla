@@ -97,6 +97,9 @@ fn dummy_image_id(image: &str) -> String {
 
 #[async_trait]
 impl EnvironmentProvider for DummyEnvironmentProvider {
+    async fn detect_readiness(&self) -> super::ProviderReadiness {
+        super::ProviderReadiness::Ready
+    }
     fn kind(&self) -> super::ProviderKind {
         super::ProviderKind::new(super::EnvironmentClass::Dummy, "dummy")
     }

@@ -1,89 +1,13 @@
 //! Runtime-only provider vocabulary. Persisted Docker inputs remain at the
 //! legacy boundary until the generated Environment table move (ADR 0058).
-use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EnvironmentClass {
-    HostDirect,
-    Container,
-    MicroVm,
-    CloudSandbox,
-    Dummy,
-}
-
-/// Implementation names are open; identity never selects runtime behaviour.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProviderKind {
-    pub class: EnvironmentClass,
-    pub implementation: String,
-}
-
-impl ProviderKind {
-    pub fn new(class: EnvironmentClass, implementation: impl Into<String>) -> Self {
-        Self { class, implementation: implementation.into() }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MaterialMode {
-    Frozen,
-    Pushed,
-    Shared,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckoutStrategy {
-    HostWorktree,
-    HostClone,
-    CloneInVessel,
-}
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EgressRoute {
-    #[default]
-    None,
-    ExplicitProxy,
-    TransparentProxy,
-    Open,
-}
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EgressEnforcement {
-    Enforced,
-    #[default]
-    Advisory,
-}
-
-/// Data consumed without branching on a runtime name or class. Unsupported
-/// operations default closed. Optional operation traits remain instance-owned.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ProviderCapabilities {
-    pub material_modes: Vec<MaterialMode>,
-    pub checkout_strategies: Vec<CheckoutStrategy>,
-    pub workspace_root: PathBuf,
-    pub reference_root: Option<PathBuf>,
-    pub suspend_resume: bool,
-    pub export: bool,
-    pub egress_route: EgressRoute,
-    pub egress_enforcement: EgressEnforcement,
-    pub fallback_runner: bool,
-    pub receives_host_tools: bool,
-    pub per_vessel: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ProviderAdvertisement {
-    pub instance: String,
-    pub kind: Option<ProviderKind>,
-    pub capabilities: ProviderCapabilities,
-}
+pub use flotilla_protocol::provider::{
+    CheckoutStrategy, EgressEnforcement, EgressRoute, EnvironmentClass, MaterialMode, ProviderAdvertisement, ProviderCapabilities,
+    ProviderKind, ProviderReadiness,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

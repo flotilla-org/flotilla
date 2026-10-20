@@ -32,6 +32,9 @@ impl HostDirectEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for HostDirectEnvironmentProvider {
+    async fn detect_readiness(&self) -> super::ProviderReadiness {
+        super::ProviderReadiness::Ready
+    }
     fn kind(&self) -> super::ProviderKind {
         super::ProviderKind::new(super::EnvironmentClass::HostDirect, "host-direct")
     }
