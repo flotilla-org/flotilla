@@ -42,13 +42,20 @@ pub async fn run_resource_watch_command(context: ResourceWatchCommandContext) ->
         }),
         Err(message) => return CommandValue::Error { message },
     };
-    let result = match (context.replica_sources, context.include_replicas, start) {
-        (true, _, Some(_)) => Err(ResourceError::invalid("replica-source watches do not support cursor resume")),
-        (true, _, None) => watch_resource_kind_replica_sources(&context.backend, &context.namespace, &context.kind).await,
-        (false, true, Some(_)) => Err(ResourceError::invalid("include-replicas watches do not support cursor resume")),
-        (false, true, None) => watch_resource_kind_including_replicas(&context.backend, &context.namespace, &context.kind).await,
-        (false, false, Some(start)) => watch_resource_kind_from(&context.backend, &context.namespace, &context.kind, start).await,
-        (false, false, None) => watch_resource_kind(&context.backend, &context.namespace, &context.kind).await,
+    let setup = async {
+        match (context.replica_sources, context.include_replicas, start) {
+            (true, _, Some(_)) => Err(ResourceError::invalid("replica-source watches do not support cursor resume")),
+            (true, _, None) => watch_resource_kind_replica_sources(&context.backend, &context.namespace, &context.kind).await,
+            (false, true, Some(_)) => Err(ResourceError::invalid("include-replicas watches do not support cursor resume")),
+            (false, true, None) => watch_resource_kind_including_replicas(&context.backend, &context.namespace, &context.kind).await,
+            (false, false, Some(start)) => watch_resource_kind_from(&context.backend, &context.namespace, &context.kind, start).await,
+            (false, false, None) => watch_resource_kind(&context.backend, &context.namespace, &context.kind).await,
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        _ = context.token.cancelled() => return CommandValue::Cancelled,
+        result = setup => result,
     };
     let watch = match result {
         Ok(watch) => watch,
@@ -247,4 +254,34 @@ fn resource_record_matches_name(record: &ResourceReadRecord, name: Option<&str>)
             .and_then(|value| value.as_str())
             == Some(name)
     })
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use flotilla_daemon_api::event_sink::BroadcastEventSink;
+    use flotilla_store_memory::InMemoryBackend;
+
+    // Cancellation owns setup as well as stream consumption. A cancelled
+    // command must return before even an immediately failing registry lookup.
+    #[tokio::test]
+    async fn cancelled_watch_does_not_start_setup_or_emit_events() {
+        let (tx, mut events) = tokio::sync::broadcast::channel(8);
+        let token = CancellationToken::new();
+        token.cancel();
+        let context = ResourceWatchCommandContext::builder()
+            .backend(ResourceBackend::new(InMemoryBackend::default()))
+            .namespace("flotilla".into())
+            .kind("not-a-registered-kind".into())
+            .include_replicas(false)
+            .replica_sources(false)
+            .command_id(1)
+            .node_id(NodeId::new("local"))
+            .repo_identity(RepoIdentity { authority: String::new(), path: String::new() })
+            .event_sink(Arc::new(BroadcastEventSink::new(tx)))
+            .token(token)
+            .build();
+        assert!(matches!(run_resource_watch_command(context).await, CommandValue::Cancelled));
+        assert!(events.try_recv().is_err());
+    }
 }

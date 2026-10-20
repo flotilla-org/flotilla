@@ -87,6 +87,20 @@ per-consumer jitter samples the upper half of each backoff window (initially
 storage/transport failures retain their existing error/recovery paths. Retry has
 one outstanding read per consumer and a capped rate during prolonged pressure.
 
+Cancellation ownership was audited by call-site family:
+
+| Read-retry caller | Owner/cancellation boundary |
+|---|---|
+| Controller primary/secondary watches and row reads | Controller loop owns current watch tasks, including respawns, and aborts them on drop; row reads are awaited in the loop |
+| WatchView and local/replica source recovery | Final view-handle drop aborts the worker; setup/recovery awaits the retry future directly |
+| Direct/routed replication and digest reads | Peer-generation cancellation is selected against the entire supervised attempt, including read backoff; supervisor drop cancels its generations |
+| Registry watch setup | Awaited by the caller; routed ResourceWatch commands select their cancellation token during setup as well as stream consumption |
+
+The controller cancellation guard failed against the detached-watch implementation
+and passes with owned tasks. A cancelled routed-watch setup guard also failed
+before setup was included in the token select. Cancellation stops future read
+attempts; a SQLite operation already executing retains its existing worker lifetime.
+
 Assumptions: watch snapshot/replay handoff remains race-free; source precedence
 is the existing fixed two-source order; a resource event replaces one complete
 body; child evidence changes use the existing full-projection invalidation boundary.

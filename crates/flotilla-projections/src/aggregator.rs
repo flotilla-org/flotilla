@@ -4499,8 +4499,8 @@ mod tests {
         let (tx, _) = broadcast::channel(32);
         let hosts = Arc::new(Hosts::default());
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver_arc(hosts.clone());
-        let first = ReadResourceObject {
-            object: convoy_object("buffered").await,
+        let mut first = ReadResourceObject {
+            object: convoy_with_vessel("buffered").await,
             provenance: ResourceProvenance::Replica {
                 origin_root: flotilla_protocol::NodeId::new("first-root"),
                 last_synced_at: Utc::now(),
@@ -4510,6 +4510,7 @@ mod tests {
         assert!(state.result_set().await.rows.as_convoys().unwrap().is_empty());
         let calls = hosts.calls.load(Ordering::Relaxed);
         let copied = aggregator.copied_convoys.load(Ordering::Relaxed);
+        first.object.status.as_mut().unwrap().work.get_mut("implement").unwrap().phase = ResourceWorkPhase::Running;
         for _ in 0..3 {
             aggregator.apply_replica_convoy_event(ReadWatchEvent::Modified(first.clone())).await;
         }
@@ -4532,18 +4533,28 @@ mod tests {
         let rows = result.rows.as_convoys().unwrap();
         assert_eq!(rows.len(), 2, "discovery must also release previously buffered keys");
         assert_eq!(rows.iter().find(|row| row.resource.name == "buffered").unwrap().resource.host, Some(HostName::new("first-host")));
+        assert_eq!(
+            rows.iter().find(|row| row.resource.name == "buffered").unwrap().vessels[0].phase,
+            WorkPhase::Running,
+            "fallback must use the latest nested child state, not the initial buffered snapshot"
+        );
         let untouched = rows.iter().find(|row| row.resource.name == "new-origin").unwrap().clone();
         assert!(aggregator.copied_convoys.load(Ordering::Relaxed) > copied, "the origin-change fallback ran");
         let copied = aggregator.copied_convoys.load(Ordering::Relaxed);
         let summarized = aggregator.summarized_convoys.load(Ordering::Relaxed);
         let calls = hosts.calls.load(Ordering::Relaxed);
         let mut changed = first;
-        changed.object.status.get_or_insert_with(Default::default).message = Some("changed".into());
+        changed.object.status.as_mut().unwrap().work.get_mut("implement").unwrap().phase = ResourceWorkPhase::Failed;
         aggregator.apply_replica_convoy_event(ReadWatchEvent::Modified(changed)).await;
         assert_eq!(aggregator.copied_convoys.load(Ordering::Relaxed), copied);
         assert_eq!(aggregator.summarized_convoys.load(Ordering::Relaxed), summarized + 1);
         assert_eq!(hosts.calls.load(Ordering::Relaxed), calls);
         let result = state.result_set().await;
+        assert_eq!(
+            result.rows.as_convoys().unwrap().iter().find(|row| row.resource.name == "buffered").unwrap().vessels[0].phase,
+            WorkPhase::Failed,
+            "same-key events must refresh changed nested child state"
+        );
         assert_eq!(result.rows.as_convoys().unwrap().iter().find(|row| row.resource.name == "new-origin"), Some(&untouched));
     }
 

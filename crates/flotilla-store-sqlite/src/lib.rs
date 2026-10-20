@@ -165,4 +165,73 @@ mod read_pressure_contract {
         controller.abort();
         replicator.abort();
     }
+    // A secondary read retry belongs to its controller. Aborting the parent
+    // must drop the retry even if the backend stays permanently busy.
+    #[tokio::test]
+    async fn aborting_controller_cancels_secondary_read_retry() {
+        use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+        use std::{future::Future, pin::Pin};
+        #[derive(Clone)]
+        struct BusyWatch {
+            attempts: Arc<AtomicUsize>,
+            dropped: Arc<AtomicUsize>,
+        }
+        struct DropProbe(Arc<AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        impl SecondaryWatch for BusyWatch {
+            type Primary = Convoy;
+            fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Convoy>> {
+                Box::new(self.clone())
+            }
+            fn spawn(
+                self: Box<Self>,
+                _: ResourceBackend,
+                _: String,
+                _: WorkQueueSender,
+            ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
+                Box::pin(async move {
+                    let _probe = DropProbe(self.dropped);
+                    // Stand in for a persistently busy storage/transport read.
+                    flotilla_store::retry_store_read(|| async {
+                        self.attempts.fetch_add(1, Ordering::Relaxed);
+                        Err::<(), _>(ResourceError::store_busy_read_deadline())
+                    })
+                    .await
+                })
+            }
+        }
+        let backend = ResourceBackend::new(SqliteBackend::open_in_memory().unwrap());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let controller = tokio::spawn(
+            ControllerLoop {
+                primary: backend.using::<Convoy>("flotilla"),
+                secondaries: vec![Box::new(BusyWatch { attempts: attempts.clone(), dropped: dropped.clone() })],
+                reconciler: Reconcile(Arc::default()),
+                resync_interval: Duration::from_secs(60),
+                backend,
+            }
+            .run(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        controller.abort();
+        assert!(controller.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while dropped.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("controller shutdown must drop the child read retry");
+    }
 }

@@ -533,6 +533,21 @@ enum WatchExited {
     Secondary { index: usize, result: Result<(), ResourceError> },
 }
 
+// Tokio handles detach on drop. Keep every current watch, including respawns,
+// owned by the loop so shutdown also cancels a watch's in-flight read/backoff.
+struct ControllerWatches {
+    primary: JoinHandle<()>,
+    secondaries: Vec<JoinHandle<()>>,
+}
+impl Drop for ControllerWatches {
+    fn drop(&mut self) {
+        self.primary.abort();
+        for watch in &self.secondaries {
+            watch.abort();
+        }
+    }
+}
+
 pub struct ControllerLoop<R: Reconciler> {
     pub primary: TypedResolver<R::Resource>,
     pub secondaries: Vec<Box<dyn SecondaryWatch<Primary = R::Resource>>>,
@@ -791,9 +806,9 @@ impl<R: Reconciler> ControllerLoop<R> {
         let ControllerLoop { primary, secondaries, reconciler, resync_interval, backend } = self;
         let (sender, mut receiver) = WorkQueueSender::channel();
         let (watch_exited_tx, mut watch_exited_rx) = mpsc::unbounded_channel();
-        let _primary_watch = Self::spawn_primary_watch(primary.clone(), sender.clone(), watch_exited_tx.clone(), None);
+        let primary_watch = Self::spawn_primary_watch(primary.clone(), sender.clone(), watch_exited_tx.clone(), None);
         let secondary_templates = secondaries;
-        let _secondary_watches: Vec<JoinHandle<()>> = secondary_templates
+        let secondary_watches: Vec<JoinHandle<()>> = secondary_templates
             .iter()
             .enumerate()
             .map(|(index, watch)| {
@@ -808,6 +823,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                 )
             })
             .collect();
+        let mut watches = ControllerWatches { primary: primary_watch, secondaries: secondary_watches };
         let mut resync = tokio::time::interval(resync_interval);
         resync.tick().await;
         let mut pending: VecDeque<String> = VecDeque::new();
@@ -1116,7 +1132,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                     match exited {
                         WatchExited::Primary(result) => {
                             Self::accept_restartable_watch_exit(result)?;
-                            let _respawn = Self::spawn_primary_watch(
+                            watches.primary = Self::spawn_primary_watch(
                                 primary.clone(),
                                 sender.clone(),
                                 watch_exited_tx.clone(),
@@ -1129,7 +1145,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                             // cannot reveal a deletion missed while its watch was expired.
                             let live_names = Self::resync_all(&primary, &sender).await?;
                             finalizer_failures.retain(|name, _| live_names.contains(name));
-                            let _respawn = Self::spawn_secondary_watch(
+                            watches.secondaries[index] = Self::spawn_secondary_watch(
                                 index,
                                 secondary_templates[index].clone(),
                                 backend.clone(),
