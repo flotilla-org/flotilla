@@ -1,4 +1,5 @@
 use super::*;
+use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 use flotilla_store_memory::InMemoryBackend;
 
 #[test]
@@ -581,4 +582,91 @@ async fn terminal_teardown_skips_a_session_absent_from_the_pool() {
     runtime.kill_session("terminal-demo-implement-coder", &spec).await.expect("missing sessions should be idempotent");
 
     assert!(pool.killed.lock().await.is_empty(), "teardown must not invoke the pool for an already-gone session");
+}
+
+// #3247: while flotillad has a hook endpoint, a host-direct Claude Code crew launches with
+// HTTP hooks to it and its terminal's hook token in the environment; without one it keeps
+// command hooks and gets no token.
+#[tokio::test]
+async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listens() {
+    for endpoint in [Some(crate::server::HookEndpoint::listening_at("http://127.0.0.1:7878")), None] {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config");
+        std::fs::create_dir_all(&config_path).expect("config dir");
+        std::fs::write(config_path.join("daemon.toml"), "machine_id = \"dinghy-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_path));
+        let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        daemon
+            .replace_local_environment_bag_for_test(
+                EnvironmentBag::new()
+                    .with(EnvironmentAssertion::env_var("HOME", home.display().to_string()))
+                    .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
+                    .with(EnvironmentAssertion::binary("claude", "/tools/claude")),
+            )
+            .expect("crew environment bag");
+        let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+        let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                Arc::clone(&daemon),
+                config,
+                local_registry,
+                None,
+                profile.host_id.clone(),
+                profile.host_direct_environment_name(),
+            )
+            .with_hook_endpoint(endpoint.clone()),
+        );
+        let session_cwd = temp.path().join("session-cwd");
+        std::fs::create_dir_all(&session_cwd).expect("session cwd");
+        assert!(ProcessCommand::new("git").args(["init", "-q"]).current_dir(&session_cwd).status().expect("git init").success());
+        let spec = flotilla_resources::TerminalSessionSpec {
+            env_ref: profile.host_direct_environment_name(),
+            role: "coder".to_string(),
+            source: TerminalSessionSource::Agent {
+                selector: Selector { capability: "code".to_string(), adapter: Some("claude-code".to_string()), model: None },
+                brief: flotilla_resources::TerminalBrief {
+                    artifact_digest: None,
+                    path: ".flotilla/briefs/coder.md".to_string(),
+                    content: "Implement the issue.".to_string(),
+                    copies: Vec::new(),
+                },
+                context: Box::new(flotilla_resources::TerminalCrewContext {
+                    namespace: NAMESPACE.to_string(),
+                    convoy: "demo".to_string(),
+                    vessel_ref: "demo-work".to_string(),
+                }),
+                message: None,
+            },
+            cwd: session_cwd.display().to_string(),
+            env: BTreeMap::new(),
+            pool: "fake-terminals".to_string(),
+        };
+        let session_name = "terminal-demo-work-coder";
+        TerminalControllerRuntime { state }.ensure_session(session_name, &spec, &[]).await.expect("launch host-direct Claude Code");
+
+        let ensured = pool.ensured.lock().await;
+        let [launch] = ensured.as_slice() else { panic!("expected one launch") };
+        let value = |name: &str| launch.env_vars.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(session_cwd.join(flotilla_agent::adapter::CLAUDE_MANAGED_SETTINGS_PATH)).expect("settings overlay"),
+        )
+        .expect("parse settings");
+        let stop = &settings["hooks"]["Stop"][0]["hooks"][0];
+        match &endpoint {
+            Some(endpoint) => {
+                let expected = endpoint.claude_code_launch(NAMESPACE, session_name).expect("endpoint");
+                assert_eq!(value(flotilla_agent::CLAUDE_CODE_HOOK_TOKEN_ENV), Some(expected.token));
+                assert_eq!(stop["type"], "http");
+                assert_eq!(stop["url"], "http://127.0.0.1:7878/v1/hooks/claude-code/stop");
+            }
+            None => {
+                assert_eq!(value(flotilla_agent::CLAUDE_CODE_HOOK_TOKEN_ENV), None);
+                assert_eq!(stop["command"], "flotilla hook claude-code stop");
+            }
+        }
+        assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["type"], "command");
+    }
 }

@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use flotilla_protocol::EnvironmentId;
+use flotilla_protocol::{AgentHookTerminalRef, EnvironmentId};
 
 use super::login::SessionId;
 use crate::server::caller::PeerCredential;
@@ -22,6 +22,9 @@ pub(in crate::server) enum CallerAuth {
     Bearer,
     /// Loopback TCP carrying a browser session cookie; the caller is the user's browser.
     Session(SessionId),
+    /// Loopback TCP carrying a hook token: an agent in this managed terminal. It reaches
+    /// only the hook routes, and only as that terminal.
+    Hook(AgentHookTerminalRef),
     /// Loopback TCP without credentials. It reaches only the login exchange.
     Anonymous,
 }
@@ -33,13 +36,18 @@ impl CallerAuth {
         match self {
             Self::Socket(_) | Self::Bearer | Self::Session(_) => None,
             Self::Environment { .. } => Some(refusal(StatusCode::FORBIDDEN, "this route is not available to an environment")),
+            Self::Hook(_) => Some(refusal(StatusCode::FORBIDDEN, "a hook token reaches only the hook routes")),
             Self::Anonymous => Some(unauthenticated()),
         }
     }
 
-    /// The refusal for an anonymous caller.
+    /// The refusal for an anonymous caller, or a hook token outside the hook routes.
     pub(super) fn refusal_unless_authenticated(&self) -> Option<Response> {
-        matches!(self, Self::Anonymous).then(unauthenticated)
+        match self {
+            Self::Anonymous => Some(unauthenticated()),
+            Self::Hook(_) => Some(refusal(StatusCode::FORBIDDEN, "a hook token reaches only the hook routes")),
+            _ => None,
+        }
     }
 }
 

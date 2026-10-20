@@ -33,7 +33,7 @@ use super::tasks::{load_checkout_archive_roots, CheckoutArchiveRoot};
 use super::terminal::PendingTerminalDelivery;
 #[cfg(test)]
 use crate::server::environment_sockets::EnvironmentSocketRegistry;
-use crate::server::environment_sockets::EnvironmentSocketService;
+use crate::server::{environment_sockets::EnvironmentSocketService, HookEndpoint};
 use crate::{
     blob_store::TieredBlobStore,
     environment_tools::{stage_local_rustc_wrapper_async, EnvironmentToolProvisioner},
@@ -51,6 +51,8 @@ pub(super) struct ControllerRuntimeState {
     pub(super) agentless_ssh: HashMap<String, AgentlessSshProfile>,
     pub(super) environment_tools: EnvironmentToolProvisioner,
     pub(super) environment_sockets: Option<EnvironmentSocketService>,
+    /// Where host-direct Claude Code crews post their hooks, when flotillad listens on TCP.
+    pub(super) hook_endpoint: Option<HookEndpoint>,
     pub(super) credential_store: Option<Arc<CredentialStore>>,
     pub(super) agent_material: Option<Arc<AgentMaterialRegistry>>,
     pub(super) blob_store: Option<Arc<TieredBlobStore>>,
@@ -76,6 +78,11 @@ pub(super) struct ControllerRuntimeState {
 impl ControllerRuntimeState {
     pub(super) fn with_environment_sockets(mut self, sockets: Option<EnvironmentSocketService>) -> Self {
         self.environment_sockets = sockets;
+        self
+    }
+
+    pub(super) fn with_hook_endpoint(mut self, endpoint: Option<HookEndpoint>) -> Self {
+        self.hook_endpoint = endpoint;
         self
     }
 
@@ -131,6 +138,7 @@ impl ControllerRuntimeState {
             agentless_ssh: HashMap::new(),
             environment_tools,
             environment_sockets: None,
+            hook_endpoint: None,
             credential_store: None,
             agent_material: None,
             blob_store: None,

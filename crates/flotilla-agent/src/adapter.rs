@@ -885,7 +885,9 @@ impl CliAgentAdapter {
                 if let Some(state_config) = invocation_state.as_ref().or(state_config.as_ref()) {
                     seed_claude_headless_state(&*self.runner, cwd.as_path(), state_config).await?;
                 }
-                let mut settings = crate::claude_code_hook_settings();
+                // The runtime supplies a hook URL and token only to host-direct sessions
+                // while flotillad has a loopback listener; vessel sessions keep commands.
+                let mut settings = crate::claude_code_hook_settings_over(crate::ClaudeCodeHookTransport::from_environment(environment));
                 settings["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
                 if *contained {
                     settings["attribution"] = serde_json::json!({ "commit": "", "pr": "", "sessionUrl": false });
@@ -2198,6 +2200,59 @@ mod tests {
         claude.cleanup(&ExecutionEnvironmentPath::new(&workspace), &brief).await.expect("cleanup");
         assert!(!workspace.join(".flotilla/claude-settings.json").exists(), "settings overlay should be removed");
         assert!(!workspace.join(".flotilla").exists(), "settings overlay should not keep .flotilla alive");
+    }
+
+    // A launch environment carrying flotillad's hook URL and token (host-direct sessions
+    // while a loopback listener is up) gets HTTP hooks; the token reaches Claude Code's
+    // environment for header interpolation. Without them, as in a vessel, hooks stay
+    // commands.
+    #[tokio::test]
+    async fn claude_prepare_installs_http_hooks_only_when_the_launch_carries_the_hook_endpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
+        let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
+        let claude = registry.get("claude-code").expect("claude adapter");
+        let brief = flotilla_resources::TerminalBrief {
+            artifact_digest: None,
+            path: ".flotilla/briefs/coder.md".into(),
+            content: "brief".into(),
+            copies: Vec::new(),
+        };
+        let hook_environment = vec![
+            (crate::CLAUDE_CODE_HOOK_URL_ENV.to_string(), "http://127.0.0.1:7878/v1/hooks/claude-code".to_string()),
+            (crate::CLAUDE_CODE_HOOK_TOKEN_ENV.to_string(), "hook-token".to_string()),
+        ];
+        for (name, environment, http) in [("host-direct", hook_environment.clone(), true), ("vessel", Vec::new(), false)] {
+            let workspace = temp.path().join(name);
+            std::fs::create_dir_all(&workspace).expect("workspace");
+            claude.prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &environment).await.expect("prepare");
+            let settings: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(workspace.join(CLAUDE_MANAGED_SETTINGS_PATH)).expect("settings overlay"))
+                    .expect("parse settings");
+            let stop = &settings["hooks"]["Stop"][0]["hooks"][0];
+            if http {
+                assert_eq!(stop["type"], "http", "{name}");
+                assert_eq!(stop["url"], "http://127.0.0.1:7878/v1/hooks/claude-code/stop");
+                assert_eq!(stop["headers"]["Authorization"], "Bearer $FLOTILLA_HOOK_TOKEN");
+            } else {
+                assert_eq!(stop["command"], "flotilla hook claude-code stop", "{name}");
+            }
+            assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"], "flotilla hook claude-code session-start", "{name}");
+            let plan = claude
+                .launch(&AgentLaunchRequest {
+                    fulfilment_grants: None,
+                    role: "coder".into(),
+                    model: None,
+                    brief: brief.clone(),
+                    environment: environment.clone(),
+                })
+                .expect("launch plan");
+            assert_eq!(
+                plan.env.iter().any(|(key, value)| key == crate::CLAUDE_CODE_HOOK_TOKEN_ENV && value == "hook-token"),
+                http,
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

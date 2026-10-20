@@ -6,6 +6,9 @@
 //! with `tower::ServiceExt::oneshot`.
 
 mod auth;
+#[cfg(test)]
+mod hook_tests;
+mod hooks;
 mod login;
 mod resource_api;
 mod tcp;
@@ -29,6 +32,7 @@ use flotilla_store::ResourceBackend;
 use futures::StreamExt;
 
 pub(in crate::server) use auth::CallerAuth;
+pub use hooks::{HookEndpoint, HookLaunch};
 pub(in crate::server) use login::LoginStore;
 use resource_api::Reply;
 use rigging_http_serve::Caller;
@@ -49,6 +53,8 @@ pub(in crate::server) const LOGOUT_PATH: &str = "/logout";
 pub(in crate::server) struct HttpRouter {
     backend: ResourceBackend,
     daemon: Option<Arc<InProcessDaemon>>,
+    /// Where hook routes record agent state; without it they answer 503.
+    agent_state_store: Option<flotilla_agent::SharedAgentStateStore>,
     logins: Arc<LoginStore>,
     /// The TCP listener's origin, for login URLs; unset when no TCP listener is declared.
     #[builder(default)]
@@ -88,6 +94,7 @@ impl HttpRouter {
     pub(in crate::server) fn for_daemon(daemon: Arc<InProcessDaemon>, logins: Arc<LoginStore>, tcp_origin: ListenerOrigin) -> Self {
         Self {
             backend: daemon.resource_backend(),
+            agent_state_store: Some(Arc::clone(daemon.agent_state_store())),
             daemon: Some(daemon),
             logins,
             tcp_origin,
@@ -101,6 +108,7 @@ impl HttpRouter {
             .route(LOGIN_CODES_PATH, post(mint_login_code))
             .route(LOGIN_PATH, get(login))
             .route(LOGOUT_PATH, post(logout))
+            .route(hooks::CLAUDE_CODE_HOOK_ROUTE, post(hooks::claude_code))
             .fallback(resource_api)
             .with_state(RouterState(Arc::new(self)))
             .layer(middleware::from_fn(caller_from_listener))
@@ -169,7 +177,7 @@ async fn login(
     Extension(caller): Extension<CallerAuth>,
     RawQuery(query): RawQuery,
 ) -> Response {
-    if matches!(caller, CallerAuth::Socket(_) | CallerAuth::Environment { .. }) {
+    if matches!(caller, CallerAuth::Socket(_) | CallerAuth::Environment { .. } | CallerAuth::Hook(_)) {
         return auth::refusal(StatusCode::NOT_FOUND, "browser login is served on the HTTP listener");
     }
     let code =

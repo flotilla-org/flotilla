@@ -1535,7 +1535,10 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             if harness_name == "codex" && expected == TerminalAttentionState::Idle {
                 let agents = store.lock().expect("agents");
                 let terminal = flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() };
-                assert_eq!(agents.lookup_by_session_id("codex-1"), Some(&flotilla_agent::attachable::codex_hook_id(None, Some(&terminal))));
+                assert_eq!(
+                    agents.lookup_by_session_id("codex-1"),
+                    Some(&flotilla_agent::attachable::terminal_hook_id(None, Some(&terminal)))
+                );
                 assert_eq!(agents.list_agents().len(), 1, "repeated notify events must not orphan identities");
             }
             let observed = sessions.get(&name).await.expect("observed terminal");

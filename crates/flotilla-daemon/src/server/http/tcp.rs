@@ -16,7 +16,11 @@ use rigging_http_serve::{Authentication, Caller, TcpPolicy, TcpServer};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use super::{login::LoginStore, CallerAuth, LOGIN_PATH};
+use super::{
+    hooks::{HookKey, HOOKS_PATH},
+    login::LoginStore,
+    CallerAuth, LOGIN_PATH,
+};
 
 /// A resolved, loopback-only listen address.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +109,7 @@ pub(in crate::server) struct TcpListener {
     server: TcpServer,
     policy: TcpPolicy<CallerAuth>,
     origin: String,
+    hook_key: HookKey,
 }
 
 impl TcpListener {
@@ -119,8 +124,15 @@ impl TcpListener {
         let token = std::fs::read(&token_path).map_err(|error| format!("read HTTP token {}: {error}", token_path.display()))?;
         // rigging writes the bare 64-hex token; trailing whitespace is never part of it.
         let token: [u8; 32] = Sha256::digest(token.trim_ascii_end()).into();
-        let policy = TcpPolicy::new(listen.allowed_hosts(bound.port()), move |request| authenticate(request, &token, &logins));
-        Ok(Self { server, policy, origin: listen.origin(bound.port()) })
+        let hook_key = HookKey::load_or_create(&directory)?;
+        let hooks = hook_key.clone();
+        let policy = TcpPolicy::new(listen.allowed_hosts(bound.port()), move |request| authenticate(request, &token, &hooks, &logins));
+        Ok(Self { server, policy, origin: listen.origin(bound.port()), hook_key })
+    }
+
+    /// The key this listener verifies hook tokens with.
+    pub(in crate::server) fn hook_key(&self) -> &HookKey {
+        &self.hook_key
     }
 
     pub(in crate::server) fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -139,19 +151,25 @@ impl TcpListener {
 
 /// How a TCP request authenticates, after rigging has checked its Host and any Origin:
 /// - an `Authorization` header must be exactly `Bearer <file token>` (compared in constant
-///   time), and never falls back to a cookie;
+///   time), or `Bearer <hook token>` on a hook route, and never falls back to a cookie;
 /// - otherwise a live session cookie from the login store, reported as cookie-based so
 ///   rigging requires the listener's Origin on unsafe methods and upgrades;
 /// - otherwise only the login exchange is reachable, anonymously. Anything else is 401.
-fn authenticate(request: &Request, token: &[u8; 32], logins: &LoginStore) -> Option<Authentication<CallerAuth>> {
+fn authenticate(request: &Request, token: &[u8; 32], hooks: &HookKey, logins: &LoginStore) -> Option<Authentication<CallerAuth>> {
     let admit = |caller: CallerAuth, uses_cookie: bool| Some(Authentication { caller: Caller::Custom(caller), uses_cookie });
     let headers = request.headers();
     if headers.contains_key(header::AUTHORIZATION) {
         let mut values = headers.get_all(header::AUTHORIZATION).iter();
         let (scheme, presented) = values.next()?.to_str().ok()?.split_once(' ')?;
+        if values.next().is_some() || !scheme.eq_ignore_ascii_case("Bearer") {
+            return None;
+        }
         let digest: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
-        let valid = values.next().is_none() && scheme.eq_ignore_ascii_case("Bearer") && bool::from(token.ct_eq(&digest));
-        return if valid { admit(CallerAuth::Bearer, false) } else { None };
+        if bool::from(token.ct_eq(&digest)) {
+            return admit(CallerAuth::Bearer, false);
+        }
+        let hook_route = request.uri().path().strip_prefix(HOOKS_PATH).is_some_and(|rest| rest.starts_with('/'));
+        return hook_route.then(|| hooks.verify(presented)).flatten().and_then(|terminal| admit(CallerAuth::Hook(terminal), false));
     }
     if let Some(session) = logins.session(headers) {
         return admit(CallerAuth::Session(session), true);

@@ -112,7 +112,7 @@ pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), 
                 terminal.namespace == crew.namespace && Some(&terminal.session_name) == crew.terminal_session.as_ref()
             }) =>
         {
-            event.attachable_id = flotilla_agent::attachable::codex_hook_id(None, event.terminal.as_ref());
+            event.attachable_id = flotilla_agent::attachable::terminal_hook_id(None, event.terminal.as_ref());
             Ok(())
         }
         _ => Err("EnvironmentCommandDenied: request is outside the crew allowlist".into()),

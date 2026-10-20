@@ -13,6 +13,8 @@ mod replication;
 mod request_dispatch;
 mod shared;
 
+pub use http::{HookEndpoint, HookLaunch};
+
 use std::{
     collections::HashMap,
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -349,6 +351,7 @@ pub struct DaemonServer {
     http_router: axum::Router,
     logins: Arc<http::LoginStore>,
     tcp_origin: http::ListenerOrigin,
+    hook_endpoint: http::HookEndpoint,
     http_listen: Option<http::ListenAddress>,
     /// Where the TCP listener's token file lives.
     state_dir: PathBuf,
@@ -506,6 +509,7 @@ impl DaemonServer {
             http_router,
             logins,
             tcp_origin,
+            hook_endpoint: http::HookEndpoint::default(),
             http_listen: None,
             state_dir,
         })
@@ -524,6 +528,12 @@ impl DaemonServer {
     /// consumes this to process data arriving from peer daemons.
     pub fn take_inbound_peer_rx(&mut self) -> Option<mpsc::Receiver<InboundPeerEnvelope>> {
         self.inbound_peer_rx.take()
+    }
+
+    /// The hook endpoint host-direct crew launches deliver Claude Code hooks to, once the
+    /// loopback TCP listener binds.
+    pub fn hook_endpoint(&self) -> http::HookEndpoint {
+        self.hook_endpoint.clone()
     }
 
     /// Signals only after binding, publishing discovery, and preparing acceptance.
@@ -565,6 +575,7 @@ impl DaemonServer {
             Some(listen) => {
                 let listener = http::TcpListener::bind(listen, &self.state_dir, Arc::clone(&self.logins)).await?;
                 self.tcp_origin.set(listener.origin().to_owned());
+                self.hook_endpoint.set(listener.origin(), listener.hook_key().clone());
                 Some(listener)
             }
             None => None,

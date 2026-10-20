@@ -94,6 +94,7 @@ pub async fn run(
         RuntimeOptions {
             startup_ready: Some(server.startup_ready()),
             environment_sockets: Some(server.environment_socket_service()),
+            hook_endpoint: Some(server.hook_endpoint()),
             ..RuntimeOptions::default()
         },
     )
