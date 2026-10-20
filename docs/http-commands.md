@@ -66,7 +66,8 @@ Queries also return 202, with their result already retained in the record.
 `wait` is between 0 and 300 seconds and returns the current record. Concurrent waiters are supported. Cancelling a
 finished command returns 409. Records survive HTTP disconnection but not daemon
 restart. At most 1,024 records are retained, evicting the oldest eligible record
-as needed. Completed records become eligible in completion order. An unknown
+as needed. Completed records become eligible in completion order, including a
+recovered unknown record: its finish event assigns a fresh completion sequence. An unknown
 record with a closed collector is immediately
 evictable. An unknown record whose collector can still recover becomes eligible
 for capacity eviction 300 seconds after its first lost observation; repeated lag

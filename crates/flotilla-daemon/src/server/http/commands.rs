@@ -124,6 +124,7 @@ impl Commands {
                 .iter()
                 .filter_map(|(id, record)| record.state.borrow().evictable_order(now).map(|order| (*id, order)))
                 .min_by_key(|(_, order)| *order);
+            // Each submission reserves one permit, so evicting one record is sufficient.
             if let Some((id, _)) = oldest {
                 records.remove(&id);
             }
@@ -526,6 +527,7 @@ impl CommandState {
     }
 
     fn push_step(&mut self, event: DaemonEvent) {
+        // Treat unencodable events as oversized: omit them and report truncated history.
         let size = serde_json::to_vec(&event).map_or(usize::MAX, |v| v.len());
         if size > MAX_PROGRESS_BYTES {
             self.progress_truncated = true;
