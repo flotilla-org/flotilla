@@ -1,6 +1,6 @@
 //! Terminal pool factory for cleat.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use flotilla_discovery_api::provider_config::ProviderConfigView;
@@ -10,7 +10,7 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
-use crate::cleat::CleatTerminalPool;
+use crate::cleat::{CleatTerminalPool, DEFAULT_CONTROLLER_IDLE};
 use crate::TerminalPool;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
@@ -35,7 +35,7 @@ impl Factory for CleatTerminalPoolFactory {
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         if let Some(binary) = env.find_binary("cleat") {
             let config = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
-            let window = std::time::Duration::from_millis(config.terminal_pool.controller_idle_ms.unwrap_or(1000));
+            let window = config.terminal_pool.controller_idle_ms.map(Duration::from_millis).unwrap_or(DEFAULT_CONTROLLER_IDLE);
             // Cleat's VT engine chooses the child's terminal identity at launch.
             Ok(Arc::new(CleatTerminalPool::new(runner, binary.as_path().display().to_string(), env).with_controller_idle(window)))
         } else {

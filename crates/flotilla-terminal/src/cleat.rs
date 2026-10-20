@@ -19,6 +19,8 @@ use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 
+pub(crate) const DEFAULT_CONTROLLER_IDLE: Duration = Duration::from_secs(1);
+
 const ENDPOINT_CACHE_TTL: Duration = Duration::from_secs(1);
 const RECORDING_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const RECORDING_PRUNE_SCRIPT: &str = r#"[ -d "$1/$2/sessions" ] || exit 0
@@ -92,7 +94,7 @@ impl CleatTerminalPool {
         Self {
             runner: environment.runner(runner),
             binary: binary.into(),
-            controller_idle: Duration::from_secs(1),
+            controller_idle: DEFAULT_CONTROLLER_IDLE,
             environment,
             launch_capability: tokio::sync::OnceCell::new(),
             attach_capability: tokio::sync::OnceCell::new(),
