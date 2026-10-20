@@ -72,8 +72,9 @@ use flotilla_resources::{
     ProjectSpec, ReadWatchEvent, Repository, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
     FLEET_DESIGNATION_NAME,
 };
-use flotilla_schema::{Cause, Code, KindCode};
+use flotilla_schema::{Cause, CodeEnum, KindCode, KindSpec};
 use flotilla_schema_sqlite::stream::{Frame, Service};
+use flotilla_state_machines::machines::{agent_session::AgentSessionEdgeKind, message::MessageSpec};
 use flotilla_store::{
     load_metrics::{LatencyHistogram, ReplicationLoadMetrics},
     ResourceBackend,
@@ -308,10 +309,12 @@ async fn watch_messages(backend: &ResourceBackend, view: Arc<HomeView>) {
 /// AgentSession receipt edge about it, following the decided store's log as a
 /// peer does, so the measurement never lists the replica.
 fn watch_engine_messages(service: Arc<Service>, view: Arc<HomeView>) {
-    const MESSAGE: KindCode = KindCode(Code::new("ms"));
-    const RECEIVE: Code = Code::new("rv");
+    const MESSAGE: KindCode = <MessageSpec as KindSpec>::CODE;
+    let receive = AgentSessionEdgeKind::Receive.code();
     tokio::spawn(async move {
         let mut cursor = None;
+        // A message never received (an abandoned convoy's) stays here for the
+        // rest of the run: bounded by the messages one run creates.
         let mut created = HashMap::new();
         loop {
             let round = tokio::task::spawn_blocking({
@@ -327,8 +330,18 @@ fn watch_engine_messages(service: Arc<Service>, view: Arc<HomeView>) {
                 }
             })
             .await
-            .expect("engine log round");
-            let (next, frames) = round.expect("engine log");
+            .map_err(|error| error.to_string())
+            .and_then(|round| round.map_err(|error| error.to_string()));
+            // A failed round is retried from the same cursor; a run whose log
+            // never reads records no samples, which `load_baseline` refuses.
+            let (next, frames) = match round {
+                Ok(round) => round,
+                Err(error) => {
+                    tracing::warn!(%error, "load engine log round failed");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
             cursor = Some(next);
             for frame in frames {
                 let Frame::Change(event) = frame else { continue };
@@ -336,7 +349,7 @@ fn watch_engine_messages(service: Arc<Service>, view: Arc<HomeView>) {
                     (Cause::Create, _) if event.kind == MESSAGE => {
                         created.insert(event.identity(), event.at);
                     }
-                    (Cause::Edge { edge, .. }, Some(message)) if *edge == RECEIVE => {
+                    (Cause::Edge { edge, .. }, Some(message)) if *edge == receive => {
                         if let Some(at) = created.remove(message) {
                             let micros = event.at.since(at).max(0);
                             view.turn_delivery.record(Duration::from_micros(micros as u64));
@@ -711,6 +724,11 @@ async fn load_baseline() {
     assert_eq!(report.total.delivered, report.dispatch.admitted, "every admitted convoy delivers");
     assert_eq!(report.dispatch.errors, 0, "{:?}", report.dispatch);
     assert_eq!(report.total.failed + report.total.abandoned, 0, "all load scripts should deliver: {:?}", report.total);
+    if load_primitives() {
+        for home in &report.home_metrics {
+            assert!(home.turn_delivery.count > 0, "switch on, the engine log reader recorded no turn delivery");
+        }
+    }
     assert_eq!(observer_failures, 0, "load produced no-ready-forge-observer stall evidence; see observer_failure lines");
 }
 
