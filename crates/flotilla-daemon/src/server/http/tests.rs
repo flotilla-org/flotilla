@@ -1,15 +1,18 @@
-//! The router in-process with injected caller authentication, and the TCP listener's
-//! admission policy over the same router, both through `tower::ServiceExt::oneshot`.
-//! No listener, socket or network is involved.
+//! The router in-process with injected caller authentication (`tower::ServiceExt::oneshot`),
+//! the Unix front door over a socket pair, and the loopback TCP listener on a real
+//! 127.0.0.1 port: flotilla's authentication behind rigging-http-serve's Host and Origin
+//! policy. No Docker and no other host.
 
 use std::{
     net::SocketAddr,
+    os::unix::fs::PermissionsExt,
+    path::Path,
     sync::{Arc, Mutex},
 };
 
 use axum::{
     body::Body,
-    http::{header, HeaderMap, Method, Request, StatusCode},
+    http::{header, HeaderMap, Request, StatusCode},
     Router,
 };
 use chrono::{DateTime, Utc};
@@ -17,15 +20,15 @@ use flotilla_protocol::EnvironmentId;
 use flotilla_resources::{Clock, Convoy, ConvoySpec, InputMeta};
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
-use hegel::generators as gs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 use super::{
     login::{LOGIN_CODE_LIFETIME, SESSION_LIFETIME, SESSION_LIMIT},
-    CallerAuth, HttpRouter, ListenAddress, LoginStore, TcpPolicy, TokenDigest,
+    tcp::{TOKEN_DIRECTORY, TOKEN_FILE},
+    CallerAuth, HttpRouter, ListenAddress, ListenerOrigin, LoginStore, TcpListener,
 };
 
-const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const ORIGIN: &str = "http://127.0.0.1:7878";
 
 struct ManualClock(Mutex<DateTime<Utc>>);
@@ -47,21 +50,22 @@ struct Incarnation {
     backend: ResourceBackend,
     clock: Arc<ManualClock>,
     logins: Arc<LoginStore>,
+    origin: ListenerOrigin,
     router: Router,
 }
 
 impl Incarnation {
     fn new() -> Self {
-        Self::with_origin(Some(ORIGIN.into()))
+        Self::with_origin(ListenerOrigin::known(ORIGIN))
     }
 
-    fn with_origin(tcp_origin: Option<String>) -> Self {
+    fn with_origin(origin: ListenerOrigin) -> Self {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let clock = Arc::new(ManualClock(Mutex::new(DateTime::parse_from_rfc3339("2026-10-19T12:00:00Z").expect("time").into())));
         let logins = Arc::new(LoginStore::new(clock.clone()));
         let router =
-            HttpRouter::builder().backend(backend.clone()).logins(Arc::clone(&logins)).maybe_tcp_origin(tcp_origin).build().into_router();
-        Self { backend, clock, logins, router }
+            HttpRouter::builder().backend(backend.clone()).logins(Arc::clone(&logins)).tcp_origin(origin.clone()).build().into_router();
+        Self { backend, clock, logins, origin, router }
     }
 
     /// The router as a listener serves it: the listener attaches the caller.
@@ -71,22 +75,27 @@ impl Incarnation {
         Reply::from(self.router.clone().oneshot(request).await.expect("router is infallible")).await
     }
 
-    /// The TCP listener bound at 127.0.0.1:7878, configured as `spec`.
-    fn tcp(&self, spec: &str, resolved: &[&str]) -> Router {
-        let resolved = resolved.iter().map(|address| address.parse().expect("address")).collect::<Vec<SocketAddr>>();
-        let listen = ListenAddress::resolve_with(spec, |_, _| Ok(resolved)).expect("loopback listen address");
-        let bound = SocketAddr::new(listen.bind_address().ip(), 7878);
-        Arc::new(TcpPolicy::new(&listen, bound, TokenDigest::new(TOKEN), Arc::clone(&self.logins))).layer(self.router.clone())
-    }
-
-    async fn login_cookie(&self) -> String {
+    /// A fresh login URL's path and query, minted over the main socket.
+    async fn login_path(&self) -> String {
         let minted = self.call(CallerAuth::Socket(None), post("/v1/web/login-codes")).await;
         let url = minted.json()["url"].as_str().expect("login url").to_owned();
-        let login = self.call(CallerAuth::Anonymous, get(url.strip_prefix(ORIGIN).expect("listener origin"))).await;
-        assert_eq!(login.status, StatusCode::SEE_OTHER);
-        let cookie = login.headers[header::SET_COOKIE].to_str().expect("cookie");
-        cookie.split(';').next().expect("cookie pair").to_owned()
+        url.strip_prefix(self.origin.get().expect("listener origin")).expect("URL on the listener origin").to_owned()
     }
+
+    /// A session cookie pair (`flotilla_session=...`) from a login exchange.
+    async fn login_cookie(&self) -> String {
+        let login = self.call(CallerAuth::Anonymous, get(&self.login_path().await)).await;
+        assert_eq!(login.status, StatusCode::SEE_OTHER);
+        cookie_pair(login.headers[header::SET_COOKIE].to_str().expect("cookie"))
+    }
+
+    fn session_of(&self, cookie: &str) -> Option<super::login::SessionId> {
+        self.logins.session(&HeaderMap::from_iter([(header::COOKIE, cookie.parse().expect("cookie"))]))
+    }
+}
+
+fn cookie_pair(set_cookie: &str) -> String {
+    set_cookie.split(';').next().expect("cookie pair").to_owned()
 }
 
 struct Reply {
@@ -117,27 +126,6 @@ fn post(uri: &str) -> Request<Body> {
 fn environment() -> CallerAuth {
     CallerAuth::Environment { environment: EnvironmentId::new("env-work"), peer: None }
 }
-
-async fn tcp_call(router: &Router, request: Request<Body>) -> Reply {
-    Reply::from(router.clone().oneshot(request).await.expect("router is infallible")).await
-}
-
-fn tcp_request(method: Method, uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    for (name, value) in headers {
-        builder = builder.header(*name, *value);
-    }
-    builder.body(Body::empty()).expect("request")
-}
-
-const BEARER: (&str, &str) = ("authorization", "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-const HOST: (&str, &str) = ("host", "127.0.0.1:7878");
-const WEBSOCKET: [(&str, &str); 4] = [
-    ("connection", "Upgrade"),
-    ("upgrade", "websocket"),
-    ("sec-websocket-version", "13"),
-    ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
-];
 
 // Every authenticated caller, whatever its listener, sees the same build identity and
 // protocol fingerprint; an unauthenticated TCP caller sees none.
@@ -242,7 +230,7 @@ async fn login_codes_are_minted_over_the_main_socket_only() {
     }
     assert_eq!(daemon.call(CallerAuth::Anonymous, post("/v1/web/login-codes")).await.status, StatusCode::UNAUTHORIZED);
 
-    let without_listener = Incarnation::with_origin(None);
+    let without_listener = Incarnation::with_origin(ListenerOrigin::default());
     assert_eq!(without_listener.call(CallerAuth::Socket(None), post("/v1/web/login-codes")).await.status, StatusCode::CONFLICT);
 }
 
@@ -278,255 +266,408 @@ async fn login_code_is_single_use_and_expires() {
     assert_eq!(daemon.call(CallerAuth::Anonymous, get(&unused)).await.status, StatusCode::SEE_OTHER, "the refused visits did not use it");
 }
 
-// A Unix-socket request is judged by its socket alone: a valid session cookie neither
-// elevates an environment caller nor changes what the main socket's caller may do.
-#[tokio::test]
-async fn session_cookie_over_a_unix_socket_is_ignored() {
-    let daemon = Incarnation::new();
-    let cookie = daemon.login_cookie().await;
-    let with_cookie = |request: Request<Body>| {
-        let mut request = request;
-        request.headers_mut().insert(header::COOKIE, cookie.parse().expect("cookie"));
-        request
-    };
-    let resources = "/apis/flotilla.work/v1/namespaces/flotilla/convoys";
-    assert_eq!(daemon.call(environment(), with_cookie(get(resources))).await.status, StatusCode::FORBIDDEN);
-    assert_eq!(daemon.call(environment(), with_cookie(post("/v1/web/login-codes"))).await.status, StatusCode::FORBIDDEN);
-    assert_eq!(daemon.call(CallerAuth::Socket(None), with_cookie(post("/v1/web/login-codes"))).await.status, StatusCode::CREATED);
-}
-
-// A session ends at its lifetime, at logout, or when newer logins push it past the cap;
-// logging in again from a session yields a fresh session, never a change of privilege.
+// Sessions end at their lifetime, at logout, or when newer logins push them past the cap.
+// A session that logs in again gets a fresh session, never more privilege.
 #[tokio::test]
 async fn sessions_expire_end_at_logout_and_are_capped() {
     let daemon = Incarnation::new();
-    let tcp = daemon.tcp("127.0.0.1:7878", &[]);
-    let hello = |cookie: &str| tcp_request(Method::GET, "/v1/hello", &[HOST, ("cookie", cookie)]);
-    let session_of = |cookie: &str| daemon.logins.session(&HeaderMap::from_iter([(header::COOKIE, cookie.parse().expect("cookie"))]));
-
     let expiring = daemon.login_cookie().await;
     daemon.clock.advance(SESSION_LIFETIME - chrono::TimeDelta::seconds(1));
-    assert_eq!(tcp_call(&tcp, hello(&expiring)).await.status, StatusCode::OK, "within its lifetime");
+    assert!(daemon.session_of(&expiring).is_some(), "within its lifetime");
     daemon.clock.advance(chrono::TimeDelta::seconds(1));
-    assert_eq!(tcp_call(&tcp, hello(&expiring)).await.status, StatusCode::UNAUTHORIZED, "past its lifetime");
+    assert!(daemon.session_of(&expiring).is_none(), "past its lifetime");
 
     let first = daemon.login_cookie().await;
     let mut cookies = Vec::new();
     for _ in 1..SESSION_LIMIT {
         cookies.push(daemon.login_cookie().await);
     }
-    assert!(session_of(&first).is_some(), "the cap holds {SESSION_LIMIT} sessions");
+    assert!(daemon.session_of(&first).is_some(), "the cap holds {SESSION_LIMIT} sessions");
     cookies.push(daemon.login_cookie().await);
-    assert!(session_of(&first).is_none(), "the oldest session is evicted past the cap");
-    assert!(cookies.iter().all(|cookie| session_of(cookie).is_some()));
+    assert!(daemon.session_of(&first).is_none(), "the oldest session is evicted past the cap");
+    assert!(cookies.iter().all(|cookie| daemon.session_of(cookie).is_some()));
 
     let current = cookies.last().expect("a live session").clone();
-    let session = session_of(&current).expect("session");
-    let minted = daemon.call(CallerAuth::Socket(None), post("/v1/web/login-codes")).await;
-    let login = minted.json()["url"].as_str().expect("url").strip_prefix(ORIGIN).expect("origin").to_owned();
-    let relogin = tcp_call(&tcp, tcp_request(Method::GET, &login, &[HOST, ("cookie", &current)])).await;
+    let session = daemon.session_of(&current).expect("session");
+    let relogin = daemon.call(CallerAuth::Session(session), get(&daemon.login_path().await)).await;
     assert_eq!(relogin.status, StatusCode::SEE_OTHER);
-    let fresh = relogin.headers[header::SET_COOKIE].to_str().expect("cookie").split(';').next().expect("pair").to_owned();
-    assert_ne!(session_of(&fresh), Some(session), "a new login is a new session");
-    assert_eq!(
-        tcp_call(&tcp, tcp_request(Method::POST, "/v1/web/login-codes", &[HOST, ("cookie", &fresh), ("origin", ORIGIN)])).await.status,
-        StatusCode::FORBIDDEN,
-        "a session still cannot mint"
-    );
+    let fresh = cookie_pair(relogin.headers[header::SET_COOKIE].to_str().expect("cookie"));
+    let fresh_session = daemon.session_of(&fresh).expect("fresh session");
+    assert_ne!(fresh_session, session, "a new login is a new session");
+    assert_eq!(daemon.call(CallerAuth::Session(fresh_session), post("/v1/web/login-codes")).await.status, StatusCode::FORBIDDEN);
 
-    assert_eq!(
-        tcp_call(&tcp, tcp_request(Method::POST, "/logout", &[HOST, ("cookie", &current)])).await.status,
-        StatusCode::FORBIDDEN,
-        "logout without Origin"
-    );
-    let logout = tcp_call(&tcp, tcp_request(Method::POST, "/logout", &[HOST, ("cookie", &current), ("origin", ORIGIN)])).await;
+    let logout = daemon.call(CallerAuth::Session(session), post("/logout")).await;
     assert_eq!(logout.status, StatusCode::NO_CONTENT);
     assert_eq!(logout.headers[header::SET_COOKIE], "flotilla_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
-    assert_eq!(tcp_call(&tcp, hello(&current)).await.status, StatusCode::UNAUTHORIZED, "logged out");
-    assert_eq!(tcp_call(&tcp, hello(&fresh)).await.status, StatusCode::OK, "other sessions survive");
-    assert_eq!(tcp_call(&tcp, tcp_request(Method::POST, "/logout", &[HOST, BEARER])).await.status, StatusCode::BAD_REQUEST);
-    assert_eq!(daemon.call(CallerAuth::Socket(None), post("/logout")).await.status, StatusCode::BAD_REQUEST);
+    assert!(daemon.session_of(&current).is_none(), "logged out");
+    assert!(daemon.session_of(&fresh).is_some(), "other sessions survive");
+    assert_eq!(daemon.call(CallerAuth::Bearer, post("/logout")).await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(daemon.call(CallerAuth::Anonymous, post("/logout")).await.status, StatusCode::UNAUTHORIZED);
 }
 
-// Codes and sessions live in memory: a cookie from one incarnation authenticates nothing
-// in the next, as the replaced file token does not.
+/// Send one request through the Unix front door, as the main or an environment socket
+/// serves it, and return the raw response.
+async fn through_front_door(router: Router, caller: CallerAuth, request: &str) -> String {
+    let (mut client, mut server) = tokio::net::UnixStream::pair().expect("socket pair");
+    let serving = tokio::spawn(async move {
+        let first = server.read_u8().await.expect("preface");
+        super::serve_sniffed(server, first, router, move |_| caller, std::future::pending()).await
+    });
+    client.write_all(request.as_bytes()).await.expect("request");
+    let mut response = String::new();
+    client.read_to_string(&mut response).await.expect("response");
+    serving.await.expect("front door").expect("served");
+    response
+}
+
+// A Unix-socket request is judged by its socket alone. A valid session cookie on the main
+// socket does not make it a session (logout, which only a session may do, is 400), and on
+// an environment socket it does not lift the environment's limits.
 #[tokio::test]
-async fn sessions_end_when_the_daemon_restarts() {
-    let before = Incarnation::new();
-    let cookie = before.login_cookie().await;
-    let hello = |cookie: &str| tcp_request(Method::GET, "/v1/hello", &[HOST, ("cookie", cookie)]);
-    assert_eq!(tcp_call(&before.tcp("127.0.0.1:7878", &[]), hello(&cookie)).await.status, StatusCode::OK);
-    let after = Incarnation::new();
-    assert_eq!(tcp_call(&after.tcp("127.0.0.1:7878", &[]), hello(&cookie)).await.status, StatusCode::UNAUTHORIZED);
+async fn session_cookie_over_a_unix_socket_is_ignored() {
+    let daemon = Incarnation::new();
+    let cookie = daemon.login_cookie().await;
+    let request = |method: &str, path: &str| {
+        format!("{method} {path} HTTP/1.1\r\nHost: flotilla\r\nCookie: {cookie}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    };
+    let logout = through_front_door(daemon.router.clone(), CallerAuth::Socket(None), &request("POST", "/logout")).await;
+    assert!(logout.starts_with("HTTP/1.1 400"), "{logout}");
+    assert!(daemon.session_of(&cookie).is_some(), "the session was not ended");
+    let resources = "/apis/flotilla.work/v1/namespaces/flotilla/convoys";
+    let listed = through_front_door(daemon.router.clone(), environment(), &request("GET", resources)).await;
+    assert!(listed.starts_with("HTTP/1.1 403"), "{listed}");
+}
+
+// The resource API's selector tests, unchanged, through the Unix front door: the server
+// honors selectors instead of returning the entire collection, and malformed and
+// undeclared field queries fail rather than silently broadening.
+#[tokio::test]
+async fn resource_http_honors_declared_selectors() {
+    let daemon = Incarnation::new();
+    let backend = daemon.backend.clone();
+    let request = |parameters: String| {
+        let router = daemon.router.clone();
+        async move {
+            let request = format!(
+                "GET /apis/flotilla.work/v1/namespaces/flotilla/convoys?{parameters} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            );
+            through_front_door(router, CallerAuth::Socket(None), &request).await
+        }
+    };
+    let items = |response: &str| -> serde_json::Value {
+        let body = response.split_once("\r\n\r\n").expect("HTTP response").1;
+        serde_json::from_str::<serde_json::Value>(body).expect("JSON body")["items"].clone()
+    };
+    for (name, label) in [("selected", "target"), ("excluded", "other"), ("punctuation()!", "a+b")] {
+        let meta =
+            InputMeta::builder().name(name.to_owned()).labels(std::collections::BTreeMap::from([("team".into(), label.into())])).build();
+        backend.using::<Convoy>("flotilla").create(&meta, &ConvoySpec::builder().workflow_ref("workflow".into()).build()).await.unwrap();
+    }
+    for parameters in ["labelSelector=team%3Dtarget", "fieldSelector=metadata.name%3Dselected"] {
+        let response = request(parameters.into()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(items(&response).as_array().unwrap().len(), 1);
+        assert_eq!(items(&response)[0]["metadata"]["name"], "selected");
+    }
+    for (parameter, selector) in [("labelSelector", "team=a+b"), ("fieldSelector", "metadata.name=punctuation()!")] {
+        let parameters = url::form_urlencoded::Serializer::new(String::new()).append_pair(parameter, selector).finish();
+        let response = request(parameters).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(items(&response).as_array().unwrap().len(), 1);
+        assert_eq!(items(&response)[0]["metadata"]["name"], "punctuation()!");
+    }
+    for parameters in [
+        "labelSelector=invalid",
+        "fieldSelector=spec.unknown%3Dx",
+        "labelSelector=a!%3Db",
+        "labelSelector=a%20in%20(x)",
+        "labelSelector=a%3D%3Db",
+    ] {
+        assert!(request(parameters.into()).await.starts_with("HTTP/1.1 400"), "{parameters}");
+    }
+    let query = flotilla_store::StoreQuery::labels(&std::collections::BTreeMap::from([("team".into(), "target".into())]), false, true);
+    let parameters: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("storeQuery", &serde_json::to_string(&query).unwrap())
+        .append_pair("labelSelector", "team=target")
+        .finish();
+    assert!(request(parameters).await.starts_with("HTTP/1.1 400"), "duplicate merged selector key is refused");
+    let parameters: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("storeQuery", &serde_json::to_string(&query).unwrap())
+        .append_pair("fieldSelector", "metadata.name=selected")
+        .finish();
+    let response = request(parameters).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "distinct query and selector predicates are combined");
+    assert_eq!(items(&response).as_array().unwrap().len(), 1);
+}
+
+/// A TCP listener over one incarnation's router, bound on 127.0.0.1 with a chosen port.
+struct Listening {
+    daemon: Incarnation,
+    port: u16,
+    token: String,
+    serving: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl Listening {
+    async fn start(spec: &str, state_dir: &Path) -> Self {
+        let listen = ListenAddress::resolve_with(spec, |_, _| async { Ok(vec!["127.0.0.1:0".parse::<SocketAddr>().expect("address")]) })
+            .await
+            .expect("loopback listen address");
+        let daemon = Incarnation::with_origin(ListenerOrigin::default());
+        let listener = TcpListener::bind(&listen, state_dir, Arc::clone(&daemon.logins)).await.expect("bind loopback listener");
+        daemon.origin.set(listener.origin().to_owned());
+        let port = listener.local_addr().expect("bound address").port();
+        let token = std::fs::read_to_string(state_dir.join(TOKEN_DIRECTORY).join(TOKEN_FILE)).expect("token file");
+        let serving = tokio::spawn(listener.serve(daemon.router.clone(), std::future::pending()));
+        Self { daemon, port, token, serving }
+    }
+
+    fn host(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+
+    fn origin(&self) -> String {
+        format!("http://{}", self.host())
+    }
+
+    fn bearer(&self) -> String {
+        format!("Bearer {}", self.token)
+    }
+
+    /// One raw HTTP/1.1 request, so Host and Origin are exactly what the test sends.
+    async fn send(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> (u16, String) {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port)).await.expect("connect");
+        let mut request = format!("{method} {path} HTTP/1.1\r\n");
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.expect("request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("response");
+        let status = response.split(' ').nth(1).and_then(|code| code.parse().ok()).unwrap_or_else(|| panic!("status line: {response}"));
+        (status, response)
+    }
+}
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        self.serving.abort();
+    }
+}
+
+// Each start writes a fresh 256-bit token, owner-only, replacing the last; a token from a
+// previous start authenticates nothing, and neither does a session from one.
+#[tokio::test]
+async fn token_file_is_private_and_replaced_at_each_start() {
+    let state = tempfile::tempdir().expect("state dir");
+    let first = Listening::start("127.0.0.1:0", state.path()).await;
+    let path = state.path().join(TOKEN_DIRECTORY).join(TOKEN_FILE);
+    assert_eq!(std::fs::metadata(&path).expect("token").permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(path.parent().expect("dir")).expect("dir").permissions().mode() & 0o777, 0o700);
+    assert!(first.token.len() == 64 && first.token.bytes().all(|byte| byte.is_ascii_hexdigit()), "{}", first.token);
+    let cookie = cookie_pair(&{
+        let (status, response) = first.send("GET", &first.daemon.login_path().await, &[("Host", &first.host())]).await;
+        assert_eq!(status, 303, "{response}");
+        response.lines().find_map(|line| line.strip_prefix("set-cookie: ")).expect("Set-Cookie").to_owned()
+    });
+    assert_eq!(first.send("GET", "/v1/hello", &[("Host", &first.host()), ("Cookie", &cookie)]).await.0, 200);
+
+    let second = Listening::start("127.0.0.1:0", state.path()).await;
+    assert_ne!(second.token, first.token, "a new start replaces the token");
+    assert_eq!(std::fs::read_to_string(&path).expect("token"), second.token);
+    assert_eq!(std::fs::metadata(&path).expect("token").permissions().mode() & 0o777, 0o600);
+    assert_eq!(second.send("GET", "/v1/hello", &[("Host", &second.host()), ("Authorization", &first.bearer())]).await.0, 401);
+    assert_eq!(
+        second.send("GET", "/v1/hello", &[("Host", &second.host()), ("Cookie", &cookie)]).await.0,
+        401,
+        "sessions end with their daemon"
+    );
+    assert_eq!(second.send("GET", "/v1/hello", &[("Host", &second.host()), ("Authorization", &second.bearer())]).await.0, 200);
+}
+
+// TCP requests need the file token. Missing, wrong, repeated or non-Bearer credentials
+// are 401 and never fall back to a cookie; a bearer request needs no Origin. Only the
+// login exchange is reachable without credentials.
+#[tokio::test]
+async fn tcp_requests_need_the_file_token() {
+    let state = tempfile::tempdir().expect("state dir");
+    let tcp = Listening::start("127.0.0.1:0", state.path()).await;
+    let host = tcp.host();
+    let host = ("Host", host.as_str());
+    let bearer = tcp.bearer();
+    assert_eq!(tcp.send("GET", "/v1/hello", &[host, ("Authorization", &bearer)]).await.0, 200, "bearer without Origin");
+    assert_eq!(tcp.send("GET", "/v1/hello", &[host, ("Authorization", &format!("bearer {}", tcp.token))]).await.0, 200);
+    let cookie = tcp.daemon.login_cookie().await;
+    for authorization in
+        [format!("Bearer {}", &tcp.token[1..]), format!("Bearer {}x", tcp.token), format!("Basic {}", tcp.token), tcp.token.clone()]
+    {
+        let (status, _) = tcp.send("GET", "/v1/hello", &[host, ("Authorization", &authorization), ("Cookie", &cookie)]).await;
+        assert_eq!(status, 401, "Authorization {authorization:?}");
+    }
+    assert_eq!(tcp.send("GET", "/v1/hello", &[host, ("Authorization", &bearer), ("Authorization", &bearer)]).await.0, 401, "two");
+    assert_eq!(tcp.send("GET", "/v1/hello", &[host]).await.0, 401, "no token");
+    assert_eq!(tcp.send("GET", "/apis/flotilla.work/v1/namespaces/flotilla/convoys", &[host]).await.0, 401);
+    assert_eq!(tcp.send("GET", &tcp.daemon.login_path().await, &[host]).await.0, 303, "the login exchange needs no credentials");
 }
 
 // Each accepted Host form reaches the route; another name (DNS rebinding), another port or
-// no Host at all is misdirected.
+// no Host at all is misdirected, before authentication.
 #[tokio::test]
 async fn tcp_listener_accepts_only_its_own_host_forms() {
-    let daemon = Incarnation::new();
-    for (spec, resolved, accepted, refused) in [
-        ("127.0.0.1:7878", &[][..], &["127.0.0.1:7878", "localhost:7878"][..], &["[::1]:7878", "evil.example:7878", "127.0.0.1:7879"][..]),
-        ("[::1]:7878", &[], &["[::1]:7878", "localhost:7878"], &["127.0.0.1:7878", "evil.example:7878", "[::1]:80"]),
-        (
-            "localhost:0",
-            &["127.0.0.1:0"],
-            &["localhost:7878", "127.0.0.1:7878", "LOCALHOST:7878"],
-            &["localhost:0", "localhost", "[::1]:7878"],
-        ),
-        (
-            "flotilla.localhost:7878",
-            &["127.0.0.1:7878"],
-            &["flotilla.localhost:7878", "localhost:7878", "127.0.0.1:7878"],
-            &["evil.example:7878", "flotilla.localhost:7879"],
-        ),
-    ] {
-        let tcp = daemon.tcp(spec, resolved);
-        for host in accepted {
-            let reply = tcp_call(&tcp, tcp_request(Method::GET, "/v1/hello", &[("host", host), BEARER])).await;
-            assert_eq!(reply.status, StatusCode::OK, "{spec}: Host {host}");
+    let state = tempfile::tempdir().expect("state dir");
+    for (spec, configured) in [("127.0.0.1:0", None), ("flotilla.localhost:0", Some("flotilla.localhost"))] {
+        let tcp = Listening::start(spec, state.path()).await;
+        let bearer = tcp.bearer();
+        let port = tcp.port;
+        let mut accepted = vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+        accepted.extend(configured.map(|name| format!("{name}:{port}")));
+        for host in &accepted {
+            assert_eq!(tcp.send("GET", "/v1/hello", &[("Host", host), ("Authorization", &bearer)]).await.0, 200, "{spec}: Host {host}");
         }
-        for host in refused {
-            let reply = tcp_call(&tcp, tcp_request(Method::GET, "/v1/hello", &[("host", host), BEARER])).await;
-            assert_eq!(reply.status, StatusCode::MISDIRECTED_REQUEST, "{spec}: Host {host}");
+        for host in
+            [format!("evil.example:{port}"), format!("127.0.0.1:{}", port.wrapping_add(1)), format!("[::1]:{port}"), "127.0.0.1".into()]
+        {
+            assert_eq!(tcp.send("GET", "/v1/hello", &[("Host", &host), ("Authorization", &bearer)]).await.0, 421, "{spec}: Host {host}");
         }
-        let missing = tcp_call(&tcp, tcp_request(Method::GET, "/v1/hello", &[BEARER])).await;
-        assert_eq!(missing.status, StatusCode::MISDIRECTED_REQUEST, "{spec}: no Host");
-        let repeated = tcp_call(&tcp, tcp_request(Method::GET, "/v1/hello", &[HOST, HOST, BEARER])).await;
-        assert_eq!(repeated.status, StatusCode::MISDIRECTED_REQUEST, "{spec}: two Hosts");
+        assert_eq!(tcp.send("GET", "/v1/hello", &[("Authorization", &bearer)]).await.0, 421, "{spec}: no Host");
     }
 }
 
-// Generated Host values: only an allowed authority with the bound port is admitted, and
-// the Host check runs before authentication, so even a valid token cannot pass a wrong one.
-#[hegel::test]
-fn tcp_host_check_admits_exactly_the_allowed_authorities(tc: hegel::TestCase) {
-    let name = tc.draw(gs::sampled_from(vec![
-        "127.0.0.1",
-        "localhost",
-        "LocalHost",
-        "[::1]",
-        "evil.example",
-        "127.0.0.2",
-        "",
-        "127.0.0.1.nip.io",
-    ]));
-    let port = tc.draw(gs::sampled_from(vec!["7878", "7879", "0", "", "07878"]));
-    let separator = tc.draw(gs::sampled_from(vec![":", "", "::"]));
-    let host = format!("{name}{separator}{port}");
-    let admitted = ["127.0.0.1:7878", "localhost:7878"].iter().any(|allowed| allowed.eq_ignore_ascii_case(&host));
-    static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
-        std::sync::LazyLock::new(|| tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime"));
-    let status = RUNTIME.block_on(async {
-        let daemon = Incarnation::new();
-        tcp_call(&daemon.tcp("127.0.0.1:7878", &[]), tcp_request(Method::GET, "/v1/hello", &[("host", &host), BEARER])).await.status
-    });
-    assert_eq!(status, if admitted { StatusCode::OK } else { StatusCode::MISDIRECTED_REQUEST }, "Host {host:?}");
-}
-
-// TCP requests need the file token; anything else in Authorization is 401 and never falls
-// back to a cookie. A bearer request needs no Origin, because browsers never add the header.
-#[tokio::test]
-async fn tcp_listener_requires_the_file_token() {
-    let daemon = Incarnation::new();
-    let tcp = daemon.tcp("127.0.0.1:7878", &[]);
-    let cookie = daemon.login_cookie().await;
-    let hello = |headers: &[(&str, &str)]| tcp_request(Method::GET, "/v1/hello", headers);
-    assert_eq!(tcp_call(&tcp, hello(&[HOST, BEARER])).await.status, StatusCode::OK, "bearer without Origin");
-    assert_eq!(tcp_call(&tcp, hello(&[HOST, ("authorization", &format!("bearer {TOKEN}"))])).await.status, StatusCode::OK);
-    for authorization in
-        [&format!("Bearer {}", &TOKEN[1..]) as &str, &format!("Bearer {TOKEN}x"), &format!("Basic {TOKEN}"), TOKEN, "Bearer "]
-    {
-        let reply = tcp_call(&tcp, hello(&[HOST, ("authorization", authorization), ("cookie", &cookie)])).await;
-        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "Authorization {authorization:?}");
-    }
-    assert_eq!(tcp_call(&tcp, hello(&[HOST, BEARER, BEARER])).await.status, StatusCode::UNAUTHORIZED, "two Authorization headers");
-    assert_eq!(tcp_call(&tcp, hello(&[HOST])).await.status, StatusCode::UNAUTHORIZED, "no token");
-    let resources = tcp_request(Method::GET, "/apis/flotilla.work/v1/namespaces/flotilla/convoys", &[HOST]);
-    assert_eq!(tcp_call(&tcp, resources).await.status, StatusCode::UNAUTHORIZED, "no token on the resource API");
-    // Without credentials the login exchange is still reachable.
-    let minted = daemon.call(CallerAuth::Socket(None), post("/v1/web/login-codes")).await;
-    let login = minted.json()["url"].as_str().expect("url").strip_prefix(ORIGIN).expect("origin").to_owned();
-    assert_eq!(tcp_call(&tcp, tcp_request(Method::GET, &login, &[HOST])).await.status, StatusCode::SEE_OTHER);
-}
+const WEBSOCKET: [(&str, &str); 3] =
+    [("Upgrade", "websocket"), ("Sec-WebSocket-Version", "13"), ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")];
 
 // A present Origin must be this listener's, on a plain route and on a WebSocket upgrade.
+// A cookie-authenticated request that could change state, or open a WebSocket, must carry
+// it (CSRF, cross-site WebSocket hijacking); a cookie GET and any bearer request need not.
 #[tokio::test]
-async fn tcp_listener_refuses_foreign_origins() {
-    let daemon = Incarnation::new();
-    let tcp = daemon.tcp("127.0.0.1:7878", &[]);
-    for origin in ["http://evil.example", "http://127.0.0.1:7879", "https://127.0.0.1:7878", "null", "http://127.0.0.1:7878/"] {
-        let plain = tcp_call(&tcp, tcp_request(Method::GET, "/v1/hello", &[HOST, BEARER, ("origin", origin)])).await;
-        assert_eq!(plain.status, StatusCode::FORBIDDEN, "Origin {origin} on a plain route");
-        let mut headers = vec![HOST, BEARER, ("origin", origin)];
-        headers.extend(WEBSOCKET);
-        let upgrade = tcp_call(&tcp, tcp_request(Method::GET, "/v1/hello", &headers)).await;
-        assert_eq!(upgrade.status, StatusCode::FORBIDDEN, "Origin {origin} on a WebSocket upgrade");
+async fn tcp_origin_rules_close_rebinding_hijacking_and_csrf() {
+    let state = tempfile::tempdir().expect("state dir");
+    let tcp = Listening::start("127.0.0.1:0", state.path()).await;
+    let (host, origin, bearer) = (tcp.host(), tcp.origin(), tcp.bearer());
+    let host = ("Host", host.as_str());
+    let upgrade = |mut headers: Vec<(&'static str, String)>| {
+        headers.push(("Connection", "Upgrade".into()));
+        headers.extend(WEBSOCKET.map(|(name, value)| (name, value.to_owned())));
+        headers
+    };
+    let send = |method: &'static str, path: &'static str, headers: Vec<(&'static str, String)>| {
+        let tcp = &tcp;
+        async move {
+            let mut all = vec![host];
+            all.extend(headers.iter().map(|(name, value)| (*name, value.as_str())));
+            tcp.send(method, path, &all).await.0
+        }
+    };
+    for foreign in ["http://evil.example", "http://127.0.0.1:1", "https://127.0.0.1", "null"] {
+        let headers = vec![("Authorization", bearer.clone()), ("Origin", foreign.to_owned())];
+        assert_eq!(send("GET", "/v1/hello", headers.clone()).await, 403, "Origin {foreign} on a plain route");
+        assert_eq!(send("GET", "/v1/hello", upgrade(headers)).await, 403, "Origin {foreign} on an upgrade");
     }
-    let doubled = tcp_call(&tcp, tcp_request(Method::GET, "/v1/hello", &[HOST, BEARER, ("origin", ORIGIN), ("origin", ORIGIN)])).await;
-    assert_eq!(doubled.status, StatusCode::FORBIDDEN, "two Origins");
-    for origin in [ORIGIN, "http://localhost:7878"] {
-        let own = tcp_call(&tcp, tcp_request(Method::GET, "/v1/hello", &[HOST, BEARER, ("origin", origin)])).await;
-        assert_eq!(own.status, StatusCode::OK, "own origin {origin}");
-    }
+    assert_eq!(send("GET", "/v1/hello", vec![("Authorization", bearer.clone()), ("Origin", origin.clone())]).await, 200, "own Origin");
+    assert_ne!(send("GET", "/v1/hello", upgrade(vec![("Authorization", bearer.clone())])).await, 403, "bearer upgrade needs no Origin");
+
+    let cookie = tcp.daemon.login_cookie().await;
+    let resources = "/apis/flotilla.work/v1/namespaces/flotilla/convoys";
+    assert_eq!(send("GET", resources, vec![("Cookie", cookie.clone())]).await, 200, "cookie GET");
+    assert_eq!(send("POST", resources, vec![("Cookie", cookie.clone())]).await, 403, "cookie POST without Origin");
+    assert_eq!(send("POST", resources, vec![("Cookie", cookie.clone()), ("Origin", origin.clone())]).await, 405, "admitted to the route");
+    assert_eq!(send("GET", "/v1/hello", upgrade(vec![("Cookie", cookie.clone())])).await, 403, "cookie upgrade without Origin");
+    assert_eq!(send("POST", "/logout", vec![("Cookie", cookie.clone())]).await, 403, "logout needs Origin");
+    assert_eq!(send("POST", "/logout", vec![("Cookie", cookie.clone()), ("Origin", origin.clone())]).await, 204);
+    assert_eq!(send("GET", "/v1/hello", vec![("Cookie", cookie)]).await, 401, "logged out");
 }
 
-// A cookie-authenticated request that could change state, or open a WebSocket, must carry
-// the listener's Origin (CSRF, cross-site WebSocket hijacking). A cookie GET need not.
+// The change stream's body fails a consumer that stops reading. After the deadline the
+// producer gives up, releasing the store and ending its task, rather than waiting forever
+// to queue its error behind frames the consumer will not read. Nothing reads the body
+// until the producer has gone, so only a non-blocking failure path lets it go.
 #[tokio::test]
-async fn cookie_requests_that_change_state_need_the_listener_origin() {
-    let daemon = Incarnation::new();
-    let tcp = daemon.tcp("127.0.0.1:7878", &[]);
-    let cookie = daemon.login_cookie().await;
-    let session = ("cookie", cookie.as_str());
-    let resources = "/apis/flotilla.work/v1/namespaces/flotilla/convoys";
-    assert_eq!(tcp_call(&tcp, tcp_request(Method::GET, resources, &[HOST, session])).await.status, StatusCode::OK, "cookie GET");
-    assert_eq!(tcp_call(&tcp, tcp_request(Method::POST, resources, &[HOST, session])).await.status, StatusCode::FORBIDDEN, "cookie POST");
-    let admitted = tcp_call(&tcp, tcp_request(Method::POST, resources, &[HOST, session, ("origin", ORIGIN)])).await;
-    assert_eq!(admitted.status, StatusCode::METHOD_NOT_ALLOWED, "a cookie POST with Origin reaches the read-only route");
-    let mut upgrade = vec![HOST, session];
-    upgrade.extend(WEBSOCKET);
-    assert_eq!(tcp_call(&tcp, tcp_request(Method::GET, "/v1/hello", &upgrade)).await.status, StatusCode::FORBIDDEN, "cookie upgrade");
-    upgrade.push(("origin", ORIGIN));
-    assert_eq!(tcp_call(&tcp, tcp_request(Method::GET, "/v1/hello", &upgrade)).await.status, StatusCode::OK, "cookie upgrade with Origin");
-    let mut bearer_upgrade = vec![HOST, BEARER];
-    bearer_upgrade.extend(WEBSOCKET);
-    assert_eq!(tcp_call(&tcp, tcp_request(Method::GET, "/v1/hello", &bearer_upgrade)).await.status, StatusCode::OK, "bearer upgrade");
-    // An unknown or ambiguous session cookie is no credential at all.
-    let unknown = ("cookie", "flotilla_session=0000");
-    assert_eq!(tcp_call(&tcp, tcp_request(Method::GET, "/v1/hello", &[HOST, unknown])).await.status, StatusCode::UNAUTHORIZED);
-    let twice = format!("{cookie}; {cookie}");
-    assert_eq!(tcp_call(&tcp, tcp_request(Method::GET, "/v1/hello", &[HOST, ("cookie", &twice)])).await.status, StatusCode::UNAUTHORIZED);
+async fn a_stalled_change_stream_consumer_is_released() {
+    use flotilla_schema_sqlite::stream::Service;
+
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::create_dir_all(dir.path().join("config")).expect("config dir");
+    std::fs::write(dir.path().join("config/daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon.toml");
+    let daemon = flotilla_core::in_process::InProcessDaemon::new(
+        vec![],
+        Arc::new(flotilla_config::ConfigStore::with_base(dir.path().join("config"))),
+        flotilla_discovery_testkit::fake_discovery(false),
+        flotilla_protocol::HostName::new("local"),
+        Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
+    let service = Arc::new(
+        Service::open(&dir.path().join("decided.sqlite"), "home", flotilla_engine_store::registry().expect("registry")).expect("store"),
+    );
+    daemon.install_decided_store(Arc::clone(&service)).expect("install decided store");
+    let idle_store = Arc::strong_count(&service);
+    // A short deadline keeps the test fast; production waits CONSUMER_DEADLINE.
+    let router = HttpRouter::builder()
+        .backend(daemon.resource_backend())
+        .daemon(daemon)
+        .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
+        .change_stream_deadline(std::time::Duration::from_millis(200))
+        .build()
+        .into_router();
+    let tasks = tokio::runtime::Handle::current().metrics();
+    let idle_tasks = tasks.num_alive_tasks();
+    let mut request = get(flotilla_schema_sqlite::stream::PATH);
+    request.extensions_mut().insert(CallerAuth::Socket(None));
+    // The router (and through it the daemon's store slot) stays alive for the whole test.
+    let response = router.clone().oneshot(request).await.expect("router");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(Arc::strong_count(&service) > idle_store, "the stream holds the store while it runs");
+    assert!(tasks.num_alive_tasks() > idle_tasks, "the stream has a producer task");
+    // Hold the body without reading it: the consumer has stalled.
+    let body = response.into_body();
+    let mut released = false;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if Arc::strong_count(&service) == idle_store && tasks.num_alive_tasks() == idle_tasks {
+            released = true;
+            break;
+        }
+    }
+    assert!(released, "the producer is still alive after the stall deadline");
+    let chunks: Vec<_> = tokio::time::timeout(std::time::Duration::from_secs(5), futures::StreamExt::collect(body.into_data_stream()))
+        .await
+        .expect("a released stream ends");
+    assert!(chunks.last().is_some_and(Result::is_err), "a stalled stream ends failed, not cleanly");
+    drop(router);
 }
 
 // The listen address must be loopback, and a hostname must resolve only to loopback.
-#[test]
-fn listen_address_must_be_loopback() {
-    let none = |_: &str, _: u16| -> std::io::Result<Vec<SocketAddr>> { panic!("numeric addresses are not resolved") };
+#[tokio::test]
+async fn listen_address_must_be_loopback() {
+    let unresolved = |_: String, _: u16| async { panic!("numeric addresses are not resolved") };
+    let resolving = |addresses: &'static [&'static str]| {
+        move |_: String, _: u16| async move { Ok(addresses.iter().map(|address| address.parse().expect("address")).collect()) }
+    };
     for spec in ["127.0.0.1:7878", "127.4.5.6:0", "[::1]:7878"] {
-        let address = ListenAddress::resolve_with(spec, none).expect(spec);
+        let address = ListenAddress::resolve_with(spec, unresolved).await.expect(spec);
         assert_eq!(address.bind_address(), spec.parse::<SocketAddr>().expect("socket address"));
     }
     for spec in ["10.0.0.1:7878", "0.0.0.0:7878", "[::]:7878", "[2001:db8::1]:7878", "192.168.1.2:80"] {
-        let error = ListenAddress::resolve_with(spec, none).expect_err(spec);
+        let error = ListenAddress::resolve_with(spec, unresolved).await.expect_err(spec);
         assert!(error.contains(spec) && error.contains("not loopback"), "{error}");
     }
-    let resolving = |addresses: &'static [&'static str]| {
-        move |_: &str, _: u16| Ok(addresses.iter().map(|address| address.parse().expect("address")).collect())
-    };
-    let both = ListenAddress::resolve_with("localhost:7878", resolving(&["127.0.0.1:7878", "[::1]:7878"])).expect("loopback hostname");
+    let both =
+        ListenAddress::resolve_with("localhost:7878", resolving(&["127.0.0.1:7878", "[::1]:7878"])).await.expect("loopback hostname");
     assert_eq!(both.bind_address(), "127.0.0.1:7878".parse::<SocketAddr>().expect("address"));
-    let any_port = ListenAddress::resolve_with("LocalHost:0", resolving(&["127.0.0.1:0"])).expect("port chosen at bind");
+    let any_port = ListenAddress::resolve_with("LocalHost:0", resolving(&["127.0.0.1:0"])).await.expect("port chosen at bind");
     assert_eq!(any_port.origin(7878), "http://localhost:7878", "login URLs name the configured host and the bound port");
-    assert_eq!(ListenAddress::resolve_with("[::1]:0", none).expect("IPv6 loopback").origin(7878), "http://[::1]:7878");
+    assert_eq!(ListenAddress::resolve_with("[::1]:0", unresolved).await.expect("IPv6 loopback").origin(7878), "http://[::1]:7878");
     let error = ListenAddress::resolve_with("rebind.example:7878", resolving(&["127.0.0.1:7878", "192.0.2.7:7878"]))
+        .await
         .expect_err("a hostname with a non-loopback result");
     assert!(error.contains("rebind.example:7878") && error.contains("192.0.2.7"), "{error}");
-    let error =
-        ListenAddress::resolve_with("gone.example:7878", |_, _| Err(std::io::Error::other("no such host"))).expect_err("unresolvable");
+    let error = ListenAddress::resolve_with("gone.example:7878", |_, _| async { Err(std::io::Error::other("no such host")) })
+        .await
+        .expect_err("unresolvable");
     assert!(error.contains("gone.example:7878"), "{error}");
-    assert!(ListenAddress::resolve_with("empty.example:7878", resolving(&[])).is_err());
+    assert!(ListenAddress::resolve_with("empty.example:7878", resolving(&[])).await.is_err());
     for malformed in ["7878", "localhost", ":7878", "localhost:http", "localhost:70000", "user@localhost:7878"] {
-        assert!(ListenAddress::resolve_with(malformed, resolving(&["127.0.0.1:7878"])).is_err(), "{malformed}");
+        assert!(ListenAddress::resolve_with(malformed, resolving(&["127.0.0.1:7878"])).await.is_err(), "{malformed}");
     }
 }

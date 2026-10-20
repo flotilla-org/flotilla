@@ -84,10 +84,11 @@ license = "Apache-2.0 OR MIT"
 # When adding dependencies anywhere in the workspace, update the external-crate
 # allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
-rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "bf71f7d840b14e50dd12e7bfc58e2654f51692c2" }
-rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "bf71f7d840b14e50dd12e7bfc58e2654f51692c2" }
-rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "bf71f7d840b14e50dd12e7bfc58e2654f51692c2" }
-rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "bf71f7d840b14e50dd12e7bfc58e2654f51692c2" }
+rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "0e17afbd10eab95614a2033159d2dabde30e5eea" }
+rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "0e17afbd10eab95614a2033159d2dabde30e5eea" }
+rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "0e17afbd10eab95614a2033159d2dabde30e5eea" }
+rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "0e17afbd10eab95614a2033159d2dabde30e5eea" }
+rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "0e17afbd10eab95614a2033159d2dabde30e5eea" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_yml = "0.0.12"
 tokio-util = "0.7"
@@ -191,5 +192,6 @@ workspace = true
 
 # The daemon and its request-session test harness are Unix-only, like the tests.
 [target.'cfg(unix)'.dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 flotilla-daemon-testkit = { path = "crates/flotilla-daemon-testkit" }
 flotilla-daemon = { path = "crates/flotilla-daemon" }

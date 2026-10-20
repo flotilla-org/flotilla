@@ -1,27 +1,22 @@
-//! The loopback TCP listener's policy (ADR 0065): the listen address and its loopback check,
-//! and how a request is admitted (Host, Origin, bearer token or session cookie).
-//!
-//! The listener itself is rigging-http-serve's. [`TcpPolicy::admit`] is the decision that
-//! listener applies before routing, in the shape rigging#21 asks for: a Host allowlist refused
-//! with 421, pluggable authentication, and Origin required when a request relies on a cookie.
+//! The loopback TCP listener (ADR 0065): the listen address and its loopback check, and
+//! flotilla's authentication on rigging-http-serve's listener. rigging owns the token file,
+//! the Host allowlist (421), Origin checks (403) and the cookie-Origin requirement.
 
 use std::{
+    future::Future,
     io,
-    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr},
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    path::Path,
     sync::Arc,
 };
 
-use axum::{
-    extract::Request,
-    http::{header, HeaderMap, Method, StatusCode},
-    middleware::{self, Next},
-    response::Response,
-    Router,
-};
+use axum::{extract::Request, http::header, Router};
+use rigging_http_serve::{Authentication, Caller, TcpPolicy, TcpServer};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use super::{auth::refusal, login::LoginStore, CallerAuth};
+use super::{login::LoginStore, CallerAuth, LOGIN_PATH};
 
 /// A resolved, loopback-only listen address.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,17 +28,19 @@ pub(in crate::server) struct ListenAddress {
 }
 
 impl ListenAddress {
-    /// Resolve `host:port` with the system resolver.
-    pub(in crate::server) fn resolve(spec: &str) -> Result<Self, String> {
-        Self::resolve_with(spec, |host, port| (host, port).to_socket_addrs().map(Iterator::collect))
+    /// Resolve `host:port` without blocking the runtime.
+    pub(in crate::server) async fn resolve(spec: &str) -> Result<Self, String> {
+        Self::resolve_with(spec, |host, port| async move { tokio::net::lookup_host((host.as_str(), port)).await.map(Iterator::collect) })
+            .await
     }
 
     /// Resolve `host:port`, refusing unless every address the host names is loopback
     /// (127.0.0.0/8 or ::1). The error names the configured address.
-    pub(in crate::server) fn resolve_with(
-        spec: &str,
-        lookup: impl FnOnce(&str, u16) -> io::Result<Vec<SocketAddr>>,
-    ) -> Result<Self, String> {
+    pub(in crate::server) async fn resolve_with<L, F>(spec: &str, lookup: L) -> Result<Self, String>
+    where
+        L: FnOnce(String, u16) -> F,
+        F: Future<Output = io::Result<Vec<SocketAddr>>>,
+    {
         let refuse = |reason: String| format!("HTTP listen address {spec:?} {reason}");
         if let Ok(address) = spec.parse::<SocketAddr>() {
             if !address.ip().is_loopback() {
@@ -62,7 +59,7 @@ impl ListenAddress {
         if host.is_empty() || host.contains(['[', ']', ':', '/', '@']) {
             return Err(refuse("has an invalid host".into()));
         }
-        let addresses = lookup(host, port).map_err(|error| refuse(format!("does not resolve: {error}")))?;
+        let addresses = lookup(host.to_owned(), port).await.map_err(|error| refuse(format!("does not resolve: {error}")))?;
         if let Some(remote) = addresses.iter().find(|address| !address.ip().is_loopback()) {
             return Err(refuse(format!("is not loopback: {host} resolves to {}", remote.ip())));
         }
@@ -96,107 +93,81 @@ impl ListenAddress {
     }
 }
 
-/// The SHA-256 digest of the file token, compared in constant time.
-pub(in crate::server) struct TokenDigest([u8; 32]);
+/// The token file, in its own private directory beneath the state directory: rigging
+/// writes it only inside a directory no one else can enter.
+pub(in crate::server) const TOKEN_DIRECTORY: &str = "http";
+pub(in crate::server) const TOKEN_FILE: &str = "token";
 
-impl TokenDigest {
-    pub(in crate::server) fn new(token: &str) -> Self {
-        Self(Sha256::digest(token.as_bytes()).into())
+/// The bound loopback TCP listener. Binding replaces the token file with a fresh 256-bit
+/// token (0600, create-then-rename); serving applies rigging's Host, Origin and
+/// cookie-Origin policy with flotilla's [`authenticate`] callback.
+pub(in crate::server) struct TcpListener {
+    server: TcpServer,
+    policy: TcpPolicy<CallerAuth>,
+    origin: String,
+}
+
+impl TcpListener {
+    pub(in crate::server) async fn bind(listen: &ListenAddress, state_dir: &Path, logins: Arc<LoginStore>) -> Result<Self, String> {
+        let directory = state_dir.join(TOKEN_DIRECTORY);
+        private_directory(&directory).map_err(|error| format!("prepare HTTP token directory {}: {error}", directory.display()))?;
+        let token_path = directory.join(TOKEN_FILE);
+        let server = TcpServer::bind(listen.bind_address(), &token_path)
+            .await
+            .map_err(|error| format!("bind HTTP listener {}: {error}", listen.bind_address()))?;
+        let bound = server.local_addr().map_err(|error| format!("read HTTP listener address: {error}"))?;
+        let token = std::fs::read(&token_path).map_err(|error| format!("read HTTP token {}: {error}", token_path.display()))?;
+        let token: [u8; 32] = Sha256::digest(&token).into();
+        let policy = TcpPolicy::new(listen.allowed_hosts(bound.port()), move |request| authenticate(request, &token, &logins));
+        Ok(Self { server, policy, origin: listen.origin(bound.port()) })
     }
 
-    fn matches(&self, presented: &str) -> bool {
-        bool::from(self.0.ct_eq(&Sha256::digest(presented.as_bytes())))
+    pub(in crate::server) fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.server.local_addr()
+    }
+
+    /// The origin login URLs name.
+    pub(in crate::server) fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    pub(in crate::server) async fn serve(self, router: Router, shutdown: impl Future<Output = ()> + Send + 'static) -> io::Result<()> {
+        self.server.serve_with_policy(router, self.policy, shutdown).await
     }
 }
 
-/// Admission for one bound TCP listener.
-pub(in crate::server) struct TcpPolicy {
-    allowed_hosts: Vec<String>,
-    allowed_origins: Vec<String>,
-    token: TokenDigest,
-    logins: Arc<LoginStore>,
+/// How a TCP request authenticates, after rigging has checked its Host and any Origin:
+/// - an `Authorization` header must be exactly `Bearer <file token>` (compared in constant
+///   time), and never falls back to a cookie;
+/// - otherwise a live session cookie from the login store, reported as cookie-based so
+///   rigging requires the listener's Origin on unsafe methods and upgrades;
+/// - otherwise only the login exchange is reachable, anonymously. Anything else is 401.
+fn authenticate(request: &Request, token: &[u8; 32], logins: &LoginStore) -> Option<Authentication<CallerAuth>> {
+    let admit = |caller: CallerAuth, uses_cookie: bool| Some(Authentication { caller: Caller::Custom(caller), uses_cookie });
+    let headers = request.headers();
+    if headers.contains_key(header::AUTHORIZATION) {
+        let mut values = headers.get_all(header::AUTHORIZATION).iter();
+        let (scheme, presented) = values.next()?.to_str().ok()?.split_once(' ')?;
+        let digest: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
+        let valid = values.next().is_none() && scheme.eq_ignore_ascii_case("Bearer") && bool::from(token.ct_eq(&digest));
+        return if valid { admit(CallerAuth::Bearer, false) } else { None };
+    }
+    if let Some(session) = logins.session(headers) {
+        return admit(CallerAuth::Session(session), true);
+    }
+    if request.uri().path() == LOGIN_PATH {
+        return admit(CallerAuth::Anonymous, false);
+    }
+    None
 }
 
-impl TcpPolicy {
-    pub(in crate::server) fn new(listen: &ListenAddress, bound: SocketAddr, token: TokenDigest, logins: Arc<LoginStore>) -> Self {
-        let allowed_hosts = listen.allowed_hosts(bound.port());
-        let allowed_origins = allowed_hosts.iter().map(|host| format!("http://{host}")).collect();
-        Self { allowed_hosts, allowed_origins, token, logins }
-    }
-
-    /// Decide how a request's caller is authenticated, or the status refusing it:
-    /// - 421 unless exactly one `Host` names this listener (closes DNS rebinding);
-    /// - 403 when an `Origin` is present and is not this listener's;
-    /// - 401 for an `Authorization` header that is not this listener's bearer token;
-    /// - 403 for a cookie-authenticated non-GET request or upgrade without `Origin` (CSRF and
-    ///   cross-site WebSocket hijacking). Bearer requests need no `Origin`: browsers never
-    ///   add that header themselves.
-    ///
-    /// A request with no credentials is admitted as [`CallerAuth::Anonymous`]; routes other
-    /// than the login exchange refuse it with 401.
-    pub(in crate::server) fn admit(&self, method: &Method, headers: &HeaderMap) -> Result<CallerAuth, StatusCode> {
-        let host = single(headers, header::HOST).ok_or(StatusCode::MISDIRECTED_REQUEST)?;
-        if !self.allowed_hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(host)) {
-            return Err(StatusCode::MISDIRECTED_REQUEST);
+/// Create `directory` owner-only, or narrow an existing one to owner-only.
+fn private_directory(directory: &Path) -> io::Result<()> {
+    match std::fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
         }
-        let origin = match headers.contains_key(header::ORIGIN) {
-            false => None,
-            true => {
-                let origin = single(headers, header::ORIGIN).ok_or(StatusCode::FORBIDDEN)?;
-                if !self.allowed_origins.iter().any(|allowed| allowed.eq_ignore_ascii_case(origin)) {
-                    return Err(StatusCode::FORBIDDEN);
-                }
-                Some(origin)
-            }
-        };
-        if headers.contains_key(header::AUTHORIZATION) {
-            // An Authorization header never falls back to a cookie.
-            let token = single(headers, header::AUTHORIZATION)
-                .and_then(|value| value.split_once(' '))
-                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
-                .map(|(_, token)| token)
-                .ok_or(StatusCode::UNAUTHORIZED)?;
-            return if self.token.matches(token) { Ok(CallerAuth::Bearer) } else { Err(StatusCode::UNAUTHORIZED) };
-        }
-        let Some(session) = self.logins.session(headers) else {
-            return Ok(CallerAuth::Anonymous);
-        };
-        let state_changing = method != Method::GET || headers.contains_key(header::UPGRADE);
-        if state_changing && origin.is_none() {
-            return Err(StatusCode::FORBIDDEN);
-        }
-        Ok(CallerAuth::Session(session))
+        Err(error) => Err(error),
     }
-
-    /// Wrap `router` so every request is admitted before any route or fallback runs.
-    pub(in crate::server) fn layer(self: Arc<Self>, router: Router) -> Router {
-        router.layer(middleware::from_fn(move |mut request: Request, next: Next| {
-            let policy = Arc::clone(&self);
-            async move {
-                match policy.admit(request.method(), request.headers()) {
-                    Ok(caller) => {
-                        request.extensions_mut().insert(caller);
-                        next.run(request).await
-                    }
-                    Err(status) => refused(status),
-                }
-            }
-        }))
-    }
-}
-
-fn refused(status: StatusCode) -> Response {
-    let message = match status {
-        StatusCode::MISDIRECTED_REQUEST => "Host does not name this listener",
-        StatusCode::FORBIDDEN => "Origin does not match this listener",
-        _ => "authentication required",
-    };
-    refusal(status, message)
-}
-
-/// The header's only value; absent, repeated or non-ASCII values count as none.
-fn single(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
-    let mut values = headers.get_all(name).iter();
-    let value = values.next()?.to_str().ok()?;
-    values.next().is_none().then_some(value)
 }

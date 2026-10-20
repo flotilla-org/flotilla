@@ -1,6 +1,5 @@
-//! The resource API's request handling, independent of how the response is written. The
-//! router renders a [`Reply`] as an axum response; `resource_http` still writes it raw on the
-//! main socket until the listeners move onto the router (rigging#21).
+//! The resource API's request handling, independent of how the response is written; the
+//! router renders each [`Reply`] as an axum response.
 
 use std::{collections::BTreeMap, sync::Arc};
 

@@ -112,6 +112,11 @@ pub enum SubCommand {
         #[command(subcommand)]
         command: EnsureSubCommand,
     },
+    /// Browser access to the daemon's loopback HTTP listener
+    Web {
+        #[command(subcommand)]
+        command: WebSubCommand,
+    },
     /// Inspect raw daemon resources
     Resource {
         #[command(subcommand)]
@@ -526,6 +531,15 @@ pub enum EnsureSubCommand {
         #[arg(long)]
         host: Option<String>,
     },
+}
+
+#[derive(clap::Subcommand)]
+pub enum WebSubCommand {
+    /// Print a one-time browser login URL for the daemon's HTTP listener
+    ///
+    /// The code is minted over this host's daemon socket, works once and expires within
+    /// minutes. The daemon needs an HTTP listener (`[http] listen` or `--http-listen`).
+    Login,
 }
 
 #[derive(clap::Subcommand)]
@@ -1408,6 +1422,12 @@ mod tests {
             .expect("paired overrides should parse")
             .client_paths()
             .is_ok());
+    }
+
+    #[test]
+    fn web_login_is_a_nested_web_command() {
+        let cli = Cli::try_parse_from(["flotilla", "web", "login"]).expect("web login should parse");
+        assert!(matches!(cli.command, Some(SubCommand::Web { command: WebSubCommand::Login })));
     }
 
     #[test]

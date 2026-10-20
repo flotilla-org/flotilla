@@ -1,28 +1,25 @@
-//! flotillad's one HTTP router (ADR 0065). It is built once and served on every listener;
-//! each listener attaches a [`CallerAuth`] before routing, so routes never inspect the
-//! transport. The router takes the daemon (or, for resource-handler tests, a bare resource
-//! backend) and needs no listener: tests drive it with `tower::ServiceExt::oneshot`.
-
-// Production serves only the startup address check until rigging#21 lets the listeners serve
-// this router; then the main socket, environment sockets and TCP listener use it all. Remove
-// this allow in the wiring change that completes #3248.
-#![cfg_attr(not(test), allow(dead_code))]
+//! flotillad's one HTTP router (ADR 0065). It is built once and served on every listener
+//! through rigging-http-serve: the main socket and environment sockets ([`unix`]) and the
+//! loopback TCP listener ([`tcp`]). Each listener attaches a [`CallerAuth`] before routing,
+//! so routes never inspect the transport. The router takes the daemon (or, for
+//! resource-handler tests, a bare resource backend) and needs no listener: tests drive it
+//! with `tower::ServiceExt::oneshot`.
 
 mod auth;
 mod login;
-pub(in crate::server) mod resource_api;
+mod resource_api;
 mod tcp;
 #[cfg(test)]
-pub(in crate::server) mod test_front_end;
-#[cfg(test)]
 mod tests;
+mod unix;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::{
     body::Body,
     extract::{RawQuery, Request, State},
     http::{header, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Json, Router,
@@ -34,9 +31,11 @@ use futures::StreamExt;
 pub(in crate::server) use auth::CallerAuth;
 pub(in crate::server) use login::LoginStore;
 use resource_api::Reply;
-// The TCP listener's policy is applied once rigging#21 serves the router (#3248).
-#[cfg_attr(not(test), allow(unused_imports))]
-pub(in crate::server) use tcp::{ListenAddress, TcpPolicy, TokenDigest};
+use rigging_http_serve::Caller;
+
+use crate::server::caller::PeerCredential;
+pub(in crate::server) use tcp::{ListenAddress, TcpListener};
+pub(in crate::server) use unix::{is_http_preface, serve_sniffed};
 
 /// Login and hello paths; everything else falls through to the resource API.
 pub(in crate::server) const HELLO_PATH: &str = "/v1/hello";
@@ -51,8 +50,34 @@ pub(in crate::server) struct HttpRouter {
     backend: ResourceBackend,
     daemon: Option<Arc<InProcessDaemon>>,
     logins: Arc<LoginStore>,
-    /// The TCP listener's origin, for login URLs; `None` when no TCP listener is declared.
-    tcp_origin: Option<String>,
+    /// The TCP listener's origin, for login URLs; unset when no TCP listener is declared.
+    #[builder(default)]
+    tcp_origin: ListenerOrigin,
+    /// How long a change-stream body waits on a consumer that stopped reading.
+    #[builder(default = super::change_stream::CONSUMER_DEADLINE)]
+    change_stream_deadline: std::time::Duration,
+}
+
+/// The TCP listener's origin, known only once it binds (its port may be chosen then). The
+/// router is built before that, because the Unix listeners serve it from startup.
+#[derive(Clone, Default)]
+pub(in crate::server) struct ListenerOrigin(Arc<OnceLock<String>>);
+
+impl ListenerOrigin {
+    #[cfg(test)]
+    pub(in crate::server) fn known(origin: &str) -> Self {
+        let known = Self::default();
+        known.set(origin.to_owned());
+        known
+    }
+
+    pub(in crate::server) fn set(&self, origin: String) {
+        let _ = self.0.set(origin);
+    }
+
+    pub(in crate::server) fn get(&self) -> Option<&str> {
+        self.0.get().map(String::as_str)
+    }
 }
 
 #[derive(Clone)]
@@ -60,8 +85,14 @@ struct RouterState(Arc<HttpRouter>);
 
 impl HttpRouter {
     /// The router over a running daemon.
-    pub(in crate::server) fn for_daemon(daemon: Arc<InProcessDaemon>, logins: Arc<LoginStore>, tcp_origin: Option<String>) -> Self {
-        Self { backend: daemon.resource_backend(), daemon: Some(daemon), logins, tcp_origin }
+    pub(in crate::server) fn for_daemon(daemon: Arc<InProcessDaemon>, logins: Arc<LoginStore>, tcp_origin: ListenerOrigin) -> Self {
+        Self {
+            backend: daemon.resource_backend(),
+            daemon: Some(daemon),
+            logins,
+            tcp_origin,
+            change_stream_deadline: super::change_stream::CONSUMER_DEADLINE,
+        }
     }
 
     pub(in crate::server) fn into_router(self) -> Router {
@@ -72,7 +103,26 @@ impl HttpRouter {
             .route(LOGOUT_PATH, post(logout))
             .fallback(resource_api)
             .with_state(RouterState(Arc::new(self)))
+            .layer(middleware::from_fn(caller_from_listener))
     }
+}
+
+/// rigging-http-serve installs `Caller<CallerAuth>`; routes read the `CallerAuth` inside.
+/// Every flotilla listener supplies `Caller::Custom`. rigging's own variants are mapped
+/// conservatively, and a request with no caller at all reaches routes unauthenticated.
+async fn caller_from_listener(mut request: Request, next: Next) -> Response {
+    if let Some(caller) = request.extensions_mut().remove::<Caller<CallerAuth>>() {
+        let caller = match caller {
+            Caller::Custom(caller) => caller,
+            Caller::Unix(peer) => CallerAuth::Socket(Some(PeerCredential::from_kernel(peer.uid, peer.pid))),
+            Caller::Bearer => CallerAuth::Bearer,
+            Caller::Cookie => CallerAuth::Anonymous,
+        };
+        request.extensions_mut().insert(caller);
+    } else if request.extensions().get::<CallerAuth>().is_none() {
+        request.extensions_mut().insert(CallerAuth::Anonymous);
+    }
+    next.run(request).await
 }
 
 /// The daemon's build identity and protocol fingerprint, as the framed `Hello` carries them.
@@ -96,7 +146,7 @@ async fn mint_login_code(State(RouterState(state)): State<RouterState>, Extensio
         CallerAuth::Anonymous => return auth::unauthenticated(),
         _ => return auth::refusal(StatusCode::FORBIDDEN, "login codes are minted over the main Unix socket"),
     }
-    let Some(origin) = &state.tcp_origin else {
+    let Some(origin) = state.tcp_origin.get() else {
         return auth::refusal(StatusCode::CONFLICT, "no HTTP listener is configured");
     };
     match state.logins.mint_code() {
@@ -175,10 +225,10 @@ async fn resource_api(
     }
     let target = request.uri().path_and_query().map_or_else(|| request.uri().path().to_owned(), |target| target.as_str().to_owned());
     let reply = resource_api::respond(request.method().as_str(), &target, state.backend.clone(), state.daemon.as_ref()).await;
-    render(reply).await
+    render(reply, state.change_stream_deadline).await
 }
 
-async fn render(reply: Reply) -> Response {
+async fn render(reply: Reply, change_stream_deadline: std::time::Duration) -> Response {
     match reply {
         Reply::Json { status, body } => {
             (StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), Json(body)).into_response()
@@ -190,9 +240,10 @@ async fn render(reply: Reply) -> Response {
             });
             streaming("application/json", Body::from_stream(lines))
         }
-        Reply::ChangeStream { service, after, clock, once } => {
-            streaming(super::change_stream::CONTENT_TYPE, Body::from_stream(super::change_stream::body(service, after, clock, once)))
-        }
+        Reply::ChangeStream { service, after, clock, once } => streaming(
+            super::change_stream::CONTENT_TYPE,
+            Body::from_stream(super::change_stream::body(service, after, clock, once, change_stream_deadline)),
+        ),
         Reply::Record { service, kind, name, now } => match super::change_stream::query_record(service, &kind, &name, now).await {
             Ok(bytes) => ([(header::CONTENT_TYPE, super::change_stream::CONTENT_TYPE)], bytes).into_response(),
             Err(error) => auth::refusal(StatusCode::INTERNAL_SERVER_ERROR, &error),
@@ -202,4 +253,23 @@ async fn render(reply: Reply) -> Response {
 
 fn streaming(content_type: &'static str, body: Body) -> Response {
     ([(header::CONTENT_TYPE, content_type)], body).into_response()
+}
+
+/// Test-only: serve a sniffed main-socket connection with the router over `backend` (and the
+/// daemon when given), exactly as the front door does, so resource API client tests drive
+/// the router through the real Unix-socket path.
+#[cfg(test)]
+pub(in crate::server) async fn serve_test_connection(
+    stream: tokio::net::UnixStream,
+    first_byte: u8,
+    backend: ResourceBackend,
+    daemon: Option<Arc<InProcessDaemon>>,
+) -> std::io::Result<()> {
+    let logins = Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock)));
+    let router = match daemon {
+        Some(daemon) => HttpRouter::for_daemon(daemon, logins, ListenerOrigin::default()),
+        None => HttpRouter::builder().backend(backend).logins(logins).build(),
+    }
+    .into_router();
+    serve_sniffed(stream, first_byte, router, |peer| CallerAuth::Socket(Some(peer)), std::future::pending()).await
 }

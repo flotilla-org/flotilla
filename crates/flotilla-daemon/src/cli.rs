@@ -19,7 +19,7 @@ use crate::{
     resource_limits::raise_file_descriptor_limit,
     restart_history::DaemonLifecycle,
     runtime::{DaemonRuntime, RuntimeOptions},
-    server::DaemonServer,
+    server::{DaemonServer, HttpListenAddress},
     DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH,
 };
 
@@ -35,7 +35,10 @@ pub async fn run(
     let config = Arc::new(ConfigStore::new(DaemonHostPath::new(config_dir), DaemonHostPath::new(state_dir)));
     let daemon_config = config.load_daemon_config()?;
     // Refuse a non-loopback listener before doing anything else (ADR 0065).
-    let http_listen = http_listen.or(daemon_config.http.listen.as_deref()).map(crate::server::resolve_http_listen).transpose()?;
+    let http_listen = match http_listen.or(daemon_config.http.listen.as_deref()) {
+        Some(spec) => Some(HttpListenAddress::resolve(spec).await?),
+        None => None,
+    };
 
     // Hardcoded directives are appended after RUST_LOG and take precedence,
     // so these noisy crates stay at INFO even if RUST_LOG sets them to DEBUG.
@@ -58,9 +61,6 @@ pub async fn run(
     let file_layer = tracing_subscriber::fmt::layer().json().with_ansi(false).with_writer(file_appender);
     init_daemon_tracing(tracing_subscriber::registry().with(filter).with(stderr_layer).with(file_layer))?;
     raise_file_descriptor_limit();
-    if let Some(address) = http_listen {
-        tracing::warn!(%address, "the HTTP listener is declared but not yet served; serving it waits on rigging#21");
-    }
 
     let timeout = if timeout_secs == 0 { Duration::from_secs(u64::MAX) } else { Duration::from_secs(timeout_secs) };
 
@@ -79,6 +79,10 @@ pub async fn run(
         timeout,
     )
     .await?;
+    let server = match http_listen {
+        Some(address) => server.with_http_listener(address),
+        None => server,
+    };
     let daemon = server.daemon();
     if let Some(fleet) = &dummy_fleet {
         crate::dummy_fleet::attach_dummy_fleet(fleet, &daemon)?;

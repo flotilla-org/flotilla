@@ -26,6 +26,7 @@ libc = { workspace = true }
 sysinfo = "0.38.4"
 
 [dev-dependencies]
+flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 rigging-replay-testkit = { workspace = true }
 hegeltest = "=0.48.1"

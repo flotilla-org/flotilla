@@ -20,6 +20,7 @@ I searched all Rust sources for `tls::client`, `client_builder`, `reqwest`, requ
 | Codex OAuth refresh (`codex_central.rs`) | Exemption documented beside tests: consumer OAuth endpoint has no published request contract for this adapter; replay would capture rotating live credentials. Fixed-response tests cover decoding and failure classification, not remote compatibility. |
 | Resource backend CRUD/list/watch, namespace/CRD bootstrap and kubeconfig (`flotilla-resources/src/http/`) | Owned resource-store/Kubernetes protocol: existing `http_wire.rs` and `provisioning_http_wire.rs` test request encoding. `http_digest_drill_down_reads_only_the_requested_partition` exercises root/children/bucket reads against the production daemon handler. Exemption beside wire tests distinguishes this from external-service contract coverage and does not claim bootstrap/TLS identity coverage. |
 | Resource validation (`src/resource_validate.rs`) | Exemption beside tests: owned daemon API over local Unix socket, exercised against actual server by existing integration tests. |
+| Browser login code (`src/cli/web.rs`, `flotilla web login`) | Owned daemon route over the local Unix socket. An in-process stand-in serves only POST on `/v1/web/login-codes` and returns the daemon's success and refusal shapes; the route itself is covered by the router tests in `crates/flotilla-daemon/src/server/http/tests.rs`. |
 | Wheelhouse metadata POST (`flotilla-manifest/src/sink.rs`) | Exemption beside tests: owned local IPC protocol, existing socket HTTP stand-in covers POST routing and payloads. |
 | Shared TLS clients / `ReqwestHttpClient::execute` / `execute_to_file`, replay transports and request factories | Service-neutral construction/execution, grouped with consumers. Exemption beside transport tests; shared TLS User-Agent has existing wire coverage. Discovery factories and examples construct the audited adapters; they introduce no distinct request shape. |
 
@@ -37,7 +38,8 @@ CLAUDE.md now requires enforcing stand-ins or recorded replay for outbound HTTP;
 
 `server/change_stream.rs` uses the forwarded Unix resource HTTP API. Its strict in-process
 stand-in enforces GET and the change-stream path and delivers fragmented CBOR frames through
-the real reqwest client. Duplex I/O covers the listener-independent HTTP response adapter.
+the real reqwest client. The router's change-stream body is covered in-process, including a
+stalled consumer that the producer abandons after its deadline.
 The same protocol source/follower is exercised over in-memory delivery with two and three
 registered stores. Point-read requests use the production `read_record` path, encode query parameters, and
 cover present/absent remote results and a local hit after replication. A paused HTTP download

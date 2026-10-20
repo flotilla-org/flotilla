@@ -159,6 +159,7 @@ checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
  "bytes",
+ "form_urlencoded",
  "futures-util",
  "http",
  "http-body",
@@ -174,11 +175,13 @@ dependencies = [
  "serde_core",
  "serde_json",
  "serde_path_to_error",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -197,6 +200,7 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -834,7 +838,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -957,7 +961,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1057,6 +1061,7 @@ name = "flotilla"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "bon",
  "chrono",
  "clap",
@@ -1342,6 +1347,7 @@ name = "flotilla-build-features-http-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "axum-core",
  "bitflags 2.11.0",
  "flotilla-build-features",
  "futures-channel",
@@ -1357,6 +1363,7 @@ dependencies = [
  "mio",
  "once_cell",
  "percent-encoding",
+ "serde",
  "serde_core",
  "serde_json",
  "smallvec",
@@ -1447,6 +1454,7 @@ name = "flotilla-build-features-tracing"
 version = "0.1.0"
 dependencies = [
  "flotilla-build-features",
+ "log",
  "once_cell",
  "tracing",
  "tracing-core",
@@ -2053,10 +2061,9 @@ dependencies = [
  "hegeltest",
  "hmac",
  "http",
- "hyper",
- "hyper-util",
  "libc",
  "reqwest 0.13.2",
+ "rigging-http-serve",
  "rigging-replay-testkit",
  "rigging-tls",
  "rusqlite",
@@ -2834,6 +2841,7 @@ dependencies = [
  "flotilla-build-features-async",
  "flotilla-build-features-base",
  "flotilla-build-features-http",
+ "flotilla-build-features-http-server",
  "flotilla-build-features-logging",
  "flotilla-build-features-os",
  "flotilla-build-features-tracing",
@@ -2961,6 +2969,7 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
+ "flotilla-build-features-http-server",
  "flotilla-build-features-logging",
  "flotilla-forge-github",
  "flotilla-paths",
@@ -3289,6 +3298,7 @@ dependencies = [
  "axum",
  "bon",
  "chrono",
+ "flotilla-build-features-http-server",
  "flotilla-build-features-logging",
  "flotilla-messaging",
  "flotilla-protocol",
@@ -4493,7 +4503,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5036,7 +5046,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5383,7 +5393,7 @@ dependencies = [
 [[package]]
 name = "rigging-http-client"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=bf71f7d840b14e50dd12e7bfc58e2654f51692c2#bf71f7d840b14e50dd12e7bfc58e2654f51692c2"
+source = "git+https://github.com/flotilla-org/rigging?rev=0e17afbd10eab95614a2033159d2dabde30e5eea#0e17afbd10eab95614a2033159d2dabde30e5eea"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5395,9 +5405,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-http-serve"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=0e17afbd10eab95614a2033159d2dabde30e5eea#0e17afbd10eab95614a2033159d2dabde30e5eea"
+dependencies = [
+ "axum",
+ "getrandom 0.3.4",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rigging-process"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=bf71f7d840b14e50dd12e7bfc58e2654f51692c2#bf71f7d840b14e50dd12e7bfc58e2654f51692c2"
+source = "git+https://github.com/flotilla-org/rigging?rev=0e17afbd10eab95614a2033159d2dabde30e5eea#0e17afbd10eab95614a2033159d2dabde30e5eea"
 dependencies = [
  "async-trait",
  "libc",
@@ -5410,7 +5436,7 @@ dependencies = [
 [[package]]
 name = "rigging-replay-testkit"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=bf71f7d840b14e50dd12e7bfc58e2654f51692c2#bf71f7d840b14e50dd12e7bfc58e2654f51692c2"
+source = "git+https://github.com/flotilla-org/rigging?rev=0e17afbd10eab95614a2033159d2dabde30e5eea#0e17afbd10eab95614a2033159d2dabde30e5eea"
 dependencies = [
  "async-trait",
  "axum",
@@ -5431,7 +5457,7 @@ dependencies = [
 [[package]]
 name = "rigging-tls"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=bf71f7d840b14e50dd12e7bfc58e2654f51692c2#bf71f7d840b14e50dd12e7bfc58e2654f51692c2"
+source = "git+https://github.com/flotilla-org/rigging?rev=0e17afbd10eab95614a2033159d2dabde30e5eea#0e17afbd10eab95614a2033159d2dabde30e5eea"
 dependencies = [
  "reqwest 0.13.2",
  "rustls",
@@ -5546,7 +5572,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5604,7 +5630,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6143,7 +6169,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6532,6 +6558,7 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -6570,6 +6597,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -7157,7 +7185,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

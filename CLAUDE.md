@@ -172,7 +172,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-cli` | Shared CLI parsing/output, image-check client, PM connector and foreground terminal attachment; no dashboard renderer |
 | `flotilla-vessel-agent` | Narrow resident vessel startup, environment configuration, logging and shutdown; no store, reconcilers or providers |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap and event loop; selected by the root default-on `tui` feature |
-| `flotilla-daemon` | Runtime supervision, socket server, replication composition and routed transport, peer networking, multi-host command routing |
+| `flotilla-daemon` | Runtime supervision, socket server and the one HTTP router (ADR 0065) on every listener, replication composition and routed transport, peer networking, multi-host command routing |
 | `flotilla-address` | ADR 0066 addresses: typed `kind:value` segments, canonical encoding, forge-kind normalisation, lenient input through a Forge lookup, `record_name`, references and the condition/template grammar; no flotilla dependencies |
 | `flotilla-cbor` | The ADR 0063 CBOR profile over `cbor2`: deterministic writers, safe readers, limits, framing and the conformance corpus; no flotilla dependencies; moving to the shared [rigging](https://github.com/flotilla-org/rigging) repo, where sibling projects take it from (ADR 0068) |
 | `flotilla-capability-contract` | Session capability contract: `CredentialCapability`, `SessionCapabilitySource`, endpoint and credential-card helpers; no flotilla dependencies |
@@ -196,6 +196,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-review-bundle-object-store` | Object-store/S3 byte adapter for the review-bundle port |
 | `rigging-tls` (external) | TLS provider selection and reqwest builders from the pinned Rigging revision |
 | `rigging-process` (external) | Command supervision, invocation macros, environment variables, filesystem/space probes, scan cache and binary/version detection |
+| `rigging-http-serve` (external) | Axum serving over Unix sockets, accepted connections and loopback TCP: typed caller identity, the token file, and the Host/Origin/cookie-Origin TCP policy around consumer authentication |
 | `rigging-http-client` (external) | Injectable HTTP execution and the reqwest implementation |
 | `rigging-replay-testkit` (external, dev-only) | Replay sessions, recording, masks, mock runners and HTTP stand-ins |
 | `flotilla-replay-testkit` | GitHub replay channel over `rigging-replay-testkit` scheduling, masks and test helpers |
@@ -242,7 +243,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-protocol/src/result_set.rs` | Aggregator query rows, result sets, and deltas |
 | `crates/flotilla-protocol/src/snapshot.rs` | `RepoInfo`, provider errors and labels |
 | `crates/flotilla-daemon/src/server.rs` | Daemon server with peer networking |
-| `crates/flotilla-daemon/src/server/` | Server submodules: client/peer connections, request dispatch, remote commands |
+| `crates/flotilla-daemon/src/server/` | Server submodules: client/peer connections, request dispatch, remote commands, and `http/` (the router, caller authentication, login sessions, the Unix front door and the TCP listener) |
 | `crates/flotilla-projections/src/lib.rs` | Aggregator runtime context and public resolver ports; wires store watch sources |
 | `crates/flotilla-projections/src/aggregator.rs` | Watches durable and observed resources and maintains query result sets |
 | `crates/flotilla-projections/src/read_projections.rs` | Store-backed explanation, host/fleet, project and crew-stall views; environment and leaf-evidence ports |

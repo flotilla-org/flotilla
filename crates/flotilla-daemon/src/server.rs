@@ -11,7 +11,6 @@ pub mod peer_runtime;
 pub mod remote_commands;
 mod replication;
 mod request_dispatch;
-mod resource_http;
 mod shared;
 
 use std::{
@@ -57,6 +56,9 @@ use crate::{
 };
 
 const CONNECTION_PREFACE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long HTTP connections may finish once shutdown begins. Watch and change-stream
+/// responses never end on their own, so they are cut at this deadline.
+const HTTP_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
 const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_ERROR_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(5);
@@ -286,9 +288,33 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
     Ok(handle)
 }
 
-/// Resolve the declared loopback HTTP listen address, refusing a non-loopback one (ADR 0065).
-pub(crate) fn resolve_http_listen(spec: &str) -> Result<std::net::SocketAddr, String> {
-    http::ListenAddress::resolve(spec).map(|address| address.bind_address())
+/// A declared loopback HTTP listen address, resolved and checked at startup (ADR 0065).
+pub struct HttpListenAddress(http::ListenAddress);
+
+impl HttpListenAddress {
+    /// Resolve `host:port` without blocking, refusing unless every address is loopback.
+    pub async fn resolve(spec: &str) -> Result<Self, String> {
+        http::ListenAddress::resolve(spec).await.map(Self)
+    }
+}
+
+/// Resolves once the daemon begins shutting down (or its shutdown sender is gone).
+async fn shutdown_signal(mut shutdown: watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|stopping| *stopping).await;
+}
+
+/// Serve one HTTP connection or listener until it ends, or until shutdown plus
+/// [`HTTP_DRAIN_DEADLINE`]: rigging drains in-flight requests, and this bounds the drain.
+async fn serve_until_drained(serving: impl std::future::Future<Output = std::io::Result<()>>, shutdown: watch::Receiver<bool>, what: &str) {
+    tokio::select! {
+        result = serving => if let Err(error) = result {
+            warn!(%error, "{what} HTTP serving failed");
+        },
+        () = async {
+            shutdown_signal(shutdown).await;
+            tokio::time::sleep(HTTP_DRAIN_DEADLINE).await;
+        } => {}
+    }
 }
 
 /// The daemon server that listens on a Unix socket and dispatches requests
@@ -318,6 +344,14 @@ pub struct DaemonServer {
     /// Registry of per-environment sockets, populated by provisioning/adoption
     /// and retired by teardown through EnvironmentSocketService.
     pub environment_sockets: Arc<tokio::sync::Mutex<EnvironmentSocketRegistry>>,
+    /// The one HTTP router (ADR 0065), served on the main socket, environment sockets and
+    /// the optional loopback TCP listener.
+    http_router: axum::Router,
+    logins: Arc<http::LoginStore>,
+    tcp_origin: http::ListenerOrigin,
+    http_listen: Option<http::ListenAddress>,
+    /// Where the TCP listener's token file lives.
+    state_dir: PathBuf,
 }
 
 struct EnvironmentClientLease {
@@ -339,10 +373,12 @@ impl DaemonServer {
         let client_count = self.client_count.clone();
         let client_notify = self.client_notify.clone();
         let shutdown = self.shutdown_rx.clone();
+        let http_router = self.http_router.clone();
         let directory = flotilla_protocol::DaemonHostPath::new(self.socket_path.with_extension("env"));
         environment_sockets::EnvironmentSocketService::new(self.environment_sockets.clone(), directory, move |listener, environment| {
             let daemon = daemon.clone();
             let router = router.clone();
+            let http_router = http_router.clone();
             let client_count = client_count.clone();
             let client_notify = client_notify.clone();
             let mut shutdown = shutdown.clone();
@@ -357,16 +393,28 @@ impl DaemonServer {
                                 let router = router.clone();
                                 let environment = environment.clone();
                                 let shutdown = shutdown.clone();
+                                let http_router = http_router.clone();
                                 client_count.fetch_add(1, Ordering::SeqCst);
                                 client_notify.notify_one();
                                 let lease = EnvironmentClientLease { count: client_count.clone(), notify: client_notify.clone() };
                                 connections.spawn(async move {
                                     let _lease = lease;
+                                    let mut stream = stream;
+                                    let Some(first_byte) = read_preface(&mut stream).await else { return };
+                                    if http::is_http_preface(first_byte) {
+                                        // The socket binds the caller to its environment, as the framed protocol does.
+                                        let bound = environment.clone();
+                                        let caller = move |peer| http::CallerAuth::Environment { environment: bound, peer: Some(peer) };
+                                        let serving = http::serve_sniffed(stream, first_byte, http_router, caller, shutdown_signal(shutdown.clone()));
+                                        serve_until_drained(serving, shutdown, "environment socket").await;
+                                        return;
+                                    }
                                     let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
                                         Ok(claims) => Some(claims),
                                         Err(error) => { warn!(%error, "environment peer evidence unavailable"); return; }
                                     };
-                                    environment_connection::serve(flotilla_transport::message::unix_message_session(stream), daemon, router, environment, claims, shutdown).await;
+                                    let session = unix_message_session_with_prefix(stream, vec![first_byte]);
+                                    environment_connection::serve(session, daemon, router, environment, claims, shutdown).await;
                                 });
                             }
                             Err(error) => { warn!(%error, "environment socket accept failed"); return; }
@@ -432,6 +480,10 @@ impl DaemonServer {
         let agent_state_store = Arc::clone(daemon.agent_state_store());
         let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
         let peer_resource_socket_dir = config.state_dir().as_path().join("peers");
+        let logins = Arc::new(http::LoginStore::new(daemon.clock_for_scenarios()));
+        let tcp_origin = http::ListenerOrigin::default();
+        let http_router = http::HttpRouter::for_daemon(Arc::clone(&daemon), Arc::clone(&logins), tcp_origin.clone()).into_router();
+        let state_dir = config.state_dir().as_path().to_path_buf();
         Ok(Self {
             daemon,
             socket_path,
@@ -451,7 +503,19 @@ impl DaemonServer {
             peer_resource_socket_dir,
             agent_state_store,
             environment_sockets: Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
+            http_router,
+            logins,
+            tcp_origin,
+            http_listen: None,
+            state_dir,
         })
+    }
+
+    /// Declare the loopback TCP listener `run` binds. Listeners come only from startup
+    /// configuration; nothing opens one at runtime (ADR 0065).
+    pub fn with_http_listener(mut self, address: HttpListenAddress) -> Self {
+        self.http_listen = Some(address.0);
+        self
     }
 
     /// Take the receiver for inbound peer wire messages.
@@ -495,9 +559,31 @@ impl DaemonServer {
         std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("failed to protect daemon socket: {error}"))?;
 
+        // A declared TCP listener that cannot bind refuses startup, before discovery
+        // advertises this daemon.
+        let tcp_listener = match &self.http_listen {
+            Some(listen) => {
+                let listener = http::TcpListener::bind(listen, &self.state_dir, Arc::clone(&self.logins)).await?;
+                self.tcp_origin.set(listener.origin().to_owned());
+                Some(listener)
+            }
+            None => None,
+        };
+
         publish_socket_path(&self.socket_discovery_path, &self.socket_path)?;
 
         info!(path = %self.socket_path.display(), "daemon listening");
+        let tcp_serving = tcp_listener.map(|listener| {
+            if let Ok(address) = listener.local_addr() {
+                info!(%address, origin = listener.origin(), "daemon HTTP listening");
+            }
+            let router = self.http_router.clone();
+            let shutdown = self.shutdown_rx.clone();
+            tokio::spawn(async move {
+                let serving = listener.serve(router, shutdown_signal(shutdown.clone()));
+                serve_until_drained(serving, shutdown, "TCP").await;
+            })
+        });
 
         // Tell the InProcessDaemon where the socket is so terminal sessions
         // can get FLOTILLA_DAEMON_SOCKET injected.
@@ -518,6 +604,7 @@ impl DaemonServer {
         let agent_state_store = self.agent_state_store;
         let remote_command_router = self.remote_command_router;
         let peer_resource_socket_dir = self.peer_resource_socket_dir;
+        let http_router = self.http_router;
 
         // This only reads local pending records and registers asynchronous retry
         // workers. Keep the snapshot before admission so replay cannot replace a
@@ -587,11 +674,13 @@ impl DaemonServer {
                             let remote_command_router = remote_command_router.clone();
                             let peer_connected_tx = peer_connected_tx.clone();
                             let agent_state_store = Arc::clone(&agent_state_store);
+                            let http_router = http_router.clone();
 
                             let shutdown_request_tx = shutdown_request_tx.clone();
                             connection_tasks.spawn(async move {
                                 handle_client_with_caller(
                                     stream,
+                                    http_router,
                                     daemon,
                                     shutdown_request_tx,
                                     shutdown_rx,
@@ -670,9 +759,31 @@ impl DaemonServer {
                 warn!(%error, "daemon connection task failed while draining");
             }
         }
+        if let Some(serving) = tcp_serving {
+            if let Err(error) = serving.await {
+                warn!(%error, "daemon HTTP listener task failed while draining");
+            }
+        }
 
         info!("daemon server stopped");
         Ok(())
+    }
+}
+
+/// Read a connection's first byte, which chooses HTTP or the framed protocol. A peer that
+/// sends nothing within [`CONNECTION_PREFACE_TIMEOUT`] is dropped.
+async fn read_preface(stream: &mut tokio::net::UnixStream) -> Option<u8> {
+    let mut first_byte = [0_u8; 1];
+    match tokio::time::timeout(CONNECTION_PREFACE_TIMEOUT, tokio::io::AsyncReadExt::read_exact(stream, &mut first_byte)).await {
+        Err(_) => {
+            warn!(timeout_secs = CONNECTION_PREFACE_TIMEOUT.as_secs(), "connection timed out before sending a preface");
+            None
+        }
+        Ok(Ok(_)) => Some(first_byte[0]),
+        Ok(Err(error)) => {
+            warn!(%error, "failed to read connection preface");
+            None
+        }
     }
 }
 
@@ -738,8 +849,11 @@ async fn handle_client(
     agent_state_store: SharedAgentStateStore,
     environment_context: Option<EnvironmentId>,
 ) {
+    let logins = Arc::new(http::LoginStore::new(daemon.clock_for_scenarios()));
+    let http_router = http::HttpRouter::for_daemon(Arc::clone(&daemon), logins, http::ListenerOrigin::default()).into_router();
     handle_client_with_caller(
         stream,
+        http_router,
         daemon,
         shutdown_request_tx,
         shutdown_rx,
@@ -759,9 +873,10 @@ async fn handle_client(
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_with_caller(
     mut stream: tokio::net::UnixStream,
+    http_router: axum::Router,
     daemon: Arc<InProcessDaemon>,
     shutdown_request_tx: mpsc::UnboundedSender<()>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
     inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     peer_manager: Arc<Mutex<PeerManager>>,
     remote_command_router: RemoteCommandRouter,
@@ -772,33 +887,22 @@ async fn handle_client_with_caller(
     environment_context: Option<EnvironmentId>,
     caller: Option<flotilla_protocol::CommandCaller>,
 ) {
-    let mut first_byte = [0_u8; 1];
-    match tokio::time::timeout(CONNECTION_PREFACE_TIMEOUT, tokio::io::AsyncReadExt::read_exact(&mut stream, &mut first_byte)).await {
-        Err(_) => {
-            warn!(timeout_secs = CONNECTION_PREFACE_TIMEOUT.as_secs(), "connection timed out before sending a preface");
-            return;
-        }
-        Ok(Ok(_)) if first_byte[0].is_ascii_uppercase() => {
-            tokio::select! {
-                result = resource_http::serve_resource_http_with_daemon(stream, first_byte[0], daemon.resource_backend().clone(), Some(Arc::clone(&daemon))) => {
-                    if let Err(error) = result {
-                        warn!(%error, "resource HTTP connection failed");
-                    }
-                }
-                _ = shutdown_rx.changed() => {}
-            }
-            return;
-        }
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            warn!(%error, "failed to read connection preface");
-            return;
-        }
+    let Some(first_byte) = read_preface(&mut stream).await else { return };
+    if http::is_http_preface(first_byte) {
+        // The main socket is a full-trust context (ADR 0065); a per-environment context
+        // binds the caller to that environment.
+        let caller = move |peer| match environment_context {
+            Some(environment) => http::CallerAuth::Environment { environment, peer: Some(peer) },
+            None => http::CallerAuth::Socket(Some(peer)),
+        };
+        let serving = http::serve_sniffed(stream, first_byte, http_router, caller, shutdown_signal(shutdown_rx.clone()));
+        serve_until_drained(serving, shutdown_rx, "main socket").await;
+        return;
     }
     let peer = caller::socket_peer_credential(&stream);
     let socket_path = stream.local_addr().ok().and_then(|address| address.as_pathname().map(Path::to_path_buf));
     handle_client_session_with_identity(
-        unix_message_session_with_prefix(stream, first_byte.to_vec()),
+        unix_message_session_with_prefix(stream, vec![first_byte]),
         daemon,
         shutdown_request_tx,
         shutdown_rx,
