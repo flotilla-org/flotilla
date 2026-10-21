@@ -17,9 +17,9 @@
 //! is the convoy's label with the quota in force and the lifetime duties
 //! retired so far.
 //!
-//! No role name or promise kind appears here: a seat's role and a promise's
-//! kind are interned text, and the kinds' rules are the frozen document
-//! admission used.
+//! No role name, vessel class or promise kind appears here: a seat's role, a
+//! quota's vessel class and a promise's kind are interned text, and the kinds'
+//! rules are the frozen document admission used.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,8 +27,16 @@ use flotilla_address::Template;
 use flotilla_schema::{Address, Frozen, Records, State, Stored};
 use serde::{Deserialize, Serialize};
 
-use super::{Priority, PromiseId, VesselClass};
+use super::{Priority, PromiseId};
 use crate::{edges, states};
+
+/// A vessel class as a quota counts it: interned text in its own domain, as a
+/// seat's role and discriminator are, so the store and its views name the
+/// class (#3627 look-over ruling 4). It replaces the old machine's numeric
+/// [`super::VesselClass`] in layer 4.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
+#[store(intern = "vc")]
+pub struct VesselClass(pub String);
 
 /// A duty's key within one convoy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]

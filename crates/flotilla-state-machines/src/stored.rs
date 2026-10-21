@@ -28,14 +28,7 @@ use flotilla_schema::{
 };
 
 use crate::{
-    machines::{
-        agent_session::AgentSession,
-        awaiting_reply::{AwaitingReplyEdgeKind, AwaitingReplySpec},
-        convoy::Convoy,
-        ensure::Ensure,
-        message::Message,
-        vessel::Vessel,
-    },
+    machines::{agent_session::AgentSession, convoy::Convoy, ensure::Ensure, message::Message, vessel::Vessel},
     EdgeEventOf, EdgeKind, EdgePayload, Label, Machine, Resource, Version,
 };
 
@@ -53,8 +46,6 @@ pub fn kinds() -> Result<KindRegistry, RegistryError> {
     registry.register::<Resource<Convoy>>()?;
     registry.register::<Resource<Vessel>>()?;
     registry.register::<Resource<Ensure>>()?;
-    // Declared ahead of its machine (#3587 layer 3); `Resource<AwaitingReply>` replaces it.
-    registry.register::<Declared<AwaitingReplySpec, AwaitingReplyEdgeKind>>()?;
     Ok(registry)
 }
 

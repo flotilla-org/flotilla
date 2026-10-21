@@ -24,15 +24,13 @@ pub const SHARED_NAMES: &[&str] = &[
 /// Column names the backend adds to a kind's root table.
 pub const RESERVED_ROOT_COLUMNS: &[&str] = &["id", "version"];
 
-/// Column names the backend adds to a kind's child tables.
-pub const RESERVED_CHILD_COLUMNS: &[&str] = &["owner"];
-
 /// The version stamp of a `records` or `history` row: the first data column of those tables, which
 /// the backend sets to the sequence of the write that appended the row.
 pub const RECORD_VERSION: &str = "version";
 
-/// Column names reserved in `records` and `history` tables: the owner id and the version stamp.
-pub const RESERVED_RECORD_COLUMNS: &[&str] = &["owner", RECORD_VERSION];
+/// Column names reserved in `records` and `history` tables beside the parent key
+/// ([`TableSet::parent_key_column`]): the version stamp.
+pub const RESERVED_RECORD_COLUMNS: &[&str] = &[RECORD_VERSION];
 
 /// One kind's storage. Tables are numbered in pre-order of declaration, root first; the
 /// encoder and decoder address tables by that index.
@@ -235,7 +233,7 @@ pub enum ColumnType {
 /// columns, under a partial-index predicate. On the root table every query the backend generates
 /// for it orders by `order..., id`, so the row id is the index's last key. On a nested table
 /// (declared on the part struct whose rows it holds) the
-/// table's primary key `owner, ..., pos` ends the index instead, as SQLite appends it to every
+/// table's primary key `<root>, ..., pos` ends the index instead, as SQLite appends it to every
 /// index of a `WITHOUT ROWID` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Index {
@@ -329,11 +327,19 @@ pub enum DescriptorError {
 }
 
 impl TableSet {
+    /// The column the backend adds to every table below the root, holding the resource's row id:
+    /// named after the root table, so `convoy_promises.convoy` and `message_references.message`
+    /// read as what they reference (ADR 0064 Records).
+    pub fn parent_key_column(&self) -> &str {
+        &self.tables[0].name
+    }
+
     /// Refuses descriptors that would render invalid or ambiguous DDL: table or index names declared
     /// twice or taken by a shared table, column names declared twice in one table (key columns included), and
-    /// data or key columns named like the backend's own columns: `id` and `version` on the root, `owner` on
-    /// children (a child row may well have a `version` field, such as a gate input's observed version),
-    /// `owner` and `version` beside the stamp on `records` and `history` tables, which must start with it,
+    /// data or key columns named like the backend's own columns: `id` and `version` on the root, the parent
+    /// key (named after the root table) on children (a child row may well have a `version` field, such as a
+    /// gate input's observed version), the parent key and `version` beside the stamp on `records` and
+    /// `history` tables, which must start with it,
     /// and indexes that are not on one of the kind's tables, name unknown or repeated columns, page through a
     /// nullable column the predicate does not require, or whose predicate cannot hold as written.
     pub fn validate(&self) -> Result<(), DescriptorError> {
@@ -355,7 +361,7 @@ impl TableSet {
             let mut columns = BTreeSet::new();
             let (reserved, data) = match table.role {
                 TableRole::Root => (if stored { RESERVED_ROOT_COLUMNS } else { &[] }, &table.columns[..]),
-                TableRole::Child | TableRole::State => (if stored { RESERVED_CHILD_COLUMNS } else { &[] }, &table.columns[..]),
+                TableRole::Child | TableRole::State => (&[][..], &table.columns[..]),
                 TableRole::Records | TableRole::History => {
                     if !table
                         .columns
@@ -367,8 +373,9 @@ impl TableSet {
                     (RESERVED_RECORD_COLUMNS, &table.columns[1..])
                 }
             };
+            let parent_key = table.parent.is_some() && (stored || matches!(table.role, TableRole::Records | TableRole::History));
             for column in table.key.iter().chain(data) {
-                if reserved.contains(&column.name.as_str()) {
+                if reserved.contains(&column.name.as_str()) || (parent_key && column.name == self.parent_key_column()) {
                     return Err(DescriptorError::ReservedColumn { kind: kind(), table: table.name.clone(), column: column.name.clone() });
                 }
                 if !columns.insert(column.name.as_str()) {

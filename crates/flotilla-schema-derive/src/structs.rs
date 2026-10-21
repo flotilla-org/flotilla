@@ -358,6 +358,9 @@ pub(crate) fn newtype(input: &DeriveInput, fields: &FieldsUnnamed, type_attrs: T
     let element = columns_element(ident, &generics);
     let key_where = Generics::new(&input.generics, [quote!(for<'__store> #ty: #schema::KeyColumn)]).where_clause;
     let wraps_string = matches!(ty, Type::Path(path) if path.qself.is_none() && path.path.is_ident("String"));
+    if let (Some(domain), false) = (&type_attrs.intern, wraps_string) {
+        return Err(refuse(domain, "`intern` on a type belongs on a newtype of String"));
+    }
     let intern = wraps_string.then(|| {
         let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
         quote! {
@@ -373,7 +376,40 @@ pub(crate) fn newtype(input: &DeriveInput, fields: &FieldsUnnamed, type_attrs: T
             }
         }
     });
-    Ok(quote! {
+    // `intern = ".."`: the newtype's one column is interned text in its domain, wherever it is stored.
+    let columns = match &type_attrs.intern {
+        Some(domain) => quote! {
+            #[automatically_derived]
+            impl #impl_generics #schema::Columns for #ident #ty_generics #where_clause {
+                const TABLES: usize = 0;
+
+                fn layout(layout: &mut #schema::Layout, name: &str, required: bool) {
+                    <#schema::adapt::AsInterned as #schema::adapt::Adapter<Self>>::layout(
+                        layout,
+                        name,
+                        required,
+                        ::core::option::Option::Some(const { #schema::Code::new(#domain) }),
+                    );
+                }
+
+                fn encode(&self, e: &mut #schema::Encoder) -> ::core::result::Result<(), #schema::EncodeError> {
+                    <#schema::adapt::AsInterned as #schema::adapt::Adapter<Self>>::encode(self, e)
+                }
+
+                fn encode_absent(e: &mut #schema::Encoder) -> ::core::result::Result<(), #schema::EncodeError> {
+                    <#schema::adapt::AsInterned as #schema::adapt::Adapter<Self>>::encode_absent(e)
+                }
+
+                fn decode(d: &mut #schema::Decoder) -> ::core::result::Result<::core::option::Option<Self>, #schema::DecodeError> {
+                    <#schema::adapt::AsInterned as #schema::adapt::Adapter<Self>>::decode(d)
+                }
+
+                fn decode_absent(d: &mut #schema::Decoder) -> ::core::result::Result<(), #schema::DecodeError> {
+                    <#schema::adapt::AsInterned as #schema::adapt::Adapter<Self>>::decode_absent(d)
+                }
+            }
+        },
+        None => quote! {
         #[automatically_derived]
         impl #impl_generics #schema::Columns for #ident #ty_generics #where_clause {
             const TABLES: usize = <#ty as #schema::Columns>::TABLES;
@@ -398,6 +434,10 @@ pub(crate) fn newtype(input: &DeriveInput, fields: &FieldsUnnamed, type_attrs: T
                 <#ty as #schema::Columns>::decode_absent(d)
             }
         }
+        },
+    };
+    Ok(quote! {
+        #columns
 
         #[automatically_derived]
         impl #impl_generics #schema::Column for #ident #ty_generics #where_clause {}

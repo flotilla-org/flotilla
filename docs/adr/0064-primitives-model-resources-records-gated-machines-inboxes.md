@@ -43,6 +43,8 @@ Convoys assumed that their vessels were co-located and fixed. Many writers could
   - last-checked values for polled external data.
 
   Attempts and receipts are not separate records: each is an edge on the resource that made it, so every write to history goes through the one edge path (#3392 R4).
+
+  A convoy's seats, promises, submissions and duties are records of the Convoy, not their own kinds. A generated parent key is named after its root table (#3627 look-over ruling).
 - **A judgement** is computed and never stored. Examples are ready, stalled, landing, kept, retry count, next attempt, stale and drift. Each judgement is a declared function with declared inputs, and it returns a value and the moment it could next change. The same function gates edges and renders listings, so the two cannot disagree.
 - **No host writes another home's resource.** It sends a message to that home, or it publishes a record of its own that the home observes.
 

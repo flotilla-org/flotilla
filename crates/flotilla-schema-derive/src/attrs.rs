@@ -34,6 +34,9 @@ pub(crate) struct TypeAttrs {
     /// `edges = E`: the code enum of a kind's edges, whose codes are the only `edge` codes its log
     /// entries may carry (#3392 A7).
     pub edges: Option<syn::Path>,
+    /// `intern = "vc"` on a newtype of `String`: the type is interned text in that domain wherever
+    /// it is stored, a map key or set value included, as an `Address` is in `ad`.
+    pub intern: Option<LitStr>,
 }
 
 /// A field's storage attributes: at most one shape attribute, and an optional `alias = "old"`
@@ -132,7 +135,7 @@ fn path_name(path: &syn::Path) -> String {
 }
 
 pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
-    let mut parsed = TypeAttrs { kind: None, code: None, indexes: Vec::new(), labels: None, state: None, edges: None };
+    let mut parsed = TypeAttrs { kind: None, code: None, indexes: Vec::new(), labels: None, state: None, edges: None, intern: None };
     for attr in store_attrs(attrs) {
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
@@ -171,6 +174,13 @@ pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
                     let value: syn::Path = meta.value()?.parse()?;
                     if parsed.edges.replace(value).is_some() {
                         return Err(meta.error("`edges` is given twice"));
+                    }
+                }
+                "intern" if meta.input.peek(syn::Token![=]) => {
+                    let value: LitStr = meta.value()?.parse()?;
+                    code(&value)?;
+                    if parsed.intern.replace(value).is_some() {
+                        return Err(meta.error("`intern` is given twice"));
                     }
                 }
                 _ if FieldAttr::parse(&name).is_some() || name == "alias" => {

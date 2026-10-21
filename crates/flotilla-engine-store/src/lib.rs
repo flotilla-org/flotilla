@@ -48,8 +48,9 @@ pub fn registry() -> Result<KindRegistry, RegistryError> {
 
 /// The kinds the Convoy stack moves (#3587), declared ahead of their machines
 /// for the owner's schema look-over: Convoy, with its seats, promises,
-/// submissions and duties as its tables, and AwaitingReply. Codes are the
-/// production registry's. Nothing opens a store with these yet; layer 4's
+/// submissions and duties as its tables, and AwaitingReply. Convoy's code is
+/// the production registry's, and AwaitingReply's `ar` is held by no
+/// production kind. Nothing opens a store with these yet; layer 4's
 /// machines replace the declarations, keeping their tables, and join
 /// [`machine_registry`].
 pub fn convoy_registry() -> Result<KindRegistry, RegistryError> {

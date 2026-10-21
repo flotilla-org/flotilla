@@ -44,3 +44,4 @@ Interned column domains:
 | `convoy_promises_submissions` | `address` | `ad` |
 | `convoy_promises_submissions` | `by_role` | `rl` |
 | `convoy_promises_submissions` | `by_seat` | `st` |
+| `convoy_quota` | `key` | `vc` |

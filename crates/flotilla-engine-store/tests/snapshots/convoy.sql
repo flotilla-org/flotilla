@@ -115,24 +115,24 @@ CREATE TABLE "convoy" (
       END)
 ) STRICT;
 CREATE TABLE "convoy_duties" (
-  "owner" INTEGER NOT NULL,
+  "convoy" INTEGER NOT NULL,
   "key" INTEGER NOT NULL,
   "owner_role" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "owner_seat" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "scope" TEXT NOT NULL CHECK ("scope" IN ('lt', 'wo')),
   "terms" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "key"),
-  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("convoy", "key"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "convoy_duties_scope_promises" (
-  "owner" INTEGER NOT NULL,
+  "convoy" INTEGER NOT NULL,
   "duties_key" INTEGER NOT NULL,
   "value" INTEGER NOT NULL,
-  PRIMARY KEY ("owner", "duties_key", "value"),
-  FOREIGN KEY ("owner", "duties_key") REFERENCES "convoy_duties" ("owner", "key") ON DELETE CASCADE
+  PRIMARY KEY ("convoy", "duties_key", "value"),
+  FOREIGN KEY ("convoy", "duties_key") REFERENCES "convoy_duties" ("convoy", "key") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "convoy_seats" (
-  "owner" INTEGER NOT NULL,
+  "convoy" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
   "role" INTEGER NOT NULL REFERENCES "strings" ("id"),
@@ -140,15 +140,15 @@ CREATE TABLE "convoy_seats" (
   "parent_role" INTEGER REFERENCES "strings" ("id"),
   "parent_seat" INTEGER REFERENCES "strings" ("id"),
   "supervised_by" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE,
+  PRIMARY KEY ("convoy", "pos"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE,
   CHECK (CASE WHEN "parent_role" IS NOT NULL
       THEN "parent_seat" IS NOT NULL
       ELSE "parent_seat" IS NULL
       END)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "convoy_promises" (
-  "owner" INTEGER NOT NULL,
+  "convoy" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
   "id" INTEGER NOT NULL,
@@ -159,11 +159,11 @@ CREATE TABLE "convoy_promises" (
   "owner_seat" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "progress" TEXT NOT NULL CHECK ("progress" IN ('ke', 'pe', 'rt', 'su')),
   "progress_since" INTEGER NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("convoy", "pos"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "convoy_promises_submissions" (
-  "owner" INTEGER NOT NULL,
+  "convoy" INTEGER NOT NULL,
   "promises_pos" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
@@ -171,21 +171,21 @@ CREATE TABLE "convoy_promises_submissions" (
   "revision" TEXT NOT NULL,
   "by_role" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "by_seat" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  PRIMARY KEY ("owner", "promises_pos", "pos"),
-  FOREIGN KEY ("owner", "promises_pos") REFERENCES "convoy_promises" ("owner", "pos") ON DELETE CASCADE
+  PRIMARY KEY ("convoy", "promises_pos", "pos"),
+  FOREIGN KEY ("convoy", "promises_pos") REFERENCES "convoy_promises" ("convoy", "pos") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "convoy_quota" (
-  "owner" INTEGER NOT NULL,
-  "key" INTEGER NOT NULL,
+  "convoy" INTEGER NOT NULL,
+  "key" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "value" INTEGER NOT NULL,
-  PRIMARY KEY ("owner", "key"),
-  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("convoy", "key"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "convoy_retired" (
-  "owner" INTEGER NOT NULL,
+  "convoy" INTEGER NOT NULL,
   "value" INTEGER NOT NULL,
-  PRIMARY KEY ("owner", "value"),
-  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("convoy", "value"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "convoy_open_by_project" ON "convoy" ("project") WHERE "state" IN ('op');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
@@ -225,7 +225,7 @@ CREATE VIEW "convoy_view" AS SELECT
   "convoy"."reason"
 FROM "convoy";
 CREATE VIEW "convoy_duties_view" AS SELECT
-  "convoy_duties"."owner",
+  "convoy_duties"."convoy",
   "convoy_duties"."key",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_duties"."owner_role") AS "owner_role",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_duties"."owner_seat") AS "owner_seat",
@@ -233,12 +233,12 @@ CREATE VIEW "convoy_duties_view" AS SELECT
   "convoy_duties"."terms"
 FROM "convoy_duties";
 CREATE VIEW "convoy_duties_scope_promises_view" AS SELECT
-  "convoy_duties_scope_promises"."owner",
+  "convoy_duties_scope_promises"."convoy",
   "convoy_duties_scope_promises"."duties_key",
   "convoy_duties_scope_promises"."value"
 FROM "convoy_duties_scope_promises";
 CREATE VIEW "convoy_seats_view" AS SELECT
-  "convoy_seats"."owner",
+  "convoy_seats"."convoy",
   "convoy_seats"."pos",
   "convoy_seats"."version",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."role") AS "role",
@@ -248,7 +248,7 @@ CREATE VIEW "convoy_seats_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."supervised_by") AS "supervised_by"
 FROM "convoy_seats";
 CREATE VIEW "convoy_promises_view" AS SELECT
-  "convoy_promises"."owner",
+  "convoy_promises"."convoy",
   "convoy_promises"."pos",
   "convoy_promises"."version",
   "convoy_promises"."id",
@@ -261,7 +261,7 @@ CREATE VIEW "convoy_promises_view" AS SELECT
   "convoy_promises"."progress_since"
 FROM "convoy_promises";
 CREATE VIEW "convoy_promises_submissions_view" AS SELECT
-  "convoy_promises_submissions"."owner",
+  "convoy_promises_submissions"."convoy",
   "convoy_promises_submissions"."promises_pos",
   "convoy_promises_submissions"."pos",
   "convoy_promises_submissions"."version",
@@ -271,12 +271,12 @@ CREATE VIEW "convoy_promises_submissions_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises_submissions"."by_seat") AS "by_seat"
 FROM "convoy_promises_submissions";
 CREATE VIEW "convoy_quota_view" AS SELECT
-  "convoy_quota"."owner",
-  "convoy_quota"."key",
+  "convoy_quota"."convoy",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_quota"."key") AS "key",
   "convoy_quota"."value"
 FROM "convoy_quota";
 CREATE VIEW "convoy_retired_view" AS SELECT
-  "convoy_retired"."owner",
+  "convoy_retired"."convoy",
   "convoy_retired"."value"
 FROM "convoy_retired";
 CREATE VIEW "log_view" AS SELECT

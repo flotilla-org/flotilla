@@ -12,7 +12,7 @@ use crate::descriptor::{Table, TableRole, TableSet};
 pub const WIDE: usize = 30;
 
 /// The columns a table has in the backend: the root's `id` and `version`, or a nested table's
-/// `owner` and key, plus the descriptor's columns (a records or history table's stamp included).
+/// parent key (named after the root table) and key, plus the descriptor's columns (a records or history table's stamp included).
 pub fn column_count(table: &Table) -> usize {
     table.generated.len() + table.key.len() + table.columns.len()
 }

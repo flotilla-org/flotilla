@@ -250,11 +250,11 @@ fn foreign_key_violations(conn: &Connection) -> i64 {
 
 /// Rows of every table of `K` owned by resource `id`.
 fn owned_rows<K: Kind>(conn: &Connection, id: i64) -> Vec<(String, i64)> {
-    K::table_set()
-        .tables
+    let set = K::table_set();
+    set.tables
         .iter()
         .map(|table| {
-            let owner = if table.parent.is_none() { "id" } else { "owner" };
+            let owner = if table.parent.is_none() { "id" } else { set.parent_key_column() };
             let sql = format!("SELECT count(*) FROM {} WHERE {owner} = ?1", quote_ident(&table.name));
             (table.name.clone(), conn.query_row(&sql, [id], |row| row.get(0)).expect("count"))
         })

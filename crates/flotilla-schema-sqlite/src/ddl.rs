@@ -170,7 +170,7 @@ fn readable(set: &TableSet, table: &Table) -> (String, String) {
     let source = quote_ident(&table.name);
     let mut lines: Vec<String> = match table.parent {
         None => ["id", "version"].iter().map(|column| format!("{source}.{}", quote_ident(column))).collect(),
-        Some(_) => vec![format!("{source}.{}", quote_ident("owner"))],
+        Some(_) => vec![format!("{source}.{}", quote_ident(set.parent_key_column()))],
     };
     for (position, column) in table.key.iter().chain(&table.columns).enumerate() {
         let value = format!("{source}.{}", quote_ident(&column.name));
@@ -191,6 +191,7 @@ fn readable(set: &TableSet, table: &Table) -> (String, String) {
 }
 
 fn render_table(out: &mut String, set: &TableSet, table: &Table, exists: &str) {
+    let owner = quote_ident(set.parent_key_column());
     let mut lines = Vec::new();
     match table.parent {
         None => {
@@ -202,20 +203,20 @@ fn render_table(out: &mut String, set: &TableSet, table: &Table, exists: &str) {
             ));
             lines.push(format!("{} INTEGER NOT NULL", quote_ident("version")));
         }
-        Some(_) => lines.push(format!("{} INTEGER NOT NULL", quote_ident("owner"))),
+        Some(_) => lines.push(format!("{owner} INTEGER NOT NULL")),
     }
     lines.extend(table.key.iter().chain(&table.columns).map(column));
     if let Some(parent_index) = table.parent {
         let parent = &set.tables[parent_index];
-        let mut key = vec![quote_ident("owner")];
+        let mut key = vec![owner.clone()];
         key.extend(table.key.iter().map(|c| quote_ident(&c.name)));
         lines.push(format!("PRIMARY KEY ({})", key.join(", ")));
         let foreign = if parent.role == TableRole::Root {
-            format!("FOREIGN KEY ({}) REFERENCES {} ({})", quote_ident("owner"), quote_ident(&parent.name), quote_ident("id"))
+            format!("FOREIGN KEY ({owner}) REFERENCES {} ({})", quote_ident(&parent.name), quote_ident("id"))
         } else {
-            let mut local = vec![quote_ident("owner")];
+            let mut local = vec![owner.clone()];
             local.extend(table.parent_key().iter().map(|c| quote_ident(&c.name)));
-            let mut remote = vec![quote_ident("owner")];
+            let mut remote = vec![owner.clone()];
             remote.extend(parent.key.iter().map(|c| quote_ident(&c.name)));
             format!("FOREIGN KEY ({}) REFERENCES {} ({})", local.join(", "), quote_ident(&parent.name), remote.join(", "))
         };
@@ -375,7 +376,7 @@ mod tests {
     }
 
     // Behaviour (DESIGN DDL): STRICT tables in pre-order; the root keyed by its identity id; each
-    // child keyed by owner plus its logical key, with a cascading FK to its parent's full key;
+    // child keyed by its parent key (named after the root) plus its logical key, with a cascading FK to its parent's full key;
     // per-type REFERENCES and CHECKs; indexes, declared and one per child-table reference column,
     // sorted by name after the tables. Then (#3392 D4)
     // the kind's `codes` rows, and one view per table naming its codes and interned strings.
@@ -390,21 +391,21 @@ mod tests {
   "workflow" BLOB NOT NULL REFERENCES "objects" ("hash")
 ) STRICT;
 CREATE TABLE "convoy_deliverables" (
-  "owner" INTEGER NOT NULL,
+  "convoy" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
   "target" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("convoy", "pos"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "convoy_deliverables_evidence" (
-  "owner" INTEGER NOT NULL,
+  "convoy" INTEGER NOT NULL,
   "deliverables_pos" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
   "value" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "deliverables_pos", "pos"),
-  FOREIGN KEY ("owner", "deliverables_pos") REFERENCES "convoy_deliverables" ("owner", "pos") ON DELETE CASCADE
+  PRIMARY KEY ("convoy", "deliverables_pos", "pos"),
+  FOREIGN KEY ("convoy", "deliverables_pos") REFERENCES "convoy_deliverables" ("convoy", "pos") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "convoy_by_name" ON "convoy" ("name");
 CREATE INDEX "convoy_deliverables_target_ref" ON "convoy_deliverables" ("target");
@@ -422,13 +423,13 @@ CREATE VIEW "convoy_view" AS SELECT
   "convoy"."workflow"
 FROM "convoy";
 CREATE VIEW "convoy_deliverables_view" AS SELECT
-  "convoy_deliverables"."owner",
+  "convoy_deliverables"."convoy",
   "convoy_deliverables"."pos",
   "convoy_deliverables"."version",
   "convoy_deliverables"."target"
 FROM "convoy_deliverables";
 CREATE VIEW "convoy_deliverables_evidence_view" AS SELECT
-  "convoy_deliverables_evidence"."owner",
+  "convoy_deliverables_evidence"."convoy",
   "convoy_deliverables_evidence"."deliverables_pos",
   "convoy_deliverables_evidence"."pos",
   "convoy_deliverables_evidence"."version",
@@ -493,7 +494,8 @@ FROM "convoy_deliverables_evidence";
             layout.column(reserved, ColumnType::Text, true);
             assert!(matches!(layout.finish().validate(), Err(DescriptorError::ReservedColumn { column, .. }) if column == reserved));
         }
-        // A child table adds only `owner`; `id` and `version` are free there.
+        // A child table adds only its parent key, named after the root table; `id`, `version` and
+        // `owner` are free there.
         let child = |name: &str| {
             let mut layout = Layout::root("Edge", KindCode::new("k1"));
             layout.table("items", TableRole::Child, |layout| {
@@ -502,7 +504,8 @@ FROM "convoy_deliverables_evidence";
             });
             layout.finish().validate()
         };
-        assert!(matches!(child("owner"), Err(DescriptorError::ReservedColumn { column, .. }) if column == "owner"));
+        assert!(matches!(child("edge"), Err(DescriptorError::ReservedColumn { column, .. }) if column == "edge"));
+        assert_eq!(child("owner"), Ok(()));
         assert_eq!(child("version"), Ok(()));
         assert_eq!(child("id"), Ok(()));
         // `records` and `history` tables start with the version stamp, and reserve its name.
@@ -520,7 +523,7 @@ FROM "convoy_deliverables_evidence";
             assert_eq!(records(&[RECORD_VERSION, "at"]), Ok(()));
             assert!(matches!(records(&["at"]), Err(DescriptorError::MissingStamp { table, .. }) if table == "edge_events"));
             assert!(matches!(records(&["at", RECORD_VERSION]), Err(DescriptorError::MissingStamp { .. })));
-            for reserved in ["owner", RECORD_VERSION] {
+            for reserved in ["edge", RECORD_VERSION] {
                 let refused = records(&[RECORD_VERSION, reserved]);
                 assert!(
                     matches!(refused, Err(DescriptorError::ReservedColumn { column, .. }) if column == reserved),

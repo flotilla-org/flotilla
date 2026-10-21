@@ -284,8 +284,9 @@ impl Layout {
                 ColumnDef { name, ..column.clone() }
             })
             .collect();
-        let mut owner = ColumnDef::new("owner", ColumnType::Ref, false);
-        owner.reference = Some(self.set.tables[0].name.clone());
+        let root = self.set.parent_key_column().to_owned();
+        let mut owner = ColumnDef::new(&root, ColumnType::Ref, false);
+        owner.reference = Some(root);
         owner.add_role("key");
         owner.add_role("ref");
         let table = Table {

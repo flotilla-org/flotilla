@@ -35,11 +35,14 @@ fn condition(guard: &Guard) -> String {
     }
 }
 
-/// A row's primary key columns: `id` on the root; `owner` and the logical key on child tables.
+/// A row's primary key columns: `id` on the root; the generated parent key and the logical key on
+/// child tables.
 fn primary_key(table: &Table) -> Vec<String> {
     match table.parent {
         None => vec![quote_ident("id")],
-        Some(_) => std::iter::once(quote_ident("owner")).chain(table.key.iter().map(|column| quote_ident(&column.name))).collect(),
+        Some(_) => {
+            std::iter::once(quote_ident(&table.generated[0].name)).chain(table.key.iter().map(|column| quote_ident(&column.name))).collect()
+        }
     }
 }
 

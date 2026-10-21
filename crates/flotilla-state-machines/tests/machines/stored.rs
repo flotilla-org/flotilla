@@ -44,15 +44,18 @@ fn kind_codes_are_pinned() {
     ];
     let expected = [
         ("AgentSession", KindCode::new("as")),
-        ("AwaitingReply", KindCode::new("ar")),
         ("Convoy", KindCode::new("cv")),
         ("Ensure", KindCode::new("en")),
         ("Message", KindCode::new("ms")),
         ("Vessel", KindCode::new("ve")),
     ];
-    let ahead = (Declared::<AwaitingReplySpec, AwaitingReplyEdgeKind>::KIND, Declared::<AwaitingReplySpec, AwaitingReplyEdgeKind>::CODE);
-    assert_eq!([&declared[..1], &[ahead], &declared[1..]].concat(), expected);
+    assert_eq!(declared, expected);
     assert_eq!(pinned, expected.map(|(kind, code)| (kind.to_owned(), code)));
+    // Declared ahead of its machine (#3587 layer 3): layer 4 registers `Resource<AwaitingReply>`
+    // under this code, which no production kind holds meanwhile.
+    let ahead = (Declared::<AwaitingReplySpec, AwaitingReplyEdgeKind>::KIND, Declared::<AwaitingReplySpec, AwaitingReplyEdgeKind>::CODE);
+    assert_eq!(ahead, ("AwaitingReply", KindCode::new("ar")));
+    assert!(registry.iter().all(|set| set.code != ahead.1));
 }
 
 fn project() -> Address {
@@ -311,7 +314,7 @@ fn declared_convoy_and_awaiting_reply_round_trip() {
         awaiting_reply::{Awaited, AwaitingReplySpec, AwaitingReplyState},
         convoy::work::{
             ConvoyEdgeKind as WorkEdgeKind, ConvoySpec as WorkSpec, ConvoyState as WorkState, Duty, DutyId, DutyScope, Progress,
-            Promise as WorkPromise, PromiseKind, PromiseKinds, Seat, SeatName, Source, Submission, Terms,
+            Promise as WorkPromise, PromiseKind, PromiseKinds, Seat, SeatName, Source, Submission, Terms, VesselClass as Class,
         },
     };
 
@@ -353,7 +356,11 @@ fn declared_convoy_and_awaiting_reply_round_trip() {
     let kinds = PromiseKinds { kinds: [("pr".to_owned(), PromiseKind::default())].into() };
     let spec = WorkSpec { project: project(), priority: Priority(3), kinds: Frozen::new(kinds).expect("frozen"), duties, seats, promises };
     let state = State::new(
-        WorkState::Abandoned { quota: [(VesselClass(0), 2)].into(), retired: BTreeSet::from([DutyId(0)]), reason: "decision".into() },
+        WorkState::Abandoned {
+            quota: [(Class("standard".into()), 2)].into(),
+            retired: BTreeSet::from([DutyId(0)]),
+            reason: "decision".into(),
+        },
         Timestamp(5),
     );
     let convoy = Declared::<WorkSpec, WorkEdgeKind>::new(spec, state);

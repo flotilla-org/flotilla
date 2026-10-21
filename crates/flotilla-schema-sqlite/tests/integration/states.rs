@@ -377,7 +377,7 @@ fn a_label_and_its_data_change_in_one_statement() {
     let together = format!("UPDATE ticket SET {closing}, reason = 'r', {signed} {}", by(stamp.id));
     assert_eq!(conn.execute(&together, []).expect("one statement"), 1);
 
-    conn.execute(&format!("INSERT INTO ticket_assignees (owner, value) VALUES ({}, 'x')", draft.id.0), []).expect("no table CHECK");
+    conn.execute(&format!("INSERT INTO ticket_assignees (ticket, value) VALUES ({}, 'x')", draft.id.0), []).expect("no table CHECK");
     let mut store = Store::open(conn, LOCAL, registry()).expect("reopen");
     let refused = store.read().expect("read").load::<Ticket>(draft.id);
     assert!(matches!(refused, Err(StoreError::Decode(flotilla_schema::DecodeError::AbsentRows { .. }))), "{refused:?}");

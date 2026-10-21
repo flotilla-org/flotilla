@@ -39,6 +39,10 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     if let Some(lifetime) = input.generics.params.iter().find(|param| matches!(param, GenericParam::Lifetime(_))) {
         return Err(refuse(lifetime, "a stored type owns its data and takes no lifetime parameters"));
     }
+    let newtype = matches!(&input.data, Data::Struct(data) if matches!(&data.fields, Fields::Unnamed(fields) if fields.unnamed.len() == 1));
+    if let (Some(domain), false) = (&type_attrs.intern, newtype) {
+        return Err(refuse(domain, "`intern` on a type belongs on a newtype of String"));
+    }
     match &input.data {
         Data::Union(data) => Err(refuse(data.union_token, "unions cannot be stored")),
         Data::Enum(data) => enums::expand(input, data, type_attrs),
@@ -581,6 +585,23 @@ mod tests {
     fn newtypes_of_string_intern() {
         assert!(expanded(quote! { struct Name(String); }).contains(":: flotilla_schema :: Intern for Name"));
         assert!(!expanded(quote! { struct Count(u32); }).contains("Intern for"));
+    }
+
+    // Behaviour (#3627 look-over ruling 4): `intern = ".."` on a newtype of String interns it in
+    // that domain wherever it is stored, a map key included; on anything else it is refused.
+    #[test]
+    fn interned_newtypes_carry_their_domain() {
+        let class = expanded(quote! { #[store(intern = "vc")] struct Class(String); });
+        for expected in [":: flotilla_schema :: Intern for Class", "adapt :: AsInterned", "Code :: new (\"vc\")", "KeyColumn for Class"] {
+            assert!(class.contains(expected), "missing {expected} in {class}");
+        }
+        for case in [
+            quote! { #[store(intern = "vc")] struct Count(u32); },
+            quote! { #[store(intern = "vc")] struct A { a: String } },
+            quote! { #[store(intern = "vc")] enum A { #[store(code = "c1")] B } },
+        ] {
+            assert!(error(case).contains("`intern` on a type belongs on a newtype of String"));
+        }
     }
 
     // Behaviour (#3392 ruling D5): a kind's spec (`state = S` beside `kind` and `code`) declares

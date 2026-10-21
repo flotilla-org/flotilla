@@ -67,7 +67,7 @@ fn the_view_counts_columns_enum_expansion_and_wide_tables() {
     assert_eq!(column_count(root), 2 + 5 + 4 + 20);
     assert_eq!(enum_columns(root), [("outer", 5), ("part_kind", 3)]);
     let rows = &set.tables[1];
-    assert_eq!(column_count(rows), 1 + 1 + 1 + 4, "owner, pos, the stamp and the part's columns");
+    assert_eq!(column_count(rows), 1 + 1 + 1 + 4, "the parent key, pos, the stamp and the part's columns");
     assert_eq!(enum_columns(rows), [("kind", 3)]);
 
     let view = render_view([&set]);

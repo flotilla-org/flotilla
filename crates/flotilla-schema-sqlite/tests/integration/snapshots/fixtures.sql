@@ -103,26 +103,26 @@ CREATE TABLE "convoy" (
       END)
 ) STRICT;
 CREATE TABLE "convoy_promises" (
-  "owner" INTEGER NOT NULL,
+  "convoy" INTEGER NOT NULL,
   "key" INTEGER NOT NULL,
   "kind" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "target" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  PRIMARY KEY ("owner", "key"),
-  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("convoy", "key"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "convoy_resolution" (
-  "owner" INTEGER NOT NULL,
+  "convoy" INTEGER NOT NULL,
   "key" INTEGER NOT NULL,
   "value" TEXT NOT NULL CHECK ("value" IN ('ke', 'pe', 'rt')),
-  PRIMARY KEY ("owner", "key"),
-  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("convoy", "key"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "convoy_quota" (
-  "owner" INTEGER NOT NULL,
+  "convoy" INTEGER NOT NULL,
   "key" INTEGER NOT NULL,
   "value" INTEGER NOT NULL,
-  PRIMARY KEY ("owner", "key"),
-  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("convoy", "key"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "convoy_open_by_project" ON "convoy" ("project") WHERE "state" IN ('op');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
@@ -150,18 +150,18 @@ CREATE VIEW "convoy_view" AS SELECT
   "convoy"."reason"
 FROM "convoy";
 CREATE VIEW "convoy_promises_view" AS SELECT
-  "convoy_promises"."owner",
+  "convoy_promises"."convoy",
   "convoy_promises"."key",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises"."kind") AS "kind",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises"."target") AS "target"
 FROM "convoy_promises";
 CREATE VIEW "convoy_resolution_view" AS SELECT
-  "convoy_resolution"."owner",
+  "convoy_resolution"."convoy",
   "convoy_resolution"."key",
   (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'resolution.value' AND "code" = "convoy_resolution"."value") AS "value"
 FROM "convoy_resolution";
 CREATE VIEW "convoy_quota_view" AS SELECT
-  "convoy_quota"."owner",
+  "convoy_quota"."convoy",
   "convoy_quota"."key",
   "convoy_quota"."value"
 FROM "convoy_quota";
@@ -175,13 +175,13 @@ CREATE TABLE "dossier" (
   "state_since" INTEGER NOT NULL
 ) STRICT;
 CREATE TABLE "dossier_inputs" (
-  "owner" INTEGER NOT NULL,
+  "dossier" INTEGER NOT NULL,
   "key" TEXT NOT NULL,
   "tag" TEXT NOT NULL CHECK ("tag" IN ('c1', 'c2', 'c3', 'c4')),
   "value" TEXT,
   "number" INTEGER,
-  PRIMARY KEY ("owner", "key"),
-  FOREIGN KEY ("owner") REFERENCES "dossier" ("id") ON DELETE CASCADE,
+  PRIMARY KEY ("dossier", "key"),
+  FOREIGN KEY ("dossier") REFERENCES "dossier" ("id") ON DELETE CASCADE,
   CHECK (CASE WHEN "tag" = 'c1'
       THEN "value" IS NOT NULL
       AND "number" IS NULL
@@ -200,15 +200,15 @@ CREATE TABLE "dossier_inputs" (
       END)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "dossier_inputs_items" (
-  "owner" INTEGER NOT NULL,
+  "dossier" INTEGER NOT NULL,
   "inputs_key" TEXT NOT NULL,
   "pos" INTEGER NOT NULL,
   "value" TEXT NOT NULL,
-  PRIMARY KEY ("owner", "inputs_key", "pos"),
-  FOREIGN KEY ("owner", "inputs_key") REFERENCES "dossier_inputs" ("owner", "key") ON DELETE CASCADE
+  PRIMARY KEY ("dossier", "inputs_key", "pos"),
+  FOREIGN KEY ("dossier", "inputs_key") REFERENCES "dossier_inputs" ("dossier", "key") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "dossier_deliverables" (
-  "owner" INTEGER NOT NULL,
+  "dossier" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
   "label" INTEGER NOT NULL REFERENCES "strings" ("id"),
@@ -217,8 +217,8 @@ CREATE TABLE "dossier_deliverables" (
   "source_step" INTEGER REFERENCES "strings" ("id"),
   "state" TEXT NOT NULL CHECK ("state" IN ('c1', 'c2')),
   "state_since" INTEGER NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "dossier" ("id") ON DELETE CASCADE,
+  PRIMARY KEY ("dossier", "pos"),
+  FOREIGN KEY ("dossier") REFERENCES "dossier" ("id") ON DELETE CASCADE,
   CHECK (CASE WHEN "source" = 'c1'
       THEN "source_step" IS NOT NULL
       END),
@@ -227,7 +227,7 @@ CREATE TABLE "dossier_deliverables" (
       END)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "dossier_deliverables_evidence" (
-  "owner" INTEGER NOT NULL,
+  "dossier" INTEGER NOT NULL,
   "deliverables_pos" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
@@ -236,8 +236,8 @@ CREATE TABLE "dossier_deliverables_evidence" (
   "verdict_accepted" INTEGER CHECK ("verdict_accepted" IN (0, 1)),
   "verdict_by" INTEGER REFERENCES "strings" ("id"),
   "verdict_at" INTEGER,
-  PRIMARY KEY ("owner", "deliverables_pos", "pos"),
-  FOREIGN KEY ("owner", "deliverables_pos") REFERENCES "dossier_deliverables" ("owner", "pos") ON DELETE CASCADE,
+  PRIMARY KEY ("dossier", "deliverables_pos", "pos"),
+  FOREIGN KEY ("dossier", "deliverables_pos") REFERENCES "dossier_deliverables" ("dossier", "pos") ON DELETE CASCADE,
   CHECK (CASE WHEN "verdict_accepted" IS NOT NULL
       THEN "verdict_by" IS NOT NULL
       AND "verdict_at" IS NOT NULL
@@ -246,13 +246,13 @@ CREATE TABLE "dossier_deliverables_evidence" (
       END)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "dossier_deliverables_evidence_metadata" (
-  "owner" INTEGER NOT NULL,
+  "dossier" INTEGER NOT NULL,
   "deliverables_pos" INTEGER NOT NULL,
   "evidence_pos" INTEGER NOT NULL,
   "key" TEXT NOT NULL,
   "value" TEXT NOT NULL,
-  PRIMARY KEY ("owner", "deliverables_pos", "evidence_pos", "key"),
-  FOREIGN KEY ("owner", "deliverables_pos", "evidence_pos") REFERENCES "dossier_deliverables_evidence" ("owner", "deliverables_pos", "pos") ON DELETE CASCADE
+  PRIMARY KEY ("dossier", "deliverables_pos", "evidence_pos", "key"),
+  FOREIGN KEY ("dossier", "deliverables_pos", "evidence_pos") REFERENCES "dossier_deliverables_evidence" ("dossier", "deliverables_pos", "pos") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('do', 'state', 'c1', 'Open'),
@@ -286,20 +286,20 @@ CREATE VIEW "dossier_view" AS SELECT
   "dossier"."state_since"
 FROM "dossier";
 CREATE VIEW "dossier_inputs_view" AS SELECT
-  "dossier_inputs"."owner",
+  "dossier_inputs"."dossier",
   "dossier_inputs"."key",
   (SELECT "name" FROM "codes" WHERE "kind" = 'do' AND "field" = 'inputs.tag' AND "code" = "dossier_inputs"."tag") AS "tag",
   "dossier_inputs"."value",
   "dossier_inputs"."number"
 FROM "dossier_inputs";
 CREATE VIEW "dossier_inputs_items_view" AS SELECT
-  "dossier_inputs_items"."owner",
+  "dossier_inputs_items"."dossier",
   "dossier_inputs_items"."inputs_key",
   "dossier_inputs_items"."pos",
   "dossier_inputs_items"."value"
 FROM "dossier_inputs_items";
 CREATE VIEW "dossier_deliverables_view" AS SELECT
-  "dossier_deliverables"."owner",
+  "dossier_deliverables"."dossier",
   "dossier_deliverables"."pos",
   "dossier_deliverables"."version",
   (SELECT "s" FROM "strings" WHERE "id" = "dossier_deliverables"."label") AS "label",
@@ -310,7 +310,7 @@ CREATE VIEW "dossier_deliverables_view" AS SELECT
   "dossier_deliverables"."state_since"
 FROM "dossier_deliverables";
 CREATE VIEW "dossier_deliverables_evidence_view" AS SELECT
-  "dossier_deliverables_evidence"."owner",
+  "dossier_deliverables_evidence"."dossier",
   "dossier_deliverables_evidence"."deliverables_pos",
   "dossier_deliverables_evidence"."pos",
   "dossier_deliverables_evidence"."version",
@@ -321,7 +321,7 @@ CREATE VIEW "dossier_deliverables_evidence_view" AS SELECT
   "dossier_deliverables_evidence"."verdict_at"
 FROM "dossier_deliverables_evidence";
 CREATE VIEW "dossier_deliverables_evidence_metadata_view" AS SELECT
-  "dossier_deliverables_evidence_metadata"."owner",
+  "dossier_deliverables_evidence_metadata"."dossier",
   "dossier_deliverables_evidence_metadata"."deliverables_pos",
   "dossier_deliverables_evidence_metadata"."evidence_pos",
   "dossier_deliverables_evidence_metadata"."key",
@@ -369,16 +369,16 @@ CREATE TABLE "ensure" (
       END)
 ) STRICT;
 CREATE TABLE "ensure_recorded" (
-  "owner" INTEGER NOT NULL,
+  "ensure" INTEGER NOT NULL,
   "value" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  PRIMARY KEY ("owner", "value"),
-  FOREIGN KEY ("owner") REFERENCES "ensure" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("ensure", "value"),
+  FOREIGN KEY ("ensure") REFERENCES "ensure" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "ensure_created" (
-  "owner" INTEGER NOT NULL,
+  "ensure" INTEGER NOT NULL,
   "value" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  PRIMARY KEY ("owner", "value"),
-  FOREIGN KEY ("owner") REFERENCES "ensure" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("ensure", "value"),
+  FOREIGN KEY ("ensure") REFERENCES "ensure" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "ensure_by_inbox" ON "ensure" ("inbox");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
@@ -421,11 +421,11 @@ CREATE VIEW "ensure_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "ensure"."bound") AS "bound"
 FROM "ensure";
 CREATE VIEW "ensure_recorded_view" AS SELECT
-  "ensure_recorded"."owner",
+  "ensure_recorded"."ensure",
   (SELECT "s" FROM "strings" WHERE "id" = "ensure_recorded"."value") AS "value"
 FROM "ensure_recorded";
 CREATE VIEW "ensure_created_view" AS SELECT
-  "ensure_created"."owner",
+  "ensure_created"."ensure",
   (SELECT "s" FROM "strings" WHERE "id" = "ensure_created"."value") AS "value"
 FROM "ensure_created";
 CREATE TABLE "message" (
@@ -516,13 +516,13 @@ CREATE TABLE "message" (
       END)
 ) STRICT;
 CREATE TABLE "message_references" (
-  "owner" INTEGER NOT NULL,
+  "message" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "address" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "revision" TEXT NOT NULL,
   "subject" INTEGER NOT NULL CHECK ("subject" IN (0, 1)),
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "message" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("message", "pos"),
+  FOREIGN KEY ("message") REFERENCES "message" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "message_by_reply" ON "message" ("in_reply_to") WHERE "in_reply_to" IS NOT NULL;
 CREATE INDEX "message_by_supersedes" ON "message" ("supersedes") WHERE "supersedes" IS NOT NULL;
@@ -581,7 +581,7 @@ CREATE VIEW "message_view" AS SELECT
   "message"."watermark"
 FROM "message";
 CREATE VIEW "message_references_view" AS SELECT
-  "message_references"."owner",
+  "message_references"."message",
   "message_references"."pos",
   (SELECT "s" FROM "strings" WHERE "id" = "message_references"."address") AS "address",
   "message_references"."revision",
@@ -675,7 +675,7 @@ CREATE TABLE "referral" (
       END)
 ) STRICT;
 CREATE TABLE "referral_references" (
-  "owner" INTEGER NOT NULL,
+  "referral" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "tag" TEXT NOT NULL CHECK ("tag" IN ('c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7')),
   "service" INTEGER REFERENCES "strings" ("id"),
@@ -686,8 +686,8 @@ CREATE TABLE "referral_references" (
   "name" TEXT,
   "resource" INTEGER REFERENCES "resource_identity" ("id"),
   "id" TEXT,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "referral" ("id") ON DELETE CASCADE,
+  PRIMARY KEY ("referral", "pos"),
+  FOREIGN KEY ("referral") REFERENCES "referral" ("id") ON DELETE CASCADE,
   CHECK (CASE WHEN "tag" = 'c1'
       THEN "service" IS NOT NULL
       AND "scope" IS NOT NULL
@@ -816,7 +816,7 @@ CREATE VIEW "referral_view" AS SELECT
   "referral"."phase_since"
 FROM "referral";
 CREATE VIEW "referral_references_view" AS SELECT
-  "referral_references"."owner",
+  "referral_references"."referral",
   "referral_references"."pos",
   (SELECT "name" FROM "codes" WHERE "kind" = 'rf' AND "field" = 'references.tag' AND "code" = "referral_references"."tag") AS "tag",
   (SELECT "s" FROM "strings" WHERE "id" = "referral_references"."service") AS "service",
@@ -876,17 +876,17 @@ CREATE TABLE "ticket" (
       END)
 ) STRICT;
 CREATE TABLE "ticket_assignees" (
-  "owner" INTEGER NOT NULL,
+  "ticket" INTEGER NOT NULL,
   "value" TEXT NOT NULL,
-  PRIMARY KEY ("owner", "value"),
-  FOREIGN KEY ("owner") REFERENCES "ticket" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("ticket", "value"),
+  FOREIGN KEY ("ticket") REFERENCES "ticket" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "ticket_notes" (
-  "owner" INTEGER NOT NULL,
+  "ticket" INTEGER NOT NULL,
   "key" TEXT NOT NULL,
   "value" TEXT NOT NULL,
-  PRIMARY KEY ("owner", "key"),
-  FOREIGN KEY ("owner") REFERENCES "ticket" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("ticket", "key"),
+  FOREIGN KEY ("ticket") REFERENCES "ticket" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "ticket_open_by_queue" ON "ticket" ("queue") WHERE "state" IN ('c2');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
@@ -915,11 +915,11 @@ CREATE VIEW "ticket_view" AS SELECT
   "ticket"."signature_at"
 FROM "ticket";
 CREATE VIEW "ticket_assignees_view" AS SELECT
-  "ticket_assignees"."owner",
+  "ticket_assignees"."ticket",
   "ticket_assignees"."value"
 FROM "ticket_assignees";
 CREATE VIEW "ticket_notes_view" AS SELECT
-  "ticket_notes"."owner",
+  "ticket_notes"."ticket",
   "ticket_notes"."key",
   "ticket_notes"."value"
 FROM "ticket_notes";
@@ -1001,17 +1001,17 @@ CREATE TABLE "terminal_session" (
       END)
 ) STRICT;
 CREATE TABLE "terminal_session_env" (
-  "owner" INTEGER NOT NULL,
+  "terminal_session" INTEGER NOT NULL,
   "key" TEXT NOT NULL,
   "value" TEXT NOT NULL,
-  PRIMARY KEY ("owner", "key"),
-  FOREIGN KEY ("owner") REFERENCES "terminal_session" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("terminal_session", "key"),
+  FOREIGN KEY ("terminal_session") REFERENCES "terminal_session" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "terminal_session_labels" (
-  "owner" INTEGER NOT NULL,
+  "terminal_session" INTEGER NOT NULL,
   "value" TEXT NOT NULL,
-  PRIMARY KEY ("owner", "value"),
-  FOREIGN KEY ("owner") REFERENCES "terminal_session" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("terminal_session", "value"),
+  FOREIGN KEY ("terminal_session") REFERENCES "terminal_session" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "terminal_session_by_vessel" ON "terminal_session" ("vessel", "ordinal");
 CREATE INDEX "terminal_session_live_by_pool" ON "terminal_session" ("pool") WHERE "state" IN ('rq', 'rl');
@@ -1065,12 +1065,12 @@ CREATE VIEW "terminal_session_view" AS SELECT
   "terminal_session"."cause_detail"
 FROM "terminal_session";
 CREATE VIEW "terminal_session_env_view" AS SELECT
-  "terminal_session_env"."owner",
+  "terminal_session_env"."terminal_session",
   "terminal_session_env"."key",
   "terminal_session_env"."value"
 FROM "terminal_session_env";
 CREATE VIEW "terminal_session_labels_view" AS SELECT
-  "terminal_session_labels"."owner",
+  "terminal_session_labels"."terminal_session",
   "terminal_session_labels"."value"
 FROM "terminal_session_labels";
 CREATE TABLE "vessel" (
@@ -1136,11 +1136,11 @@ CREATE TABLE "vessel" (
       END)
 ) STRICT;
 CREATE TABLE "vessel_shape" (
-  "owner" INTEGER NOT NULL,
+  "vessel" INTEGER NOT NULL,
   "key" INTEGER NOT NULL,
   "value" INTEGER NOT NULL,
-  PRIMARY KEY ("owner", "key"),
-  FOREIGN KEY ("owner") REFERENCES "vessel" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("vessel", "key"),
+  FOREIGN KEY ("vessel") REFERENCES "vessel" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "vessel_by_convoy" ON "vessel" ("convoy");
 CREATE INDEX "vessel_live_by_host" ON "vessel" ("host") WHERE "state" IN ('rq', 'rl');
@@ -1187,7 +1187,7 @@ CREATE VIEW "vessel_view" AS SELECT
   "vessel"."cause_detail"
 FROM "vessel";
 CREATE VIEW "vessel_shape_view" AS SELECT
-  "vessel_shape"."owner",
+  "vessel_shape"."vessel",
   "vessel_shape"."key",
   "vessel_shape"."value"
 FROM "vessel_shape";

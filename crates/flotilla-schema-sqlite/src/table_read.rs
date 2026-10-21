@@ -44,9 +44,9 @@ pub(crate) fn read(
     name: &str,
     filters: &[TableFilter],
 ) -> Result<TableRead, StoreError> {
-    let source = kinds
+    let (set, source) = kinds
         .iter()
-        .find_map(|set| set.tables.iter().find(|table| table.name == name))
+        .find_map(|set| set.tables.iter().find(|table| table.name == name).map(|table| (set, table)))
         .ok_or_else(|| StoreError::Stream("unknown table".into()))?;
     let mut table = source.with_natural_references();
     let mut key = vec![ColumnDef::new("resource.home", ColumnType::Text, false), ColumnDef::new("resource.name", ColumnType::Text, false)];
@@ -55,7 +55,7 @@ pub(crate) fn read(
     }
     key.extend(table.key.clone());
     table.key = key;
-    let owner = if source.parent.is_none() { "id" } else { "owner" };
+    let owner = if source.parent.is_none() { "id" } else { set.parent_key_column() };
     let mut expressions = vec![
         "(SELECT s FROM strings WHERE id=i.home) AS \"resource.home\"".into(),
         "(SELECT s FROM strings WHERE id=i.name) AS \"resource.name\"".into(),
