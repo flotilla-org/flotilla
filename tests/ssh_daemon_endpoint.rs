@@ -54,6 +54,7 @@ fn daemon_hello(fingerprint: &str) -> Message {
         session_id: uuid::Uuid::nil(),
         connection_role: None,
         surface: None,
+        crew_claims: Default::default(),
     }
 }
 

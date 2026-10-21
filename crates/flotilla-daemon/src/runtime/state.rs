@@ -51,6 +51,8 @@ pub(super) struct ControllerRuntimeState {
     pub(super) agentless_ssh: HashMap<String, AgentlessSshProfile>,
     pub(super) environment_tools: EnvironmentToolProvisioner,
     pub(super) environment_sockets: Option<EnvironmentSocketService>,
+    /// Forwarded environment sockets and CLI delivery for agentless hosts (#3618).
+    pub(super) agentless_reach: Option<Arc<super::agentless_reach::AgentlessReach>>,
     /// Where host-direct Claude Code crews post their hooks, when flotillad listens on TCP.
     pub(super) hook_endpoint: Option<HookEndpoint>,
     pub(super) credential_store: Option<Arc<CredentialStore>>,
@@ -78,6 +80,13 @@ pub(super) struct ControllerRuntimeState {
 impl ControllerRuntimeState {
     pub(super) fn with_environment_sockets(mut self, sockets: Option<EnvironmentSocketService>) -> Self {
         self.environment_sockets = sockets;
+        self
+    }
+
+    /// Agentless crews reach the daemon only through forwarded environment
+    /// sockets, so reach exists exactly when the socket server does.
+    pub(super) fn with_agentless_reach(mut self, reach: Option<Arc<super::agentless_reach::AgentlessReach>>) -> Self {
+        self.agentless_reach = reach;
         self
     }
 
@@ -138,6 +147,7 @@ impl ControllerRuntimeState {
             agentless_ssh: HashMap::new(),
             environment_tools,
             environment_sockets: None,
+            agentless_reach: None,
             hook_endpoint: None,
             credential_store: None,
             agent_material: None,
@@ -262,7 +272,7 @@ impl ControllerRuntimeState {
         self.environment_sockets = Some(EnvironmentSocketService::new(
             Arc::new(Mutex::new(EnvironmentSocketRegistry::new())),
             self.config.state_dir().join("env"),
-            |listener, _| {
+            |listener, _, _| {
                 tokio::spawn(async move {
                     let _listener = listener;
                     std::future::pending::<()>().await

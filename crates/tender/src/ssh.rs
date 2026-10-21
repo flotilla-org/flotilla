@@ -467,6 +467,28 @@ pub fn forwarding_arguments(
     args
 }
 
+/// OpenSSH arguments that publish a local endpoint at a remote socket path and
+/// nothing else: no local forward and no remote command. The remote listener is
+/// bound by sshd, whose own `StreamLocalBindUnlink` decides whether a stale file
+/// is replaced, so callers remove a stale remote socket before dialling.
+pub fn reverse_forwarding_arguments(destination: &str, remote_listener: &Path, local_endpoint: &Path) -> Vec<String> {
+    vec![
+        "-N".into(),
+        "-T".into(),
+        "-R".into(),
+        forward_spec(remote_listener, local_endpoint),
+        "-o".into(),
+        "ExitOnForwardFailure=yes".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ServerAliveInterval=15".into(),
+        "-o".into(),
+        "ServerAliveCountMax=3".into(),
+        destination.into(),
+    ]
+}
+
 /// Wait for a local forward, detecting early process exit. The process probe
 /// keeps this reusable by Flotilla's injected runner without importing it.
 pub async fn wait_for_socket(
@@ -882,6 +904,20 @@ impl Tender for SshTender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #3618: a reverse forward publishes only the remote listener. It carries
+    // no local forward or remote command, and the destination is the last word.
+    #[test]
+    fn reverse_forward_carries_only_the_remote_listener() {
+        let args = reverse_forwarding_arguments("b1", Path::new("/run/user/1000/f.sock"), Path::new("/tmp/env/f.sock"));
+        assert_eq!(args.iter().filter(|arg| *arg == "-R").count(), 1);
+        assert!(!args.iter().any(|arg| arg == "-L"));
+        assert_eq!(args[args.iter().position(|arg| arg == "-R").expect("-R") + 1], "/run/user/1000/f.sock:/tmp/env/f.sock");
+        assert!(args.windows(2).any(|pair| pair == ["-o", "ExitOnForwardFailure=yes"]));
+        assert!(args.windows(2).any(|pair| pair == ["-o", "BatchMode=yes"]));
+        assert_eq!(args.last().map(String::as_str), Some("b1"));
+        assert_eq!(args[0], "-N");
+    }
 
     // A failed partial write must not install an invalid permanent key file.
     #[test]

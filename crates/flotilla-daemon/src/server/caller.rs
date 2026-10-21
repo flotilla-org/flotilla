@@ -9,6 +9,8 @@ use flotilla_protocol::{CallerCrew, CommandCaller, EnvironmentId, PrincipalRef};
 use flotilla_resources::Environment;
 use flotilla_store::StoreQuery;
 
+use super::environment_sockets::SocketReach;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PeerCredential {
     pid: Option<u32>,
@@ -79,6 +81,42 @@ fn split_nul(bytes: &[u8]) -> Vec<String> {
 
 pub(super) fn claims_from_peer(peer: Option<PeerCredential>) -> HashMap<String, String> {
     peer.and_then(|peer| peer.pid).and_then(read_environ).unwrap_or_default()
+}
+
+/// The kernel peer evidence an environment socket may use. A forwarded
+/// socket's peer is the controller's own ssh client: neither its credentials
+/// nor its environment identify a crew, so only placement and in-band claims do.
+///
+/// Trust boundary: crews placed on one agentless host share its account, and
+/// any process of that account can reach the owner-only forwarded socket and
+/// claim any crew placed in that Environment (never one placed elsewhere).
+/// They are mutually trusted, exactly as crews are on a host-direct daemon
+/// host. With several crews and no claims, identity is ambiguous and refused.
+pub(super) fn reach_evidence(reach: SocketReach, peer: Option<PeerCredential>) -> Option<PeerCredential> {
+    match reach {
+        SocketReach::Mounted => peer,
+        SocketReach::Forwarded => None,
+    }
+}
+
+/// Add a client's in-band claims to the kernel-peer claims. Either source can
+/// only narrow placement, so the two must agree on any variable both carry.
+pub(super) fn combine_claims(
+    mut peer: HashMap<String, String>,
+    in_band: &std::collections::BTreeMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
+    for key in flotilla_protocol::CREW_CLAIM_VARIABLES {
+        let Some(claim) = in_band.get(key) else { continue };
+        match peer.get(key) {
+            Some(existing) if existing != claim => {
+                return Err(format!("CallerIdentityMismatch: in-band {key} disagrees with the peer process"));
+            }
+            _ => {
+                peer.insert(key.to_string(), claim.clone());
+            }
+        }
+    }
+    Ok(peer)
 }
 
 /// Claims can only narrow identities already established by placement.
@@ -379,6 +417,41 @@ fn read_environ(_pid: u32) -> Option<HashMap<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #3618: forwarded sockets never take crew evidence from the kernel peer,
+    // whose process is the controller's own ssh client.
+    #[test]
+    fn forwarded_sockets_discard_kernel_peer_evidence() {
+        let peer = PeerCredential::from_kernel(1000, Some(42));
+        assert_eq!(reach_evidence(SocketReach::Mounted, Some(peer)), Some(peer));
+        assert_eq!(reach_evidence(SocketReach::Forwarded, Some(peer)), None);
+        assert!(claims_from_peer(reach_evidence(SocketReach::Forwarded, Some(PeerCredential::from_kernel(0, Some(1))))).is_empty());
+    }
+
+    // #3618: in-band claims add to kernel-peer claims but can never contradict
+    // them, and unknown variables are not carried.
+    #[hegel::test]
+    fn in_band_claims_narrow_and_never_contradict_peer_claims(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let key = flotilla_protocol::CREW_CLAIM_VARIABLES[tc.draw(gs::integers::<usize>().min_value(0).max_value(5))];
+        let peer_value = tc.draw(gs::sampled_from(vec![None, Some("a"), Some("b")]));
+        let in_band_value = tc.draw(gs::sampled_from(vec![None, Some("a"), Some("b")]));
+        let peer: HashMap<String, String> = peer_value.map(|value| (key.to_string(), value.to_string())).into_iter().collect();
+        let mut in_band: std::collections::BTreeMap<String, String> =
+            in_band_value.map(|value| (key.to_string(), value.to_string())).into_iter().collect();
+        in_band.insert("PATH".into(), "/forged".into());
+        let combined = combine_claims(peer, &in_band);
+        match (peer_value, in_band_value) {
+            (Some(peer), Some(claim)) if peer != claim => {
+                assert!(combined.expect_err("contradiction").starts_with("CallerIdentityMismatch:"));
+            }
+            (peer, claim) => {
+                let combined = combined.expect("consistent claims");
+                assert_eq!(combined.get(key).map(String::as_str), peer.or(claim));
+                assert!(!combined.contains_key("PATH"));
+            }
+        }
+    }
 
     // Every field independently rejects forged and empty claims; absence and
     // matching claims accept exactly one placed session, never duplicates.

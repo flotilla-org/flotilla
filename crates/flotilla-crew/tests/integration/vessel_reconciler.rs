@@ -3225,6 +3225,7 @@ async fn create_running_terminal(
                 occupancy: Default::default(),
                 completion_pending: None,
                 degraded: None,
+                daemon_unreachable: None,
             },
         )
         .await

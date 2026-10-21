@@ -137,6 +137,11 @@ pub trait TerminalRuntime: Send + Sync {
     ) -> Result<Option<TerminalObservation>, String> {
         Ok(None)
     }
+    /// Why a running session's crew cannot reach its controlling daemon, if it
+    /// cannot. Actuators without a separate daemon path report reachable.
+    async fn daemon_reach(&self, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     async fn observe_failure(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<Option<String>, String> {
         Ok(None)
     }
@@ -343,6 +348,7 @@ pub enum TerminalPrepared {
     CleatEndpoint(Option<flotilla_protocol::result_set::CleatEndpoint>),
     Attention(TerminalObservation),
     AttentionStale,
+    DaemonReach(Option<String>),
     OwnerMissing,
     OwnerTerminal,
     Failed(String),
@@ -586,6 +592,16 @@ where
                 }
                 Ok(_) => {}
             }
+            // #3618: a session's own liveness says nothing about its crew's
+            // path back to the daemon; record that separately so a vessel
+            // shows why hooks and settlement stopped.
+            match self.runtime.daemon_reach(&obj.spec).await {
+                Ok(unreachable) if obj.status.as_ref().and_then(|status| status.daemon_unreachable.as_ref()) != unreachable.as_ref() => {
+                    return Ok(TerminalPrepared::DaemonReach(unreachable));
+                }
+                Err(error) => tracing::warn!(%session_id, %error, "daemon reach observation failed"),
+                Ok(_) => {}
+            }
             if let Some(observation) = self.runtime.observe_attention(session_id, &obj.spec).await.map_err(ResourceError::other)? {
                 return Ok(TerminalPrepared::Attention(observation));
             }
@@ -721,6 +737,7 @@ where
                 | TerminalPrepared::MessageDeliveryUnconfirmed { .. }
                 | TerminalPrepared::Attention(_)
                 | TerminalPrepared::AttentionStale
+                | TerminalPrepared::DaemonReach(_)
                 | TerminalPrepared::OwnerMissing
                 | TerminalPrepared::OwnerTerminal => None,
             },
@@ -740,6 +757,9 @@ where
                 TerminalPrepared::Lost(reason) => Some(TerminalSessionStatusPatch::MarkLost { reason: reason.clone(), lost_at: now }),
                 TerminalPrepared::CleatEndpoint(endpoint) => {
                     Some(TerminalSessionStatusPatch::ObserveCleatEndpoint { endpoint: endpoint.clone() })
+                }
+                TerminalPrepared::DaemonReach(unreachable) => {
+                    Some(TerminalSessionStatusPatch::ObserveDaemonReach { unreachable: unreachable.clone() })
                 }
                 TerminalPrepared::Failed(message) => {
                     Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })

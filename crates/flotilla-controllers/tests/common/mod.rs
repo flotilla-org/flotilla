@@ -453,6 +453,7 @@ pub async fn create_stopped_terminal(
                 occupancy: Default::default(),
                 completion_pending: None,
                 degraded: None,
+                daemon_unreachable: None,
             },
         )
         .await

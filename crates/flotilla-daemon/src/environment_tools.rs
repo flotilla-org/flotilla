@@ -461,8 +461,8 @@ fn resolve_cleat_binary(path: &Path) -> Result<DaemonHostPath, String> {
     resolve_cleat_binary_from(path, &current_dir, search_path.as_deref())
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn adjacent_flotilla_binary(daemon_binary: &Path) -> Result<DaemonHostPath, String> {
+// Also the agentless CLI source on every platform (#3618).
+pub(crate) fn adjacent_flotilla_binary(daemon_binary: &Path) -> Result<DaemonHostPath, String> {
     let parent = daemon_binary.parent().ok_or_else(|| format!("daemon binary has no parent directory: {}", daemon_binary.display()))?;
     let flotilla_binary = parent.join("flotilla");
     if !flotilla_binary.is_file() {

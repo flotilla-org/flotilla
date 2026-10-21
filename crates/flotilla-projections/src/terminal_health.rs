@@ -14,13 +14,23 @@ pub fn condition(status: &TerminalSessionStatus) -> Option<ExplainedTerminalCond
         TerminalSessionPhase::Stopped if status.inner_command_status == Some(InnerCommandStatus::Exited) => {
             Some(ExplainedTerminalCondition::ProcessExited { exit_code: status.inner_exit_code })
         }
-        _ => status.degraded.as_ref().map(|condition| {
-            if condition.is_delivery() {
-                ExplainedTerminalCondition::DeliveryUnconfirmed { message: condition.message.clone() }
-            } else {
-                ExplainedTerminalCondition::ProviderUnavailable { message: condition.message.clone() }
-            }
-        }),
+        _ => status
+            .degraded
+            .as_ref()
+            .map(|condition| {
+                if condition.is_delivery() {
+                    ExplainedTerminalCondition::DeliveryUnconfirmed { message: condition.message.clone() }
+                } else {
+                    ExplainedTerminalCondition::ProviderUnavailable { message: condition.message.clone() }
+                }
+            })
+            // #3618: a crew that cannot reach its daemon loses hooks and settlement.
+            .or_else(|| {
+                status
+                    .daemon_unreachable
+                    .as_ref()
+                    .map(|message| ExplainedTerminalCondition::ProviderUnavailable { message: message.clone() })
+            }),
     }
 }
 
@@ -30,6 +40,24 @@ mod tests {
     use flotilla_resources::{StatusPatch, TerminalSessionStatusPatch};
 
     use super::*;
+
+    // #3618: an unreachable daemon is shown while the session keeps running,
+    // yields to the reconciler's own degradation, and clears on recovery.
+    #[test]
+    fn unreachable_daemon_is_a_running_condition() {
+        let mut status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
+        TerminalSessionStatusPatch::ObserveDaemonReach { unreachable: Some("daemon forward down: ssh exited".into()) }.apply(&mut status);
+        assert_eq!(status.phase, TerminalSessionPhase::Running);
+        assert!(matches!(condition(&status),
+            Some(ExplainedTerminalCondition::ProviderUnavailable { message }) if message.contains("daemon forward down")));
+        TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { message_id: "turn".into(), message: "held".into(), observed_at: Utc::now() }
+            .apply(&mut status);
+        assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::DeliveryUnconfirmed { .. })));
+        TerminalSessionStatusPatch::MarkMessageDelivered { message_id: "turn".into() }.apply(&mut status);
+        assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::ProviderUnavailable { .. })));
+        TerminalSessionStatusPatch::ObserveDaemonReach { unreachable: None }.apply(&mut status);
+        assert_eq!(condition(&status), None);
+    }
 
     // Transient outages remain Running regardless of duration; the same shared
     // projection exposes degradation, confirmed loss, and recovery distinctly.

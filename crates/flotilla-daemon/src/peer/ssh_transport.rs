@@ -338,6 +338,7 @@ impl SshTransport {
                 session_id: self.local_session_id,
                 connection_role: None,
                 surface: None,
+                crew_claims: Default::default(),
             },
         )
         .await?;
@@ -1138,6 +1139,7 @@ mod tests {
             session_id: uuid::Uuid::nil(),
             connection_role: None,
             surface: None,
+            crew_claims: Default::default(),
         };
 
         let (node, session_id) =
@@ -1155,6 +1157,7 @@ mod tests {
             session_id: uuid::Uuid::nil(),
             connection_role: None,
             surface: None,
+            crew_claims: Default::default(),
         };
 
         let err = SshTransport::validate_remote_hello(&HostName::new("expected-host"), None, hello)
@@ -1171,6 +1174,7 @@ mod tests {
             session_id: uuid::Uuid::nil(),
             connection_role: None,
             surface: None,
+            crew_claims: Default::default(),
         };
 
         let (node, _) = SshTransport::validate_remote_hello(&HostName::new("expected-host"), Some(&NodeId::new("expected-node")), hello)
@@ -1187,6 +1191,7 @@ mod tests {
             session_id: uuid::Uuid::nil(),
             connection_role: None,
             surface: None,
+            crew_claims: Default::default(),
         };
 
         let err = SshTransport::validate_remote_hello(&HostName::new("expected-host"), Some(&NodeId::new("expected-node")), hello)
@@ -1203,6 +1208,7 @@ mod tests {
             session_id: uuid::Uuid::nil(),
             connection_role: None,
             surface: None,
+            crew_claims: Default::default(),
         };
 
         let (node, _) =
@@ -1301,6 +1307,7 @@ mod tests {
                 session_id: uuid::Uuid::nil(),
                 connection_role: None,
                 surface: None,
+                crew_claims: Default::default(),
             })
             .expect("serialize hello");
             let peer = serde_json::to_string(&Message::Peer(Box::new(PeerWireMessage::RouteAdvertisement {
