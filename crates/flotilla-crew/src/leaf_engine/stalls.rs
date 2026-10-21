@@ -618,6 +618,22 @@ impl ReconcilerWake {
                                 status.crew_work[vessel][role].message.clone().unwrap_or_else(|| "crew stalled".into()),
                                 StallEvidenceSource::Crew,
                             ))
+                        } else if (status
+                            .crew_work
+                            .get(vessel)
+                            .and_then(|crew| crew.get(role))
+                            .is_some_and(|work| work.phase == flotilla_resources::CrewWorkPhase::Pending)
+                            && (session.is_none() || attention.is_some_and(|attention| attention.state == TerminalAttentionState::Idle)))
+                            || session.is_some_and(|session| {
+                                session.status.as_ref().is_none_or(|status| status.phase == TerminalSessionPhase::Starting)
+                            })
+                        {
+                            // Launching is not a dead session or an ended turn. Keep
+                            // both clocks clear so launch latency cannot age evidence.
+                            self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
+                            obligation.quiet_since = None;
+                            unknown = true;
+                            continue;
                         } else if let Some(reason) = lost_reason {
                             self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
                             Err((format!("session dead: {reason}"), StallEvidenceSource::Session))
