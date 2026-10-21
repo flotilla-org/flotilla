@@ -87,7 +87,7 @@ async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_
     };
 
     let error = DockerControllerRuntime { state: Arc::clone(&state) }
-        .provision("contained-work", &spec)
+        .provision_docker("contained-work", &spec)
         .await
         .expect_err("capture provider should stop provision");
 
@@ -199,7 +199,7 @@ async fn docker_provisioning_fails_loudly_without_interior_cleat_assets() {
     };
 
     let error = DockerControllerRuntime { state }
-        .provision("contained-work", &spec)
+        .provision_docker("contained-work", &spec)
         .await
         .expect_err("provisioning without cleat must fail before creating a container");
 
@@ -293,7 +293,7 @@ async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_r
         };
 
         let error = DockerControllerRuntime { state }
-            .provision("prepared-auth-environment", &spec)
+            .provision_docker("prepared-auth-environment", &spec)
             .await
             .expect_err("capture provider or preflight must stop provision");
 
@@ -456,7 +456,8 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
             mounts: Vec::new(),
             env: BTreeMap::new(),
         };
-        let error = DockerControllerRuntime { state }.provision("composed-environment", &spec).await.expect_err("capture stops provision");
+        let error =
+            DockerControllerRuntime { state }.provision_docker("composed-environment", &spec).await.expect_err("capture stops provision");
         let opts = provider.create_opts.lock().await.take();
         match case {
             "granted" => {
@@ -530,6 +531,20 @@ async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
     let outside_state = state.config.state_dir().as_path().join("keep");
     fs::create_dir_all(&outside_state).expect("unrelated state");
     fs::write(outside_state.join("sentinel"), "keep").expect("sentinel");
+    state
+        .daemon
+        .resource_backend()
+        .using::<Environment>(NAMESPACE)
+        .create(
+            &empty_meta("contained-restarted"),
+            &EnvironmentSpec {
+                provider_address: Some("host:host-test/provider:docker".parse().expect("provider address")),
+                host_direct: None,
+                docker: None,
+            },
+        )
+        .await
+        .expect("addressed environment record");
     let runtime = DockerControllerRuntime { state };
     for invalid in ["../keep", "..", "/", ""] {
         runtime.cleanup(invalid).await.expect("unsafe names must not wedge finalization");
@@ -600,6 +615,7 @@ async fn docker_orphan_cleanup_without_persisted_status_reaps_backing() {
         .create(
             &empty_meta("env-lost-status"),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
                     host_ref: "host-test".into(),
@@ -669,7 +685,8 @@ async fn docker_provisioning_reports_unavailable_flotilla_cli() {
         env: BTreeMap::new(),
     };
 
-    let error = DockerControllerRuntime { state }.provision("contained-work", &spec).await.expect_err("missing CLI should fail provision");
+    let error =
+        DockerControllerRuntime { state }.provision_docker("contained-work", &spec).await.expect_err("missing CLI should fail provision");
 
     assert!(
         error.to_string().starts_with("flotilla CLI unavailable for environment provisioning: "),
@@ -728,7 +745,7 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
     };
 
     let error = DockerControllerRuntime { state: Arc::clone(&state) }
-        .provision("contained-work", &spec)
+        .provision_docker("contained-work", &spec)
         .await
         .expect_err("reserved socket directory mount should fail provision");
 
@@ -746,7 +763,7 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
         ..spec
     };
     let error = DockerControllerRuntime { state }
-        .provision("contained-work", &cli_collision_spec)
+        .provision_docker("contained-work", &cli_collision_spec)
         .await
         .expect_err("reserved CLI mount should fail provision");
 
@@ -1214,7 +1231,7 @@ async fn provisioned_environment_is_destroyed_when_declared_adapter_is_missing()
     };
 
     let error = DockerControllerRuntime { state }
-        .provision("contained-rejected", &spec)
+        .provision_docker("contained-rejected", &spec)
         .await
         .expect_err("missing declared adapter should reject the environment");
 

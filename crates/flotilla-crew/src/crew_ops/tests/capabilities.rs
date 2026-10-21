@@ -51,6 +51,7 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
         .create(
             &InputMeta::builder().name("resume-env".into()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
                 docker: None,
             },
@@ -348,6 +349,7 @@ async fn refresh_after_reaped_message_recovers_with_full_card() {
         .create(
             &InputMeta::builder().name("resume-env".into()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
                 docker: None,
             },
@@ -426,6 +428,7 @@ async fn failing_source_never_publishes_an_empty_card() {
         .create(
             &InputMeta::builder().name("resume-env".into()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
                 docker: None,
             },

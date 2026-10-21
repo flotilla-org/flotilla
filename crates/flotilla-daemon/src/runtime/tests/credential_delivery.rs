@@ -9,6 +9,7 @@ async fn credential_refresh_retry_waits_until_deadline_without_rewriting_status(
         .create(
             &empty_meta("refresh-work"),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
                 docker: None,
             },
@@ -561,7 +562,7 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
         ]),
     };
 
-    DockerControllerRuntime { state }.provision("contained-claude", &spec).await.expect("provision Claude vessel");
+    DockerControllerRuntime { state }.provision_docker("contained-claude", &spec).await.expect("provision Claude vessel");
 
     assert!(staged.load(Ordering::SeqCst), "provisioning must stage pinned skills before interior discovery");
     assert!(!destroyed.load(Ordering::SeqCst), "successful skill staging must keep the fresh vessel");
@@ -637,7 +638,7 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
     };
 
     let error = DockerControllerRuntime { state: Arc::clone(&state) }
-        .provision("contained-work", &spec)
+        .provision_docker("contained-work", &spec)
         .await
         .expect_err("capture provider should stop provision");
 
@@ -655,7 +656,7 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
     let mut preconfigured = spec;
     preconfigured.env.insert("CODEX_HOME".to_string(), "/image/codex".to_string());
     DockerControllerRuntime { state }
-        .provision("contained-preconfigured", &preconfigured)
+        .provision_docker("contained-preconfigured", &preconfigured)
         .await
         .expect_err("capture provider should stop provision");
     let opts = provider.create_opts.lock().await.take().expect("captured preconfigured create options");
@@ -754,7 +755,7 @@ async fn codex_credential_and_agent_material_conflict_before_container_creation(
     };
 
     let error = DockerControllerRuntime { state }
-        .provision("contained-work", &spec)
+        .provision_docker("contained-work", &spec)
         .await
         .expect_err("two Codex-home contributors must conflict")
         .to_string();
@@ -846,7 +847,7 @@ async fn an_unprovisioned_central_codex_credential_fails_before_registry_preflig
     };
 
     let error = DockerControllerRuntime { state }
-        .provision("unprovisioned-environment", &spec)
+        .provision_docker("unprovisioned-environment", &spec)
         .await
         .expect_err("a host with no central Codex login cannot provision a Codex crew");
 

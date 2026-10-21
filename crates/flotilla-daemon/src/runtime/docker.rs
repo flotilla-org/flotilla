@@ -18,9 +18,9 @@ use flotilla_environment::environment::EnvironmentToolAssetKind;
 use flotilla_environment::environment::EnvironmentVariableUpdate;
 use flotilla_environment::environment::{contained_daemon_socket_path, DAEMON_SOCKET_ENV};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, EnvironmentId};
+use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
-use flotilla_provisioning::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning};
+use flotilla_provisioning::reconcilers::{EnvironmentProvisioning, EnvironmentRuntime};
 use flotilla_resources::{
     Environment, EnvironmentSpec, PlacementPolicy, Resource, ResourceError, Vessel, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ENV,
@@ -30,7 +30,7 @@ use tracing::{info, warn};
 
 use super::credentials::{agent_material_environment, stage_agent_environment};
 use super::environments::ActiveProvisionedEnvironment;
-use super::state::{canonical_runtime_host_id, ControllerRuntimeState};
+use super::state::ControllerRuntimeState;
 use crate::environment_tools::{EnvironmentToolContext, DOCKER_PROVIDER_KIND};
 
 pub(super) struct DockerControllerRuntime {
@@ -38,6 +38,20 @@ pub(super) struct DockerControllerRuntime {
 }
 
 impl DockerControllerRuntime {
+    pub(super) async fn provision_docker(
+        &self,
+        name: &str,
+        spec: &flotilla_resources::DockerEnvironmentSpec,
+    ) -> Result<EnvironmentProvisioning, String> {
+        let result = self.provision_contained(name, spec).await;
+        if result.is_err() {
+            if let Some(sockets) = &self.state.environment_sockets {
+                sockets.remove(&EnvironmentId::new(name)).await?;
+            }
+        }
+        result
+    }
+
     // One-generation bridge until #2731. New snapshots and Environments freeze
     // baseline provenance; old records recover it through the live policy.
     pub(super) async fn legacy_baseline_for_environment(&self, name: &str) -> Result<bool, String> {
@@ -71,36 +85,32 @@ impl DockerControllerRuntime {
     pub(super) async fn provider_for_environment(
         &self,
         name: &str,
-        kind: flotilla_environment::environment::EnvironmentInput,
     ) -> Result<Arc<dyn flotilla_environment::environment::EnvironmentProvider>, String> {
         use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
-        let environment = match self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(name).await {
-            Ok(environment) => Some(environment),
-            Err(ResourceError::NotFound { .. }) => None,
-            Err(error) => return Err(error.to_string()),
-        };
-        let instance =
-            environment.as_ref().and_then(|environment| environment.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)).cloned();
-        let registry = if let Some(direct) = environment.as_ref().and_then(|environment| environment.spec.host_direct.as_ref()) {
-            let local = CanonicalHostId::resolved(&self.state.local_host_ref);
-            let host = canonical_runtime_host_id(&self.state.daemon, &self.state.namespace, &local, &direct.host_ref).await?;
-            if host == local {
-                Arc::clone(&self.state.local_registry)
-            } else {
-                let ssh = self.state.agentless_ssh_for_host(host.as_str()).ok_or("host-direct provider host is not registered")?;
-                self.state
-                    .daemon
-                    .environment_registry_for_environment(&ssh.environment_id)
-                    .ok_or("host-direct host registry unavailable")?
-            }
-        } else {
-            Arc::clone(&self.state.local_registry)
-        };
-        registry
-            .environment_providers
-            .select_legacy_input(kind, instance.as_deref())
-            .map(|(_, provider)| Arc::clone(provider))
-            .ok_or_else(|| format!("environment provider unavailable or ambiguous for {name} (instance {instance:?}, kind {kind:?})"))
+        let environment = self
+            .state
+            .daemon
+            .resource_backend()
+            .using::<Environment>(&self.state.namespace)
+            .get(name)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.provider_for_spec(
+            name,
+            &environment.spec,
+            environment.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
+        )
+        .await
+    }
+
+    async fn provider_for_spec(
+        &self,
+        name: &str,
+        spec: &EnvironmentSpec,
+        instance: Option<&str>,
+    ) -> Result<Arc<dyn flotilla_environment::environment::EnvironmentProvider>, String> {
+        let address = self.state.provider_address(name, spec, instance).await?;
+        self.state.environment_providers.get(&address)
     }
 }
 
@@ -161,9 +171,21 @@ impl DockerControllerRuntime {
         &self,
         name: &str,
         spec: &flotilla_resources::DockerEnvironmentSpec,
-    ) -> Result<DockerProvisioning, String> {
+    ) -> Result<EnvironmentProvisioning, String> {
         let legacy_baseline = self.legacy_baseline_for_environment(name).await?;
-        let provider = self.provider_for_environment(name, flotilla_environment::environment::EnvironmentInput::Docker).await?;
+        let (mut environment_spec, instance) =
+            match self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(name).await {
+                Ok(environment) => (
+                    environment.spec,
+                    environment.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned(),
+                ),
+                Err(ResourceError::NotFound { .. }) => {
+                    (EnvironmentSpec { provider_address: None, host_direct: None, docker: Some(spec.clone()) }, None)
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+        environment_spec.docker = Some(spec.clone());
+        let provider = self.provider_for_spec(name, &environment_spec, instance.as_deref()).await?;
         let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new() };
         let mut tools = if provider.receives_host_tools() {
             self.state.environment_tools.prepare(DOCKER_PROVIDER_KIND, name, &context).await?
@@ -356,7 +378,7 @@ impl DockerControllerRuntime {
         };
         let prepared = match provider
             .prepare(
-                &EnvironmentSpec { host_direct: None, docker: Some(spec.clone()) },
+                &environment_spec,
                 &flotilla_environment::environment::PrepareOpts { legacy_baseline, prepared_auth: opts.prepared_auth.clone() },
             )
             .await
@@ -625,10 +647,10 @@ impl DockerControllerRuntime {
         }
         let handle_registry_digest = handle.registry_digest().map(str::to_owned);
         self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { handle });
-        Ok(DockerProvisioning {
-            container_id,
-            image_ref,
-            local_image_id,
+        Ok(EnvironmentProvisioning {
+            backing_id: Some(container_id),
+            image_ref: Some(image_ref),
+            local_image_id: Some(local_image_id),
             registry_digest: handle_registry_digest,
             configured_limits: Some(ConfiguredResourceLimits {
                 cpus: None,
@@ -641,36 +663,31 @@ impl DockerControllerRuntime {
 }
 
 #[async_trait]
-impl DockerEnvironmentRuntime for DockerControllerRuntime {
+impl EnvironmentRuntime for DockerControllerRuntime {
     async fn provision_environment(
         &self,
         name: &str,
         spec: &EnvironmentSpec,
-    ) -> Result<flotilla_provisioning::reconcilers::environment::EnvironmentProvisioning, String> {
-        use flotilla_environment::environment::EnvironmentInput;
-        use flotilla_provisioning::reconcilers::environment::EnvironmentProvisioning;
-        let kind = EnvironmentInput::of(spec)?;
-        if kind == EnvironmentInput::Docker {
-            return self.provision(name, spec.docker.as_ref().expect("kind checked")).await.map(EnvironmentProvisioning::Docker);
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+        use flotilla_provisioning::reconcilers::EnvironmentProvisioning;
+        if let Some(docker) = &spec.docker {
+            return self.provision_docker(name, docker).await;
         }
-        let provider = self.provider_for_environment(name, kind).await?;
+        let provider = self.provider_for_environment(name).await?;
         let prepared = provider.prepare(spec, &Default::default()).await?;
-        provider.provision(EnvironmentId::new(name), &prepared, Default::default()).await?;
+        let handle = provider.provision(EnvironmentId::new(name), &prepared, Default::default()).await?;
         // A re-provisioned agentless Environment may reach the daemon again (#3618).
         if let Some(reach) = &self.state.agentless_reach {
             reach.admit(&EnvironmentId::new(name)).await;
         }
-        Ok(EnvironmentProvisioning::HostDirect)
-    }
-
-    async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
-        let result = self.provision_contained(name, spec).await;
-        if result.is_err() {
-            if let Some(sockets) = &self.state.environment_sockets {
-                sockets.remove(&EnvironmentId::new(name)).await?;
-            }
-        }
-        result
+        let facts = EnvironmentProvisioning {
+            backing_id: Some(handle.backing_id().to_string()),
+            local_image_id: handle.local_image_id().map(str::to_owned),
+            registry_digest: handle.registry_digest().map(str::to_owned),
+            ..Default::default()
+        };
+        self.state.provisioned_environments.lock().await.insert(handle.backing_id().to_string(), ActiveProvisionedEnvironment { handle });
+        Ok(facts)
     }
 
     async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String> {
@@ -678,8 +695,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         match active {
             Some(active) => active.handle.destroy().await?,
             None => {
-                let provider =
-                    self.provider_for_environment(environment_ref, flotilla_environment::environment::EnvironmentInput::Docker).await?;
+                let provider = self.provider_for_environment(environment_ref).await?;
                 provider.destroy(container_id).await?;
             }
         }
@@ -692,7 +708,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
     }
 
     async fn destroy_unrecorded(&self, environment_ref: &str) -> Result<(), String> {
-        let provider = self.provider_for_environment(environment_ref, flotilla_environment::environment::EnvironmentInput::Docker).await?;
+        let provider = self.provider_for_environment(environment_ref).await?;
         // The record may predate status persistence, or the daemon may have
         // restarted after Docker creation. Mutable mount labels are irrelevant.
         for backing in provider.list_backings().await? {
@@ -714,10 +730,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         let resource = self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(environment_ref).await;
         match resource {
             Ok(environment) if environment.spec.host_direct.is_some() => {
-                self.provider_for_environment(environment_ref, flotilla_environment::environment::EnvironmentInput::HostDirect)
-                    .await?
-                    .destroy(environment_ref)
-                    .await?;
+                self.provider_for_environment(environment_ref).await?.destroy(environment_ref).await?;
             }
             Ok(_) | Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),

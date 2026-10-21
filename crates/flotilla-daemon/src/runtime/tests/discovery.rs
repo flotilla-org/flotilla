@@ -227,6 +227,10 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
     // SSH environment's registry, not the owner's.
     let environment =
         daemon.resource_backend().using::<Environment>(NAMESPACE).get(environment_id.as_str()).await.expect("SSH host-direct Environment");
+    assert_eq!(
+        environment.spec.provider_address.as_ref().expect("new SSH environments write an address").to_string(),
+        format!("host:{host_id}/provider:host-direct")
+    );
     let environments = DockerControllerRuntime { state: Arc::clone(&state) };
     environments
         .provision_environment(environment_id.as_str(), &environment.spec)

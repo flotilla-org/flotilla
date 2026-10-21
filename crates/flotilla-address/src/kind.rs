@@ -11,6 +11,10 @@ use crate::Error;
 pub enum Kind {
     /// A flotilla Project: `project:flotilla`.
     Project,
+    /// A host place that advertises provider instances.
+    Host,
+    /// An instance under a host or provider account.
+    Provider,
     /// A convoy, at the root or under its project.
     Convoy,
     /// A convoy's vessel.
@@ -37,12 +41,14 @@ pub enum Kind {
     Ref,
     /// A usage provider; the root of an account's usage.
     Usage,
-    /// An account at a usage provider.
+    /// A provider account place, or an account under a usage provider.
     Account,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 15] = [
+    pub const ALL: [Kind; 17] = [
+        Kind::Host,
+        Kind::Provider,
         Kind::Project,
         Kind::Convoy,
         Kind::Vessel,
@@ -63,6 +69,8 @@ impl Kind {
     /// The segment token, as printed before `:`.
     pub fn as_str(self) -> &'static str {
         match self {
+            Kind::Host => "host",
+            Kind::Provider => "provider",
             Kind::Project => "project",
             Kind::Convoy => "convoy",
             Kind::Vessel => "vessel",
@@ -85,7 +93,7 @@ impl Kind {
     /// an address when `parent` is `None`. This is the whole shape grammar.
     pub fn may_follow(self, parent: Option<Kind>) -> bool {
         match self {
-            Kind::Project | Kind::Forge | Kind::Usage => parent.is_none(),
+            Kind::Project | Kind::Forge | Kind::Usage | Kind::Host => parent.is_none(),
             // A convoy without a Project is valid today (`ConvoySpec.project_ref`
             // is optional); a convoy with one sits under it.
             Kind::Convoy => matches!(parent, None | Some(Kind::Project)),
@@ -96,7 +104,8 @@ impl Kind {
             Kind::Message => parent == Some(Kind::Role),
             Kind::Repo => parent == Some(Kind::Forge),
             Kind::ChangeRequest | Kind::Issue | Kind::Comment | Kind::Commit | Kind::Ref => parent == Some(Kind::Repo),
-            Kind::Account => parent == Some(Kind::Usage),
+            Kind::Account => matches!(parent, None | Some(Kind::Usage)),
+            Kind::Provider => matches!(parent, Some(Kind::Host | Kind::Account)),
         }
     }
 }

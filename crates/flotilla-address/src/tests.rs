@@ -46,7 +46,7 @@ fn segment_value(tc: &hegel::TestCase, kind: Kind) -> String {
 /// one. Covers every kind, the root convoy, nested project/convoy/role and
 /// repositories on both forge kinds.
 fn address(tc: &hegel::TestCase) -> Address {
-    let roots = [Kind::Project, Kind::Convoy, Kind::Forge, Kind::Usage];
+    let roots = [Kind::Project, Kind::Convoy, Kind::Forge, Kind::Usage, Kind::Host, Kind::Account];
     let root = roots[draw_index(tc, roots.len())];
     let mut address = match root {
         Kind::Forge => {

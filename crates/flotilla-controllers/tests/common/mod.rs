@@ -242,6 +242,7 @@ pub async fn create_ready_host_direct_environment(
         .create(
             &meta(&name),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec {
                     host_ref: host_ref.to_string(),
                     repo_default_dir: repo_default_dir.to_string(),
@@ -283,7 +284,7 @@ pub async fn create_ready_docker_environment(
     let environments = backend.clone().using::<Environment>(namespace);
     let image_ref = docker.image.clone();
     let created = environments
-        .create(&meta(name), &EnvironmentSpec { host_direct: None, docker: Some(docker) })
+        .create(&meta(name), &EnvironmentSpec { provider_address: None, host_direct: None, docker: Some(docker) })
         .await
         .expect("docker env create should succeed");
     environments

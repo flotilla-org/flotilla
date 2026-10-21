@@ -592,6 +592,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     let host_id = daemon.local_host_id().expect("local host id");
     let environment_name = format!("host-direct-{host_id}");
     let environment_spec = EnvironmentSpec {
+        provider_address: None,
         host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_id.to_string(), repo_default_dir: "/tmp".to_string() }),
         docker: None,
     };

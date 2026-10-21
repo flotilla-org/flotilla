@@ -49,6 +49,7 @@ async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_ho
             .create(
                 &empty_meta(name),
                 &EnvironmentSpec {
+                    provider_address: None,
                     host_direct: None,
                     docker: Some(flotilla_resources::DockerEnvironmentSpec {
                         image_build_ref: None,

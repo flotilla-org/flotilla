@@ -1132,6 +1132,7 @@ dependencies = [
  "async-trait",
  "bon",
  "chrono",
+ "flotilla-address",
  "flotilla-agent",
  "flotilla-ai-utility",
  "flotilla-build-features",
@@ -2143,6 +2144,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bon",
+ "flotilla-address",
  "flotilla-agent",
  "flotilla-ai-utility",
  "flotilla-build-features",

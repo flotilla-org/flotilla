@@ -16,7 +16,7 @@ use flotilla_resources::{Environment, Resource};
 use flotilla_store::ResourceBackend;
 use tokio::time::Instant;
 
-use crate::reconcilers::DockerEnvironmentRuntime;
+use crate::reconcilers::EnvironmentRuntime;
 
 pub const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const ORPHAN_GRACE: Duration = Duration::from_secs(600);
@@ -67,7 +67,7 @@ impl EnvironmentOrphanSweep {
         &mut self,
         backend: &ResourceBackend,
         provider: &dyn EnvironmentProvider,
-        runtime: &dyn DockerEnvironmentRuntime,
+        runtime: &dyn EnvironmentRuntime,
         now: Instant,
     ) -> Result<(), String> {
         if self.readiness == StoreReadiness::Restoring {
@@ -81,7 +81,7 @@ impl EnvironmentOrphanSweep {
         &mut self,
         backend: &ResourceBackend,
         provider: &dyn EnvironmentProvider,
-        runtime: &dyn DockerEnvironmentRuntime,
+        runtime: &dyn EnvironmentRuntime,
         now: Instant,
     ) -> Result<(), String> {
         let observations = async {
@@ -235,12 +235,12 @@ mod tests {
         }
     }
     #[async_trait]
-    impl DockerEnvironmentRuntime for DockerBoundary {
-        async fn provision(
+    impl EnvironmentRuntime for DockerBoundary {
+        async fn provision_environment(
             &self,
             _: &str,
-            _: &flotilla_resources::DockerEnvironmentSpec,
-        ) -> Result<crate::reconcilers::DockerProvisioning, String> {
+            _spec: &flotilla_resources::EnvironmentSpec,
+        ) -> Result<crate::reconcilers::EnvironmentProvisioning, String> {
             unreachable!()
         }
         async fn destroy(&self, environment: &str, id: &str) -> Result<(), String> {
@@ -265,6 +265,7 @@ mod tests {
             .create(
                 &InputMeta::builder().name("env".into()).build(),
                 &EnvironmentSpec {
+                    provider_address: None,
                     host_direct: Some(HostDirectEnvironmentSpec { host_ref: "home".into(), repo_default_dir: "/".into() }),
                     docker: None,
                 },

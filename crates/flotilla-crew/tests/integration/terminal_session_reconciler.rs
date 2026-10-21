@@ -71,6 +71,7 @@ async fn create_ready_environment(backend: &ResourceBackend, name: &str) {
         .create(
             &meta(name),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "01HXYZ".to_string(), repo_default_dir: "/workspace".to_string() }),
                 docker: None,
             },
@@ -307,6 +308,7 @@ async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
         .create(
             &meta("env-a"),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec {
                     host_ref: "01HXYZ".to_string(),
                     repo_default_dir: "/Users/alice/dev/flotilla-repos".to_string(),
@@ -941,6 +943,7 @@ impl WorldBuilder for GhostRecoveryWorldBuilder {
             .create(
                 &meta("host-direct-feta"),
                 &EnvironmentSpec {
+                    provider_address: None,
                     host_direct: Some(HostDirectEnvironmentSpec {
                         host_ref: "feta".to_string(),
                         repo_default_dir: "/worktrees".to_string(),
@@ -1224,6 +1227,7 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
         .create(
             &meta("env-a"),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".into(), repo_default_dir: "/repos".into() }),
                 docker: None,
             },

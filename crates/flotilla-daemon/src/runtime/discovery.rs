@@ -47,6 +47,7 @@ pub(super) struct LocalProvisioningProfile {
     pub(super) display_name: String,
     pub(super) repo_default_dir: String,
     pub(super) host_direct_pool: String,
+    pub(super) host_direct_provider: String,
     pub(super) docker_pool: String,
     pub(super) available_pools: Vec<String>,
     pub(super) available_agent_adapters: BTreeSet<String>,
@@ -105,6 +106,11 @@ pub(super) async fn discover_agentless_ssh_profile(
         .to_string();
     let available_pools = registry.terminal_pools.iter().map(|(description, _)| description.implementation.clone()).collect();
     let provisioning = LocalProvisioningProfile {
+        host_direct_provider: registry
+            .environment_providers
+            .select_legacy_input(EnvironmentInput::HostDirect, None)
+            .map(|(_, provider)| registry.environment_providers.instance_name(provider).expect("registered provider").to_string())
+            .unwrap_or_else(|| "host-direct".into()),
         environment_providers: observe_provider_advertisements(&registry).await,
         host_id,
         display_name: direct.display_name.unwrap_or_else(|| environment_id.to_string()),
@@ -402,6 +408,11 @@ pub(super) async fn build_local_profile(
     let available_agent_adapters = local_registry.agent_adapters.ids().map(ToString::to_string).collect();
 
     Ok(LocalProvisioningProfile {
+        host_direct_provider: local_registry
+            .environment_providers
+            .select_legacy_input(EnvironmentInput::HostDirect, None)
+            .map(|(_, provider)| local_registry.environment_providers.instance_name(provider).expect("registered provider").to_string())
+            .unwrap_or_else(|| "host-direct".into()),
         environment_providers: observe_provider_advertisements(local_registry).await,
         host_id,
         display_name: daemon.host_name().to_string(),

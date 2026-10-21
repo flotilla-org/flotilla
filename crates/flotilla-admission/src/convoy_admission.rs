@@ -942,28 +942,17 @@ impl ConvoyAdmission {
             .await
             .map_err(|error| error.to_string())?;
         let local_host = self.environment_manager.local_host_id().as_str();
+        let local_environment_query = host_direct_environment_query(local_host)?;
         let environments = self
             .backend
-            .query_declared::<Environment>(
-                namespace,
-                &StoreQuery {
-                    fields: BTreeMap::from([("spec.host_direct.host_ref".into(), local_host.into())]),
-                    include_replicas: true,
-                    ..Default::default()
-                },
-            )
+            .query_declared::<Environment>(namespace, &StoreQuery { include_replicas: true, ..local_environment_query.clone() })
             .await
             .map_err(|error| error.to_string())?;
         let local_checkout_query = StoreQuery {
             field_values: BTreeMap::from([("spec.repo_ref".into(), repository_names.into_iter().collect())]),
             any_of: Some(vec![
                 StoreQuery { fields: BTreeMap::from([("spec.host_ref".into(), local_host.into())]), ..Default::default() },
-                StoreQuery::related_kind(
-                    "spec.env_ref",
-                    "Environment",
-                    "metadata.name",
-                    StoreQuery { fields: BTreeMap::from([("spec.host_direct.host_ref".into(), local_host.into())]), ..Default::default() },
-                ),
+                StoreQuery::related_kind("spec.env_ref", "Environment", "metadata.name", local_environment_query),
             ]),
             ..Default::default()
         };
@@ -1601,6 +1590,27 @@ impl PlacementBuildJoiner<'_> {
         }
         Ok((images, builds))
     }
+}
+
+fn host_direct_environment_query(local_host: &str) -> Result<StoreQuery, String> {
+    let host_address = flotilla_address::Address::root(flotilla_address::Kind::Host, local_host).map_err(|error| error.to_string())?;
+    // Keep admission bounded to this host's direct environments. A full
+    // Environment scan grows with every per-vessel cloud/container backing.
+    Ok(StoreQuery {
+        any_of: Some(vec![
+            StoreQuery {
+                field_prefixes: BTreeMap::from([("spec.provider_address".into(), format!("{host_address}/provider:"))]),
+                present: vec!["spec.host_direct".into()],
+                ..Default::default()
+            },
+            StoreQuery {
+                fields: BTreeMap::from([("spec.host_direct.host_ref".into(), local_host.into())]),
+                missing_fields: BTreeSet::from(["spec.provider_address".into()]),
+                ..Default::default()
+            },
+        ]),
+        ..Default::default()
+    })
 }
 
 /// Write composed images into the placement: the convoy-level policy carries
@@ -5233,6 +5243,47 @@ mod tests {
 
     use flotilla_discovery_testkit::FakeChangeRequest;
     use flotilla_protocol::ChangeRequest;
+
+    // WORKLOAD.md: admission must select only this host's direct environments,
+    // independently of the number of unrelated per-vessel environments.
+    #[hegel::test]
+    fn direct_environment_query_covers_only_local_current_and_legacy_records(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Escaped/case-sensitive hosts, both stored generations, missing direct
+        // inputs, and a conflicting legacy host alongside an explicit address.
+        let host = tc.draw(gs::text().alphabet("aZ09 /:%é").min_size(1).max_size(16));
+        let address = flotilla_address::Address::root(flotilla_address::Kind::Host, &host).expect("host address");
+        let mut index = flotilla_store::QueryIndex::default();
+        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(24));
+        let mut expected = BTreeSet::new();
+        for row in 0..count {
+            let local = tc.draw(gs::booleans());
+            let legacy = tc.draw(gs::booleans());
+            let direct = tc.draw(gs::booleans());
+            let target = if local { host.clone() } else { format!("{host}-other") };
+            let mut spec = serde_json::json!({});
+            if !legacy {
+                let place = flotilla_address::Address::root(flotilla_address::Kind::Host, &target).expect("place");
+                spec["provider_address"] = format!("{place}/provider:custom").into();
+            }
+            if direct {
+                spec["host_direct"] =
+                    serde_json::json!({"host_ref": if legacy { target.clone() } else { host.clone() }, "repo_default_dir":"/work"});
+            } else {
+                spec["docker"] = serde_json::json!({"host_ref": target, "image":"image"});
+            }
+            let name = format!("environment-{row}");
+            index.update(&name, Some(&serde_json::json!({"kind":"Environment", "metadata":{"name":name}, "spec":spec})));
+            if local && direct {
+                expected.insert(name);
+            }
+            assert_eq!(
+                index.names(&host_direct_environment_query(&host).expect("query")),
+                expected,
+                "candidate cover after every insert at {address}"
+            );
+        }
+    }
 
     // Artifact storage is the process boundary; read inventories and rendering
     // use real collaborators. Multiple vessels must not reread a kind.

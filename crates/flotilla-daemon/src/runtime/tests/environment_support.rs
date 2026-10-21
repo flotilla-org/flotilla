@@ -541,8 +541,8 @@ pub(super) fn register_host_adoption(registry: &mut ProviderRegistry) {
     // The injected runner stands in for host subprocesses; adopting and
     // detaching the host itself must never invoke it.
     registry.environment_providers.insert(
-        "host-fixture",
-        ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "host-fixture"),
+        "host-direct",
+        ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "host-direct"),
         Arc::new(HostDirectEnvironmentProvider::new(Arc::new(DiscoveryMockRunner::builder().build()), HashMap::new())),
     );
 }
@@ -592,6 +592,7 @@ pub(super) async fn create_ready_docker_environment(
         .create(
             &empty_meta(name),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
                     image_build_ref: None,

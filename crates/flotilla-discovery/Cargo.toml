@@ -9,6 +9,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+flotilla-address = { path = "../flotilla-address" }
 flotilla-github-providers = { path = "../flotilla-github-providers" }
 flotilla-forgejo-providers = { path = "../flotilla-forgejo-providers" }
 flotilla-agent = { path = "../flotilla-agent" }

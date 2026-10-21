@@ -43,6 +43,7 @@ pub(super) struct ControllerRuntimeState {
     pub(super) daemon: Arc<InProcessDaemon>,
     pub(super) config: Arc<ConfigStore>,
     pub(super) local_registry: Arc<ProviderRegistry>,
+    pub(super) environment_providers: flotilla_discovery::registry::EnvironmentProviderRegistry,
     pub(super) local_host_ref: String,
     /// OS probe boundary, injectable for deterministic launch tests.
     pub(super) local_core_count: fn() -> Result<NonZeroUsize, std::io::Error>,
@@ -78,6 +79,25 @@ pub(super) struct ControllerRuntimeState {
 }
 
 impl ControllerRuntimeState {
+    pub(super) async fn provider_address(
+        &self,
+        name: &str,
+        spec: &flotilla_resources::EnvironmentSpec,
+        instance: Option<&str>,
+    ) -> Result<flotilla_address::Address, String> {
+        use flotilla_environment::environment::EnvironmentInput;
+        let address = if let Some(address) = &spec.provider_address {
+            flotilla_resources::validate_environment_provider_address(address)?;
+            address.clone()
+        } else {
+            let host = spec.host_ref().ok_or_else(|| format!("environment {name} has no provider address or legacy host"))?;
+            let local = CanonicalHostId::resolved(&self.local_host_ref);
+            let host = canonical_runtime_host_id(&self.daemon, &self.namespace, &local, host).await?;
+            self.environment_providers.resolve_legacy(host.as_str(), EnvironmentInput::of(spec)?, instance)?
+        };
+        Ok(address)
+    }
+
     pub(super) fn with_environment_sockets(mut self, sockets: Option<EnvironmentSocketService>) -> Self {
         self.environment_sockets = sockets;
         self
@@ -136,7 +156,11 @@ impl ControllerRuntimeState {
         host_direct_environment_name: String,
     ) -> Self {
         let environment_tools = EnvironmentToolProvisioner::for_local_host(&daemon, &config, daemon_socket_path.clone());
+        let mut environment_providers = flotilla_discovery::registry::EnvironmentProviderRegistry::default();
+        let place = flotilla_address::Address::root(flotilla_address::Kind::Host, &local_host_ref).expect("local host identity");
+        environment_providers.register_place(&place, &local_registry.environment_providers).expect("unique local provider addresses");
         Self {
+            environment_providers,
             local_core_count: std::thread::available_parallelism,
             daemon,
             config,
@@ -215,6 +239,13 @@ impl ControllerRuntimeState {
     }
 
     pub(super) fn with_agentless_ssh(mut self, profiles: Vec<AgentlessSshProfile>) -> Self {
+        for profile in &profiles {
+            if let Some(registry) = self.daemon.environment_registry_for_environment(&profile.environment_id) {
+                let place = flotilla_address::Address::root(flotilla_address::Kind::Host, &profile.provisioning.host_id)
+                    .expect("SSH host identity");
+                self.environment_providers.register_place(&place, &registry.environment_providers).expect("unique SSH provider addresses");
+            }
+        }
         self.agentless_ssh = profiles.into_iter().map(|profile| (profile.environment_id.to_string(), profile)).collect();
         self
     }
@@ -373,23 +404,8 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
         }
         for environment in environments {
             let instance = environment.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL);
-            let (_, provider) = self
-                .local_registry
-                .environment_providers
-                .select_legacy_input(flotilla_environment::environment::EnvironmentInput::Docker, instance.map(String::as_str))
-                .ok_or_else(|| {
-                    let reason =
-                        if instance.is_some() {
-                            "instance absent or wrong kind"
-                        } else if self.local_registry.environment_providers.iter().any(|(_, provider)| {
-                            provider.legacy_input() == Some(flotilla_environment::environment::EnvironmentInput::Docker)
-                        }) {
-                            "ambiguous instances"
-                        } else {
-                            "absent"
-                        };
-                    format!("Docker environment provider {reason} for Environment/{} (instance {instance:?})", environment.metadata.name)
-                })?;
+            let address = self.provider_address(&environment.metadata.name, &environment.spec, instance.map(String::as_str)).await?;
+            let provider = self.environment_providers.get(&address)?;
             let handles = provider
                 .list()
                 .await

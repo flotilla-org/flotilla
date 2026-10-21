@@ -73,7 +73,7 @@ use flotilla_provider_runtime::ProcessCommandRunner;
 use flotilla_provisioning::reconcilers::clone::runtime::{CloneControllerRuntime, CloneFlights};
 use flotilla_provisioning::reconcilers::{
     checkout::runtime::CheckoutControllerRuntime, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime,
-    CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, EnvironmentReconciler,
+    CloneReconciler, CloneRuntime, EnvironmentReconciler, EnvironmentRuntime,
 };
 use flotilla_replay_testkit::Masks;
 use flotilla_replay_testkit::ReplayHttpClient;

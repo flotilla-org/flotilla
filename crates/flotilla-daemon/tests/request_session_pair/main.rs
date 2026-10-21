@@ -4884,6 +4884,7 @@ async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
         .create(
             &InputMeta::builder().name("capabilities-env".into()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "session-host".into(), repo_default_dir: "/repo".into() }),
                 docker: None,
             },

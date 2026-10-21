@@ -236,6 +236,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         .create(
             &empty_meta(env_id.as_str()),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
                 docker: None,
             },
@@ -435,6 +436,7 @@ async fn undecodable_credential_spec_parks_delivery_as_a_terminal_controller_fai
         .create(
             &empty_meta("credential-work"),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
                 docker: None,
             },
