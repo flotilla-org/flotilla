@@ -2414,6 +2414,8 @@ impl Aggregator {
                 )
             })
             .filter_map(|demand| demand.metadata.annotations.get(flotilla_resources::delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION))
+            // Several held crews show one, chosen lexicographically so the row is stable;
+            // explain lists every held batch.
             .min()
             .cloned()
             .filter(|_| !phase.is_terminal());
