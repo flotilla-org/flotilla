@@ -1765,6 +1765,7 @@ impl<'a> GitCliBackend<'a> {
     async fn adoption_base(&self, branch: &str, base: &str, has_origin: bool) -> Result<String, String> {
         let short =
             base.strip_prefix("refs/remotes/origin/").or_else(|| base.strip_prefix("origin/")).or_else(|| base.strip_prefix("refs/heads/"));
+        // Heuristic: full-length hexadecimal bases resolve locally without fetching.
         let immutable_commit = matches!(base.len(), 40 | 64) && base.bytes().all(|byte| byte.is_ascii_hexdigit());
         let short = short.or_else(|| (!base.starts_with("refs/") && !immutable_commit).then_some(base));
         let reference = if let Some(short) = short {
