@@ -1874,17 +1874,35 @@ fn pending_crew_startup_never_stalls(tc: hegel::TestCase) {
                     let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.unwrap();
                     wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.unwrap();
                 }
+                // Verify that each observation reached its intended session state.
+                match session_kind {
+                    0 => assert!(matches!(sessions.get("resumed-coder").await, Err(ResourceError::NotFound { .. }))),
+                    1 => assert!(sessions.get("resumed-coder").await.unwrap().status.is_none()),
+                    2 => assert_eq!(sessions.get("resumed-coder").await.unwrap().status.unwrap().phase, TerminalSessionPhase::Starting),
+                    3 => {
+                        let status = sessions.get("resumed-coder").await.unwrap().status.unwrap();
+                        assert_eq!(status.phase, TerminalSessionPhase::Running);
+                        assert_eq!(status.attention.unwrap().state, TerminalAttentionState::Idle);
+                    }
+                    _ => unreachable!(),
+                }
                 let status = backend.using::<Convoy>("flotilla").get("stalled-work").await.unwrap().status.unwrap();
                 assert!(status.stalled.is_none(), "startup session kind {session_kind} at {seconds}s: {:?}", status.stalled);
             }
-            // Once launched, ordinary idle detection must still apply.
-            if session_kind == 3 {
+            // Once Working, every session kind must regain dead-session or idle detection.
+            {
                 update_convoy(&backend, "stalled-work", |status| {
                     status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().phase = CrewWorkPhase::Working;
                 })
                 .await;
                 for seconds in [1201, 1261, 1321, 1381] {
-                    observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(seconds)).await;
+                    let now = start + chrono::Duration::seconds(seconds);
+                    if session_kind == 3 {
+                        observe_actor(&backend, &wake, TerminalAttentionState::Idle, now).await;
+                    } else {
+                        let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.unwrap();
+                        wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.unwrap();
+                    }
                 }
                 assert!(backend.using::<Convoy>("flotilla").get("stalled-work").await.unwrap().status.unwrap().stalled.is_some());
             }
