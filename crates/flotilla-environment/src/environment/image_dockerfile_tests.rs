@@ -381,3 +381,19 @@ fn stdlib_layers_generate_for_both_architectures() {
         assert!(formal["tlc"].executable && formal["probe.sh"].executable && !formal["package.json"].executable);
     }
 }
+
+// Glue: the two shipped layer definitions must deliver the shell contract
+// through the generated Dockerfile and check it in their runtime probes.
+#[test]
+fn stdlib_layers_provide_and_probe_crew_shells() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stdlib/image-layers");
+    let base = read_layer(&root.join("base-ubuntu-24.04"));
+    let utilities = read_layer(&root.join("crew-utilities"));
+    let generated = generate_build(&[base.clone(), utilities.clone()], "amd64").expect("shell layers generate");
+    assert!(generated.dockerfile.lines().any(|line| line == "ENV SHELL=/bin/bash"));
+    assert!(base.probe.contains("test \"$SHELL\" = /bin/bash"));
+    let installs = utilities.fragment.split("apt-get install").skip(1);
+    assert!(installs.filter_map(|install| install.split(';').next()).flat_map(str::split_whitespace).any(|package| package == "zsh"));
+    let tools = utilities.probe.lines().find_map(|line| line.trim().strip_prefix("for tool in ")).expect("tool probe loop");
+    assert!(tools.split(';').next().expect("probed tools").split_whitespace().any(|tool| tool == "zsh"));
+}

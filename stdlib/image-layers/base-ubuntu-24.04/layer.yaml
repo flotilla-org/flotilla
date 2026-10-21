@@ -25,6 +25,7 @@ probe: |
       command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 1; }
   done
   locale -a | grep -qx 'en_US.utf8'
+  test "$SHELL" = /bin/bash
   test "$LANG" = en_US.UTF-8
   case ":$PATH:" in :/opt/flotilla/bin:*) ;; *) echo "PATH must start with /opt/flotilla/bin: $PATH" >&2; exit 1 ;; esac
   # Probes run unprivileged on the final image, so this also catches a layer

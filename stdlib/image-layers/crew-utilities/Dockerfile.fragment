@@ -15,7 +15,8 @@ RUN set -eu; \
         openssh-client \
         procps \
         python3 \
-        ripgrep; \
+        ripgrep \
+        zsh; \
     rm -rf /var/lib/apt/lists/*
 RUN set -eu; \
     case "${TARGETARCH}" in \
