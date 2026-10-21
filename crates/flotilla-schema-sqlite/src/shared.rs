@@ -1,5 +1,7 @@
 //! The shared tables every kind's tables reference.
 
+use std::collections::BTreeSet;
+
 use crate::{quote_ident, render_ddl_with, render_views, DdlMode, StoreError, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD};
 use flotilla_schema::KindRegistry;
 use rusqlite::{Connection, OptionalExtension};
@@ -248,7 +250,8 @@ pub(crate) fn has_string_domain(conn: &Connection) -> rusqlite::Result<bool> {
 }
 
 /// Refuses a kind table whose columns differ from its kind's: the backend's own columns (`id` and
-/// `version` on the root, the parent key below it), then the key and data columns, in order.
+/// `version` on the root, the parent key below it), and the key and data columns. Order is not
+/// compared: statements name their columns, and an additive upgrade (`ADD COLUMN`) appends.
 pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Result<(), StoreError> {
     let mut statement = conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
     for set in kinds.iter() {
@@ -259,7 +262,7 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
             };
             expected.extend(table.key.iter().chain(&table.columns).map(|column| column.name.clone()));
             let found = statement.query_map([&table.name], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
-            if found != expected {
+            if found.iter().collect::<BTreeSet<_>>() != expected.iter().collect::<BTreeSet<_>>() {
                 return Err(StoreError::KindTableDrift { table: table.name.clone(), expected, found });
             }
         }
