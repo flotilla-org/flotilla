@@ -1114,17 +1114,20 @@ pub(crate) mod tests {
 
     #[derive(Default)]
     // Boundary double: records process argv and stdin separately.
-    struct RecordingRunner(Mutex<Vec<(String, Vec<String>)>>, Mutex<Vec<Vec<u8>>>);
+    struct RecordingRunner {
+        calls: Mutex<Vec<(String, Vec<String>)>>,
+        inputs: Mutex<Vec<Vec<u8>>>,
+    }
 
     #[async_trait]
     impl CommandRunner for RecordingRunner {
         async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
-            self.1.lock().expect("recording input lock").push(input.to_vec());
+            self.inputs.lock().expect("recording input lock").push(input.to_vec());
             self.run(cmd, args, cwd, label).await
         }
 
         async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-            self.0
+            self.calls
                 .lock()
                 .expect("recording runner lock should be healthy")
                 .push((cmd.to_string(), args.iter().map(|arg| (*arg).to_string()).collect()));
@@ -1525,6 +1528,18 @@ esac
         );
     }
 
+    // Glue: a literal dash pathname must reach the shell as a pathname rather
+    // than its stdin sentinel; normalization must not change other arguments.
+    #[tokio::test]
+    async fn skill_manifest_dash_path_is_not_stdin() {
+        let runner = RecordingRunner::default();
+        let args = ["flotilla-stage-skills", "-", "/skills", "false", "/cache"].map(str::to_string);
+        stage_git_skill_sources(&runner, &args).await.expect("stage pathname");
+        let calls = runner.calls.lock().expect("recorded calls");
+        assert_eq!(&calls[0].1[3..], &["flotilla-stage-skills", "./-", "/skills", "false", "/cache"]);
+        assert!(runner.inputs.lock().expect("recorded input").is_empty());
+    }
+
     #[tokio::test]
     async fn pinned_skills_are_staged_to_the_seam_resolved_claude_config() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1548,12 +1563,12 @@ esac
             .await
             .expect("stage pinned skills");
 
-        let calls = runner.0.lock().expect("recording runner lock should be healthy");
+        let calls = runner.calls.lock().expect("recording runner lock should be healthy");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "sh");
         assert_eq!(calls[0].1[4], "-", "inline manifest is consumed through stdin");
         assert!(!calls[0].1.iter().any(|arg| arg.starts_with("json:")));
-        let inputs = runner.1.lock().expect("recorded stdin");
+        let inputs = runner.inputs.lock().expect("recorded stdin");
         let manifest: SkillBundleManifest = serde_json::from_slice(&inputs[0]).expect("manifest");
         assert_eq!(manifest.sources[0].revision, "1".repeat(40));
         assert!(calls[0].1.contains(&"/tmp/flotilla-config/credentials/claude-max/claude/skills".to_string()));
@@ -2093,7 +2108,7 @@ esac
 
         registry.stage_test_skills("crew-codex", &required, &environment, &BTreeMap::new(), &runner).await.expect("stage pinned skills");
 
-        let calls = runner.0.lock().expect("recording runner lock should be healthy");
+        let calls = runner.calls.lock().expect("recording runner lock should be healthy");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "sh");
         assert!(calls[0].1.contains(&format!("{CONTAINER_CODEX_HOME}/skills")));
@@ -2121,7 +2136,7 @@ esac
             .await
             .expect("stage pinned skills for both adapters");
 
-        let calls = runner.0.lock().expect("recording runner lock should be healthy");
+        let calls = runner.calls.lock().expect("recording runner lock should be healthy");
         assert_eq!(calls.len(), 2);
         let destinations =
             calls.iter().map(|(_, args)| args.get(5).expect("staging call must include its destination").as_str()).collect::<BTreeSet<_>>();
@@ -2154,7 +2169,7 @@ esac
             .expect("skip external Codex home");
 
         assert_eq!(
-            runner.0.lock().expect("recording runner lock should be healthy").as_slice(),
+            runner.calls.lock().expect("recording runner lock should be healthy").as_slice(),
             &[("rm".to_string(), vec!["-f".to_string(), "--".to_string(), "/tmp/unused-skill-token".to_string()])]
         );
     }
