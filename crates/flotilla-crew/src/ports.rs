@@ -47,3 +47,13 @@ pub trait EngineMessages: Send + Sync {
 /// The composition root's slot for [`EngineMessages`]: set once, at startup,
 /// when `[primitives]` is on.
 pub type MessagePath = std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn EngineMessages>>>;
+
+/// Fresh inspection requested by an explicit convoy deletion before its stored-evidence gate.
+#[async_trait]
+pub trait CheckoutIntegrationInspector: Send + Sync {
+    async fn inspect(
+        &self,
+        convoy: &flotilla_resources::ResourceObject<flotilla_resources::Convoy>,
+        checkout: &flotilla_resources::ResourceObject<flotilla_resources::Checkout>,
+    ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String>;
+}

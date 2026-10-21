@@ -3,7 +3,53 @@ pub mod discovery;
 
 use std::{path::PathBuf, sync::Arc};
 
-use flotilla_provider_runtime::{http_execute, HttpClient};
+pub use flotilla_provider_runtime::http_execute as untraced_http_execute;
+use flotilla_provider_runtime::HttpClient;
+
+/// Trace precisely one HTTP attempt without logging credentials or query strings.
+#[macro_export]
+macro_rules! forge_http_execute {
+    ($forge:expr, $request:expr) => {{
+        let request = $request;
+        let trace = $crate::ForgejoCallTrace::new(request.url().path());
+        let result = $crate::untraced_http_execute!($forge.http, request);
+        trace.finish(result.as_ref().map(|response| response.status().as_u16()).ok());
+        result
+    }};
+}
+
+#[doc(hidden)]
+pub struct ForgejoCallTrace {
+    caller: &'static str,
+    endpoint: String,
+    pending: bool,
+}
+impl ForgejoCallTrace {
+    pub fn new(endpoint: &str) -> Self {
+        Self {
+            caller: tracing::Span::current().metadata().map_or("unattributed", |metadata| metadata.name()),
+            endpoint: endpoint.into(),
+            pending: true,
+        }
+    }
+    pub fn finish(mut self, status: Option<u16>) {
+        self.emit(status, "transport_error");
+        self.pending = false;
+    }
+    fn emit(&self, status: Option<u16>, fallback: &str) {
+        tracing::info!(target: "flotilla::forge_call", caller = self.caller, identity = "configured Forgejo credential", budget = "REST",
+            endpoint = %self.endpoint, status = %status.map(|code| code.to_string()).unwrap_or_else(|| fallback.to_string()),
+            charged_cost = %status.map(|code| u64::from(code != 304).to_string()).unwrap_or_else(|| "unknown".into()),
+            not_modified = status == Some(304), "forge call");
+    }
+}
+impl Drop for ForgejoCallTrace {
+    fn drop(&mut self) {
+        if self.pending {
+            self.emit(None, "cancelled");
+        }
+    }
+}
 
 /// Authentication assertion key used by Forgejo discovery and admission.
 pub const FORGEJO_AUTH_PROVIDER: &str = "forgejo";
@@ -73,7 +119,7 @@ impl ForgejoClient {
     }
 
     pub async fn get_json(&self, path: &str, query: &[(&str, String)]) -> Result<(serde_json::Value, bool), String> {
-        let response = http_execute!(self.http, self.issue_request(path, query)?)?;
+        let response = forge_http_execute!(self, self.issue_request(path, query)?)?;
         let status = response.status();
         let has_more = response
             .headers()
@@ -125,7 +171,7 @@ impl ForgejoClient {
         query: &[(&str, String)],
         body: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, String> {
-        let response = http_execute!(self.http, self.repository_request(repo_slug, method, path, query, body)?)?;
+        let response = forge_http_execute!(self, self.repository_request(repo_slug, method, path, query, body)?)?;
         if !response.status().is_success() {
             return Err(format!("Forgejo HTTP {}: {}", response.status(), String::from_utf8_lossy(response.body())));
         }

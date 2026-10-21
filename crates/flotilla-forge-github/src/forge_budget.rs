@@ -141,14 +141,55 @@ impl ForgeBudgets {
 }
 /// An interrupted subprocess may already have reached GitHub. Record the
 /// attempt without inventing a received response or GraphQL cost.
+#[derive(bon::Builder)]
 struct BudgetAttempt<'a> {
     budgets: &'a ForgeBudgets,
     key: Option<(&'static str, &'static str)>,
+    caller: &'static str,
+    command_kind: String,
+    trace_pending: bool,
 }
 impl BudgetAttempt<'_> {
-    fn finish(mut self, raw: &str) {
-        if let Some((identity, budget)) = self.key.take() {
+    fn new<'a>(budgets: &'a ForgeBudgets, cmd: &str, args: &[&str]) -> BudgetAttempt<'a> {
+        let caller = tracing::Span::current().metadata().map_or("unattributed", |metadata| metadata.name());
+        // Only static command categories are logged; arguments may contain secrets.
+        let command_kind = match args.first().copied() {
+            Some("api") if args.contains(&"graphql") => "api graphql",
+            Some("api") => "api REST",
+            Some("pr") => "pr",
+            Some("issue") => "issue",
+            _ => "other",
+        }
+        .to_string();
+        BudgetAttempt::builder()
+            .budgets(budgets)
+            .maybe_key(ForgeBudgets::key(cmd, args))
+            .caller(caller)
+            .command_kind(command_kind)
+            .trace_pending(cmd == "gh")
+            .build()
+    }
+    fn emit(&self, identity: &str, budget: &str, raw: &str, outcome: &str) {
+        let response = parse_gh_api_response(raw);
+        let document: serde_json::Value = serde_json::from_str(if response.status == 0 { raw } else { &response.body }).unwrap_or_default();
+        let charged_cost = match budget {
+            "REST" => Some(u64::from(response.status != 304)),
+            "GraphQL" => document["data"]["rateLimit"]["cost"].as_u64(),
+            _ => None,
+        };
+        tracing::info!(target: "flotilla::forge_call", caller = self.caller, identity, budget,
+            command_kind = %self.command_kind, status = %if response.status == 0 { outcome.to_string() } else { response.status.to_string() },
+            charged_cost = %charged_cost.map(|cost| cost.to_string()).unwrap_or_else(|| "unknown".into()), not_modified = response.status == 304, "forge call");
+    }
+    fn finish(mut self, raw: &str, outcome: &str) {
+        let key = self.key.take();
+        if let Some((identity, budget)) = key {
             self.budgets.after_for(identity, budget, raw);
+        }
+        if self.trace_pending {
+            let (identity, budget) = key.unwrap_or(("host gh login", "CLI"));
+            self.emit(identity, budget, raw, outcome);
+            self.trace_pending = false;
         }
     }
 }
@@ -156,6 +197,10 @@ impl Drop for BudgetAttempt<'_> {
     fn drop(&mut self) {
         if let Some((identity, budget)) = self.key {
             self.budgets.after_for(identity, budget, "cancelled before response");
+        }
+        if self.trace_pending {
+            let (identity, budget) = self.key.unwrap_or(("host gh login", "CLI"));
+            self.emit(identity, budget, "", "cancelled");
         }
     }
 }
@@ -203,19 +248,25 @@ impl CommandRunner for BudgetedRunner {
     }
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         self.budgets.before(cmd, args)?;
-        let attempt = BudgetAttempt { budgets: &self.budgets, key: ForgeBudgets::key(cmd, args) };
+        let attempt = BudgetAttempt::new(&self.budgets, cmd, args);
         let result = self.inner.run(cmd, args, cwd, label).await;
-        attempt.finish(result.as_ref().map(|value| value.as_str()).unwrap_or_else(|error| error.as_str()));
+        attempt.finish(
+            result.as_ref().map(|value| value.as_str()).unwrap_or_else(|error| error.as_str()),
+            if result.is_ok() { "success" } else { "error" },
+        );
         result
     }
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         self.budgets.before(cmd, args)?;
-        let attempt = BudgetAttempt { budgets: &self.budgets, key: ForgeBudgets::key(cmd, args) };
+        let attempt = BudgetAttempt::new(&self.budgets, cmd, args);
         let result = self.inner.run_output(cmd, args, cwd, label).await;
-        attempt.finish(match &result {
-            Ok(output) => &output.stdout,
-            Err(error) => error,
-        });
+        attempt.finish(
+            match &result {
+                Ok(output) => &output.stdout,
+                Err(error) => error,
+            },
+            if result.as_ref().is_ok_and(|output| output.success()) { "success" } else { "error" },
+        );
         result
     }
     async fn run_output_with_grace(
@@ -227,12 +278,15 @@ impl CommandRunner for BudgetedRunner {
         grace: Duration,
     ) -> Result<CommandOutput, String> {
         self.budgets.before(cmd, args)?;
-        let attempt = BudgetAttempt { budgets: &self.budgets, key: ForgeBudgets::key(cmd, args) };
+        let attempt = BudgetAttempt::new(&self.budgets, cmd, args);
         let result = self.inner.run_output_with_grace(cmd, args, cwd, label, grace).await;
-        attempt.finish(match &result {
-            Ok(output) => &output.stdout,
-            Err(error) => error,
-        });
+        attempt.finish(
+            match &result {
+                Ok(output) => &output.stdout,
+                Err(error) => error,
+            },
+            if result.as_ref().is_ok_and(|output| output.success()) { "success" } else { "error" },
+        );
         result
     }
     async fn run_with_timeout(
@@ -244,9 +298,12 @@ impl CommandRunner for BudgetedRunner {
         timeout: Duration,
     ) -> Result<String, String> {
         self.budgets.before(cmd, args)?;
-        let attempt = BudgetAttempt { budgets: &self.budgets, key: ForgeBudgets::key(cmd, args) };
+        let attempt = BudgetAttempt::new(&self.budgets, cmd, args);
         let result = self.inner.run_with_timeout(cmd, args, cwd, label, timeout).await;
-        attempt.finish(result.as_ref().map(|value| value.as_str()).unwrap_or_else(|error| error.as_str()));
+        attempt.finish(
+            result.as_ref().map(|value| value.as_str()).unwrap_or_else(|error| error.as_str()),
+            if result.is_ok() { "success" } else { "error" },
+        );
         result
     }
     async fn spawn_long_lived(
@@ -363,12 +420,87 @@ mod tests {
         })
         .join()
         .is_err());
-        let attempt = BudgetAttempt { budgets: &budgets, key: Some(("host gh login", "GraphQL")) };
+        let attempt = BudgetAttempt::new(&budgets, "gh", &["api", "graphql"]);
         drop(attempt);
         let row = budgets.rows("host").pop().expect("cancelled attempt row");
         assert_eq!(row.calls, 1);
         assert_eq!(row.unreported_calls, 1);
         assert_eq!(row.reported_cost, 0);
+    }
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // Process boundary fake: return headers and costs without contacting GitHub.
+    struct TraceRunner;
+    #[async_trait]
+    impl CommandRunner for TraceRunner {
+        async fn run_output(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+            label: &ChannelLabel,
+        ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+            self.run(cmd, args, cwd, label).await.map(|stdout| flotilla_provider_runtime::CommandOutput {
+                stdout,
+                stderr: String::new(),
+                exit_code: Some(0),
+            })
+        }
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            true
+        }
+        async fn run(&self, _: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+            Ok(if args.contains(&"graphql") {
+                "HTTP/2 200 OK\r\n\r\n{\"data\":{\"rateLimit\":{\"cost\":3}}}"
+            } else {
+                "HTTP/2 304 Not Modified\r\n\r\n"
+            }
+            .into())
+        }
+    }
+    // #3710: each subprocess attempt emits exactly one structured event and
+    // captures its named caller, with an explicit fallback outside a span.
+    #[test]
+    fn every_call_traces_caller_and_unspanned_calls_are_unattributed() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(logs.clone());
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            runtime.block_on(async {
+                let runner = BudgetedRunner { inner: Arc::new(TraceRunner), budgets: ForgeBudgets::default() };
+                {
+                    let span = tracing::info_span!("test_forge_caller");
+                    let _entered = span.enter();
+                    runner.run("gh", &["api", "graphql", "secret-token"], Path::new("/"), &ChannelLabel::Default).await.expect("call");
+                }
+                runner.run("gh", &["api", "repos/org/repo"], Path::new("/"), &ChannelLabel::Default).await.expect("call");
+            });
+        });
+        let logs = String::from_utf8(logs.lock().expect("logs").clone()).expect("UTF-8");
+        assert_eq!(logs.matches("forge call").count(), 2, "{logs}");
+        for field in [
+            "caller=\"test_forge_caller\"",
+            "caller=\"unattributed\"",
+            "identity=\"host gh login\"",
+            "budget=\"GraphQL\"",
+            "charged_cost=3",
+            "charged_cost=0",
+            "not_modified=true",
+        ] {
+            assert!(logs.contains(field), "missing {field}: {logs}");
+        }
+        assert!(!logs.contains("secret-token"));
     }
 
     // REST diagnostics conservatively count attempts, including HTTP failures

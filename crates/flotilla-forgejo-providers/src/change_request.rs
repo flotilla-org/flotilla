@@ -5,7 +5,6 @@ use chrono::Utc;
 use flotilla_forge_forgejo::{ForgejoClient, ForgejoIssueProviderConfig};
 use flotilla_protocol::ChangeRequest;
 use flotilla_protocol::ChangeRequestStatus;
-use flotilla_provider_runtime::http_execute;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::HttpClient;
@@ -131,7 +130,7 @@ impl ForgejoChangeRequestProvider {
                 &[("limit", PAGE_SIZE.to_string()), ("page", page.to_string())],
                 None,
             )?;
-            let response = http_execute!(self.forge.http, request)?;
+            let response = flotilla_forge_forgejo::forge_http_execute!(self.forge, request)?;
             crate::observation::check_response(&self.forge.config.service_url, response.status(), response.headers(), response.body())?;
             // Forgejo counts all returned reviews, including stale and
             // dismissed ones. If a proxy strips the header, an empty page

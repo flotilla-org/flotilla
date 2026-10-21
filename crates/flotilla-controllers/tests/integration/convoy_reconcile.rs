@@ -2224,6 +2224,30 @@ async fn terminal_bound_change_request_settles_checkout_without_own_landed_evide
     );
 }
 
+// #3710: a merged record older than the observer TTL still settles Landing;
+// no refresh of its checks or reviews is necessary.
+#[tokio::test]
+async fn landing_settles_on_merged_record_older_than_stale_after() {
+    let TerminalChangeRequestReconcile { backend, .. } = reconcile_terminal_bound_change_request(true, true, false).await;
+    let records = backend.using::<ChangeRequest>("flotilla");
+    let old = timestamp(40) - chrono::Duration::hours(1);
+    for record in records.list().await.expect("records").items {
+        let mut status = record.status.expect("status");
+        status.state.observed_at = old;
+        status.checks.observed_at = old;
+        status.review.actionable_at_head.observed_at = old;
+        records.update_status(&record.metadata.name, &record.metadata.resource_version, &status).await.expect("old merge");
+    }
+    let current = backend.using::<Convoy>("flotilla").get("convoy-a").await.expect("convoy");
+    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+        .with_vessels(backend.using::<Vessel>("flotilla"))
+        .with_checkouts(backend.using::<Checkout>("flotilla"))
+        .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
+        .with_clock(Arc::new(FixedClock(timestamp(40))));
+    let prepared = reconciler.prepare(&current).await.expect("prepare");
+    assert!(settlement_transition(reconciler.reconcile(&current, &prepared, timestamp(40)).patch).is_some());
+}
+
 #[tokio::test]
 async fn terminal_bound_change_request_discharges_missing_checkout_after_vessel_teardown() {
     let TerminalChangeRequestReconcile { outcome, .. } = reconcile_terminal_bound_change_request(false, false, false).await;

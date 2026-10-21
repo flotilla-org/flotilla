@@ -46,11 +46,18 @@ pub async fn inspect_checkout_integration(
         checkout_path,
         spec,
         change_request_id,
-        None,
         change_request_id.is_some(),
         false,
+        None,
     )
     .await
+}
+
+/// Replicated change-request facts and the checkout's latched landing metadata.
+#[derive(Clone, Copy)]
+pub struct ChangeRequestIntegrationInput<'a> {
+    pub status: Option<&'a ChangeRequestStatus>,
+    pub landed_evidence: Option<&'a LandedEvidence>,
 }
 
 /// Inspect a checkout for settlement after the caller has resolved the
@@ -62,7 +69,7 @@ pub async fn inspect_convoy_checkout_integration(
     spec: &CheckoutSpec,
     convoy: &ResourceObject<Convoy>,
     change_request_id: Option<&str>,
-    observed_change_request: Option<&ChangeRequestStatus>,
+    recorded: ChangeRequestIntegrationInput<'_>,
 ) -> CheckoutIntegrationStatus {
     let observe_remote_ref = convoy.status.as_ref().is_some_and(|status| {
         status.crew_work.values().flat_map(BTreeMap::values).any(|work| work.phase == CrewWorkPhase::Done && work.claim_evidence.is_some())
@@ -72,9 +79,9 @@ pub async fn inspect_convoy_checkout_integration(
         checkout_path,
         spec,
         change_request_id,
-        observed_change_request,
         convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_at.is_some()) || change_request_id.is_some(),
         observe_remote_ref,
+        Some(recorded),
     )
     .await
 }
@@ -85,14 +92,15 @@ struct IntegrationProviders<'a> {
     vcs: &'a dyn Vcs,
 }
 
+#[tracing::instrument(name = "checkout_landing_evidence", skip_all)]
 async fn inspect_checkout_integration_with_association(
     providers: IntegrationProviders<'_>,
     checkout_path: &Path,
     spec: &CheckoutSpec,
     change_request_id: Option<&str>,
-    observed_change_request: Option<&ChangeRequestStatus>,
     convoy_association_complete: bool,
     observe_remote_ref: bool,
+    recorded_landing: Option<ChangeRequestIntegrationInput<'_>>,
 ) -> CheckoutIntegrationStatus {
     let observed_at = Utc::now().to_rfc3339();
     let clean = if matches!(spec, CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_some()) {
@@ -104,16 +112,32 @@ async fn inspect_checkout_integration_with_association(
     } else {
         inspect_clean(providers.vcs, &observed_at).await
     };
-    let pushed = inspect_pushed(providers.vcs, observed_change_request, &observed_at).await;
-    let (landed, landed_evidence, change_request) = inspect_landed(
-        providers,
-        checkout_path,
-        checkout_base_ref_from_spec(spec),
-        change_request_id,
-        convoy_association_complete,
-        &observed_at,
-    )
-    .await;
+    let pushed = inspect_pushed(providers.vcs, recorded_landing.and_then(|recorded| recorded.status), &observed_at).await;
+    let (landed, landed_evidence, change_request) = match recorded_landing {
+        Some(recorded) => {
+            inspect_recorded_landed(
+                providers,
+                checkout_path,
+                checkout_base_ref_from_spec(spec),
+                change_request_id,
+                recorded,
+                convoy_association_complete,
+                &observed_at,
+            )
+            .await
+        }
+        None => {
+            inspect_landed(
+                providers,
+                checkout_path,
+                checkout_base_ref_from_spec(spec),
+                change_request_id,
+                convoy_association_complete,
+                &observed_at,
+            )
+            .await
+        }
+    };
     let remote_refs = if observe_remote_ref {
         inspect_remote_ref(providers.vcs, checkout_branch_from_spec(spec), &observed_at).await
     } else {
@@ -162,6 +186,91 @@ async fn inspect_pushed(vcs: &dyn Vcs, observed_change_request: Option<&ChangeRe
         VcsCheck::Unknown(details) => (ConditionValue::Unknown, details),
     };
     IntegrationCondition::builder().value(value).details(details).observed_at(observed_at.to_string()).build()
+}
+
+// Convoy inspection uses the replicated observation. Only immutable metadata
+// absent from that observation is fetched on the first merged inspection.
+async fn inspect_recorded_landed(
+    providers: IntegrationProviders<'_>,
+    checkout_path: &Path,
+    base_ref: Option<&str>,
+    id: Option<&str>,
+    recorded: ChangeRequestIntegrationInput<'_>,
+    association_complete: bool,
+    observed_at: &str,
+) -> (IntegrationCondition, Option<LandedEvidence>, Option<ChangeRequestObservation>) {
+    let condition =
+        |value, detail| IntegrationCondition::builder().value(value).details(vec![detail]).observed_at(observed_at.to_string()).build();
+    let Some(id) = id else {
+        let comparison = compare_branch_to_base(providers.vcs, base_ref).await;
+        return (landed_without_change_request(&comparison, association_complete, observed_at), None, None);
+    };
+    let Some(status) = recorded.status else {
+        return (condition(ConditionValue::Unknown, format!("PR #{id} has no replicated observation")), None, None);
+    };
+    let state = match status.state.value {
+        Some(ObservedChangeRequestState::Merged) => ChangeRequestState::Merged,
+        Some(ObservedChangeRequestState::Closed) => ChangeRequestState::Closed,
+        Some(ObservedChangeRequestState::Open | ObservedChangeRequestState::Draft) => ChangeRequestState::Open,
+        None => return (condition(ConditionValue::Unknown, format!("PR #{id} state is unknown")), None, None),
+    };
+    let mergeability = match status.mergeable.value {
+        Some(flotilla_resources::ObservedMergeability::Mergeable) => ChangeRequestMergeability::Mergeable,
+        Some(flotilla_resources::ObservedMergeability::Conflicting) => ChangeRequestMergeability::Conflicting,
+        _ => ChangeRequestMergeability::Unknown,
+    };
+    let mut observation = ChangeRequestObservation::builder()
+        .id(id.to_string())
+        .state(state)
+        .mergeability(mergeability)
+        .observed_at(observed_at.to_string())
+        .build();
+    if state == ChangeRequestState::Open {
+        return (condition(ConditionValue::False, format!("PR #{id} OPEN, not merged")), None, Some(observation));
+    }
+    if state == ChangeRequestState::Closed {
+        return (
+            condition(ConditionValue::True, format!("PR #{id} closed")),
+            Some(LandedEvidence::builder().change_request_id(id.to_string()).checkout_head_in_merged_head(false).build()),
+            Some(observation),
+        );
+    }
+    let mut evidence = recorded.landed_evidence.filter(|evidence| evidence.change_request_id == id).cloned();
+    if evidence.is_none() {
+        let result = providers
+            .runner
+            .run_output("gh", &["pr", "view", id, "--json", "mergedAt,baseRefName"], checkout_path, &ChannelLabel::Default)
+            .await;
+        if let Ok(output) = result {
+            if output.success() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&output.stdout) {
+                    let value = value.as_array().and_then(|items| items.first()).unwrap_or(&value);
+                    evidence = Some(
+                        LandedEvidence::builder()
+                            .change_request_id(id.to_string())
+                            .maybe_merged_at(value["mergedAt"].as_str().filter(|value| !value.is_empty()).map(str::to_string))
+                            .maybe_target_ref(value["baseRefName"].as_str().filter(|value| !value.is_empty()).map(str::to_string))
+                            .checkout_head_in_merged_head(false)
+                            .build(),
+                    );
+                }
+            }
+        }
+    }
+    let verified = match status.head_sha.value.as_deref() {
+        Some(head) => providers.vcs.head_in_history_of(head).await,
+        None => Err("merged PR head revision is unavailable".into()),
+    };
+    let (value, detail) = match verified {
+        Ok(true) => (ConditionValue::True, format!("PR #{id} merged; checkout HEAD is in merged PR head")),
+        Ok(false) => (ConditionValue::False, format!("PR #{id} merged, but checkout HEAD is not in merged PR head")),
+        Err(error) => (ConditionValue::Unknown, format!("PR #{id} merged; checkout revision could not be verified: {error}")),
+    };
+    if let Some(evidence) = evidence.as_mut() {
+        evidence.checkout_head_in_merged_head = value == ConditionValue::True;
+        observation.target_ref = evidence.target_ref.clone();
+    }
+    (condition(value, detail), evidence, Some(observation))
 }
 
 async fn inspect_landed(
@@ -432,6 +541,109 @@ mod tests {
                 exit_code: Some(0),
             })
         }
+    }
+
+    // Process boundary fake: any forge access before merge is a test failure.
+    struct RecordedLandingRunner {
+        allow_gh: std::sync::atomic::AtomicBool,
+        gh_calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl CommandRunner for RecordedLandingRunner {
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            true
+        }
+        async fn run(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+            if cmd == "gh" {
+                assert!(self.allow_gh.load(std::sync::atomic::Ordering::SeqCst), "forge call before merge");
+                assert_eq!(args, ["pr", "view", "42", "--json", "mergedAt,baseRefName"]);
+                self.gh_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(r#"{"mergedAt":"2026-10-21T00:00:00Z","baseRefName":"main"}"#.into())
+            } else {
+                Ok(String::new())
+            }
+        }
+        async fn run_output(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+            label: &ChannelLabel,
+        ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+            self.run(cmd, args, cwd, label).await.map(|stdout| flotilla_provider_runtime::CommandOutput {
+                stdout,
+                stderr: String::new(),
+                exit_code: Some(0),
+            })
+        }
+    }
+    // #3710: convoy integration uses replicated state before merge, and obtains
+    // only missing immutable metadata once after merge, reusing latched evidence.
+    #[tokio::test]
+    async fn convoy_checkout_landed_uses_replicated_change_request() {
+        use std::sync::atomic::Ordering;
+        let runner = Arc::new(RecordedLandingRunner { allow_gh: false.into(), gh_calls: 0.into() });
+        let vcs = FlotillaVcs::new(
+            ExecutionEnvironmentPath::new("/checkout"),
+            runner.clone(),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), runner.clone()))),
+        );
+        let spec = CheckoutSpec::Observed(
+            ObservedCheckoutSpec::builder()
+                .r#ref("topic".into())
+                .path("/checkout".into())
+                .repo_ref(flotilla_protocol::RepositoryKey("repo".into()))
+                .host_ref("host".into())
+                .is_main(false)
+                .build(),
+        );
+        let convoy = ResourceObject::<Convoy> {
+            metadata: serde_json::from_value(serde_json::json!({"name":"convoy", "namespace":"ops", "resource_version":"1", "labels":{}, "annotations":{}, "creation_timestamp":"2026-10-01T00:00:00Z"})).expect("metadata"),
+            spec: flotilla_resources::ConvoySpec::builder().workflow_ref("review".into()).build(), status: None,
+        };
+        let mut status = merged_change_request("merged-head");
+        status.state.value = Some(ObservedChangeRequestState::Open);
+        status.mergeable.value = Some(flotilla_resources::ObservedMergeability::Conflicting);
+        let open = inspect_convoy_checkout_integration(
+            &*runner,
+            &vcs,
+            Path::new("/checkout"),
+            &spec,
+            &convoy,
+            Some("42"),
+            ChangeRequestIntegrationInput { status: Some(&status), landed_evidence: None },
+        )
+        .await;
+        assert_eq!(open.landed.value, ConditionValue::False);
+        assert_eq!(open.change_request.expect("request").mergeability, ChangeRequestMergeability::Conflicting);
+        assert_eq!(runner.gh_calls.load(Ordering::SeqCst), 0);
+        status.state.value = Some(ObservedChangeRequestState::Merged);
+        runner.allow_gh.store(true, Ordering::SeqCst);
+        let merged = inspect_convoy_checkout_integration(
+            &*runner,
+            &vcs,
+            Path::new("/checkout"),
+            &spec,
+            &convoy,
+            Some("42"),
+            ChangeRequestIntegrationInput { status: Some(&status), landed_evidence: None },
+        )
+        .await;
+        assert_eq!(merged.landed.value, ConditionValue::True);
+        assert_eq!(merged.landed_evidence.as_ref().expect("evidence").target_ref.as_deref(), Some("main"));
+        runner.allow_gh.store(false, Ordering::SeqCst);
+        let again = inspect_convoy_checkout_integration(
+            &*runner,
+            &vcs,
+            Path::new("/checkout"),
+            &spec,
+            &convoy,
+            Some("42"),
+            ChangeRequestIntegrationInput { status: Some(&status), landed_evidence: merged.landed_evidence.as_ref() },
+        )
+        .await;
+        assert_eq!(again.landed.value, ConditionValue::True);
+        assert_eq!(runner.gh_calls.load(Ordering::SeqCst), 1);
     }
 
     // Non-UTF-8 native paths must report their unsupported encoding explicitly,

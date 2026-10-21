@@ -230,20 +230,79 @@ impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
     }
 }
 
+/// Process-local six-hour successes, keyed by service/repository. Per-key locks
+/// coalesce concurrent prepares without blocking unrelated repositories.
+/// [Workload note](https://github.com/flotilla-org/flotilla/blob/main/docs/implementation-choices/forge-budget-bleed.md).
 pub(super) struct GhForgeDefaultBranchResolver {
-    pub(super) runner: Arc<dyn CommandRunner>,
+    runner: Arc<dyn CommandRunner>,
+    cache: StdMutex<DefaultBranchCache>,
 }
-
+#[derive(Default)]
+struct DefaultBranchCache {
+    last_prune: Option<tokio::time::Instant>,
+    entries: HashMap<(String, String), Arc<tokio::sync::Mutex<BranchLookup>>>,
+}
+#[derive(Default)]
+struct BranchLookup {
+    success: Option<(tokio::time::Instant, String)>,
+    retry_at: Option<chrono::DateTime<Utc>>,
+}
+impl GhForgeDefaultBranchResolver {
+    pub(super) fn new(runner: Arc<dyn CommandRunner>) -> Self {
+        Self { runner, cache: Default::default() }
+    }
+}
 #[async_trait]
 impl ForgeDefaultBranchResolver for GhForgeDefaultBranchResolver {
+    #[tracing::instrument(name = "repository_default_branch", skip_all)]
     async fn default_branch(&self, forge: &ForgeIdentity) -> Result<Option<String>, String> {
         if forge.service_url.trim_end_matches('/') != "https://github.com" {
             return Ok(None);
         }
+        let key = (forge.service_url.trim_end_matches('/').to_string(), forge.repository.clone());
+        let lookup = {
+            let mut cache = self.cache.lock().expect("default branch cache lock");
+            let now = tokio::time::Instant::now();
+            if cache.last_prune.is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(60)) {
+                cache.entries.retain(|_, entry| {
+                    Arc::strong_count(entry) > 1
+                        || entry.try_lock().map_or(true, |lookup| {
+                            lookup.success.as_ref().is_some_and(|(expires, _)| *expires > now)
+                                || lookup.retry_at.is_some_and(|at| at > Utc::now())
+                        })
+                });
+                cache.last_prune = Some(now);
+            }
+            Arc::clone(cache.entries.entry(key).or_default())
+        };
+        let mut lookup = lookup.lock().await;
+        if let Some((_, branch)) = lookup.success.as_ref().filter(|(at, _)| *at > tokio::time::Instant::now()) {
+            return Ok(Some(branch.clone()));
+        }
+        lookup.success = None;
+        if let Some(retry_at) = lookup.retry_at.filter(|at| *at > Utc::now()) {
+            return Err(format!("github rate limited (budget=REST core, identity=host gh login, retry_at={retry_at})"));
+        }
+        lookup.retry_at = None;
         let endpoint = format!("repos/{}", forge.repository);
-        let output = self.runner.run("gh", &["api", &endpoint, "--jq", ".default_branch"], Path::new("/"), &ChannelLabel::Default).await?;
+        let output =
+            match self.runner.run("gh", &["api", &endpoint, "--jq", ".default_branch"], Path::new("/"), &ChannelLabel::Default).await {
+                Ok(output) => output,
+                Err(error) => {
+                    lookup.retry_at = error
+                        .strip_prefix("github rate limited (")
+                        .and_then(|fields| fields.strip_suffix(')'))
+                        .and_then(|fields| fields.rsplit_once("retry_at=").or_else(|| fields.rsplit_once("reset_at=")))
+                        .and_then(|(_, deadline)| deadline.parse().ok());
+                    return Err(error);
+                }
+            };
         let branch = output.trim();
-        Ok((!branch.is_empty()).then(|| branch.to_string()))
+        if branch.is_empty() {
+            return Ok(None);
+        }
+        lookup.success = Some((tokio::time::Instant::now() + std::time::Duration::from_secs(6 * 60 * 60), branch.to_string()));
+        Ok(Some(branch.to_string()))
     }
 }
 
@@ -357,7 +416,10 @@ impl RoutingCheckoutRuntime {
 
 #[async_trait]
 impl CheckoutRuntime for RoutingCheckoutRuntime {
-    async fn validate_new_branch(&self, checkout: &ResourceObject<Checkout>) -> Result<Option<String>, String> {
+    async fn validate_new_branch(
+        &self,
+        checkout: &ResourceObject<Checkout>,
+    ) -> Result<Option<String>, flotilla_provider_runtime::ObservationError> {
         let Some(target) = checkout.spec.target_path() else { return Ok(None) };
         let env_ref = checkout.spec.env_ref().ok_or_else(|| "checkout environment unavailable".to_string())?;
         let environment = self.state.daemon.resolve_environment_ref(env_ref).ok_or("checkout environment unavailable")?;
@@ -490,12 +552,7 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
     ) -> Result<CheckoutIntegrationStatus, String> {
         let path = checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec).ok_or("checkout path unavailable")?;
         let runtime = self.runtime_for(env_ref, path).await?;
-        if convoy.is_none() {
-            return runtime.inspect_integration(checkout, convoy).await;
-        }
-        let vcs = runtime.vcs(path)?;
-        let request = self.state.daemon.resolve_live_checkout_change_request(checkout, vcs.as_ref(), Path::new(path)).await?;
-        runtime.inspect_integration_with_request(checkout, convoy, request.as_deref()).await
+        runtime.inspect_integration(checkout, convoy).await
     }
 
     async fn remove_checkout_in(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
@@ -519,6 +576,94 @@ pub(super) const RECONCILE_NOW_ANNOTATION: &str = "flotilla.work/reconcile-now-a
 #[cfg(test)]
 mod chained_default_branch_tests {
     use super::*;
+
+    // Process boundary fake: count only the default-branch gh command.
+    struct DefaultBranchRunner {
+        calls: std::sync::atomic::AtomicUsize,
+        failures: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl CommandRunner for DefaultBranchRunner {
+        async fn run_output(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+            label: &ChannelLabel,
+        ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+            self.run(cmd, args, cwd, label).await.map(|stdout| flotilla_provider_runtime::CommandOutput {
+                stdout,
+                stderr: String::new(),
+                exit_code: Some(0),
+            })
+        }
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            true
+        }
+        async fn run(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+            assert_eq!(cmd, "gh");
+            assert_eq!(args, ["api", "repos/org/repo", "--jq", ".default_branch"]);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .failures
+                .try_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |left| left.checked_sub(1))
+                .is_ok()
+            {
+                Err("temporary forge failure".into())
+            } else {
+                Ok("main\n".into())
+            }
+        }
+    }
+    async fn default_branch_fixture(
+        failures: usize,
+    ) -> (Arc<DefaultBranchRunner>, flotilla_provisioning::reconcilers::RepositoryReconciler, ResourceObject<flotilla_resources::Repository>)
+    {
+        let runner = Arc::new(DefaultBranchRunner { calls: Default::default(), failures: failures.into() });
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let spec = flotilla_resources::RepositorySpec::remote("https://github.com/org/repo.git").expect("spec");
+        let repository = backend
+            .using::<flotilla_resources::Repository>("ops")
+            .create(&InputMeta::builder().name(spec.key().to_string()).build(), &spec)
+            .await
+            .expect("repository");
+        let reconciler = flotilla_provisioning::reconcilers::RepositoryReconciler::new(backend.clone(), backend, "ops")
+            .with_forge_default_branch_resolver(Arc::new(GhForgeDefaultBranchResolver::new(runner.clone())));
+        (runner, reconciler, repository)
+    }
+    // #3710: reconciliation resync and repeated prepares reuse six-hour successes.
+    #[tokio::test(start_paused = true)]
+    async fn forge_default_branch_cached_across_prepares() {
+        use flotilla_store::controller::Reconciler;
+        let (runner, reconciler, repository) = default_branch_fixture(0).await;
+        for _ in 0..10 {
+            assert_eq!(reconciler.prepare(&repository).await.expect("prepare").default_branch.as_deref(), Some("main"));
+            tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        }
+        assert_eq!(runner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    // #3710: an ordinary failure is retried on the very next prepare.
+    #[tokio::test]
+    async fn failed_default_branch_lookup_not_cached() {
+        use flotilla_store::controller::Reconciler;
+        let (runner, reconciler, repository) = default_branch_fixture(1).await;
+        assert!(reconciler.prepare(&repository).await.expect("failed lookup").default_branch.is_none());
+        assert_eq!(reconciler.prepare(&repository).await.expect("retry").default_branch.as_deref(), Some("main"));
+        assert_eq!(runner.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+    // #3710: a success is valid strictly before six hours, then refreshed.
+    #[tokio::test(start_paused = true)]
+    async fn default_branch_refreshes_after_ttl() {
+        use flotilla_store::controller::Reconciler;
+        let (runner, reconciler, repository) = default_branch_fixture(0).await;
+        reconciler.prepare(&repository).await.expect("first");
+        tokio::time::advance(std::time::Duration::from_secs(6 * 60 * 60 - 1)).await;
+        reconciler.prepare(&repository).await.expect("cached");
+        assert_eq!(runner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        reconciler.prepare(&repository).await.expect("refreshed");
+        assert_eq!(runner.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
 
     struct Answer(Result<Option<&'static str>, &'static str>);
 

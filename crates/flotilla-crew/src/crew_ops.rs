@@ -117,6 +117,8 @@ pub struct CrewService {
     host_name: HostName,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
     checkout_vcs: Arc<dyn CheckoutVcsResolver>,
+    #[builder(default)]
+    checkout_inspector: std::sync::RwLock<Option<Arc<dyn crate::ports::CheckoutIntegrationInspector>>>,
     local_environment_id: EnvironmentId,
 }
 
@@ -1495,6 +1497,10 @@ impl CrewService {
         Ok(CommandValue::Ok)
     }
 
+    pub fn set_checkout_inspector(&self, inspector: Arc<dyn crate::ports::CheckoutIntegrationInspector>) {
+        *self.checkout_inspector.write().expect("checkout inspector lock") = Some(inspector);
+    }
+
     pub async fn teardown(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         if force {
             return Ok(());
@@ -1514,6 +1520,29 @@ impl CrewService {
             .await
             .map_err(|err| err.to_string())?;
         let checkout_list = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items).into_values().collect::<Vec<_>>();
+        let mut checkout_list = checkout_list;
+        if convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Active) {
+            let inspector = self.checkout_inspector.read().expect("checkout inspector lock").clone();
+            if let Some(inspector) = inspector {
+                for checkout in &mut checkout_list {
+                    let mut integration = inspector.inspect(&convoy, checkout).await?;
+                    if let Some(status) = &checkout.status {
+                        flotilla_resources::latch_evidence_backed_integration(&status.integration, &mut integration);
+                    }
+                    // The gate consumes exactly the versioned observation we publish here.
+                    if let Ok(local) = self.resource_backend.using::<ResourceCheckout>(namespace).get(&checkout.metadata.name).await {
+                        apply_resource_status_patch(
+                            &self.resource_backend.using::<ResourceCheckout>(namespace),
+                            &local.metadata.name,
+                            &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration.clone()) },
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    }
+                    checkout.status.get_or_insert_with(Default::default).integration = integration;
+                }
+            }
+        }
         self.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkout_list, false).await
     }
 

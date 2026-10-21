@@ -94,9 +94,6 @@ impl FinalSettlementInputs {
             InstantiatedExit::Claim => {}
             InstantiatedExit::Table(entries) => {
                 for leaf in entries.iter().flat_map(|entry| &entry.leaves) {
-                    if !matches!(leaf.field_path.as_str(), ".state" | ".ready") {
-                        return None;
-                    }
                     let name = record_name(&leaf_address(&leaf.address, forges).ok()?)?;
                     let observation = observations.get(&name)?;
                     if observation.status.as_ref()?.state.value != Some(flotilla_resources::ObservedChangeRequestState::Merged) {

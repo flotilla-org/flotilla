@@ -13,7 +13,7 @@ use flotilla_resources::{
 };
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
 use flotilla_vcs::checkout_integration::inspect_checkout_integration;
-use flotilla_vcs::checkout_integration::inspect_convoy_checkout_integration;
+use flotilla_vcs::checkout_integration::{inspect_convoy_checkout_integration, ChangeRequestIntegrationInput};
 use flotilla_vcs::vcs as core_vcs;
 use flotilla_vcs::vcs::CheckoutRegistration;
 use flotilla_vcs::vcs::Vcs;
@@ -143,6 +143,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
 
 impl CheckoutControllerRuntime {
     /// Accepts the change-request identity resolved by the daemon’s routing adapter.
+    #[tracing::instrument(name = "checkout_landing_evidence", skip_all)]
     pub async fn inspect_integration_with_request(
         &self,
         checkout: &ResourceObject<Checkout>,
@@ -164,7 +165,10 @@ impl CheckoutControllerRuntime {
                 &checkout.spec,
                 convoy,
                 change_request_id,
-                observed_change_request.as_ref(),
+                ChangeRequestIntegrationInput {
+                    status: observed_change_request.as_ref(),
+                    landed_evidence: checkout.status.as_ref().and_then(|status| status.integration.landed_evidence.as_ref()),
+                },
             )
             .await);
         }
