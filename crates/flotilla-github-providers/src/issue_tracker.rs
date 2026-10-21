@@ -498,42 +498,40 @@ impl flotilla_issue_tracker::IssueProvider for GitHubIssueProvider {
         let (items, has_more, total) = match &params.search {
             None => {
                 let label = params.label.as_ref().map(|label| format!("&labels={}", urlencoding::encode(label))).unwrap_or_default();
-                let fields = params
-                    .match_fields
-                    .iter()
-                    .map(|(field, values)| format!("&{}={}", urlencoding::encode(field), urlencoding::encode(&values.join(","))))
-                    .collect::<String>();
                 let endpoint = format!(
-                    "repos/{}/issues?state=open&sort=updated&direction=desc&per_page={}&page={}{}{}",
-                    source.scope, per_page, page, label, fields
+                    "repos/{}/issues?state=open&sort=updated&direction=desc&per_page={}&page={}{}",
+                    source.scope, per_page, page, label
                 );
                 let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
                 let raw_items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
                 let issues = raw_items
                     .into_iter()
                     .filter(|value| !value.as_object().is_some_and(|object| object.contains_key("pull_request")))
+                    .filter(|value| flotilla_issue_tracker::match_fields::matches(value, &params.match_fields))
                     .filter_map(|value| parse_issue(source, &value, as_of))
                     .collect();
                 (issues, response.has_next_page, None)
             }
             Some(search_term) => {
                 let label = params.label.as_ref().map(|label| format!(" label:\"{label}\"")).unwrap_or_default();
-                let fields = params
-                    .match_fields
-                    .iter()
-                    .flat_map(|(field, values)| values.iter().map(move |value| format!(" {field}:\"{value}\"")))
-                    .collect::<String>();
-                let raw_query = format!("repo:{} is:issue is:open{}{} {}", source.scope, label, fields, search_term);
+                let raw_query = format!("repo:{} is:issue is:open{} {}", source.scope, label, search_term);
                 let encoded_query = urlencoding::encode(&raw_query);
                 let endpoint = format!("search/issues?q={}&sort=updated&order=desc&per_page={}&page={}", encoded_query, per_page, page);
                 let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
                 let parsed: serde_json::Value = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
                 let total = parsed["total_count"].as_u64().and_then(|value| u32::try_from(value).ok());
                 let raw_items = parsed["items"].as_array().ok_or("no items array in search response")?;
-                let issues = raw_items.iter().filter_map(|value| parse_issue(source, value, as_of)).collect();
+                let issues = raw_items
+                    .iter()
+                    .filter(|value| flotilla_issue_tracker::match_fields::matches(value, &params.match_fields))
+                    .filter_map(|value| parse_issue(source, value, as_of))
+                    .collect();
                 (issues, response.has_next_page, total)
             }
         };
+        // Filtering preserves the upstream page cursor, including empty pages.
+        // The upstream total counts unfiltered issues and is not a matched total.
+        let total = if params.match_fields.is_empty() { total } else { None };
         Ok(IssueResultPage { items, total, has_more })
     }
 
@@ -882,6 +880,41 @@ mod tests {
                 PathBuf::from("/neutral"),
             )]
         );
+    }
+
+    // ADR 0020: selectors filter native fields identically for list/search,
+    // never become ignored query parameters or search syntax, and preserve
+    // continuation through an empty filtered page. The GhApi double stands
+    // in for HTTP; exact endpoints below enforce the outbound request contract.
+    #[tokio::test]
+    async fn match_fields_filter_list_and_search_without_changing_requests() {
+        for search in [None, Some("bug".to_string())] {
+            for field in ["labels", "component", "sort"] {
+                let rows = r#"[{"number":1,"title":"Bug","state":"open","labels":[{"name":"terminal"}]},{"number":2,"title":"Other","state":"open","labels":[]}]"#;
+                let body = if search.is_some() { format!("{{\"total_count\":2,\"items\":{rows}}}") } else { rows.into() };
+                let api = Arc::new(MockGhApi::new(vec![ok_response(&body, true)]));
+                let provider = GitHubIssueProvider::new(api.clone(), Arc::new(MockRunner::new(vec![])), Path::new("/neutral"));
+                let query = IssueQuery {
+                    search: search.clone(),
+                    match_fields: [(field.into(), vec!["terminal".into()])].into(),
+                    ..IssueQuery::default()
+                };
+                let page = provider.query(&source(), &query, 2, 10).await.expect("query");
+                let expected = if field == "labels" { vec!["1"] } else { vec![] };
+                assert_eq!(page.items.iter().map(|issue| issue.reference.id.as_str()).collect::<Vec<_>>(), expected);
+                assert!(page.has_more);
+                assert_eq!(page.total, None);
+                let endpoint = if search.is_some() {
+                    format!(
+                        "search/issues?q={}&sort=updated&order=desc&per_page=10&page=2",
+                        urlencoding::encode("repo:owner/repo is:issue is:open bug")
+                    )
+                } else {
+                    "repos/owner/repo/issues?state=open&sort=updated&direction=desc&per_page=10&page=2".into()
+                };
+                assert_eq!(api.requests(), vec![(endpoint, PathBuf::from("/neutral"))]);
+            }
+        }
     }
 
     #[tokio::test]

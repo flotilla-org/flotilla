@@ -1,4 +1,5 @@
 //! Forge-neutral source-addressed issue providers and mission-field decoding.
+pub mod match_fields;
 pub mod mission_fields;
 
 use std::sync::Arc;
