@@ -301,12 +301,15 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelMappedWatch<W, P> {
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             let resolver = backend.using::<W>(&namespace);
-            let listed = crate::retry_store_read(|| resolver.list()).await?;
+            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.list()).await?;
             for object in &listed.items {
                 Self::enqueue_from_object(self.label_key, &sender, object).await?;
             }
 
-            let mut watch = crate::retry_store_read(|| resolver.watch(WatchStart::resuming_from(&listed))).await?;
+            let mut watch = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || {
+                resolver.watch(WatchStart::resuming_from(&listed))
+            })
+            .await?;
             while let Some(event) = watch.next().await {
                 match event? {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -341,11 +344,14 @@ impl<W: Resource, P: Resource> SecondaryWatch for ResolverLabelMappedWatch<W, P>
         sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            let listed = crate::retry_store_read(|| self.resolver.list()).await?;
+            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.list()).await?;
             for object in &listed.items {
                 LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, object).await?;
             }
-            let mut watch = crate::retry_store_read(|| self.resolver.watch(WatchStart::resuming_from(&listed))).await?;
+            let mut watch = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || {
+                self.resolver.watch(WatchStart::resuming_from(&listed))
+            })
+            .await?;
             while let Some(event) = watch.next().await {
                 match event? {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -380,8 +386,9 @@ impl<W: Resource, P: Resource> SecondaryWatch for ReplicaLabelMappedWatch<W, P> 
         sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            let mut watch = crate::retry_store_read(|| self.resolver.watch()).await?;
-            let listed = crate::retry_store_read(|| self.resolver.list()).await?;
+            let mut watch =
+                crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.watch()).await?;
+            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.list()).await?;
             for source in &listed.items {
                 LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, &source.object).await?;
             }
@@ -421,7 +428,11 @@ impl ReplicaConvoyCheckoutWatch {
         // Listing locally labeled checkouts on each convoy event is acceptable
         // at current scale and avoids another watch-side index to maintain.
         let selector = BTreeMap::from([(crate::CONVOY_LABEL.to_string(), convoy.metadata.name.clone())]);
-        for checkout in crate::retry_store_read(|| checkouts.list_matching_labels(&selector)).await?.items {
+        for checkout in
+            crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || checkouts.list_matching_labels(&selector))
+                .await?
+                .items
+        {
             sender
                 .send(checkout.metadata.name)
                 .await
@@ -446,8 +457,9 @@ impl SecondaryWatch for ReplicaConvoyCheckoutWatch {
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             let checkouts = backend.using::<crate::Checkout>(&namespace);
-            let mut watch = crate::retry_store_read(|| self.resolver.watch()).await?;
-            let listed = crate::retry_store_read(|| self.resolver.list()).await?;
+            let mut watch =
+                crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.watch()).await?;
+            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.list()).await?;
             for source in &listed.items {
                 Self::enqueue_checkouts(&sender, &checkouts, &source.object).await?;
             }
@@ -482,7 +494,9 @@ impl<W: Resource, P: Resource> LabelJoinWatch<W, P> {
             return Ok(());
         };
         let selector = BTreeMap::from([(label_key.to_string(), value.clone())]);
-        let listed = crate::retry_store_read(|| primaries.list_matching_labels(&selector)).await?;
+        let listed =
+            crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primaries.list_matching_labels(&selector))
+                .await?;
         for object in listed.items {
             sender
                 .send(object.metadata.name)
@@ -509,12 +523,15 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelJoinWatch<W, P> {
         Box::pin(async move {
             let watched = backend.clone().using::<W>(&namespace);
             let primaries = backend.using::<P>(&namespace);
-            let listed = crate::retry_store_read(|| watched.list()).await?;
+            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || watched.list()).await?;
             for object in &listed.items {
                 Self::enqueue_matching_primaries(self.label_key, &sender, object, &primaries).await?;
             }
 
-            let mut watch = crate::retry_store_read(|| watched.watch(WatchStart::resuming_from(&listed))).await?;
+            let mut watch = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || {
+                watched.watch(WatchStart::resuming_from(&listed))
+            })
+            .await?;
             while let Some(event) = watch.next().await {
                 match event? {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -582,11 +599,12 @@ impl<R: Reconciler> ControllerLoop<R> {
             }
             Actuation::RetryClone { name, failed_at } => {
                 let resolver = backend.using::<crate::Clone>(namespace);
-                let clone = match crate::retry_store_read(|| resolver.get(&name)).await {
-                    Ok(clone) => clone,
-                    Err(ResourceError::NotFound { .. }) => return Ok(()),
-                    Err(error) => return Err(error),
-                };
+                let clone =
+                    match crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.get(&name)).await {
+                        Ok(clone) => clone,
+                        Err(ResourceError::NotFound { .. }) => return Ok(()),
+                        Err(error) => return Err(error),
+                    };
                 let current_failed_at =
                     clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
                 if clone.status.as_ref().map(|status| status.phase) != Some(crate::ClonePhase::Failed) || current_failed_at != failed_at {
@@ -615,7 +633,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                 // Re-read the acknowledgment and pending queue together on every
                 // conflict: never erase a concurrently enqueued operator brief.
                 for _ in 0..8 {
-                    let current = crate::retry_store_read(|| resolver.get(&name)).await?;
+                    let current =
+                        crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.get(&name)).await?;
                     let mut spec = current.spec.clone();
                     let crate::TerminalSessionSource::Agent { message: Some(head), .. } = &mut spec.source else {
                         return Ok(());
@@ -672,7 +691,7 @@ impl<R: Reconciler> ControllerLoop<R> {
     }
 
     async fn delete_if_lifecycle_owned<T: Resource>(resolver: &TypedResolver<T>, name: &str) -> Result<(), ResourceError> {
-        let object = match crate::retry_store_read(|| resolver.get(name)).await {
+        let object = match crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.get(name)).await {
             Ok(object) => object,
             Err(ResourceError::NotFound { .. }) => return Ok(()),
             Err(err) => return Err(err),
@@ -697,7 +716,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                 tokio::time::sleep(backoff).await;
             }
             let result = async {
-                let listed = crate::retry_store_read(|| primary.list()).await?;
+                let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.list()).await?;
                 for object in &listed.items {
                     sender
                         .send(object.metadata.name.clone())
@@ -705,7 +724,10 @@ impl<R: Reconciler> ControllerLoop<R> {
                         .map_err(|_| ResourceError::other("controller queue closed while forwarding initial primary list"))?;
                 }
 
-                let mut watch = crate::retry_store_read(|| primary.watch(WatchStart::resuming_from(&listed))).await?;
+                let mut watch = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || {
+                    primary.watch(WatchStart::resuming_from(&listed))
+                })
+                .await?;
                 while let Some(event) = watch.next().await {
                     match event? {
                         WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -749,7 +771,7 @@ impl<R: Reconciler> ControllerLoop<R> {
     }
 
     async fn resync_all(primary: &TypedResolver<R::Resource>, sender: &WorkQueueSender) -> Result<HashSet<String>, ResourceError> {
-        let listed = crate::retry_store_read(|| primary.list()).await?;
+        let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.list()).await?;
         let mut live_names = HashSet::with_capacity(listed.items.len());
         for object in listed.items {
             live_names.insert(object.metadata.name.clone());
@@ -842,23 +864,24 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let woke_at = Instant::now();
                 metrics.queue_wait.record(sender.start(&name));
                 let _busy = metrics.busy();
-                let object = match crate::retry_store_read(|| primary.get(&name)).await {
-                    Ok(object) => object,
-                    Err(ResourceError::NotFound { .. }) => {
-                        object_failures.remove(&name);
-                        finalizer_failures.remove(&name);
-                        continue;
-                    }
-                    Err(err) => {
-                        warn!(
-                            resource_kind = R::Resource::API_PATHS.kind,
-                            resource = %name,
-                            %err,
-                            "controller failed to read object; leaving it for a later resync",
-                        );
-                        continue;
-                    }
-                };
+                let object =
+                    match crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.get(&name)).await {
+                        Ok(object) => object,
+                        Err(ResourceError::NotFound { .. }) => {
+                            object_failures.remove(&name);
+                            finalizer_failures.remove(&name);
+                            continue;
+                        }
+                        Err(err) => {
+                            warn!(
+                                resource_kind = R::Resource::API_PATHS.kind,
+                                resource = %name,
+                                %err,
+                                "controller failed to read object; leaving it for a later resync",
+                            );
+                            continue;
+                        }
+                    };
                 if finalizer_failures.get(&name).is_some_and(|failure| failure.creation_timestamp != object.metadata.creation_timestamp) {
                     finalizer_failures.remove(&name);
                 }
@@ -1175,7 +1198,8 @@ pub async fn delete_lifecycle_owned_matching<T: Resource>(
     resolver: &TypedResolver<T>,
     selector: &BTreeMap<String, String>,
 ) -> Result<(), ResourceError> {
-    let listed = crate::retry_store_read(|| resolver.list_matching_labels(selector)).await?;
+    let listed =
+        crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.list_matching_labels(selector)).await?;
     for object in listed.items {
         if !is_lifecycle_owned(object.metadata.lifecycle_authority()?) {
             continue;

@@ -1,11 +1,12 @@
-//! Load instrumentation (#3206): lock-free counters and latency histograms that
+//! Load instrumentation (#3206): counters and latency histograms that
 //! the store, controller loops and replication record into, and that a load
-//! driver samples. Recording is a few relaxed atomic operations, so the
-//! metrics stay on in production builds; nothing reads them unless asked.
+//! driver samples. Most recording uses relaxed atomics; read-retry lifecycle
+//! tracking takes a short mutex only on refusal and completion. Metrics stay
+//! on in production builds.
 //!
-//! A snapshot is cumulative since start. Subtract an earlier snapshot to
-//! measure one phase of a run (`since`); peaks are the exception, being
-//! high-water marks over the whole run.
+//! Counters are cumulative since start. Where supported, subtract an earlier
+//! snapshot to measure one phase (`since`); peaks are high-water marks over
+//! the whole run. Read-retry snapshots also expose explicitly current gauges.
 
 use std::{
     collections::BTreeMap,
@@ -179,6 +180,165 @@ impl Peak {
     pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
+}
+
+/// Retry labels are a fixed process-wide set: no resource, peer or view IDs.
+#[derive(Debug, Clone, Copy)]
+#[repr(usize)]
+pub enum ReadRetryConsumer {
+    Controller,
+    WatchView,
+    Replication,
+}
+
+impl ReadRetryConsumer {
+    pub const ALL: [Self; 3] = [Self::Controller, Self::WatchView, Self::Replication];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Controller => "controller",
+            Self::WatchView => "watch_view",
+            Self::Replication => "replication",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// A consumer becomes prolonged after 30 seconds since its first busy refusal,
+/// including time spent waiting on its next read. Finishing or dropping the
+/// retry future removes its active signal; only successful reads count as recovery.
+pub const READ_RETRY_PROLONGED: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Default)]
+pub struct ReadRetryMetrics {
+    state: Mutex<ReadRetryState>,
+}
+
+#[derive(Debug, Default)]
+struct ReadRetryState {
+    next_id: u64,
+    retries: u64,
+    recoveries: u64,
+    failures: u64,
+    cancellations: u64,
+    peak_consecutive: u64,
+    active: BTreeMap<u64, (tokio::time::Instant, u64)>,
+}
+
+/// Counters are cumulative; active/prolonged/consecutive/oldest are current
+/// gauges. Storage is proportional only to currently retrying calls and is
+/// released on completion or cancellation, never retained by consumer identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ReadRetrySnapshot {
+    pub retries: u64,
+    pub recoveries: u64,
+    pub failures: u64,
+    pub cancellations: u64,
+    /// Highest consecutive refusal count of any single call since start.
+    pub peak_consecutive: u64,
+    pub active: u64,
+    pub prolonged: u64,
+    /// Sum of consecutive refusal counts across currently active calls.
+    pub consecutive: u64,
+    pub oldest_millis: u64,
+}
+
+impl ReadRetryMetrics {
+    // Instrumentation must remain usable in Drop and health reporting even if
+    // a prior panic poisoned the lock; metrics must not cause a second panic.
+    fn state(&self) -> std::sync::MutexGuard<'_, ReadRetryState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn snapshot(&self) -> ReadRetrySnapshot {
+        let state = self.state();
+        let now = tokio::time::Instant::now();
+        let (mut prolonged, mut consecutive, mut oldest) = (0, 0, Duration::ZERO);
+        for (at, count) in state.active.values() {
+            let age = now.saturating_duration_since(*at);
+            prolonged += u64::from(age >= READ_RETRY_PROLONGED);
+            consecutive += count;
+            oldest = oldest.max(age);
+        }
+        ReadRetrySnapshot {
+            retries: state.retries,
+            recoveries: state.recoveries,
+            failures: state.failures,
+            cancellations: state.cancellations,
+            peak_consecutive: state.peak_consecutive,
+            active: state.active.len() as u64,
+            prolonged,
+            consecutive,
+            oldest_millis: u64::try_from(oldest.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+
+    pub(crate) fn retrying(&self) -> ReadRetryGuard<'_> {
+        ReadRetryGuard { metrics: self, id: None }
+    }
+}
+
+pub(crate) struct ReadRetryGuard<'a> {
+    metrics: &'a ReadRetryMetrics,
+    id: Option<u64>,
+}
+
+impl ReadRetryGuard<'_> {
+    pub(crate) fn busy(&mut self) {
+        let mut state = self.metrics.state();
+        let id = *self.id.get_or_insert_with(|| {
+            let id = state.next_id;
+            state.next_id += 1;
+            id
+        });
+        let count = {
+            let entry = state.active.entry(id).or_insert_with(|| (tokio::time::Instant::now(), 0));
+            entry.1 += 1;
+            entry.1
+        };
+        state.retries += 1;
+        state.peak_consecutive = state.peak_consecutive.max(count);
+    }
+
+    pub(crate) fn finish(&mut self, recovered: bool) {
+        if let Some(id) = self.id.take() {
+            let mut state = self.metrics.state();
+            state.active.remove(&id);
+            if recovered {
+                state.recoveries += 1;
+            } else {
+                state.failures += 1;
+            }
+        }
+    }
+}
+
+impl Drop for ReadRetryGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            let mut state = self.metrics.state();
+            state.active.remove(&id);
+            state.cancellations += 1;
+        }
+    }
+}
+
+fn read_retry_metrics() -> &'static [ReadRetryMetrics; ReadRetryConsumer::ALL.len()] {
+    static METRICS: std::sync::OnceLock<[ReadRetryMetrics; ReadRetryConsumer::ALL.len()]> = std::sync::OnceLock::new();
+    METRICS.get_or_init(Default::default)
+}
+
+pub(crate) fn read_retry_metrics_for(consumer: ReadRetryConsumer) -> &'static ReadRetryMetrics {
+    &read_retry_metrics()[consumer.index()]
+}
+
+/// All retries in this process, including remote replication reads. These are
+/// process metrics, independent of which backend a read uses.
+pub fn read_retry_snapshot() -> BTreeMap<&'static str, ReadRetrySnapshot> {
+    ReadRetryConsumer::ALL.into_iter().map(|consumer| (consumer.label(), read_retry_metrics_for(consumer).snapshot())).collect()
 }
 
 /// One durable store's single writer and its reader pool.
@@ -505,5 +665,117 @@ mod busy_tests {
         let _guard = metrics.busy();
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(metrics.snapshot().since(&end).busy_micros, 1_000_000);
+    }
+}
+
+#[cfg(test)]
+mod read_retry_tests {
+    use super::*;
+
+    // Generated interleavings cover idle calls, duplicate busy refusals, success,
+    // error and cancellation. Current gauges equal the remaining live consumers;
+    // cumulative retries and outcomes survive their removal.
+    #[hegel::test]
+    fn retry_lifecycle_tracks_only_live_consumers(tc: hegel::TestCase) {
+        // Always exercise every outcome and overlapping consumers, then vary
+        // the interleavings. Even an empty generated suffix covers all branches.
+        let mut operations = vec![0, 3, 0, 1, 1, 0, 1, 3, 4, 0, 1, 5];
+        operations.extend(tc.draw(hegel::generators::vecs(hegel::generators::integers::<u8>().min_value(0).max_value(5)).max_size(40)));
+        tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
+            let metrics = ReadRetryMetrics::default();
+            assert_eq!(metrics.snapshot(), ReadRetrySnapshot::default());
+            let mut guards = Vec::new();
+            let mut counts = Vec::new();
+            let (mut retries, mut recoveries, mut failures, mut cancellations, mut peak) = (0, 0, 0, 0, 0);
+            for op in operations {
+                match op {
+                    0 => {
+                        guards.push(metrics.retrying());
+                        counts.push(0);
+                    }
+                    1 | 2 => {
+                        if let Some(guard) = guards.last_mut() {
+                            guard.busy();
+                            *counts.last_mut().unwrap() += 1;
+                            retries += 1;
+                            peak = peak.max(*counts.last().unwrap());
+                        }
+                    }
+                    _ => {
+                        if let Some(mut guard) = guards.pop() {
+                            let count = counts.pop().unwrap();
+                            match op {
+                                3 => {
+                                    guard.finish(true);
+                                    recoveries += u64::from(count > 0);
+                                }
+                                4 => {
+                                    guard.finish(false);
+                                    failures += u64::from(count > 0);
+                                }
+                                _ => {
+                                    cancellations += u64::from(count > 0);
+                                }
+                            }
+                        }
+                    }
+                }
+                let snapshot = metrics.snapshot();
+                assert_eq!(snapshot.retries, retries);
+                assert_eq!(snapshot.recoveries, recoveries);
+                assert_eq!(snapshot.failures, failures);
+                assert_eq!(snapshot.cancellations, cancellations);
+                assert_eq!(snapshot.peak_consecutive, peak);
+                assert_eq!(snapshot.active, counts.iter().filter(|count| **count > 0).count() as u64);
+                assert_eq!(snapshot.consecutive, counts.iter().sum::<u64>());
+            }
+            drop(guards);
+            assert_eq!(metrics.snapshot().active, 0);
+        });
+    }
+
+    // A poisoned instrumentation lock must not disable snapshots, retry
+    // accounting or cancellation cleanup. One example covers the lock adapter.
+    #[test]
+    fn read_retry_poisoned_lock_remains_observable() {
+        let metrics = ReadRetryMetrics::default();
+        let poisoned = std::panic::catch_unwind(|| {
+            let _state = metrics.state.lock().unwrap();
+            panic!("poison instrumentation lock");
+        });
+        assert!(poisoned.is_err());
+        assert_eq!(metrics.snapshot(), ReadRetrySnapshot::default());
+        let mut recovered = metrics.retrying();
+        recovered.busy();
+        recovered.finish(true);
+        let mut cancelled = metrics.retrying();
+        cancelled.busy();
+        drop(cancelled);
+        let end = metrics.snapshot();
+        assert_eq!((end.retries, end.recoveries, end.cancellations, end.active), (2, 1, 1, 0));
+    }
+
+    // The 30-second boundary includes exactly 30s, even when the next read is
+    // still pending; finishing one consumer must not clear another one's signal.
+    #[tokio::test(start_paused = true)]
+    async fn prolonged_boundary_and_independent_recovery() {
+        let metrics = ReadRetryMetrics::default();
+        let mut first = metrics.retrying();
+        first.busy();
+        tokio::time::advance(READ_RETRY_PROLONGED - Duration::from_millis(1)).await;
+        assert_eq!(metrics.snapshot().prolonged, 0);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(metrics.snapshot().prolonged, 1);
+        let mut second = metrics.retrying();
+        second.busy();
+        first.finish(true);
+        assert_eq!(metrics.snapshot().prolonged, 0);
+        assert_eq!(metrics.snapshot().active, 1);
+        tokio::time::advance(READ_RETRY_PROLONGED).await;
+        assert_eq!(metrics.snapshot().prolonged, 1);
+        drop(second);
+        let end = metrics.snapshot();
+        assert_eq!((end.active, end.prolonged, end.consecutive, end.oldest_millis), (0, 0, 0, 0));
+        assert_eq!((end.retries, end.recoveries, end.cancellations), (2, 1, 1));
     }
 }

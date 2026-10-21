@@ -38,7 +38,7 @@ pub use project::*;
 mod project_hierarchy;
 pub use project_hierarchy::*;
 mod read_retry;
-pub use read_retry::retry_store_read;
+pub use read_retry::{retry_store_read, retry_store_read_for};
 mod registry;
 pub use registry::*;
 pub mod replica;

@@ -195,6 +195,7 @@ impl RuntimeHealth {
     pub(super) async fn conditions(&self) -> Vec<HostCondition> {
         let mut conditions = self.failures.lock().expect("runtime health lock poisoned").values().cloned().collect::<Vec<_>>();
         conditions.extend(self.issue_polling.condition());
+        conditions.extend(store_read_retry_condition(&flotilla_store::load_metrics::read_retry_snapshot()));
         if let Some(state_dir) = self.restart_history_dir.clone() {
             let frequency =
                 flotilla_provider_runtime::probe::blocking("restart history", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
@@ -488,6 +489,7 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
     if let Some(snapshot) = crate::resource_limits::io_pressure_snapshot().await {
         capabilities.insert("io_pressure".to_string(), snapshot);
     }
+    capabilities.insert("store_read_retries".into(), json!(flotilla_store::load_metrics::read_retry_snapshot()));
     capabilities.insert("forge_budgets".into(), serde_json::to_value(daemon.forge_budget_rows()).expect("forge budgets serialize"));
     let ready = !conditions.iter().any(HostCondition::blocks_readiness);
     flotilla_store::apply_status_patch(
@@ -868,5 +870,66 @@ mod provider_readiness_tests {
             observations.record_provider_advertisements(vec![provider.clone()]).await;
             assert_eq!(observations.provider_advertisements().await.unwrap()[0].readiness, provider.readiness);
         });
+    }
+}
+
+/// Informational pressure signal, independent of readiness, forge admission,
+/// and restart policy. Recomputed on every heartbeat.
+fn store_read_retry_condition(snapshot: &BTreeMap<&str, flotilla_store::load_metrics::ReadRetrySnapshot>) -> Option<HostCondition> {
+    let prolonged = snapshot
+        .iter()
+        .filter(|(_, metrics)| metrics.prolonged > 0)
+        .map(|(class, metrics)| {
+            format!(
+                "{class}: {} prolonged, {} consecutive busy refusals, oldest {} ms",
+                metrics.prolonged, metrics.consecutive, metrics.oldest_millis
+            )
+        })
+        .collect::<Vec<_>>();
+    if prolonged.is_empty() {
+        return None;
+    }
+    Some(
+        HostCondition::builder()
+            .condition_type("ResourceStore/ReadRetries")
+            .value(ConditionValue::False)
+            .reason("StoreBusyReadRetriesProlonged")
+            .message(format!(
+                "store-busy reads retrying for at least {} seconds; {}",
+                flotilla_store::load_metrics::READ_RETRY_PROLONGED.as_secs(),
+                prolonged.join("; ")
+            ))
+            .observed_at(Utc::now())
+            .blocks_readiness(false)
+            .blocks_forge_observation(false)
+            .build(),
+    )
+}
+
+#[cfg(test)]
+mod read_retry_health_tests {
+    use super::*;
+    use flotilla_store::load_metrics::ReadRetrySnapshot;
+
+    // The health condition exists only while at least one class has prolonged
+    // retries. Historical counters never keep it latched after recovery.
+    #[hegel::test]
+    fn prolonged_retries_are_informational_and_recovery_clears(tc: hegel::TestCase) {
+        let prolonged = tc.draw(hegel::generators::integers::<u64>().min_value(0).max_value(10));
+        let historical = tc.draw(hegel::generators::integers::<u64>());
+        let mut snapshot = BTreeMap::from([(
+            "controller",
+            ReadRetrySnapshot { prolonged, retries: historical, recoveries: historical, ..Default::default() },
+        )]);
+        let condition = store_read_retry_condition(&snapshot);
+        assert_eq!(condition.is_some(), prolonged > 0);
+        if let Some(condition) = condition {
+            assert_eq!(condition.condition_type, "ResourceStore/ReadRetries");
+            assert!(!condition.blocks_readiness());
+            assert!(!condition.blocks_forge_observation());
+            assert!(condition.message.contains("controller"));
+        }
+        snapshot.get_mut("controller").unwrap().prolonged = 0;
+        assert!(store_read_retry_condition(&snapshot).is_none());
     }
 }
