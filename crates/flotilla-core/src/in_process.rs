@@ -3078,6 +3078,19 @@ impl InProcessDaemon {
             apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::UnlinkSubject { subject })
                 .await
                 .map_err(|error| error.to_string())?;
+            // Explicit unlink must release retention even for terminal convoys,
+            // which the live-demand watch intentionally does not list.
+            let current = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+            let forges = self
+                .resource_backend
+                .definitions::<Forge>(namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|forge| forge.spec)
+                .collect::<Vec<_>>();
+            self.leaf_subscription_diagnostics.0.release_unlinked_change_request_claims(&current, &forges).await?;
         }
         Ok(())
     }

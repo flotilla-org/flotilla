@@ -878,6 +878,7 @@ fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
     let total_count = tc.draw(gs::integers::<u32>().min_value(0).max_value(101));
     let mut outcomes = vec![
         Err(ObservationError::Failed("rate limited diagnostics unavailable".into())),
+        Err(ObservationError::NotFound("pull request missing".into())),
         Ok(GhApiResponse { status: 200, etag: Some("etag".into()), body: "[]".into(), has_next_page, total_count: Some(total_count) }),
     ];
     for kind in [GithubRateLimitKind::Primary, GithubRateLimitKind::Secondary] {

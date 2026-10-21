@@ -215,7 +215,32 @@ async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
         .link_convoy_subject("flotilla", "switch-work", "repo0!7", Some(flotilla_protocol::Relationship::Produces))
         .await
         .expect("stale link");
+    // #3633: the unlink command also releases persisted retention history,
+    // including when the observation was not present in live demand discovery.
+    let records = backend.using::<flotilla_resources::ChangeRequest>("flotilla");
+    let address = flotilla_resources::address::stored_change_request_address("github.com", "team/repo0", 7, &[]).unwrap();
+    let record_name = flotilla_resources::address::record_name(&address).unwrap();
+    let claim = flotilla_resources::ChangeRequestSubjectHistory::builder()
+        .namespace("flotilla".into())
+        .convoy("switch-work".into())
+        .origin("test-host".into())
+        .relationship(flotilla_protocol::Relationship::Produces)
+        .role("coder".into())
+        .last_seen(Utc::now())
+        .build();
+    let mut spec = flotilla_resources::ChangeRequestSpec::builder()
+        .service("github.com".into())
+        .scope("team/repo0".into())
+        .number(7)
+        .observing_authority("test-host".into())
+        .build();
+    spec.subject_of = vec![claim];
+    records.create(&test_meta(&record_name), &spec).await.expect("retained stale subject");
     fixture.daemon.link_convoy_subject("flotilla", "switch-work", "repo0!7", None).await.expect("unlink stale merged subject");
+    assert!(
+        matches!(records.get(&record_name).await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+        "unlink must collect an otherwise unheld record"
+    );
     fixture.daemon.discover_convoy_branch_subjects("flotilla", "switch-work", "requested").await.expect("repair discovery");
     let repaired = convoys.get("switch-work").await.expect("convoy").status.expect("subjects");
     assert_eq!(repaired.subjects.len(), 1);
