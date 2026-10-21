@@ -1,12 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress};
 use flotilla_resources::{
     address::leaf_record_name, evaluate_leaf, expected_change_request_leaves, external_patches, Artifact, ArtifactLeafSubject,
-    ChangeRequest, Convoy, ConvoyAttention, ConvoyPhase, HoldAct, Issue, ObservedChecks, ResourceObject, StatusPatch, TerminalSession,
-    TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    ChangeRequest, Convoy, ConvoyAttention, ConvoyPhase, HoldAct, Issue, ObservedChecks, ResourceError, ResourceObject, StatusPatch,
+    TerminalSession, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::stalls::{is_active_change_request_probe, is_conflict_probe, is_merged_settlement_probe};
@@ -16,7 +18,7 @@ use super::{CrewTurnAdmission, CrewTurnIntent, LeafSubscriptionTable, TurnDelive
 pub(crate) fn turn_message_producer_key(source: &str, subject_revision: &str) -> String {
     format!("turn-delivery:{source}:{subject_revision}")
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct DeliveryError {
     pub(super) reason: String,
     kind: flotilla_resources::TurnDeliveryFailureKind,
@@ -45,7 +47,129 @@ impl TurnDeliveryActuator for UnavailableTurnDeliveryActuator {
     }
 }
 
+/// One convoy's failures not yet written, newest per source, and whether a
+/// firing is already writing them.
+#[derive(Default)]
+pub(super) struct PendingFailures {
+    pub(super) failures: BTreeMap<String, DeliveryError>,
+    pub(super) writing: bool,
+}
+
+/// Pending failures per `(namespace, convoy)`.
+pub(super) type PendingFailureMap = Mutex<HashMap<(String, String), PendingFailures>>;
+
+/// Every pending failure of one convoy, applied in one status write. Attempts
+/// and backoff derive from the status each optimistic retry reads; `changed`
+/// names the sources whose failure evidence differs from that status.
+struct FailTurnDeliveries {
+    failures: BTreeMap<String, DeliveryError>,
+    now: DateTime<Utc>,
+    changed: Mutex<Vec<String>>,
+}
+
+impl FailTurnDeliveries {
+    fn failure(
+        &self,
+        status: &flotilla_resources::ConvoyStatus,
+        source: &str,
+        error: &DeliveryError,
+    ) -> flotilla_resources::TurnDeliveryFailure {
+        let prior = status.turn_deliveries.get(source).and_then(|delivery| delivery.failure.as_ref());
+        let attempts = prior.map_or(1, |prior| prior.attempts.saturating_add(1));
+        let delay = 5_i64.saturating_mul(1_i64 << attempts.saturating_sub(1).min(6)).min(300);
+        flotilla_resources::TurnDeliveryFailure::builder()
+            .reason(error.reason.clone())
+            .failed_at(self.now)
+            .kind(error.kind)
+            .attempts(attempts)
+            .retry_at(self.now + chrono::Duration::seconds(delay))
+            .build()
+    }
+}
+
+impl StatusPatch<flotilla_resources::ConvoyStatus> for FailTurnDeliveries {
+    fn apply(&self, status: &mut flotilla_resources::ConvoyStatus) {
+        let mut changed = self.changed.lock().expect("changed turn-delivery failures");
+        changed.clear();
+        for (source, error) in &self.failures {
+            let prior = status.turn_deliveries.get(source).and_then(|delivery| delivery.failure.as_ref());
+            if prior.is_none_or(|prior| prior.reason != error.reason || prior.kind != error.kind) {
+                changed.push(source.clone());
+            }
+            let failure = self.failure(status, source, error);
+            flotilla_resources::ConvoyStatusPatch::FailTurnDelivery { source: source.clone(), failure }.apply(status);
+        }
+    }
+}
+
+/// The single writer of one convoy's pending failures. A batch it fails to
+/// write, or abandons when its firing is cancelled, returns to the pending set
+/// for the next failure's writer; failures recorded since keep precedence.
+pub(super) struct FailureWriter<'a> {
+    pending: &'a PendingFailureMap,
+    key: (String, String),
+    in_flight: Option<BTreeMap<String, DeliveryError>>,
+    released: bool,
+}
+
+impl<'a> FailureWriter<'a> {
+    pub(super) fn new(pending: &'a PendingFailureMap, key: (String, String)) -> Self {
+        Self { pending, key, in_flight: None, released: false }
+    }
+
+    /// Takes the failures recorded since the last write. With none left it
+    /// frees the slot in the same critical section, so it never touches a
+    /// newer writer's entry.
+    pub(super) fn next_batch(&mut self) -> Option<BTreeMap<String, DeliveryError>> {
+        let mut pending = self.pending.lock().expect("pending turn-delivery failures");
+        match pending.get_mut(&self.key) {
+            Some(entry) if !entry.failures.is_empty() => {
+                let batch = std::mem::take(&mut entry.failures);
+                self.in_flight = Some(batch.clone());
+                Some(batch)
+            }
+            _ => {
+                pending.remove(&self.key);
+                self.released = true;
+                None
+            }
+        }
+    }
+
+    fn written(&mut self) {
+        self.in_flight = None;
+    }
+
+    /// The convoy is gone: nothing can record its failures, so drop them all
+    /// and free the slot rather than keep them pending for the daemon's life.
+    fn abandon(&mut self) {
+        self.in_flight = None;
+        self.pending.lock().expect("pending turn-delivery failures").remove(&self.key);
+        self.released = true;
+    }
+}
+
+impl Drop for FailureWriter<'_> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let mut pending = self.pending.lock().expect("pending turn-delivery failures");
+        let entry = pending.entry(self.key.clone()).or_default();
+        for (source, error) in self.in_flight.take().into_iter().flatten() {
+            entry.failures.entry(source).or_insert(error);
+        }
+        entry.writing = false;
+        if entry.failures.is_empty() {
+            pending.remove(&self.key);
+        }
+    }
+}
+
 impl LeafSubscriptionTable {
+    /// Records a delivery failure. Concurrent failures for one convoy coalesce:
+    /// the first firing writes every failure pending for that convoy in one
+    /// status write, and firings that arrive meanwhile leave theirs to it (#3455).
     pub(super) async fn record_delivery_failure(
         &self,
         namespace: &str,
@@ -53,32 +177,53 @@ impl LeafSubscriptionTable {
         source: &str,
         error: &DeliveryError,
     ) -> Result<(), String> {
+        let key = (namespace.to_string(), convoy.to_string());
+        {
+            let mut pending = self.inner.pending_failures.lock().expect("pending turn-delivery failures");
+            let entry = pending.entry(key.clone()).or_default();
+            entry.failures.insert(source.to_string(), error.clone());
+            if entry.writing {
+                return Ok(());
+            }
+            entry.writing = true;
+        }
+        // A failed write returns its batch to the pending set and frees the slot;
+        // the next failure for this convoy writes it again with its own. Until
+        // then a follower's failure is only in memory, with no durable backoff:
+        // its turn row stays armed and level-triggered, so the next observation
+        // or convoy event re-fires the delivery, which fails again and records.
+        let mut writer = FailureWriter::new(&self.inner.pending_failures, key);
         let convoys = self.inner.backend.clone().using::<Convoy>(namespace);
-        let current = convoys.get(convoy).await.map_err(|error| error.to_string())?;
-        let prior =
-            current.status.as_ref().and_then(|status| status.turn_deliveries.get(source)).and_then(|delivery| delivery.failure.as_ref());
-        let changed = prior.is_none_or(|prior| prior.reason != error.reason || prior.kind != error.kind);
-        let attempts = prior.map_or(1, |prior| prior.attempts.saturating_add(1));
-        let delay = 5_i64.saturating_mul(1_i64 << attempts.saturating_sub(1).min(6)).min(300);
-        let now = Utc::now();
-        flotilla_store::apply_status_patch(
-            &convoys,
-            convoy,
-            &flotilla_resources::ConvoyStatusPatch::FailTurnDelivery {
-                source: source.to_string(),
-                failure: flotilla_resources::TurnDeliveryFailure::builder()
-                    .reason(error.reason.clone())
-                    .failed_at(now)
-                    .kind(error.kind)
-                    .attempts(attempts)
-                    .retry_at(now + chrono::Duration::seconds(delay))
-                    .build(),
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        if changed {
-            tracing::warn!(%convoy, %source, error = %error.reason, failure_kind = ?error.kind, attempts, retry_seconds = delay, "turn delivery failed");
+        while let Some(failures) = writer.next_batch() {
+            match self.write_delivery_failures(&convoys, convoy, failures).await {
+                Ok(()) => writer.written(),
+                Err(error @ ResourceError::NotFound { .. }) => {
+                    writer.abandon();
+                    return Err(error.to_string());
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(())
+    }
+
+    async fn write_delivery_failures(
+        &self,
+        convoys: &flotilla_store::TypedResolver<Convoy>,
+        convoy: &str,
+        failures: BTreeMap<String, DeliveryError>,
+    ) -> Result<(), ResourceError> {
+        let patch = FailTurnDeliveries { failures, now: Utc::now(), changed: Default::default() };
+        let written = flotilla_store::apply_status_patch_checked(convoys, convoy, &patch, |_| Ok(())).await?;
+        let status = written.status.unwrap_or_default();
+        for source in patch.changed.lock().expect("changed turn-delivery failures").iter() {
+            let (Some(error), Some(failure)) =
+                (patch.failures.get(source), status.turn_deliveries.get(source).and_then(|delivery| delivery.failure.as_ref()))
+            else {
+                continue;
+            };
+            let retry_seconds = failure.retry_at.signed_duration_since(failure.failed_at).num_seconds();
+            tracing::warn!(%convoy, %source, error = %error.reason, failure_kind = ?error.kind, attempts = failure.attempts, retry_seconds, "turn delivery failed");
         }
         Ok(())
     }

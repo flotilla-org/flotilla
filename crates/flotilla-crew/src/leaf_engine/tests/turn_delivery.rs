@@ -2,6 +2,9 @@ use super::*;
 use flotilla_resources::queued_turn_evidence;
 use flotilla_resources::{Observation, ObservedChangeRequestState, ObservedMergeability};
 use flotilla_store_memory::InMemoryBackend;
+use tracing::instrument::WithSubscriber;
+
+use crate::leaf_engine::turn_delivery::{DeliveryError, FailureWriter, PendingFailureMap};
 
 // #2684: queue acceptance remains queued for every attention state. Only an
 // exact terminal receipt confirms submission; age raises advisory attention.
@@ -1478,4 +1481,141 @@ async fn publish_review_round(
         },
     );
     wake.subscriptions.deliver_turn(id, "rounds", "review-round", rule, &leaf).await.expect("artifact turn");
+}
+
+// #3455 part 4: failures that arrive while a convoy's failure write is in
+// flight join it. They are recorded by one status write, not one write each,
+// so a burst of firings cannot exhaust the status patch retry budget.
+#[tokio::test]
+async fn concurrent_delivery_failures_for_one_convoy_share_one_status_write() {
+    // Scope this test's failure warnings, as the log-counting tests do, so the
+    // shared callsite never registers without a subscriber.
+    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    concurrent_failures_share_one_write().with_subscriber(captured_subscriber(logs, tracing::Level::WARN)).await;
+}
+
+async fn concurrent_failures_share_one_write() {
+    let (backend, wake, _) = project_supervision_case(&[]).await;
+    let table = &wake.subscriptions;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let key = ("flotilla".to_string(), "stalled-work".to_string());
+    let sources = (0..19).map(|index| format!("merged-unclaimed-{index}")).collect::<Vec<_>>();
+    // A firing is already writing this convoy's failures.
+    table.inner.pending_failures.lock().expect("pending").entry(key.clone()).or_default().writing = true;
+    let before = convoys.get("stalled-work").await.expect("convoy").metadata.resource_version;
+    for source in &sources {
+        let error = DeliveryError::from(format!("terminal was not ready for {source}"));
+        table.record_delivery_failure("flotilla", "stalled-work", source, &error).await.expect("joins the in-flight write");
+    }
+    assert_eq!(convoys.get("stalled-work").await.expect("convoy").metadata.resource_version, before, "followers do not write");
+    // The in-flight writer finishes; the next firing writes everything pending at once.
+    table.inner.pending_failures.lock().expect("pending").get_mut(&key).expect("pending entry").writing = false;
+    let mut watch = convoys.watch(WatchStart::Now).await.expect("convoy watch");
+    let error = DeliveryError::from("terminal was not ready".to_string());
+    table.record_delivery_failure("flotilla", "stalled-work", "checks-settled", &error).await.expect("writer");
+    let first = tokio::time::timeout(Duration::from_secs(2), watch.next()).await.expect("one write").expect("watch open").expect("event");
+    assert!(tokio::time::timeout(Duration::from_millis(50), watch.next()).await.is_err(), "exactly one status write: {first:?}");
+    let status = convoys.get("stalled-work").await.expect("convoy").status.expect("status");
+    for source in sources.iter().map(String::as_str).chain(["checks-settled"]) {
+        let failure = status.turn_deliveries[source].failure.as_ref().expect("recorded failure");
+        assert_eq!(failure.attempts, 1, "{source}");
+        assert!(failure.reason.starts_with("terminal was not ready"), "{source}");
+    }
+    assert!(table.inner.pending_failures.lock().expect("pending").is_empty(), "the writer releases its slot");
+}
+
+// #3455 part 4: a burst of truly concurrent failures for one convoy all record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_delivery_failure_burst_records_every_source() {
+    let (backend, wake, _) = project_supervision_case(&[]).await;
+    let table = wake.subscriptions.clone();
+    let barrier = Arc::new(tokio::sync::Barrier::new(32));
+    let tasks = (0..32)
+        .map(|index| {
+            let table = table.clone();
+            let barrier = barrier.clone();
+            let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+            tokio::spawn(
+                async move {
+                    barrier.wait().await;
+                    let error = DeliveryError::from("terminal was not ready".to_string());
+                    table.record_delivery_failure("flotilla", "stalled-work", &format!("turn-{index}"), &error).await
+                }
+                .with_subscriber(captured_subscriber(logs, tracing::Level::WARN)),
+            )
+        })
+        .collect::<Vec<_>>();
+    for task in tasks {
+        task.await.expect("task").expect("failure recorded without exhausting the retry budget");
+    }
+    let status = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy").status.expect("status");
+    for index in 0..32 {
+        assert_eq!(status.turn_deliveries[&format!("turn-{index}")].failure.as_ref().expect("failure").attempts, 1);
+    }
+    assert!(table.inner.pending_failures.lock().expect("pending").is_empty());
+}
+
+// #3455 part 4 (review): a failure write for a convoy that no longer exists
+// drops its batch and frees the slot, so nothing stays pending for the
+// daemon's life; a later convoy of that name starts clean. A write that fails
+// for any other reason requeues through the writer's drop, as a cancelled
+// write does (covered below).
+#[tokio::test]
+async fn failure_write_for_a_missing_convoy_prunes_its_batch() {
+    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    async {
+        let (backend, wake, _) = project_supervision_case(&[]).await;
+        let table = &wake.subscriptions;
+        let error = DeliveryError::from("terminal was not ready".to_string());
+        let failed = table.record_delivery_failure("flotilla", "late", "merged-unclaimed", &error).await.expect_err("write fails");
+        assert!(failed.contains("not found"), "{failed}");
+        assert!(table.inner.pending_failures.lock().expect("pending").is_empty(), "a missing convoy's failures are pruned");
+        create_convoy(&backend, "late", ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() }).await;
+        table.record_delivery_failure("flotilla", "late", "checks-settled", &error).await.expect("next writer");
+        let status = backend.using::<Convoy>("flotilla").get("late").await.expect("convoy").status.expect("status");
+        assert_eq!(status.turn_deliveries["checks-settled"].failure.as_ref().expect("recorded").attempts, 1);
+        assert!(!status.turn_deliveries.contains_key("merged-unclaimed"), "the pruned failure is not resurrected");
+        assert!(table.inner.pending_failures.lock().expect("pending").is_empty());
+    }
+    .with_subscriber(captured_subscriber(logs, tracing::Level::WARN))
+    .await;
+}
+
+// #3455 part 4 (review): a writer cancelled mid-write returns its batch and
+// frees the slot; a failure recorded meanwhile keeps precedence for its source.
+// A writer that found nothing left releases in the same critical section, so
+// its drop cannot free a newer writer's slot.
+#[test]
+fn failure_writer_requeues_on_cancel_and_never_frees_a_newer_slot() {
+    let pending = PendingFailureMap::default();
+    let key = ("flotilla".to_string(), "convoy".to_string());
+    let error = |reason: &str| DeliveryError::from(reason.to_string());
+    let seed = |pending: &PendingFailureMap, source: &str, reason: &str| {
+        let mut map = pending.lock().expect("pending");
+        let entry = map.entry(key.clone()).or_default();
+        entry.failures.insert(source.to_string(), error(reason));
+        entry.writing = true;
+    };
+    seed(&pending, "a", "old a");
+    seed(&pending, "b", "old b");
+    let mut writer = FailureWriter::new(&pending, key.clone());
+    assert_eq!(writer.next_batch().expect("batch").len(), 2);
+    // A newer failure for `a` arrives while the batch is in flight; then the firing is cancelled.
+    seed(&pending, "a", "new a");
+    drop(writer);
+    {
+        let map = pending.lock().expect("pending");
+        let entry = &map[&key];
+        assert!(!entry.writing);
+        assert_eq!(entry.failures["a"].reason, "new a", "the newer failure keeps precedence");
+        assert_eq!(entry.failures["b"].reason, "old b", "the abandoned batch is requeued");
+    }
+    // A writer that drains to empty releases at once; a newer writer's slot survives its drop.
+    pending.lock().expect("pending").get_mut(&key).expect("entry").writing = true;
+    let mut writer = FailureWriter::new(&pending, key.clone());
+    writer.next_batch().expect("batch");
+    assert!(writer.next_batch().is_none());
+    seed(&pending, "c", "newer writer");
+    drop(writer);
+    assert!(pending.lock().expect("pending")[&key].writing, "a newer writer keeps its slot");
 }
