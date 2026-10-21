@@ -441,6 +441,9 @@ mod tests {
                 assert!(!page.has_more);
             }
         }
+        // Empty value lists fail closed through the provider too (ADR 0020).
+        let empty_values = IssueQuery { match_fields: [("labels".into(), vec![])].into(), ..IssueQuery::default() };
+        assert!(provider.query(&source, &empty_values, 1, 30).await.expect("empty selector values").items.is_empty());
         // A fully filtered page still carries the forge's continuation cursor.
         let query = IssueQuery { match_fields: [("labels".into(), vec!["provider".into()])].into(), ..IssueQuery::default() };
         let first = provider.query(&source, &query, 1, 1).await.expect("first page");
@@ -521,6 +524,8 @@ mod tests {
                 );
             }
             if missing {
+                // The fake's native issue payload has no component field; this
+                // deliberately exercises absent-field nonmatching, not labels.
                 match_fields.insert("component".into(), vec!["terminal".into()]);
             }
             let query = IssueQuery { label: label.map(str::to_string), match_fields, ..IssueQuery::default() };
