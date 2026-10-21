@@ -8,7 +8,7 @@ out=$1
 jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
 [ -r "$jar" ] || { echo "missing readable Apalache jar: $jar; install Apalache or set APALACHE_JAR" >&2; exit 2; }
 mkdir -p "$out"
-for machine in ${MACHINES:-lifecycle agent_session convoy message ensure vessel}; do
+for machine in ${MACHINES:-lifecycle agent_session convoy message ensure vessel awaiting_reply}; do
   module="${machine}_conformance"
   quint compile "$machine.qnt" --target tlaplus > "$out/$machine.compile.log"
   awk '/^-+ MODULE/{found=1} found' "$out/$machine.compile.log" > "$out/$module.tla"

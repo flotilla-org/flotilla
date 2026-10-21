@@ -38,7 +38,7 @@ module admission_placement {
     val r = requests.get(id)
     any {
       all {
-        C::admitRequest(convoy, { project: "project", projectKnown: true, promises: Map(0 -> { kind: "opaque", target: "target" }), quota: Map(0 -> 1, 1 -> 1), priority: if (convoy == 1) 2 else 1 }),
+        C::admitRequest(convoy, { project: "project", projectKnown: true, promises: Map(0 -> { promise: { kind: "opaque", target: "target" }, source: C::Template, owner: "coder" }), duties: Map(), quota: Map(0 -> 1, 1 -> 1), priority: if (convoy == 1) 2 else 1 }),
         V::unchanged,
         keepPlaced,
       },

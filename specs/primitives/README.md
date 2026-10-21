@@ -7,13 +7,13 @@ ADR 0064 and [the owner resolution](https://github.com/flotilla-org/flotilla/iss
 are fixed rules here. There are no design-option or mutant constants in the design.
 
 ```text
-machines/     Message, shared lifecycle, Convoy, Ensure, and the consumer kinds AgentSession and controller
+machines/     Message, shared lifecycle, Convoy, Ensure, AwaitingReply, and the consumer kinds AgentSession and controller
 world/        per-home ordered streams, host death, clock, adapter acceptance
 scenarios/    compositions and their safety / conditional liveness properties
 mutants/      single-definition overrides; each must violate a property
 conformance/  per-machine harnesses whose full reachable graphs the engine must match
 check.sh      fast exhaustive safety, graph conformance, ITF replay, mutants
-symbolic.sh   inductive and bounded SMT checks
+symbolic.sh   bounded SMT checks
 viewer.html   local, standalone ITF viewer
 ```
 
@@ -39,15 +39,52 @@ Every variable still receives an assignment, and world variables stay separate.
 The step blocks contain no assignment lists or machine rules. Imported variants use bare names in
 `match` patterns (constructors in expressions remain qualified).
 
-Convoy admission accepts `{project, promises, quota, priority}`. The promise map
-is nonempty and preserves opaque kind/target data. Admission fixes the project,
-the promise definitions and the priority; the quota in force is work state, which
-readmission raises, so no admitted copy of it can go stale. Resolution is a map from
-promise id to `Pending | Kept | Retracted`; a settled promise cannot be kept or
-retracted again (`PromiseSettled`), and `Kept` is final. Terminal variants retain
-the work record so delivery and finality remain state properties. A continuing
-commitment is a lend with terms; its breach becomes a message to the lender.
-A demo promise delivers a running demo plus a recipe to reactivate it.
+Convoy admission accepts `{project, promises, duties, quota, priority}` (#3587
+spec ruling). Admission needs an obligation: at least one promise or one
+convoy-lifetime duty (`NoObligations`). Each admitted promise keeps its opaque
+kind/target data, its source (template, dispatch or crew) and its owner seat;
+seats are compared only for equality, and seat relations are the caller's.
+Admission fixes the project, the duties and the priority; promises are work
+state, since the crew's `Declare` adds one while the convoy is Open (refused
+for an id ever used, retracted ids included), and the quota in force is work
+state, which readmission raises, so no admitted copy of it can go stale.
+
+A promise is `Pending → Submitted → Kept | Retracted`. Only its owner seat may
+`Submit`, with a reference the caller recorded as durable for the kind (as it
+records `authorised`); submitting again replaces the current submission, and
+`Reject` returns a Submitted promise to Pending. Submissions are kept in order,
+rejected ones included, and observed evidence names one by its position.
+"Ready" is not a state: it is a view of the kind's rules. `Keep` has two forms:
+observed, only from Submitted with evidence naming the current submission
+(otherwise `StaleEvidence`), and an attributed verdict with a reason, from
+Pending or Submitted. `Retract` carries `by`, an authority class and a reason;
+the machine checks the class against the promise's source: a template promise
+is the convoy supervisor's, a dispatch promise the dispatcher's, a
+crew-declared promise its owner's alone before any submission and its owner's
+supervisor's after, and an operator may retract any promise. A verdict keep
+follows the same rule, except that an owner never keeps its own promise.
+`Reassign` (by the owner, its supervisor or an operator) moves a Pending or
+Submitted promise and its submissions to another seat. A settled promise
+refuses every promise edge (`PromiseSettled`), and `Kept` is final.
+
+Duties sit beside promises: an owner seat, a scope and opaque terms, never
+kept. A convoy-lifetime duty refuses `Deliver` (`DutyHolds`) until an
+authorised `RetireDuty`; a duty while some promises are open has no edges and
+ends with them, and a breach of terms is a message, not an edge. `Deliver` is
+refused while any promise is Pending or Submitted, or while a lifetime duty
+holds. Terminal variants retain the work record so delivery and finality remain
+state properties. A demo promise delivers a running demo plus a recipe to
+reactivate it.
+
+AwaitingReply is the sender's half of a Reply or Outcome exchange (#3587
+awaiting-reply ruling), homed at the sender's home and written in the send's
+transaction: `Open → Answered | Expired | Withdrawn`. `Answer` reads the reply
+in the sender's own inbox, answering the awaited message; `Expire` reads the
+sender home's clock past the deadline, and a reply already present wins; the
+sender withdraws with a reason. A stall is an open record whose kind is
+`stall`. The scenario models no stream watermark for expiry: a reply still in
+flight when the deadline passes can lose to `Expire`, and still lands in the
+inbox as a message.
 
 Admission grants a per-class cap, never a host reservation. Increasing a cap is
 readmission of the same convoy; the model keeps the class domain fixed and refuses decreases. Vessel placement
@@ -94,7 +131,8 @@ The scenarios encode these rulings:
 
 | Scenario | Fixed rules and safety | Deep temporal checks |
 |---|---|---|
-| Convoy | nonempty admission of a known project; deliver requires every promise kept or an accepted retraction; abandon requires an authorised decision | once promises are satisfied, fair delivery ends the convoy |
+| Convoy | admission of a known project holds an obligation; deliver requires nothing Pending or Submitted and no holding lifetime duty; a submitted promise has a submission; settled promises refuse every promise edge; an owner's retraction closes once anything is submitted | once nothing is open and no lifetime duty holds, fair delivery ends the convoy |
+| Reply exchange | the record exists exactly when its message was sent; Answered names a reply to the awaited message in the sender's inbox; expiry follows the deadline and never beats a reply already in the inbox; ends are final | a reply that lands while the record is open is eventually its answer under fair answering |
 | Inbox / replacement / unbind | turn before receipt; per-session dedupe; drain observed receipts before bind; accept an old session's receipt; one receiver; no undeliverable drop with an observed receipt; unbound timeout starts at unbind | observed receipts make progress under fair home delivery; observed session ends and sustained silence trigger owner unbind reactions |
 | Ensure | record before create; bind only Realised/receiving; release and observe Gone before replacement; retire releases every created fulfiller, including Requested; a hold follows a failure in the current window; resume retains history and moves the window | a bound fulfiller observed Gone is eventually unbound under a fair owner reaction |
 | Message race | outcome may settle Pending; terminal edges refuse; expiry waits for the consumer prefix past the deadline and loses to visible evidence; supersede and withdrawn reasons | visible expected evidence eventually settles under fair settlement; ends remain final |
@@ -142,7 +180,7 @@ counterexamples. Before TLC, the fast tier runs each scenario through
 step that omits any variable, even when that branch is initially unreachable;
 simulation and typechecking alone do not provide this guarantee. Logs are stored
 as `*.frames.log`. The tier then runs one aggregate TLC safety check per scenario
-and generates 128 ITF traces of up to 80 steps for **each of six** scenarios
+and generates 128 ITF traces of up to 80 steps for **each of eight** scenarios
 with seed 3220 and `quint run --mbt` in a fresh directory.
 
 Full-graph conformance (#3109's resolution) comes next. Each machine has a small
@@ -174,13 +212,23 @@ rather than impersonating a production transport. Ended AgentSessions
 deliberately retain no channel in the Quint state. Both checks are `#[ignore]`d
 in workspace CI, which runs the crate's own fmt, Clippy and unit tests.
 
-Fourteen external patches each change one rule in an isolated copy: missing expiry
+The Convoy machine's owned promises and duties and the AwaitingReply machine
+are specified ahead of the engine (#3587 layer 2). The fast tier checks their
+scenarios, exports their graphs and runs their mutants, but the engine skips
+the Convoy graph and leaves the `convoy_deliver`, `admission_placement` and
+`reply_exchange` traces unread (`AWAITING_ENGINE` in `quint_replay.rs`) until
+it implements them (#3587 layer 4).
+
+Nineteen external patches each change one rule in an isolated copy: missing expiry
 watermark, cancellation only from Realised, duplicate turns, bind without drain,
-resettling a promise, exceeding convoy caps, overbooking hosts and bypassing the
+resettling a promise, delivering with a promise Submitted or a lifetime duty
+holding, an owner retracting its submitted crew promise, exceeding convoy caps,
+overbooking hosts and bypassing the
 priority queue, retaining a lease after Gone, undeliverable drops with confirmed
-receipts, holding an Ensure on failures before its window or before its last success, and
+receipts, holding an Ensure on failures before its window or before its last success,
 giving a lifecycle up with a cause other than its last failure's or on failures
-before its last success. Each must produce an actual TLC invariant counterexample;
+before its last success, answering a record with a message that is not its reply, and
+expiring a record over a reply already in the inboxbefore its last success. Each must produce an actual TLC invariant counterexample;
 parse, compiler and tool failures are errors, never mutant detection. Production
 modules contain no mutant switches. Generated specs, ITF and logs stay in `build/`.
 Shell connects compilation to TLC (`VIEW` is not exposed by Quint's TLC runtime
@@ -210,9 +258,12 @@ specs/primitives/symbolic.sh
 SYMBOLIC_DEPTH=6 specs/primitives/symbolic.sh
 ```
 
-Apalache checks Convoy's `inductive` invariant by initial inclusion and one-step
-preservation. This proves that invariant for **every depth**, at the stated
-finite promise bound. For inbox and race it checks `safety` with six stream rows,
+Convoy has no inductive invariant since owned promises (#3587 layer 2): an
+explicit universe of every promise shape (source, owner seat, state and
+submission) is beyond Apalache within a crew vessel's memory. The fast tier's
+TLC run exhausts `convoy_deliver`'s complete finite graph instead, which covers
+every depth at its stated bounds, as for admission/placement. For inbox and
+race the symbolic tier checks `safety` with six stream rows,
 at the chosen depth (default 10); these are bounded SMT results, not induction or
 unbounded liveness proofs. The baseline TLC and Rust checks remain necessary:
 SMT does not replace trace replay. Logs go under `build/`.

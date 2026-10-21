@@ -1,0 +1,11 @@
+--- a/machines/convoy.qnt
++++ b/machines/convoy.qnt
+@@ -128,7 +128,7 @@
+           else if (not(holdingDuties(w).contains(a.duty))) Refused(UnknownDuty)
+           else Moved(Open({ ...w, retired: w.retired.union(Set(a.duty)) }))
+       | Deliver => val outstanding = w.promises.keys().filter(p => open(w.promises.get(p)))
+-          if (outstanding.size() > 0) Refused(PromisesOutstanding(outstanding))
++          if (outstanding.filter(p => w.promises.get(p).state == Pending).size() > 0) Refused(PromisesOutstanding(outstanding))
+           else if (holdingDuties(w).size() > 0) Refused(DutyHolds(holdingDuties(w)))
+           else Moved(Delivered(w))
+       | Abandon(a) => if (not(a.authorised) or a.reason == "") Refused(Unauthorised)

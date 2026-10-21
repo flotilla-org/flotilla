@@ -1,0 +1,11 @@
+--- a/machines/awaiting_reply.qnt
++++ b/machines/awaiting_reply.qnt
+@@ -30,7 +30,7 @@
+       // A reply present in the inbox wins over a passed deadline.
+       | Expire(x) => match r.deadline {
+           | Never => Refused(NoDeadline)
+-          | At(d) => if (x.now <= d) Refused(NotDue) else if (x.replyPresent) Refused(ReplyPresent) else Moved(Expired({ at: x.now }))
++          | At(d) => if (x.now <= d) Refused(NotDue) else if (false) Refused(ReplyPresent) else Moved(Expired({ at: x.now }))
+         }
+       // The sender withdraws (its message withdrawn or superseded), with a reason.
+       | Withdraw(w) => if (not(w.authorised) or w.reason == "") Refused(Unauthorised) else Moved(Withdrawn({ reason: w.reason }))

@@ -4,8 +4,8 @@ set -euo pipefail
 export JVM_ARGS="${JVM_ARGS:--Xmx3g -Xss16m}"
 cd "$(dirname "$0")"
 mkdir -p build
-# Induction: initial inclusion and one-step preservation, hence every depth.
-quint verify scenarios/convoy_deliver.qnt --inductive-invariant inductive > build/convoy.induction.log 2>&1
+# Convoy has no induction step: the fast tier exhausts convoy_deliver's complete
+# finite graph, which covers every depth at its bounds (see README).
 # Bounded SMT checks at a larger stream bound than the fast TLC tier.
 # Admission/placement has no expanded stream bound: the fast tier exhausts its
 # complete finite state graph, which covers every depth (including this bound).

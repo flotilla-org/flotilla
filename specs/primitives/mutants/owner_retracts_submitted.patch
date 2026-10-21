@@ -1,0 +1,11 @@
+--- a/machines/convoy.qnt
++++ b/machines/convoy.qnt
+@@ -74,7 +74,7 @@
+     | Operator => true
+     | ConvoySupervisor => p.source == Template
+     | Dispatcher => p.source == Dispatch
+-    | Owner => p.source == Crew and by == p.owner and p.submissions.length() == 0
++    | Owner => p.source == Crew and by == p.owner
+     | OwnerSupervisor => p.source == Crew and p.submissions.length() > 0
+   }
+   // A verdict that keeps follows the same source rule; an owner never keeps
