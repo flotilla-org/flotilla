@@ -40,6 +40,10 @@ pub fn delivery_hold_overdue(started_at: DateTime<Utc>, now: DateTime<Utc>) -> b
     now.signed_duration_since(started_at) >= DELIVERY_HOLD_FOR
 }
 
+/// Names the held batch, why it is held and the command that clears it, so
+/// convoy attention can say more than "needs you" (#3455).
+pub const DELIVERY_HOLD_REASON_ANNOTATION: &str = "flotilla.work/delivery-hold-reason";
+
 pub fn delivery_demand_name(session: &ResourceObject<TerminalSession>) -> String {
     format!("terminal-delivery-{}", session.metadata.name)
 }

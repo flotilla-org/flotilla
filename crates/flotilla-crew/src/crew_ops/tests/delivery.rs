@@ -98,3 +98,71 @@ fn queued_resume_replaces_and_withdraws_without_staging(tc: hegel::TestCase) {
         }
     });
 }
+
+// #3455: `convoy resume` reports a held batch ahead of its brief instead of
+// "queued for turn end". An operator brief supersedes held system turns at
+// delivery, and waits behind any other held batch until an operator clears it.
+#[hegel::test]
+fn queued_resume_names_a_held_batch_ahead_of_it(tc: hegel::TestCase) {
+    use flotilla_resources::{
+        ControllerRetry, ControllerRetryDisposition, InputMeta, Message, MessagePhase, MessageRelation, MessageSpec, MessageStatus,
+    };
+    use hegel::generators as gs;
+    let phase = if tc.draw(gs::booleans()) { CrewWorkPhase::Working } else { CrewWorkPhase::Done };
+    let held = tc.draw(gs::booleans());
+    let mixed = tc.draw(gs::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let (crew, backend, probe, _config) = fixture(phase).await;
+        probe.fail.store(false, Ordering::SeqCst);
+        let messages = backend.using::<Message>("flotilla");
+        let now = chrono::Utc::now();
+        let members = ["held-0", "held-1"];
+        for (index, name) in members.iter().enumerate() {
+            let sender = if mixed && index == 1 { "flotilla/other/work/reviewer" } else { "system:turn-rules" };
+            let intent = MessageSpec::builder()
+                .sender(sender.into())
+                .receiver("flotilla/crew/work/coder".into())
+                .relation(MessageRelation::System)
+                .body("merged-unclaimed".into())
+                .build();
+            let created = messages.create(&InputMeta::builder().name((*name).into()).build(), &intent).await.expect("message");
+            let disposition = if held {
+                ControllerRetryDisposition::Terminal { needs: "terminal was not ready before submission".into() }
+            } else {
+                ControllerRetryDisposition::Retryable { next_attempt_at: now + chrono::Duration::minutes(1) }
+            };
+            let status = MessageStatus::builder()
+                .phase(MessagePhase::Deliverable)
+                .since(now)
+                .reason("delivery held: terminal was not ready before submission; attempt 3/3".into())
+                .retry(ControllerRetry { attempts: 3, first_failure_at: now, disposition })
+                .failed_batch_members(members.iter().map(|member| member.to_string()).collect())
+                .build();
+            messages.update_status(name, &created.metadata.resource_version, &status).await.expect("held status");
+        }
+        // A working crew queues for its turn end; a completed one is reopened.
+        let intent = if phase == CrewWorkPhase::Working { ResumeIntent::Reminder } else { ResumeIntent::Reopen };
+        let outcome = crew
+            .convoy_resume_with_sender_internal(
+                "flotilla",
+                "crew",
+                "the PR merged; complete",
+                (None, None),
+                MessageAttribution::operator(None),
+                intent,
+            )
+            .await
+            .expect("resume");
+        if !held {
+            assert_eq!(outcome, ConvoyResumeOutcome::Queued { displaced: None });
+            return;
+        }
+        let ConvoyResumeOutcome::QueuedBehindHold { held, .. } = outcome else { panic!("hold not reported: {outcome:?}") };
+        assert!(held.contains("message batch `held-0` is held for flotilla/crew/work/coder (2 messages: held-0, held-1)"), "{held}");
+        assert!(held.contains("terminal was not ready before submission"), "{held}");
+        assert!(held.contains("flotilla resource fail-message-batch held-0 --namespace flotilla"), "{held}");
+        let expected = if mixed { "it waits behind a held batch" } else { "it supersedes held system turns at delivery" };
+        assert!(held.starts_with(expected), "{held}");
+    });
+}

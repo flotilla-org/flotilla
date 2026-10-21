@@ -162,6 +162,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::ConvoyBriefInformational { .. }
         | CommandValue::ConvoyBriefQueued { .. }
         | CommandValue::ConvoyBriefWithdrawn { .. } => {}
+        CommandValue::ConvoyBriefHeld { held, .. } => app.set_status_message(Some(format!("brief queued: {held}"))),
         CommandValue::CrewCompletionAdvisory { pending } => {
             let message = if pending.is_empty() {
                 "Your part ends when your promises are kept or retracted.".into()

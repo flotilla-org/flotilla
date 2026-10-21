@@ -13,14 +13,14 @@ use crate::{
     apply_status_patch,
     delivery_hold::{
         delivery_acceptance_evidence, delivery_demand, delivery_demand_name, delivery_retry_backoff, delivery_retry_exhausted,
-        DELIVERY_HOLD_FOR, DELIVERY_MAX_ATTEMPTS,
+        DELIVERY_HOLD_FOR, DELIVERY_HOLD_REASON_ANNOTATION, DELIVERY_MAX_ATTEMPTS,
     },
     message_expectation_open, message_supersedes,
     role_routing::topic_receiver_addresses,
-    ControllerRetry, ControllerRetryDisposition, Demand, DemandStatusPatch, InputMeta, Message, MessageExpectation, MessageInbox,
-    MessagePhase, MessageQuery, MessageReceiverSnapshot, MessageReference, MessageRelation, MessageSpec, MessageStatus, MessageStatusPatch,
-    MessageSubmission, ReadResourceObject, ResolvedMessageReceiver, ResourceError, ResourceObject, ResourceProvenance, StatusPatch,
-    TerminalSession, TerminalSessionPhase,
+    ControllerRetry, ControllerRetryDisposition, Demand, DemandStatusPatch, HeldMessageBatch, InputMeta, Message, MessageExpectation,
+    MessageInbox, MessagePhase, MessageQuery, MessageReceiverSnapshot, MessageReference, MessageRelation, MessageSpec, MessageStatus,
+    MessageStatusPatch, MessageSubmission, ReadResourceObject, ResolvedMessageReceiver, ResourceError, ResourceObject, ResourceProvenance,
+    StatusPatch, TerminalSession, TerminalSessionPhase,
 };
 
 // Bound adapter calls independently of admission.
@@ -448,6 +448,10 @@ impl MessageInbox {
         all: &[ResourceObject<Message>],
         now: DateTime<Utc>,
     ) -> Result<(), ResourceError> {
+        let pending = &self.supersede_held_system_turns(receivers, pending, all, now).await?;
+        if pending.is_empty() {
+            return Ok(());
+        }
         let existing = pending.iter().find_map(|message| message.status.as_ref().and_then(|status| status.submission.clone()));
         let running_holder = holder
             .status
@@ -677,6 +681,68 @@ impl MessageInbox {
         self.outcome(receivers, DeliveryAttempt { members: pending, holder, submission: &submission }, router, routed.outcome, now).await
     }
 
+    /// An operator or supervisor message supersedes the held system turns
+    /// queued ahead of it for the same receiver (#3455). A held batch exists
+    /// so that ambiguous input is never typed twice; superseding closes it
+    /// without retyping, keeps its submission for the audit, and records the
+    /// superseding message in each member's reason. Turn rules fire again if
+    /// their condition still holds. A held batch with any non-system member
+    /// stays held: only an operator may close another person's intent.
+    async fn supersede_held_system_turns(
+        &self,
+        receivers: &MessageReceiverSnapshot,
+        pending: &[ResourceObject<Message>],
+        all: &[ResourceObject<Message>],
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ResourceObject<Message>>, ResourceError> {
+        let Some(successor) =
+            pending.iter().find(|message| message.spec.is_operator_or_supervisor() && !HeldMessageBatch::is_held(message))
+        else {
+            return Ok(pending.to_vec());
+        };
+        let held = HeldMessageBatch::collect(all);
+        let superseded: Vec<_> = held
+            .iter()
+            .filter(|batch| batch.system_only)
+            .filter(|batch| batch.members.iter().any(|member| pending.iter().any(|message| message.metadata.name == *member)))
+            .collect();
+        if superseded.is_empty() {
+            return Ok(pending.to_vec());
+        }
+        let _admission = self.admission.lock().await;
+        let mut closed = BTreeSet::new();
+        for batch in &superseded {
+            tracing::info!(
+                batch = %batch.batch, receiver = %batch.receiver, successor = %successor.metadata.name,
+                "operator message supersedes held system turns"
+            );
+            for member in &batch.members {
+                apply_status_patch(
+                    &self.messages,
+                    member,
+                    &MessageStatusPatch::Finish {
+                        phase: MessagePhase::Superseded,
+                        reason: format!(
+                            "superseded while held by {} message `{}`: {}",
+                            if successor.spec.sender.starts_with("principal:") { "operator" } else { "supervisor" },
+                            successor.metadata.name,
+                            batch.reason
+                        ),
+                        at: now,
+                    },
+                )
+                .await?;
+                closed.insert(member.clone());
+            }
+        }
+        let remaining: Vec<_> = pending.iter().filter(|message| !closed.contains(&message.metadata.name)).cloned().collect();
+        // The receiver's gate stays raised while another held batch remains.
+        if !remaining.iter().any(HeldMessageBatch::is_held) {
+            self.clear_signal(receivers, successor).await?;
+        }
+        Ok(remaining)
+    }
+
     async fn outcome(
         &self,
         receivers: &MessageReceiverSnapshot,
@@ -786,6 +852,7 @@ impl MessageInbox {
             .apply(&mut status);
             status.retry = Some(retry);
             self.write(&current, &status).await?;
+            let current = ResourceObject { status: Some(status.clone()), ..current };
             let overdue = status
                 .submission
                 .as_ref()
@@ -911,11 +978,24 @@ impl MessageInbox {
             return Ok(());
         };
         let demands = self.backend.using::<Demand>(&self.namespace);
-        let (meta, spec) = delivery_demand(&holder.object);
+        let (mut meta, spec) = delivery_demand(&holder.object);
+        let description = HeldMessageBatch::collect([message]).first().map(|batch| batch.describe(&self.namespace));
         match demands.get(&meta.name).await {
-            Ok(_) => return Ok(()),
+            Ok(existing) => {
+                // Keep the gate's description current as the held reason changes.
+                let current = existing.metadata.annotations.get(DELIVERY_HOLD_REASON_ANNOTATION);
+                if let Some(description) = description.filter(|description| current != Some(description)) {
+                    let mut meta = InputMeta::from(&existing.metadata);
+                    meta.annotations.insert(DELIVERY_HOLD_REASON_ANNOTATION.into(), description);
+                    demands.update(&meta, &existing.metadata.resource_version, &existing.spec).await?;
+                }
+                return Ok(());
+            }
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error),
+        }
+        if let Some(description) = description {
+            meta.annotations.insert(DELIVERY_HOLD_REASON_ANNOTATION.into(), description);
         }
         demands.create(&meta, &spec).await?;
         apply_status_patch(&demands, &meta.name, &DemandStatusPatch::Raise { as_of: now, authority: "terminal-delivery".into() }).await?;

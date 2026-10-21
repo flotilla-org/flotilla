@@ -222,6 +222,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         subscriptions: Vec::new(),
         crew_deliveries: Vec::new(),
         messages: Vec::new(),
+        held_deliveries: Vec::new(),
         queued_turns: Vec::new(),
         unclaimed_work: vec![ExplainedUnclaimedWork { vessel: "work".into(), role: "coder".into(), evidence: "turn_idle".into() }],
         artifacts: vec![flotilla_protocol::ExplainedArtifact {
@@ -343,6 +344,19 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         raised_at: "2026-10-07T12:00:00Z".into(),
     });
     assert!(format_convoy_explanation_human(&held).contains("checks-settled held since=2026-10-07T12:00:00Z: episode limit"));
+    // #3455: a held batch is named at the top, before every other section.
+    let mut held_batch = explanation.clone();
+    held_batch.held_deliveries.push(flotilla_protocol::commands::ExplainedHeldDelivery {
+        batch: "message-0".into(),
+        receiver: "flotilla/ledger/work/coder".into(),
+        members: vec!["message-0".into()],
+        reason: "delivery held: terminal was not ready before submission; attempt 3/3".into(),
+        clear_command: "flotilla resource fail-message-batch message-0 --namespace flotilla --reason '<why>'".into(),
+        description: "message batch `message-0` is held for flotilla/ledger/work/coder".into(),
+    });
+    assert!(format_convoy_explanation_human(&held_batch).starts_with(
+        "Convoy: flotilla/ledger\nPhase: Landing\nHELD DELIVERY: message batch `message-0` is held for flotilla/ledger/work/coder\n"
+    ));
     // #3009: an unresolvable receiver is shown beside its Message.
     let mut unresolved = explanation.clone();
     unresolved.messages.push(flotilla_protocol::query::CrewMessageView {
@@ -421,6 +435,7 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         subscriptions: Vec::new(),
         crew_deliveries: Vec::new(),
         messages: Vec::new(),
+        held_deliveries: Vec::new(),
         queued_turns: Vec::new(),
         unclaimed_work: Vec::new(),
         decision_ledgers: Vec::new(),
@@ -479,6 +494,13 @@ fn replaced_pending_brief_echoes_the_displaced_text() {
 fn convoy_resume_reports_immediate_and_deferred_delivery_distinctly() {
     assert_eq!(format_command_result(&CommandValue::ConvoyBriefDelivered { displaced: None }), "brief delivered now");
     assert_eq!(format_command_result(&CommandValue::ConvoyBriefQueued { displaced: None }), "brief queued for turn end");
+    // #3455: a brief behind a held batch says so and names the hold.
+    let held = format_command_result(&CommandValue::ConvoyBriefHeld {
+        displaced: None,
+        held: "it waits behind a held batch: message batch `held-0` is held".into(),
+    });
+    assert_eq!(held, "brief queued, not for turn end: it waits behind a held batch: message batch `held-0` is held");
+    assert!(!held.contains("queued for turn end"));
 }
 
 #[test]

@@ -130,6 +130,12 @@ impl CrewActions<'_> {
                                 .await;
                             CommandValue::ConvoyBriefQueued { displaced }
                         }
+                        Ok(ConvoyResumeOutcome::QueuedBehindHold { displaced, held }) => {
+                            self.crew
+                                .record_lifecycle_mutation_best_effort(&namespace, &record_name, mutation_action, caller.as_ref(), false)
+                                .await;
+                            CommandValue::ConvoyBriefHeld { displaced, held }
+                        }
                         Err(message) => CommandValue::Error { message },
                     }
                 }

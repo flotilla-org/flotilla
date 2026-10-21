@@ -410,8 +410,17 @@ impl MessageAttribution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyResumeOutcome {
     Informational,
-    Delivered { displaced: Option<String> },
-    Queued { displaced: Option<String> },
+    Delivered {
+        displaced: Option<String>,
+    },
+    Queued {
+        displaced: Option<String>,
+    },
+    /// Queued with a held Message batch ahead of it for the same crew (#3455).
+    QueuedBehindHold {
+        displaced: Option<String>,
+        held: String,
+    },
 }
 
 type ConvoyMessageKey = (String, String);
@@ -2389,7 +2398,7 @@ impl CrewService {
             let message_name = flotilla_resources::message_record_name(&receiver, &address, &format!("resume:{}", uuid::Uuid::new_v4()));
             let intent = flotilla_resources::MessageSpec::builder()
                 .sender(address)
-                .receiver(receiver)
+                .receiver(receiver.clone())
                 .relation(relation)
                 .body(prompt.to_string())
                 .maybe_supersedes(prior.map(|message| message.object.metadata.name))
@@ -2407,7 +2416,7 @@ impl CrewService {
                 .await
                 .map_err(|error| error.to_string())?;
             }
-            return Ok(ConvoyResumeOutcome::Queued { displaced });
+            return Ok(self.queued_resume(namespace, &receiver, displaced).await);
         }
 
         let pending_ref = status.crew_work.get(&vessel).and_then(|crew| crew.get(&role)).and_then(|state| state.pending_follow_up.as_ref());
@@ -2472,7 +2481,7 @@ impl CrewService {
                     .restore_crew_work_after_delivery_failure(&convoys, name, &reopened.metadata.resource_version, status, error)
                     .await);
             }
-            return Ok(ConvoyResumeOutcome::Queued { displaced });
+            return Ok(self.queued_resume(namespace, &receiver, displaced).await);
         }
         let session = session.object;
         self.reconcile_or_restore_crew_work(namespace, &session.spec.env_ref, &convoys, name, status.clone(), &reopened).await?;
@@ -2491,7 +2500,35 @@ impl CrewService {
                 .restore_crew_work_after_delivery_failure(&convoys, name, &reopened.metadata.resource_version, status, error)
                 .await);
         }
-        Ok(ConvoyResumeOutcome::Queued { displaced })
+        Ok(self.queued_resume(namespace, &receiver, displaced).await)
+    }
+
+    /// A queued resume says when a held batch is ahead of it: an operator or
+    /// supervisor brief supersedes held system turns at delivery, and waits
+    /// behind any other held batch until an operator clears it (#3455).
+    async fn queued_resume(&self, namespace: &str, receiver: &str, displaced: Option<String>) -> ConvoyResumeOutcome {
+        let open = match self.open_messages_to(namespace, receiver).await {
+            Ok(open) => open.into_iter().map(|message| message.object).collect::<Vec<_>>(),
+            Err(error) => {
+                tracing::warn!(%receiver, %error, "could not read held batches for a queued resume");
+                return ConvoyResumeOutcome::Queued { displaced };
+            }
+        };
+        let notes = flotilla_resources::HeldMessageBatch::collect(&open)
+            .into_iter()
+            .map(|batch| {
+                if batch.system_only {
+                    format!("it supersedes held system turns at delivery ({})", batch.describe(namespace))
+                } else {
+                    format!("it waits behind a held batch: {}", batch.describe(namespace))
+                }
+            })
+            .collect::<Vec<_>>();
+        if notes.is_empty() {
+            ConvoyResumeOutcome::Queued { displaced }
+        } else {
+            ConvoyResumeOutcome::QueuedBehindHold { displaced, held: notes.join("; ") }
+        }
     }
 
     pub async fn withdraw_pending_brief(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {

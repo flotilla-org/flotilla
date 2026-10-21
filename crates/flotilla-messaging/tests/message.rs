@@ -703,6 +703,11 @@ impl AgentTransport for FakeMessageTransport {
     }
 }
 async fn delivery_inbox() -> (ResourceBackend, flotilla_messaging::MessageInbox) {
+    delivery_inbox_from(&["flotilla/checks"; 3]).await
+}
+
+/// The standard holder with one Message per sender, `message-0` first.
+async fn delivery_inbox_from(senders: &[&str]) -> (ResourceBackend, flotilla_messaging::MessageInbox) {
     use flotilla_resources::*;
     use flotilla_store::*;
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -743,9 +748,10 @@ async fn delivery_inbox() -> (ResourceBackend, flotilla_messaging::MessageInbox)
         .await
         .expect("running");
     let inbox = MessageInbox::new(backend.clone(), "flotilla");
-    for index in 0..3 {
+    for (index, sender) in senders.iter().enumerate() {
         let mut intent = spec(None, MessageExpectation::None);
         intent.body = format!("body-{index}");
+        intent.sender = (*sender).into();
         inbox.accept(&InputMeta::builder().name(format!("message-{index}")).build(), &intent, at(10)).await.expect("message");
     }
     (backend, inbox)
@@ -836,6 +842,93 @@ async fn genuinely_unsent_batches_back_off_and_stop_after_three_attempts() {
     assert_eq!(transport.submissions.lock().expect("submissions").len(), 4);
 
     assert_eq!(transport.observations.load(std::sync::atomic::Ordering::SeqCst), 8, "held attention refreshes");
+}
+
+// #3455: a held batch of system turns does not hold an operator or supervisor
+// message behind it. The successor supersedes the held system turns, keeping
+// their submission audit and naming itself in their reason, and is delivered.
+// A held batch carrying anyone else's intent stays held, and the successor
+// waits behind it. While held, the receiver's gate names the batch, why it is
+// held, and the command that clears it. Covers both ways a batch is held:
+// ambiguous acceptance and an exhausted definitely-unsent budget.
+#[hegel::test]
+fn operator_message_supersedes_held_system_turns(tc: hegel::TestCase) {
+    let ambiguous = tc.draw(gs::booleans());
+    let mixed = tc.draw(gs::booleans());
+    let operator = tc.draw(gs::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let senders = ["system:turn-rules", "system:charter", if mixed { "flotilla/convoy/work/reviewer" } else { "system:turn-rules" }];
+        let (backend, inbox) = delivery_inbox_from(&senders).await;
+        let failing = Arc::new(FakeMessageTransport {
+            submissions: Default::default(),
+            observations: Default::default(),
+            outcome: if ambiguous {
+                TransportOutcome::Unconfirmed { reason: "submission was not confirmed".into() }
+            } else {
+                TransportOutcome::NotSubmitted { reason: "terminal was not ready before submission".into() }
+            },
+            accepted: Default::default(),
+            working: Default::default(),
+        });
+        let held_at: &[i64] = if ambiguous { &[20, 400] } else { &[20, 21, 80, 81, 200, 500] };
+        for second in held_at {
+            inbox.reconcile_delivery(&router(&failing), at(*second)).await.expect("hold the batch");
+        }
+        let messages = backend.using::<Message>("flotilla");
+        let held = flotilla_resources::HeldMessageBatch::collect(&messages.list().await.expect("messages").items);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].members, ["message-0", "message-1", "message-2"]);
+        assert_eq!(held[0].system_only, !mixed);
+        let gates = backend.using::<flotilla_resources::Demand>("flotilla").list().await.expect("demands").items;
+        assert_eq!(gates.len(), 1);
+        let description = gates[0]
+            .metadata
+            .annotations
+            .get(flotilla_resources::delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION)
+            .expect("the gate names its hold");
+        assert!(description.contains(&format!("message batch `{}`", held[0].batch)), "{description}");
+        assert!(description.contains("delivery held"), "{description}");
+        assert!(description.contains("flotilla resource fail-message-batch message-0 --namespace flotilla"), "{description}");
+
+        let successor = MessageSpec::builder()
+            .sender(if operator { "principal:operator" } else { "flotilla/supervisor/work/bosun" }.into())
+            .receiver("flotilla/convoy/work/coder".into())
+            .relation(MessageRelation::Supervisor)
+            .body("resume: the PR merged; complete the convoy".into())
+            .build();
+        inbox.accept(&InputMeta::builder().name("resume".into()).build(), &successor, at(501)).await.expect("operator resume");
+        let accepting = Arc::new(FakeMessageTransport {
+            submissions: Default::default(),
+            observations: Default::default(),
+            outcome: TransportOutcome::Accepted { evidence: "accepted by holder".into() },
+            accepted: Default::default(),
+            working: Default::default(),
+        });
+        inbox.reconcile_delivery(&router(&accepting), at(502)).await.expect("deliver past the held system turns");
+        let resume = messages.get("resume").await.expect("resume").status.expect("status");
+        let members = ["message-0", "message-1", "message-2"];
+        if mixed {
+            assert!(accepting.submissions.lock().expect("submissions").is_empty(), "another's held intent is never bypassed");
+            assert!(!resume.phase.is_terminal() && resume.resolved_receiver.is_none());
+            for name in members {
+                let status = messages.get(name).await.expect("member").status.expect("status");
+                assert!(!status.phase.is_terminal(), "{name} stays held");
+            }
+            return;
+        }
+        assert_eq!(resume.phase, MessagePhase::Delivered);
+        assert_eq!(accepting.submissions.lock().expect("submissions").as_slice(), [frame_message(&successor)]);
+        let who = if operator { "operator" } else { "supervisor" };
+        for name in members {
+            let status = messages.get(name).await.expect("member").status.expect("status");
+            assert_eq!(status.phase, MessagePhase::Superseded);
+            let reason = status.reason.expect("audit reason");
+            assert!(reason.starts_with(&format!("superseded while held by {who} message `resume`: delivery held")), "{reason}");
+            assert_eq!(status.submission.is_some(), ambiguous, "the submission audit is kept");
+        }
+        assert!(backend.using::<flotilla_resources::Demand>("flotilla").list().await.expect("demands").items.is_empty());
+    });
 }
 
 // Delivery leaves reply/outcome expectations open. A correlated durable reply
