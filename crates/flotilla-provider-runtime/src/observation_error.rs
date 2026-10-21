@@ -46,7 +46,7 @@ mod tests {
     use super::*;
 
     // #3039: neutral errors preserve adapter diagnostics and optional retry deadlines.
-    // Finite forwarding contract: exhaust both variants and absent/present deadlines,
+    // Finite forwarding contract: exhaust all variants and absent/present deadlines,
     // using empty and non-GitHub diagnostics to prove this type has no forge policy.
     #[test]
     fn forwards_diagnostics_and_deadlines_without_forge_policy() {
@@ -55,6 +55,9 @@ mod tests {
             assert_eq!(failed, ObservationError::Failed(diagnostic.into()));
             assert_eq!(failed.to_string(), diagnostic);
             assert_eq!(failed.retry_at(), None);
+            let missing = ObservationError::NotFound(diagnostic.into());
+            assert_eq!(missing.to_string(), diagnostic);
+            assert_eq!(missing.retry_at(), None);
             for retry_at in [None, DateTime::from_timestamp(0, 0), DateTime::from_timestamp(1893456000, 0)] {
                 let limited = ObservationError::RateLimited { budget: "service quota".into(), retry_at, detail: diagnostic.into() };
                 assert_eq!(limited.to_string(), diagnostic);
