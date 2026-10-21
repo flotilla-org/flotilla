@@ -659,7 +659,9 @@ fn transient_fetch_failure(line: &str) -> bool {
         // connection diagnostic or [IP: address port] annotation are not codes.
         let status = fetch.split_whitespace().nth(1).and_then(|word| word.parse::<u16>().ok());
         // Without a response code an apt fetch can have failed in DNS/TLS or
-        // timed out. Explicit non-retryable statuses remain recipe failures.
+        // timed out. This also retries hash mismatches or persistent DNS/TLS
+        // faults; the controller's attempt ceiling bounds that cost. Explicit
+        // non-retryable statuses remain recipe failures.
         return status.is_none_or(|code| code == 429 || (500..600).contains(&code));
     }
     if let Some(error) = line.strip_prefix("curl: (22) ") {
