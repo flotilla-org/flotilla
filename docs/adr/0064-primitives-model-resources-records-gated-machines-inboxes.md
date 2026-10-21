@@ -110,6 +110,8 @@ ADR 0064 records that a machine's log may stamp persistence-only metadata (such 
 
   Either form may also require a human verdict.
 
+ADR 0064 declared kinds: promise kinds are federated data definitions composing a code-owned condition vocabulary into durable, ready and kept rules. Charters may add kinds or tighten stock kinds by extension, and admission freezes the definitions used.
+
 ### Roles, inboxes and delivery
 
 ADR 0064 §"Roles, inboxes and delivery" records that resident pending order is a budgeted cache over the store's `pending_by_inbox` index (which also serves restart), and that an unbound inbox's timeout clock starts when it gains its first open message and is released when it has none.

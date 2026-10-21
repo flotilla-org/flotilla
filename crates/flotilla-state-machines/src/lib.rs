@@ -55,6 +55,7 @@
 pub mod attempt;
 mod code;
 mod home;
+pub mod kinds;
 mod log;
 mod machine;
 pub mod machines;
