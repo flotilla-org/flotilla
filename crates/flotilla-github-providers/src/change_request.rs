@@ -147,7 +147,20 @@ impl GitHubChangeRequest {
         crew_logins: &flotilla_change_request::CrewGithubLoginsByRequest,
     ) -> Result<String, flotilla_forge_github::github::GhApiFailure> {
         let endpoint = format!("repos/{}/pulls/{number}", self.repo_slug);
-        let response = self.api.get_classified_response(&endpoint, execution_root(), &gh_api_channel_label("GET", &endpoint)).await?;
+        let response = match self.api.get_classified_response(&endpoint, execution_root(), &gh_api_channel_label("GET", &endpoint)).await {
+            Ok(response) => response,
+            Err(mut failure) => {
+                // A private repository can hide lost access behind 404. Confirm
+                // repository reachability before treating the pull as absent.
+                if failure.response.as_ref().is_some_and(|response| response.status == 404) {
+                    let repository = format!("repos/{}/pulls?state=all&per_page=1", self.repo_slug);
+                    // Propagate confirmation failures so retry classification uses their access/rate-limit evidence, not the pull's 404.
+                    self.api.get_classified_response(&repository, execution_root(), &gh_api_channel_label("GET", &repository)).await?;
+                    failure.error = ObservationError::NotFound(failure.error.to_string());
+                }
+                return Err(failure);
+            }
+        };
         let value: serde_json::Value = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
         let mut checks = Vec::new();
         if let Some(sha) = value["head"]["sha"].as_str() {
@@ -224,7 +237,16 @@ impl GitHubChangeRequest {
         for number in numbers {
             let request = &repository[format!("pr{number}")];
             if request.is_null() {
-                statuses.insert(*number, Err(format!("GitHub pull request {number} not found").into()));
+                let explicitly_missing = document["errors"].as_array().is_some_and(|errors| {
+                    errors.iter().any(|error| {
+                        error["type"] == "NOT_FOUND" && error["path"] == serde_json::json!(["repository", format!("pr{number}")])
+                    })
+                });
+                let detail = format!("GitHub pull request {number} not found");
+                statuses.insert(
+                    *number,
+                    Err(if explicitly_missing { ObservationError::NotFound(detail) } else { ObservationError::Failed(detail) }),
+                );
                 continue;
             }
             if let Some(error) = &cooldown {
@@ -1227,9 +1249,31 @@ mod tests {
         let api = Arc::new(GhApiClient::new(runner.clone()));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), api, runner);
         let statuses = provider.observe_bound(&[1, 2], &Default::default()).await.expect("partial GraphQL result");
-        assert!(statuses[&1].as_ref().unwrap_err().to_string().contains("not found"));
+        assert!(matches!(statuses[&1], Err(ObservationError::NotFound(_))));
         assert!(statuses.contains_key(&2));
     }
+    // Subprocess boundary: a hidden private repository must not turn a pull
+    // 404 into collectible absence. Confirm pull-list reachability first.
+    #[tokio::test]
+    async fn pull_absence_requires_repository_pull_access() {
+        for repository_status in [200, 401, 403, 404, 429, 500] {
+            let output = |status| {
+                Ok(CommandOutput {
+                    stdout: format!("HTTP/2 {status} Result\r\n\r\n[]"),
+                    stderr: String::new(),
+                    exit_code: Some(if status == 200 { 0 } else { 1 }),
+                })
+            };
+            let runner = Arc::new(MockRunner::with_outputs(vec![output(404), output(repository_status)]));
+            let provider =
+                GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
+            let error = provider.poll_revision(70, &Default::default()).await.unwrap_err().error;
+            assert_eq!(matches!(error, ObservationError::NotFound(_)), repository_status == 200);
+            assert!(runner.calls()[1].1.contains(&"repos/team/one/pulls?state=all&per_page=1".to_string()));
+            assert_eq!(runner.remaining(), 0);
+        }
+    }
+
     // #3633: each failed REST read affects only its PR; scope failures abort.
     // Subprocess boundary: gh emits HTTP status/headers and partial GraphQL data.
     #[tokio::test]
@@ -1266,6 +1310,9 @@ mod tests {
                         exit_code: Some(1),
                     }));
                 }
+                if status == 404 && failed_read == 0 {
+                    outputs.push(ok("{}"));
+                }
                 if expect_local {
                     outputs.push(ok("{}"));
                     outputs.push(ok(r#"{"data":{"repository":{"pr2":{"title":"survivor","state":"OPEN"}}}}"#));
@@ -1283,6 +1330,8 @@ mod tests {
                 if expect_local {
                     let statuses = result.expect("independent outcomes");
                     assert!(statuses[&1].is_err());
+                    // A 404 on status/check reads does not establish PR absence.
+                    assert_eq!(matches!(statuses[&1], Err(ObservationError::NotFound(_))), status == 404 && failed_read == 0);
                     assert_eq!(statuses[&2].as_ref().unwrap().title.value.as_deref(), Some("survivor"));
                 } else {
                     assert!(result.is_err(), "scope failure {status} must fail batch");
@@ -1295,7 +1344,9 @@ mod tests {
                     assert!(call.1.contains(&"--include".to_string()));
                 }
                 if expect_local {
-                    assert!(calls[failed_read + 1].1.contains(&"repos/team/one/pulls/2".to_string()));
+                    assert!(calls[failed_read + 1 + usize::from(status == 404 && failed_read == 0)]
+                        .1
+                        .contains(&"repos/team/one/pulls/2".to_string()));
                     let query = calls.last().unwrap().1.join(" ");
                     assert!(query.contains("pr2: pullRequest(number:2)"));
                     assert!(!query.contains("pr1: pullRequest(number:1)"));

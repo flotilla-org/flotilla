@@ -216,7 +216,7 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
     ) -> Result<flotilla_change_request::BoundObservations, ObservationError> {
         let mut statuses = std::collections::HashMap::new();
         for number in numbers {
-            let result = match crate::observation::execute(&self.forge, &self.repo_slug, &format!("pulls/{number}"), &[]).await {
+            let result = match crate::observation::execute_pull(&self.forge, &self.repo_slug, *number).await {
                 Ok(value) => {
                     let mut status = self.observed_status(&value);
                     let observed_at = Utc::now();
@@ -483,6 +483,32 @@ mod tests {
         async fn execute(&self, request: reqwest::Request, _label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
             self.urls.lock().expect("request URLs").push(request.url().to_string());
             self.responses.lock().expect("responses").pop_front().ok_or_else(|| "unexpected HTTP request".into())
+        }
+    }
+
+    // HTTP boundary: check the pull and pull-list routes while varying
+    // repository access after a hidden/missing pull's 404.
+    #[tokio::test]
+    async fn pull_absence_requires_repository_pull_access() {
+        for repository_status in [200, 401, 403, 404, 429, 500] {
+            let http = Arc::new(MockHttp {
+                responses: Mutex::new(VecDeque::from([
+                    error_response(404),
+                    if repository_status == 200 { response(&[]) } else { error_response(repository_status) },
+                ])),
+                urls: Mutex::new(Vec::new()),
+            });
+            let provider = provider(http.clone());
+            let outcomes = provider.observe_bound(&[70], &Default::default()).await.unwrap();
+            assert_eq!(matches!(outcomes[&70], Err(ObservationError::NotFound(_))), repository_status == 200);
+            assert_eq!(
+                *http.urls.lock().unwrap(),
+                vec![
+                    "https://forgejo.example/api/v1/repos/team/repo/pulls/70",
+                    "https://forgejo.example/api/v1/repos/team/repo/pulls?state=all&limit=1&page=1",
+                ]
+            );
+            assert!(http.responses.lock().unwrap().is_empty());
         }
     }
 
@@ -1211,7 +1237,7 @@ mod tests {
         fake.set_draft(&repo, 2, false).expect("ready");
         let missing = provider.observe_bound(&[2, 99], &Default::default()).await.expect("observe bound");
         assert!(missing[&2].is_ok());
-        assert!(missing[&99].as_ref().expect_err("missing pull request").to_string().contains("404"));
+        assert!(matches!(missing[&99], Err(ObservationError::NotFound(_))));
 
         // Merge one request, close the other.
         let second = open_through_api(&provider, "feature/two", "Second change", "").await;

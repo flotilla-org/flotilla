@@ -173,6 +173,7 @@ impl ChangeRequestRefresher {
     }
 
     async fn reconcile_convoy_demands(&self, namespace: &str, demands: &mut HashMap<ChangeRequestKey, uuid::Uuid>) -> Result<(), String> {
+        self.release_unlinked_history(namespace).await?;
         let convoys = self
             .inner
             .backend
@@ -232,6 +233,85 @@ impl ChangeRequestRefresher {
             }
         }
         Ok(())
+    }
+
+    /// Release only explicit unlink assertions. Missing convoys retain history.
+    async fn release_unlinked_history(&self, namespace: &str) -> Result<(), String> {
+        let records = self.inner.backend.using::<ChangeRequest>(namespace);
+        let inventory = records.list().await.map_err(|error| error.to_string())?;
+        if inventory.items.iter().all(|record| record.spec.subject_of.is_empty()) {
+            return Ok(());
+        }
+        let forges = self.forges(namespace).await?;
+        let convoys = self.inner.backend.including_replicas::<Convoy>(namespace).list().await.map_err(|e| e.to_string())?;
+        for record in inventory.items {
+            if record.spec.subject_of.is_empty() {
+                continue;
+            }
+            let subject = match record.spec.address(&forges).and_then(|address| ChangeRequestKey::new(namespace, address)) {
+                Ok(subject) => subject,
+                Err(error) => {
+                    tracing::debug!(record = %record.metadata.name, %error, "change request history has no address; unlink not processed");
+                    continue;
+                }
+            };
+            let lock = self.subject_lock(&subject).await;
+            let _guard = lock.lock().await;
+            loop {
+                let current = match records.get(&record.metadata.name).await {
+                    Ok(current) => current,
+                    Err(ResourceError::NotFound { .. }) => break,
+                    Err(error) => return Err(error.to_string()),
+                };
+                let mut spec = current.spec.clone();
+                spec.subject_of.retain(|entry| {
+                    !convoys.items.iter().any(|copy| {
+                        let convoy = &copy.object;
+                        convoy.metadata.namespace == entry.namespace
+                            && convoy.metadata.name == entry.convoy
+                            && convoy.status.as_ref().is_some_and(|status| {
+                                status.unlinked_subjects.iter().any(|unlinked| {
+                                    unlinked.kind == ConvoySubjectKind::ChangeRequest
+                                        && subject_address(unlinked, &forges).is_ok_and(|address| &address == subject.address())
+                                })
+                            })
+                    })
+                });
+                if spec == current.spec {
+                    break;
+                }
+                let demanded = self.inner.active.lock().await.get(&subject).is_some_and(|refresh| !refresh.demands.is_empty());
+                if !demanded && spec.subject_of.is_empty() {
+                    // Delete before dropping the final history entry. A failed
+                    // deletion leaves that entry available for the next retry.
+                    let held_elsewhere = self.subject_held_elsewhere(&subject, &current.metadata.name).await?;
+                    records.delete(&current.metadata.name).await.map_err(|e| e.to_string())?;
+                    if !held_elsewhere {
+                        if let Some(refresh) = self.inner.active.lock().await.remove(&subject) {
+                            refresh.task.abort();
+                        }
+                        self.inner.observation_errors.lock().await.remove(&subject);
+                    }
+                    break;
+                }
+                match records.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await {
+                    Ok(_) => break,
+                    Err(ResourceError::Conflict { .. }) => continue,
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Check aliases before deletion so a read failure leaves retryable history.
+    // Unrelated history-less records are never deleted by unlink reconciliation.
+    async fn subject_held_elsewhere(&self, subject: &ChangeRequestKey, name: &str) -> Result<bool, String> {
+        let records = self.inner.backend.using::<ChangeRequest>(subject.namespace()).list().await.map_err(|e| e.to_string())?;
+        Ok(records
+            .items
+            .iter()
+            .any(|record| record.metadata.name != name && spec_names(&record.spec, subject) && !record.spec.subject_of.is_empty()))
     }
 
     async fn subject_lock(&self, subject: &ChangeRequestKey) -> Arc<Mutex<()>> {
@@ -339,7 +419,7 @@ impl ChangeRequestRefresher {
             Err(error) => return Err(error.to_string()),
         }
 
-        self.record_convoy_history(&subject).await?;
+        self.record_convoy_history_locked(&subject).await?;
         let mut active = self.inner.active.lock().await;
         if let Some(refresh) = active.get_mut(&subject) {
             let was_retained = refresh.demands.is_empty();
@@ -480,6 +560,7 @@ impl ChangeRequestRefresher {
     pub async fn garbage_collect_orphans(&self) -> Result<(), String> {
         let namespaces = self.inner.backend.local_namespaces::<ChangeRequest>().await.map_err(|error| error.to_string())?;
         for namespace in namespaces {
+            self.release_unlinked_history(&namespace).await?;
             let records = self.inner.backend.using::<ChangeRequest>(&namespace);
             let forges = self.forges(&namespace).await?;
             for record in records.list().await.map_err(|error| error.to_string())?.items {
@@ -552,7 +633,16 @@ impl ChangeRequestRefresher {
     /// Capture links at admission, before a convoy can disappear. History is in
     /// the spec so ordinary forge status refreshes cannot erase it, and it follows
     /// the record's existing observation replication class.
+    // Tests can capture history without already holding demand admission's lock.
+    #[cfg(test)]
     async fn record_convoy_history(&self, subject: &ChangeRequestKey) -> Result<(), String> {
+        let lock = self.subject_lock(subject).await;
+        let _guard = lock.lock().await;
+        self.record_convoy_history_locked(subject).await
+    }
+
+    // Caller holds the subject lock, shared by demand admission and unlink cleanup.
+    async fn record_convoy_history_locked(&self, subject: &ChangeRequestKey) -> Result<(), String> {
         let convoys = self.inner.backend.using::<Convoy>(subject.namespace()).list().await.map_err(|error| error.to_string())?;
         let forges = self.forges(subject.namespace()).await?;
         let mut history = Vec::new();
@@ -707,12 +797,18 @@ impl ChangeRequestRefresher {
                 Ok(status) => {
                     let demanded =
                         self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.values().any(Option::is_some));
+                    let lock = self.subject_lock(&subject).await;
+                    let guard = lock.lock().await;
+                    if !self.inner.active.lock().await.contains_key(&subject) {
+                        return;
+                    }
                     if let Err(error) = self.publish(&subject, &record_name, status.clone(), demanded, true, true).await {
                         self.inner.observation_errors.lock().await.insert(subject.clone(), ObservationError::Failed(error.clone()));
                         tracing::warn!(change_request = %subject.address(), %error, "publish change request observation failed");
                     } else {
                         self.inner.observation_errors.lock().await.remove(&subject);
                     }
+                    drop(guard);
                     match self.collect_retained_if_terminal(&subject).await {
                         Ok(true) => return,
                         Ok(false) => {}
@@ -740,6 +836,22 @@ impl ChangeRequestRefresher {
                     }
                 }
                 Err(error) => {
+                    if matches!(error, ObservationError::NotFound(_)) {
+                        let lock = self.subject_lock(&subject).await;
+                        let _guard = lock.lock().await;
+                        let retained = self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.is_empty());
+                        if retained {
+                            match self.collect_local_subject(&subject).await {
+                                Ok(()) => {
+                                    self.inner.active.lock().await.remove(&subject);
+                                    self.inner.observation_errors.lock().await.remove(&subject);
+                                    // Returning ends this refresh task; it must not abort itself.
+                                    return;
+                                }
+                                Err(error) => tracing::warn!(%error, "collect nonexistent retained change request failed"),
+                            }
+                        }
+                    }
                     self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
                     tracing::warn!(change_request = %subject.address(), %error, "change request observation failed");
                     let retained = self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.is_empty());
@@ -873,7 +985,7 @@ impl ChangeRequestRefresher {
         if !self.owns_record(subject, allow_takeover, create_missing).await? {
             return Ok(());
         }
-        self.record_convoy_history(subject).await?;
+        self.record_convoy_history_locked(subject).await?;
         let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
         let current = records.get(name).await.map_err(|error| error.to_string())?;
         if current.spec.observing_authority != self.inner.authority {
@@ -1289,6 +1401,243 @@ mod tests {
         })
         .await
         .expect("retained observation before deadline");
+    }
+
+    // Network boundary fake: return explicit absence, throttling, authentication,
+    // or transport failure. Only explicit absence may collect a retained record.
+    struct ErrorSource(ObservationError);
+    #[async_trait::async_trait]
+    impl ChangeRequestObservationSource for ErrorSource {
+        async fn observe(&self, _: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
+            Err(self.0.clone())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retained_missing_request_is_collected_but_read_failures_are_kept() {
+        for error in [
+            ObservationError::NotFound("missing".into()),
+            ObservationError::Failed("401 unauthenticated".into()),
+            ObservationError::Failed("transport unavailable".into()),
+            ObservationError::RateLimited { budget: "forge".into(), retry_at: None, detail: "throttled".into() },
+        ] {
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let refresher = ChangeRequestRefresher::new(
+                "kiwi".into(),
+                backend.clone(),
+                "node".into(),
+                Arc::new(ErrorSource(error.clone())),
+                ChangeRequestRefreshCadence::default(),
+            );
+            let subject = ChangeRequestKey::new(
+                "ops",
+                flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).expect("address"),
+            )
+            .expect("key");
+            refresher.ensure_record(&subject, &subject.record_name()).await.expect("record");
+            let records = backend.using::<ChangeRequest>("ops");
+            let record = records.get(&subject.record_name()).await.expect("record");
+            let mut spec = record.spec.clone();
+            spec.subject_of.push(
+                ChangeRequestSubjectHistory::builder()
+                    .namespace("ops".into())
+                    .convoy("gone".into())
+                    .origin("kiwi".into())
+                    .relationship(Relationship::Produces)
+                    .role("coder".into())
+                    .last_seen(Utc::now())
+                    .build(),
+            );
+            records.update(&InputMeta::from(&record.metadata), &record.metadata.resource_version, &spec).await.expect("history");
+            refresher.start_retained(subject.clone()).await;
+            for _ in 0..30 {
+                tokio::task::yield_now().await;
+            }
+            let missing = matches!(error, ObservationError::NotFound(_));
+            assert_eq!(backend.using::<ChangeRequest>("ops").list().await.expect("records").items.is_empty(), missing, "{error}");
+            assert_eq!(refresher.inner.active.lock().await.contains_key(&subject), !missing);
+            for (_, refresh) in refresher.inner.active.lock().await.drain() {
+                refresh.task.abort();
+            }
+        }
+    }
+
+    // Explicit unlink releases only that convoy's history. A second producer
+    // keeps the request retained; duplicate unlink is harmless.
+    #[hegel::test]
+    fn unlinked_request_releases_only_the_unlinking_convoy(tc: hegel::TestCase) {
+        use flotilla_resources::{ConvoySpec, ConvoyStatus};
+        // Generate one to four holders, either unlink order and duplicate reconciliations.
+        // This observer-local lifecycle uses the real store; no request routing changes.
+        let holders = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(4));
+        let reverse = tc.draw(hegel::generators::booleans());
+        let repeats = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime");
+        runtime.block_on(async {
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let refresher = ChangeRequestRefresher::new(
+                "kiwi".into(),
+                backend.clone(),
+                "node".into(),
+                Arc::new(UnavailableSource),
+                ChangeRequestRefreshCadence::default(),
+            );
+            let subject = ChangeRequestKey::new(
+                "ops",
+                flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).expect("address"),
+            )
+            .expect("key");
+            refresher.ensure_record(&subject, &subject.record_name()).await.expect("record");
+            let convoys = backend.using::<Convoy>("ops");
+            let linked = flotilla_protocol::Subject {
+                kind: ConvoySubjectKind::ChangeRequest,
+                source: IssueSource { service: "github.com".into(), scope: "org/repo".into() },
+                id: "42".into(),
+            };
+            for i in 0..holders {
+                let name = format!("producer-{i}");
+                let convoy = convoys
+                    .create(
+                        &InputMeta::builder().name(name.clone()).build(),
+                        &ConvoySpec::builder().workflow_ref("dev".into()).role("coder".into()).build(),
+                    )
+                    .await
+                    .expect("convoy");
+                let mut status = ConvoyStatus::default();
+                status.discover_subject(
+                    linked.clone(),
+                    Relationship::Produces,
+                    flotilla_resources::SubjectDiscoverySource::Operator,
+                    Utc::now(),
+                );
+                convoys.update_status(&name, &convoy.metadata.resource_version, &status).await.expect("link");
+            }
+            refresher.record_convoy_history(&subject).await.expect("history");
+            let mut order = (0..holders).collect::<Vec<_>>();
+            if reverse {
+                order.reverse();
+            }
+            for (step, i) in order.iter().enumerate() {
+                let name = format!("producer-{i}");
+                let convoy = convoys.get(&name).await.expect("convoy");
+                let mut status = convoy.status.expect("status");
+                status.unlink_subject(&linked);
+                convoys.update_status(&name, &convoy.metadata.resource_version, &status).await.expect("unlink");
+                // Reconciliation observes explicit unlink assertions, including duplicates.
+                for _ in 0..repeats {
+                    refresher.reconcile_convoy_demands("ops", &mut HashMap::new()).await.expect("reconcile");
+                }
+                let records = backend.using::<ChangeRequest>("ops").list().await.expect("records").items;
+                if step + 1 == holders {
+                    assert!(records.is_empty(), "last unlink collects the record");
+                } else {
+                    assert_eq!(records.len(), 1);
+                    assert_eq!(records[0].spec.subject_of.len(), holders - step - 1);
+                    for remaining in &order[step + 1..] {
+                        assert!(records[0].spec.subject_of.iter().any(|entry| entry.convoy == format!("producer-{remaining}")));
+                    }
+                }
+            }
+            for (_, refresh) in refresher.inner.active.lock().await.drain() {
+                refresh.task.abort();
+            }
+        });
+    }
+
+    // An explicit-unlink pass must leave unrelated observations alone, regardless
+    // of their authority. Startup GC is a separate policy for history-less rows.
+    #[tokio::test]
+    async fn unlink_reconciliation_keeps_unrelated_historyless_records() {
+        for authority in ["node", "peer"] {
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let refresher = ChangeRequestRefresher::new(
+                "fleet".into(),
+                backend.clone(),
+                "node".into(),
+                Arc::new(UnavailableSource),
+                ChangeRequestRefreshCadence::default(),
+            );
+            let records = backend.using::<ChangeRequest>("ops");
+            records
+                .create(
+                    &InputMeta::builder().name("unrelated".into()).build(),
+                    &ChangeRequestSpec::builder()
+                        .service("github.com".into())
+                        .scope("org/repo".into())
+                        .number(42)
+                        .observing_authority(authority.into())
+                        .build(),
+                )
+                .await
+                .unwrap();
+            refresher.reconcile_convoy_demands("ops", &mut HashMap::new()).await.unwrap();
+            assert_eq!(records.get("unrelated").await.unwrap().spec.observing_authority, authority);
+        }
+    }
+
+    // Network boundary: pause a missing-PR response so a new demand can be
+    // admitted before collection. The demand must keep its record and diagnostics.
+    struct PausedMissingSource {
+        started: Notify,
+        proceed: Notify,
+    }
+    #[async_trait::async_trait]
+    impl ChangeRequestObservationSource for PausedMissingSource {
+        async fn observe(&self, _: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
+            self.started.notify_one();
+            self.proceed.notified().await;
+            Err(ObservationError::NotFound("missing".into()))
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn demand_arriving_during_missing_collection_preserves_observation() {
+        for collection_first in [false, true] {
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let source = Arc::new(PausedMissingSource { started: Notify::new(), proceed: Notify::new() });
+            let refresher = ChangeRequestRefresher::new(
+                "fleet".into(),
+                backend.clone(),
+                "node".into(),
+                source.clone(),
+                ChangeRequestRefreshCadence::default(),
+            );
+            let subject = ChangeRequestKey::new(
+                "ops",
+                flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).unwrap(),
+            )
+            .unwrap();
+            refresher.ensure_record(&subject, &subject.record_name()).await.unwrap();
+            refresher.start_retained(subject.clone()).await;
+            source.started.notified().await;
+            let demand = uuid::Uuid::new_v4();
+            if collection_first {
+                let lock = refresher.subject_lock(&subject).await;
+                let guard = lock.lock().await;
+                source.proceed.notify_one();
+                // The missing response queues cleanup on the subject lock.
+                for _ in 0..30 {
+                    tokio::task::yield_now().await;
+                }
+                let resumed = refresher.clone();
+                let demanded = subject.clone();
+                let admission = tokio::spawn(async move { resumed.demand(demand, demanded, None).await });
+                tokio::task::yield_now().await;
+                drop(guard);
+                admission.await.unwrap().unwrap();
+                // Cleanup ran first; admission must recreate and re-arm demand.
+                source.started.notified().await;
+            } else {
+                refresher.demand(demand, subject.clone(), None).await.unwrap();
+            }
+            source.proceed.notify_one();
+            for _ in 0..30 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(refresher.active_demands().await, 1);
+            assert!(backend.using::<ChangeRequest>("ops").get(&subject.record_name()).await.is_ok());
+            assert!(matches!(refresher.observation_error(&subject).await, Some(ObservationError::NotFound(_))));
+            refresher.release(demand).await;
+        }
     }
 
     // HTTP boundary: an invalid endpoint deterministically refuses backend I/O,
