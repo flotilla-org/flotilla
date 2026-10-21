@@ -160,6 +160,7 @@ impl Machine for Rogue {
     type Spec = ();
     type State = Latch;
     type Edge = LatchEdge;
+    type Write = flotilla_state_machines::NoRecords;
     type Refusal = LatchRefusal;
     type World = Table<Signal>;
     fn definition() -> MachineDef<Self> {
@@ -313,6 +314,7 @@ fn validate_rejects_a_label_and_edge_sharing_a_word() {
         type Spec = ();
         type State = Clash;
         type Edge = LatchEdge;
+        type Write = flotilla_state_machines::NoRecords;
         type Refusal = LatchRefusal;
         type World = Table<Signal>;
         fn definition() -> MachineDef<Self> {
@@ -478,6 +480,7 @@ fn validate_rejects_duplicate_codes() {
         type Spec = ();
         type State = Twin;
         type Edge = TwinEdge;
+        type Write = flotilla_state_machines::NoRecords;
         type Refusal = Never;
         type World = ();
         fn definition() -> MachineDef<Self> {

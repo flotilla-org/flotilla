@@ -14,7 +14,7 @@ fn units(pairs: &[(u32, u32)]) -> Units {
 }
 
 fn quota(pairs: &[(u32, u32)]) -> Quota {
-    pairs.iter().map(|(class, n)| (VesselClass(*class), *n)).collect()
+    pairs.iter().map(|(class, n)| (VesselClass::new(class.to_string()), *n)).collect()
 }
 
 fn convoy(n: u32) -> ConvoyId {
@@ -26,7 +26,7 @@ fn vessel(n: u32) -> VesselId {
 }
 
 fn request(convoy_n: u32, class: u32, shape: &[(u32, u32)], priority: u32) -> Request {
-    Request { convoy: convoy(convoy_n), class: VesselClass(class), shape: units(shape), priority: Priority(priority) }
+    Request { convoy: convoy(convoy_n), class: VesselClass::new(class.to_string()), shape: units(shape), priority: Priority(priority) }
 }
 
 fn evidence(available: &[(u32, u32)], waiting: Vec<Request>, live: u32, cap: u32, admitted: bool) -> Evidence {
@@ -42,7 +42,7 @@ fn draw_units(tc: &hegel::TestCase) -> Units {
 fn draw_request(tc: &hegel::TestCase) -> Request {
     Request {
         convoy: convoy(tc.draw(gs::integers::<u32>().min_value(1).max_value(2))),
-        class: VesselClass(tc.draw(gs::integers::<u32>().min_value(0).max_value(1))),
+        class: VesselClass::new(tc.draw(gs::integers::<u32>().min_value(0).max_value(1)).to_string()),
         shape: draw_units(tc),
         priority: Priority(tc.draw(gs::integers::<u32>().min_value(0).max_value(2))),
     }
@@ -228,7 +228,9 @@ fn the_ledger_keeps_caps_and_capacity(tc: hegel::TestCase) {
         ledger.add_host(*host, capacity.clone()).expect("host");
     }
     for n in 1..=2 {
-        let initial: Quota = (0..2).map(|class| (VesselClass(class), tc.draw(gs::integers::<u32>().min_value(0).max_value(1)))).collect();
+        let initial: Quota = (0..2)
+            .map(|class: u32| (VesselClass::new(class.to_string()), tc.draw(gs::integers::<u32>().min_value(0).max_value(1))))
+            .collect();
         ledger.set_caps(convoy(n), initial.clone());
         caps.insert(convoy(n), initial);
     }
@@ -255,14 +257,14 @@ fn the_ledger_keeps_caps_and_capacity(tc: hegel::TestCase) {
             }
             Op::Raise(n, class) => {
                 let raised = caps.entry(convoy(n)).or_default();
-                *raised.entry(VesselClass(class)).or_default() += 1;
+                *raised.entry(VesselClass::new(class.to_string())).or_default() += 1;
                 ledger.set_caps(convoy(n), raised.clone());
             }
         }
         for n in 1..=2 {
-            for class in (0..2).map(VesselClass) {
+            for class in (0..2u32).map(|class| VesselClass::new(class.to_string())) {
                 let cap = caps.get(&convoy(n)).and_then(|c| c.get(&class)).copied().unwrap_or(0);
-                assert!(ledger.live(&convoy(n), class) <= cap, "convoy {n} class {class:?} over its cap {cap}");
+                assert!(ledger.live(&convoy(n), &class) <= cap, "convoy {n} class {class:?} over its cap {cap}");
             }
         }
         for (host, capacity) in &capacities {

@@ -586,6 +586,7 @@ impl Machine for Probe {
     type Spec = ProbeSpec;
     type State = ProbeState;
     type Edge = ProbeEdge;
+    type Write = flotilla_state_machines::NoRecords;
     type Refusal = ProbeRefusal;
     type World = Table<Receipts>;
 

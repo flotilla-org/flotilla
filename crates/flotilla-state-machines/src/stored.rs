@@ -29,7 +29,7 @@ use flotilla_schema::{
 
 use crate::{
     machines::{agent_session::AgentSession, convoy::Convoy, ensure::Ensure, message::Message, vessel::Vessel},
-    EdgeEventOf, EdgeKind, EdgePayload, Label, Machine, Resource, Version,
+    EdgeEventOf, EdgeKind, EdgePayload, Label, Machine, NoRecords, Resource, Version,
 };
 
 /// The production kind registry (#3373 ruling 6): every stored kind the engine
@@ -140,6 +140,20 @@ where
 
     fn table_set() -> TableSet {
         holder_tables::<S, E>()
+    }
+}
+
+/// A records write as a stored edge's rows: an [`Edge::append`] or
+/// [`Edge::append_in`] for an appended row, an [`Edge::set_in`] for a changed
+/// field. Implemented beside each machine whose spec holds records, for its
+/// [`Resource`].
+pub trait StoredWrite<K> {
+    fn store(&self, edge: Edge<K>) -> Result<Edge<K>, EdgeError>;
+}
+
+impl<K> StoredWrite<K> for NoRecords {
+    fn store(&self, _: Edge<K>) -> Result<Edge<K>, EdgeError> {
+        match *self {}
     }
 }
 

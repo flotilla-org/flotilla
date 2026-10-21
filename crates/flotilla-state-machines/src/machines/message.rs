@@ -57,8 +57,8 @@ use crate::{
         consumer::{Consumer, ConsumerKind},
         convoy::ConvoyRequest,
     },
-    states, Admission, EdgeDef, EdgePayload, Ended, Handle, Kind, Machine, MachineDef, Ref, Resource, Source, Table, Transport, Version,
-    WrongState,
+    states, Admission, EdgeDef, EdgePayload, Ended, Handle, Kind, Machine, MachineDef, NoRecords, Ref, Resource, Source, Table, Transport,
+    Version, WrongState,
 };
 
 /// What would settle the message. `Nothing` settles on delivery.
@@ -612,6 +612,7 @@ impl Machine for Message {
     type Spec = MessageSpec;
     type State = MessageState;
     type Edge = MessageEdge;
+    type Write = NoRecords;
     type Refusal = MessageRefusal;
     type World = dyn MessageWorld;
 

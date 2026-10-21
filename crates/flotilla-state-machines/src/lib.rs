@@ -68,8 +68,9 @@ pub use code::{changed, Coded, Datum, Edge, EdgeArg, StateValue};
 pub use home::{Created, Home, Resource, WriteError};
 pub use log::{edge_event, EntryError, Log, LogError, MemoryLog};
 pub use machine::{
-    Check, DeclaredEdge, DefError, Diagram, EdgeDef, EdgeKind, EndDef, Ended, Fault, Label, Machine, MachineDef, StepError, WrongState,
+    Check, DeclaredEdge, DefError, Diagram, EdgeDef, EdgeKind, EndDef, Ended, Fault, Label, Machine, MachineDef, NoRecords, RecordWrite,
+    StepError, WrongState,
 };
 pub use read::{Admission, Handle, InputRead, Judged, Kind, Ref, Source, Table, Version};
 pub use record::{EdgeEventOf, EdgePayload, Transport};
-pub use stored::{kinds, Declared, StoredState};
+pub use stored::{kinds, Declared, StoredState, StoredWrite};

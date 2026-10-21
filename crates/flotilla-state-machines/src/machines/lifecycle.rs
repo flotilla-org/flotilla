@@ -25,14 +25,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     attempt, edges, states, Admission, AttemptPolicy, Cause, EdgeDef, EdgePayload, Ended, Failure, Handle, Kind, Machine, MachineDef,
-    Outcome, Ref, Source, Table, Version, WrongState,
+    NoRecords, Outcome, Ref, Source, Table, Version, WrongState,
 };
 
 /// One kind sharing the lifecycle: its name, request and retry policy.
 pub trait LifecycleKind: 'static {
     const NAME: &'static str;
     /// What a caller asks for; the resource's immutable spec. Opaque here.
-    type Request;
+    type Request: Clone;
     /// The policy `give_up` judges the attempts against.
     fn policy() -> AttemptPolicy {
         DEFAULT_POLICY
@@ -229,6 +229,7 @@ impl<K: LifecycleKind> Machine for Lifecycle<K> {
     type Spec = K::Request;
     type State = LifecycleState;
     type Edge = LifecycleEdge;
+    type Write = NoRecords;
     type Refusal = LifecycleRefusal;
     type World = dyn LifecycleWorld;
 

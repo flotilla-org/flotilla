@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     edges,
     machines::consumer::{Consumer, ConsumerKind},
-    states, Admission, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Transport, Version, WrongState,
+    states, Admission, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, NoRecords, Ref, Source, Table, Transport, Version, WrongState,
 };
 
 /// Whether a channel to a Live session is attached (spec `Channel`).
@@ -235,6 +235,7 @@ impl Machine for AgentSession {
     type Spec = AgentSessionSpec;
     type State = AgentSessionState;
     type Edge = AgentSessionEdge;
+    type Write = NoRecords;
     type Refusal = AgentSessionRefusal;
     type World = dyn AgentSessionWorld;
 

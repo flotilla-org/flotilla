@@ -201,13 +201,13 @@ impl Ledger {
     }
 
     /// The convoy's cap for a class; zero when it holds none.
-    pub fn cap(&self, convoy: &ConvoyId, class: VesselClass) -> u32 {
-        self.caps.get(convoy).and_then(|quota| quota.get(&class)).copied().unwrap_or(0)
+    pub fn cap(&self, convoy: &ConvoyId, class: &VesselClass) -> u32 {
+        self.caps.get(convoy).and_then(|quota| quota.get(class)).copied().unwrap_or(0)
     }
 
     /// Leased vessels of the convoy and class, on any host.
-    pub fn live(&self, convoy: &ConvoyId, class: VesselClass) -> u32 {
-        let count = self.leases().filter(|(_, lease)| lease.request.convoy == *convoy && lease.request.class == class).count();
+    pub fn live(&self, convoy: &ConvoyId, class: &VesselClass) -> u32 {
+        let count = self.leases().filter(|(_, lease)| lease.request.convoy == *convoy && lease.request.class == *class).count();
         u32::try_from(count).unwrap_or(u32::MAX)
     }
 
@@ -224,8 +224,8 @@ impl Ledger {
                 _ => None,
             })
             .collect();
-        let cap = self.cap(&request.convoy, request.class);
-        Ok(Evidence { host, available, waiting, live: self.live(&request.convoy, request.class), cap, admitted: cap > 0 })
+        let cap = self.cap(&request.convoy, &request.class);
+        Ok(Evidence { host, available, waiting, live: self.live(&request.convoy, &request.class), cap, admitted: cap > 0 })
     }
 
     /// Places waiting vessel `id` on `host` when [`place`] allows it.

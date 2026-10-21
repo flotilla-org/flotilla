@@ -202,6 +202,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'promises.progress', 'rt', 'Retracted'),
   ('cv', 'promises.progress', 'su', 'Submitted'),
   ('cv', 'log:edge', 'ab', 'Abandon'),
+  ('cv', 'log:edge', 'as', 'AddSeat'),
   ('cv', 'log:edge', 'dc', 'Declare'),
   ('cv', 'log:edge', 'de', 'Deliver'),
   ('cv', 'log:edge', 'ke', 'Keep'),
@@ -211,6 +212,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'log:edge', 'rs', 'Reassign'),
   ('cv', 'log:edge', 'rt', 'Retract'),
   ('cv', 'log:edge', 'su', 'Submit'),
+  ('cv', 'log:edge', 'sv', 'Resupervise'),
   ('cv', 'log:label', 'ab', 'Abandoned'),
   ('cv', 'log:label', 'de', 'Delivered'),
   ('cv', 'log:label', 'op', 'Open');

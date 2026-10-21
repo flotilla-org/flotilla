@@ -14,7 +14,8 @@ use flotilla_state_machines::{
         agent_session::{AgentSession, MemoryAgentSessionWorld},
         awaiting_reply::{AwaitingReplyEdgeKind, AwaitingReplySpec},
         convoy::{
-            Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyRequest, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId, VesselClass,
+            AdmittedPromise, Authority, Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyRequest, Deliver, Duty, DutyId, DutyScope, Keep,
+            MemoryConvoyWorld, Priority, PromiseId, PromiseKinds, PromiseSource, RetireDuty, Seat, SeatName, Submit, Terms, VesselClass,
         },
         ensure::{Attempted, Ensure, EnsureSpec, MemoryEnsureWorld, Record},
         lifecycle::{self, LifecycleLabel, LifecycleState, MemoryLifecycleWorld, Observed, Realisation, Realise, Vanish},
@@ -62,8 +63,34 @@ fn project() -> Address {
     Address::project("p").expect("project")
 }
 
-fn promise() -> Promise {
-    Promise { kind: "k".into(), target: Address::project("t").expect("target") }
+fn promise() -> AdmittedPromise {
+    AdmittedPromise {
+        kind: "k".into(),
+        target: Address::project("t").expect("target"),
+        source: PromiseSource::Template,
+        owner: SeatName::new("coder", ""),
+    }
+}
+
+/// A convoy whose seat `coder` owns promise 0 and a lifetime duty.
+fn convoy_request() -> ConvoyRequest {
+    ConvoyRequest {
+        project: project(),
+        promises: [(PromiseId(0), promise())].into(),
+        duties: [(DutyId(0), Duty { owner: SeatName::new("coder", ""), scope: DutyScope::Lifetime, terms: Terms::default() })].into(),
+        seats: vec![Seat { role: "coder".into(), seat: String::new(), parent: None, supervised_by: project() }],
+        quota: [(VesselClass::new("standard"), 2)].into(),
+        priority: Priority(4),
+        kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
+    }
+}
+
+/// The convoy world: the project exists, and `yes` is authorised and durable.
+fn convoy_world() -> MemoryConvoyWorld {
+    let mut world = MemoryConvoyWorld::default().with_project(&project());
+    world.authority.put(&Ref::new("yes"), true);
+    world.durable.put(&Ref::new("yes"), true);
+    world
 }
 
 /// `name`'s resource at `home`, encoded and decoded through the schema codec (the name and
@@ -93,12 +120,7 @@ where
 #[test]
 fn resources_survive_the_codec() {
     let mut messages = Home::<Message>::new("home").expect("valid");
-    let request = ConvoyRequest {
-        project: project(),
-        promises: [(PromiseId(0), promise())].into(),
-        quota: [(VesselClass(1), 2)].into(),
-        priority: Priority(4),
-    };
+    let request = convoy_request();
     let spec = MessageSpec {
         references: vec![
             MessageReference { address: Address::project("cr").expect("subject"), revision: "abc".into(), subject: true },
@@ -128,12 +150,21 @@ fn resources_survive_the_codec() {
     round_trip(&sessions, "s");
 
     let mut convoys = Home::<Convoy>::new("home").expect("valid");
-    let promises = [(PromiseId(0), promise())].into();
-    let request = ConvoyRequest { project: project(), promises, quota: [(VesselClass(1), 2)].into(), priority: Priority(4) };
-    convoys.create("c", request, &MemoryConvoyWorld::default().with_project(&project()), Timestamp(2)).expect("created");
-    convoys.apply("c", Keep { promise: PromiseId(0) }, &MemoryConvoyWorld::default(), Timestamp(3)).expect("kept");
+    convoys.create("c", convoy_request(), &convoy_world(), Timestamp(2)).expect("created");
+    let submit = Submit {
+        promise: PromiseId(0),
+        by: SeatName::new("coder", ""),
+        address: project(),
+        revision: "abc".into(),
+        durable: Ref::new("yes"),
+    };
+    convoys.apply("c", submit, &convoy_world(), Timestamp(3)).expect("submitted");
+    let keep =
+        Keep::Verdict { promise: PromiseId(0), by: SeatName::new("operator", ""), authority: Authority::Operator, reason: "r".into() };
+    convoys.apply("c", keep, &convoy_world(), Timestamp(4)).expect("kept");
     let convoy = round_trip(&convoys, "c");
-    assert_eq!((convoy.version(), convoy.since()), (Version(2), Timestamp(2)), "a data-only edge keeps since");
+    assert_eq!((convoy.version(), convoy.since()), (Version(3), Timestamp(2)), "a records edge keeps since");
+    assert_eq!(convoy.spec().promises.get(flotilla_schema::Position(0)).expect("row").record.submissions.len(), 1);
 
     let mut ensures = Home::<Ensure>::new("home").expect("valid");
     ensures
@@ -171,7 +202,7 @@ fn resources_survive_the_codec() {
 fn lease_of(convoy: &str, units: u32) -> Lease {
     let convoy = flotilla_schema::Ref::new(convoy, "admitting-host");
     Lease {
-        request: Request { convoy, class: VesselClass(1), shape: [(Dimension(0), units)].into(), priority: Priority(2) },
+        request: Request { convoy, class: VesselClass::new("1"), shape: [(Dimension(0), units)].into(), priority: Priority(2) },
         host: Host(3),
     }
 }
@@ -186,7 +217,7 @@ fn the_host_ledger_is_rebuilt_from_live_vessels() {
     let mut vessels = Home::<Vessel>::new("capacity-host").expect("valid");
     for (name, units) in [("a", 4), ("b", 3), ("gone", 2)] {
         let lease = lease_of("c", units);
-        before.set_caps(lease.request.convoy.clone(), [(VesselClass(1), 5)].into());
+        before.set_caps(lease.request.convoy.clone(), [(VesselClass::new("1"), 5)].into());
         before.request(VesselId::new(name), lease.request.clone()).expect("requested");
         let placed = before.place(&VesselId::new(name), Host(3)).expect("placed").clone();
         vessels.create(name, placed.into(), &MemoryLifecycleWorld::default(), Timestamp(0)).expect("created");
@@ -214,7 +245,7 @@ fn the_host_ledger_is_rebuilt_from_live_vessels() {
     assert_eq!(after.leases().collect::<Vec<_>>(), before.leases().collect::<Vec<_>>());
     assert_eq!(after.available(Host(3)), Ok([(Dimension(0), 3)].into()));
     let convoy = lease_of("c", 0).request.convoy;
-    assert_eq!(after.live(&convoy, VesselClass(1)), before.live(&convoy, VesselClass(1)));
+    assert_eq!(after.live(&convoy, &VesselClass::new("1")), before.live(&convoy, &VesselClass::new("1")));
     assert_eq!(after.restore(VesselId::new("a"), lease_of("c", 1)), Err(LedgerError::DuplicateRequest(VesselId::new("a"))));
     assert_eq!(
         after.restore(VesselId::new("big"), lease_of("c", 4)),
@@ -246,13 +277,14 @@ fn root_sets(parts: &EdgeParts) -> Vec<&'static str> {
 #[test]
 fn a_resources_edge_moves_since_only_with_the_label() {
     let mut home = Home::<Convoy>::new("home").expect("valid");
-    let promises = [(PromiseId(0), promise())].into();
-    let world = MemoryConvoyWorld::default().with_project(&project());
-    home.create("c", ConvoyRequest { project: project(), promises, quota: [].into(), priority: Priority(1) }, &world, Timestamp(1))
-        .expect("created");
+    let mut request = convoy_request();
+    request.promises.clear();
+    let world = convoy_world();
+    home.create("c", request, &world, Timestamp(1)).expect("created");
     let created = home.get("c").expect("exists").stored_state().clone();
 
-    let event = home.apply("c", Keep { promise: PromiseId(0) }, &world, Timestamp(5)).expect("kept");
+    let retire = RetireDuty { duty: DutyId(0), by: SeatName::new("coder", ""), authority: Ref::new("yes") };
+    let event = home.apply("c", retire, &world, Timestamp(5)).expect("retired");
     let resource = home.get("c").expect("exists");
     let edge = resource.stored_edge(&created, &event).expect("edge");
     assert_eq!(resource.since(), Timestamp(1), "a data-only edge keeps since");
@@ -261,7 +293,7 @@ fn a_resources_edge_moves_since_only_with_the_label() {
     assert_eq!(
         (root_sets(&parts), parts.rows.len(), parts.from.code),
         (vec!["state", "reason"], 1, Code::new("op")),
-        "the whole state, one resolution row"
+        "the whole state, one retired row"
     );
     assert_eq!(parts.sets[0].values[1], flotilla_schema::Value::Int(1), "the stored since");
     assert_eq!(parts.appends.len(), 0, "the event is the entry's header, not a row");
@@ -303,19 +335,15 @@ fn live_leases_and_the_live_by_host_index_agree() {
     }
 }
 
-// Behaviour (#3587 layer 3): the declared Convoy and AwaitingReply kinds round-trip through their
-// row codec with every table filled (seats, promises with nested submissions, duties with a
-// WhileOpen scope and terms, the frozen kinds, quota and retired duties), so layer 4's machines
-// inherit working codecs. In memory only: nothing stores a declaration.
+// Behaviour (#3587 layers 3 and 4): Convoy and the declared AwaitingReply round-trip through
+// their row codec with every table filled (seats, promises with nested submissions, duties with
+// a WhileOpen scope and terms, the frozen kinds, quota and retired duties).
 #[test]
 fn declared_convoy_and_awaiting_reply_round_trip() {
     use flotilla_schema::Records;
     use flotilla_state_machines::machines::{
         awaiting_reply::{Awaited, AwaitingReplySpec, AwaitingReplyState},
-        convoy::work::{
-            ConvoyEdgeKind as WorkEdgeKind, ConvoySpec as WorkSpec, ConvoyState as WorkState, Duty, DutyId, DutyScope, Progress,
-            Promise as WorkPromise, PromiseKind, PromiseKinds, Seat, SeatName, Source, Submission, Terms, VesselClass as Class,
-        },
+        convoy::{ConvoySpec, ConvoyState, Progress, Promise, PromiseKind, Submission},
     };
 
     let seat = |role: &str, seat: &str| SeatName { role: role.into(), seat: seat.into() };
@@ -325,11 +353,11 @@ fn declared_convoy_and_awaiting_reply_round_trip() {
     promises
         .append(
             1,
-            WorkPromise {
+            Promise {
                 id: PromiseId(0),
                 kind: "pr".into(),
                 target: project(),
-                source: Source::Dispatch,
+                source: PromiseSource::Dispatch,
                 owner: seat("coder", ""),
                 progress: State::new(Progress::Submitted, Timestamp(2)),
                 submissions,
@@ -354,17 +382,18 @@ fn declared_convoy_and_awaiting_reply_round_trip() {
     ]
     .into();
     let kinds = PromiseKinds { kinds: [("pr".to_owned(), PromiseKind::default())].into() };
-    let spec = WorkSpec { project: project(), priority: Priority(3), kinds: Frozen::new(kinds).expect("frozen"), duties, seats, promises };
+    let spec =
+        ConvoySpec { project: project(), priority: Priority(3), kinds: Frozen::new(kinds).expect("frozen"), duties, seats, promises };
     let state = State::new(
-        WorkState::Abandoned {
-            quota: [(Class("standard".into()), 2)].into(),
+        ConvoyState::Abandoned {
+            quota: [(VesselClass::new("standard"), 2)].into(),
             retired: BTreeSet::from([DutyId(0)]),
             reason: "decision".into(),
         },
         Timestamp(5),
     );
-    let convoy = Declared::<WorkSpec, WorkEdgeKind>::new(spec, state);
-    let decoded: Declared<WorkSpec, WorkEdgeKind> = Decoder::decode(Encoder::encode(&convoy).expect("encodes")).expect("decodes");
+    let convoy = Resource::<Convoy>::stored("", spec, state, Version(0));
+    let decoded: Resource<Convoy> = Decoder::decode(Encoder::encode(&convoy).expect("encodes")).expect("decodes");
     assert_eq!(decoded, convoy);
 
     let spec = AwaitingReplySpec {
