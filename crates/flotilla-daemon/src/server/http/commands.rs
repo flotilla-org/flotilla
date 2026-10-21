@@ -19,7 +19,8 @@ use axum::{
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
-    CommandCaller, CommandValue, DaemonEvent, Message, PrincipalRef, Request as RpcRequest, Response as RpcResponse, ResponseResult,
+    CommandCaller, CommandValue, DaemonEvent, DispatcherErrorClass, Message, PrincipalRef, Request as RpcRequest, Response as RpcResponse,
+    ResponseResult,
 };
 use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
@@ -331,9 +332,9 @@ pub(super) async fn handle(
             let Some(command_id) = command_id else {
                 return encoding.error(StatusCode::CONFLICT, "command cannot be cancelled");
             };
-            return match commands.router.dispatch_cancel(command_id).await {
+            return match commands.router.dispatch_cancel_typed(command_id).await {
                 Ok(()) => encoding.render(StatusCode::ACCEPTED, json!({"id": id})),
-                Err(e) => encoding.error(cancel_status(&e, &receiver.borrow()), e),
+                Err(e) => encoding.error(cancel_status(e.class, &receiver.borrow()), e.message),
             };
         }
         let wait = match query.get("wait").map(|v| v.parse::<f64>()).transpose() {
@@ -413,7 +414,7 @@ pub(super) async fn handle(
     let response = match response {
         Message::Response { response, .. } => match *response {
             ResponseResult::Ok { response } => *response,
-            ResponseResult::Err { message } => return encoding.error(error_status(&message), message),
+            ResponseResult::Err { class, message } => return encoding.error(error_status(class), message),
         },
         _ => return encoding.error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected dispatcher response"),
     };
@@ -559,35 +560,23 @@ async fn collect_progress(
     }
 }
 
-fn cancel_status(message: &str, state: &CommandState) -> StatusCode {
-    if state.outcome.is_some() || message == "no matching active command" || message.starts_with("unknown command") {
-        StatusCode::CONFLICT
+fn cancel_status(class: DispatcherErrorClass, state: &CommandState) -> StatusCode {
+    // A retained record proves prior existence: missing execution means it is
+    // no longer cancellable, even if its completion event has not arrived yet.
+    if state.outcome.is_some() || class == DispatcherErrorClass::Missing {
+        error_status(DispatcherErrorClass::Conflict)
     } else {
-        error_status(message)
+        error_status(class)
     }
 }
 
-// TODO(#3584): carry typed dispatcher errors; provider prose is not a trustworthy error class.
-fn error_status(message: &str) -> StatusCode {
-    if message.starts_with("resource conflict for ") || message.starts_with("field ownership refused") || message == "command has finished"
-    {
-        StatusCode::CONFLICT
-    } else if message.starts_with("CallerIdentity")
-        || message.starts_with("Environment")
-        || message.starts_with("unauthorized:")
-        || message == "artifact put requires a calling crew session"
-        || message == "artifact get requires a connected operator principal"
-    {
-        StatusCode::FORBIDDEN
-    } else if message.starts_with("resource not found:")
-        || message.starts_with("unknown command")
-        || message.starts_with("no Repository matches ")
-    {
-        StatusCode::NOT_FOUND
-    } else if message.starts_with("invalid resource:") || message == "operator artifact destination must be absolute" {
-        StatusCode::BAD_REQUEST
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
+fn error_status(class: DispatcherErrorClass) -> StatusCode {
+    match class {
+        DispatcherErrorClass::InvalidInput => StatusCode::BAD_REQUEST,
+        DispatcherErrorClass::Forbidden => StatusCode::FORBIDDEN,
+        DispatcherErrorClass::Missing => StatusCode::NOT_FOUND,
+        DispatcherErrorClass::Conflict => StatusCode::CONFLICT,
+        DispatcherErrorClass::DaemonFault => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -599,6 +588,7 @@ mod tests {
     use flotilla_config::ConfigStore;
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_protocol::{Command, CommandAction, HostName};
+    use flotilla_provider_runtime::CommandRunner;
     use flotilla_store::ResourceBackend;
     use flotilla_store_memory::InMemoryBackend;
     use tower::ServiceExt;
@@ -618,13 +608,17 @@ mod tests {
 
     impl Harness {
         async fn new() -> Self {
+            Self::with_discovery(flotilla_discovery_testkit::fake_discovery(false)).await
+        }
+
+        async fn with_discovery(discovery: flotilla_discovery::DiscoveryRuntime) -> Self {
             let temp = tempfile::tempdir().unwrap();
             std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"http-command-test\"\n").unwrap();
             let config = Arc::new(ConfigStore::with_base(temp.path()));
             let daemon = InProcessDaemon::new_with_resource_backend(
                 vec![],
                 config,
-                flotilla_discovery_testkit::fake_discovery(false),
+                discovery,
                 HostName::new("http-test"),
                 ResourceBackend::new(InMemoryBackend::default()),
                 Arc::new(crate::peer::HostPeerOverlay::default()),
@@ -1177,21 +1171,177 @@ mod tests {
         assert!(error["message"].as_str().unwrap().contains("depth-limit"));
     }
 
-    // Glue: the legacy dispatcher's string error vocabulary maps to HTTP status classes.
-    #[test]
-    fn dispatcher_error_status_classes() {
-        for (message, status) in [
-            ("resource conflict for test: stale version", StatusCode::CONFLICT),
-            ("field ownership refused 1 violation(s)", StatusCode::CONFLICT),
-            ("unauthorized: foreign principal", StatusCode::FORBIDDEN),
-            ("invalid resource: unknown kind", StatusCode::BAD_REQUEST),
-            ("resource not found: test", StatusCode::NOT_FOUND),
-            ("no Repository matches 'missing'", StatusCode::NOT_FOUND),
-            ("store unavailable", StatusCode::INTERNAL_SERVER_ERROR),
-            ("provider failed reading /tmp/requires-invalid-not found-conflict", StatusCode::INTERNAL_SERVER_ERROR),
-            ("resource not found: requires-invalid-conflict", StatusCode::NOT_FOUND),
-        ] {
-            assert_eq!(error_status(message), status, "{message}");
+    // Behaviour: arbitrary provider messages and caller paths cannot alter the
+    // class carried over the framed wire or its HTTP status (ADR 0047).
+    #[hegel::test]
+    fn dispatcher_error_status_classes(tc: hegel::TestCase) {
+        use flotilla_protocol::DispatcherError;
+        use hegel::generators as gs;
+        let cases = [
+            (DispatcherErrorClass::InvalidInput, StatusCode::BAD_REQUEST),
+            (DispatcherErrorClass::Forbidden, StatusCode::FORBIDDEN),
+            (DispatcherErrorClass::Missing, StatusCode::NOT_FOUND),
+            (DispatcherErrorClass::Conflict, StatusCode::CONFLICT),
+            (DispatcherErrorClass::DaemonFault, StatusCode::INTERNAL_SERVER_ERROR),
+        ];
+        // Explicit generator spans empty/long suffixes and path separators,
+        // control characters and Unicode. Every case checks every class/prefix.
+        let alphabet = ['/', ':', '\0', '\n', '⚓'];
+        let suffix: String = (0..tc.draw(gs::integers::<usize>().min_value(0).max_value(64)))
+            .map(|_| alphabet[tc.draw(gs::integers::<usize>().min_value(0).max_value(alphabet.len() - 1))])
+            .collect();
+        for (class, expected) in cases {
+            for prefix in [
+                "",
+                "unauthorized: provider failure",
+                "resource not found: /caller/path",
+                "invalid resource: conflict",
+                "field ownership refused",
+                "Environment/path",
+            ] {
+                let message = format!("{prefix}{suffix}");
+                let wire = serde_json::to_vec(&Message::error_response(7, DispatcherError::new(class, &message))).unwrap();
+                let Message::Response { response, .. } = serde_json::from_slice::<Message>(&wire).unwrap() else { panic!("response") };
+                let ResponseResult::Err { class, message: decoded } = *response else { panic!("error") };
+                assert_eq!(decoded, message);
+                assert_eq!(error_status(class), expected);
+                let Message::Response { response, .. } = Message::error_response(7, message) else { panic!("response") };
+                assert!(matches!(*response, ResponseResult::Err { class: DispatcherErrorClass::DaemonFault, .. }));
+            }
+        }
+    }
+
+    // Behaviour: a missing execution has a typed framed refusal; for an HTTP
+    // record that previously existed, the same refusal means cancellation conflict.
+    #[tokio::test]
+    async fn cancellation_refusals_keep_their_class() {
+        let h = Harness::new().await;
+        let error = h.commands.router.dispatch_cancel_typed(u64::MAX).await.unwrap_err();
+        assert_eq!(error.class, DispatcherErrorClass::Missing);
+        assert_eq!(error.message, "no matching active command");
+        let state = CommandState::new(Uuid::new_v4(), None, &AtomicU64::new(0));
+        assert_eq!(cancel_status(error.class, &state), StatusCode::CONFLICT);
+        for class in [DispatcherErrorClass::Forbidden, DispatcherErrorClass::DaemonFault] {
+            assert_eq!(cancel_status(class, &state), error_status(class));
+        }
+    }
+
+    // Process/filesystem boundary: inject arbitrary provider failure text while
+    // retaining the real daemon, artifact store, dispatcher and HTTP renderer.
+    struct ProviderFailureRunner {
+        inner: flotilla_discovery_testkit::DiscoveryMockRunner,
+        message: Arc<std::sync::Mutex<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for ProviderFailureRunner {
+        async fn run(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &std::path::Path,
+            label: &flotilla_provider_runtime::ChannelLabel,
+        ) -> Result<String, String> {
+            self.inner.run(cmd, args, cwd, label).await
+        }
+        async fn run_output(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &std::path::Path,
+            label: &flotilla_provider_runtime::ChannelLabel,
+        ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+            self.inner.run_output(cmd, args, cwd, label).await
+        }
+        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+            self.inner.exists(cmd, args).await
+        }
+        async fn path_exists(&self, path: &std::path::Path) -> Result<bool, String> {
+            self.inner.path_exists(path).await
+        }
+        async fn ensure_file(&self, path: &std::path::Path, content: &str) -> Result<String, String> {
+            self.inner.ensure_file(path, content).await
+        }
+        async fn write_file(&self, path: &std::path::Path, content: &str) -> Result<(), String> {
+            self.inner.write_file(path, content).await
+        }
+        async fn write_file_with_mode(&self, path: &std::path::Path, content: &str, mode: u32) -> Result<(), String> {
+            self.inner.write_file_with_mode(path, content, mode).await
+        }
+        async fn read_file_to(&self, source: &std::path::Path, destination: &std::path::Path) -> Result<(), String> {
+            self.inner.read_file_to(source, destination).await
+        }
+        async fn write_file_from(&self, _source: &std::path::Path, _destination: &std::path::Path) -> Result<(), String> {
+            Err(self.message.lock().unwrap().clone())
+        }
+    }
+
+    // Behaviour: arbitrary provider prose remains a daemon fault in JSON and
+    // CBOR. The user-facing message is preserved, including misleading prefixes.
+    #[tokio::test]
+    async fn provider_messages_cannot_select_http_status() {
+        let message = Arc::new(std::sync::Mutex::new(String::new()));
+        let runner = Arc::new(ProviderFailureRunner {
+            inner: flotilla_discovery_testkit::DiscoveryMockRunner::builder().build(),
+            message: message.clone(),
+        });
+        let h = Harness::with_discovery(flotilla_discovery_testkit::fake_discovery_with_runner(false, runner)).await;
+        let digest = h.blobs.put(b"contents").await.unwrap();
+        for cbor in [false, true] {
+            for text in [
+                "",
+                "unauthorized: provider failure",
+                "resource not found: provider",
+                "invalid resource: /caller/path",
+                "field ownership refused",
+                "Environment/provider",
+            ] {
+                *message.lock().unwrap() = text.to_string();
+                let query = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("reference", digest.as_str())
+                    .append_pair("destination_path", "/provider/destination")
+                    .finish();
+                let reply = h
+                    .call_with_evidence(
+                        "GET",
+                        &format!("/v1/artifacts/content?{query}"),
+                        None,
+                        cbor,
+                        socket_caller(),
+                        Some(host_evidence()),
+                    )
+                    .await;
+                assert_eq!(reply.0, StatusCode::INTERNAL_SERVER_ERROR, "{text}: {}", reply.1);
+                assert_eq!(reply.1["message"], text);
+            }
+        }
+    }
+
+    // Behaviour: caller-controlled relative destinations remain invalid input,
+    // even when they resemble forbidden/missing/conflict provider error prose.
+    #[tokio::test]
+    async fn caller_paths_cannot_select_dispatcher_status() {
+        let h = Harness::new().await;
+        let digest = h.blobs.put(b"contents").await.unwrap();
+        for cbor in [false, true] {
+            for path in ["", "unauthorized: provider", "resource not found: caller", "field ownership refused", "Environment/path"] {
+                let query = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("reference", digest.as_str())
+                    .append_pair("destination_path", path)
+                    .finish();
+                let reply = h
+                    .call_with_evidence(
+                        "GET",
+                        &format!("/v1/artifacts/content?{query}"),
+                        None,
+                        cbor,
+                        socket_caller(),
+                        Some(host_evidence()),
+                    )
+                    .await;
+                assert_eq!(reply.0, StatusCode::BAD_REQUEST, "{path}: {}", reply.1);
+                assert_eq!(reply.1["message"], "operator artifact destination must be absolute");
+            }
         }
     }
 

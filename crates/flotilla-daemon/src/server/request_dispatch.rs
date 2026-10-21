@@ -4,7 +4,8 @@ use flotilla_agent::{AgentEntry, SharedAgentStateStore};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
-    AgentHookEvent, Command, CommandAction, CommandCaller, CommandValue, DaemonEvent, Message, RepoSelector, Request, Response,
+    AgentHookEvent, Command, CommandAction, CommandCaller, CommandValue, DaemonEvent, DispatcherError, DispatcherErrorClass, Message,
+    RepoSelector, Request, Response,
 };
 use tracing::warn;
 
@@ -160,7 +161,11 @@ impl<'a> RequestDispatcher<'a> {
             return Message::error_response(id, "ArtifactPut request selected the wrong handler");
         };
         let result = Box::pin(async {
-            let caller = self.caller.crew.as_ref().ok_or_else(|| missing_crew_message("artifact put"))?;
+            let caller = self
+                .caller
+                .crew
+                .as_ref()
+                .ok_or_else(|| DispatcherError::new(DispatcherErrorClass::Forbidden, missing_crew_message("artifact put")))?;
             let subject = if kind == "decision-ledger" && subject.is_empty() { caller.convoy.clone() } else { subject };
             let settings = self.daemon.config_store().load_daemon_config()?;
             let blobs = self.remote_command_router.blob_store()?;
@@ -176,7 +181,7 @@ impl<'a> RequestDispatcher<'a> {
             let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
             runner.read_file_to(&source_path, temporary.path()).await?;
             if kind == "decision-ledger" && !summary.is_empty() {
-                return Err("decision ledger summary is daemon-owned".to_string());
+                return Err(DispatcherError::new(DispatcherErrorClass::InvalidInput, "decision ledger summary is daemon-owned"));
             }
             let input = ArtifactPutInput::builder()
                 .kind(kind)
@@ -197,7 +202,7 @@ impl<'a> RequestDispatcher<'a> {
             let node_id = match target {
                 Some(target) => target.node_id,
                 None if self.daemon.has_authoritative_convoy(&namespace, &caller.convoy).await? => self.daemon.node_id().clone(),
-                None => return Err("convoy home is unavailable for artifact put".to_string()),
+                None => return Err(DispatcherError::from("convoy home is unavailable for artifact put")),
             };
             let document = |spec: &flotilla_resources::ArtifactSpec| {
                 serde_json::json!({
@@ -214,7 +219,7 @@ impl<'a> RequestDispatcher<'a> {
                 other => Err(format!("unexpected artifact home result: {other:?}")),
             };
             store(&spec).await?;
-            Ok(Response::ArtifactPut {
+            Ok::<_, DispatcherError>(Response::ArtifactPut {
                 address: format!("artifact/{name}"),
                 view_url: flotilla_config::artifact_view_url(&spec, &settings.blob_stores),
                 digest: spec.digest,
@@ -235,7 +240,7 @@ impl<'a> RequestDispatcher<'a> {
             if let Some(caller) = self.caller.crew.as_ref() {
                 let name = reference.strip_prefix("artifact/").unwrap_or(&reference);
                 if name.split_once('/').is_some_and(|(namespace, _)| namespace != caller.namespace) {
-                    return Err("crew artifact reads cannot cross namespaces".to_string());
+                    return Err(DispatcherError::new(DispatcherErrorClass::Forbidden, "crew artifact reads cannot cross namespaces"));
                 }
             }
             let blobs = self.remote_command_router.blob_store()?;
@@ -259,10 +264,12 @@ impl<'a> RequestDispatcher<'a> {
                 (runner, absolute_crew_path(&destination_path, &session.spec.cwd))
             } else {
                 if !self.authenticated_user {
-                    self.daemon.principal_for_surface(self.session_id)?.ok_or("artifact get requires a connected operator principal")?;
+                    self.daemon.principal_for_surface(self.session_id)?.ok_or_else(|| {
+                        DispatcherError::new(DispatcherErrorClass::Forbidden, "artifact get requires a connected operator principal")
+                    })?;
                 }
                 if !destination_path.is_absolute() {
-                    return Err("operator artifact destination must be absolute".to_string());
+                    return Err(DispatcherError::new(DispatcherErrorClass::InvalidInput, "operator artifact destination must be absolute"));
                 }
                 let runner = self.daemon.local_command_runner().ok_or("local artifact environment is unavailable")?;
                 (runner, destination_path)
@@ -270,7 +277,7 @@ impl<'a> RequestDispatcher<'a> {
             let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
             let size = service.get_to_file(&reference, temporary.path()).await?;
             runner.write_file_from(temporary.path(), &destination_path).await?;
-            Ok::<_, String>(Response::ArtifactGet { size, view_url })
+            Ok::<_, DispatcherError>(Response::ArtifactGet { size, view_url })
         })
         .await;
         match result {
@@ -326,7 +333,7 @@ impl<'a> RequestDispatcher<'a> {
                 Ok(principal_ref) => {
                     let mut caller = self.caller.clone();
                     caller.principal_ref = principal_ref.unwrap_or_else(|| self.caller.principal_ref.clone());
-                    match self.remote_command_router.dispatch_execute_for_caller(command, Some(caller)).await {
+                    match self.remote_command_router.dispatch_execute_for_caller_typed(command, Some(caller)).await {
                         Ok(command_id) => Message::ok_response(id, Response::Execute { command_id }),
                         Err(e) => Message::error_response(id, e),
                     }
@@ -340,7 +347,7 @@ impl<'a> RequestDispatcher<'a> {
         let Request::Cancel { command_id } = request else {
             return Message::error_response(id, "Cancel request selected the wrong handler");
         };
-        match self.remote_command_router.dispatch_cancel(command_id).await {
+        match self.remote_command_router.dispatch_cancel_typed(command_id).await {
             Ok(()) => Message::ok_response(id, Response::Cancel),
             Err(e) => Message::error_response(id, e),
         }
@@ -354,7 +361,7 @@ impl<'a> RequestDispatcher<'a> {
             context_repo: None,
             action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) },
         };
-        match self.daemon.execute(command).await {
+        match self.daemon.execute_for_caller_typed(command, None).await {
             Ok(_) => Message::ok_response(id, Response::Refresh),
             Err(e) => Message::error_response(id, e),
         }
@@ -364,7 +371,7 @@ impl<'a> RequestDispatcher<'a> {
         let Request::AddRepo { path } = request else { return Message::error_response(id, "AddRepo request selected the wrong handler") };
         let command =
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::TrackRepoPath { path } };
-        match self.daemon.execute(command).await {
+        match self.daemon.execute_for_caller_typed(command, None).await {
             Ok(_) => Message::ok_response(id, Response::AddRepo),
             Err(e) => Message::error_response(id, e),
         }
@@ -380,7 +387,7 @@ impl<'a> RequestDispatcher<'a> {
             context_repo: None,
             action: CommandAction::UntrackRepo { repo: RepoSelector::Path(path) },
         };
-        match self.daemon.execute(command).await {
+        match self.daemon.execute_for_caller_typed(command, None).await {
             Ok(_) => Message::ok_response(id, Response::RemoveRepo),
             Err(e) => Message::error_response(id, e),
         }
@@ -420,7 +427,10 @@ impl<'a> RequestDispatcher<'a> {
             queries.iter().all(|cursor| subscriptions.contains(&cursor.query))
         };
         if !subscribed {
-            return Message::error_response(id, "query is not subscribed on this connection");
+            return Message::error_response(
+                id,
+                DispatcherError::new(DispatcherErrorClass::InvalidInput, "query is not subscribed on this connection"),
+            );
         }
         match self.daemon.recover_queries(queries).await {
             Ok(events) => Message::ok_response(id, Response::RecoverQueries(events)),
@@ -434,7 +444,10 @@ impl<'a> RequestDispatcher<'a> {
         };
         let subscribed = self.query_subscriptions.read().expect("query subscriptions lock poisoned").contains(&query);
         if !subscribed {
-            Message::error_response(id, format!("query is not subscribed on this connection: {query}"))
+            Message::error_response(
+                id,
+                DispatcherError::new(DispatcherErrorClass::InvalidInput, format!("query is not subscribed on this connection: {query}")),
+            )
         } else {
             match self.daemon.fetch_more(&query).await {
                 Ok(()) => Message::ok_response(id, Response::FetchMore),

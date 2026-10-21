@@ -2652,10 +2652,18 @@ impl InProcessDaemon {
         .await
     }
 
-    async fn resolve_repo_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
+    async fn resolve_repo_selector(
+        &self,
+        selector: &flotilla_protocol::RepoSelector,
+    ) -> Result<PathBuf, flotilla_protocol::DispatcherError> {
         let repository = self.repository_for_selector(selector).await?;
         let key = repository.spec.key();
-        self.local_checkout_for_repository(&key).await?.ok_or_else(|| format!("Repository {key} has no available checkout on this host"))
+        self.local_checkout_for_repository(&key).await?.ok_or_else(|| {
+            flotilla_protocol::DispatcherError::new(
+                flotilla_protocol::DispatcherErrorClass::Missing,
+                format!("Repository {key} has no available checkout on this host"),
+            )
+        })
     }
 
     fn resolve_observation_root_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
@@ -2734,18 +2742,18 @@ impl InProcessDaemon {
         };
 
         match &command.action {
-            CommandAction::Checkout { repo, .. } => self.resolve_repo_selector(repo).await,
+            CommandAction::Checkout { repo, .. } => self.resolve_repo_selector(repo).await.map_err(String::from),
             CommandAction::RemoveCheckout { checkout, .. } => {
                 if let Some(selector) = command.context_repo.as_ref() {
-                    self.resolve_repo_selector(selector).await
+                    self.resolve_repo_selector(selector).await.map_err(String::from)
                 } else {
                     self.resolve_checkout_selector(checkout, &checkout_scope).await.map(|(repo, _)| repo)
                 }
             }
-            CommandAction::Refresh { repo: Some(selector) } => self.resolve_repo_selector(selector).await,
+            CommandAction::Refresh { repo: Some(selector) } => self.resolve_repo_selector(selector).await.map_err(String::from),
             CommandAction::FetchCheckoutStatus { .. } | CommandAction::ArchiveSession { .. } | CommandAction::GenerateBranchName { .. } => {
                 let selector = command.context_repo.as_ref().ok_or_else(|| "command requires repo context".to_string())?;
-                self.resolve_repo_selector(selector).await
+                self.resolve_repo_selector(selector).await.map_err(String::from)
             }
             _ => Err("command does not resolve to a single repo".to_string()),
         }
@@ -4843,7 +4851,7 @@ impl InProcessDaemon {
         command: Command,
         remote_executor: Arc<dyn RemoteStepExecutor>,
     ) -> Result<u64, String> {
-        self.execute_impl(command, remote_executor, true, None).await
+        self.execute_impl(command, remote_executor, true, None).await.map_err(String::from)
     }
 
     pub async fn execute_for_principal(&self, command: Command, principal_ref: Option<PrincipalRef>) -> Result<u64, String> {
@@ -4851,7 +4859,29 @@ impl InProcessDaemon {
         self.execute_for_caller(command, caller).await
     }
 
+    /// Cancel an active command, preserving the refusal class for dispatchers.
+    pub async fn cancel_typed(&self, command_id: u64) -> Result<(), flotilla_protocol::DispatcherError> {
+        let guard = self.active_commands.lock().await;
+        match guard.get(&command_id) {
+            Some(token) => {
+                token.cancel();
+                Ok(())
+            }
+            None => {
+                Err(flotilla_protocol::DispatcherError::new(flotilla_protocol::DispatcherErrorClass::Missing, "no matching active command"))
+            }
+        }
+    }
+
     pub async fn execute_for_caller(&self, command: Command, caller: Option<flotilla_protocol::CommandCaller>) -> Result<u64, String> {
+        self.execute_for_caller_typed(command, caller).await.map_err(String::from)
+    }
+
+    pub async fn execute_for_caller_typed(
+        &self,
+        command: Command,
+        caller: Option<flotilla_protocol::CommandCaller>,
+    ) -> Result<u64, flotilla_protocol::DispatcherError> {
         self.execute_impl(command, Arc::new(flotilla_executor::step::UnsupportedRemoteStepExecutor), false, caller).await
     }
 
@@ -4978,7 +5008,7 @@ impl InProcessDaemon {
         remote_executor: Arc<dyn RemoteStepExecutor>,
         allow_remote_host: bool,
         caller: Option<flotilla_protocol::CommandCaller>,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, flotilla_protocol::DispatcherError> {
         let dispatching_principal_ref = caller.as_ref().map(|caller| caller.principal_ref.clone());
         let command_node_id = command.node_id.clone().unwrap_or_else(|| self.node_id.clone());
         debug!(
@@ -4986,7 +5016,7 @@ impl InProcessDaemon {
             desc = %command.description(), "execute_impl"
         );
         if !allow_remote_host && command_node_id != self.node_id {
-            return Err(format!("remote command routing not implemented yet for node {command_node_id}"));
+            return Err(format!("remote command routing not implemented yet for node {command_node_id}").into());
         }
 
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
@@ -5034,7 +5064,7 @@ impl InProcessDaemon {
         // Boxing only the helper call still builds that future on the caller stack.
         macro_rules! boxed_action {
             ($future:expr) => {
-                Box::pin(async { Box::pin($future).await }).await
+                Box::pin(async { Box::pin($future).await }).await.map_err(flotilla_protocol::DispatcherError::from)
             };
         }
 
@@ -5119,7 +5149,9 @@ impl InProcessDaemon {
             CommandAction::ProjectRefresh { .. } => return boxed_action!(admission.execute_action_project_refresh(id, &command)),
             CommandAction::ImageCheck { .. } => return boxed_action!(admission.execute_action_image_check(id, &command)),
             CommandAction::TrackRepoPath { .. } => return boxed_action!(executor.execute_action_track_repo_path(id, &command)),
-            CommandAction::UntrackRepo { .. } => return boxed_action!(executor.execute_action_untrack_repo(id, &command)),
+            CommandAction::UntrackRepo { .. } => {
+                return Box::pin(async { Box::pin(executor.execute_action_untrack_repo(id, &command)).await }).await
+            }
             CommandAction::OpenChangeRequest { .. }
             | CommandAction::CloseChangeRequest { .. }
             | CommandAction::MergeChangeRequest { .. }
@@ -5127,11 +5159,13 @@ impl InProcessDaemon {
             | CommandAction::LinkIssuesToChangeRequest { .. } => {
                 return boxed_action!(executor.execute_action_repository_forge(id, &command))
             }
-            CommandAction::Refresh { repo: Some(_) } => return boxed_action!(executor.execute_action_refresh_repo(id, &command)),
+            CommandAction::Refresh { repo: Some(_) } => {
+                return Box::pin(async { Box::pin(executor.execute_action_refresh_repo(id, &command)).await }).await
+            }
             _ => {}
         }
 
-        self.executor_actions().execute_provider_action(id, command, command_node_id, remote_executor).await
+        self.executor_actions().execute_provider_action(id, command, command_node_id, remote_executor).await.map_err(Into::into)
     }
 }
 
@@ -5317,7 +5351,7 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn execute(&self, command: Command) -> Result<u64, String> {
-        self.execute_impl(command, Arc::new(flotilla_executor::step::UnsupportedRemoteStepExecutor), false, None).await
+        self.execute_for_caller(command, None).await
     }
 
     async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
@@ -5329,14 +5363,7 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn cancel(&self, command_id: u64) -> Result<(), String> {
-        let guard = self.active_commands.lock().await;
-        match guard.get(&command_id) {
-            Some(token) => {
-                token.cancel();
-                Ok(())
-            }
-            None => Err("no matching active command".into()),
-        }
+        self.cancel_typed(command_id).await.map_err(|error| error.message)
     }
 
     async fn replay_since(&self, last_seen: &HashMap<StreamKey, u64>) -> Result<Vec<DaemonEvent>, String> {
@@ -5623,13 +5650,19 @@ impl executor_actions::ExecutorActionPort for InProcessDaemon {
     async fn remove_repo(&self, path: &Path) -> Result<(), String> {
         InProcessDaemon::remove_repo(self, path).await
     }
-    async fn repository_for_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<ResourceObject<Repository>, String> {
+    async fn repository_for_selector(
+        &self,
+        selector: &flotilla_protocol::RepoSelector,
+    ) -> Result<ResourceObject<Repository>, flotilla_protocol::DispatcherError> {
         InProcessDaemon::repository_for_selector(self, selector).await
     }
     fn resolve_observation_root_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
         InProcessDaemon::resolve_observation_root_selector(self, selector)
     }
-    async fn resolve_repo_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
+    async fn resolve_repo_selector(
+        &self,
+        selector: &flotilla_protocol::RepoSelector,
+    ) -> Result<PathBuf, flotilla_protocol::DispatcherError> {
         InProcessDaemon::resolve_repo_selector(self, selector).await
     }
     async fn tracked_repo_identity_for_path(&self, repo_path: &Path) -> Option<flotilla_protocol::RepoIdentity> {

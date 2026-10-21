@@ -77,9 +77,12 @@ pub trait ExecutorActionPort: Send + Sync {
     async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState;
     async fn refresh(&self, repo: &RepoSelector) -> Result<Option<RepositoryIdentityChange>, String>;
     async fn remove_repo(&self, path: &Path) -> Result<(), String>;
-    async fn repository_for_selector(&self, selector: &RepoSelector) -> Result<ResourceObject<Repository>, String>;
+    async fn repository_for_selector(
+        &self,
+        selector: &RepoSelector,
+    ) -> Result<ResourceObject<Repository>, flotilla_protocol::DispatcherError>;
     fn resolve_observation_root_selector(&self, selector: &RepoSelector) -> Result<PathBuf, String>;
-    async fn resolve_repo_selector(&self, selector: &RepoSelector) -> Result<PathBuf, String>;
+    async fn resolve_repo_selector(&self, selector: &RepoSelector) -> Result<PathBuf, flotilla_protocol::DispatcherError>;
     async fn tracked_repo_identity_for_path(&self, repo_path: &Path) -> Option<RepoIdentity>;
 }
 
@@ -341,7 +344,7 @@ impl ExecutorActions<'_> {
         Err("TrackRepoPath action selected the wrong handler".to_string())
     }
 
-    pub async fn execute_action_untrack_repo(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_untrack_repo(&self, id: u64, command: &Command) -> Result<u64, flotilla_protocol::DispatcherError> {
         if let CommandAction::UntrackRepo { repo } = &command.action {
             let repo_path = match self.port.resolve_repo_selector(repo).await {
                 Ok(path) => path,
@@ -370,10 +373,10 @@ impl ExecutorActions<'_> {
             });
             return Ok(id);
         }
-        Err("UntrackRepo action selected the wrong handler".to_string())
+        Err("UntrackRepo action selected the wrong handler".into())
     }
 
-    pub async fn execute_action_refresh_repo(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_refresh_repo(&self, id: u64, command: &Command) -> Result<u64, flotilla_protocol::DispatcherError> {
         if let CommandAction::Refresh { repo: Some(selector) } = &command.action {
             let repository = self.port.repository_for_selector(selector).await?;
             let repo_path = self.port.local_checkout_for_repository(&repository.spec.key()).await?;
@@ -403,7 +406,7 @@ impl ExecutorActions<'_> {
             });
             return Ok(id);
         }
-        Err("Refresh action selected the wrong handler".to_string())
+        Err("Refresh action selected the wrong handler".into())
     }
 }
 

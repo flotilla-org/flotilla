@@ -395,9 +395,17 @@ impl RemoteCommandRouter {
 
     pub(super) async fn dispatch_execute_for_caller(
         &self,
-        mut command: Command,
+        command: Command,
         caller: Option<flotilla_protocol::CommandCaller>,
     ) -> Result<u64, String> {
+        self.dispatch_execute_for_caller_typed(command, caller).await.map_err(String::from)
+    }
+
+    pub(super) async fn dispatch_execute_for_caller_typed(
+        &self,
+        mut command: Command,
+        caller: Option<flotilla_protocol::CommandCaller>,
+    ) -> Result<u64, flotilla_protocol::DispatcherError> {
         let dispatching_principal_ref = caller.as_ref().map(|caller| caller.principal_ref.clone());
         let mut crew_completion = self.resolve_crew_command_routing(&mut command.action).await?;
         if let Some(completion) = &mut crew_completion {
@@ -418,7 +426,7 @@ impl RemoteCommandRouter {
                 let message = format!("authority unreachable for {}: no authority route is available", completion.convoy);
                 self.persist_crew_completion(completion, &authority, &message).await;
                 self.spawn_crew_completion_retry(completion.clone());
-                return Err(format!("completion pending: {message}"));
+                return Err(format!("completion pending: {message}").into());
             }
         }
         let target_node_id = self.target_node_id(&target.host).await.map_err(|error| error.to_string())?;
@@ -431,13 +439,13 @@ impl RemoteCommandRouter {
         info!(%target_node_id, %local, %caller_label, %action, %subject, %desc, reason = ?target.reason, "dispatch_execute");
         if target_node_id != *self.daemon.node_id() {
             if target.delivery == RemoteDelivery::Command {
-                Box::pin(self.dispatch_remote_command(command, caller, &target, crew_completion, target_node_id)).await
+                Box::pin(self.dispatch_remote_command(command, caller, &target, crew_completion, target_node_id)).await.map_err(Into::into)
             } else {
                 let remote_executor: Arc<dyn RemoteStepExecutor> = Arc::new(self.clone());
-                Box::pin(self.daemon.execute_with_remote_executor(command, remote_executor)).await
+                Box::pin(self.daemon.execute_with_remote_executor(command, remote_executor)).await.map_err(Into::into)
             }
         } else {
-            Box::pin(self.daemon.execute_for_caller(command, caller)).await
+            Box::pin(self.daemon.execute_for_caller_typed(command, caller)).await
         }
     }
 
@@ -544,6 +552,10 @@ impl RemoteCommandRouter {
     }
 
     pub(super) async fn dispatch_cancel(&self, command_id: u64) -> Result<(), String> {
+        self.dispatch_cancel_typed(command_id).await.map_err(|error| error.message)
+    }
+
+    pub(super) async fn dispatch_cancel_typed(&self, command_id: u64) -> Result<(), flotilla_protocol::DispatcherError> {
         let remote = {
             let pending = self.pending_remote_commands.lock().await;
             pending
@@ -568,19 +580,19 @@ impl RemoteCommandRouter {
             let send_result = self.send_routed_to(&target_node_id, routed).await;
             if let Err(err) = send_result {
                 self.pending_remote_cancels.lock().await.remove(&cancel_id);
-                return Err(err);
+                return Err(err.into());
             }
             match tokio::time::timeout(Duration::from_secs(5), rx).await {
                 Ok(Ok(Ok(()))) => Ok(()),
-                Ok(Ok(Err(message))) => Err(message),
-                Ok(Err(_)) => Err("remote cancel response channel closed".to_string()),
+                Ok(Ok(Err(message))) => Err(message.into()),
+                Ok(Err(_)) => Err("remote cancel response channel closed".into()),
                 Err(_) => {
                     self.pending_remote_cancels.lock().await.remove(&cancel_id);
-                    Err("timed out waiting for remote cancel response".to_string())
+                    Err("timed out waiting for remote cancel response".into())
                 }
             }
         } else {
-            self.daemon.cancel(command_id).await
+            self.daemon.cancel_typed(command_id).await
         }
     }
 
