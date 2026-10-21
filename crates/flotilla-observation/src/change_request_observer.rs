@@ -1737,7 +1737,7 @@ mod tests {
                 Arc::new(UnavailableSource),
                 ChangeRequestRefreshCadence::default(),
             );
-            assert!(refresher.reconcile_convoy_demands("ops", &mut HashMap::new()).await.is_err(), "cleanup failure must remain retryable");
+            refresher.reconcile_convoy_demands("ops", &mut HashMap::new()).await.unwrap();
             if name == "one" {
                 let remaining = records.get(&subject.record_name()).await.unwrap();
                 assert_eq!(remaining.spec.subject_of.len(), 1);

@@ -390,7 +390,7 @@ impl GhApi for RecordingGhApi {
                 }
                 headers.insert("observation-diagnostic".into(), error.to_string());
                 match error {
-                    ObservationError::Failed(_) | ObservationError::NotFound(_) => {
+                    ObservationError::Failed(_) => {
                         headers.insert("observation-error-kind".into(), "forge".into());
                     }
                     ObservationError::NotFound(_) => {
