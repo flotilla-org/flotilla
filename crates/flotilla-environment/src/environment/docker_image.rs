@@ -357,7 +357,7 @@ impl OwnedBuildKitService {
             let stderr = redact(output.stderr);
             *failed_step = failing_step_layer(&stderr, layers);
             let reason = failure_summary(&stderr, output.exit_code);
-            return Err(failure(classify_build_failure(output.exit_code, &reason), reason));
+            return Err(failure(classify_build_failure(output.exit_code, &stderr), reason));
         }
 
         let image = match delivery {
@@ -632,14 +632,45 @@ const MAX_REASON_CHARS: usize = 2048;
 
 // Status holds a bounded diagnostic, while the Artifact retains the full output.
 // BuildKit's final ERROR summary follows the progress stream. Never classify
-// arbitrary Dockerfile/probe output as infrastructure evidence.
+// arbitrary Dockerfile/probe output as infrastructure evidence; only recognized
+// apt/curl diagnostics before that summary can override a failed RUN step.
 pub fn failure_summary(stderr: &str, exit_code: Option<i32>) -> String {
     let tail = stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("").trim();
     let summary = if tail.is_empty() { format!("Docker process exited with {exit_code:?}") } else { tail.to_string() };
     summary.chars().take(MAX_REASON_CHARS).collect()
 }
 
+// Recognize tool diagnostics, not RUN command text or arbitrary output that
+// happens to mention an HTTP status. BuildKit prefixes output with a step and
+// elapsed seconds; raw tool output is accepted too.
+fn transient_fetch_failure(line: &str) -> bool {
+    let line = line.trim();
+    let line = line
+        .split_once(' ')
+        .and_then(|(step, rest)| {
+            step.strip_prefix('#')?.parse::<u32>().ok()?;
+            let (elapsed, diagnostic) = rest.trim_start().split_once(' ')?;
+            elapsed.parse::<f64>().ok()?;
+            Some(diagnostic.trim_start())
+        })
+        .unwrap_or(line);
+    let apt = line.starts_with("e: failed to fetch ") || line.starts_with("w: failed to fetch ");
+    let curl_http = line.starts_with("curl: (22)");
+    if apt || curl_http {
+        let status = line
+            .split_whitespace()
+            .find_map(|word| word.trim_matches(|c: char| !c.is_ascii_digit()).parse::<u16>().ok().filter(|code| (400..600).contains(code)));
+        // Missing packages and authorization errors remain recipe failures.
+        // An apt fetch failure without an HTTP status can be DNS/TLS/timeout.
+        return status.map_or(apt, |code| code == 429 || code >= 500);
+    }
+    line.starts_with("curl: (7)") || line.starts_with("curl: (28)")
+}
+
 pub fn classify_build_failure(exit_code: Option<i32>, reason: &str) -> ImageBuildFailureClass {
+    if reason.to_ascii_lowercase().lines().any(transient_fetch_failure) {
+        return ImageBuildFailureClass::Infrastructure;
+    }
     let reason = failure_summary(reason, exit_code).to_ascii_lowercase();
     if exit_code.is_some() && exit_code != Some(137) && reason.contains("did not complete successfully") && reason.contains("exit code:") {
         return ImageBuildFailureClass::Recipe;

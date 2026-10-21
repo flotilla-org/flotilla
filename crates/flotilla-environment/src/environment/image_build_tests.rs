@@ -530,6 +530,64 @@ async fn build_failures_are_classified_and_redacted() {
     }
 }
 
+// Fetch failures in RUN output must reach the existing infrastructure retry
+// path even when BuildKit ends with its generic exit-code summary. Ordinary
+// recipe failures and diagnostic-looking command text remain permanent.
+#[tokio::test]
+async fn transient_fetch_failures_survive_buildkit_summary_and_redaction() {
+    let cases = [
+        ("#8 1.2 E: Failed to fetch https://snapshot.ubuntu.com/pkg.deb 503 Service Unavailable", ImageBuildFailureClass::Infrastructure),
+        ("#8 1.2 E: Failed to fetch https://snapshot.ubuntu.com/pkg.deb Connection timed out", ImageBuildFailureClass::Infrastructure),
+        ("#8 1.2 W: Failed to fetch https://snapshot.ubuntu.com/index 503 Service Unavailable", ImageBuildFailureClass::Infrastructure),
+        ("#8 1.2 curl: (22) The requested URL returned error: 429", ImageBuildFailureClass::Infrastructure),
+        ("#8 1.2 curl: (22) The requested URL returned error: 502", ImageBuildFailureClass::Infrastructure),
+        ("#8 1.2 curl: (28) Operation timed out after 30000 milliseconds", ImageBuildFailureClass::Infrastructure),
+        ("#8 1.2 curl: (7) Failed to connect to example.org port 443", ImageBuildFailureClass::Infrastructure),
+        ("#8 1.2 curl: (22) The requested URL returned error: 404", ImageBuildFailureClass::Recipe),
+        ("#8 1.2 E: Failed to fetch https://snapshot.ubuntu.com/pkg.deb 404 Not Found", ImageBuildFailureClass::Recipe),
+        ("#8 1.2 E: Unable to locate package typo", ImageBuildFailureClass::Recipe),
+        ("#8 1.2 make: *** 503", ImageBuildFailureClass::Recipe),
+        ("#8 [flotilla-layer-0 2/2] RUN echo 'E: Failed to fetch https://example.org 503' && false", ImageBuildFailureClass::Recipe),
+        ("#8 1.2 ordinary output: connection reset; curl: (28) timeout", ImageBuildFailureClass::Recipe),
+    ];
+    for (diagnostic, expected) in cases {
+        let directory = tempfile::tempdir().expect("directory");
+        let mut runner = BuildKitStandIn::new(Mode::Push, layers(), directory.path());
+        runner.build = Step::Exit(
+            Some(1),
+            format!(
+            "{diagnostic} {SECRET}\nERROR: failed to solve: process \"/bin/sh -c install\" did not complete successfully: exit code: 100\n"
+        ),
+        );
+        let runner = Arc::new(runner);
+        let mut log = String::new();
+        let failed = build(&runner, BTreeMap::new(), &mut log).await.expect_err("failed fetch");
+        assert_eq!(failed.failure.class, expected, "{diagnostic}");
+        assert!(failed.failure.reason.starts_with("ERROR: failed to solve:"));
+        assert!(!failed.failure.reason.contains(SECRET) && !log.contains(SECRET));
+        assert_cleaned(&runner);
+    }
+}
+
+// HTTP 429 and every 5xx are transient for apt/curl, independent of BuildKit's
+// progress prefix and repeated diagnostics. Other 4xx remain recipe errors.
+#[hegel::test]
+fn fetch_http_status_controls_retry_class(tc: hegel::TestCase) {
+    // Cover the 429 exception, both sides of 500, and the entire 5xx range.
+    let status = tc.draw(gs::integers::<u16>().min_value(400).max_value(599));
+    let curl = tc.draw(gs::booleans());
+    let progress = if tc.draw(gs::booleans()) { "#12 0.123 " } else { "" };
+    let diagnostic = if curl {
+        format!("curl: (22) The requested URL returned error: {status}")
+    } else {
+        format!("E: Failed to fetch https://example.org/pkg.deb {status} response")
+    };
+    let output = format!("{progress}{diagnostic}\n{progress}{diagnostic}\nERROR: process did not complete successfully: exit code: 100");
+    let expected =
+        if status == 429 || (500..600).contains(&status) { ImageBuildFailureClass::Infrastructure } else { ImageBuildFailureClass::Recipe };
+    assert_eq!(super::docker_image::classify_build_failure(Some(1), &output), expected, "{output}");
+}
+
 // Deadlines are infrastructure failures. A timed-out probe's container is
 // force-removed by name, later probes are not run, and the directory is cleaned.
 #[tokio::test(start_paused = true)]

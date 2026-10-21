@@ -21,6 +21,12 @@ probe: |
   test "$VERSION_ID" = 24.04
   grep -q 'https://snapshot.ubuntu.com/ubuntu/20261012T000000Z' /etc/apt/sources.list.d/ubuntu.sources
   test -s /etc/ssl/certs/ca-certificates.crt
+  for setting in Acquire::Retries=3 Acquire::http::Timeout=30 Acquire::https::Timeout=30; do
+      key="${setting%=*}"
+      expected="${setting#*=}"
+      actual="$(apt-config shell value "$key" | sed -n "s/^value='\(.*\)'$/\1/p")"
+      test "$actual" = "$expected"
+  done
   for tool in curl git bash cc make pkg-config unzip xz tini; do
       command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 1; }
   done
