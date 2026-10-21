@@ -44,7 +44,7 @@ scripts/install-cargo-sweep-schedule.sh        # install/verify the daily per-ho
 
 Use the [Git boundary check recipe](docs/development.md#git-boundary-check) for the check and its tests. It uses `uv` without requiring Python's `venv`/`ensurepip` packages.
 
-Platform test coverage belongs in `ci/platform-tests/selectors.txt`, executed by `ci/platform-tests/run.sh`. Add a CI job only for a new runner type or OS, or for deliberate isolation; otherwise use an existing job on the same runner.
+Platform-specific code gets cfg-gated tests in its own crate; platform jobs pick them up through their fixed crate scope (the explicit list of crates each platform job tests; see [#2909](https://github.com/flotilla-org/flotilla/issues/2909)). Do not add lines to `ci/platform-tests/selectors.txt` (being retired, #2909). Add a CI job only for a new runner type or OS; otherwise use an existing job on the same runner.
 
 Before pushing, run the local gate:
 - `cargo fmt --check` (whole workspace).
