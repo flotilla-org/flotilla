@@ -12,6 +12,7 @@ use flotilla_state_machines::{
     kinds,
     machines::{
         agent_session::{AgentSession, MemoryAgentSessionWorld},
+        awaiting_reply::{AwaitingReplyEdgeKind, AwaitingReplySpec},
         convoy::{
             Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyRequest, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId, VesselClass,
         },
@@ -24,7 +25,7 @@ use flotilla_state_machines::{
         vessel::{live_leases, Vessel},
     },
     placement::{Dimension, Host, Lease, Ledger, LedgerError, Request, VesselId},
-    AttemptPolicy, EdgePayload, Home, Label, Machine, Outcome, Ref, Resource, Version,
+    AttemptPolicy, Declared, EdgePayload, Home, Label, Machine, Outcome, Ref, Resource, Version,
 };
 
 // Kind codes are stored with every identity and change, so the production registry pins them,
@@ -43,12 +44,14 @@ fn kind_codes_are_pinned() {
     ];
     let expected = [
         ("AgentSession", KindCode::new("as")),
+        ("AwaitingReply", KindCode::new("ar")),
         ("Convoy", KindCode::new("cv")),
         ("Ensure", KindCode::new("en")),
         ("Message", KindCode::new("ms")),
         ("Vessel", KindCode::new("ve")),
     ];
-    assert_eq!(declared, expected);
+    let ahead = (Declared::<AwaitingReplySpec, AwaitingReplyEdgeKind>::KIND, Declared::<AwaitingReplySpec, AwaitingReplyEdgeKind>::CODE);
+    assert_eq!([&declared[..1], &[ahead], &declared[1..]].concat(), expected);
     assert_eq!(pinned, expected.map(|(kind, code)| (kind.to_owned(), code)));
 }
 

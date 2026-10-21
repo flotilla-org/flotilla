@@ -1,6 +1,6 @@
 use std::{env, fs, path::Path};
 
-use flotilla_engine_store::registry;
+use flotilla_engine_store::{convoy_registry, registry};
 use flotilla_schema::render_view;
 use flotilla_schema_sqlite::schema_ddl;
 use flotilla_schema_sqlite::DdlMode;
@@ -31,4 +31,34 @@ fn message_store_schema_view_matches_the_snapshot() {
         render_view(registry().expect("registry").iter())
     );
     check("schema_view.md", &view);
+}
+
+// Behaviour (CLAUDE.md schema review, #3587 layer 3): the Convoy stack's kinds (Convoy with its
+// seats, promises, submissions and duties, and AwaitingReply) render deterministic DDL, checked in
+// so the owner's look-over and every later change show as a diff.
+#[test]
+fn convoy_store_ddl_matches_the_snapshot() {
+    check("convoy.sql", &schema_ddl(&convoy_registry().expect("registry"), DdlMode::Create));
+}
+
+// Behaviour (CLAUDE.md schema review, #3587 layer 3): the readable view of the Convoy stack's
+// kind tables (widths, enum expansion, child tables, indexes) is checked in beside the DDL.
+#[test]
+fn convoy_store_schema_view_matches_the_snapshot() {
+    let view = format!(
+        "# Convoy store schema view\n\nKind tables only; the shared tables are in `convoy.sql`.\n\n{}",
+        render_view(convoy_registry().expect("registry").iter())
+    );
+    check("convoy_schema_view.md", &view);
+}
+
+// Behaviour (#3373 ruling 6): the Convoy stack's codes are the production registry's, so neither
+// declaration takes a code another production kind holds.
+#[test]
+fn convoy_store_codes_are_the_production_codes() {
+    let production = flotilla_state_machines::kinds().expect("production registry");
+    for kind in convoy_registry().expect("registry").iter() {
+        let held = production.iter().find(|set| set.code == kind.code).unwrap_or_else(|| panic!("{} has no production code", kind.kind));
+        assert_eq!(held.kind, kind.kind);
+    }
 }

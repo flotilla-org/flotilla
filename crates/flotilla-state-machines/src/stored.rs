@@ -26,7 +26,14 @@ use flotilla_schema::{
 };
 
 use crate::{
-    machines::{agent_session::AgentSession, convoy::Convoy, ensure::Ensure, message::Message, vessel::Vessel},
+    machines::{
+        agent_session::AgentSession,
+        awaiting_reply::{AwaitingReplyEdgeKind, AwaitingReplySpec},
+        convoy::Convoy,
+        ensure::Ensure,
+        message::Message,
+        vessel::Vessel,
+    },
     EdgeEventOf, EdgeKind, EdgePayload, Label, Machine, Resource, Version,
 };
 
@@ -44,7 +51,79 @@ pub fn kinds() -> Result<KindRegistry, RegistryError> {
     registry.register::<Resource<Convoy>>()?;
     registry.register::<Resource<Vessel>>()?;
     registry.register::<Resource<Ensure>>()?;
+    // Declared ahead of its machine (#3587 layer 3); `Resource<AwaitingReply>` replaces it.
+    registry.register::<Declared<AwaitingReplySpec, AwaitingReplyEdgeKind>>()?;
     Ok(registry)
+}
+
+/// The tables of a kind stored through a holder: the spec's row, then its state as the field
+/// `state`, the spec's indexes and the kind's edge codes. [`Resource`] and [`Declared`] both lay
+/// out through it, so a kind declared ahead of its machine keeps its tables when the machine's
+/// `Resource<M>` replaces the declaration.
+fn holder_tables<S, E>() -> TableSet
+where
+    S: KindSpec,
+    S::State: StateData + Labelled,
+    E: CodeEnum,
+{
+    let mut layout = Layout::root(S::KIND, S::CODE);
+    S::layout_row(&mut layout);
+    <AsColumns as Adapter<State<S::State>>>::layout(&mut layout, "state", true, None);
+    S::layout_indexes(&mut layout);
+    layout.edges(E::CODES, E::NAMES);
+    layout.finish()
+}
+
+/// A kind declared by its spec, its state and its edge codes ahead of its machine, for a schema
+/// look-over before anything writes it (CLAUDE.md "Schema review before build"; #3587 layer 3).
+/// Its tables are exactly those of the machine's `Resource<M>` with the same spec and edges.
+/// Nothing stores one: it is registered for the schema and replaced by `Resource<M>` once the
+/// machine exists.
+pub struct Declared<S: KindSpec, E> {
+    pub spec: S,
+    pub state: State<<S as KindSpec>::State>,
+    edges: std::marker::PhantomData<fn() -> E>,
+}
+
+impl<S, E> Element for Declared<S, E>
+where
+    S: KindSpec,
+    S::State: StateData + Labelled,
+    E: CodeEnum,
+{
+    const TABLES: usize = S::TABLES + <AsColumns as Adapter<State<S::State>>>::TABLES;
+
+    fn layout_row(layout: &mut Layout) {
+        S::layout_row(layout);
+        <AsColumns as Adapter<State<S::State>>>::layout(layout, "state", true, None);
+    }
+
+    fn encode_row(&self, e: &mut Encoder) -> Result<(), EncodeError> {
+        self.spec.encode_row(e)?;
+        <AsColumns as Adapter<State<S::State>>>::encode(&self.state, e).map_err(|error| error.at("state"))
+    }
+
+    fn decode_row(d: &mut Decoder) -> Result<Self, DecodeError> {
+        let spec = S::decode_row(d)?;
+        let state = <AsColumns as Adapter<State<S::State>>>::decode(d)
+            .map_err(|error| error.at("state"))?
+            .ok_or_else(|| DecodeError::missing("state"))?;
+        Ok(Declared { spec, state, edges: std::marker::PhantomData })
+    }
+}
+
+impl<S, E> Kind for Declared<S, E>
+where
+    S: KindSpec,
+    S::State: StateData + Labelled,
+    E: CodeEnum,
+{
+    const KIND: &'static str = S::KIND;
+    const CODE: KindCode = S::CODE;
+
+    fn table_set() -> TableSet {
+        holder_tables::<S, E>()
+    }
 }
 
 /// Machine `M`'s state as stored: the value and the time its label was entered.
@@ -91,11 +170,7 @@ where
     const CODE: KindCode = <M::Spec as KindSpec>::CODE;
 
     fn table_set() -> TableSet {
-        let mut layout = Layout::root(Self::KIND, Self::CODE);
-        Self::layout_row(&mut layout);
-        <M::Spec as KindSpec>::layout_indexes(&mut layout);
-        layout.edges(<EdgeKind<M> as CodeEnum>::CODES, <EdgeKind<M> as CodeEnum>::NAMES);
-        layout.finish()
+        holder_tables::<M::Spec, EdgeKind<M>>()
     }
 
     fn with_identity(self, name: &str, version: u64) -> Self {

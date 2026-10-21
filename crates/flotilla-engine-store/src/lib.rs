@@ -12,10 +12,12 @@ use flotilla_schema_sqlite::{AboutCursor, Read, Stamp, Store, StoreError};
 use flotilla_state_machines::{
     machines::{
         agent_session::AgentSession,
+        awaiting_reply::{AwaitingReplyEdgeKind, AwaitingReplySpec},
         consumer::Consumer,
+        convoy,
         message::{Message, ReceiptLog},
     },
-    EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, Version,
+    Declared, EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, Version,
 };
 
 /// The kinds the `[primitives]` switch moves: Message, and the minimal
@@ -42,6 +44,19 @@ pub fn machine_registry() -> Result<MachineRegistry, RegistryError> {
 }
 pub fn registry() -> Result<KindRegistry, RegistryError> {
     Ok(machine_registry()?.kinds)
+}
+
+/// The kinds the Convoy stack moves (#3587), declared ahead of their machines
+/// for the owner's schema look-over: Convoy, with its seats, promises,
+/// submissions and duties as its tables, and AwaitingReply. Codes are the
+/// production registry's. Nothing opens a store with these yet; layer 4's
+/// machines replace the declarations, keeping their tables, and join
+/// [`machine_registry`].
+pub fn convoy_registry() -> Result<KindRegistry, RegistryError> {
+    let mut kinds = KindRegistry::new();
+    kinds.register::<Declared<convoy::work::ConvoySpec, convoy::work::ConvoyEdgeKind>>()?;
+    kinds.register::<Declared<AwaitingReplySpec, AwaitingReplyEdgeKind>>()?;
+    Ok(kinds)
 }
 
 fn refused(error: impl std::error::Error + Send + Sync + 'static) -> LogError {
