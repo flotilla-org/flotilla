@@ -427,6 +427,8 @@ impl flotilla_change_request::ChangeRequestTracker for GitHubChangeRequest {
                     // Authentication, throttling and failures without an HTTP
                     // response apply to the whole scope. Other HTTP failures
                     // belong to this request, including its status/check reads.
+                    // A 5xx response alone does not prove a scope-wide outage:
+                    // preserve independent reads even for server errors.
                     let local = failure.response.as_ref().is_some_and(|response| !matches!(response.status, 401 | 403 | 429))
                         && !matches!(failure.error, ObservationError::RateLimited { .. });
                     if !local {
@@ -1233,7 +1235,21 @@ mod tests {
     #[tokio::test]
     async fn polling_batch_keeps_independent_outcomes() {
         for failed_read in 0..3 {
-            for status in [0, 404, 500, 401, 403, 429] {
+            // Exhaust the scope failures and common missing/server responses;
+            // even 5xx errors must not hide a later successful PR observation.
+            for (status, expect_local) in [
+                (0, false), // no HTTP response: transport failure
+                (401, false),
+                (403, false),
+                (429, false),
+                (404, true),
+                (410, true),
+                (422, true),
+                (500, true),
+                (502, true),
+                (503, true),
+                (504, true),
+            ] {
                 let ok = |body: &str| {
                     Ok(CommandOutput { stdout: format!("HTTP/2 200 OK\r\n\r\n{body}"), stderr: String::new(), exit_code: Some(0) })
                 };
@@ -1250,8 +1266,7 @@ mod tests {
                         exit_code: Some(1),
                     }));
                 }
-                let local = matches!(status, 404 | 500);
-                if local {
+                if expect_local {
                     outputs.push(ok("{}"));
                     outputs.push(ok(r#"{"data":{"repository":{"pr2":{"title":"survivor","state":"OPEN"}}}}"#));
                 }
@@ -1265,7 +1280,7 @@ mod tests {
                 )
                 .with_poll_directory(directory.path().into());
                 let result = provider.observe_bound(&[1, 2], &Default::default()).await;
-                if local {
+                if expect_local {
                     let statuses = result.expect("independent outcomes");
                     assert!(statuses[&1].is_err());
                     assert_eq!(statuses[&2].as_ref().unwrap().title.value.as_deref(), Some("survivor"));
@@ -1279,7 +1294,7 @@ mod tests {
                     assert!(call.1.contains(&endpoint.to_string()), "unexpected REST read: {call:?}");
                     assert!(call.1.contains(&"--include".to_string()));
                 }
-                if local {
+                if expect_local {
                     assert!(calls[failed_read + 1].1.contains(&"repos/team/one/pulls/2".to_string()));
                     let query = calls.last().unwrap().1.join(" ");
                     assert!(query.contains("pr2: pullRequest(number:2)"));
