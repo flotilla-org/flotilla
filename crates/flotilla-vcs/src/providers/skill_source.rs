@@ -69,6 +69,9 @@ is_auth_failure() {
 }
 trap cleanup EXIT HUP INT TERM
 mkdir -p "$staged" "$sources" "$cache_root"
+# Consume stdin before any Git child can read it. Pathname manifests retain
+# their existing copy-at-publication behavior.
+if [ "$manifest" = - ]; then cat >"$staged/.flotilla-sources.json"; fi
 while [ "$#" -gt 0 ]; do
   name=$1
   repository=$2
@@ -239,7 +242,7 @@ while [ "$#" -gt 0 ]; do
   done <"$selected_file"
 done
 case "$manifest" in
-  json:*) printf '%s\n' "${manifest#json:}" >"$staged/.flotilla-sources.json" ;;
+  -) ;;
   *) cp "$manifest" "$staged/.flotilla-sources.json" ;;
 esac
 rm -rf "$destination"
@@ -250,8 +253,15 @@ trap - EXIT HUP INT TERM"#;
 
 pub async fn stage_git_skill_sources(runner: &dyn CommandRunner, args: &[String]) -> Result<String, String> {
     // The script reads the prefix from $0, then shifts past args[0], the stage command identifier.
-    let command_args = ["-c", STAGE_SCRIPT, STAGE_DIAGNOSTIC_PREFIX].into_iter().chain(args.iter().map(String::as_str)).collect::<Vec<_>>();
-    runner.run("sh", &command_args, Path::new("/"), &ChannelLabel::Default).await
+    // Keep the controlled inline-manifest API, but never pass its payload to a
+    // process as an argv word. Other arguments remain source metadata, not JSON.
+    let input = args.get(1).and_then(|manifest| manifest.strip_prefix("json:"));
+    let stage_args = args.iter().enumerate().map(|(index, arg)| if index == 1 && input.is_some() { "-" } else { arg.as_str() });
+    let command_args = ["-c", STAGE_SCRIPT, STAGE_DIAGNOSTIC_PREFIX].into_iter().chain(stage_args).collect::<Vec<_>>();
+    match input {
+        Some(manifest) => runner.run_with_input("sh", &command_args, Path::new("/"), &ChannelLabel::Default, manifest.as_bytes()).await,
+        None => runner.run("sh", &command_args, Path::new("/"), &ChannelLabel::Default).await,
+    }
 }
 
 #[cfg(test)]
@@ -259,6 +269,43 @@ mod tests {
     use std::{fs, process::Command};
 
     use super::*;
+
+    // A resolved catalog larger than typical aggregate argv limits must stage
+    // unchanged through stdin. The pathname mode must preserve the same bytes.
+    #[tokio::test]
+    async fn large_manifest_uses_stdin_and_pathnames_remain_compatible() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let revision = "1234567890abcdef1234567890abcdef12345678";
+        // Explicit catalog spanning 65,536 distinct source names with frozen pins.
+        let sources = (0..65_536)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("source-{index}"), "revision": revision, "repository": "https://example.test/skills"
+                })
+            })
+            .collect::<Vec<_>>();
+        let manifest = serde_json::json!({"schema_version": 5, "sources": sources}).to_string();
+        assert!(manifest.len() > 4 * 1024 * 1024, "exceeds typical argv limits");
+        let path = temp.path().join("manifest with spaces.json");
+        fs::write(&path, &manifest).expect("pathname manifest");
+        for (mode, manifest_arg) in [("stdin", format!("json:{manifest}")), ("path", path.display().to_string())] {
+            let destination = temp.path().join(format!("skills {mode}"));
+            let args = vec![
+                "flotilla-stage-skills".to_string(),
+                manifest_arg,
+                destination.display().to_string(),
+                "true".to_string(),
+                temp.path().join("cache").display().to_string(),
+            ];
+            stage_git_skill_sources(&flotilla_provider_runtime::ProcessCommandRunner, &args).await.expect("stage manifest");
+            assert_eq!(fs::read_to_string(destination.join(".flotilla-sources.json")).unwrap(), manifest);
+            assert_eq!(
+                fs::read_dir(temp.path()).unwrap().count(),
+                if mode == "stdin" { 3 } else { 4 },
+                "temporary stage directories are removed"
+            );
+        }
+    }
 
     #[test]
     fn staging_reaps_dead_pid_directories_without_disturbing_a_live_stage() {
