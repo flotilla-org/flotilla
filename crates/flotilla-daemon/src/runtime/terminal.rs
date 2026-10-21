@@ -38,6 +38,8 @@ use super::credentials::{agent_material_environment, RuntimeSessionCapabilities}
 use super::state::ControllerRuntimeState;
 use crate::blob_store::BlobDigest;
 use crate::blob_store::BlobStore;
+use crate::stdlib_image_layers::harness_session_environment;
+use flotilla_agent::adapter::FLOTILLA_ENVIRONMENT_ID_ENV;
 
 pub(super) struct PendingTerminalDelivery {
     pub(super) message_batch: Option<String>,
@@ -411,6 +413,36 @@ impl TerminalRuntime for TerminalControllerRuntime {
             }
         }
         credential_env = declared_env.into_iter().collect();
+        // #3655: containment is a property of the session. A session in a
+        // flotilla environment names it, and its harness takes the contained
+        // path; the daemon host's own host-direct session does not.
+        let agentless = self.state.agentless_ssh.get(&spec.env_ref);
+        if let Some(profile) = agentless {
+            // #3618: an agentless host's crews reach the daemon through the forwarded
+            // environment socket, with the controller generation's CLI on PATH.
+            match &self.state.agentless_reach {
+                Some(reach) => {
+                    let paths = reach.prepare_session(&ReachTarget::from(profile)).await?;
+                    apply_reach_environment(&mut credential_env, &spec.env_ref, &paths, profile.env_bag.find_env_var("PATH"));
+                }
+                // As for contained provisioning: a crew that cannot reach the
+                // daemon must not start silently without hooks or settlement.
+                None => return Err("EnvironmentSocketUnavailable: agentless sessions require a crew socket server".to_string()),
+            }
+            // What the crew image sets for its harnesses, a bare host's
+            // session gets too; the session's own declarations win, as they do
+            // over a vessel's image environment.
+            for (name, value) in harness_session_environment() {
+                if !credential_env.iter().any(|(key, _)| key == name) {
+                    credential_env.push((name.clone(), value.clone()));
+                }
+            }
+        } else if spec.env_ref != self.state.host_direct_environment_name {
+            // A provisioned vessel's container already names its environment;
+            // the session states it too, so the harness sees what it runs in.
+            credential_env.retain(|(key, _)| key != FLOTILLA_ENVIRONMENT_ID_ENV);
+            credential_env.push((FLOTILLA_ENVIRONMENT_ID_ENV.to_string(), spec.env_ref.clone()));
+        }
         let (command, mut env, crew) = match &spec.source {
             TerminalSessionSource::Tool { command } => (command.clone(), credential_env.clone(), None),
             TerminalSessionSource::Agent { selector, brief, context, .. } => {
@@ -447,6 +479,19 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         let runner = self.runner_for_env(&spec.env_ref)?;
                         credential_env = material.crew_environment(&spec.role, &required, &environment, &*runner).await?;
                     }
+                }
+                // #3655: an agentless crew's harness home is flotilla-owned and
+                // lives on the host, under its runner's writable base.
+                if let Some(profile) = agentless {
+                    let material = self
+                        .state
+                        .agent_material
+                        .as_ref()
+                        .ok_or("agentless crews require the agent material registry for their harness home")?;
+                    let required = BTreeSet::from([requirement.adapter.clone()]);
+                    credential_env = material
+                        .host_harness_environment(&spec.env_ref, &spec.role, &required, &credential_env, profile.runner.as_ref())
+                        .await?;
                 }
                 if let Some(store) = &self.state.credential_store {
                     store.record_capability_endpoints(&spec.env_ref, name, &credential_env).await;
@@ -534,19 +579,6 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 (flotilla_agent::process::monitored_command(&plan.command, &crew.id), env, Some(crew))
             }
         };
-        // #3618: an agentless host's crews reach the daemon through the forwarded
-        // environment socket, with the controller generation's CLI on PATH.
-        if let Some(profile) = self.state.agentless_ssh.get(&spec.env_ref) {
-            match &self.state.agentless_reach {
-                Some(reach) => {
-                    let paths = reach.prepare_session(&ReachTarget::from(profile)).await?;
-                    apply_reach_environment(&mut env, &spec.env_ref, &paths, profile.env_bag.find_env_var("PATH"));
-                }
-                // As for contained provisioning: a crew that cannot reach the
-                // daemon must not start silently without hooks or settlement.
-                None => return Err("EnvironmentSocketUnavailable: agentless sessions require a crew socket server".to_string()),
-            }
-        }
         // Crews rebuild one checkout across edits, rebases and review fixes. Set this explicitly: Cargo turns
         // incremental compilation off by default when `CI` is set, and harness shells may set it.
         env.push(("CARGO_INCREMENTAL".to_string(), "1".to_string()));

@@ -115,6 +115,25 @@ terminal pool through its SSH connection. Agentless hosts are excluded from
 the daemon peer mesh and from contained placement. Attach opens the remote
 terminal pool through SSH. No container image is built or pulled.
 
+A crew on an agentless host takes the same harness path as a Docker crew
+(#3655). Its session names its environment (`FLOTILLA_ENVIRONMENT_ID`), and its
+harness runs from a flotilla-owned home under the SSH runner's writable base,
+not from the login user's own configuration:
+
+- Claude Code uses the delivered credential's config directory
+  (`<base>/credentials/<credential>/claude`), with a per-crew
+  `crews/<role>` home inside it. Onboarding, workspace trust for the checkout
+  and attribution suppression are seeded there.
+- Codex uses `<base>/agent-homes/<environment>/codex`, or a delivered Codex key's
+  home. Workspace trust is seeded in that home's `config.toml`, and the host's
+  existing Codex login (`auth.json`) is linked into it.
+- The session gets the crew image's harness environment (`DISABLE_AUTOUPDATER`,
+  `DISABLE_INSTALLATION_CHECKS`, `GH_NO_UPDATE_NOTIFIER`, `LANG`), read from the
+  stdlib image layers.
+
+The login user's `~/.claude`, `~/.claude.json` and `~/.codex/config.toml` are
+never written. Skills are not staged on agentless hosts yet.
+
 The admission free-space floor below is checked against the SSH host's
 `~/dev/flotilla-repos` checkout volume using its remote `df` result.
 

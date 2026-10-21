@@ -674,10 +674,24 @@ enum AdapterFlavor {
     /// present. Managed sessions seed the first two into Claude's mutable state
     /// and carry the documented bypass-consent setting alongside Flotilla's
     /// hooks in the invocation-only `--settings` overlay.
-    ClaudeCode { state_config: Option<ClaudeStateConfig>, state_lock: Arc<Mutex<()>>, contained: bool },
+    ClaudeCode { state_config: Option<ClaudeStateConfig>, state_lock: Arc<Mutex<()>> },
     /// Codex gates on a persisted per-project trust level, so the workspace has
     /// to be marked trusted in its config before launch.
-    Codex { trust_config: Option<CodexTrustConfig>, contained: bool },
+    Codex { trust_config: Option<CodexTrustConfig>, trust_lock: Arc<Mutex<()>> },
+}
+
+/// Names the flotilla environment a session runs in. Docker vessels and
+/// agentless hosts with daemon reach applied carry it; a host-direct session on
+/// the daemon's own host does not.
+pub const FLOTILLA_ENVIRONMENT_ID_ENV: &str = "FLOTILLA_ENVIRONMENT_ID";
+
+/// Containment is a property of the session, not of the host it was
+/// discovered on (#3655): an agentless host's discovery bag is its login
+/// environment, which never names a flotilla environment, while its sessions
+/// do. A contained session gets a flotilla-owned harness home; the host user's
+/// own harness configuration is never selected or written.
+fn session_is_contained(environment: &TerminalEnvVars) -> bool {
+    environment.iter().any(|(name, _)| name == FLOTILLA_ENVIRONMENT_ID_ENV)
 }
 
 impl AdapterFlavor {
@@ -744,10 +758,10 @@ impl CliAgentAdapter {
     }
 
     fn claude_invocation_config_dir(&self, environment: &TerminalEnvVars) -> Option<PathBuf> {
-        let AdapterFlavor::ClaudeCode { contained, .. } = &self.flavor else {
+        if !matches!(&self.flavor, AdapterFlavor::ClaudeCode { .. }) || !session_is_contained(environment) {
             return None;
-        };
-        contained.then(|| environment.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, value)| PathBuf::from(value))).flatten()
+        }
+        environment.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, value)| PathBuf::from(value))
     }
 }
 
@@ -829,12 +843,13 @@ impl AgentAdapter for CliAgentAdapter {
 
     fn launch(&self, request: &AgentLaunchRequest) -> Result<AgentLaunchPlan, String> {
         let mut env = request.environment.clone();
-        if matches!(&self.flavor, AdapterFlavor::ClaudeCode { contained: true, .. })
-            && !env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
-        {
+        let claude = matches!(&self.flavor, AdapterFlavor::ClaudeCode { .. });
+        let contained = session_is_contained(&env);
+        if claude && contained && !env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
             return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
         }
-        if matches!(&self.flavor, AdapterFlavor::ClaudeCode { contained: true, .. })
+        if claude
+            && contained
             && env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
             && !env.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
         {
@@ -843,9 +858,7 @@ impl AgentAdapter for CliAgentAdapter {
         if let Some(config_dir) = self.claude_invocation_config_dir(&env) {
             env.retain(|(name, _)| name != "CLAUDE_CONFIG_DIR");
             env.push(("CLAUDE_CONFIG_DIR".to_string(), config_dir.display().to_string()));
-        } else if matches!(&self.flavor, AdapterFlavor::ClaudeCode { contained: false, .. })
-            && env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
-        {
+        } else if claude && !contained && env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
             // Credential delivery supplies a private config directory for
             // contained crews. Trusted crews deliberately retain the host's
             // ambient settings, skills, and MCP configuration while the token
@@ -870,11 +883,12 @@ impl CliAgentAdapter {
             ensure_flotilla_git_exclude(&*self.runner, vcs, cwd.as_path(), &runtime_paths).await?;
         }
         match &self.flavor {
-            AdapterFlavor::ClaudeCode { state_config, state_lock, contained } => {
-                if *contained && !environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
+            AdapterFlavor::ClaudeCode { state_config, state_lock } => {
+                let contained = session_is_contained(environment);
+                if contained && !environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
                     return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
                 }
-                if *contained
+                if contained
                     && environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
                     && !environment.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
                 {
@@ -887,14 +901,17 @@ impl CliAgentAdapter {
                 } else {
                     None
                 };
-                if let Some(state_config) = invocation_state.as_ref().or(state_config.as_ref()) {
+                // A contained session never falls back to the discovered
+                // (host user's) state file: it is seeded only in its own home.
+                let host_state = state_config.as_ref().filter(|_| !contained);
+                if let Some(state_config) = invocation_state.as_ref().or(host_state) {
                     seed_claude_headless_state(&*self.runner, cwd.as_path(), state_config).await?;
                 }
                 // The runtime supplies a hook URL and token only to host-direct sessions
                 // while flotillad has a loopback listener; vessel sessions keep commands.
                 let mut settings = crate::claude_code_hook_settings_over(crate::ClaudeCodeHookTransport::from_environment(environment));
                 settings["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
-                if *contained {
+                if contained {
                     settings["attribution"] = serde_json::json!({ "commit": "", "pr": "", "sessionUrl": false });
                     settings["includeCoAuthoredBy"] = serde_json::Value::Bool(false);
                 }
@@ -902,15 +919,16 @@ impl CliAgentAdapter {
                     serde_json::to_string_pretty(&settings).map_err(|error| format!("render Claude Code settings overlay: {error}"))?;
                 self.runner.write_file(&cwd.as_path().join(CLAUDE_MANAGED_SETTINGS_PATH), &settings).await?;
             }
-            AdapterFlavor::Codex { trust_config, contained } => {
-                let config = trust_config
-                    .as_ref()
-                    .ok_or_else(|| "cannot determine Codex config path because neither CODEX_HOME nor HOME was detected".to_string())?;
+            AdapterFlavor::Codex { trust_config, trust_lock } => {
                 let invocation_config = environment
                     .iter()
                     .find(|(name, _)| name == "CODEX_HOME")
-                    .map(|(_, home)| CodexTrustConfig { path: PathBuf::from(home).join("config.toml"), lock: Arc::clone(&config.lock) });
-                seed_codex_workspace_trust(&*self.runner, cwd.as_path(), invocation_config.as_ref().unwrap_or(config), *contained).await?;
+                    .map(|(_, home)| CodexTrustConfig { path: PathBuf::from(home).join("config.toml"), lock: Arc::clone(trust_lock) });
+                let config = invocation_config
+                    .as_ref()
+                    .or(trust_config.as_ref())
+                    .ok_or_else(|| "cannot determine Codex config path because neither CODEX_HOME nor HOME was detected".to_string())?;
+                seed_codex_workspace_trust(&*self.runner, cwd.as_path(), config, session_is_contained(environment)).await?;
             }
         }
         self.runner.write_file(&cwd.as_path().join(&brief.path), &brief.content).await?;
@@ -1186,7 +1204,6 @@ impl AgentAdapterRegistry {
                 flavor: AdapterFlavor::ClaudeCode {
                     state_config: state_path.map(|path| ClaudeStateConfig { path, lock: Arc::clone(&state_lock) }),
                     state_lock,
-                    contained: env.find_env_var("FLOTILLA_ENVIRONMENT_ID").is_some(),
                 },
             }));
         }
@@ -1196,12 +1213,13 @@ impl AgentAdapterRegistry {
                 .map(PathBuf::from)
                 .or_else(|| env.find_env_var("HOME").map(|home| PathBuf::from(home).join(".codex")))
                 .map(|home| home.join("config.toml"));
+            let trust_lock = Arc::new(Mutex::new(()));
             registry.insert(Arc::new(CliAgentAdapter {
                 binary: binary.as_path().display().to_string(),
                 runner,
                 flavor: AdapterFlavor::Codex {
-                    trust_config: config_path.map(|path| CodexTrustConfig { path, lock: Arc::new(Mutex::new(())) }),
-                    contained: env.find_env_var("FLOTILLA_ENVIRONMENT_ID").is_some(),
+                    trust_config: config_path.map(|path| CodexTrustConfig { path, lock: Arc::clone(&trust_lock) }),
+                    trust_lock,
                 },
             }));
         }
@@ -2165,7 +2183,6 @@ mod tests {
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::create_dir_all(&claude_config).expect("Claude config");
         let env = EnvironmentBag::new()
-            .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "contained-claude"))
             .with(EnvironmentAssertion::env_var("CLAUDE_CONFIG_DIR", claude_config.display().to_string()))
             .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
@@ -2178,6 +2195,7 @@ mod tests {
         };
 
         let invocation_environment = vec![
+            ("FLOTILLA_ENVIRONMENT_ID".to_string(), "contained-claude".to_string()),
             ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string()),
             ("CLAUDE_CONFIG_DIR".to_string(), claude_config.display().to_string()),
         ];
@@ -2280,9 +2298,7 @@ mod tests {
     async fn contained_claude_uses_the_seam_resolved_invocation_config() {
         let workspace = ExecutionEnvironmentPath::new("/workspace");
         let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok("/workspace\n".to_string()), Err("not a checkout".to_string())]));
-        let env = EnvironmentBag::new()
-            .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "contained-claude"))
-            .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
+        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, runner.clone());
         let claude = registry.get("claude-code").expect("Claude adapter");
         let brief = flotilla_resources::TerminalBrief {
@@ -2291,13 +2307,15 @@ mod tests {
             content: "brief".into(),
             copies: Vec::new(),
         };
+        let contained = ("FLOTILLA_ENVIRONMENT_ID".to_string(), "contained-claude".to_string());
         let invocation_environment = vec![
+            contained.clone(),
             ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string()),
             ("CLAUDE_CONFIG_DIR".to_string(), "/home/crew/flotilla/credentials/claude-max/claude".to_string()),
         ];
 
         let missing = claude
-            .prepare_with_environment(&workspace, &brief, &Vec::new())
+            .prepare_with_environment(&workspace, &brief, &vec![contained])
             .await
             .expect_err("contained Claude must refuse a session without delivered authentication");
         assert_eq!(missing, "contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`");
@@ -2394,6 +2412,93 @@ mod tests {
                 .expect("parse settings overlay");
         assert!(settings.get("attribution").is_none());
         assert!(settings.get("includeCoAuthoredBy").is_none());
+    }
+
+    // #3655: containment is a property of the session. A session that names a
+    // flotilla environment seeds onboarding (Claude) and workspace trust in the
+    // harness home its environment selects, and never writes the host user's
+    // `~/.claude.json` or `~/.codex/config.toml`, whatever the discovery bag
+    // says. Generator: both harnesses; a host bag with and without explicit
+    // config homes; a bag that does or does not itself claim containment (an
+    // agentless login environment never does); repeated preparation.
+    #[hegel::test]
+    fn a_contained_session_prepares_only_its_own_harness_home(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let codex = tc.draw(gs::booleans());
+        let explicit_host_homes = tc.draw(gs::booleans());
+        let bag_claims_containment = tc.draw(gs::booleans());
+        let preparations = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
+        let temp = tempfile::tempdir().expect("tempdir");
+        let host_home = temp.path().join("host-home");
+        let workspace = temp.path().join("checkout");
+        let flotilla_home = temp.path().join("flotilla-config/agent-homes/host-direct-b3");
+        std::fs::create_dir_all(host_home.join(".claude")).expect("host Claude dir");
+        std::fs::create_dir_all(host_home.join(".codex")).expect("host Codex dir");
+        std::fs::create_dir_all(&workspace).expect("checkout");
+        let host_files = [host_home.join(".claude.json"), host_home.join(".claude/.claude.json"), host_home.join(".codex/config.toml")];
+        for file in &host_files {
+            std::fs::write(file, "host-owned").expect("host harness file");
+        }
+        let mut bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("HOME", host_home.display().to_string()))
+            .with(EnvironmentAssertion::binary("claude", "/tools/claude"))
+            .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
+        if explicit_host_homes {
+            bag = bag
+                .with(EnvironmentAssertion::env_var("CLAUDE_CONFIG_DIR", host_home.join(".claude").display().to_string()))
+                .with(EnvironmentAssertion::env_var("CODEX_HOME", host_home.join(".codex").display().to_string()));
+        }
+        if bag_claims_containment {
+            bag = bag.with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "host-direct-b3"));
+        }
+        let (adapter_id, home) = if codex { ("codex", flotilla_home.join("codex")) } else { ("claude-code", flotilla_home.join("claude")) };
+        std::fs::create_dir_all(&home).expect("flotilla home");
+        let mut session = vec![(super::FLOTILLA_ENVIRONMENT_ID_ENV.to_string(), "host-direct-b3".to_string())];
+        if codex {
+            session.push(("CODEX_HOME".to_string(), home.display().to_string()));
+        } else {
+            session.push(("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string()));
+            session.push(("CLAUDE_CONFIG_DIR".to_string(), home.display().to_string()));
+        }
+        let brief = flotilla_resources::TerminalBrief {
+            artifact_digest: None,
+            path: ".flotilla/briefs/coder.md".into(),
+            content: "brief".into(),
+            copies: Vec::new(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let registry = AgentAdapterRegistry::discover(&bag, Arc::new(ProcessCommandRunner));
+        let adapter = registry.get(adapter_id).expect("adapter");
+        for _ in 0..preparations {
+            runtime
+                .block_on(adapter.prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &session))
+                .expect("prepare contained session");
+        }
+        let plan = adapter
+            .launch(&AgentLaunchRequest { fulfilment_grants: None, role: "coder".into(), model: None, brief, environment: session })
+            .expect("launch contained session");
+
+        for file in &host_files {
+            assert_eq!(std::fs::read_to_string(file).expect("host harness file"), "host-owned", "{} was written", file.display());
+        }
+        let canonical = workspace.canonicalize().expect("canonical checkout").display().to_string();
+        let selected = |name: &str| plan.env.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
+        if codex {
+            let config = std::fs::read_to_string(home.join("config.toml")).expect("flotilla Codex config");
+            let config = config.parse::<DocumentMut>().expect("parse Codex config");
+            assert_eq!(config["projects"][&canonical]["trust_level"].as_str(), Some("trusted"));
+            assert_eq!(selected("CODEX_HOME"), Some(home.display().to_string()));
+        } else {
+            let state: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json")).expect("flotilla Claude state")).expect("state");
+            assert_eq!(state["hasCompletedOnboarding"], true);
+            assert_eq!(state["projects"][&canonical]["hasTrustDialogAccepted"], true);
+            assert_eq!(selected("CLAUDE_CONFIG_DIR"), Some(home.display().to_string()));
+            let settings: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(workspace.join(CLAUDE_MANAGED_SETTINGS_PATH)).expect("settings overlay"))
+                    .expect("parse settings overlay");
+            assert_eq!(settings["attribution"], serde_json::json!({ "commit": "", "pr": "", "sessionUrl": false }));
+        }
     }
 
     #[test]
@@ -2558,7 +2663,6 @@ mod tests {
         std::fs::write(codex_home.join("config.toml"), format!("[projects.{canonical_workspace:?}]\ntrust_level = \"trusted\"\n"))
             .expect("initial Codex config");
         let env = EnvironmentBag::new()
-            .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "contained-codex"))
             .with(EnvironmentAssertion::env_var("CODEX_HOME", codex_home.display().to_string()))
             .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
@@ -2570,10 +2674,12 @@ mod tests {
         };
 
         let codex = registry.get("codex").expect("codex adapter");
-        codex.prepare(&ExecutionEnvironmentPath::new(&workspace), &brief).await.expect("prepare");
+        // A Docker vessel's session names its environment; its home is the image's CODEX_HOME.
+        let session = vec![("FLOTILLA_ENVIRONMENT_ID".to_string(), "contained-codex".to_string())];
+        codex.prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &session).await.expect("prepare");
 
         let plan = codex
-            .launch(&AgentLaunchRequest { fulfilment_grants: None, role: "coder".into(), model: None, brief, environment: Vec::new() })
+            .launch(&AgentLaunchRequest { fulfilment_grants: None, role: "coder".into(), model: None, brief, environment: session })
             .expect("contained Codex launch");
         assert!(plan.command.contains("--no-daemon"));
         // #3051: invocation hooks remain wired if the home config is later rewritten.
