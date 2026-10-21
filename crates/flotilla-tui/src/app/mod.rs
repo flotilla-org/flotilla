@@ -3,6 +3,7 @@ mod file_picker;
 mod key_handlers;
 mod navigation;
 pub mod open_views;
+mod projection_cache;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod ui_state;
@@ -265,6 +266,7 @@ pub struct NamespaceModel {
 /// window it subscribed to.
 #[derive(Default)]
 pub struct QueryTableCache {
+    projection: projection_cache::ProjectionCache,
     pub dispatch_ready: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::DispatchQueueRow>>,
     pub convoys: HashMap<flotilla_protocol::QueryId, QueryTableResult<crate::convoy_model::ConvoySummary>>,
     pub independents: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IndependentRow>>,
@@ -1148,6 +1150,16 @@ impl App {
     // ── Daemon event handling ──
 
     pub fn handle_daemon_event(&mut self, event: DaemonEvent) {
+        if matches!(
+            &event,
+            DaemonEvent::ResultSet(_)
+                | DaemonEvent::ResultDelta(_)
+                | DaemonEvent::HostSnapshot(_)
+                | DaemonEvent::HostRemoved { .. }
+                | DaemonEvent::PeerStatusChanged { .. }
+        ) {
+            self.query_tables.projection.invalidate();
+        }
         match event {
             DaemonEvent::RepoDelta(_) => {}
             DaemonEvent::RepoRefreshCompleted { .. } => {}

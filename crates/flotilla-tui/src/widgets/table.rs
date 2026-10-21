@@ -192,12 +192,11 @@ pub struct TableWidget {
 }
 
 impl TableWidget {
-    fn projected(ctx: &WidgetContext<'_>) -> Result<TableView, String> {
+    fn projected(ctx: &WidgetContext<'_>) -> Result<std::rc::Rc<TableView>, String> {
         let address = ctx.views.active_address().ok_or_else(|| "active view has no valid address".to_string())?;
         let filter = ctx.views.active_table_state().filter.clone();
         let source_search = ctx.views.active_table_state().source_search.as_deref();
-        let rows = crate::app::table_rows(ctx.model, ctx.namespaces, ctx.query_tables, source_search);
-        table_view::project(address, &rows).map(|view| view.filtered(&filter))
+        ctx.query_tables.project_table(address, ctx.model, ctx.namespaces, source_search, &filter)
     }
 
     fn click_row(&self, mouse: MouseEvent, row_count: usize) -> Option<usize> {
@@ -470,8 +469,7 @@ impl InteractiveWidget for TableWidget {
         let Some(address) = ctx.views.active_address().cloned() else { return };
         let filter = ctx.views.active_table_state().filter.clone();
         let source_search = ctx.views.active_table_state().source_search.as_deref();
-        let rows = crate::app::table_rows(ctx.model, ctx.namespaces, ctx.query_tables, source_search);
-        let Ok(view) = table_view::project(&address, &rows).map(|view| view.filtered(&filter)) else { return };
+        let Ok(view) = ctx.query_tables.project_table(&address, ctx.model, ctx.namespaces, source_search, &filter) else { return };
         let breadcrumbs = ctx.views.active().breadcrumb_addresses();
         self.render_table(frame, area, ctx.theme, &view, ctx.views.active_table_state_mut(), &breadcrumbs);
     }

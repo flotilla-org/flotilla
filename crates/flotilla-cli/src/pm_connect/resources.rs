@@ -14,6 +14,7 @@ pub(super) const KINDS: &[&str] = &["changerequests", "issues", "forges", "repos
 
 // Decode at admission, retaining typed records so projection cannot panic
 // while trying to decode an already accepted JSON value again.
+#[derive(Clone)]
 enum SubjectRecord {
     Convoy(Box<ResourceObject<Convoy>>),
     Artifact(ResourceObject<Artifact>),
@@ -83,12 +84,17 @@ record_type!(Forge, Forge);
 record_type!(Repository, Repository);
 record_type!(Project, Project);
 
+pub(super) type RecordKey = (String, String, String, String);
+
 #[derive(Default)]
 pub(super) struct Records {
     // Retain each source separately: deleting one replica must not erase the
     // same observation still held by another root.
     objects: BTreeMap<(String, String, String, String), SubjectRecord>,
     local_roots: BTreeSet<String>,
+    changed: BTreeSet<RecordKey>,
+    configuration: Option<std::sync::Arc<SubjectCatalogInput>>,
+    source_configuration: BTreeMap<IssueSource, (Vec<ResourceObject<Forge>>, Vec<RepositoryAlias>)>,
 }
 
 fn decode<T: Resource>(value: &Value) -> Result<ResourceObject<T>, String> {
@@ -108,6 +114,11 @@ impl Records {
             .collect();
         for key in keys {
             self.objects.remove(&key);
+            self.changed.insert(key);
+        }
+        if matches!(kind, "forges" | "repositories" | "projects") {
+            self.configuration = None;
+            self.source_configuration.clear();
         }
     }
 
@@ -133,6 +144,11 @@ impl Records {
             };
             let namespace = object.pointer("/metadata/namespace").and_then(Value::as_str).unwrap_or(&envelope.namespace);
             let key = (envelope.plural.clone(), namespace.to_owned(), name.to_owned(), root);
+            self.changed.insert(key.clone());
+            if matches!(envelope.plural.as_str(), "forges" | "repositories" | "projects") {
+                self.configuration = None;
+                self.source_configuration.clear();
+            }
             if record.record_type == ResourceRecordType::Deleted {
                 self.objects.remove(&key);
                 continue;
@@ -161,6 +177,127 @@ impl Records {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn forget_source(&mut self, source: &IssueSource) {
+        self.source_configuration.remove(source);
+    }
+
+    pub(super) fn take_changes(&mut self) -> BTreeSet<RecordKey> {
+        std::mem::take(&mut self.changed)
+    }
+
+    pub(super) fn links(&self, key: &RecordKey) -> Option<Vec<super::projection::Dependency>> {
+        use super::projection::Dependency;
+        use flotilla_protocol::{IssueSource, Subject, SubjectKind};
+        use flotilla_resources::MessageReference;
+        let record = self.objects.get(key)?;
+        let convoy = |namespace: &str, name: &str| Dependency::Convoy(namespace.to_owned(), name.to_owned());
+        let mut links = Vec::new();
+        match record {
+            SubjectRecord::Convoy(row) => links.push(convoy(&row.metadata.namespace, &row.metadata.name)),
+            SubjectRecord::Artifact(row) => links.push(convoy(&row.metadata.namespace, &row.spec.convoy)),
+            SubjectRecord::Message(row) => {
+                for address in [&row.spec.sender, &row.spec.receiver] {
+                    let parts: Vec<_> = address.split('/').collect();
+                    if parts.len() == 4 {
+                        links.push(convoy(&row.metadata.namespace, parts[1]));
+                    }
+                }
+                for reference in &row.spec.references {
+                    if let MessageReference::ControlRecord { resource, .. } = reference {
+                        if resource.kind == "Convoy" {
+                            links.push(convoy(&resource.namespace, &resource.name));
+                        }
+                    }
+                }
+            }
+            SubjectRecord::ChangeRequest(row) => {
+                links.push(Dependency::Subject(Subject {
+                    kind: SubjectKind::ChangeRequest,
+                    source: IssueSource { service: row.spec.service.clone(), scope: row.spec.scope.clone() },
+                    id: row.spec.number.to_string(),
+                }));
+                for history in &row.spec.subject_of {
+                    links.push(convoy(&history.namespace, &history.convoy));
+                }
+            }
+            SubjectRecord::Issue(row) => links.push(Dependency::Subject(Subject {
+                kind: SubjectKind::Issue,
+                source: IssueSource { service: row.spec.service.clone(), scope: row.spec.scope.clone() },
+                id: row.spec.number.to_string(),
+            })),
+            SubjectRecord::Forge(_) | SubjectRecord::Repository(_) | SubjectRecord::Project(_) => return None,
+        }
+        Some(links)
+    }
+
+    pub(super) fn configuration(&mut self) -> std::sync::Arc<SubjectCatalogInput> {
+        if self.configuration.is_none() {
+            let mut definitions = Self { local_roots: self.local_roots.clone(), ..Self::default() };
+            for kind in ["forges", "repositories", "projects"] {
+                for (key, value) in self
+                    .objects
+                    .range((kind.to_owned(), String::new(), String::new(), String::new())..)
+                    .take_while(|(key, _)| key.0 == kind)
+                {
+                    definitions.objects.insert(key.clone(), value.clone());
+                }
+            }
+            self.configuration = Some(std::sync::Arc::new(definitions.projection()));
+        }
+        self.configuration.as_ref().expect("configuration just populated").clone()
+    }
+
+    pub(super) fn projection_selected(
+        &mut self,
+        keys: &[RecordKey],
+        sources: &BTreeSet<IssueSource>,
+        configuration: &SubjectCatalogInput,
+    ) -> SubjectCatalogInput {
+        let mut selected = Self {
+            local_roots: keys.iter().filter_map(|key| self.local_roots.contains(&key.3).then_some(key.3.clone())).collect(),
+            ..Self::default()
+        };
+        for key in keys {
+            if let Some(record) = self.objects.get(key) {
+                selected.objects.insert(key.clone(), record.clone());
+            }
+        }
+        let mut result = selected.projection();
+        for source in sources {
+            let (forges, references) = self.source_configuration.entry(source.clone()).or_insert_with(|| {
+                let owner = subject_forge(&configuration.forges, &source.service);
+                let forges = owner.cloned().into_iter().collect();
+                let references = configuration
+                    .references
+                    .repositories
+                    .iter()
+                    .filter(|reference| {
+                        reference.source.scope == source.scope
+                            && owner.is_some_and(|forge| {
+                                subject_forge(&configuration.forges, &reference.source.service)
+                                    .is_some_and(|other| other.spec.forge_id == forge.spec.forge_id)
+                            })
+                    })
+                    .map(|reference| {
+                        let mut reference = reference.clone();
+                        reference.source = source.clone();
+                        reference
+                    })
+                    .collect();
+                (forges, references)
+            });
+            for forge in forges {
+                if !result.forges.iter().any(|existing| {
+                    existing.metadata.name == forge.metadata.name && existing.metadata.namespace == forge.metadata.namespace
+                }) {
+                    result.forges.push(forge.clone());
+                }
+            }
+            result.references.repositories.extend(references.iter().cloned());
+        }
+        result
     }
 
     fn typed<T: RecordType>(&self, kind: &str) -> Vec<ResourceObject<T>> {
