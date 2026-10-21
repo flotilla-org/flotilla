@@ -668,9 +668,15 @@ impl FlotillaVcs {
         let backend = GitCliBackend::checkout_root(Path::new(target), &*self.runner);
         let preserve = |reason| Some(CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason });
         let current = match backend.current_branch().await {
-            Err(_) if self.orphaned_worktree(target).await? => return Ok(preserve(CheckoutPreservationReason::OrphanedCheckout)),
-            Err(error) if error.contains("not a git repository") => return Ok(None),
-            Err(_) => return Ok(preserve(CheckoutPreservationReason::DifferentBranch)),
+            Err(error) => {
+                if self.orphaned_worktree_after_failure(target, &error).await? {
+                    return Ok(preserve(CheckoutPreservationReason::OrphanedCheckout));
+                }
+                if error.contains("not a git repository") {
+                    return Ok(None);
+                }
+                return Ok(preserve(CheckoutPreservationReason::DifferentBranch));
+            }
             Ok(current) => current,
         };
         let status = backend.working_tree_status(false).await?;
@@ -690,6 +696,10 @@ impl FlotillaVcs {
             }
         }
         Ok(None)
+    }
+
+    async fn orphaned_worktree_after_failure(&self, target: &str, error: &str) -> Result<bool, String> {
+        self.orphaned_worktree(target).await.map_err(|probe_error| format!("{error}; orphaned worktree probe failed: {probe_error}"))
     }
 
     fn cli(&self) -> GitCliBackend<'_> {
@@ -1180,7 +1190,7 @@ impl Vcs for FlotillaVcs {
             {
                 return Err(format!("{error}; failed to remove partial archive at {staging_path}: {cleanup_error}"));
             }
-            if self.orphaned_worktree(target).await? {
+            if self.orphaned_worktree_after_failure(target, &error).await? {
                 return Ok(CheckoutRemoval::PreservedCheckout {
                     path: target.to_string(),
                     reason: CheckoutPreservationReason::OrphanedCheckout,
@@ -3408,6 +3418,36 @@ mod tests {
     // normal and forced teardown, keeping all files when Git cannot verify them.
     #[tokio::test]
     async fn orphaned_worktree_teardown_preserves_unverifiable_contents() {
+        // Runner boundary: fail the filesystem probe after Git has failed on
+        // the pruned registration. Both diagnostic causes must be retained.
+        struct FailOrphanProbeRunner;
+        #[async_trait]
+        impl CommandRunner for FailOrphanProbeRunner {
+            async fn run(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &flotilla_provider_runtime::ChannelLabel,
+            ) -> Result<String, String> {
+                flotilla_provider_runtime::ProcessCommandRunner.run(cmd, args, cwd, label).await
+            }
+            async fn run_output(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &flotilla_provider_runtime::ChannelLabel,
+            ) -> Result<CommandOutput, String> {
+                if cmd == "cat" {
+                    return Err("orphan probe unavailable".into());
+                }
+                flotilla_provider_runtime::ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+            }
+            async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+                flotilla_provider_runtime::ProcessCommandRunner.exists(cmd, args).await
+            }
+        }
         for relative in [false, true] {
             for dirty in [false, true] {
                 let dir = tempfile::tempdir().expect("tempdir");
@@ -3432,6 +3472,17 @@ mod tests {
                     std::fs::write(target.join("README.md"), "changed\n").expect("tracked change");
                     std::fs::write(target.join("untracked"), "keep me").expect("untracked file");
                 }
+                let failing = test_fl(&source, Arc::new(FailOrphanProbeRunner), true);
+                let normal_error = failing.remove_materialised_checkout("convoy/work", path).await.expect_err("normal probes fail");
+                assert!(
+                    normal_error.contains("resolve shared Git directory") && normal_error.contains("orphan probe unavailable"),
+                    "both normal failures must be retained: {normal_error}"
+                );
+                let force_error = failing.force_remove_materialised_checkout("convoy/work", path).await.expect_err("forced probes fail");
+                assert!(
+                    force_error.contains("resolve shared Git directory") && force_error.contains("orphan probe unavailable"),
+                    "both forced failures must be retained: {force_error}"
+                );
                 let expected =
                     CheckoutRemoval::PreservedCheckout { path: path.into(), reason: CheckoutPreservationReason::OrphanedCheckout };
                 for _ in 0..2 {
