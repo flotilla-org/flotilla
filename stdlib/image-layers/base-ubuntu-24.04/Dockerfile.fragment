@@ -53,6 +53,7 @@ RUN set -eu; \
 # so 0644 would leave them unsearchable for the runtime UID. Creating them
 # here keeps them 0755; COPY leaves existing directories unchanged.
 RUN install -d -m 0755 /etc/flotilla /etc/flotilla/prelude.d /opt/flotilla /opt/flotilla/bin
+ENV SHELL=/bin/bash
 ENV LANG=en_US.UTF-8
 ENV PATH="/opt/flotilla/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV TERMINFO_DIRS=/opt/flotilla/share/terminfo:/usr/share/terminfo

@@ -34,7 +34,8 @@ No user is baked in. The image works for any UID, and the environment provider
 supplies `HOME`. Writable state lives under `HOME`: Cargo and rustup state,
 npm, uv, Zig and gh caches, and on-demand toolchains. Static environment is
 image `ENV` set by each layer's fragment, so every exec path on every provider
-sees it. Preludes in `/etc/flotilla/prelude.d/` only perform actions at launch,
+sees it. The base sets `SHELL=/bin/bash`, matching the crew launch shell;
+`crew-utilities` also installs zsh for projects whose tests need it. Preludes in `/etc/flotilla/prelude.d/` only perform actions at launch,
 such as starting Xvfb.
 
 ### Never in an image
@@ -165,7 +166,7 @@ Only a merged change to the layer rebuilds the project's image.
 | `zig` | shared | `0.16.0` | `toolchain:zig@0.16.0` |
 | `display-x11` | shared | `1.0.0` | `display:x11`, `display:headless-x11` |
 | `formal-modelling` | shared | `0.33.0` | `toolchain:jdk`, `tool:quint`, `tool:tlc`, `tool:apalache`, `tool:quint-evaluator` (requires `toolchain:node`) |
-| `crew-utilities` | agent_runtime | `1.0.0` | `crew:utilities`, `tool:gh`, `tool:tea`, `tool:uv` |
+| `crew-utilities` | agent_runtime | `1.0.1` | `crew:utilities`, `tool:gh`, `tool:tea`, `tool:uv` |
 | `harness-claude-code` | agent_runtime | `2.1.287` | `harness:claude-code@2.1.287` |
 | `harness-codex` | agent_runtime | `0.160.0` | `harness:codex@0.160.0` |
 

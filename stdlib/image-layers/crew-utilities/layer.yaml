@@ -6,7 +6,7 @@
 # definition's revision: the layer bundles several independently versioned
 # tools.
 name: crew-utilities
-version: 1.0.0
+version: 1.0.1
 tier: agent_runtime
 provides:
   - crew:utilities
@@ -47,7 +47,7 @@ probe: |
   uv --version | grep -E '(^|[^0-9])0\.13\.0([^0-9.]|$)'
   uvx --version >/dev/null
   python3 --version
-  for tool in jq rg less ps ssh file; do
+  for tool in jq rg less ps ssh file zsh; do
       command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 1; }
   done
   printf '{"ready": true}\n' | jq -e .ready >/dev/null
