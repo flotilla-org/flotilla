@@ -879,14 +879,22 @@ pub async fn apply_manifest_resource_document(
 }
 
 /// Hash a resource document's spec after its registered typed representation
-/// has applied Serde defaults.
+/// has applied Serde defaults and metadata-dependent canonicalization.
 pub fn resource_document_spec_hash(document: &Value) -> Result<String, ResourceError> {
     let kind = document
         .get("kind")
         .and_then(Value::as_str)
         .ok_or_else(|| ResourceError::decode("decode resource document: missing or non-string kind"))?;
     let spec = document.get("spec").ok_or_else(|| ResourceError::decode("decode resource document: missing spec"))?;
-    dispatch_resource_kind!(lookup_resource_kind(kind)?.resource, typed_spec_hash(spec))
+    let labels = document
+        .pointer("/metadata/labels")
+        .filter(|labels| !labels.is_null())
+        .cloned()
+        .map(serde_json::from_value::<BTreeMap<String, String>>)
+        .transpose()
+        .map_err(|error| ResourceError::decode(format!("decode resource labels: {error}")))?
+        .unwrap_or_default();
+    dispatch_resource_kind!(lookup_resource_kind(kind)?.resource, typed_spec_hash(spec, &labels))
 }
 
 /// Fail the pre-roll gate before retired fields can be dropped by typed decoding.
@@ -1005,10 +1013,10 @@ fn validate_typed_spec<T: Resource>(spec: &Value) -> Result<(), ResourceError> {
         .map_err(|error| ResourceError::decode(format!("spec.{}: {error}", error.path())))
 }
 
-fn typed_spec_hash<T: Resource>(spec: &Value) -> Result<String, ResourceError> {
+fn typed_spec_hash<T: Resource>(spec: &Value, labels: &BTreeMap<String, String>) -> Result<String, ResourceError> {
     let typed = serde_json::from_value::<T::Spec>(spec.clone())
         .map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", T::API_PATHS.kind)))?;
-    let normalized = serde_json::to_value(typed)
+    let normalized = serde_json::to_value(T::canonicalize_spec(labels, std::borrow::Cow::Owned(typed))?)
         .map_err(|error| ResourceError::decode(format!("encode normalized {} spec: {error}", T::API_PATHS.kind)))?;
     crate::content_hash(&normalized)
 }

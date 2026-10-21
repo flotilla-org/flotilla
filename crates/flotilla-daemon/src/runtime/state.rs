@@ -86,7 +86,7 @@ impl ControllerRuntimeState {
         instance: Option<&str>,
     ) -> Result<flotilla_address::Address, String> {
         use flotilla_environment::environment::EnvironmentInput;
-        let address = if let Some(address) = &spec.provider_address {
+        let mut address = if let Some(address) = &spec.provider_address {
             flotilla_resources::validate_environment_provider_address(address)?;
             address.clone()
         } else {
@@ -95,6 +95,18 @@ impl ControllerRuntimeState {
             let host = canonical_runtime_host_id(&self.daemon, &self.namespace, &local, host).await?;
             self.environment_providers.resolve_legacy(host.as_str(), EnvironmentInput::of(spec)?, instance)?
         };
+        // A legacy host_ref may be a display alias. Metadata-aware decoding can
+        // already qualify its instance; retain the same Host authority lookup
+        // for the place without ever substituting another provider instance.
+        if self.environment_providers.get(&address).is_err() {
+            if let Some(host) = address.get(flotilla_address::Kind::Host) {
+                let local = CanonicalHostId::resolved(&self.local_host_ref);
+                let canonical = canonical_runtime_host_id(&self.daemon, &self.namespace, &local, host).await?;
+                address = flotilla_address::Address::root(flotilla_address::Kind::Host, canonical.as_str())
+                    .and_then(|place| place.child(flotilla_address::Kind::Provider, address.name()))
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         Ok(address)
     }
 
@@ -391,6 +403,11 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
             }
             return Ok(());
         }
+        // This standing-convoy expunge proof still consumes the preceding-
+        // generation Docker status/host contract. Account and microVM recovery
+        // is deliberately unproven here until its provider observation path is
+        // wired in; refusal is never evidence that such a backing is dead.
+        // The EnvironmentRuntime provisioning/teardown port has no such filter.
         if let Some(environment) = environments.iter().find(|environment| environment.spec.docker.is_none()) {
             return Err(format!("Environment/{} has no inspectable Docker backing", environment.metadata.name));
         }

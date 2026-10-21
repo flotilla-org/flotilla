@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt::Debug};
+use std::{borrow::Cow, collections::BTreeMap, fmt::Debug};
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::NodeId;
@@ -12,7 +12,7 @@ use crate::{
 };
 
 macro_rules! define_resource {
-    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr $(, initial_status = $initializer:path)?, queryable = $fields:expr) => {
+    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr $(, initial_status = $initializer:path)? $(, canonicalize_spec = $canonicalizer:path)?, queryable = $fields:expr) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name;
 
@@ -25,6 +25,10 @@ macro_rules! define_resource {
             const API_PATHS: $crate::resource::ApiPaths =
                 $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
             const REPLICATION_CLASS: $crate::ReplicationClass = $replication;
+
+            $(fn canonicalize_spec<'a>(labels: &std::collections::BTreeMap<String, String>, spec: std::borrow::Cow<'a, Self::Spec>) -> Result<std::borrow::Cow<'a, Self::Spec>, $crate::ResourceError> {
+                $canonicalizer(labels, spec)
+            })?
 
             $(fn initial_status(meta: &$crate::InputMeta) -> Result<Option<Self::Status>, $crate::ResourceError> {
                 $initializer(meta)
@@ -229,6 +233,12 @@ pub trait Resource: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Resolve legacy spec identity held in metadata labels before typed reads,
+    /// canonical writes and no-op comparisons. The default moves the spec intact.
+    fn canonicalize_spec<'a>(_labels: &BTreeMap<String, String>, spec: Cow<'a, Self::Spec>) -> Result<Cow<'a, Self::Spec>, ResourceError> {
+        Ok(spec)
+    }
+
     fn validate_spec(_meta: &InputMeta, _spec: &Self::Spec) -> Result<(), ResourceError> {
         Ok(())
     }
@@ -419,9 +429,10 @@ pub struct ResourceObject<T: Resource> {
 
 impl<T: Resource> ResourceObject<T> {
     pub fn matches_update(&self, meta: &InputMeta, spec: &T::Spec) -> Result<bool, ResourceError> {
-        let current_spec =
-            serde_json::to_value(&self.spec).map_err(|err| ResourceError::decode(format!("serialize current spec: {err}")))?;
-        let requested_spec = serde_json::to_value(spec).map_err(|err| ResourceError::decode(format!("serialize requested spec: {err}")))?;
+        let current_spec = serde_json::to_value(T::canonicalize_spec(&self.metadata.labels, Cow::Borrowed(&self.spec))?)
+            .map_err(|err| ResourceError::decode(format!("serialize current spec: {err}")))?;
+        let requested_spec = serde_json::to_value(T::canonicalize_spec(&meta.labels, Cow::Borrowed(spec))?)
+            .map_err(|err| ResourceError::decode(format!("serialize requested spec: {err}")))?;
         Ok(self.metadata.name == meta.name
             && self.metadata.labels == meta.labels
             && self.metadata.annotations == meta.annotations
@@ -460,7 +471,8 @@ impl<T: Resource> ResourceObject<T> {
         if value.kind != T::API_PATHS.kind {
             return Err(ResourceError::decode(format!("unexpected kind '{}', expected '{}'", value.kind, T::API_PATHS.kind)));
         }
-        Ok(Self { metadata: value.metadata.into(), spec: value.spec, status: value.status })
+        let spec = T::canonicalize_spec(&value.metadata.labels, Cow::Owned(value.spec))?.into_owned();
+        Ok(Self { metadata: value.metadata.into(), spec, status: value.status })
     }
 }
 

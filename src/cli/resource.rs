@@ -850,6 +850,7 @@ mod tests {
             &EnvironmentSpec {
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.clone(), repo_default_dir: "/workspace".into() }),
                 docker: None,
+                ..Default::default()
             },
         )
         .await;

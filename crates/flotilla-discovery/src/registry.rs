@@ -40,10 +40,19 @@ impl EnvironmentProviderRegistry {
         place: &flotilla_address::Address,
         providers: &ProviderSet<dyn EnvironmentProvider>,
     ) -> Result<(), String> {
-        for (name, (_, provider)) in &providers.inner {
-            let address = place.child(flotilla_address::Kind::Provider, name).map_err(|error| error.to_string())?;
-            self.insert(address, Arc::clone(provider))?;
-        }
+        let entries = providers
+            .inner
+            .iter()
+            .map(|(name, (_, provider))| {
+                let address = place.child(flotilla_address::Kind::Provider, name).map_err(|error| error.to_string())?;
+                flotilla_resources::validate_environment_provider_address(&address)?;
+                if self.entries.contains_key(&address) {
+                    return Err(format!("duplicate environment provider address {address}"));
+                }
+                Ok((address, Arc::clone(provider)))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        self.entries.extend(entries);
         Ok(())
     }
 
@@ -494,6 +503,27 @@ mod address_registry_tests {
     use flotilla_address::{Address, Kind};
     use flotilla_environment::environment::host_direct::HostDirectEnvironmentProvider;
     use hegel::generators as gs;
+
+    // Registration is one startup operation: a collision must not leave an
+    // earlier, non-conflicting instance installed from the rejected batch.
+    #[test]
+    fn register_place_is_atomic_on_collision() {
+        let mut registry = EnvironmentProviderRegistry::default();
+        let place = Address::root(Kind::Host, "home").expect("place");
+        let provider: Arc<dyn EnvironmentProvider> = Arc::new(HostDirectEnvironmentProvider::new(
+            Arc::new(flotilla_replay_testkit::testing::MockRunner::new(vec![])),
+            Default::default(),
+        ));
+        let occupied = place.child(Kind::Provider, "occupied").expect("address");
+        registry.insert(occupied.clone(), provider.clone()).expect("existing instance");
+        let mut providers = ProviderSet::new();
+        for name in ["new", "occupied"] {
+            providers.insert(name, ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, name), provider.clone());
+        }
+        assert!(registry.register_place(&place, &providers).is_err());
+        assert!(registry.get(&place.child(Kind::Provider, "new").expect("address")).is_err());
+        assert!(Arc::ptr_eq(&registry.get(&occupied).expect("original retained"), &provider));
+    }
 
     // ADR 0058: equal instance names at distinct places are independent;
     // account and SSH-host entries use the same resolution as local entries.

@@ -106,6 +106,53 @@ async fn seed(backend: &ResourceBackend) {
     backend.replace_replicas_typed::<Convoy>(&NodeId::new("local"), "flotilla", &listed, chrono::Utc::now(), None).await.unwrap();
 }
 async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
+    // The Environment admission query must have the same candidate cover on
+    // memory, SQLite (sync/async/file), hybrid and resource HTTP adapters.
+    for (name, spec) in [
+        (
+            "current-direct",
+            serde_json::json!({"provider_address":"host:home%2F%25/provider:custom", "host_direct":{"repo_default_dir":"/work"}}),
+        ),
+        ("legacy-direct", serde_json::json!({"host_direct":{"host_ref":"home/%", "repo_default_dir":"/work"}})),
+        ("container", serde_json::json!({"provider_address":"host:home%2F%25/provider:custom", "docker":{"image":"image"}})),
+        (
+            "conflicting-legacy",
+            serde_json::json!({"provider_address":"host:remote/provider:custom", "host_direct":{"host_ref":"home/%", "repo_default_dir":"/work"}}),
+        ),
+        (
+            "other-host",
+            serde_json::json!({"provider_address":"host:home%2F%25-other/provider:custom", "host_direct":{"repo_default_dir":"/work"}}),
+        ),
+    ] {
+        authority
+            .store()
+            .create_raw(
+                flotilla_store::ResourceKind::of::<flotilla_resources::Environment>(),
+                "environment-contract",
+                &InputMeta::builder().name(name.into()).build(),
+                &spec,
+            )
+            .await
+            .expect("stored generation fixture");
+    }
+    let query = StoreQuery {
+        any_of: Some(vec![
+            StoreQuery {
+                field_prefixes: BTreeMap::from([("spec.provider_address".into(), "host:home%2F%25/provider:".into())]),
+                present: vec!["spec.host_direct".into()],
+                ..Default::default()
+            },
+            StoreQuery {
+                fields: BTreeMap::from([("spec.host_direct.host_ref".into(), "home/%".into())]),
+                missing_fields: ["spec.provider_address".into()].into(),
+                ..Default::default()
+            },
+        ]),
+        ..Default::default()
+    };
+    let found =
+        backend.query_declared::<flotilla_resources::Environment>("environment-contract", &query).await.expect("Environment query cover");
+    assert_eq!(found.items.iter().map(|item| item.object.metadata.name.as_str()).collect::<Vec<_>>(), ["current-direct", "legacy-direct"]);
     // Finite sets and alternatives are indexed selections: duplicates never
     // multiply rows, empty alternatives select nothing, and outer predicates
     // still intersect the union. The same contract runs over every adapter.

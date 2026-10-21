@@ -1,9 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use flotilla_protocol::ConfiguredResourceLimits;
 use serde::{Deserialize, Serialize};
 
-use crate::{placement_policy::DockerImagePullPolicy, resource::define_resource, status_patch::StatusPatch, ControllerRetry};
+use crate::{
+    placement_policy::DockerImagePullPolicy, resource::define_resource, status_patch::StatusPatch, ControllerRetry, ResourceError,
+};
 
 define_resource!(
     Environment,
@@ -12,6 +17,7 @@ define_resource!(
     EnvironmentStatus,
     EnvironmentStatusPatch,
     replication = crate::ReplicationClass::None,
+    canonicalize_spec = canonicalize_environment_spec,
     queryable = &[
         "metadata.name",
         "spec.provider_address",
@@ -30,11 +36,27 @@ pub fn host_direct_environment_name(host_ref: &str) -> String {
     format!("{HOST_DIRECT_NAME_PREFIX}{host_ref}")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct EnvironmentSpec {
     pub provider_address: Option<flotilla_address::Address>,
     pub host_direct: Option<HostDirectEnvironmentSpec>,
     pub docker: Option<DockerEnvironmentSpec>,
+}
+
+// A preceding-generation Environment can bind a non-default instance in its
+// metadata. Resolve it while that context is present, before Serialize could
+// select a built-in default. Explicit addresses always remain authoritative.
+fn canonicalize_environment_spec<'a>(
+    labels: &BTreeMap<String, String>,
+    mut spec: Cow<'a, EnvironmentSpec>,
+) -> Result<Cow<'a, EnvironmentSpec>, ResourceError> {
+    if spec.provider_address.is_none() {
+        if let Some(instance) = labels.get("flotilla.work/environment-provider-instance") {
+            let address = spec.resolved_provider_address(Some(instance)).map_err(ResourceError::invalid)?;
+            spec.to_mut().provider_address = address;
+        }
+    }
+    Ok(spec)
 }
 
 /// Only host/account places followed by one provider instance name are valid.
@@ -76,6 +98,8 @@ impl EnvironmentSpec {
 
 // Canonical writes are centralized here so every resource author, including
 // manifest ingestion, writes the new address and never legacy host fields.
+// Resource::canonicalize_spec first resolves legacy instance labels while the
+// metadata context is available.
 impl Serialize for EnvironmentSpec {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]

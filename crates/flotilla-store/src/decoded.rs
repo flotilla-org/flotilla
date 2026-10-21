@@ -10,7 +10,7 @@
 //! Raw (`*_raw`) reads are unchanged: replication and resource HTTP still
 //! receive the stored `spec` and `status` trees verbatim, so a read never
 //! applies defaults or drops unknown fields on their behalf.
-use std::any::Any;
+use std::{any::Any, borrow::Cow};
 
 use flotilla_resources::{ReadResourceObject, Resource, ResourceError, ResourceObject, ResourcePosition, ResourceProvenance};
 use serde::Deserialize;
@@ -161,6 +161,7 @@ pub fn typed_object<T: Resource>(object: ResourceObject<SerializedResource>) -> 
         ResourceError::decode(format!("decode stored object {}/{}: {error}", T::API_PATHS.kind, object.metadata.name))
     };
     let spec = T::Spec::deserialize(object.spec).map_err(error)?;
+    let spec = T::canonicalize_spec(&object.metadata.labels, Cow::Owned(spec))?.into_owned();
     let status = match object.status {
         Some(status) => Option::<T::Status>::deserialize(status).map_err(error)?,
         None => None,
