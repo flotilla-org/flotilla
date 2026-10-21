@@ -36,8 +36,20 @@ print(json.dumps({
     'toolchain': {tool: version(tool) for tool in ['cargo', 'rustc']},
 }))
 PY
-# The installer observes Running before releasing the completion claim.
+# The installer observes Running and verifies the report before releasing settlement.
 while [[ ! -e "$probe_dir/fleet-canary-continue" ]]; do sleep 1; done
-flotilla crew complete --message 'fleet canary baseline verified'
+cat >"$probe_dir/fleet-canary-ledger.md" <<'LEDGER'
+## Decision ledger
+
+1. **Brief silence:** How the credential-free probe proves settlement.
+- **Choice:** Keep a decision-ledger promise after the installer verifies the baseline report.
+- **Alternative:** Retract a crew-sourced promise without exercising artifact submission.
+- **If asking were free:** Which forge-free deliverable should prove settlement?
+LEDGER
+# Declare the baseline evidence before publishing it: ledger observation submits
+# and keeps both ledger promises. Publishing last avoids racing automatic Done
+# with a second CLI call after the artifact is visible.
+flotilla crew promise --promise baseline --kind decision-ledger
+flotilla artifact put --kind decision-ledger "$probe_dir/fleet-canary-ledger.md"
 # Stay alive until the normal convoy finalizers reap the terminal/container.
 while true; do sleep 1; done
