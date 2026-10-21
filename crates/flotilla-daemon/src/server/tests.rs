@@ -6024,14 +6024,17 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
 // releasing or aborting it wakes the idle watcher. Explicit shutdown is independent.
 #[tokio::test]
 async fn environment_client_lease_releases_idle_accounting() {
-    let count = Arc::new(AtomicUsize::new(1));
+    let count = Arc::new(AtomicUsize::new(0));
     let notify = Arc::new(Notify::new());
+    let lease = super::ClientActivityLease::acquire(count.clone(), notify.clone());
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    // Consume acquisition's wakeup so it cannot mask a missing release wakeup.
+    tokio::time::timeout(Duration::from_secs(1), notify.notified()).await.expect("acquisition wakes idle watcher");
     let notified = notify.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
-    let lease = super::EnvironmentClientLease { count: count.clone(), notify: notify.clone() };
     drop(lease);
-    notified.await;
+    tokio::time::timeout(Duration::from_secs(1), notified).await.expect("release wakes idle watcher");
     assert_eq!(count.load(Ordering::SeqCst), 0);
 }
 
@@ -6789,4 +6792,55 @@ async fn agent_activity_duplicates_skip_terminal_reads() {
     );
     assert_eq!(primitives.sessions().get("agent").unwrap(), before);
     drop(daemon);
+}
+
+// Issue #3570: recent TCP HTTP requests prevent idle exit, including when each
+// request closes its connection. Once requests stop, the daemon must idle-exit.
+// This transport regression needs real TCP; router scenario tests bypass serving.
+#[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "requires socket bind")]
+async fn tcp_http_requests_reset_daemon_idle_timeout() {
+    let tmp = TestSocketDir::new();
+    let config = test_config_store(tmp.path().join("config"));
+    let server = DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("daemon.sock"), Duration::from_secs(1))
+        .await
+        .expect("server")
+        .with_http_listener(super::HttpListenAddress::resolve("127.0.0.1:0").await.expect("listen address"));
+    let token_path = server.state_dir.join("http/token");
+    let origin = server.tcp_origin.clone();
+    let mut running = tokio::spawn(server.run());
+    let address = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(origin) = origin.get() {
+                break origin.to_owned();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("listener starts");
+    let token = std::fs::read_to_string(token_path).expect("listener token");
+    for _ in 0..6 {
+        // Separate authenticated requests exercise recent activity without a persistent connection.
+        let host = address.strip_prefix("http://").expect("HTTP origin");
+        let mut stream = tokio::net::TcpStream::connect(host).await.expect("daemon remains reachable");
+        stream
+            .write_all(
+                format!("GET /v1/hello HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n", token.trim())
+                    .as_bytes(),
+            )
+            .await
+            .expect("request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("response");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!running.is_finished(), "recent HTTP traffic must prevent idle exit");
+    }
+    // A quiet client must not pin the daemon forever through its session or pool.
+    tokio::time::timeout(Duration::from_secs(5), &mut running)
+        .await
+        .expect("idle exit after traffic stops")
+        .expect("server task")
+        .expect("server shuts down cleanly");
 }

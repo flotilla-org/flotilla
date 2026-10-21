@@ -358,12 +358,20 @@ pub struct DaemonServer {
     state_dir: PathBuf,
 }
 
-struct EnvironmentClientLease {
+struct ClientActivityLease {
     count: Arc<AtomicUsize>,
     notify: Arc<Notify>,
 }
 
-impl Drop for EnvironmentClientLease {
+impl ClientActivityLease {
+    fn acquire(count: Arc<AtomicUsize>, notify: Arc<Notify>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        notify.notify_one();
+        Self { count, notify }
+    }
+}
+
+impl Drop for ClientActivityLease {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::SeqCst);
         self.notify.notify_one();
@@ -401,9 +409,7 @@ impl DaemonServer {
                                     let environment = environment.clone();
                                     let shutdown = shutdown.clone();
                                     let http_router = http_router.clone();
-                                    client_count.fetch_add(1, Ordering::SeqCst);
-                                    client_notify.notify_one();
-                                    let lease = EnvironmentClientLease { count: client_count.clone(), notify: client_notify.clone() };
+                                    let lease = ClientActivityLease::acquire(client_count.clone(), client_notify.clone());
                                     connections.spawn(async move {
                                         let _lease = lease;
                                         let mut stream = stream;
@@ -598,7 +604,19 @@ impl DaemonServer {
             if let Ok(address) = listener.local_addr() {
                 info!(%address, origin = listener.origin(), "daemon HTTP listening");
             }
-            let router = self.http_router.clone();
+            let count = self.client_count.clone();
+            let notify = self.client_notify.clone();
+            // TCP clients use short requests as well as persistent connections. Count
+            // admitted requests and restart the idle interval when each one finishes;
+            // a browser session alone must not keep an unused daemon alive forever.
+            let router = self.http_router.clone().layer(axum::middleware::from_fn(move |request, next: axum::middleware::Next| {
+                let count = count.clone();
+                let notify = notify.clone();
+                async move {
+                    let _lease = ClientActivityLease::acquire(count, notify);
+                    next.run(request).await
+                }
+            }));
             let shutdown = self.shutdown_rx.clone();
             tokio::spawn(async move {
                 let serving = listener.serve(router, shutdown_signal(shutdown.clone()));
