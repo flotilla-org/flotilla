@@ -6,8 +6,9 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress};
 use flotilla_resources::{
     address::leaf_record_name, evaluate_leaf, expected_change_request_leaves, external_patches, Artifact, ArtifactLeafSubject,
-    ChangeRequest, Convoy, ConvoyAttention, ConvoyPhase, HoldAct, Issue, ObservedChecks, ResourceObject, StatusPatch, TerminalSession,
-    TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    ChangeRequest, Convoy, ConvoyAttention, ConvoyPhase, HoldAct, Issue, ObservedChecks, ResourceError, ResourceObject, StatusPatch,
+    TerminalSession, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::stalls::{is_active_change_request_probe, is_conflict_probe, is_merged_settlement_probe};
@@ -138,6 +139,14 @@ impl<'a> FailureWriter<'a> {
     fn written(&mut self) {
         self.in_flight = None;
     }
+
+    /// The convoy is gone: nothing can record its failures, so drop them all
+    /// and free the slot rather than keep them pending for the daemon's life.
+    fn abandon(&mut self) {
+        self.in_flight = None;
+        self.pending.lock().expect("pending turn-delivery failures").remove(&self.key);
+        self.released = true;
+    }
 }
 
 impl Drop for FailureWriter<'_> {
@@ -186,8 +195,14 @@ impl LeafSubscriptionTable {
         let mut writer = FailureWriter::new(&self.inner.pending_failures, key);
         let convoys = self.inner.backend.clone().using::<Convoy>(namespace);
         while let Some(failures) = writer.next_batch() {
-            self.write_delivery_failures(&convoys, convoy, failures).await?;
-            writer.written();
+            match self.write_delivery_failures(&convoys, convoy, failures).await {
+                Ok(()) => writer.written(),
+                Err(error @ ResourceError::NotFound { .. }) => {
+                    writer.abandon();
+                    return Err(error.to_string());
+                }
+                Err(error) => return Err(error.to_string()),
+            }
         }
         Ok(())
     }
@@ -197,10 +212,9 @@ impl LeafSubscriptionTable {
         convoys: &flotilla_store::TypedResolver<Convoy>,
         convoy: &str,
         failures: BTreeMap<String, DeliveryError>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ResourceError> {
         let patch = FailTurnDeliveries { failures, now: Utc::now(), changed: Default::default() };
-        let written =
-            flotilla_store::apply_status_patch_checked(convoys, convoy, &patch, |_| Ok(())).await.map_err(|error| error.to_string())?;
+        let written = flotilla_store::apply_status_patch_checked(convoys, convoy, &patch, |_| Ok(())).await?;
         let status = written.status.unwrap_or_default();
         for source in patch.changed.lock().expect("changed turn-delivery failures").iter() {
             let (Some(error), Some(failure)) =

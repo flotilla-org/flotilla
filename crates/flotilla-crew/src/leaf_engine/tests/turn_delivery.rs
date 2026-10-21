@@ -1555,30 +1555,26 @@ async fn concurrent_delivery_failure_burst_records_every_source() {
     assert!(table.inner.pending_failures.lock().expect("pending").is_empty());
 }
 
-// #3455 part 4 (review): a batch whose write fails is not lost. It returns to
-// the pending set, the slot is freed, and the next failure for that convoy
-// writes it together with its own.
+// #3455 part 4 (review): a failure write for a convoy that no longer exists
+// drops its batch and frees the slot, so nothing stays pending for the
+// daemon's life; a later convoy of that name starts clean. A write that fails
+// for any other reason requeues through the writer's drop, as a cancelled
+// write does (covered below).
 #[tokio::test]
-async fn failed_failure_write_requeues_its_batch_for_the_next_writer() {
+async fn failure_write_for_a_missing_convoy_prunes_its_batch() {
     let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
     async {
         let (backend, wake, _) = project_supervision_case(&[]).await;
         let table = &wake.subscriptions;
         let error = DeliveryError::from("terminal was not ready".to_string());
-        // The convoy does not exist yet, so the write fails.
-        table.record_delivery_failure("flotilla", "late", "merged-unclaimed", &error).await.expect_err("write fails");
-        {
-            let pending = table.inner.pending_failures.lock().expect("pending");
-            let entry = &pending[&("flotilla".to_string(), "late".to_string())];
-            assert!(!entry.writing, "the failed writer frees its slot");
-            assert!(entry.failures.contains_key("merged-unclaimed"), "the failed batch is requeued");
-        }
+        let failed = table.record_delivery_failure("flotilla", "late", "merged-unclaimed", &error).await.expect_err("write fails");
+        assert!(failed.contains("not found"), "{failed}");
+        assert!(table.inner.pending_failures.lock().expect("pending").is_empty(), "a missing convoy's failures are pruned");
         create_convoy(&backend, "late", ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() }).await;
         table.record_delivery_failure("flotilla", "late", "checks-settled", &error).await.expect("next writer");
         let status = backend.using::<Convoy>("flotilla").get("late").await.expect("convoy").status.expect("status");
-        for source in ["merged-unclaimed", "checks-settled"] {
-            assert_eq!(status.turn_deliveries[source].failure.as_ref().expect("recorded").attempts, 1, "{source}");
-        }
+        assert_eq!(status.turn_deliveries["checks-settled"].failure.as_ref().expect("recorded").attempts, 1);
+        assert!(!status.turn_deliveries.contains_key("merged-unclaimed"), "the pruned failure is not resurrected");
         assert!(table.inner.pending_failures.lock().expect("pending").is_empty());
     }
     .with_subscriber(captured_subscriber(logs, tracing::Level::WARN))
