@@ -154,6 +154,7 @@ impl GitHubChangeRequest {
                 // repository reachability before treating the pull as absent.
                 if failure.response.as_ref().is_some_and(|response| response.status == 404) {
                     let repository = format!("repos/{}/pulls?state=all&per_page=1", self.repo_slug);
+                    // Propagate confirmation failures so retry classification uses their access/rate-limit evidence, not the pull's 404.
                     self.api.get_classified_response(&repository, execution_root(), &gh_api_channel_label("GET", &repository)).await?;
                     failure.error = ObservationError::NotFound(failure.error.to_string());
                 }
