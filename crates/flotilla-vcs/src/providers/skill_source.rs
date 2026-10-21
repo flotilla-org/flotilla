@@ -39,9 +39,17 @@ done
 cleanup() {
   rm -rf "$staged" "$sources"
   if [ -n "$cache_tmp" ]; then rm -rf "$cache_tmp"; fi
-  for marker in $token_markers; do rm -f -- "$marker"; done
+  while IFS= read -r marker; do
+    [ -z "$marker" ] || rm -f -- "$marker"
+  done <<EOF
+$token_markers
+EOF
   if [ "$retrying" != true ] && { [ "$cleanup_tokens" = true ] || [ "$succeeded" != true ]; }; then
-    for token_file in $token_files; do rm -f "$token_file"; done
+    while IFS= read -r token_file; do
+      [ -z "$token_file" ] || rm -f -- "$token_file"
+    done <<EOF
+$token_files
+EOF
   fi
 }
 print_git_stderr() {
@@ -102,14 +110,17 @@ while [ "$#" -gt 0 ]; do
     selected_count=$((selected_count - 1))
   done
   if [ ! -s "$selected_file" ]; then
-    if [ -n "$token_file" ]; then token_files="$token_files $token_file"; fi
+    if [ -n "$token_file" ]; then token_files="$token_files
+$token_file"; fi
     continue
   fi
   if [ -n "$token_file" ]; then
-    token_files="$token_files $token_file"
+    token_files="$token_files
+$token_file"
     marker="$token_file.in-use.$$"
     : >"$marker"
-    token_markers="$token_markers $marker"
+    token_markers="$token_markers
+$marker"
   fi
   if [ -n "$credential" ]; then
     if [ -z "$token_file" ] || [ ! -s "$token_file" ]; then
@@ -318,6 +329,35 @@ mod tests {
             let entries =
                 fs::read_dir(temp.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect::<std::collections::BTreeSet<_>>();
             assert_eq!(entries, expected_entries, "only the manifest, cache and published destinations remain");
+        }
+    }
+
+    // Cleanup must remove the original token and in-use marker as whole paths,
+    // even when whitespace and glob characters occur in their names.
+    #[test]
+    fn staging_cleanup_preserves_token_path_boundaries() {
+        for name in ["token with spaces", "token\twith\t tabs", "token[*]\\file"] {
+            let temp = tempfile::tempdir().unwrap();
+            let token = temp.path().join(name);
+            fs::write(&token, "").unwrap();
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(STAGE_SCRIPT)
+                .arg(STAGE_DIAGNOSTIC_PREFIX)
+                .arg("flotilla-stage-skills")
+                .arg(temp.path().join("manifest"))
+                .arg(temp.path().join("skills"))
+                .arg("false")
+                .arg(temp.path().join("cache"))
+                .args(["source", "https://example.test/skills", "revision"])
+                .arg(&token)
+                .args(["credential", "0", "1", "skill", "skill"])
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("credential credential is unavailable"));
+            assert!(!token.exists(), "token must be removed: {name:?}");
+            assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1, "only cache remains; no marker: {name:?}");
         }
     }
 

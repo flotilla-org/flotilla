@@ -1998,8 +1998,11 @@ impl CredentialStore {
                         .await
                         .map_err(|error| format!("write token file: {error}"))?;
                     let helper = format!(
-                        "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nprotocol=\nhost=\nwhile IFS='=' read -r key value; do\n  case \"$key\" in\n    protocol) protocol=$value ;;\n    host) host=$value ;;\n  esac\ndone\n[ \"$protocol\" = https ] || exit 0\n[ \"$host\" = {host}{} ] || exit 0\nprintf 'username=%s\\n' \"$FORGEJO_USERNAME\"\nprintf 'password='\ncat \"$FORGEJO_TOKEN_FILE\"\nprintf '\\n'\n",
-                        parsed_url.port().map(|port| format!(":{port}")).unwrap_or_default()
+                        "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nprotocol=\nhost=\nwhile IFS='=' read -r key value; do\n  case \"$key\" in\n    protocol) protocol=$value ;;\n    host) host=$value ;;\n  esac\ndone\n[ \"$protocol\" = https ] || exit 0\n[ \"$host\" = {} ] || exit 0\nprintf 'username=%s\\n' \"$FORGEJO_USERNAME\"\nprintf 'password='\ncat \"$FORGEJO_TOKEN_FILE\"\nprintf '\\n'\n",
+                        shell_single_quote(&match parsed_url.port() {
+                            Some(port) => format!("{host}:{port}"),
+                            None => host.to_string(),
+                        })
                     );
                     runner
                         .write_file_with_mode(Path::new(&helper_path), &helper, 0o700)
@@ -5898,6 +5901,78 @@ interactions:
 
         assert!(error.contains("multiple granted credentials target the same Git HTTPS host"), "unexpected error: {error}");
         assert!(runner.writes.lock().expect("writes lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn forgejo_helper_matches_literal_hosts() {
+        // Format-string glue: exercise port and shell metacharacter hosts through
+        // delivery, then require exact host matching from the real sh helper.
+        for host in ["forgejo.lab:3000", "forgejo.lab';false;'"] {
+            let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+            let forge = ForgeSpec::builder()
+                .forge_id("lab".to_string())
+                .kind(ForgeKind::Forgejo)
+                .hosts(BTreeSet::from(["forgejo.lab".to_string()]))
+                .https_url(format!("https://{host}"))
+                .git_ssh_host("forgejo.lab".to_string())
+                .build();
+            backend
+                .definitions::<Forge>("flotilla")
+                .create(&InputMeta::builder().name("lab".to_string()).build(), &forge)
+                .await
+                .expect("create Forge definition");
+            backend
+                .definitions::<CredentialSpec>("flotilla")
+                .create(
+                    &InputMeta::builder().name("forgejo-api".to_string()).build(),
+                    &CredentialSpecSpec {
+                        consumer: CredentialConsumer::Forgejo { forge_ref: "lab".to_string(), username: "crew".to_string() },
+                        source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
+                        lifecycle: CredentialLifecycle::Static,
+                        placement: CredentialPlacementRequirements::default(),
+                    },
+                )
+                .await
+                .expect("create credential declaration");
+            let runner = Arc::new(RecordingRunner::default());
+            let store = CredentialStore::new(
+                backend,
+                "flotilla",
+                Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "secret".to_string())]))),
+                EnvironmentBag::new(),
+                runner.clone(),
+                PathBuf::from("/tmp/flotilla-test-state"),
+            );
+            store.prepare("env-a", &BTreeSet::from(["forgejo-api".to_string()]), runner.clone()).await.expect("prepare Forgejo credential");
+            let helper = runner
+                .writes
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(path, _)| path.ends_with("git-credential-forgejo"))
+                .expect("rendered helper")
+                .1
+                .clone();
+            let temp = tempfile::tempdir().unwrap();
+            let token = temp.path().join("token");
+            std::fs::write(&token, "test-secret").unwrap();
+            for (request_host, expected) in [(host, "username=crew\npassword=test-secret\n"), ("other.lab", "")] {
+                use std::io::Write;
+                let mut child = std::process::Command::new("sh")
+                    .args(["-c", &helper, "helper", "get"])
+                    .env("FORGEJO_USERNAME", "crew")
+                    .env("FORGEJO_TOKEN_FILE", &token)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                write!(child.stdin.take().unwrap(), "protocol=https\nhost={request_host}\n\n").unwrap();
+                let output = child.wait_with_output().unwrap();
+                assert!(output.status.success(), "host {host}: {:?}", output);
+                assert_eq!(String::from_utf8(output.stdout).unwrap(), expected, "host {host}");
+            }
+        }
     }
 
     #[tokio::test]
