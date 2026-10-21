@@ -1592,6 +1592,10 @@ mod tests {
             .content;
             assert!(content.contains("--propose <resume|reduce-scope|fail>"), "{template}");
             assert!(!content.contains("crew fail"), "{template}");
+            // #3703: each task variant must teach settlement even with no admitted promises.
+            assert!(!content.contains("flotilla crew complete"), "{template}");
+            assert!(content.contains("flotilla crew promise --promise"), "{template}");
+            assert!(content.contains("every promise is kept or retracted"), "{template}");
         }
     }
 
@@ -1728,16 +1732,16 @@ mod tests {
         assert!(brief.contains("with the `pr-shepherd` skill for a GitHub destination, or through the injected Forgejo API credentials for a Forgejo destination"));
         assert!(!brief.contains("pull request using the `pr-shepherd` skill"));
         assert!(!brief.contains("Future events belong to a later engagement"));
-        assert!(brief.contains("claim's linked `## Decision ledger` comment"));
+        assert!(brief.contains("the crew's decision-ledger artifact"));
         // #2690: count both occurrences: inherited settlement and the shepherd delivery block's readiness gate.
         assert_eq!(brief.matches(SETTLEMENT_YIELD).count(), 2);
         // Select the inherited brief section before the fenced ledger example, which repeats its heading.
         let settlement = brief.split_once("\n## Decision ledger\n").expect("ledger section").1;
         assert!(settlement.contains(SETTLEMENT_YIELD));
-        assert!(brief.contains("A completion without a ledger is refused"));
+        assert!(brief.contains("Submit your own decision ledger after the clean final snapshot"));
         assert!(brief.contains("park the verified commit"));
         assert!(brief.contains("redispatched under the owning project"));
-        assert!(brief.contains("flotilla crew complete --message '<PR URL>'"));
+        assert!(brief.contains("flotilla crew submit --kind pr --reference '<PR URL>'"));
         assert!(brief.contains("Never use unauthenticated or anonymous GitHub API requests"));
         assert!(!brief.contains("wait-for-checks"));
         assert!(!brief.contains("No assignment was provided"));

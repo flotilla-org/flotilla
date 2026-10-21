@@ -345,6 +345,10 @@ class Contract(unittest.TestCase):
     def test_isolated_launch_baseline_completion_and_reaping(self):
         _, processes = self.exercise()
         self.assertTrue(processes.completed)
+        # #3703: automatic Done requires promises; this probe owes no forge PR.
+        probe = processes.manifests['WorkflowTemplate']['spec']['vessels'][0]['crew'][0]
+        self.assertEqual(probe['promises'], [{'kind': 'decision-ledger', 'owner': 'probe'}])
+        self.assertFalse(probe.get('deliverer', False))
         placement = processes.manifests['PlacementPolicy']['spec']['docker_per_vessel']
         self.assertEqual(placement['image'], canary.canary_image('sha256:' + 'a' * 64))
         self.assertNotIn('CrewImageBaseline', processes.manifests)
@@ -490,7 +494,28 @@ class Contract(unittest.TestCase):
             bin_dir.mkdir()
             # Stand-in for the CLI subprocess, not a Flotilla/model implementation.
             cli = bin_dir / 'flotilla'
-            cli.write_text('#!/bin/bash\nprintf "%s\\n" "$*" > "$CANARY_COMPLETE_LOG"\n')
+            cli.write_text("""#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+if args == ['crew', 'promise', '--promise', 'baseline', '--kind', 'decision-ledger']:
+    Path(os.environ['CANARY_COMPLETE_LOG'] + '.promise').touch()
+elif args[:2] == ['artifact', 'put']:
+    assert args[2:4] == ['--kind', 'decision-ledger'], args
+    assert Path(os.environ['CANARY_COMPLETE_LOG'] + '.promise').exists()
+    ledger = Path(args[4])
+    assert ledger.is_file() and ledger.parent == Path(os.environ['HOME'])
+    assert not ledger.resolve().is_relative_to(Path.cwd().resolve()), 'ledger must be outside checkout'
+    text = ledger.read_text()
+    for field in ['## Decision ledger', '1. **Brief silence:**', '**Choice:**',
+                  '**Alternative:**', '**If asking were free:**']:
+        assert field in text, field
+    Path(os.environ['CANARY_COMPLETE_LOG']).write_text('ledger published after promise')
+else:
+    raise SystemExit('unexpected settlement command: ' + ' '.join(args))
+""")
             cli.chmod(0o755)
             # Toolchain stand-ins: the stub reports what the image's PATH runs.
             for tool in ('cargo', 'rustc'):
@@ -500,7 +525,10 @@ class Contract(unittest.TestCase):
             if broken_toolchain:
                 (bin_dir / 'cargo').write_text('#!/bin/bash\necho "cargo 1.99.0 (stand-in)"\n'
                                                'echo "error: no default toolchain configured" >&2\nexit 1\n')
-            subprocess.check_call(['git', '-C', str(root), 'init', '-q'])
+            # Evidence lives outside the checkout, as it does in the vessel.
+            checkout = root / 'checkout'
+            checkout.mkdir()
+            subprocess.check_call(['git', '-C', str(checkout), 'init', '-q'])
             completion = root / 'completion'
             # HOME excludes user global config; NOSYSTEM excludes system config.
             environment = {'PATH': f'{bin_dir}:/usr/local/bin:/usr/bin:/bin', 'HOME': str(root),
@@ -513,7 +541,7 @@ class Contract(unittest.TestCase):
                 # Refuse Git's guessed identity so the real git var failure is exercised.
                 environment.update(GIT_CONFIG_COUNT='4', GIT_CONFIG_KEY_3='user.useConfigOnly', GIT_CONFIG_VALUE_3='true')
             stub = Path(__file__).with_name('fleet-canary-agent.sh')
-            process = subprocess.Popen(['bash', str(stub), str(root)], cwd=root, env=environment,
+            process = subprocess.Popen(['bash', str(stub), str(root)], cwd=checkout, env=environment,
                                        start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             try:
                 deadline = time.monotonic() + 5
@@ -545,7 +573,9 @@ class Contract(unittest.TestCase):
                 deadline = time.monotonic() + 5
                 while not completion.exists() and time.monotonic() < deadline:
                     time.sleep(0.02)
-                self.assertEqual(completion.read_text().strip(), 'crew complete --message fleet canary baseline verified')
+                self.assertTrue(completion.exists(), 'probe must declare its promise and publish the ledger')
+                self.assertEqual(completion.read_text().strip(),
+                                 'ledger published after promise')
                 self.assertIsNone(process.poll(), 'stub remains available until ordinary finalizers reap it')
             finally:
                 if process.poll() is None:

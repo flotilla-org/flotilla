@@ -300,7 +300,8 @@ class Canary:
             for item in self.list('hosts')))
         self.apply('WorkflowTemplate', 'fleet-canary', {
             'exit': 'claim', 'vessels': [{'name': 'work', 'crew': [
-                {'role': 'probe', 'selector': {'capability': 'code'}, 'completion_conditions': []}]}]})
+                {'role': 'probe', 'selector': {'capability': 'code'},
+                 'promises': [{'kind': 'decision-ledger', 'owner': 'probe'}]}]}]})
         self.cli('convoy', 'start', '--project', 'fleet-canary', '--name', 'probe',
                  '--branch', 'fleet-canary', '--workflow', 'fleet-canary', '--fulfilment', 'fleet-canary',
                  '--escalation-reason', 'fleet generation canary', '--agent', 'fleet-canary',
