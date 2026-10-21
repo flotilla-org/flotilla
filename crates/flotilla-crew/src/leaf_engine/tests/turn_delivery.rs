@@ -4,7 +4,7 @@ use flotilla_resources::{Observation, ObservedChangeRequestState, ObservedMergea
 use flotilla_store_memory::InMemoryBackend;
 use tracing::instrument::WithSubscriber;
 
-use crate::leaf_engine::turn_delivery::DeliveryError;
+use crate::leaf_engine::turn_delivery::{DeliveryError, FailureWriter, PendingFailureMap};
 
 // #2684: queue acceptance remains queued for every attention state. Only an
 // exact terminal receipt confirms submission; age raises advisory attention.
@@ -1553,4 +1553,73 @@ async fn concurrent_delivery_failure_burst_records_every_source() {
         assert_eq!(status.turn_deliveries[&format!("turn-{index}")].failure.as_ref().expect("failure").attempts, 1);
     }
     assert!(table.inner.pending_failures.lock().expect("pending").is_empty());
+}
+
+// #3455 part 4 (review): a batch whose write fails is not lost. It returns to
+// the pending set, the slot is freed, and the next failure for that convoy
+// writes it together with its own.
+#[tokio::test]
+async fn failed_failure_write_requeues_its_batch_for_the_next_writer() {
+    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    async {
+        let (backend, wake, _) = project_supervision_case(&[]).await;
+        let table = &wake.subscriptions;
+        let error = DeliveryError::from("terminal was not ready".to_string());
+        // The convoy does not exist yet, so the write fails.
+        table.record_delivery_failure("flotilla", "late", "merged-unclaimed", &error).await.expect_err("write fails");
+        {
+            let pending = table.inner.pending_failures.lock().expect("pending");
+            let entry = &pending[&("flotilla".to_string(), "late".to_string())];
+            assert!(!entry.writing, "the failed writer frees its slot");
+            assert!(entry.failures.contains_key("merged-unclaimed"), "the failed batch is requeued");
+        }
+        create_convoy(&backend, "late", ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() }).await;
+        table.record_delivery_failure("flotilla", "late", "checks-settled", &error).await.expect("next writer");
+        let status = backend.using::<Convoy>("flotilla").get("late").await.expect("convoy").status.expect("status");
+        for source in ["merged-unclaimed", "checks-settled"] {
+            assert_eq!(status.turn_deliveries[source].failure.as_ref().expect("recorded").attempts, 1, "{source}");
+        }
+        assert!(table.inner.pending_failures.lock().expect("pending").is_empty());
+    }
+    .with_subscriber(captured_subscriber(logs, tracing::Level::WARN))
+    .await;
+}
+
+// #3455 part 4 (review): a writer cancelled mid-write returns its batch and
+// frees the slot; a failure recorded meanwhile keeps precedence for its source.
+// A writer that found nothing left releases in the same critical section, so
+// its drop cannot free a newer writer's slot.
+#[test]
+fn failure_writer_requeues_on_cancel_and_never_frees_a_newer_slot() {
+    let pending = PendingFailureMap::default();
+    let key = ("flotilla".to_string(), "convoy".to_string());
+    let error = |reason: &str| DeliveryError::from(reason.to_string());
+    let seed = |pending: &PendingFailureMap, source: &str, reason: &str| {
+        let mut map = pending.lock().expect("pending");
+        let entry = map.entry(key.clone()).or_default();
+        entry.failures.insert(source.to_string(), error(reason));
+        entry.writing = true;
+    };
+    seed(&pending, "a", "old a");
+    seed(&pending, "b", "old b");
+    let mut writer = FailureWriter::new(&pending, key.clone());
+    assert_eq!(writer.next_batch().expect("batch").len(), 2);
+    // A newer failure for `a` arrives while the batch is in flight; then the firing is cancelled.
+    seed(&pending, "a", "new a");
+    drop(writer);
+    {
+        let map = pending.lock().expect("pending");
+        let entry = &map[&key];
+        assert!(!entry.writing);
+        assert_eq!(entry.failures["a"].reason, "new a", "the newer failure keeps precedence");
+        assert_eq!(entry.failures["b"].reason, "old b", "the abandoned batch is requeued");
+    }
+    // A writer that drains to empty releases at once; a newer writer's slot survives its drop.
+    pending.lock().expect("pending").get_mut(&key).expect("entry").writing = true;
+    let mut writer = FailureWriter::new(&pending, key.clone());
+    writer.next_batch().expect("batch");
+    assert!(writer.next_batch().is_none());
+    seed(&pending, "c", "newer writer");
+    drop(writer);
+    assert!(pending.lock().expect("pending")[&key].writing, "a newer writer keeps its slot");
 }

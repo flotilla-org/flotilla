@@ -119,7 +119,7 @@ struct LeafSubscriptionTableInner {
     turn_delivery: Mutex<Arc<dyn TurnDeliveryActuator>>,
     episode_limit: u32,
     /// Turn-delivery failures awaiting their convoy's single status write (#3455).
-    pending_failures: std::sync::Mutex<HashMap<(String, String), turn_delivery::PendingFailures>>,
+    pending_failures: turn_delivery::PendingFailureMap,
     decisions: crate::decision_log::DecisionLog,
     supervisor_context: Mutex<HashMap<(String, String), String>>,
     #[cfg(test)]
