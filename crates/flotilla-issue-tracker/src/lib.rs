@@ -1,4 +1,5 @@
 //! Forge-neutral source-addressed issue providers and mission-field decoding.
+pub mod match_fields;
 pub mod mission_fields;
 
 use std::sync::Arc;
@@ -39,6 +40,9 @@ pub trait IssueProvider: Send + Sync {
     }
     fn supports(&self, source: &IssueSource) -> bool;
 
+    /// Returns one native page after provider-interpreted project filtering.
+    /// Pages may be short or empty with `has_more = true`; callers must use
+    /// `has_more`, rather than item count, to decide whether to request more.
     async fn query(&self, source: &IssueSource, params: &IssueQuery, page: u32, count: usize) -> Result<IssueResultPage, String>;
 
     async fn fetch_by_id(&self, reference: &IssueRef) -> Result<Issue, String>;
