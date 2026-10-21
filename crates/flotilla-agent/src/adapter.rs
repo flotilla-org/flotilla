@@ -998,6 +998,10 @@ fn codex_composer_visible(screen: &str) -> bool {
 /// may not be the last prompt row. Otherwise the live composer's draft text,
 /// except a selection row, is named with whether it looks like a stray
 /// terminal reply.
+///
+/// Precondition: the caller has already classified `screen` as
+/// `Unobservable`. The "Back to bottom" and last-`›`-row checks would match
+/// transcript text on screens the attention classifier reads otherwise.
 fn codex_obstruction(screen: &str) -> Option<flotilla_resources::ScreenObstruction> {
     let lines = screen.lines().map(str::trim).collect::<Vec<_>>();
     if lines.iter().any(|line| line.contains("Back to bottom")) {
