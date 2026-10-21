@@ -303,7 +303,7 @@ pub(super) async fn handle(
         CallerAuth::Socket(None) => {
             return encoding.error(StatusCode::FORBIDDEN, "CallerIdentityUnavailable: socket peer credentials unavailable")
         }
-        CallerAuth::Hook(_) => return encoding.error(StatusCode::FORBIDDEN, "a hook token reaches only the hook routes"),
+        CallerAuth::Hook(_, _) => return encoding.error(StatusCode::FORBIDDEN, "a hook token reaches only the hook routes"),
         CallerAuth::Anonymous => return encoding.error(StatusCode::UNAUTHORIZED, "authentication required"),
     };
     if transport_bound && method == Method::DELETE && command_resource.is_some() {
@@ -722,10 +722,10 @@ mod tests {
                 ("POST", "/v1/commands", Some(watch_command())),
                 ("GET", "/v1/commands/00000000-0000-0000-0000-000000000001", None),
             ] {
-                let caller = CallerAuth::Hook(flotilla_protocol::AgentHookTerminalRef {
-                    namespace: "flotilla".into(),
-                    session_name: "crew-session".into(),
-                });
+                let caller = CallerAuth::Hook(
+                    flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: "crew-session".into() },
+                    "generation".into(),
+                );
                 let reply = h.call(method, path, body, cbor, caller).await;
                 assert_eq!(reply.0, StatusCode::FORBIDDEN);
                 assert_eq!(reply.1["message"], "a hook token reaches only the hook routes");

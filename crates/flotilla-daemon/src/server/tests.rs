@@ -6595,7 +6595,10 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
                     ListenerOrigin::default(),
                 )
                 .into_router()
-                .layer(Extension(CallerAuth::Hook(terminal.clone())));
+                .layer(Extension(CallerAuth::Hook(
+                    terminal.clone(),
+                    terminals.get(&name).await.expect("terminal").metadata.creation_timestamp.to_rfc3339(),
+                )));
                 let (harness, parser) = flotilla_agent::parser_for_harness(harness_name).unwrap();
                 let interrupt =
                     if harness_name == "codex" { ("interrupt", "Interrupt") } else { ("post-tool-use-failure", "PostToolUseFailure") };

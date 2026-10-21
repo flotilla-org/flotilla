@@ -536,9 +536,12 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 // loopback TCP (#3247); vessel sessions keep command hooks until their
                 // loopback forwarder (#3485). The token binds the hooks to this terminal.
                 if spec.env_ref == self.state.host_direct_environment_name && requirement.adapter == "claude-code" {
-                    if let Some(hooks) =
-                        self.state.hook_endpoint.as_ref().and_then(|endpoint| endpoint.claude_code_launch(&context.namespace, name))
-                    {
+                    let hooks = if let Some(endpoint) = self.state.hook_endpoint.as_ref() {
+                        endpoint.claude_code_launch(&self.state.daemon.resource_backend(), &context.namespace, name).await
+                    } else {
+                        None
+                    };
+                    if let Some(hooks) = hooks {
                         info!(session = %name, url = %hooks.base_url, "Claude Code hooks post over HTTP");
                         credential_env.retain(|(key, _)| key != CLAUDE_CODE_HOOK_URL_ENV && key != CLAUDE_CODE_HOOK_TOKEN_ENV);
                         credential_env.extend([

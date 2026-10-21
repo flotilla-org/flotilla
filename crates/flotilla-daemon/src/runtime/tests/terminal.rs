@@ -646,6 +646,13 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
             pool: "fake-terminals".to_string(),
         };
         let session_name = "terminal-demo-work-coder";
+        let backend = daemon.resource_backend();
+        backend
+            .clone()
+            .using::<flotilla_resources::TerminalSession>(NAMESPACE)
+            .create(&flotilla_resources::InputMeta::builder().name(session_name.to_string()).build(), &spec)
+            .await
+            .expect("session");
         TerminalControllerRuntime { state }.ensure_session(session_name, &spec, &[]).await.expect("launch host-direct Claude Code");
 
         let ensured = pool.ensured.lock().await;
@@ -658,7 +665,7 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
         let stop = &settings["hooks"]["Stop"][0]["hooks"][0];
         match &endpoint {
             Some(endpoint) => {
-                let expected = endpoint.claude_code_launch(NAMESPACE, session_name).expect("endpoint");
+                let expected = endpoint.claude_code_launch(&backend, NAMESPACE, session_name).await.expect("endpoint");
                 assert_eq!(value(flotilla_agent::CLAUDE_CODE_HOOK_TOKEN_ENV), Some(expected.token));
                 assert_eq!(stop["type"], "http");
                 assert_eq!(stop["url"], "http://127.0.0.1:7878/v1/hooks/claude-code/stop");

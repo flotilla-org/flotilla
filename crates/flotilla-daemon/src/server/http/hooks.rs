@@ -4,10 +4,12 @@
 //! answers with an empty 2xx (a command hook that printed nothing).
 //!
 //! A host-direct crew session authenticates with a hook token bound to its terminal. The
-//! token is an HMAC of the terminal's namespace and session name under a key kept in the
-//! state directory, so it outlives flotillad restarts that replace the listener's file
+//! token is an HMAC of the terminal's namespace, session name and creation timestamp under
+//! a key kept in the state directory, so it outlives flotillad restarts that replace the listener's file
 //! token, as running crews do. It authenticates only these routes, and only for its own
-//! terminal: the caller's identity comes from the token, never from the request body.
+//! terminal instance: the caller's identity comes from the token, never from the request
+//! body. The route refuses tokens for missing, deleting or recreated sessions. Legacy v1
+//! tokens lack the instance binding and are refused; those crews must relaunch once.
 //!
 //! Tokens do not expire. To rotate the key, stop flotillad, delete `http/hook-key` beneath
 //! its state directory and start it again: a fresh key is created, every token minted
@@ -44,6 +46,8 @@ use flotilla_agent::{
     HarnessHookParser,
 };
 use flotilla_protocol::{AgentHarness, AgentHookEvent, AgentHookTerminalRef};
+use flotilla_resources::TerminalSession;
+use flotilla_store::ResourceBackend;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -59,8 +63,8 @@ pub(in crate::server) const CLAUDE_CODE_HOOK_ROUTE: &str = "/v1/hooks/claude-cod
 /// The hook key's file, beside the listener's token in its private directory.
 pub(in crate::server) const HOOK_KEY_FILE: &str = "hook-key";
 
-const TOKEN_VERSION: &str = "v1";
-const MAC_CONTEXT: &[u8] = b"flotilla-agent-hook-v1";
+const TOKEN_VERSION: &str = "v2";
+const MAC_CONTEXT: &[u8] = b"flotilla-agent-hook-v2";
 
 /// The key hook tokens are signed with. Unlike the listener's file token it is kept across
 /// restarts: crews launched by an earlier flotillad still hold tokens it minted.
@@ -125,9 +129,9 @@ impl HookKey {
         Some(Self(key))
     }
 
-    fn mac(&self, terminal: &AgentHookTerminalRef) -> Hmac<Sha256> {
+    fn mac(&self, terminal: &AgentHookTerminalRef, generation: &str) -> Hmac<Sha256> {
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.0).expect("HMAC accepts any key length");
-        for part in [MAC_CONTEXT, terminal.namespace.as_bytes(), terminal.session_name.as_bytes()] {
+        for part in [MAC_CONTEXT, terminal.namespace.as_bytes(), terminal.session_name.as_bytes(), generation.as_bytes()] {
             mac.update(&(part.len() as u64).to_be_bytes());
             mac.update(part);
         }
@@ -135,22 +139,23 @@ impl HookKey {
     }
 
     /// The hook token for one terminal session.
-    pub(in crate::server) fn mint(&self, terminal: &AgentHookTerminalRef) -> String {
-        let signature = self.mac(terminal).finalize().into_bytes();
+    pub(in crate::server) fn mint(&self, terminal: &AgentHookTerminalRef, generation: &str) -> String {
+        let signature = self.mac(terminal, generation).finalize().into_bytes();
         format!(
-            "{TOKEN_VERSION}.{}.{}.{}",
+            "{TOKEN_VERSION}.{}.{}.{}.{}",
             URL_SAFE_NO_PAD.encode(&terminal.namespace),
             URL_SAFE_NO_PAD.encode(&terminal.session_name),
+            URL_SAFE_NO_PAD.encode(generation),
             URL_SAFE_NO_PAD.encode(signature)
         )
     }
 
     /// The terminal a hook token was minted for, when its signature verifies (in constant
     /// time).
-    pub(in crate::server) fn verify(&self, token: &str) -> Option<AgentHookTerminalRef> {
+    pub(in crate::server) fn verify(&self, token: &str) -> Option<(AgentHookTerminalRef, String)> {
         let mut parts = token.split('.');
-        let (Some(TOKEN_VERSION), Some(namespace), Some(session), Some(signature), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
+        let (Some(TOKEN_VERSION), Some(namespace), Some(session), Some(generation), Some(signature), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
         else {
             return None;
         };
@@ -162,8 +167,9 @@ impl HookKey {
         if terminal.namespace.is_empty() || terminal.session_name.is_empty() {
             return None;
         }
-        self.mac(&terminal).verify_slice(&decode(signature)?).ok()?;
-        Some(terminal)
+        let generation = String::from_utf8(decode(generation)?).ok()?;
+        self.mac(&terminal, &generation).verify_slice(&decode(signature)?).ok()?;
+        Some((terminal, generation))
     }
 }
 
@@ -213,10 +219,12 @@ impl HookEndpoint {
 
     /// The Claude Code hook URL and token for a terminal session, when flotillad listens on
     /// loopback TCP.
-    pub fn claude_code_launch(&self, namespace: &str, session_name: &str) -> Option<HookLaunch> {
+    pub async fn claude_code_launch(&self, backend: &ResourceBackend, namespace: &str, session_name: &str) -> Option<HookLaunch> {
         let (origin, key) = self.0.get()?;
         let terminal = AgentHookTerminalRef { namespace: namespace.to_owned(), session_name: session_name.to_owned() };
-        Some(HookLaunch { base_url: format!("{origin}{HOOKS_PATH}/claude-code"), token: key.mint(&terminal) })
+        let session = backend.clone().using::<TerminalSession>(namespace).get(session_name).await.ok()?;
+        let generation = session.metadata.creation_timestamp.to_rfc3339();
+        Some(HookLaunch { base_url: format!("{origin}{HOOKS_PATH}/claude-code"), token: key.mint(&terminal, &generation) })
     }
 }
 
@@ -255,7 +263,15 @@ async fn handle(
     harness: AgentHarness,
 ) -> Response {
     let (terminal, policy) = match caller {
-        CallerAuth::Hook(terminal) => (Some(terminal), HookIdentityPolicy::PlacedTerminal),
+        CallerAuth::Hook(terminal, generation) => {
+            let session = state.backend.clone().using::<TerminalSession>(&terminal.namespace).get(&terminal.session_name).await;
+            match session {
+                Ok(session)
+                    if session.metadata.creation_timestamp.to_rfc3339() == generation && session.metadata.deletion_timestamp.is_none() => {}
+                _ => return auth::unauthenticated(),
+            }
+            (Some(terminal), HookIdentityPolicy::PlacedTerminal)
+        }
         CallerAuth::Socket(_) | CallerAuth::Bearer => (None, HookIdentityPolicy::NativeSession),
         CallerAuth::Anonymous => return auth::unauthenticated(),
         CallerAuth::Environment { .. } | CallerAuth::Session(_) => {
@@ -308,7 +324,7 @@ async fn handle(
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => {
             tracing::warn!(err = %error, "failed to process agent hook event");
-            auth::refusal(StatusCode::INTERNAL_SERVER_ERROR, &error)
+            auth::refusal(StatusCode::INTERNAL_SERVER_ERROR, "failed to process agent hook event")
         }
     }
 }
