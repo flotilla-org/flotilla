@@ -428,24 +428,31 @@ fn lifecycle_end_refuses<K: LifecycleKind>(
 // ---------------------------------------------------------------------------
 // AgentSession (spec `machines/agent_session.qnt`)
 
-/// The spec's `Live(Channel) | Ended(EndReason)`.
+/// Lifecycle labels with their current observed activity, as in the spec.
 fn session_value(state: &AgentSessionState) -> Value {
+    use flotilla_state_machines::machines::agent_session::Activity;
+    let observation = state.observation().map_or_else(|| variant("Unobserved", serde_json::json!({"#tup":[]})), |o| {
+        variant("Observed", serde_json::json!({
+            "activity": variant(match o.activity { Activity::Working => "Working", Activity::Idle => "Idle", Activity::Interrupted => "Interrupted" }, serde_json::json!({"#tup":[]})),
+            "since": serde_json::json!({"#bigint": (o.activity_since.0 / 60_000_000).to_string()}),
+            "cause": o.activity_cause,
+        }))
+    });
     match state {
-        AgentSessionState::Live { channel } => variant(
+        AgentSessionState::Live { channel, .. } => variant(
             "Live",
-            constant(match channel {
-                Channel::Detached => "Detached",
-                Channel::Attached => "Attached",
+            serde_json::json!({
+                "channel": variant(match channel { Channel::Detached => "Detached", Channel::Attached => "Attached" }, serde_json::json!({"#tup":[]})),
+                "observation": observation,
             }),
         ),
-        AgentSessionState::Ended { reason } => variant("Ended", constant(end_reason_name(*reason))),
-    }
-}
-
-fn end_reason_name(reason: EndReason) -> &'static str {
-    match reason {
-        EndReason::Completed => "Completed",
-        EndReason::Lost => "Lost",
+        AgentSessionState::Ended { reason, .. } => variant(
+            "Ended",
+            serde_json::json!({
+                "reason": variant(match reason { EndReason::Completed => "Completed", EndReason::Lost => "Lost" }, serde_json::json!({"#tup":[]})),
+                "observation": observation,
+            }),
+        ),
     }
 }
 

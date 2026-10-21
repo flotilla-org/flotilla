@@ -139,6 +139,29 @@ impl Sessions {
         home.apply(name, End { reason, observed }, &world, now).map(|_| ()).map_err(|error| format!("AgentSession `{name}`: {error:?}"))
     }
 
+    /// Records only a real hook activity change; repeated and late hooks write nothing.
+    pub fn observe(
+        &self,
+        name: &str,
+        activity: flotilla_state_machines::machines::agent_session::Activity,
+        cause: String,
+        now: Timestamp,
+    ) -> Result<bool, String> {
+        use flotilla_state_machines::{
+            machines::agent_session::{AgentSessionRefusal, Observe},
+            WriteError,
+        };
+        let mut home = self.home.lock().expect("session home");
+        if home.get(name).is_none() {
+            home.create(name, (), &MemoryAgentSessionWorld::default(), now).map_err(|error| format!("AgentSession `{name}`: {error:?}"))?;
+        }
+        match home.apply(name, Observe { activity, cause }, &MemoryAgentSessionWorld::default(), now) {
+            Ok(_) => Ok(true),
+            Err(WriteError::Refused(AgentSessionRefusal::UnchangedActivity | AgentSessionRefusal::AlreadyEnded)) => Ok(false),
+            Err(error) => Err(format!("AgentSession `{name}`: {error:?}")),
+        }
+    }
+
     pub fn get(&self, name: &str) -> Option<Resource<AgentSession>> {
         self.home.lock().expect("session home").get(name).cloned()
     }

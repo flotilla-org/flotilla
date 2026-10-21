@@ -12,7 +12,7 @@
 //! [`AgentSessionSpec`]: the state and the edge log as `history`, receipts
 //! among its edges.
 
-use flotilla_schema::Stored;
+use flotilla_schema::{Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -39,19 +39,56 @@ pub enum EndReason {
     Lost,
 }
 
+/// The latest hook observation; absent until a hook reports activity.
+#[derive(Clone, Debug, PartialEq, Eq, Stored)]
+pub struct ActivityObservation {
+    pub activity: Activity,
+    pub activity_since: Timestamp,
+    pub activity_cause: String,
+}
+
 states! {
-    /// The spec's `State`, with Ended carrying its reason.
+    /// Lifecycle labels stay Live and Ended; activity is observed data.
     pub enum AgentSessionState => AgentSessionLabel {
-        Live { channel: Channel } = "li",
-        Ended { reason: EndReason } = "en",
+        Live { channel: Channel, activity: Option<Activity>, activity_since: Option<Timestamp>, activity_cause: Option<String> } = "li",
+        Ended { reason: EndReason, activity: Option<Activity>, activity_since: Option<Timestamp>, activity_cause: Option<String> } = "en",
     }
 }
 
 impl AgentSessionState {
+    pub fn observation(&self) -> Option<ActivityObservation> {
+        let (activity, activity_since, activity_cause) = match self {
+            Self::Live { activity, activity_since, activity_cause, .. } | Self::Ended { activity, activity_since, activity_cause, .. } => {
+                (activity, activity_since, activity_cause)
+            }
+        };
+        Some(ActivityObservation { activity: (*activity)?, activity_since: (*activity_since)?, activity_cause: activity_cause.clone()? })
+    }
+
+    pub fn with_observation(mut self, observation: Option<ActivityObservation>) -> Self {
+        let (activity, activity_since, activity_cause) = match &mut self {
+            Self::Live { activity, activity_since, activity_cause, .. } | Self::Ended { activity, activity_since, activity_cause, .. } => {
+                (activity, activity_since, activity_cause)
+            }
+        };
+        *activity = observation.as_ref().map(|o| o.activity);
+        *activity_since = observation.as_ref().map(|o| o.activity_since);
+        *activity_cause = observation.map(|o| o.activity_cause);
+        self
+    }
+
+    pub fn live(channel: Channel) -> Self {
+        Self::Live { channel, activity: None, activity_since: None, activity_cause: None }
+    }
+
+    pub fn ended(reason: EndReason) -> Self {
+        Self::Ended { reason, activity: None, activity_since: None, activity_cause: None }
+    }
+
     /// The channel, while Live.
     pub fn channel(&self) -> Option<Channel> {
         match self {
-            AgentSessionState::Live { channel } => Some(*channel),
+            AgentSessionState::Live { channel, .. } => Some(*channel),
             AgentSessionState::Ended { .. } => None,
         }
     }
@@ -59,7 +96,7 @@ impl AgentSessionState {
     /// The reason, once Ended.
     pub fn end_reason(&self) -> Option<EndReason> {
         match self {
-            AgentSessionState::Ended { reason } => Some(*reason),
+            AgentSessionState::Ended { reason, .. } => Some(*reason),
             AgentSessionState::Live { .. } => None,
         }
     }
@@ -100,6 +137,7 @@ edges! {
         Detach(Detach) = "de",
         End(End) = "en",
         Receive(Receive) = "rv",
+        Observe(Observe) = "ob",
     }
 }
 
@@ -123,6 +161,7 @@ pub enum AgentSessionRefusal {
     AlreadyEnded,
     WrongChannel,
     MissingEvidence,
+    UnchangedActivity,
 }
 
 impl From<Ended<AgentSessionLabel>> for AgentSessionRefusal {
@@ -164,8 +203,26 @@ impl Source<ChannelPresence> for MemoryAgentSessionWorld {
 
 pub struct AgentSession;
 
-/// A session's spec: nothing, since the session's name is its identity. It
-/// declares the stored AgentSession (kind code `as`).
+/// Activity observed by a harness hook, independent of session machine state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
+pub enum Activity {
+    #[store(code = "wo")]
+    Working,
+    #[store(code = "id")]
+    Idle,
+    #[store(code = "in")]
+    Interrupted,
+}
+
+/// Records a hook's activity only when it changes. Cause is the native event
+/// name, never tool arguments, call identifiers or transcript contents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Observe {
+    pub activity: Activity,
+    pub cause: String,
+}
+
+/// The session's name is its identity (kind code `as`).
 #[derive(Clone, Debug, PartialEq, Eq, Default, Stored)]
 #[store(kind = "AgentSession", code = "as", state = AgentSessionState)]
 pub struct AgentSessionSpec {}
@@ -188,7 +245,7 @@ impl Machine for AgentSession {
                     .to([Live])
                     .changes(["channel"])
                     .gate("the channel is detached and is observed present", gate_attach)
-                    .effect(|_, _, _| AgentSessionState::Live { channel: Channel::Attached }),
+                    .effect(|_, state, _| AgentSessionState::live(Channel::Attached).with_observation(state.observation())),
             )
             .edge(
                 EdgeDef::<Self, Detach>::new()
@@ -196,7 +253,7 @@ impl Machine for AgentSession {
                     .to([Live])
                     .changes(["channel"])
                     .gate("the channel is attached and is observed absent", gate_detach)
-                    .effect(|_, _, _| AgentSessionState::Live { channel: Channel::Detached }),
+                    .effect(|_, state, _| AgentSessionState::live(Channel::Detached).with_observation(state.observation())),
             )
             .edge(
                 EdgeDef::<Self, Receive>::new()
@@ -207,18 +264,36 @@ impl Machine for AgentSession {
                     .effect(|_, state, _| state),
             )
             .edge(
+                EdgeDef::<Self, Observe>::new()
+                    .from([Live])
+                    .to([Live])
+                    .changes(["activity", "activity_since", "activity_cause"])
+                    .gate("the observed activity differs from the current activity", |h, edge| {
+                        if h.state().observation().is_some_and(|old| old.activity == edge.activity) {
+                            Err(AgentSessionRefusal::UnchangedActivity)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .effect(|h, state, edge| {
+                        AgentSessionState::live(state.channel().expect("observe is Live only")).with_observation(Some(
+                            ActivityObservation { activity: edge.activity, activity_since: h.now(), activity_cause: edge.cause.clone() },
+                        ))
+                    }),
+            )
+            .edge(
                 EdgeDef::<Self, End>::new()
                     .from([Live])
                     .to([Ended])
                     .changes(["reason"])
                     .gate("the session's end is observed with this reason", gate_end)
-                    .effect(|_, _, end| AgentSessionState::Ended { reason: end.reason }),
+                    .effect(|_, state, end| AgentSessionState::ended(end.reason).with_observation(state.observation())),
             )
             .end(Ended, "the session has ended")
     }
 
     fn admit(_: &mut Admission<'_, AgentSession>, _: ()) -> Result<(AgentSessionSpec, AgentSessionState), AgentSessionRefusal> {
-        Ok((AgentSessionSpec {}, AgentSessionState::Live { channel: Channel::Detached }))
+        Ok((AgentSessionSpec::default(), AgentSessionState::live(Channel::Detached)))
     }
 }
 

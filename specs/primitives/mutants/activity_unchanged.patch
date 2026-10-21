@@ -1,0 +1,5 @@
+--- a/machines/agent_session.qnt
++++ b/machines/agent_session.qnt
+@@ -19,1 +19,1 @@
+-      | Observe(o) => if (sameActivity(a.observation, o.activity)) Refused(UnchangedActivity)
++      | Observe(o) => if (false) Refused(UnchangedActivity)

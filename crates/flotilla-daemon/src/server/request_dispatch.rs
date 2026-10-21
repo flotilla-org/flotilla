@@ -483,7 +483,15 @@ impl<'a> RequestDispatcher<'a> {
         let Request::AgentHook { event } = request else {
             return Message::error_response(id, "AgentHook request selected the wrong handler");
         };
-        match handle_agent_hook(&self.daemon.resource_backend(), self.agent_state_store, self.hook_identity_policy, event).await {
+        match handle_agent_hook(
+            &self.daemon.resource_backend(),
+            self.agent_state_store,
+            self.hook_identity_policy,
+            self.daemon.message_primitives(),
+            event,
+        )
+        .await
+        {
             Ok(()) => Message::ok_response(id, Response::AgentHook),
             Err(e) => {
                 warn!(err = %e, "failed to process agent hook event");
@@ -523,6 +531,7 @@ pub(super) async fn handle_agent_hook(
     backend: &flotilla_store::ResourceBackend,
     agent_state_store: &SharedAgentStateStore,
     hook_identity_policy: HookIdentityPolicy,
+    primitives: Option<std::sync::Arc<flotilla_core::primitives::MessagePrimitives>>,
     mut event: AgentHookEvent,
 ) -> Result<(), String> {
     use flotilla_protocol::AgentEventType;
@@ -609,11 +618,35 @@ pub(super) async fn handle_agent_hook(
     }
 
     let Some(terminal) = event.terminal.as_ref() else { return Ok(()) };
+    if let Some(primitives) = primitives {
+        use flotilla_state_machines::machines::agent_session::Activity;
+        let activity = match event.event_type {
+            AgentEventType::Active | AgentEventType::ToolActive => Some(Activity::Working),
+            AgentEventType::Idle => Some(Activity::Idle),
+            AgentEventType::Interrupted => Some(Activity::Interrupted),
+            _ => None,
+        };
+        if let (Some(activity), Some(cause)) = (activity, event.hook_event.as_ref()) {
+            // Resolve the transport-bound terminal by key before recording its hook.
+            backend
+                .using::<flotilla_resources::TerminalSession>(&terminal.namespace)
+                .get(&terminal.session_name)
+                .await
+                .map_err(|error| error.to_string())?;
+            let sessions = std::sync::Arc::clone(primitives.sessions());
+            let name = terminal.session_name.clone();
+            let cause = cause.clone();
+            let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
+            tokio::task::spawn_blocking(move || sessions.observe(&name, activity, cause, now))
+                .await
+                .map_err(|error| error.to_string())??;
+        }
+    }
     let state = match event.event_type {
         AgentEventType::Active | AgentEventType::ToolActive => flotilla_resources::TerminalAttentionState::Working,
         AgentEventType::Idle | AgentEventType::Started => flotilla_resources::TerminalAttentionState::Idle,
         AgentEventType::WaitingForPermission => flotilla_resources::TerminalAttentionState::NeedsInput,
-        AgentEventType::Ended | AgentEventType::NoChange => return Ok(()),
+        AgentEventType::Ended | AgentEventType::NoChange | AgentEventType::Interrupted => return Ok(()),
     };
     if !event.native_codex_hook {
         return crate::agent_attention::observe_hook_attention(

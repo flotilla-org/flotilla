@@ -226,6 +226,8 @@ pub enum AgentEventType {
     ToolActive,
     Idle,
     WaitingForPermission,
+    /// An observed abort; legacy attention is unchanged.
+    Interrupted,
     /// The event was informational and should not change agent status.
     NoChange,
 }
@@ -239,7 +241,7 @@ impl AgentEventType {
             AgentEventType::Active | AgentEventType::ToolActive => Some(AgentStatus::Active),
             AgentEventType::Idle => Some(AgentStatus::Idle),
             AgentEventType::WaitingForPermission => Some(AgentStatus::WaitingForPermission),
-            AgentEventType::NoChange => None,
+            AgentEventType::NoChange | AgentEventType::Interrupted => None,
         }
     }
 }
@@ -253,6 +255,9 @@ pub struct AgentHookEvent {
     pub harness: AgentHarness,
     /// What happened.
     pub event_type: AgentEventType,
+    /// Native hook event name, used as the cause of an activity change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_event: Option<String>,
     /// The agent's native session ID (if available).
     pub session_id: Option<String>,
     /// Model being used (if reported).

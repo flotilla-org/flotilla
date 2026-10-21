@@ -10,7 +10,8 @@ module agent_session_conformance {
     .union(Set(true, false).map(a => A::Detach({ channelAbsent: a })))
     .union(Set("turn", "notify", "mute").map(t => A::Receive({ message: 1, transport: t })))
     .union(Set(A::Completed, A::Lost).map(r => Set(true, false).map(o => A::End({ reason: r, observed: o }))).flatten())
-  action init = all { state' = A::Live(A::Detached), probe' = Started }
+    .union(Set(A::Working, A::Idle, A::Interrupted).map(a => Set("prompt", "tool").map(c => A::Observe({ activity: a, at: 1, cause: c }))).flatten())
+  action init = all { state' = A::initial(A::Detached), probe' = Started }
   action step = {
     nondet e = events.oneOf()
     val n = A::step(state, e)

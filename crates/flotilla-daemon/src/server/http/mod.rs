@@ -132,6 +132,7 @@ impl HttpRouter {
             .route(LOGIN_PATH, get(login))
             .route(LOGOUT_PATH, post(logout))
             .route(hooks::CLAUDE_CODE_HOOK_ROUTE, post(hooks::claude_code))
+            .route(hooks::CODEX_HOOK_ROUTE, post(hooks::codex))
             .route("/v1/commands", axum::routing::any(commands::handle))
             .route("/v1/commands/{id}", axum::routing::any(commands::handle))
             .route("/v1/status", axum::routing::any(commands::handle))
