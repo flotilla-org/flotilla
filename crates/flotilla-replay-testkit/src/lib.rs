@@ -114,7 +114,7 @@ fn replay_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -
 // provenance conversion at the adapter boundary. Replay never infers deadlines.
 // The observation-* recording schema is reserved and separate from actual REST
 // headers: discard raw headers in this namespace before adding these keys.
-// - observation-error-kind: forge, primary or secondary classification;
+// - observation-error-kind: forge, not-found, primary or secondary classification;
 // - observation-budget / observation-retry-source: rate-limit provenance;
 // - observation-retry-at: optional absolute deadline, never inferred on replay;
 // - observation-diagnostic: original classified Display diagnostic;
@@ -126,6 +126,9 @@ fn replay_classified_gh_error(status: u16, body: &str, headers: &HashMap<String,
     if let Some(kind) = headers.get("observation-error-kind") {
         let kind = match kind.as_str() {
             "forge" => return ObservationError::Failed(headers.get("observation-diagnostic").cloned().unwrap_or_else(|| body.to_string())),
+            "not-found" => {
+                return ObservationError::NotFound(headers.get("observation-diagnostic").cloned().unwrap_or_else(|| body.to_string()))
+            }
             "primary" => GithubRateLimitKind::Primary,
             "secondary" => GithubRateLimitKind::Secondary,
             other => panic!("unknown recorded observation error kind: {other}"),
@@ -387,8 +390,11 @@ impl GhApi for RecordingGhApi {
                 }
                 headers.insert("observation-diagnostic".into(), error.to_string());
                 match error {
-                    ObservationError::Failed(_) | ObservationError::NotFound(_) => {
+                    ObservationError::Failed(_) => {
                         headers.insert("observation-error-kind".into(), "forge".into());
+                    }
+                    ObservationError::NotFound(_) => {
+                        headers.insert("observation-error-kind".into(), "not-found".into());
                     }
                     ObservationError::RateLimited { budget, .. } => {
                         let limit = GithubRateLimit::from_observation_error(error).expect("GitHub rate-limit provenance");

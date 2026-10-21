@@ -259,6 +259,10 @@ impl LeafSubscriptionTable {
         self.inner.change_requests.watch_convoy_demands(namespace).await;
     }
 
+    pub async fn release_unlinked_change_request_claims(&self, namespace: &str) -> Result<(), String> {
+        self.inner.change_requests.release_unlinked_history(namespace).await
+    }
+
     pub async fn refresh_change_request_once(&self, subject: &ChangeRequestKey) -> Result<(), ObservationError> {
         self.inner.change_requests.refresh_once(subject).await
     }

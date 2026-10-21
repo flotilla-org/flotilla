@@ -3078,6 +3078,11 @@ impl InProcessDaemon {
             apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::UnlinkSubject { subject })
                 .await
                 .map_err(|error| error.to_string())?;
+            // Explicit unlink must release retention even for terminal convoys,
+            // which the live-demand watch intentionally does not list. If cleanup
+            // fails, the marker remains persisted; retrying this command is safe,
+            // and the observer also retries cleanup independently.
+            self.leaf_subscription_diagnostics.0.release_unlinked_change_request_claims(namespace).await?;
         }
         Ok(())
     }
