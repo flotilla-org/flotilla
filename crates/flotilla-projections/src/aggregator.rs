@@ -238,7 +238,7 @@ pub struct Aggregator {
     #[builder(skip)]
     attach_refresh_tasks: tokio::task::JoinSet<AttachCapabilityResolution>,
     #[builder(skip)]
-    attach_refresh_generation: Option<uuid::Uuid>,
+    attach_refresh_generations: HashMap<SessionKey, (uuid::Uuid, tokio::task::AbortHandle)>,
     #[builder(skip)]
     attach_refresh_inputs: HashMap<SessionKey, AttachCapabilityInput>,
     #[builder(skip)]
@@ -267,14 +267,16 @@ pub struct Aggregator {
 #[derive(Clone, PartialEq, Eq)]
 struct AttachCapabilityInput {
     host: HostName,
-    metadata: flotilla_resources::ObjectMeta,
-    spec: flotilla_resources::TerminalSessionSpec,
-    status: Option<flotilla_resources::TerminalSessionStatus>,
+    session_id: Option<String>,
+    endpoint: Option<flotilla_protocol::result_set::CleatEndpoint>,
+    environment: String,
+    pool: String,
 }
 
 struct AttachCapabilityResolution {
     generation: uuid::Uuid,
-    attachable_sessions: HashSet<SessionKey>,
+    key: SessionKey,
+    attachable: bool,
 }
 
 struct ChangeRequestResolution {
@@ -349,7 +351,7 @@ impl Aggregator {
             emitted_queries: HashSet::new(),
             attach_resolver: None,
             attach_refresh_tasks: tokio::task::JoinSet::new(),
-            attach_refresh_generation: None,
+            attach_refresh_generations: HashMap::new(),
             attach_refresh_inputs: HashMap::new(),
             change_request_resolver: None,
             convoy_change_requests: HashMap::new(),
@@ -597,11 +599,12 @@ impl Aggregator {
                             self.refresh_repository_change_requests(&delta.repo_identity).await;
                         }
                     }
-                    Ok(
-                        DaemonEvent::PeerStatusChanged { .. }
-                        | DaemonEvent::HostSnapshot(_)
-                        | DaemonEvent::HostRemoved { .. },
-                    ) => {
+                    Ok(event @ (DaemonEvent::PeerStatusChanged { .. } | DaemonEvent::HostSnapshot(_) | DaemonEvent::HostRemoved { .. })) => {
+                        // Snapshot/status churn does not itself change a route.
+                        // Explicit topology transitions invalidate route preflight.
+                        if !matches!(event, DaemonEvent::HostSnapshot(_)) {
+                            self.attach_refresh_inputs.clear();
+                        }
                         self.rebuild_independents_projection().await;
                         self.rebuild_local_projection().await;
                         self.rebuild_checkout_rows().await?;
@@ -1666,7 +1669,12 @@ impl Aggregator {
         self.rebuild_local_projection().await;
     }
 
-    async fn apply_environment_event(&mut self, _event: WatchEvent<Environment>) {
+    async fn apply_environment_event(&mut self, event: WatchEvent<Environment>) {
+        let name = match &event {
+            WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => &object.metadata.name,
+            _ => return,
+        };
+        self.attach_refresh_inputs.retain(|_, input| &input.environment != name);
         self.rebuild_independents_projection().await;
         self.rebuild_local_projection().await;
     }
@@ -1956,58 +1964,88 @@ impl Aggregator {
     }
 
     fn refresh_attach_capabilities(&mut self) {
-        // Provider liveness/preflight I/O must not hold up resource projection.
-        // Keep confirmed capabilities only while their resource snapshot and host
-        // are unchanged; superseded checks cannot restore an obsolete recipe.
-        let candidates = self
+        // Running status is a liveness gate, not part of the provider target.
+        // Keep the last verified capability during rechecks; only a current
+        // negative result or removal from the running set withdraws it.
+        let inputs = self
             .terminal_sessions
             .iter()
             .filter_map(|(key, session)| {
-                self.read_host(&session.provenance).map(|host| {
-                    (
-                        key.clone(),
-                        session.object.metadata.name.clone(),
-                        AttachCapabilityInput {
-                            host: host.clone(),
-                            metadata: session.object.metadata.clone(),
-                            spec: session.object.spec.clone(),
-                            status: session.object.status.clone(),
-                        },
-                        host,
-                    )
-                })
+                let status = session.object.status.as_ref()?;
+                if status.phase != TerminalSessionPhase::Running {
+                    return None;
+                }
+                Some((
+                    key.clone(),
+                    AttachCapabilityInput {
+                        host: self.read_host(&session.provenance)?,
+                        session_id: status.session_id.clone(),
+                        endpoint: status.cleat_endpoint.clone(),
+                        environment: session.object.spec.env_ref.clone(),
+                        pool: session.object.spec.pool.clone(),
+                    },
+                ))
             })
-            .collect::<Vec<_>>();
-        let inputs = candidates.iter().map(|(key, _, input, _)| (key.clone(), input.clone())).collect::<HashMap<_, _>>();
-        self.attachable_sessions.retain(|key| inputs.get(key).is_some_and(|input| self.attach_refresh_inputs.get(key) == Some(input)));
-        self.attach_refresh_inputs = inputs;
-        self.attach_refresh_tasks.abort_all();
-        let generation = uuid::Uuid::new_v4();
-        self.attach_refresh_generation = Some(generation);
+            .collect::<HashMap<_, _>>();
+        self.attachable_sessions.retain(|key| inputs.contains_key(key));
+        self.attach_refresh_generations.retain(|key, (_, task)| {
+            let unchanged = inputs.get(key).is_some_and(|input| self.attach_refresh_inputs.get(key) == Some(input));
+            if !unchanged {
+                task.abort();
+            }
+            unchanged
+        });
         let Some(resolver) = self.attach_resolver.clone() else {
+            self.attach_refresh_inputs = inputs;
             self.attachable_sessions.clear();
             return;
         };
-        if candidates.is_empty() {
-            return;
-        }
-        self.attach_refresh_tasks.spawn(async move {
-            let targets = candidates.iter().map(|(_, name, _, host)| (name.clone(), host.clone())).collect::<Vec<_>>();
-            let attachable_sessions = match resolver.resolvable_attach_targets(&targets).await {
-                Ok(resolved) if resolved.len() == candidates.len() => {
-                    candidates.into_iter().zip(resolved).filter_map(|((key, _, _, _), resolved)| resolved.then_some(key)).collect()
+        for (key, input) in &inputs {
+            if self.attach_refresh_generations.contains_key(key) {
+                continue;
+            }
+            let generation = uuid::Uuid::new_v4();
+            let key = key.clone();
+            let name = self.terminal_sessions[&key].object.metadata.name.clone();
+            let host = input.host.clone();
+            let resolver = resolver.clone();
+            let result_key = key.clone();
+            let task = self.attach_refresh_tasks.spawn(async move {
+                let targets = [(name, host)];
+                let mut delay = Duration::from_millis(250);
+                let mut warned = false;
+                loop {
+                    let error = match resolver.resolvable_attach_targets(&targets).await {
+                        Ok(resolved) if resolved.len() == 1 => {
+                            return AttachCapabilityResolution { generation, key: result_key, attachable: resolved[0] };
+                        }
+                        Ok(_) => "terminal capability resolver returned an invalid result count".to_string(),
+                        Err(error) => error,
+                    };
+                    if warned {
+                        tracing::debug!(%error, "terminal capability check still failing; retrying");
+                    } else {
+                        tracing::warn!(%error, "terminal capability check failed; retrying");
+                        warned = true;
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(30));
                 }
-                Ok(_) | Err(_) => HashSet::new(),
-            };
-            AttachCapabilityResolution { generation, attachable_sessions }
-        });
+            });
+            self.attach_refresh_generations.insert(key, (generation, task));
+        }
+        self.attach_refresh_inputs = inputs;
     }
 
     async fn apply_attach_capability_resolution(&mut self, resolution: AttachCapabilityResolution) -> Result<(), ResourceError> {
-        if self.attach_refresh_generation != Some(resolution.generation) {
+        if !self.attach_refresh_generations.get(&resolution.key).is_some_and(|(generation, _)| *generation == resolution.generation) {
             return Ok(());
         }
-        self.attachable_sessions = resolution.attachable_sessions;
+        if resolution.attachable {
+            self.attachable_sessions.insert(resolution.key);
+        } else {
+            self.attachable_sessions.remove(&resolution.key);
+        }
         self.publish_independents_projection(false).await;
         self.rebuild_local_projection().await;
         self.rebuild_checkout_rows().await
@@ -5129,7 +5167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn independents_projection_resolves_attach_capabilities_once_per_rebuild() {
+    async fn independents_projection_resolves_each_target_only_once() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
         let resolver = Arc::new(CountingAttachResolver::new());
@@ -5140,7 +5178,10 @@ mod tests {
             .await;
 
         settle_attach_refresh(&mut aggregator).await;
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+        aggregator.rebuild_independents_projection().await;
+        settle_attach_refresh(&mut aggregator).await;
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
         let result_set = state.independents_result_set(&None).await;
         let rows = result_set.rows.as_independents().expect("session rows");
         assert_eq!(rows.len(), 2);
@@ -6960,56 +7001,215 @@ mod tests {
         }
     }
 
-    // Capability results may enrich only the current resource snapshot. Generated
-    // sequences cover deletion/recreation, changed versions, errors, malformed
-    // batches, and empty terminal sets; every step checks published attach recipes.
+    // A resolver installed after sessions were observed must verify them on the
+    // next refresh. Replacement with identical attach inputs keeps that verified
+    // capability: resource metadata is not part of the terminal's attach target.
+    #[tokio::test]
+    async fn late_attach_resolver_and_identical_target_replacement() {
+        let state = AggregatorProjectionState::new();
+        let (tx, _) = broadcast::channel(64);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
+        aggregator.replace_session_source(LocalSource::Durable, vec![session_object("same-target").await]).await;
+        assert!(state.independents_result_set(&None).await.rows.as_independents().unwrap()[0].attach.is_none());
+        let resolver = Arc::new(CountingAttachResolver::new());
+        aggregator = aggregator.with_attach_resolver(resolver.clone());
+        aggregator.rebuild_independents_projection().await;
+        settle_attach_refresh(&mut aggregator).await;
+        assert!(state.independents_result_set(&None).await.rows.as_independents().unwrap()[0].attach.is_some());
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        let mut replacement = session_object("same-target").await;
+        replacement.metadata.resource_version = "replacement-version".into();
+        aggregator.replace_session_source(LocalSource::Durable, vec![replacement]).await;
+        settle_attach_refresh(&mut aggregator).await;
+        assert!(state.independents_result_set(&None).await.rows.as_independents().unwrap()[0].attach.is_some());
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Ordinary running-status updates must preserve a verified opening action
+    // and must not schedule another provider check.
+    #[tokio::test]
+    async fn status_churn_preserves_attach_action() {
+        let state = AggregatorProjectionState::new();
+        let (tx, _) = broadcast::channel(64);
+        let resolver = Arc::new(ScriptedAttachResult(Mutex::new(Ok(vec![true]))));
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver(resolver);
+        let mut session = session_object("busy").await;
+        aggregator.replace_session_source(LocalSource::Durable, vec![session.clone()]).await;
+        settle_attach_refresh(&mut aggregator).await;
+        session.status.as_mut().unwrap().message = Some("working".into());
+        aggregator.replace_session_source(LocalSource::Durable, vec![session.clone()]).await;
+        assert!(state.independents_result_set(&None).await.rows.as_independents().unwrap()[0].attach.is_some());
+        assert!(aggregator.attach_refresh_tasks.is_empty());
+        session.status.as_mut().unwrap().phase = TerminalSessionPhase::Stopped;
+        aggregator.replace_session_source(LocalSource::Durable, vec![session]).await;
+        assert!(aggregator.attachable_sessions.is_empty());
+        assert!(state.independents_result_set(&None).await.rows.as_independents().unwrap().iter().all(|row| row.attach.is_none()));
+    }
+
+    // Only current attach inputs may change a capability. Generate response,
+    // deletion/recreation and host/endpoint changes, checking pending and settled
+    // projections at every step; metadata versions deliberately do not matter.
     #[hegel::test]
     fn capability_results_do_not_restore_superseded_sessions(tc: hegel::TestCase) {
         use hegel::generators as gs;
         let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
-        let ops =
-            (0..steps).map(|_| (tc.draw(gs::booleans()), tc.draw(gs::integers::<usize>().min_value(0).max_value(2)))).collect::<Vec<_>>();
+        let ops = (0..steps).map(|_| (tc.draw(gs::booleans()), tc.draw(gs::booleans()), tc.draw(gs::booleans()))).collect::<Vec<_>>();
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
             let state = AggregatorProjectionState::new();
             let (tx, _) = broadcast::channel(64);
             let resolver = Arc::new(ScriptedAttachResult(Mutex::new(Ok(vec![true]))));
             let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver(resolver.clone());
-            for (step, (recreate, mode)) in ops.into_iter().enumerate() {
+            for (step, (recreate, change_host, answer)) in ops.into_iter().enumerate() {
                 *resolver.0.lock().await = Ok(vec![true]);
                 let mut session = session_object("changing-session").await;
-                session.metadata.resource_version = format!("{step}-before");
                 aggregator.replace_session_source(LocalSource::Durable, vec![session.clone()]).await;
                 settle_attach_refresh(&mut aggregator).await;
-                let before = state.independents_result_set(&None).await;
-                assert!(before.rows.as_independents().expect("rows")[0].attach.is_some());
+                assert!(state.independents_result_set(&None).await.rows.as_independents().unwrap()[0].attach.is_some());
 
-                // Complete the old check, but let a resource change win the race
-                // before the aggregator applies its queued result.
-                aggregator.rebuild_independents_projection().await;
-                let old = aggregator.attach_refresh_tasks.join_next().await.expect("check").expect("completed check");
-                *resolver.0.lock().await = match mode {
-                    0 => Ok(vec![false]),
-                    1 => Err("terminal unavailable".into()),
-                    _ => Ok(vec![]),
-                };
-                session.metadata.resource_version = format!("{step}-after");
-                aggregator.replace_session_source(LocalSource::Durable, if recreate { vec![session] } else { vec![] }).await;
-                aggregator.apply_attach_capability_resolution(old).await.expect("ignore stale result");
+                session.status.as_mut().unwrap().session_id = Some(format!("{step}-pending"));
+                aggregator.replace_session_source(LocalSource::Durable, vec![session.clone()]).await;
+                let old = aggregator.attach_refresh_tasks.join_next().await.unwrap().unwrap();
+                *resolver.0.lock().await = Ok(vec![answer]);
+                if change_host {
+                    aggregator.local_host = HostName::new(format!("host-{step}"));
+                } else {
+                    session.status.as_mut().unwrap().session_id = Some(format!("{step}-current"));
+                }
+                // Removal invalidates even a completed, unapplied check. Re-add
+                // with the same target to cover the ABA deletion race as well.
+                aggregator.replace_session_source(LocalSource::Durable, vec![]).await;
+                if recreate {
+                    aggregator.replace_session_source(LocalSource::Durable, vec![session]).await;
+                }
+                aggregator.apply_attach_capability_resolution(old).await.unwrap();
                 let pending = state.independents_result_set(&None).await;
                 assert_eq!(pending.rows.len(), usize::from(recreate));
-                assert!(
-                    pending.rows.as_independents().expect("rows").iter().all(|row| row.attach.is_none()),
-                    "obsolete result restored a recipe"
-                );
+                assert!(pending.rows.as_independents().unwrap().iter().all(|row| row.attach.is_none()));
                 settle_attach_refresh(&mut aggregator).await;
                 let after = state.independents_result_set(&None).await;
                 assert_eq!(after.rows.len(), usize::from(recreate));
-                assert!(
-                    after.rows.as_independents().expect("rows").iter().all(|row| row.attach.is_none()),
-                    "failed or malformed check granted a recipe"
-                );
+                assert!(after.rows.as_independents().unwrap().iter().all(|row| row.attach.is_some() == answer));
             }
         });
+    }
+
+    type AttachReply = tokio::sync::oneshot::Sender<Result<Vec<bool>, String>>;
+
+    // Provider I/O boundary: each individual lookup is explicitly completed by
+    // the test, exposing cancellation, retry timing and concurrent interleavings.
+    struct ControlledAttachResolver(mpsc::UnboundedSender<(String, HostName, AttachReply)>);
+
+    #[async_trait]
+    impl AttachCapabilityResolver for ControlledAttachResolver {
+        async fn resolvable_attach_targets(&self, targets: &[(String, HostName)]) -> Result<Vec<bool>, String> {
+            assert_eq!(targets.len(), 1);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.0.send((targets[0].0.clone(), targets[0].1.clone(), tx)).unwrap();
+            rx.await.unwrap()
+        }
+    }
+
+    async fn apply_next_attach(aggregator: &mut Aggregator) {
+        loop {
+            if let Ok(result) = aggregator.attach_refresh_tasks.join_next().await.unwrap() {
+                aggregator.apply_attach_capability_resolution(result).await.unwrap();
+                break;
+            }
+        }
+    }
+
+    // A target change retains the last verified action until a current negative
+    // answer. Errors and malformed batches preserve it and retry with backoff.
+    #[tokio::test(start_paused = true)]
+    async fn attach_target_changes_retry_without_withdrawing_known_capability() {
+        for mode in 0..4 {
+            let state = AggregatorProjectionState::new();
+            let (tx, _) = broadcast::channel(64);
+            let (requests, mut rx) = mpsc::unbounded_channel();
+            let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx)
+                .with_attach_resolver(Arc::new(ControlledAttachResolver(requests)));
+            let mut session = session_object("changing").await;
+            aggregator.replace_session_source(LocalSource::Durable, vec![session.clone()]).await;
+            rx.recv().await.unwrap().2.send(Ok(vec![true])).unwrap();
+            apply_next_attach(&mut aggregator).await;
+            match mode {
+                0 => aggregator.local_host = HostName::new("new-host"),
+                1 => session.status.as_mut().unwrap().session_id = Some("new-target".into()),
+                2 => {
+                    session.status.as_mut().unwrap().cleat_endpoint = Some(flotilla_protocol::result_set::CleatEndpoint {
+                        runtime_root: "/run/new".into(),
+                        daemon: "daemon".into(),
+                        session: "new-target".into(),
+                    })
+                }
+                _ => session.spec.pool = "new-pool".into(),
+            }
+            aggregator.replace_session_source(LocalSource::Durable, vec![session.clone()]).await;
+            let (_, host, reply) = rx.recv().await.unwrap();
+            if mode == 0 {
+                assert_eq!(host, HostName::new("new-host"));
+            }
+            assert!(state.independents_result_set(&None).await.rows.as_independents().unwrap()[0].attach.is_some());
+            let mut reply = reply;
+            for (attempt, result) in [Err("unavailable".into()), Ok(vec![]), Ok(vec![true, false])].into_iter().enumerate() {
+                let started = tokio::time::Instant::now();
+                reply.send(result).unwrap();
+                // Status churn must neither restart the retry nor clear capability.
+                session.status.as_mut().unwrap().message = Some(format!("working-{attempt}"));
+                aggregator.replace_session_source(LocalSource::Durable, vec![session.clone()]).await;
+                reply = rx.recv().await.unwrap().2;
+                assert_eq!(started.elapsed(), Duration::from_millis(250 * (1 << attempt)));
+                assert!(state.independents_result_set(&None).await.rows.as_independents().unwrap()[0].attach.is_some());
+            }
+            reply.send(Ok(vec![false])).unwrap();
+            apply_next_attach(&mut aggregator).await;
+            assert!(state.independents_result_set(&None).await.rows.as_independents().unwrap()[0].attach.is_none());
+            session.status.as_mut().unwrap().phase = TerminalSessionPhase::Stopped;
+            aggregator.replace_session_source(LocalSource::Durable, vec![session]).await;
+            assert!(aggregator.attachable_sessions.is_empty());
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    // Churning one target must not cancel an unrelated in-flight lookup. A
+    // superseded success must not overwrite the newer target's negative answer.
+    #[tokio::test(start_paused = true)]
+    async fn attach_checks_are_isolated_and_superseded_results_are_ignored() {
+        let state = AggregatorProjectionState::new();
+        let (tx, _) = broadcast::channel(64);
+        let (requests, mut rx) = mpsc::unbounded_channel();
+        let mut aggregator =
+            Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver(Arc::new(ControlledAttachResolver(requests)));
+        let mut busy = session_object("busy").await;
+        let quiet = session_object("quiet").await;
+        aggregator.replace_session_source(LocalSource::Durable, vec![busy.clone(), quiet.clone()]).await;
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        let (busy_reply, quiet_reply) = if first.0 == "busy" { (first.2, second.2) } else { (second.2, first.2) };
+        busy_reply.send(Ok(vec![true])).unwrap();
+        let old = aggregator.attach_refresh_tasks.join_next().await.unwrap().unwrap();
+        for step in 0..3 {
+            busy.status.as_mut().unwrap().session_id = Some(format!("target-{step}"));
+            aggregator.replace_session_source(LocalSource::Durable, vec![busy.clone(), quiet.clone()]).await;
+            let request = rx.recv().await.unwrap();
+            assert_eq!(request.0, "busy");
+            if step == 2 {
+                request.2.send(Err("busy target unavailable".into())).unwrap();
+            }
+        }
+        quiet_reply.send(Ok(vec![true])).unwrap();
+        apply_next_attach(&mut aggregator).await;
+        let pending = state.independents_result_set(&None).await;
+        assert!(pending.rows.as_independents().unwrap().iter().find(|row| row.resource.name == "quiet").unwrap().attach.is_some());
+        let retry = rx.recv().await.unwrap();
+        assert_eq!(retry.0, "busy");
+        retry.2.send(Ok(vec![false])).unwrap();
+        settle_attach_refresh(&mut aggregator).await;
+        aggregator.apply_attach_capability_resolution(old).await.unwrap();
+        let rows = state.independents_result_set(&None).await;
+        for row in rows.rows.as_independents().unwrap() {
+            assert_eq!(row.attach.is_some(), row.resource.name == "quiet");
+        }
     }
 
     // A held provider check belongs to the aggregator lifetime, including an
