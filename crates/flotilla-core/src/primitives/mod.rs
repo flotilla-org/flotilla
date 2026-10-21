@@ -178,6 +178,12 @@ impl Sessions {
         }
     }
 
+    /// One keyed read of a session; absence means no such record.
+    ///
+    /// # Panics
+    /// A poisoned home is an invalid writer invariant, not an absent record.
+    /// This existing read API fails fast; hook observers instead use the fallible
+    /// `needs_observation` and `observe` methods so attention handling can continue.
     pub fn get(&self, name: &str) -> Option<Resource<AgentSession>> {
         self.home.lock().expect("session home").get(name).cloned()
     }

@@ -168,6 +168,8 @@ impl HarnessHookParser for ClaudeCodeParser {
                 struct Failure {
                     #[serde(flatten)]
                     common: ClaudeCommonPayload,
+                    // Only explicit abort evidence means Interrupted. Older or
+                    // ordinary failure payloads must remain informational.
                     #[serde(default)]
                     is_interrupt: bool,
                 }
