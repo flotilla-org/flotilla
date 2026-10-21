@@ -58,6 +58,8 @@ impl InProcessDaemon {
                     ResourceError::Conflict { .. } | ResourceError::FieldOwnership { .. } => Class::Conflict,
                     ResourceError::Invalid { .. } => Class::InvalidInput,
                     ResourceError::Unauthorized { .. } => Class::Forbidden,
+                    // Fail closed for infrastructure failures and future variants;
+                    // only known caller/state refusals receive a non-500 class.
                     _ => Class::DaemonFault,
                 };
                 DispatcherError::new(class, error.to_string())
