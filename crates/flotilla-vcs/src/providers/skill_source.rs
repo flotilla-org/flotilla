@@ -251,16 +251,19 @@ succeeded=true
 cleanup
 trap - EXIT HUP INT TERM"#;
 
+// args[0] is the stage identifier; the shell shifts it before reading manifest=$1.
+const MANIFEST_ARG_INDEX: usize = 1;
+
 pub async fn stage_git_skill_sources(runner: &dyn CommandRunner, args: &[String]) -> Result<String, String> {
     // The script reads the prefix from $0, then shifts past args[0], the stage
     // command identifier. Its manifest=$1 therefore corresponds to args[1].
     // Keep the controlled inline-manifest API, but never pass its payload to a
     // process as an argv word. Other arguments remain source metadata, not JSON.
-    let input = args.get(1).and_then(|manifest| manifest.strip_prefix("json:"));
+    let input = args.get(MANIFEST_ARG_INDEX).and_then(|manifest| manifest.strip_prefix("json:"));
     let stage_args = args.iter().enumerate().map(|(index, arg)| {
-        if index == 1 && input.is_some() {
+        if index == MANIFEST_ARG_INDEX && input.is_some() {
             "-"
-        } else if index == 1 && arg == "-" {
+        } else if index == MANIFEST_ARG_INDEX && arg == "-" {
             // Preserve the existing relative pathname instead of the stdin sentinel.
             "./-"
         } else {
