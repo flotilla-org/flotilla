@@ -252,7 +252,7 @@ async fn convoy_parent_cleanup_contract() {
             })
             .await
             .expect("test fixture operation succeeds");
-        let CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path } = outcome else { panic!("forced removal must archive first") };
+        let CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path, .. } = outcome else { panic!("forced removal must archive first") };
         assert!(Path::new(&archive_path).join("worktree.tar.gz").exists());
         assert!(!target.exists());
         assert_eq!(parent.exists(), extra.is_some());
@@ -833,7 +833,7 @@ async fn checkout_runtime_removes_a_shared_bootstrap_branch_in_either_teardown_o
 }
 
 #[tokio::test]
-async fn checkout_runtime_refuses_existing_local_branch_and_recovers_existing_target() {
+async fn checkout_runtime_refuses_unverified_base_and_recovers_existing_target() {
     let temp = TempDir::new().expect("tempdir");
     let missing_origin = temp.path().join("missing-origin.git");
     let clone =
@@ -842,12 +842,12 @@ async fn checkout_runtime_refuses_existing_local_branch_and_recovers_existing_ta
     let runtime =
         CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
 
-    // #2698: refuse new work on an existing branch without contacting its unavailable origin.
+    // #3340: refuse adoption when the configured origin cannot verify the base.
     let error = runtime
         .create_worktree(clone.path().to_str().expect("clone"), "main", Some("main"), target.to_str().expect("target"))
         .await
         .expect_err("branch conflict");
-    assert!(error.contains("main") && error.contains("already exists"), "{error}");
+    assert!(error.contains("verify checkout branch main base main"), "{error}");
     assert!(!target.exists());
     // Existing targets are reconciliation retries, so recovery and cleanup
     // still preserve a branch that the convoy did not create.
@@ -1444,4 +1444,69 @@ fn checkout_observation_prefers_replica_status(tc: hegel::TestCase) {
         let observed = runtime.observed_change_request(&convoy, &checkout, "3556").await.unwrap();
         assert_eq!(observed.and_then(|status| status.state.value), Some(ObservedChangeRequestState::Merged));
     });
+}
+
+// #3340: real controller-runtime mapping retains both the archive and every
+// branch-preservation category after forced teardown removes a fixture checkout.
+#[tokio::test]
+async fn forced_checkout_runtime_maps_archive_and_preserved_branch() {
+    for reason in [
+        BranchPreservationReason::CommitsPastBase,
+        BranchPreservationReason::NotCreatedForConvoy,
+        BranchPreservationReason::CheckedOutElsewhere,
+    ] {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let target = temp.path().join("checkout");
+        let runtime =
+            CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+        runtime
+            .create_worktree(source.path().to_str().expect("source"), "governor", Some("main"), target.to_str().expect("target"))
+            .await
+            .expect("create");
+        let args: Vec<&str> = match reason {
+            BranchPreservationReason::CommitsPastBase => vec!["commit", "--allow-empty", "-m", "unique work"],
+            BranchPreservationReason::NotCreatedForConvoy => vec!["update-ref", "-d", "refs/flotilla/bootstrap/governor"],
+            BranchPreservationReason::CheckedOutElsewhere => vec![],
+        };
+        if !args.is_empty() {
+            assert!(ProcessCommand::new("git").arg("-C").arg(&target).args(args).status().expect("fixture mutation").success());
+        } else {
+            assert!(ProcessCommand::new("git")
+                .arg("-C")
+                .arg(source.path())
+                .args(["worktree", "add", "--force"])
+                .arg(temp.path().join("holder"))
+                .arg("governor")
+                .status()
+                .expect("holder")
+                .success());
+        }
+        let outcome = runtime
+            .remove_checkout(&CheckoutRemoval::ForcedWorktree {
+                clone_path: source.path().to_str().expect("source").into(),
+                branch: "governor".into(),
+                target_path: target.to_str().expect("target").into(),
+            })
+            .await
+            .expect("force removal");
+        let CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path, preserved_branch } = outcome else { panic!("archive expected") };
+        assert_eq!(preserved_branch, Some(("governor".into(), reason)));
+        assert!(Path::new(&archive_path).join("history.bundle").exists());
+        assert!(!target.exists());
+    }
+}
+
+// Conversion glue: checkout-level preservation reasons cannot be reported as
+// branch-preservation reasons; cover the complete invalid variant set.
+#[test]
+fn branch_preservation_mapping_rejects_checkout_reasons() {
+    for reason in [
+        core_vcs::CheckoutPreservationReason::DifferentBranch,
+        core_vcs::CheckoutPreservationReason::DirtyCheckout,
+        core_vcs::CheckoutPreservationReason::OrphanedCheckout,
+    ] {
+        let error = branch_preservation_reason(reason).expect_err("checkout reason is not a branch reason");
+        assert!(error.contains(&format!("{reason:?}")), "invalid category is reported: {error}");
+    }
 }

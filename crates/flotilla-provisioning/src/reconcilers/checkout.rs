@@ -45,10 +45,20 @@ pub enum BranchPreservationReason {
     NotCreatedForConvoy,
 }
 
+impl std::fmt::Display for BranchPreservationReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CommitsPastBase => "has commits beyond the recorded base",
+            Self::CheckedOutElsewhere => "is checked out in another worktree",
+            Self::NotCreatedForConvoy => "was not created for this convoy",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutRemovalOutcome {
     Removed,
-    ArchivedAndRemoved { archive_path: String },
+    ArchivedAndRemoved { archive_path: String, preserved_branch: Option<(String, BranchPreservationReason)> },
     PreservedBranch { branch: String, reason: BranchPreservationReason },
     PreservedOrphanedCheckout { path: String },
 }
@@ -782,7 +792,7 @@ where
         } else {
             self.runtime.remove_checkout_in(obj.spec.env_ref().unwrap_or(""), &removal).await.map_err(ResourceError::other)?
         };
-        if let CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path } = &outcome {
+        if let CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path, .. } = &outcome {
             if let Err(error) = EventRecorder::new(self.backend.clone())
                 .record(
                     ObjectEvent::for_object(obj, "CheckoutArchived", format!("checkout archive saved at {archive_path}")),
@@ -810,8 +820,22 @@ where
                 .await?;
             warn!(%path, "preserved orphaned checkout during cleanup");
         }
-        if let CheckoutRemovalOutcome::PreservedBranch { branch, reason } = outcome {
-            warn!(%branch, ?reason, "preserved branch during checkout cleanup");
+        let preserved_branch = match &outcome {
+            CheckoutRemovalOutcome::PreservedBranch { branch, reason } => Some((branch, reason)),
+            CheckoutRemovalOutcome::ArchivedAndRemoved { preserved_branch: Some((branch, reason)), .. } => Some((branch, reason)),
+            _ => None,
+        };
+        if let Some((branch, reason)) = preserved_branch {
+            if let Err(error) = EventRecorder::new(self.backend.clone())
+                .record(
+                    ObjectEvent::for_object(obj, "CheckoutBranchPreserved", format!("branch {branch} preserved: {reason}")),
+                    self.clock.now(),
+                )
+                .await
+            {
+                warn!(%error, %branch, "could not record preserved branch event");
+            }
+            warn!(%branch, %reason, "preserved branch during checkout cleanup");
         }
         Ok(())
     }

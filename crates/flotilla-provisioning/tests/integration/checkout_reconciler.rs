@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use common::{create_ready_checkout, create_ready_clone, meta};
 use flotilla_protocol::NodeId;
 use flotilla_provisioning::reconcilers::{
-    checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
+    checkout::BranchPreservationReason, checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome,
+    CheckoutRuntime, PreparedCheckout,
 };
 use flotilla_resources::repo_key;
 use flotilla_resources::Actuation;
@@ -80,6 +81,7 @@ struct RecordingCheckoutRuntime {
     release_removal: Arc<Notify>,
     removal_blocked: Arc<Notify>,
     archive_path: Option<String>,
+    preserved_branch: Option<(String, BranchPreservationReason)>,
     orphaned_path: Option<String>,
     path_exists: Option<bool>,
     protection_error: Option<String>,
@@ -235,7 +237,10 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
             return Ok(CheckoutRemovalOutcome::PreservedOrphanedCheckout { path: path.clone() });
         }
         if let Some(archive_path) = &self.archive_path {
-            return Ok(CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path: archive_path.clone() });
+            return Ok(CheckoutRemovalOutcome::ArchivedAndRemoved {
+                archive_path: archive_path.clone(),
+                preserved_branch: self.preserved_branch.clone(),
+            });
         }
         Ok(CheckoutRemovalOutcome::Removed)
     }
@@ -792,7 +797,11 @@ async fn forced_convoy_deletion_directs_checkout_authority_to_archive_before_rem
         )
         .await
         .expect("create checkout");
-    let runtime = Arc::new(RecordingCheckoutRuntime { archive_path: Some("/archives/work-123".to_string()), ..Default::default() });
+    let runtime = Arc::new(RecordingCheckoutRuntime {
+        archive_path: Some("/archives/work-123".to_string()),
+        preserved_branch: Some(("feature/cleanup".into(), BranchPreservationReason::CommitsPastBase)),
+        ..Default::default()
+    });
     let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE);
 
     timeout(Duration::from_secs(2), async {
@@ -815,6 +824,10 @@ async fn forced_convoy_deletion_directs_checkout_authority_to_archive_before_rem
         .items
         .iter()
         .any(|event| { event.spec.reason == "CheckoutArchived" && event.spec.message.contains("/archives/work-123") }));
+    // #3340: archiving still reports unique branch commits to the operator.
+    assert!(events.items.iter().any(|event| event.spec.reason == "CheckoutBranchPreserved"
+        && event.spec.message.contains("feature/cleanup")
+        && event.spec.message.contains("commits beyond the recorded base")));
 }
 
 #[tokio::test]
