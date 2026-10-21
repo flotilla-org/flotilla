@@ -9,6 +9,12 @@ pub enum StoreError {
     /// The new store's pre-domain baseline has no migration path; reject it at open.
     #[error("strings table has no domain column: pre-domain dictionaries are unsupported; open a new domain-tagged store")]
     LegacyDictionarySchema,
+    /// A kind table exists with other columns than its kind declares, such as one written before
+    /// the parent key was named after its root table (#3627). Opening only creates missing tables,
+    /// and SQLite reads an unknown double-quoted column name as a string literal, so a stale table
+    /// would read as empty rather than fail; reject it at open.
+    #[error("kind table {table} has columns {found:?}, not {expected:?}: the database predates this schema and has no migration; open a new store")]
+    KindTableDrift { table: String, expected: Vec<String>, found: Vec<String> },
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]

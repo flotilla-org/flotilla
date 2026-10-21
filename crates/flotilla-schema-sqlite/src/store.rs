@@ -27,10 +27,11 @@ use crate::{
     error::{Malformed, StoreError},
     query::{page_limit, Cursor, Page},
     shared::{
-        has_string_domain, schema_ddl, sync_views, FLOOR_GET, FLOOR_RAISE, HOME_IDS_RESET, HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET,
-        IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_ABOUT_AFTER,
-        LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE, LOG_EXPUNGED_AFTER, OBJECT_BYTES, OBJECT_EXISTS,
-        OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS, STRING_ID, STRING_INSERT, WATERMARK_PUT,
+        check_kind_columns, has_string_domain, schema_ddl, sync_views, FLOOR_GET, FLOOR_RAISE, HOME_IDS_RESET, HOME_LOG_CLEAR,
+        HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ,
+        IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE,
+        LOG_EXPUNGED_AFTER, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE,
+        SHARED_STATEMENTS, STRING_ID, STRING_INSERT, WATERMARK_PUT,
     },
     sql::{KindSql, TableSql},
 };
@@ -166,6 +167,7 @@ impl Store {
         if !has_string_domain(&tx)? {
             return Err(StoreError::LegacyDictionarySchema);
         }
+        check_kind_columns(&tx, &kinds)?;
         sync_views(&tx, &kinds)?;
         tx.commit()?;
         Self::from_connection(conn, home, kinds, options)
