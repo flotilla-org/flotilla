@@ -3222,6 +3222,7 @@ async fn create_running_terminal(
                 launch_command: Some(command.to_string()),
                 delivered_message_id: None,
                 attention: None,
+                screen_obstruction: None,
                 occupancy: Default::default(),
                 completion_pending: None,
                 degraded: None,

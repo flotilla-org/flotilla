@@ -35,6 +35,8 @@ pub struct TerminalRuntimeState {
 pub struct TerminalObservation {
     pub output_digest: Option<String>,
     pub attention: Option<TerminalAttention>,
+    /// What the same screen read says blocks an idle-looking agent (#3460).
+    pub obstruction: Option<flotilla_resources::ScreenObstruction>,
     pub occupancy: TerminalOccupancy,
 }
 
@@ -799,6 +801,15 @@ where
                         )
                     });
                     let occupancy_changed = current.is_none_or(|status| status.occupancy != observation.occupancy);
+                    // A screen read restates the obstruction; other evidence leaves it.
+                    let obstruction = observation
+                        .attention
+                        .as_ref()
+                        .filter(|attention| attention.source == TerminalAttentionSource::Screen)
+                        .map(|_| observation.obstruction.clone());
+                    let obstruction_changed = obstruction
+                        .as_ref()
+                        .is_some_and(|obstruction| current.and_then(|status| status.screen_obstruction.as_ref()) != obstruction.as_ref());
                     let attention_changed = attention.as_ref().is_some_and(|attention| {
                         current.and_then(|status| status.attention.as_ref()).is_none_or(|previous| previous.should_replace_with(attention))
                     });
@@ -828,12 +839,15 @@ where
                         && current
                             .and_then(|status| status.last_output_activity_at)
                             .is_none_or(|at| now.signed_duration_since(at) >= chrono::Duration::seconds(30));
-                    (occupancy_changed || attention_changed || output_changed).then_some(TerminalSessionStatusPatch::Observe {
-                        attention,
-                        occupancy: observation.occupancy,
-                        output_digest: observation.output_digest.clone().filter(|_| output_changed),
-                        observed_at: now,
-                    })
+                    (occupancy_changed || attention_changed || output_changed || obstruction_changed).then_some(
+                        TerminalSessionStatusPatch::Observe {
+                            attention,
+                            obstruction,
+                            occupancy: observation.occupancy,
+                            output_digest: observation.output_digest.clone().filter(|_| output_changed),
+                            observed_at: now,
+                        },
+                    )
                 }
                 TerminalPrepared::AttentionStale => Some(TerminalSessionStatusPatch::ObserveAttention {
                     attention: TerminalAttention {

@@ -224,6 +224,10 @@ pub enum CrewAttention {
     DeliveryUnconfirmed,
     Idle,
     Unobservable,
+    /// Idle, but text nobody submitted sits in the composer (#3460).
+    IdleComposerText,
+    /// Idle, but the transcript is scrolled back (#3460).
+    IdleScrolledBack,
 }
 
 impl std::fmt::Display for CrewAttention {
@@ -234,6 +238,8 @@ impl std::fmt::Display for CrewAttention {
             Self::DeliveryUnconfirmed => "delivery unconfirmed",
             Self::Idle => "idle",
             Self::Unobservable => "unobservable",
+            Self::IdleComposerText => "idle, composer holds unsent text",
+            Self::IdleScrolledBack => "idle, transcript scrolled back",
         })
     }
 }

@@ -341,6 +341,9 @@ impl std::fmt::Display for ExplainedTerminalCondition {
 pub struct ExplainedCrewDelivery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_condition: Option<ExplainedTerminalCondition>,
+    /// Why an idle-looking crew cannot take a turn, and its recovery (#3460).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obstruction: Option<String>,
     pub session: String,
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

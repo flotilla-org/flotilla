@@ -1864,6 +1864,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
 
     if !startup_not_ready {
         *runtime.observation.lock().expect("observation mutex") = Some(TerminalObservation {
+            obstruction: None,
             output_digest: None,
             attention: Some(TerminalAttention {
                 state: TerminalAttentionState::Idle,
@@ -1893,6 +1894,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
                 for offset in [-1, 0, 1] {
                     let at = held_at + chrono::Duration::seconds(offset);
                     let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                        obstruction: None,
                         output_digest: None,
                         attention: Some(TerminalAttention { state, source, as_of: at }),
                         occupancy: TerminalOccupancy::Vacant,
@@ -1919,6 +1921,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
             });
             let at = held_at + chrono::Duration::seconds(1 + elapsed);
             let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                obstruction: None,
                 output_digest: None,
                 attention: Some(TerminalAttention {
                     state: TerminalAttentionState::Working,
@@ -1940,6 +1943,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
                 let mut output = flagged.clone();
                 output.status.as_mut().expect("status").last_output_digest = baseline.map(str::to_string);
                 let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                    obstruction: None,
                     output_digest: Some("new".into()),
                     attention: state.map(|state| TerminalAttention {
                         state,
@@ -2002,6 +2006,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
 
         // Positive activity after the ambiguous write acknowledges it without a resend.
         *runtime.observation.lock().expect("observation mutex") = Some(TerminalObservation {
+            obstruction: None,
             output_digest: None,
             attention: Some(TerminalAttention {
                 state: TerminalAttentionState::Working,
@@ -2019,6 +2024,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
 
         // Unresolved holds surface a single durable demand, including after restart.
         *runtime.observation.lock().expect("observation mutex") = Some(TerminalObservation {
+            obstruction: None,
             output_digest: None,
             attention: Some(TerminalAttention {
                 state: TerminalAttentionState::Idle,
@@ -2052,6 +2058,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
         // A fresh Idle observation refreshes as_of even after expiry.
         let refresh_at = status.attention.as_ref().expect("attention").as_of + chrono::Duration::seconds(6);
         let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+            obstruction: None,
             output_digest: None,
             attention: Some(TerminalAttention {
                 state: TerminalAttentionState::Idle,
@@ -2065,6 +2072,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
         assert_eq!(status.degraded.as_ref().expect("failure").reason, "DeliveryExpired");
         // Late consumption still resolves an expired hold and clears its demand.
         let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+            obstruction: None,
             output_digest: None,
             attention: Some(TerminalAttention {
                 state: TerminalAttentionState::Working,
@@ -2155,6 +2163,7 @@ async fn meaningful_output_progress_survives_coalesced_attention() {
     {
         let session = sessions.get("output-crew").await.expect("session");
         let observation = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+            obstruction: None,
             output_digest: Some(digest.into()),
             attention: None,
             occupancy: TerminalOccupancy::Vacant,
@@ -2166,6 +2175,58 @@ async fn meaningful_output_progress_survives_coalesced_attention() {
         }
         let status = sessions.get("output-crew").await.expect("session").status.expect("status");
         assert_eq!(status.last_output_activity_at, Some(start + chrono::Duration::seconds(expected)));
+    }
+}
+
+// #3460: the screen classifier reports Unobservable on every pass while a
+// stray reply sits in the composer, and identical observations are debounced.
+// The obstruction still reaches the status as soon as it appears, and clears
+// when the composer does; repeats write nothing.
+#[tokio::test]
+async fn screen_obstruction_is_recorded_while_attention_is_debounced() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(
+            &meta("stray-crew"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".into(),
+                role: "coder".into(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "test".into() },
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+            },
+        )
+        .await
+        .expect("session");
+    let start = Utc::now();
+    let unobservable = |second| TerminalAttention {
+        state: TerminalAttentionState::Unobservable,
+        as_of: start + chrono::Duration::seconds(second),
+        source: TerminalAttentionSource::Screen,
+    };
+    let status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, attention: Some(unobservable(0)), ..Default::default() };
+    sessions.update_status("stray-crew", &created.metadata.resource_version, &status).await.expect("running session");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
+    let stray = flotilla_resources::ScreenObstruction::ComposerText { reply: Some("6;24;9t".into()), chars: 7 };
+    for (second, obstruction, changed) in
+        [(1, Some(stray.clone()), true), (2, Some(stray.clone()), false), (3, None, true), (4, None, false)]
+    {
+        let session = sessions.get("stray-crew").await.expect("session");
+        let observation = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+            obstruction: obstruction.clone(),
+            output_digest: None,
+            attention: Some(unobservable(second)),
+            occupancy: TerminalOccupancy::Vacant,
+        });
+        let result = reconciler.reconcile(&session, &observation, start + chrono::Duration::seconds(second));
+        assert_eq!(result.patch.is_some(), changed, "second {second}");
+        if let Some(patch) = result.patch {
+            flotilla_store::apply_status_patch(&sessions, "stray-crew", &patch).await.expect("persist observation");
+        }
+        let status = sessions.get("stray-crew").await.expect("session").status.expect("status");
+        assert_eq!(status.idle_obstruction(), obstruction.as_ref(), "second {second}");
     }
 }
 
@@ -2206,6 +2267,7 @@ async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_s
     let attached = reconciler.reconcile(
         &session,
         &flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+            obstruction: None,
             output_digest: None,
             attention: Some(attention.clone()),
             occupancy: TerminalOccupancy::Occupied,
@@ -2217,6 +2279,7 @@ async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_s
     let detached = reconciler.reconcile(
         &session,
         &flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+            obstruction: None,
             output_digest: None,
             attention: Some(attention),
             occupancy: TerminalOccupancy::Vacant,
@@ -2391,6 +2454,7 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
             return Ok(Some(observation));
         }
         Ok(Some(TerminalObservation {
+            obstruction: None,
             output_digest: None,
             attention: Some(TerminalAttention {
                 state: TerminalAttentionState::Working,
@@ -3327,6 +3391,7 @@ async fn unchanged_attention_decisions_log_once() {
     async {
         for step in 1..=10 {
             let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                obstruction: None,
                 output_digest: None,
                 occupancy: TerminalOccupancy::Vacant,
                 attention: Some(TerminalAttention {

@@ -341,6 +341,11 @@ pub struct TerminalSessionStatus {
     /// This deliberately does not participate in the session lifecycle phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<TerminalAttention>,
+    /// Why the last screen read an otherwise idle agent as unable to take a
+    /// turn (#3460). Absent on records written before it; the decoder default
+    /// stays because absence is also the steady state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_obstruction: Option<ScreenObstruction>,
     /// Automatic turn delivery hold. Remove the decoder default one roll after #2758.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_delivery_hold: Option<crate::ConvoyAttention>,
@@ -456,6 +461,89 @@ impl TerminalSessionDegradedCondition {
             TERMINAL_DELIVERY_UNCONFIRMED_REASON | TERMINAL_DELIVERY_NOT_SUBMITTED_REASON | TERMINAL_DELIVERY_EXPIRED_REASON
         )
     }
+}
+
+/// What keeps an agent that otherwise looks idle from taking a turn (#3460).
+/// Attention stays `Unobservable` so delivery still refuses; this names why,
+/// and the operator command that recovers it. Flotilla never clears the
+/// composer itself: text there may be a person's draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScreenObstruction {
+    /// The composer holds `chars` characters nobody submitted. `reply` keeps
+    /// the text only when it is shaped like a terminal's answer to a query
+    /// whose escape prefix was consumed (for example `6;24;9t`, the reply to
+    /// CSI 16t). A person's draft is never copied out of the terminal: these
+    /// surfaces replicate and are read more widely than the terminal is.
+    ComposerText {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply: Option<String>,
+        chars: usize,
+    },
+    /// The transcript is scrolled back ("Back to bottom"); the live composer
+    /// is not where the screen classifier can read it.
+    ScrolledBack,
+}
+
+impl ScreenObstruction {
+    /// The key that recovers the session, for `cleat send-keys`.
+    pub fn recovery_key(&self) -> &'static str {
+        match self {
+            Self::ComposerText { .. } => "C-u",
+            Self::ScrolledBack => "Escape",
+        }
+    }
+
+    /// The exact command, run inside the crew's environment.
+    pub fn recovery_command(&self, session: &str) -> String {
+        format!("cleat send-keys {session} {}", self.recovery_key())
+    }
+
+    /// The attention label: the condition first, then how to recover it.
+    pub fn describe(&self, session: &str) -> String {
+        let command = self.recovery_command(session);
+        match self {
+            Self::ComposerText { reply: Some(reply), .. } => format!(
+                "idle, composer holds unsent text `{reply}` that looks like a stray terminal reply; \
+                 clear it with `{command}` inside the crew's environment"
+            ),
+            Self::ComposerText { reply: None, chars } => format!(
+                "idle, composer holds {chars} characters of unsent text; if nobody is drafting there, \
+                 clear it with `{command}` inside the crew's environment"
+            ),
+            Self::ScrolledBack => {
+                format!("idle, transcript scrolled back; return it to the bottom with `{command}` inside the crew's environment")
+            }
+        }
+    }
+}
+
+impl TerminalSessionStatus {
+    /// The obstruction behind the current screen-read `Unobservable`
+    /// attention, if any: an idle agent that cannot take a turn (#3460).
+    pub fn idle_obstruction(&self) -> Option<&ScreenObstruction> {
+        self.attention
+            .as_ref()
+            .filter(|attention| {
+                attention.state == TerminalAttentionState::Unobservable && attention.source == TerminalAttentionSource::Screen
+            })
+            .and(self.screen_obstruction.as_ref())
+    }
+}
+
+/// Whether composer text has the shape of a terminal's reply to a query
+/// after its `ESC [` prefix was consumed: optional `?`/`>`/`[`, numeric
+/// parameters separated by `;`, and one final letter or `~`. Typed prose
+/// essentially never has this shape.
+pub fn looks_like_terminal_reply(text: &str) -> bool {
+    let text = text.trim();
+    let text = text.strip_prefix('[').unwrap_or(text);
+    let text = text.strip_prefix(['?', '>']).unwrap_or(text);
+    let Some(last) = text.chars().last() else { return false };
+    let params = &text[..text.len() - last.len_utf8()];
+    (last.is_ascii_alphabetic() || last == '~')
+        && params.split(';').all(|param| !param.is_empty() && param.chars().all(|c| c.is_ascii_digit()))
+        && params.contains(|c: char| c.is_ascii_digit())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -610,6 +698,8 @@ pub enum TerminalSessionStatusPatch {
     },
     Observe {
         attention: Option<TerminalAttention>,
+        /// The screen read behind `attention`, when one was read.
+        obstruction: Option<Option<ScreenObstruction>>,
         occupancy: TerminalOccupancy,
         output_digest: Option<String>,
         observed_at: DateTime<Utc>,
@@ -781,8 +871,11 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     status.degraded = None;
                 }
             }
-            Self::Observe { attention, occupancy, output_digest, observed_at } => {
+            Self::Observe { attention, obstruction, occupancy, output_digest, observed_at } => {
                 status.occupancy = *occupancy;
+                if let Some(obstruction) = obstruction {
+                    status.screen_obstruction = obstruction.clone();
+                }
                 if let Some(digest) = output_digest {
                     if status.last_output_digest.as_ref() != Some(digest) {
                         status.last_output_digest = Some(digest.clone());
@@ -811,6 +904,61 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::*;
+
+    // #3460: replies to terminal queries whose `ESC [` prefix was consumed are
+    // recognised; prose, placeholders and bare numbers are not.
+    #[hegel::test]
+    fn terminal_replies_are_recognised_and_prose_is_not(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+        let params: Vec<String> = (0..count).map(|_| tc.draw(gs::integers::<u32>().min_value(0).max_value(9999)).to_string()).collect();
+        let finals = ['t', 'R', 'c', 'n', '~', 'u'];
+        let last = finals[tc.draw(gs::integers::<usize>().min_value(0).max_value(finals.len() - 1))];
+        let prefix = ["", "[", "?", "[?", ">"][tc.draw(gs::integers::<usize>().min_value(0).max_value(4))];
+        let reply = format!("{prefix}{}{last}", params.join(";"));
+        assert!(looks_like_terminal_reply(&reply), "{reply}");
+        for prose in ["", "t", "6;24;9", "fix the 2 tests", "Ask Codex to do anything", "6;;9t", "6;24;9tt", "1. Yes", "a;b;ct"] {
+            assert!(!looks_like_terminal_reply(prose), "{prose}");
+        }
+    }
+
+    // #3460: a screen read records or clears the obstruction even when the
+    // attention it accompanies is unchanged; a read without a screen keeps it.
+    // The obstruction names an idle crew only under screen Unobservable.
+    #[test]
+    fn screen_reads_record_the_idle_obstruction() {
+        let at = Utc.timestamp_opt(100, 0).single().expect("time");
+        let unobservable =
+            TerminalAttention { state: TerminalAttentionState::Unobservable, as_of: at, source: TerminalAttentionSource::Screen };
+        let stray = ScreenObstruction::ComposerText { reply: Some("6;24;9t".into()), chars: 7 };
+        let observe = |obstruction| TerminalSessionStatusPatch::Observe {
+            attention: Some(unobservable.clone()),
+            obstruction,
+            occupancy: TerminalOccupancy::Vacant,
+            output_digest: None,
+            observed_at: at,
+        };
+        let mut status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
+        observe(Some(Some(stray.clone()))).apply(&mut status);
+        assert_eq!(status.idle_obstruction(), Some(&stray));
+        observe(None).apply(&mut status);
+        assert_eq!(status.screen_obstruction.as_ref(), Some(&stray), "no screen read keeps it");
+        assert_eq!(crate::read_evidence::crew_attention(Some(&status), at), Some(flotilla_protocol::CrewAttention::IdleComposerText));
+        let described = stray.describe("crew-session");
+        assert!(described.starts_with("idle, composer holds unsent text `6;24;9t` that looks like a stray terminal reply"), "{described}");
+        assert!(described.contains("`cleat send-keys crew-session C-u`"), "{described}");
+        assert!(ScreenObstruction::ScrolledBack.describe("crew-session").contains("`cleat send-keys crew-session Escape`"));
+        let draft = ScreenObstruction::ComposerText { reply: None, chars: 26 }.describe("crew-session");
+        assert!(draft.starts_with("idle, composer holds 26 characters of unsent text; if nobody is drafting there"), "{draft}");
+        // Hook evidence of a working agent hides the stale screen obstruction.
+        status.attention =
+            Some(TerminalAttention { state: TerminalAttentionState::Working, as_of: at, source: TerminalAttentionSource::Hook });
+        assert_eq!(status.idle_obstruction(), None);
+        status.attention = Some(unobservable.clone());
+        observe(Some(None)).apply(&mut status);
+        assert_eq!(status.idle_obstruction(), None, "a clear screen read clears it");
+        assert_eq!(crate::read_evidence::crew_attention(Some(&status), at), Some(flotilla_protocol::CrewAttention::Unobservable));
+    }
 
     // #2755: observations and repeated expiry cannot erase a delivery failure,
     // reset its deadline, acknowledge the message, or change its attempt count.
@@ -844,6 +992,7 @@ mod tests {
                 1 => TerminalSessionStatusPatch::ObserveAttention { attention },
                 2 => TerminalSessionStatusPatch::ObserveToolActivity { attention },
                 3 => TerminalSessionStatusPatch::Observe {
+                    obstruction: None,
                     attention: Some(attention),
                     occupancy: TerminalOccupancy::Vacant,
                     output_digest: Some(format!("output-{step}")),
@@ -907,6 +1056,7 @@ mod tests {
                 TerminalSessionStatusPatch::ObserveAttention { attention: hook.clone() }
             } else {
                 TerminalSessionStatusPatch::Observe {
+                    obstruction: None,
                     attention: Some(hook.clone()),
                     occupancy: TerminalOccupancy::Vacant,
                     output_digest: None,
@@ -1024,6 +1174,7 @@ mod tests {
         let mut status = TerminalSessionStatus::default();
         for (digest, second, expected) in [("first", 0, 0), ("first", 30, 0), ("second", 60, 60), ("second", 90, 60)] {
             TerminalSessionStatusPatch::Observe {
+                obstruction: None,
                 attention: None,
                 occupancy: TerminalOccupancy::Vacant,
                 output_digest: Some(digest.into()),
@@ -1188,6 +1339,7 @@ mod tests {
             let patch = match tc.draw(gs::integers::<usize>().min_value(0).max_value(4)) {
                 0 => TerminalSessionStatusPatch::ObserveAttention { attention },
                 1 => TerminalSessionStatusPatch::Observe {
+                    obstruction: None,
                     attention: Some(attention),
                     occupancy: TerminalOccupancy::Occupied,
                     output_digest: Some("output".into()),

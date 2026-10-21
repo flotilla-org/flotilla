@@ -158,7 +158,11 @@ pub fn crew_attention(
         TerminalAttentionState::Working => flotilla_protocol::CrewAttention::Working,
         TerminalAttentionState::NeedsInput => flotilla_protocol::CrewAttention::NeedsInput,
         TerminalAttentionState::Idle => flotilla_protocol::CrewAttention::Idle,
-        TerminalAttentionState::Unobservable => flotilla_protocol::CrewAttention::Unobservable,
+        TerminalAttentionState::Unobservable => match status.idle_obstruction() {
+            Some(crate::ScreenObstruction::ComposerText { .. }) => flotilla_protocol::CrewAttention::IdleComposerText,
+            Some(crate::ScreenObstruction::ScrolledBack) => flotilla_protocol::CrewAttention::IdleScrolledBack,
+            None => flotilla_protocol::CrewAttention::Unobservable,
+        },
     })
 }
 

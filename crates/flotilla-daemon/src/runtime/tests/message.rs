@@ -911,6 +911,7 @@ async fn held_pool_delivery_scenario(mode: &str) {
                     let outcome = reconciler.reconcile(
                         &legacy,
                         &flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                            obstruction: None,
                             attention: None,
                             occupancy: TerminalOccupancy::Vacant,
                             output_digest: None,
@@ -936,6 +937,7 @@ async fn held_pool_delivery_scenario(mode: &str) {
             .reconcile(
                 &legacy_receiver,
                 &flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                    obstruction: None,
                     attention: None,
                     occupancy: TerminalOccupancy::Vacant,
                     output_digest: None,
@@ -1313,4 +1315,84 @@ fn legacy_controller_refusals_retry_within_a_bounded_hold(tc: hegel::TestCase) {
         }
         assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
     });
+}
+
+// #3460: delivery waiting on an idle crew that cannot take a turn says why,
+// with the recovery command, instead of "waiting for a fresh idle holder
+// observation". The transport still refuses: the crew is not ready.
+#[tokio::test]
+async fn delivery_wait_names_an_idle_crew_composer_obstruction() {
+    use flotilla_agent_connector::{AgentTransport, DeliveryTarget};
+    use flotilla_resources::{ScreenObstruction, TerminalAttention, TerminalAttentionSource, TerminalAttentionState};
+    let temp = TempDir::new().expect("tempdir");
+    let config_base = temp.path().join("config");
+    fs::create_dir_all(&config_base).expect("config directory");
+    fs::write(config_base.join("daemon.toml"), "machine_id = \"obstruction-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(config_base));
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+        HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
+    let sessions = daemon.resource_backend().using::<TerminalSession>(NAMESPACE);
+    let created = sessions
+        .create(
+            &empty_meta("crew-terminal"),
+            &flotilla_resources::TerminalSessionSpec {
+                env_ref: "host-direct-host-test".into(),
+                role: "coder".into(),
+                source: TerminalSessionSource::Tool { command: "codex".into() },
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+            },
+        )
+        .await
+        .expect("session");
+    let runtime = super::super::terminal::TerminalControllerRuntime {
+        state: Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            Arc::new(ProviderRegistry::new()),
+            None,
+            "host-test".to_string(),
+            "host-direct-host-test".to_string(),
+        )),
+    };
+    let target = DeliveryTarget {
+        namespace: NAMESPACE.into(),
+        holder: "crew-terminal".into(),
+        session: Some("crew-session".into()),
+        crew_id: None,
+        harness: None,
+        live_shapes: None,
+    };
+    let mut status = TerminalSessionStatus {
+        phase: TerminalSessionPhase::Running,
+        session_id: Some("crew-session".into()),
+        attention: Some(TerminalAttention {
+            state: TerminalAttentionState::Unobservable,
+            as_of: Utc::now(),
+            source: TerminalAttentionSource::Screen,
+        }),
+        ..Default::default()
+    };
+    let mut version = created.metadata.resource_version;
+    for obstruction in [None, Some(ScreenObstruction::ComposerText { reply: Some("6;24;9t".into()), chars: 7 })] {
+        status.screen_obstruction = obstruction.clone();
+        version = sessions.update_status("crew-terminal", &version, &status).await.expect("status").metadata.resource_version;
+        let observation = runtime.observe(&target, None).await.expect("observation");
+        assert!(!observation.ready);
+        let reason = observation.waiting_reason.expect("waiting reason");
+        match obstruction {
+            None => assert_eq!(reason, "waiting for a fresh idle holder observation"),
+            Some(_) => {
+                assert!(reason.starts_with("waiting on the holder: idle, composer holds unsent text `6;24;9t`"), "{reason}");
+                assert!(reason.contains("`cleat send-keys crew-session C-u`"), "{reason}");
+            }
+        }
+    }
 }
