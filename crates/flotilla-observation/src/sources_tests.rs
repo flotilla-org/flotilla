@@ -320,3 +320,105 @@ fn forge_identity_subjects_resolve_their_repository() {
     assert!(repository_observes_subject(&remote, "github.com", "team/app"));
     assert!(!repository_observes_subject(&remote, "lab", "team/app"));
 }
+
+// Forge boundary fake: record the bound batch without making network calls.
+struct BoundBatchTracker(Arc<Mutex<Vec<Vec<u64>>>>);
+#[async_trait]
+impl ChangeRequestTracker for BoundBatchTracker {
+    async fn open_in_browser(&self, _: &str) -> Result<(), String> {
+        unreachable!()
+    }
+    async fn close_change_request(&self, _: &str) -> Result<(), String> {
+        unreachable!()
+    }
+    async fn merge_change_request(&self, _: &str) -> Result<(), String> {
+        unreachable!()
+    }
+    async fn list_merged_branch_names(&self, _: usize) -> Result<Vec<String>, String> {
+        unreachable!()
+    }
+    async fn list_change_requests(&self, _: usize) -> Result<Vec<(String, flotilla_protocol::ChangeRequest)>, String> {
+        unreachable!()
+    }
+    async fn get_change_request(&self, _: &str) -> Result<(String, flotilla_protocol::ChangeRequest), String> {
+        unreachable!()
+    }
+    async fn observe_bound(
+        &self,
+        numbers: &[u64],
+        _: &flotilla_change_request::CrewGithubLoginsByRequest,
+    ) -> Result<BoundObservations, ObservationError> {
+        self.0.lock().await.push(numbers.to_vec());
+        Ok(numbers
+            .iter()
+            .map(|number| {
+                (
+                    *number,
+                    Ok(flotilla_change_request::observation::parse_gh_observation(
+                        r#"{"state":"OPEN","headRefOid":"head","statusCheckRollup":[]}"#,
+                        Utc::now(),
+                    )
+                    .expect("status")),
+                )
+            })
+            .collect())
+    }
+}
+struct BoundBatchReads(Arc<Mutex<Vec<Vec<u64>>>>);
+#[async_trait]
+impl ChangeRequestQueryPort for BoundBatchReads {
+    async fn discover_repository_change_request(&self, _: &str, _: &RepositorySpec) -> Result<Arc<dyn ChangeRequestTracker>, String> {
+        Ok(Arc::new(BoundBatchTracker(self.0.clone())))
+    }
+}
+// #3710: a selected merged record is absent from a sibling's bound batch and
+// can be read directly without a provider call. Closed requests still enter it.
+#[tokio::test]
+async fn merged_record_excluded_from_bound_batch() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let repository = RepositorySpec::remote("https://github.com/org/repo.git").expect("repository");
+    backend
+        .using::<Repository>("ops")
+        .create(&flotilla_resources::InputMeta::builder().name(repository.key().to_string()).build(), &repository)
+        .await
+        .expect("repository");
+    let records = backend.using::<ChangeRequest>("ops");
+    for (number, state) in [(41, ObservedChangeRequestState::Merged), (43, ObservedChangeRequestState::Closed)] {
+        let spec = flotilla_resources::ChangeRequestSpec::builder()
+            .service("github.com".into())
+            .scope("org/repo".into())
+            .number(number)
+            .observing_authority("node".into())
+            .build();
+        let record =
+            records.create(&flotilla_resources::InputMeta::builder().name(format!("pr-{number}")).build(), &spec).await.expect("record");
+        records
+            .update_status(
+                &record.metadata.name,
+                &record.metadata.resource_version,
+                &flotilla_resources::ChangeRequestStatus {
+                    state: flotilla_resources::Observation::known(state, Utc::now()),
+                    ..flotilla_change_request::observation::parse_gh_observation(
+                        r#"{"state":"OPEN","headRefOid":"head","statusCheckRollup":[]}"#,
+                        Utc::now(),
+                    )
+                    .expect("status")
+                },
+            )
+            .await
+            .expect("state");
+    }
+    let batches = Arc::new(Mutex::new(Vec::new()));
+    let source = ProviderChangeRequestObservationSource::new(backend, Arc::new(BoundBatchReads(batches.clone())));
+    let subjects = [41, 42, 43].map(|number| {
+        ChangeRequestKey::new(
+            "ops",
+            flotilla_resources::address::stored_change_request_address("github.com", "org/repo", number, &[]).expect("address"),
+        )
+        .expect("subject")
+    });
+    source.observe_group(&subjects, &subjects[1]).await.expect("sibling read");
+    assert_eq!(*batches.lock().await, vec![vec![42, 43]]);
+    assert_eq!(source.observe(&subjects[0]).await.expect("merged record").state.value, Some(ObservedChangeRequestState::Merged));
+    assert_eq!(batches.lock().await.len(), 1);
+}

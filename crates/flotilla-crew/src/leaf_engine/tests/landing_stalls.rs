@@ -144,7 +144,7 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
     let missing = tc.draw(gs::booleans());
     let merged = tc.draw(gs::booleans());
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        for field in [".state", ".ready", ".checks"] {
+        for field in [".state", ".ready", ".checks", ".review.actionable-at-head"] {
             for (age, missing, merged) in
                 [(0, false, false), (19, false, false), (20, false, false), (21, true, false), (400, false, true), (age, missing, merged)]
             {
@@ -184,7 +184,9 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
                         flotilla_resources::ObservedChecks::Pass,
                         start - chrono::Duration::seconds(300),
                     ),
-                    review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+                    review: flotilla_resources::ChangeRequestReviewObservation {
+                        actionable_at_head: flotilla_resources::Observation::known(false, start - chrono::Duration::seconds(300)),
+                    },
                     mergeable: Default::default(),
                 };
                 if !missing {
@@ -201,6 +203,7 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
                             match field {
                                 ".ready" => "true",
                                 ".checks" => "pass",
+                                ".review.actionable-at-head" => "false",
                                 _ => "merged",
                             }
                         )
@@ -218,7 +221,7 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
                     let objects = HashMap::from([("forge".into(), convoys.get("forge").await.unwrap())]);
                     wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
                     let stall = convoys.get("forge").await.unwrap().status.unwrap().stalled;
-                    assert_eq!(stall.is_some(), age >= 20 && !(merged && !missing && field != ".checks"));
+                    assert_eq!(stall.is_some(), age >= 20 && !(merged && !missing));
                     if let Some(stall) = stall {
                         assert!(stall.evidence.contains("change_request observer"));
                         assert!(stall.evidence.contains("observer behind scheduled refresh grace"));
@@ -246,6 +249,8 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
                     flotilla_resources::ObservedChecks::Pass,
                     start + chrono::Duration::seconds(age),
                 );
+                observation.review.actionable_at_head =
+                    flotilla_resources::Observation::known(false, start + chrono::Duration::seconds(age));
                 let current = records.get(&name).await.unwrap();
                 records.update_status(&name, &current.metadata.resource_version, &observation).await.unwrap();
                 let objects = HashMap::from([("forge".into(), convoys.get("forge").await.unwrap())]);

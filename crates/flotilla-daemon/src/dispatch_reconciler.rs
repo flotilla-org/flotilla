@@ -249,6 +249,7 @@ impl DispatchReconciler {
         self
     }
 
+    #[tracing::instrument(name = "dispatch_reconciler", skip_all)]
     pub(crate) async fn reconcile_once(&self) -> Result<ReconcilePass, String> {
         let projects = self.backend.clone().using::<Project>(&self.namespace).list().await.map_err(|error| error.to_string())?;
         let mut mission = self.mission.lock().await;

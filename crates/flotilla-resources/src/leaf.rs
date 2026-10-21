@@ -74,6 +74,10 @@ pub trait LeafSubject {
     fn observed_at(&self, _field_path: &str) -> Option<DateTime<Utc>> {
         None
     }
+    /// Immutable observations satisfy subsequent freshness demands too.
+    fn is_final(&self) -> bool {
+        false
+    }
 }
 
 pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
@@ -159,7 +163,9 @@ pub fn evaluate_leaf(
     if subject.kind() != leaf.address.kind() {
         return Err(format!("leaf addresses {} but subject is {}", leaf.address.kind(), subject.kind()));
     }
-    if freshness_demand.is_some_and(|demand| subject.observed_at(&leaf.field_path).is_none_or(|observed_at| observed_at < demand)) {
+    if !subject.is_final()
+        && freshness_demand.is_some_and(|demand| subject.observed_at(&leaf.field_path).is_none_or(|observed_at| observed_at < demand))
+    {
         return Ok(LeafEvaluation { result: ThreeValue::Unknown, value: None });
     }
     let Some(value) = subject.value(&leaf.field_path) else {
@@ -419,15 +425,8 @@ impl ChangeRequestLeafSubject<'_> {
     }
 
     pub(crate) fn is_fresh(&self, field_path: &str) -> bool {
-        // Merge is irreversible: state and merged readiness cannot age out.
-        // Other fields still describe mutable observations and retain their TTL.
-        if matches!(field_path, ".state" | ".ready")
-            && self
-                .change_request
-                .status
-                .as_ref()
-                .is_some_and(|status| status.state.value == Some(crate::ObservedChangeRequestState::Merged))
-        {
+        // Every field of a merged request is final and cannot age out.
+        if self.change_request.status.as_ref().is_some_and(|status| status.state.value == Some(crate::ObservedChangeRequestState::Merged)) {
             return true;
         }
         self.field_observed_at(field_path)
@@ -437,6 +436,10 @@ impl ChangeRequestLeafSubject<'_> {
 }
 
 impl LeafSubject for ChangeRequestLeafSubject<'_> {
+    fn is_final(&self) -> bool {
+        self.change_request.status.as_ref().is_some_and(|status| status.state.value == Some(crate::ObservedChangeRequestState::Merged))
+    }
+
     fn kind(&self) -> LeafKind {
         LeafKind::ChangeRequest
     }
@@ -555,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_state_and_ready_do_not_expire_but_other_fields_do() {
+    fn every_merged_field_is_fresh_forever() {
         let observed_at = "2026-08-03T20:00:00Z".parse().expect("time");
         let object = ResourceObject::<ChangeRequest> {
             metadata: crate::ObjectMeta {
@@ -603,10 +606,17 @@ mod tests {
             operator: LeafOperator::Equal,
             literal: "merged".to_string(),
         };
-        // Merged is final for state and readiness, while checks retain freshness.
+        // Issue #3710: every merged field is final; checks and reviews remain usable after the TTL.
         assert_eq!(evaluate_leaf(&leaf, Some(&subject), None).expect("evaluate").result, ThreeValue::True);
         assert_eq!(subject.value(".ready"), Some(LeafValue::Text("true".to_string())));
-        assert_eq!(subject.value(".checks"), None);
+        assert_eq!(subject.value(".checks"), Some(LeafValue::Text("pass".to_string())));
+        assert_eq!(subject.value(".review.actionable-at-head"), Some(LeafValue::Text("false".to_string())));
+        for field in [".state", ".ready", ".head-sha", ".checks", ".review.actionable-at-head", ".mergeable"] {
+            assert!(subject.is_fresh(field), "{field}");
+            let value = subject.value(field).expect("known field").to_string();
+            let demanded = Leaf { field_path: field.to_string(), literal: value, ..leaf.clone() };
+            assert_eq!(evaluate_leaf(&demanded, Some(&subject), Some(subject.now)).expect("final freshness").result, ThreeValue::True);
+        }
         // Reopenable states remain known at the TTL boundary and expire just after it.
         for state in
             [crate::ObservedChangeRequestState::Open, crate::ObservedChangeRequestState::Draft, crate::ObservedChangeRequestState::Closed]

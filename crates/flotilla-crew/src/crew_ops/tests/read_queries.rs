@@ -1,6 +1,10 @@
 use super::*;
+use chrono::Utc;
 use flotilla_protocol::CrewCommandContext;
 use flotilla_resources::{ChangeRequest, ChangeRequestSpec, Message, MessageRelation, MessageSpec, Vessel, VesselSpec};
+use flotilla_resources::{
+    Checkout as ResourceCheckout, CheckoutIntegrationStatus, ConditionValue, IntegrationCondition, LifecycleAuthority, ResourceObject,
+};
 use flotilla_store::StoreExt;
 
 async fn create_vessel(backend: &ResourceBackend) {
@@ -279,4 +283,135 @@ async fn completion_refreshes_caller_after_lock_wait() {
     task.await.expect("task").expect("complete");
     let convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
     assert!(!convoy.status.expect("status").crew_work["work"]["coder"].completed_while_crew_active);
+}
+
+// Inspection boundary fake: explicit deletion obtains newly observed checkout facts.
+struct FreshDeleteInspection(std::sync::atomic::AtomicUsize);
+#[async_trait::async_trait]
+impl crate::ports::CheckoutIntegrationInspector for FreshDeleteInspection {
+    async fn inspect(
+        &self,
+        _: &ResourceObject<ResourceConvoy>,
+        _: &ResourceObject<ResourceCheckout>,
+    ) -> Result<CheckoutIntegrationStatus, String> {
+        let inspection = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let condition = IntegrationCondition::builder().value(ConditionValue::True).observed_at(Utc::now().to_rfc3339()).build();
+        let mut landed = condition.clone();
+        if inspection > 0 {
+            landed.value = ConditionValue::Unknown;
+        }
+        Ok(CheckoutIntegrationStatus {
+            clean: condition.clone(),
+            pushed: condition,
+            landed,
+            landed_evidence: (inspection == 0).then(|| {
+                flotilla_resources::LandedEvidence::builder()
+                    .change_request_id("42".into())
+                    .merged_at(Utc::now().to_rfc3339())
+                    .target_ref("main".into())
+                    .checkout_head_in_merged_head(true)
+                    .build()
+            }),
+            ..Default::default()
+        })
+    }
+}
+async fn active_delete_fixture() -> (Arc<CrewService>, ResourceBackend, tempfile::TempDir) {
+    let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let mut convoy = convoys.get("crew").await.expect("convoy");
+    convoy.spec.adopted_checkout_refs.insert(flotilla_protocol::RepositoryKey("repo".into()), "checkout".into());
+    let convoy = convoys.update(&InputMeta::from(&convoy.metadata), &convoy.metadata.resource_version, &convoy.spec).await.expect("adopt");
+    let mut status = convoy.status.expect("status");
+    status.phase = ConvoyPhase::Active;
+    convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("active");
+    let checkouts = backend.using::<ResourceCheckout>("flotilla");
+    let checkout = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("checkout".into())
+                .labels(BTreeMap::from([(CONVOY_LABEL.into(), "crew".into())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &flotilla_resources::CheckoutSpec::Observed(
+                flotilla_resources::ObservedCheckoutSpec::builder()
+                    .r#ref("topic".into())
+                    .path("/checkout".into())
+                    .repo_ref(flotilla_protocol::RepositoryKey("repo".into()))
+                    .host_ref("host".into())
+                    .is_main(false)
+                    .build(),
+            ),
+        )
+        .await
+        .expect("checkout");
+    checkouts
+        .update_status(
+            "checkout",
+            &checkout.metadata.resource_version,
+            &flotilla_resources::CheckoutStatus { phase: flotilla_resources::CheckoutPhase::Ready, ..Default::default() },
+        )
+        .await
+        .expect("stale checkout");
+    (crew, backend, _config)
+}
+
+// Process/VCS boundary stand-in: a transient failure must not publish fallback evidence.
+struct FailedDeleteInspection;
+#[async_trait::async_trait]
+impl crate::ports::CheckoutIntegrationInspector for FailedDeleteInspection {
+    async fn inspect(
+        &self,
+        _: &ResourceObject<ResourceConvoy>,
+        _: &ResourceObject<ResourceCheckout>,
+    ) -> Result<CheckoutIntegrationStatus, String> {
+        Err("VCS temporarily unavailable".into())
+    }
+}
+// An Active checkout requires a wired inspector; transient inspection failure
+// refuses deletion and leaves its prior observation untouched.
+#[tokio::test]
+async fn active_teardown_refuses_unset_or_failing_inspector() {
+    for configured in [false, true] {
+        let (crew, backend, _config) = active_delete_fixture().await;
+        if configured {
+            crew.set_checkout_inspector(Arc::new(FailedDeleteInspection));
+        }
+        let error = crew.teardown("flotilla", "crew", false).await.expect_err("inspection is required");
+        assert!(
+            error.contains(if configured {
+                "fresh inspection failed for checkout checkout: VCS temporarily unavailable"
+            } else {
+                "inspector not configured"
+            }),
+            "{error}"
+        );
+        let checkout = backend.using::<ResourceCheckout>("flotilla").get("checkout").await.expect("checkout preserved");
+        assert_eq!(checkout.status.expect("status").integration, CheckoutIntegrationStatus::default());
+        assert!(checkout.metadata.deletion_timestamp.is_none());
+    }
+}
+
+// #3710: each manual Active-convoy delete forces one fresh checkout inspection,
+// including a second request inside the normal evidence freshness horizon.
+#[tokio::test]
+async fn manual_active_convoy_delete_inspects_checkout_once_per_request() {
+    let (crew, backend, _config) = active_delete_fixture().await;
+    assert!(crew.teardown("flotilla", "crew", false).await.expect_err("missing inspector").contains("inspector not configured"));
+    let inspector = Arc::new(FreshDeleteInspection(0.into()));
+    crew.set_checkout_inspector(inspector.clone());
+    crew.teardown("flotilla", "crew", false).await.expect("fresh delete evidence");
+    crew.teardown("flotilla", "crew", false).await.expect("second explicit inspection");
+    assert_eq!(inspector.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(backend
+        .using::<ResourceCheckout>("flotilla")
+        .get("checkout")
+        .await
+        .expect("checkout")
+        .status
+        .expect("status")
+        .integration
+        .landed
+        .observed_at
+        .is_some());
 }

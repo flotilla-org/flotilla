@@ -817,7 +817,7 @@ impl ReconcilerWake {
                                 let merged = observation.is_some_and(|status| {
                                     status.state.value == Some(flotilla_resources::ObservedChangeRequestState::Merged)
                                 });
-                                let final_settlement = merged && matches!(leaf.field_path.as_str(), ".state" | ".ready");
+                                let final_settlement = merged;
                                 let fresh = final_settlement
                                     || (has_value
                                         && observation.is_some_and(|status| {

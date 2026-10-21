@@ -87,6 +87,7 @@ subtle = "2"
 libc = { workspace = true }
 
 [dev-dependencies]
+flotilla-forge-github = { path = "../flotilla-forge-github" }
 rigging-replay-testkit = { workspace = true }
 flotilla-load-driver = { path = "../flotilla-load-driver" }
 flotilla-change-request = { path = "../flotilla-change-request" }

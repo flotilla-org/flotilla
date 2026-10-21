@@ -745,11 +745,22 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
         .expect("mark checkout ready");
 
     let checkout = checkouts.get("checkout-b").await.expect("get checkout on authority host B");
+    // #3710: the PR observation is replicated before checkout inspection; gh
+    // supplies only merge time/base metadata, never the landing state or SHA.
+    publish_merged_change_request(&checkout_host, 1367, "checkout-root").await;
+    let runner = Arc::new(MergedPrProcessRunner::new(1367));
+    let vcs = test_controller_vcs(runner.clone(), &git_repo.path().to_string_lossy());
+    let records = checkout_host.using::<flotilla_resources::ChangeRequest>(NAMESPACE);
+    let record = records.list().await.expect("records").items.into_iter().find(|record| record.spec.number == 1367).expect("merged record");
+    let mut status = record.status.expect("merged status");
+    status.head_sha.value =
+        Some(vcs.read_repository(git_repo.path(), flotilla_vcs::vcs::RepositoryRead::HeadRevision).await.expect("HEAD").trim().to_string());
+    records.update_status(&record.metadata.name, &record.metadata.resource_version, &status).await.expect("replicated head");
     let observer = CheckoutReconciler::new(
         Arc::new(CheckoutControllerRuntime::new(
-            Arc::new(MergedPrProcessRunner::new(1367)),
-            Some(test_controller_vcs(Arc::new(MergedPrProcessRunner::new(1367)), &git_repo.path().to_string_lossy())),
-            None,
+            runner,
+            Some(vcs),
+            Some(checkout_host.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE)),
             Vec::new(),
         )),
         checkout_host.clone(),
@@ -765,7 +776,6 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
         ConditionValue::True,
         "checkout authority B must observe the merged change request",
     );
-    publish_merged_change_request(&checkout_host, 1367, "checkout-root").await;
 
     authority
         .replica_writer::<Checkout>(checkout_root, NAMESPACE)

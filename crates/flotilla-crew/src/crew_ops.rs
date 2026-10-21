@@ -117,6 +117,8 @@ pub struct CrewService {
     host_name: HostName,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
     checkout_vcs: Arc<dyn CheckoutVcsResolver>,
+    #[builder(default)]
+    checkout_inspector: std::sync::RwLock<Option<Arc<dyn crate::ports::CheckoutIntegrationInspector>>>,
     local_environment_id: EnvironmentId,
 }
 
@@ -1495,6 +1497,10 @@ impl CrewService {
         Ok(CommandValue::Ok)
     }
 
+    pub fn set_checkout_inspector(&self, inspector: Arc<dyn crate::ports::CheckoutIntegrationInspector>) {
+        *self.checkout_inspector.write().expect("checkout inspector lock") = Some(inspector);
+    }
+
     pub async fn teardown(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         if force {
             return Ok(());
@@ -1513,7 +1519,41 @@ impl CrewService {
             )
             .await
             .map_err(|err| err.to_string())?;
-        let checkout_list = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items).into_values().collect::<Vec<_>>();
+        let mut checkout_list =
+            flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items).into_values().collect::<Vec<_>>();
+        if !checkout_list.is_empty() && convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Active) {
+            let inspector = self.checkout_inspector.read().expect("checkout inspector lock").clone().ok_or_else(|| {
+                tracing::warn!(convoy = name, "Active convoy checkout inspector is not configured");
+                "fresh checkout inspection is unavailable: inspector not configured".to_string()
+            })?;
+            for checkout in &mut checkout_list {
+                // Fail closed: an unavailable inspection must not authorize deletion
+                // from the old six-hour observation, even if another checkout passed.
+                let mut integration = inspector
+                    .inspect(&convoy, checkout)
+                    .await
+                    .map_err(|error| format!("fresh inspection failed for checkout {}: {error}", checkout.metadata.name))?;
+                if let Some(status) = &checkout.status {
+                    flotilla_resources::latch_evidence_backed_integration(&status.integration, &mut integration);
+                }
+                let records = self.resource_backend.using::<ResourceCheckout>(namespace);
+                match records.get(&checkout.metadata.name).await {
+                    Ok(local) => {
+                        apply_resource_status_patch(
+                            &records,
+                            &local.metadata.name,
+                            &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration.clone()) },
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        *checkout = records.get(&local.metadata.name).await.map_err(|error| error.to_string())?;
+                    }
+                    // A selected checkout may exist only as a replica here.
+                    Err(ResourceError::NotFound { .. }) => checkout.status.get_or_insert_with(Default::default).integration = integration,
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
         self.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkout_list, false).await
     }
 

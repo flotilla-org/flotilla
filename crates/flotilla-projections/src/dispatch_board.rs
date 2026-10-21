@@ -15,6 +15,7 @@ use std::{
 use flotilla_protocol::{DispatchBoardRepository, IssueSource};
 use futures::FutureExt;
 use tokio::{sync::Mutex, time::Instant};
+use tracing::Instrument;
 
 // Process-local identities: never persist or compare revisions across daemons.
 static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -72,35 +73,38 @@ impl DispatchBoardCache {
             state.refreshing = true;
             state.last_attempt = Some(Instant::now());
             let refresh_entry = entry.clone();
-            tokio::spawn(async move {
-                // Catch panics both while constructing and polling the future.
-                // Treat them as an observation failure so the source can retry.
-                let result = match tokio::time::timeout(REFRESH_TIMEOUT, AssertUnwindSafe(async move { load().await }).catch_unwind()).await
-                {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(_)) => Err("board tracker refresh panicked".into()),
-                    Err(_) => Err("board tracker refresh timed out".into()),
-                };
-                let mut entry = refresh_entry.lock().await;
-                entry.refreshing = false;
-                // Retry backoff starts on completion, including a slow failure.
-                entry.last_attempt = Some(Instant::now());
-                match result {
-                    Ok(board) => {
-                        if entry.board.as_ref().is_none_or(|previous| previous.issues != board.issues) {
-                            entry.revision = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(
+                async move {
+                    // Catch panics both while constructing and polling the future.
+                    // Treat them as an observation failure so the source can retry.
+                    let result =
+                        match tokio::time::timeout(REFRESH_TIMEOUT, AssertUnwindSafe(async move { load().await }).catch_unwind()).await {
+                            Ok(Ok(result)) => result,
+                            Ok(Err(_)) => Err("board tracker refresh panicked".into()),
+                            Err(_) => Err("board tracker refresh timed out".into()),
+                        };
+                    let mut entry = refresh_entry.lock().await;
+                    entry.refreshing = false;
+                    // Retry backoff starts on completion, including a slow failure.
+                    entry.last_attempt = Some(Instant::now());
+                    match result {
+                        Ok(board) => {
+                            if entry.board.as_ref().is_none_or(|previous| previous.issues != board.issues) {
+                                entry.revision = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
+                            }
+                            entry.board = Some(Arc::new(board));
+                            entry.error = None;
                         }
-                        entry.board = Some(Arc::new(board));
-                        entry.error = None;
-                    }
-                    Err(error) => {
-                        if let Some(board) = &mut entry.board {
-                            Arc::make_mut(board).refresh_error = Some(error.clone());
+                        Err(error) => {
+                            if let Some(board) = &mut entry.board {
+                                Arc::make_mut(board).refresh_error = Some(error.clone());
+                            }
+                            entry.error = Some(error);
                         }
-                        entry.error = Some(error);
                     }
                 }
-            });
+                .instrument(tracing::info_span!("dispatch_board")),
+            );
         }
         let Some(board) = state.board.clone() else {
             return Err(format!(
@@ -185,6 +189,7 @@ impl DispatchBoard<'_> {
             Err(errors.join("; "))
         }
     }
+    #[tracing::instrument(name = "dispatch_board", skip_all)]
     pub async fn collect_dispatch_board_inputs(&self, projects: &[ResourceObject<Project>]) -> Result<DispatchBoardInputs, String> {
         let namespace = self.namespace.clone();
         let inventory = self.backend.including_replicas::<Repository>(&namespace).list().await.map_err(|error| error.to_string())?;

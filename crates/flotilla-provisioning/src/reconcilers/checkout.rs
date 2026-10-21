@@ -74,7 +74,10 @@ pub trait CheckoutRuntime: Send + Sync {
     /// Refuse a new branch that is already a forge change-request head.
     /// Existing targets are retries and must remain recoverable.
     /// Ok(Some) names a permanent conflict; Err is a retryable lookup failure.
-    async fn validate_new_branch(&self, _checkout: &ResourceObject<Checkout>) -> Result<Option<String>, String> {
+    async fn validate_new_branch(
+        &self,
+        _checkout: &ResourceObject<Checkout>,
+    ) -> Result<Option<String>, flotilla_provider_runtime::ObservationError> {
         Ok(None)
     }
 
@@ -169,6 +172,7 @@ pub struct CheckoutReconciler<R> {
     backend: ResourceBackend,
     finalizers: Mutex<BTreeMap<String, JoinHandle<Result<CheckoutRemovalOutcome, String>>>>,
     background_removal_limit: NonZeroUsize,
+    validation_backoff: std::sync::Mutex<BTreeMap<String, Duration>>,
 }
 
 impl<R> CheckoutReconciler<R> {
@@ -196,6 +200,7 @@ impl<R> CheckoutReconciler<R> {
             backend: backend.clone(),
             finalizers: Mutex::new(BTreeMap::new()),
             background_removal_limit: DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
+            validation_backoff: Default::default(),
         }
     }
 
@@ -290,7 +295,7 @@ pub enum CheckoutPrepared {
     Integration { status: Box<CheckoutIntegrationStatus> },
     RetryClone { clone_name: String, failed_at: DateTime<Utc> },
     Waiting,
-    ValidationUnavailable(String),
+    ValidationUnavailable(flotilla_provider_runtime::ObservationError),
     Failed(String),
 }
 
@@ -322,7 +327,12 @@ fn checkout_registration_reason(checkout: &ResourceObject<Checkout>, convoy: Opt
 }
 
 fn convoy_needs_delete_evidence(convoy: Option<&ResourceObject<Convoy>>) -> bool {
-    convoy.is_some_and(|convoy| convoy.status.as_ref().is_none_or(|status| status.phase != ConvoyPhase::Abandoned))
+    convoy.is_some_and(|convoy| {
+        convoy.status.as_ref().is_some_and(|status| {
+            // Abandoned teardown bypasses the evidence gate, as before.
+            status.phase == ConvoyPhase::Landing || (status.phase.is_terminal() && status.phase != ConvoyPhase::Abandoned)
+        })
+    })
 }
 
 impl<R> Reconciler for CheckoutReconciler<R>
@@ -462,9 +472,14 @@ where
             let validation = if sharing_ready_branch { Ok(None) } else { self.runtime.validate_new_branch(obj).await };
             match validation {
                 Ok(Some(conflict)) => return Ok(CheckoutPrepared::Failed(conflict)),
-                Ok(None) => {}
+                Ok(None) => {
+                    self.validation_backoff.lock().expect("validation backoff lock").remove(&obj.metadata.name);
+                }
                 Err(error) => {
-                    if obj.status.as_ref().and_then(|status| status.message.as_deref()) == Some(error.as_str()) {
+                    let mut backoffs = self.validation_backoff.lock().expect("validation backoff lock");
+                    let delay = backoffs.entry(obj.metadata.name.clone()).or_insert(Duration::ZERO);
+                    *delay = (*delay * 2).max(Duration::from_secs(1)).min(Duration::from_secs(60));
+                    if obj.status.as_ref().and_then(|status| status.message.as_deref()) == Some(error.to_string().as_str()) {
                         debug!(checkout = %obj.metadata.name, %error, "checkout branch validation still unavailable; retrying");
                     } else {
                         warn!(checkout = %obj.metadata.name, %error, "checkout branch validation unavailable; retrying");
@@ -636,9 +651,11 @@ where
                 | CheckoutPrepared::Reappeared => None,
                 CheckoutPrepared::RetryClone { .. } => None,
                 CheckoutPrepared::Failed(message) => Some(CheckoutStatusPatch::MarkFailed { message: message.clone() }),
-                CheckoutPrepared::ValidationUnavailable(message) => (obj.status.as_ref().and_then(|status| status.message.as_ref())
-                    != Some(message))
-                .then(|| CheckoutStatusPatch::ObserveValidation { message: Some(message.clone()) }),
+                CheckoutPrepared::ValidationUnavailable(error) => {
+                    let message = error.to_string();
+                    (obj.status.as_ref().and_then(|status| status.message.as_ref()) != Some(&message))
+                        .then_some(CheckoutStatusPatch::ObserveValidation { message: Some(message) })
+                }
                 CheckoutPrepared::Waiting | CheckoutPrepared::None => obj
                     .status
                     .as_ref()
@@ -710,7 +727,20 @@ where
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) == CheckoutPhase::Pending
             && !matches!(prepared, CheckoutPrepared::Failed(_))
         {
-            outcome.requeue_after = Some(CHECKOUT_PROVISIONING_REQUEUE_AFTER);
+            outcome.requeue_after = Some(match prepared {
+                CheckoutPrepared::ValidationUnavailable(error) => error
+                    .retry_at()
+                    .map(|at| at.signed_duration_since(self.clock.now()).to_std().unwrap_or_default())
+                    .unwrap_or_else(|| {
+                        self.validation_backoff
+                            .lock()
+                            .expect("validation backoff lock")
+                            .get(&obj.metadata.name)
+                            .copied()
+                            .unwrap_or(CHECKOUT_PROVISIONING_REQUEUE_AFTER)
+                    }),
+                _ => CHECKOUT_PROVISIONING_REQUEUE_AFTER,
+            });
         }
         outcome
     }
@@ -727,6 +757,7 @@ where
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        self.validation_backoff.lock().expect("validation backoff lock").remove(&obj.metadata.name);
         let convoy = self.owning_convoy(obj).await?;
         let forced = convoy
             .as_ref()

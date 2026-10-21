@@ -8,10 +8,10 @@ use flotilla_issue_tracker::IssueProvider;
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::address::{issue_reference_address, subject_address, GITHUB_FORGE_ID};
 use flotilla_resources::{
-    active_change_request_subjects, Convoy as ResourceConvoy, CredentialConsumer, CredentialSpec, Forge, Repository, RepositorySpec,
-    ResourceObject,
+    active_change_request_subjects, select_change_requests, ChangeRequest, Convoy as ResourceConvoy, CredentialConsumer, CredentialSpec,
+    Forge, ObservedChangeRequestState, Repository, RepositorySpec, ResourceObject,
 };
-use flotilla_store::ResourceBackend;
+use flotilla_store::{ResourceBackend, StoreQuery};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
@@ -239,6 +239,7 @@ impl ProviderChangeRequestObservationSource {
         }
     }
 
+    #[tracing::instrument(name = "pr_observer_bound_batch", skip_all)]
     async fn query(
         &self,
         subjects: &[ChangeRequestKey],
@@ -249,6 +250,32 @@ impl ProviderChangeRequestObservationSource {
         let key = (subject.namespace().to_string(), service.clone(), scope.clone());
         let mut numbers = subjects.iter().map(ChangeRequestKey::number).collect::<BTreeSet<_>>();
         numbers.insert(subject.number());
+        let records = self
+            .backend
+            .query_declared::<ChangeRequest>(
+                subject.namespace(),
+                &StoreQuery {
+                    fields: BTreeMap::from([
+                        ("spec.service".into(), service.clone()),
+                        ("spec.scope".into(), scope.clone()),
+                        ("spec.number".into(), subject.number().to_string()),
+                    ]),
+                    include_replicas: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let selected = select_change_requests(records.items.iter().map(|source| &source.object));
+        let mut merged_numbers = BTreeSet::new();
+        for record in selected.values().filter(|record| record.spec.service == service && record.spec.scope == scope) {
+            if let Some(status) = record.status.as_ref().filter(|status| status.state.value == Some(ObservedChangeRequestState::Merged)) {
+                merged_numbers.insert(record.spec.number);
+                if record.spec.number == subject.number() {
+                    return Ok(status.clone());
+                }
+            }
+        }
         let scope_cache = {
             let mut cache = self.cache.lock().await;
             Arc::clone(cache.entry(key).or_insert_with(|| Arc::new(Mutex::new(None))))
@@ -322,6 +349,29 @@ impl ProviderChangeRequestObservationSource {
                 }
             }
         }
+        let records = self
+            .backend
+            .query_declared::<ChangeRequest>(
+                subject.namespace(),
+                &StoreQuery {
+                    fields: BTreeMap::from([("spec.service".into(), service.clone()), ("spec.scope".into(), scope.clone())]),
+                    field_values: BTreeMap::from([("spec.number".into(), numbers.iter().map(u64::to_string).collect())]),
+                    include_replicas: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let selected = select_change_requests(records.items.iter().map(|source| &source.object));
+        merged_numbers.extend(
+            selected
+                .values()
+                .filter(|record| {
+                    record.status.as_ref().is_some_and(|status| status.state.value == Some(ObservedChangeRequestState::Merged))
+                })
+                .map(|record| record.spec.number),
+        );
+        numbers.retain(|number| !merged_numbers.contains(number));
         let queried = numbers;
         if !fresh {
             if let Some(entry) = cache.as_ref() {

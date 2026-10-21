@@ -9,7 +9,9 @@ fn observed_request(state: flotilla_resources::ObservedChangeRequestState, at: D
         state: flotilla_resources::Observation::known(state, at),
         head_sha: Default::default(),
         checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, at),
-        review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+        review: flotilla_resources::ChangeRequestReviewObservation {
+            actionable_at_head: flotilla_resources::Observation::known(false, at),
+        },
         mergeable: Default::default(),
     }
 }
@@ -32,14 +34,13 @@ async fn sync_snapshot(backend: &ResourceBackend, wake: &ReconcilerWake) -> bool
         .any(|row| matches!(&row.maker, LeafMaker::Controller { resource_kind, .. } if resource_kind == "Convoy"))
 }
 
-// Final state/readiness and empty claim exits do not age; unchanged final
-// evidence is evaluated once. Mutable checks must still expire at the exact
-// TTL, and changing the convoy's exit must invalidate a cached positive proof.
+// #3710: every merged field and empty claim exits remain final. Unchanged
+// evidence is evaluated once; changing the exit invalidates its cached proof.
 #[hegel::test]
 fn final_settlement_cache_preserves_freshness_and_input_changes(tc: hegel::TestCase) {
-    let field = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3));
+    let field = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(4));
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        for field in [0, 1, 2, 3, field] {
+        for field in [0, 1, 2, 3, 4, field] {
             let backend = ResourceBackend::new(InMemoryBackend::default());
             let mut wake = supervision_wake(&backend);
             let now = Utc::now();
@@ -68,7 +69,8 @@ fn final_settlement_cache_preserves_freshness_and_input_changes(tc: hegel::TestC
                     flotilla_resources::parse_leaf_template(match field {
                         0 => "$cr.state == merged",
                         1 => "$cr.ready == true",
-                        _ => "$cr.checks == pass",
+                        2 => "$cr.checks == pass",
+                        _ => "$cr.review.actionable-at-head == false",
                     })
                     .unwrap(),
                 )]))
@@ -119,10 +121,10 @@ fn final_settlement_cache_preserves_freshness_and_input_changes(tc: hegel::TestC
             assert!(sync_snapshot(&backend, &wake).await);
             let before = calls();
             assert!(sync_snapshot(&backend, &wake).await);
-            assert_eq!(calls(), before + usize::from(field == 2));
+            assert_eq!(calls(), before);
             clock.advance(chrono::Duration::seconds(181));
-            assert_eq!(sync_snapshot(&backend, &wake).await, field != 2);
-            assert_eq!(calls(), before + if field == 2 { 2 } else { 0 });
+            assert!(sync_snapshot(&backend, &wake).await);
+            assert_eq!(calls(), before);
             let current = convoys.get("cached").await.unwrap();
             let mut changed = current.status.unwrap();
             changed.message = Some("revision changed".into());
@@ -138,7 +140,7 @@ fn final_settlement_cache_preserves_freshness_and_input_changes(tc: hegel::TestC
             }
             convoys.update_status("cached", &current.metadata.resource_version, &changed).await.unwrap();
             assert_eq!(sync_snapshot(&backend, &wake).await, field == 3);
-            assert_eq!(calls(), before + if field == 2 { 3 } else { 1 });
+            assert_eq!(calls(), before + 1);
         }
     });
 }

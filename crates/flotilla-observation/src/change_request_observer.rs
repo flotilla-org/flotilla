@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{hash_map::Entry, BTreeMap, HashMap, HashSet},
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -15,7 +15,7 @@ use flotilla_resources::{
     ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState, ObservedChecks,
     ResourceError, ResourceProvenance,
 };
-use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend};
+use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend, StoreQuery};
 #[cfg(test)]
 use flotilla_store_http::HttpBackend;
 #[cfg(test)]
@@ -388,7 +388,33 @@ impl ChangeRequestRefresher {
         self.refresh_once_with_creation(subject, true).await
     }
 
+    async fn selected_merged(&self, subject: &ChangeRequestKey) -> Result<bool, ObservationError> {
+        // Numeric identity is indexed; keep spelling/alias selection in spec_names.
+        let sources = self
+            .inner
+            .backend
+            .query_declared::<ChangeRequest>(
+                subject.namespace(),
+                &StoreQuery {
+                    fields: BTreeMap::from([("spec.number".into(), subject.number().to_string())]),
+                    include_replicas: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| ObservationError::Failed(error.to_string()))?;
+        let selected = select_change_requests(sources.items.iter().map(|source| &source.object));
+        Ok(selected.values().any(|record| {
+            spec_names(&record.spec, subject)
+                && record.status.as_ref().is_some_and(|status| status.state.value == Some(ObservedChangeRequestState::Merged))
+        }))
+    }
+
     async fn refresh_once_with_creation(&self, subject: &ChangeRequestKey, create_missing: bool) -> Result<(), ObservationError> {
+        if self.selected_merged(subject).await? {
+            self.inner.observation_errors.lock().await.remove(subject);
+            return Ok(());
+        }
         let record_name = subject.record_name();
         let lock = self.subject_lock(subject).await;
         let _guard = lock.lock().await;
@@ -400,8 +426,15 @@ impl ChangeRequestRefresher {
         let status = if create_missing {
             self.inner.source.observe_for_completion(subject).await
         } else {
-            let group =
-                self.inner.active.lock().await.keys().filter(|candidate| same_repository(candidate, subject)).cloned().collect::<Vec<_>>();
+            let group = self
+                .inner
+                .active
+                .lock()
+                .await
+                .iter()
+                .filter(|(candidate, refresh)| same_repository(candidate, subject) && !refresh.demands.is_empty())
+                .map(|(candidate, _)| candidate.clone())
+                .collect::<Vec<_>>();
             self.inner.source.observe_group(&group, subject).await
         };
         let status = match status {
@@ -778,6 +811,20 @@ impl ChangeRequestRefresher {
                     tracing::warn!(change_request = %subject.address(), %error, "collect retained change request failed")
                 }
             }
+            match self.selected_merged(&subject).await {
+                Ok(true) => {
+                    self.inner.observation_errors.lock().await.remove(&subject);
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.inner.observation_errors.lock().await.insert(subject.clone(), error);
+                    if !self.wait_for_next(&subject, self.inner.cadence.checks_pending, self.inner.cadence.checks_pending).await {
+                        return;
+                    }
+                    continue;
+                }
+            }
             match self.owns_record(&subject, true, true).await {
                 Ok(false) => {
                     if !self
@@ -804,8 +851,15 @@ impl ChangeRequestRefresher {
                 }
                 Ok(true) => {}
             }
-            let group =
-                self.inner.active.lock().await.keys().filter(|candidate| same_repository(candidate, &subject)).cloned().collect::<Vec<_>>();
+            let group = self
+                .inner
+                .active
+                .lock()
+                .await
+                .iter()
+                .filter(|(candidate, refresh)| same_repository(candidate, &subject) && !refresh.demands.is_empty())
+                .map(|(candidate, _)| candidate.clone())
+                .collect::<Vec<_>>();
             match self.inner.source.observe_group(&group, &subject).await {
                 Ok(status) => {
                     let demanded =
@@ -1382,6 +1436,90 @@ mod tests {
             self.1.fetch_add(1, Ordering::SeqCst);
             Ok(status)
         }
+    }
+
+    fn test_subject(number: u64) -> ChangeRequestKey {
+        ChangeRequestKey::new(
+            "ops",
+            flotilla_resources::address::stored_change_request_address("github.com", "org/repo", number, &[]).expect("address"),
+        )
+        .expect("subject")
+    }
+    // #3710: an already merged demanded record never reaches the forge, even
+    // after ten minutes or when explicitly refreshed for completion.
+    #[tokio::test(start_paused = true)]
+    async fn demanded_merged_subject_not_polled() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let source = Arc::new(MutableSource(
+            Mutex::new(
+                parse_gh_observation(
+                    r#"{"state":"MERGED","headRefOid":"head","statusCheckRollup":[],"mergeable":"MERGEABLE"}"#,
+                    Utc::now(),
+                )
+                .expect("merged"),
+            ),
+            AtomicUsize::new(0),
+        ));
+        let refresher = ChangeRequestRefresher::new(
+            "fleet".into(),
+            backend.clone(),
+            "node".into(),
+            source.clone(),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let subject = test_subject(42);
+        refresher.refresh_once(&subject).await.expect("initial observation");
+        assert_eq!(source.1.load(Ordering::SeqCst), 1);
+        let demand = uuid::Uuid::new_v4();
+        refresher.demand(demand, subject.clone(), None).await.expect("demand");
+        for _ in 0..12 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+        }
+        refresher.refresh_once(&subject).await.expect("completion uses merged record");
+        assert_eq!(source.1.load(Ordering::SeqCst), 1);
+        refresher.release(demand).await;
+    }
+
+    // Forge boundary fake: expose exactly which subjects a batch asks to read.
+    struct GroupSource(Mutex<Vec<Vec<u64>>>);
+    #[async_trait]
+    impl ChangeRequestObservationSource for GroupSource {
+        async fn observe(&self, _: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
+            Ok(parse_gh_observation(r#"{"state":"OPEN","headRefOid":"head","statusCheckRollup":[],"mergeable":"MERGEABLE"}"#, Utc::now())
+                .expect("open"))
+        }
+        async fn observe_group(
+            &self,
+            subjects: &[ChangeRequestKey],
+            subject: &ChangeRequestKey,
+        ) -> Result<ChangeRequestStatus, ObservationError> {
+            self.0.lock().await.push(subjects.iter().map(ChangeRequestKey::number).collect());
+            self.observe(subject).await
+        }
+    }
+    // #3710: retained history has its own cadence and cannot ride a live sibling's batch.
+    #[tokio::test(start_paused = true)]
+    async fn retained_subject_does_not_ride_along_with_demanded_sibling() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let source = Arc::new(GroupSource(Mutex::new(Vec::new())));
+        let refresher =
+            ChangeRequestRefresher::new("fleet".into(), backend, "node".into(), source.clone(), ChangeRequestRefreshCadence::default());
+        let retained = test_subject(41);
+        refresher.refresh_once(&retained).await.expect("seed retained");
+        refresher.start_retained(retained).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        source.0.lock().await.clear();
+        let sibling = test_subject(42);
+        let demand = uuid::Uuid::new_v4();
+        refresher.demand(demand, sibling.clone(), None).await.expect("sibling demand");
+        refresher.refresh_once_with_creation(&sibling, false).await.expect("sibling batch");
+        let groups = source.0.lock().await.clone();
+        assert!(!groups.is_empty());
+        assert!(groups.iter().all(|group| !group.contains(&41)), "{groups:?}");
+        refresher.release(demand).await;
     }
 
     async fn wait_for_request_state(records: &TypedResolver<ChangeRequest>, name: &str, expected: Option<ObservedChangeRequestState>) {

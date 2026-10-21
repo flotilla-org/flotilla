@@ -86,16 +86,27 @@ struct RecordingCheckoutRuntime {
     path_exists: Option<bool>,
     protection_error: Option<String>,
     validation_failures: Mutex<usize>,
+    validation_retry_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[async_trait]
 impl CheckoutRuntime for RecordingCheckoutRuntime {
     // Forge boundary: a transient lookup failure must leave creation retryable.
-    async fn validate_new_branch(&self, _checkout: &ResourceObject<Checkout>) -> Result<Option<String>, String> {
+    async fn validate_new_branch(
+        &self,
+        _checkout: &ResourceObject<Checkout>,
+    ) -> Result<Option<String>, flotilla_provider_runtime::ObservationError> {
         let mut remaining = self.validation_failures.lock().expect("validation failure counter");
         if *remaining > 0 {
             *remaining -= 1;
-            Err("forge rate limit".into())
+            Err(match self.validation_retry_at {
+                Some(retry_at) => flotilla_provider_runtime::ObservationError::RateLimited {
+                    budget: "REST".into(),
+                    retry_at: Some(retry_at),
+                    detail: "forge rate limit".into(),
+                },
+                None => "forge rate limit".into(),
+            })
         } else {
             Ok(None)
         }
@@ -1059,17 +1070,30 @@ async fn ready_checkout_reconciler_retries_protection_errors_without_failing_fre
     assert_eq!(checkouts.get("checkout-a").await.expect("checkout").status.expect("status").phase, CheckoutPhase::Ready);
 }
 
+// #3710: only Landing and terminal convoys require 30s integration evidence.
 #[tokio::test]
 async fn checkout_authority_keeps_delete_evidence_fresh_for_replicated_convoy() {
-    for (phase, refreshes_delete_evidence) in [
-        (ConvoyPhase::Pending, true),
-        (ConvoyPhase::Active, true),
-        (ConvoyPhase::Interrupted, true),
-        (ConvoyPhase::Landing, true),
+    assert_checkout_refresh_for_phases(&[
+        (ConvoyPhase::Pending, false),
+        (ConvoyPhase::Interrupted, false),
         (ConvoyPhase::Landed, true),
         (ConvoyPhase::Failed, true),
         (ConvoyPhase::Abandoned, false),
-    ] {
+    ])
+    .await;
+}
+// Active convoy checkouts retain the normal six-hour integration cadence.
+#[tokio::test]
+async fn active_convoy_checkout_uses_slow_integration_refresh() {
+    assert_checkout_refresh_for_phases(&[(ConvoyPhase::Active, false)]).await;
+}
+// Landing needs fresh evidence at the existing 30s horizon.
+#[tokio::test]
+async fn landing_convoy_checkout_keeps_30s_refresh() {
+    assert_checkout_refresh_for_phases(&[(ConvoyPhase::Landing, true)]).await;
+}
+async fn assert_checkout_refresh_for_phases(phases: &[(ConvoyPhase, bool)]) {
+    for &(phase, refreshes_delete_evidence) in phases {
         let authority_root = NodeId::new("convoy-authority");
         let checkout_root = NodeId::new("checkout-authority");
         let authority = ResourceBackend::new(InMemoryBackend::default()).with_local_root(authority_root.clone());
@@ -1138,7 +1162,7 @@ async fn checkout_authority_keeps_delete_evidence_fresh_for_replicated_convoy() 
 
         let checkout = checkouts.get("remote-checkout").await.expect("get checkout");
         let runtime = Arc::new(RecordingCheckoutRuntime::default());
-        let reconciler = CheckoutReconciler::with_clock(runtime.clone(), checkout_host.clone(), NAMESPACE, clock)
+        let reconciler = CheckoutReconciler::with_clock(runtime.clone(), checkout_host.clone(), NAMESPACE, clock.clone())
             .with_federated_convoys(&checkout_host, NAMESPACE);
 
         let deps = reconciler.prepare(&checkout).await.expect("resolve replicated delete-gated convoy");
@@ -1153,6 +1177,12 @@ async fn checkout_authority_keeps_delete_evidence_fresh_for_replicated_convoy() 
             usize::from(refreshes_delete_evidence),
             "only evidence-gated convoys should provoke an authority-side probe"
         );
+        if !refreshes_delete_evidence {
+            clock.advance(chrono::Duration::seconds(6 * 60 * 60 - 32));
+            assert!(matches!(reconciler.prepare(&checkout).await.expect("before expiry"), CheckoutPrepared::None));
+            clock.advance(chrono::Duration::seconds(2));
+            assert!(matches!(reconciler.prepare(&checkout).await.expect("after expiry"), CheckoutPrepared::Integration { .. }));
+        }
     }
 }
 
@@ -1475,7 +1505,7 @@ async fn convoy_checkout_refuses_branch_held_by_checkout() {
         NAMESPACE,
     );
     let unavailable = retrying.prepare(&old).await.expect("transient lookup");
-    assert!(matches!(unavailable, CheckoutPrepared::ValidationUnavailable(ref message) if message == "forge rate limit"));
+    assert!(matches!(unavailable, CheckoutPrepared::ValidationUnavailable(ref message) if message.to_string() == "forge rate limit"));
     let outcome = retrying.reconcile(&old, &unavailable, chrono::Utc::now());
     let patch = outcome.patch.expect("visible validation failure");
     apply_status_patch(&checkouts, "old", &patch).await.expect("record validation diagnostic");
@@ -1499,6 +1529,70 @@ async fn convoy_checkout_refuses_branch_held_by_checkout() {
     let clear = retrying.reconcile(&old, &recovered, chrono::Utc::now()).patch.expect("clear validation diagnostic");
     apply_status_patch(&checkouts, "old", &clear).await.expect("clear error");
     assert!(checkouts.get("old").await.expect("recovered checkout").status.expect("status").message.is_none());
+}
+
+async fn validation_fixture(
+    failures: usize,
+    retry_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> (Arc<RecordingCheckoutRuntime>, CheckoutReconciler<RecordingCheckoutRuntime>, ResourceObject<Checkout>) {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let runtime = Arc::new(RecordingCheckoutRuntime {
+        validation_failures: Mutex::new(failures),
+        validation_retry_at: retry_at,
+        ..Default::default()
+    });
+    let spec = CheckoutSpec::Worktree(
+        CheckoutWorktreeSpec::builder()
+            .clone_ref("missing".into())
+            .r#ref("new".into())
+            .target_path("/checkout/new".into())
+            .env_ref("host".into())
+            .repo_ref(RepositoryKey(repo_key(REPO_URL)))
+            .build(),
+    );
+    let checkout = backend
+        .using::<Checkout>(NAMESPACE)
+        .create(&InputMeta::builder().name("new".into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), "convoy".into())])).build(), &spec)
+        .await
+        .expect("checkout");
+    let now = "2026-10-21T00:00:00Z".parse().expect("now");
+    let reconciler = CheckoutReconciler::with_clock(runtime.clone(), backend, NAMESPACE, Arc::new(VirtualClock::new(now)));
+    (runtime, reconciler, checkout)
+}
+
+// #3710: unclassified validation failures double from 1s to the 60s ceiling.
+#[tokio::test]
+async fn validation_unavailable_backs_off_exponentially() {
+    let (_, reconciler, checkout) = validation_fixture(10, None).await;
+    for seconds in [1, 2, 4, 8, 16, 32, 60, 60, 60, 60] {
+        let prepared = reconciler.prepare(&checkout).await.expect("prepare");
+        assert!(matches!(prepared, CheckoutPrepared::ValidationUnavailable(_)));
+        assert_eq!(reconciler.reconcile(&checkout, &prepared, chrono::Utc::now()).requeue_after, Some(Duration::from_secs(seconds)));
+    }
+}
+// #3710: a classified forge deadline overrides exponential retry timing.
+#[tokio::test]
+async fn validation_rate_limited_requeues_at_retry_at() {
+    let retry_at = "2026-10-21T00:03:00Z".parse().expect("retry");
+    let (_, reconciler, checkout) = validation_fixture(2, Some(retry_at)).await;
+    for _ in 0..2 {
+        let prepared = reconciler.prepare(&checkout).await.expect("prepare");
+        assert!(matches!(&prepared, CheckoutPrepared::ValidationUnavailable(error) if error.retry_at() == Some(retry_at)));
+        assert_eq!(reconciler.reconcile(&checkout, &prepared, chrono::Utc::now()).requeue_after, Some(Duration::from_secs(180)));
+    }
+}
+// #3710: successful validation clears retry history for this checkout.
+#[tokio::test]
+async fn validation_success_resets_backoff() {
+    let (runtime, reconciler, checkout) = validation_fixture(3, None).await;
+    for seconds in [1, 2, 4] {
+        let prepared = reconciler.prepare(&checkout).await.expect("prepare");
+        assert_eq!(reconciler.reconcile(&checkout, &prepared, chrono::Utc::now()).requeue_after, Some(Duration::from_secs(seconds)));
+    }
+    assert!(matches!(reconciler.prepare(&checkout).await.expect("success"), CheckoutPrepared::Waiting));
+    *runtime.validation_failures.lock().expect("failures") = 1;
+    let prepared = reconciler.prepare(&checkout).await.expect("prepare again");
+    assert_eq!(reconciler.reconcile(&checkout, &prepared, chrono::Utc::now()).requeue_after, Some(Duration::from_secs(1)));
 }
 
 // #2873: logical reservations span environments, and cease holding a branch

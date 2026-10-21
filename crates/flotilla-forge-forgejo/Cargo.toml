@@ -18,6 +18,11 @@ tracing.workspace = true
 dirs = "6"
 
 [dev-dependencies]
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+async-trait.workspace = true
+bytes.workspace = true
+http.workspace = true
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

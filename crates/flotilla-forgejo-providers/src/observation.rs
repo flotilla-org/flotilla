@@ -1,7 +1,7 @@
 //! Preserve HTTP retry metadata before the plain client reduces errors to strings.
 use chrono::{DateTime, Utc};
 use flotilla_forge_forgejo::ForgejoClient;
-use flotilla_provider_runtime::{http_execute, ObservationError};
+use flotilla_provider_runtime::ObservationError;
 
 pub(crate) async fn execute(
     forge: &ForgejoClient,
@@ -10,7 +10,7 @@ pub(crate) async fn execute(
     query: &[(&str, String)],
 ) -> Result<serde_json::Value, ObservationError> {
     let request = forge.repository_request(repo, reqwest::Method::GET, path, query, None)?;
-    let response = http_execute!(forge.http, request)?;
+    let response = flotilla_forge_forgejo::forge_http_execute!(forge, request)?;
     check_response(&forge.config.service_url, response.status(), response.headers(), response.body())?;
     serde_json::from_slice(response.body()).map_err(|error| ObservationError::Failed(error.to_string()))
 }
@@ -18,7 +18,7 @@ pub(crate) async fn execute(
 /// Only a pull read may establish PR absence, after confirming repository access.
 pub(crate) async fn execute_pull(forge: &ForgejoClient, repo: &str, number: u64) -> Result<serde_json::Value, ObservationError> {
     let request = forge.repository_request(repo, reqwest::Method::GET, &format!("pulls/{number}"), &[], None)?;
-    let response = http_execute!(forge.http, request)?;
+    let response = flotilla_forge_forgejo::forge_http_execute!(forge, request)?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         // A successful repository pull listing confirms both repository access
         // and pull-read permission, including private repositories.

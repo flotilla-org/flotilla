@@ -744,7 +744,7 @@ fn spawn_controller_loops(
     let gh_default_branches = state
         .daemon
         .local_command_runner()
-        .map(|runner| Arc::new(GhForgeDefaultBranchResolver { runner }) as Arc<dyn ForgeDefaultBranchResolver>);
+        .map(|runner| Arc::new(GhForgeDefaultBranchResolver::new(runner)) as Arc<dyn ForgeDefaultBranchResolver>);
     let forge_default_branch_resolver = match (state.forge_default_branches.clone(), gh_default_branches) {
         (Some(first), Some(then)) => {
             Some(Arc::new(ChainedForgeDefaultBranchResolver(vec![first, then])) as Arc<dyn ForgeDefaultBranchResolver>)
