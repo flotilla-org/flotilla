@@ -1835,3 +1835,77 @@ async fn standing_stalled_and_snapshot_less_roles_have_no_settlement_obligation(
         );
     }
 }
+
+// #3529: startup is unknown until the crew launches. Session creation latency
+// and fresh idle screens before WorkRunning must not manufacture a dead actor.
+#[hegel::test]
+fn pending_crew_startup_never_stalls(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    // Cross both the absent debounce and idle grace; repeat judge observations.
+    let delay = tc.draw(gs::integers::<i64>().min_value(1).max_value(600));
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        for session_kind in 0..4 {
+            let (backend, wake, _) = actor_nudge_scenario(&[]).await;
+            update_convoy(&backend, "stalled-work", |status| {
+                status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().phase = CrewWorkPhase::Pending;
+            })
+            .await;
+            let sessions = backend.using::<TerminalSession>("flotilla");
+            if session_kind == 0 {
+                sessions.delete("resumed-coder").await.unwrap();
+            }
+            let start = Utc::now();
+            for seconds in [0, 10, 60, 120, 180, 240, 300, 600, 600 + delay] {
+                let now = start + chrono::Duration::seconds(seconds);
+                if session_kind == 3 {
+                    observe_actor(&backend, &wake, TerminalAttentionState::Idle, now).await;
+                } else {
+                    if session_kind == 2 {
+                        let session = sessions.get("resumed-coder").await.unwrap();
+                        sessions
+                            .update_status(
+                                "resumed-coder",
+                                &session.metadata.resource_version,
+                                &flotilla_resources::TerminalSessionStatus::default(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.unwrap();
+                    wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.unwrap();
+                }
+                // Verify that each observation reached its intended session state.
+                match session_kind {
+                    0 => assert!(matches!(sessions.get("resumed-coder").await, Err(ResourceError::NotFound { .. }))),
+                    1 => assert!(sessions.get("resumed-coder").await.unwrap().status.is_none()),
+                    2 => assert_eq!(sessions.get("resumed-coder").await.unwrap().status.unwrap().phase, TerminalSessionPhase::Starting),
+                    3 => {
+                        let status = sessions.get("resumed-coder").await.unwrap().status.unwrap();
+                        assert_eq!(status.phase, TerminalSessionPhase::Running);
+                        assert_eq!(status.attention.unwrap().state, TerminalAttentionState::Idle);
+                    }
+                    _ => unreachable!(),
+                }
+                let status = backend.using::<Convoy>("flotilla").get("stalled-work").await.unwrap().status.unwrap();
+                assert!(status.stalled.is_none(), "startup session kind {session_kind} at {seconds}s: {:?}", status.stalled);
+            }
+            // Once Working, every session kind must regain dead-session or idle detection.
+            {
+                update_convoy(&backend, "stalled-work", |status| {
+                    status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().phase = CrewWorkPhase::Working;
+                })
+                .await;
+                for seconds in [1201, 1261, 1321, 1381] {
+                    let now = start + chrono::Duration::seconds(seconds);
+                    if session_kind == 3 {
+                        observe_actor(&backend, &wake, TerminalAttentionState::Idle, now).await;
+                    } else {
+                        let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.unwrap();
+                        wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.unwrap();
+                    }
+                }
+                assert!(backend.using::<Convoy>("flotilla").get("stalled-work").await.unwrap().status.unwrap().stalled.is_some());
+            }
+        }
+    });
+}

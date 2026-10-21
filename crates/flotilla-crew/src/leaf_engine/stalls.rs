@@ -8,7 +8,7 @@ use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     actor_obligation,
     address::{leaf_address, record_name},
-    select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, LeafMaker, NudgeObligation, ResourceObject,
+    select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, CrewWorkPhase, LeafMaker, NudgeObligation, ResourceObject,
     StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition, SupervisionTarget, TerminalAttention,
     TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule,
     CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
@@ -199,9 +199,8 @@ pub(super) fn is_active_change_request_probe(
         && status.crew_work.get(&rule.to.vessel).and_then(|crew| crew.get(&rule.to.role)).is_some_and(|work| {
             work.finished_at.is_none()
                 && (is_conflict_probe(leaf)
-                    || ((promise_rejection || is_merged_settlement_probe(leaf))
-                        && work.phase == flotilla_resources::CrewWorkPhase::Stalled)
-                    || matches!(work.phase, flotilla_resources::CrewWorkPhase::Working | flotilla_resources::CrewWorkPhase::Interrupted))
+                    || ((promise_rejection || is_merged_settlement_probe(leaf)) && work.phase == CrewWorkPhase::Stalled)
+                    || matches!(work.phase, CrewWorkPhase::Working | CrewWorkPhase::Interrupted))
         })
 }
 
@@ -388,7 +387,7 @@ impl ReconcilerWake {
                             .crew_work
                             .get(vessel)
                             .and_then(|crew| crew.get(role))
-                            .is_some_and(|work| work.phase == flotilla_resources::CrewWorkPhase::Done)
+                            .is_some_and(|work| work.phase == CrewWorkPhase::Done)
                 }
                 _ => false,
             });
@@ -413,9 +412,7 @@ impl ReconcilerWake {
                         return false;
                     };
                     status.crew_work.get(work).and_then(|crew| crew.get(role)).is_some_and(|state| {
-                        state.phase == flotilla_resources::CrewWorkPhase::Done
-                            && leaf.operator == LeafOperator::Equal
-                            && leaf.literal == "Done"
+                        state.phase == CrewWorkPhase::Done && leaf.operator == LeafOperator::Equal && leaf.literal == "Done"
                     })
                 }) {
                     continue;
@@ -608,16 +605,25 @@ impl ReconcilerWake {
                             .and_then(|session| session.status.as_ref())
                             .filter(|status| status.phase == TerminalSessionPhase::Running)
                             .and_then(|status| status.attention.as_ref());
-                        if status
-                            .crew_work
-                            .get(vessel)
-                            .and_then(|crew| crew.get(role))
-                            .is_some_and(|work| work.phase == flotilla_resources::CrewWorkPhase::Stalled)
-                        {
+                        let crew_phase = status.crew_work.get(vessel).and_then(|crew| crew.get(role)).map(|work| work.phase);
+                        let launching = crew_phase == Some(CrewWorkPhase::Pending)
+                            && (session.is_none()
+                                || attention.is_some_and(|attention| attention.state == TerminalAttentionState::Idle)
+                                || session.is_some_and(|session| {
+                                    session.status.as_ref().is_none_or(|status| status.phase == TerminalSessionPhase::Starting)
+                                }));
+                        if crew_phase == Some(CrewWorkPhase::Stalled) {
                             Err((
                                 status.crew_work[vessel][role].message.clone().unwrap_or_else(|| "crew stalled".into()),
                                 StallEvidenceSource::Crew,
                             ))
+                        } else if launching {
+                            // Pending launch is not a dead session or an ended turn. Keep
+                            // both clocks clear so launch latency cannot age evidence.
+                            self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
+                            obligation.quiet_since = None;
+                            unknown = true;
+                            continue;
                         } else if let Some(reason) = lost_reason {
                             self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
                             Err((format!("session dead: {reason}"), StallEvidenceSource::Session))
@@ -996,7 +1002,7 @@ impl ReconcilerWake {
                         .crew_work
                         .get(vessel)
                         .and_then(|crew| crew.get(role))
-                        .filter(|work| work.phase == flotilla_resources::CrewWorkPhase::Working)
+                        .filter(|work| work.phase == CrewWorkPhase::Working)
                         .and_then(|work| work.resumed_at.zip(work.resume_brief_id.as_deref()))
                         .is_some_and(|(resumed_at, brief_id)| {
                             // A missing or recreated session must not suppress
@@ -1037,7 +1043,7 @@ impl ReconcilerWake {
                                     .crew_work
                                     .get(vessel)
                                     .and_then(|crew| crew.get(role))
-                                    .is_some_and(|crew| crew.phase == flotilla_resources::CrewWorkPhase::Stalled);
+                                    .is_some_and(|crew| crew.phase == CrewWorkPhase::Stalled);
                                 let obligation = if declared_stall {
                                     "Your stall is recorded. What changed since your report? If the blocker persists, update the stall with new evidence; if it has cleared, ask your supervisor to resume you.".into()
                                 } else {
