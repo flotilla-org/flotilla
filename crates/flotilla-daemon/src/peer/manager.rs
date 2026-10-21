@@ -549,7 +549,8 @@ impl PeerManager {
         ActivationResult::Accepted { generation, displaced }
     }
 
-    pub async fn handle_inbound(&mut self, env: InboundPeerEnvelope) -> HandleResult {
+    pub async fn handle_inbound(&mut self, mut env: InboundPeerEnvelope) -> HandleResult {
+        env.msg.sanitize_trace_context();
         if !self.generation_is_current(&env.connection_peer, env.connection_generation) {
             debug!(
                 peer = %env.connection_peer,

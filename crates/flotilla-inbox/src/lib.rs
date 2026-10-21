@@ -817,6 +817,8 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             state.home.get(&name).ok_or_else(|| Error::Storage("committed admission missing from Home".into()))?.spec().admitted_seq;
         Self::index_pending(state, &inbox, admitted, &name);
         Self::publish(state)?;
+        // Pending is a state entry, not an event on every reader scan.
+        flotilla_tracing::queued_span(&name, "waiting").in_scope(|| tracing::info!("message pending"));
         Ok(name)
     }
 
@@ -1014,9 +1016,6 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
                 let result = backend
                     .access(move |backend, state| {
                         while let Some(name) = Self::next_pending(state, &query_inbox, &mut query)? {
-                            let span = flotilla_tracing::queued_span(&name, "waiting");
-                            let _entered = span.enter();
-                            tracing::info!("message pending");
                             let resource = state.home.get(&name).expect("pending candidate");
                             let allowed = backend.world(state, Some(&name))?.run(backend.observations.as_ref(), |world| {
                                 resource.judge(world, backend.observations.now(), |h| pending_for(h, &query_consumer)).value
@@ -1156,5 +1155,25 @@ mod read_set_tests {
                 let _ = world.lookup(&Ref::<Condition>::new("undeclared"));
             })
             .expect("snapshot");
+    }
+}
+
+#[cfg(test)]
+mod trace_identity_tests {
+    // Production next_name supplies the decided Store's home and next sequence.
+    // Equal inbox/sender/sequence on different homes must still yield distinct
+    // stable IDs. Generate sequence boundaries and home suffixes explicitly.
+    #[hegel::test]
+    fn unkeyed_message_ids_distinguish_homes(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let sequence = tc.draw(gs::integers::<u64>());
+        let host = tc.draw(gs::integers::<u64>());
+        let inbox = "project:fleet/role:reader".parse().expect("inbox");
+        let sender = "project:fleet/role:sender".parse().expect("sender");
+        let a = super::unkeyed_name(&inbox, &sender, &format!("host-a-{host}"), sequence).expect("name");
+        let duplicate = super::unkeyed_name(&inbox, &sender, &format!("host-a-{host}"), sequence).expect("duplicate");
+        let b = super::unkeyed_name(&inbox, &sender, &format!("host-b-{host}"), sequence).expect("name");
+        assert_eq!(a, duplicate);
+        assert_ne!(a, b);
     }
 }

@@ -65,59 +65,74 @@ pub async fn run(
     let trace_layer = flotilla_tracing::layer().with_tracer(trace_provider.tracer("flotilla-daemon"));
     let stderr_layer = std::io::stderr().is_terminal().then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     let file_layer = flotilla_tracing::json_layer(file_appender);
-    init_daemon_tracing(tracing_subscriber::registry().with(filter).with(trace_layer).with(stderr_layer).with(file_layer))?;
-    raise_file_descriptor_limit();
+    with_trace_shutdown(trace_provider, async {
+        init_daemon_tracing(tracing_subscriber::registry().with(filter).with(trace_layer).with(stderr_layer).with(file_layer))?;
+        raise_file_descriptor_limit();
 
-    let timeout = if timeout_secs == 0 { Duration::from_secs(u64::MAX) } else { Duration::from_secs(timeout_secs) };
+        let timeout = if timeout_secs == 0 { Duration::from_secs(u64::MAX) } else { Duration::from_secs(timeout_secs) };
 
-    let repo_roots = config.load_observation_roots()?;
-    info!(repo_count = repo_roots.len(), "starting daemon");
+        let repo_roots = config.load_observation_roots()?;
+        info!(repo_count = repo_roots.len(), "starting daemon");
 
-    let mut discovery = DiscoveryRuntime::for_process();
-    let dummy_fleet = crate::dummy_fleet::install_dummy_fleet(&daemon_config, &mut discovery);
-    let repo_root_paths = repo_roots.into_iter().map(|p| p.into_path_buf()).collect();
-    let server = DaemonServer::new_with_socket_discovery_path(
-        repo_root_paths,
-        Arc::clone(&config),
-        discovery,
-        socket_path.to_path_buf(),
-        stable_socket_discovery_path(),
-        timeout,
-    )
-    .await?;
-    let server = match http_listen {
-        Some(address) => server.with_http_listener(address),
-        None => server,
-    };
-    let daemon = server.daemon();
-    if let Some(fleet) = &dummy_fleet {
-        crate::dummy_fleet::attach_dummy_fleet(fleet, &daemon)?;
-    }
-    let runtime = DaemonRuntime::start_with_options(
-        daemon,
-        Arc::clone(&config),
-        Some(socket_path.to_path_buf()),
-        RuntimeOptions {
-            startup_ready: Some(server.startup_ready()),
-            environment_sockets: Some(server.environment_socket_service()),
-            hook_endpoint: Some(server.hook_endpoint()),
-            ..RuntimeOptions::default()
-        },
-    )
-    .await?;
-    server.install_controller_metrics(Arc::clone(&runtime.controller_metrics));
-    server.install_blob_store(Arc::clone(&runtime.blob_store))?;
+        let mut discovery = DiscoveryRuntime::for_process();
+        let dummy_fleet = crate::dummy_fleet::install_dummy_fleet(&daemon_config, &mut discovery);
+        let repo_root_paths = repo_roots.into_iter().map(|p| p.into_path_buf()).collect();
+        let server = DaemonServer::new_with_socket_discovery_path(
+            repo_root_paths,
+            Arc::clone(&config),
+            discovery,
+            socket_path.to_path_buf(),
+            stable_socket_discovery_path(),
+            timeout,
+        )
+        .await?;
+        let server = match http_listen {
+            Some(address) => server.with_http_listener(address),
+            None => server,
+        };
+        let daemon = server.daemon();
+        if let Some(fleet) = &dummy_fleet {
+            crate::dummy_fleet::attach_dummy_fleet(fleet, &daemon)?;
+        }
+        let runtime = DaemonRuntime::start_with_options(
+            daemon,
+            Arc::clone(&config),
+            Some(socket_path.to_path_buf()),
+            RuntimeOptions {
+                startup_ready: Some(server.startup_ready()),
+                environment_sockets: Some(server.environment_socket_service()),
+                hook_endpoint: Some(server.hook_endpoint()),
+                ..RuntimeOptions::default()
+            },
+        )
+        .await?;
+        server.install_controller_metrics(Arc::clone(&runtime.controller_metrics));
+        server.install_blob_store(Arc::clone(&runtime.blob_store))?;
 
-    let result = server.run().await;
-    // Stop background tasks after the accept loop ends. SIGTERM, SIGINT, idle
-    // timeout, and explicit shutdown return Ok and clear the lifecycle marker;
-    // a server error deliberately leaves it behind as an abnormal exit.
-    runtime.shutdown();
-    if let Err(error) = trace_provider.shutdown() {
-        tracing::warn!(%error, "trace exporter shutdown failed");
-    }
-    if result.is_ok() {
-        lifecycle.finish()?;
+        let result = server.run().await;
+        // Stop background tasks after the accept loop ends. SIGTERM, SIGINT, idle
+        // timeout, and explicit shutdown return Ok and clear the lifecycle marker;
+        // a server error deliberately leaves it behind as an abnormal exit.
+        runtime.shutdown();
+        if result.is_ok() {
+            lifecycle.finish()?;
+        }
+        result
+    })
+    .await
+}
+
+/// Always flush after the operation, including initialization errors. The SDK's
+/// bounded blocking shutdown must never occupy a Tokio worker.
+async fn with_trace_shutdown<T>(
+    provider: SdkTracerProvider,
+    operation: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let result = operation.await;
+    match tokio::task::spawn_blocking(move || provider.shutdown_with_timeout(Duration::from_secs(5))).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "trace exporter shutdown failed"),
+        Err(error) => tracing::warn!(%error, "trace exporter shutdown task failed"),
     }
     result
 }
@@ -257,5 +272,60 @@ mod tests {
         assert_eq!(record["level"], "INFO");
         assert_eq!(record["fields"]["message"], "starting daemon");
         assert_eq!(record["fields"]["repo_count"], 0);
+    }
+    // Review #3715: a valid blocking HTTP exporter can be constructed inside
+    // Tokio, and an unreachable collector cannot skip cleanup on startup error.
+    #[tokio::test]
+    async fn valid_exporter_flushes_after_startup_error_inside_tokio() {
+        // Match flotillad's TLS bootstrap before constructing reqwest clients.
+        rigging_tls::install_default_provider();
+        // Port zero cannot be a listening collector; no fleet/network fixture.
+        let config = flotilla_config::DaemonTracingConfig {
+            endpoint: "http://127.0.0.1:0/v1/traces".into(),
+            service_name: "test".into(),
+            sampling: 1.0,
+        };
+        let provider = super::trace_provider(Some(&config), "test-host").expect("valid exporter inside Tokio");
+        use flotilla_tracing::TracerProvider as _;
+        let subscriber = tracing_subscriber::registry().with(flotilla_tracing::layer().with_tracer(provider.tracer("startup")));
+        tracing::subscriber::with_default(subscriber, || {
+            drop(tracing::info_span!("startup.failure"));
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::with_trace_shutdown(provider, async { Err::<(), _>("startup failed".to_owned()) }),
+        )
+        .await
+        .expect("bounded cleanup");
+        assert_eq!(result, Err("startup failed".into()));
+    }
+
+    #[derive(Debug)]
+    struct ShutdownProbe {
+        runtime_thread: std::thread::ThreadId,
+        closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl opentelemetry_sdk::trace::SpanExporter for ShutdownProbe {
+        async fn export(&self, _: Vec<opentelemetry_sdk::trace::SpanData>) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+        fn shutdown_with_timeout(&self, _: std::time::Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+            // Network-boundary fake: a collector's synchronous close/flush.
+            assert_ne!(std::thread::current().id(), self.runtime_thread, "shutdown must leave the async worker");
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    // Cleanup always runs after an error and executes on a blocking worker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn trace_cleanup_runs_off_worker_even_when_operation_fails() {
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = flotilla_tracing::SdkTracerProvider::builder()
+            .with_simple_exporter(ShutdownProbe { runtime_thread: std::thread::current().id(), closed: closed.clone() })
+            .build();
+        let result = super::with_trace_shutdown(provider, async { Err::<(), _>("early error".into()) }).await;
+        assert_eq!(result, Err("early error".into()));
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

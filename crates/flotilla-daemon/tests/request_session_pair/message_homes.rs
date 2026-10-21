@@ -211,8 +211,10 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     let inbox_b = engine_b.inbox();
     inbox_b.bind(sent.spec().inbox.clone(), consumer.clone()).await.expect("bind");
     use futures::StreamExt;
-    let mut pending = inbox_b.pending(&sent.spec().inbox, &consumer, &flotilla_inbox::Rules(Vec::new())).await.expect("pending");
-    assert!(pending.next().await.expect("pending message").is_ok());
+    for _ in 0..8 {
+        let mut pending = inbox_b.pending(&sent.spec().inbox, &consumer, &flotilla_inbox::Rules(Vec::new())).await.expect("pending");
+        assert!(pending.next().await.expect("pending message").is_ok());
+    }
     inbox_b.receive(&consumer, sent.name(), Transport::Turn).await.expect("receipt");
     inbox_b.deliver(sent.name(), Deliver { receiver: consumer.clone(), transport: Transport::Turn }).await.expect("deliver");
     assert!(matches!(homed(&engine_b, &request).expect("sent").1.state(), MessageState::Awaiting { .. }));

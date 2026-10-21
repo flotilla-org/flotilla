@@ -333,3 +333,13 @@ the native Windows graph.
 The mandatory Windows C-free base queries still pass, and target feature drift
 is rejected rather than hidden. No macOS build or test execution is claimed:
 these are Cargo graph queries from Linux.
+
+### OTLP HTTP export (#3712)
+
+The daemon's opt-in OTLP HTTP exporter uses the SDK's blocking reqwest client
+on its background batch worker. This selects reqwest's `blocking` feature in
+the native HTTP feature anchor so every reqwest consumer keeps the same build
+selection. The feature is compiled for all those consumers; only the configured
+daemon exporter constructs/uses this client. SDK shutdown is bounded and runs
+on `spawn_blocking`. The base anchor similarly aligns `futures-executor`'s
+default selection reached by the SDK.

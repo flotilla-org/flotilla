@@ -5,7 +5,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tracing::Instrument;
 
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_executor::step::RemoteStepBatchRequest;
@@ -17,7 +16,7 @@ use tokio::{
     sync::{mpsc, Mutex},
     task::JoinSet,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument};
 
 use super::{
     remote_commands::RemoteCommandRouter,
@@ -26,6 +25,145 @@ use super::{
     PeerConnectedNotice, PeerConnectionEvent, SshTransport,
 };
 use crate::peer::{dispatch_pending_sends, peer_resource_socket_path, HandleResult, InboundPeerEnvelope, PeerManager, PeerSender};
+
+async fn handle_peer_envelope(
+    mut env: InboundPeerEnvelope,
+    peer_manager_task: &Arc<Mutex<PeerManager>>,
+    peer_daemon: &Arc<InProcessDaemon>,
+    remote_command_router_task: &RemoteCommandRouter,
+) {
+    env.msg.sanitize_trace_context();
+    let span = env.msg.trace_context().map(flotilla_tracing::receive).unwrap_or_else(tracing::Span::none);
+    async {
+        let (post_handle_action, pending_sends) = {
+            let mut pm = peer_manager_task.lock().await;
+            let post_handle_action = match pm.handle_inbound(env).await {
+                HandleResult::ReconnectSuppressed { peer } => PostHandleAction::ReconnectSuppressed { peer },
+                HandleResult::CommandRequested { request_id, requester_node_id, reply_via, command, caller, session_id } => {
+                    PostHandleAction::CommandRequested { request_id, requester_node_id, reply_via, command, caller, session_id }
+                }
+                HandleResult::CommandCancelRequested { cancel_id, requester_node_id, reply_via, command_request_id } => {
+                    PostHandleAction::CommandCancelRequested { cancel_id, requester_node_id, reply_via, command_request_id }
+                }
+                HandleResult::CommandEventReceived { request_id, responder_node_id, event } => {
+                    PostHandleAction::CommandEventReceived { request_id, responder_node_id, event }
+                }
+                HandleResult::CommandResponseReceived { request_id, responder_node_id, result } => {
+                    PostHandleAction::CommandResponseReceived { request_id, responder_node_id, result }
+                }
+                HandleResult::CommandCancelResponseReceived { cancel_id, responder_node_id: _, error } => {
+                    PostHandleAction::CommandCancelResponseReceived { cancel_id, error }
+                }
+                HandleResult::RemoteStepRequested { request_id, requester_node_id, reply_via, repo_identity, step_offset, steps } => {
+                    PostHandleAction::RemoteStepRequested { request_id, requester_node_id, reply_via, repo_identity, step_offset, steps }
+                }
+                HandleResult::RemoteStepEventReceived {
+                    request_id,
+                    responder_node_id,
+                    batch_step_index,
+                    batch_step_count,
+                    description,
+                    status,
+                } => PostHandleAction::RemoteStepEventReceived {
+                    request_id,
+                    responder_node_id,
+                    batch_step_index,
+                    batch_step_count,
+                    description,
+                    status,
+                },
+                HandleResult::RemoteStepResponseReceived { request_id, responder_node_id, outcomes } => {
+                    PostHandleAction::RemoteStepResponseReceived { request_id, responder_node_id, outcomes }
+                }
+                HandleResult::RemoteStepCancelRequested { cancel_id, requester_node_id, reply_via, remote_step_request_id } => {
+                    PostHandleAction::RemoteStepCancelRequested { cancel_id, requester_node_id, reply_via, remote_step_request_id }
+                }
+                HandleResult::RemoteStepCancelResponseReceived { cancel_id, responder_node_id: _, error } => {
+                    PostHandleAction::RemoteStepCancelResponseReceived { cancel_id, error }
+                }
+                HandleResult::Ignored => PostHandleAction::Ignored,
+            };
+            let pending_sends = pm.take_pending_sends();
+            (post_handle_action, pending_sends)
+        };
+        dispatch_pending_sends(pending_sends).await;
+
+        match post_handle_action {
+            PostHandleAction::ReconnectSuppressed { peer } => {
+                info!(peer = %peer, "peer requested reconnect suppression");
+            }
+            PostHandleAction::CommandRequested { request_id, requester_node_id, reply_via, command, caller, session_id } => {
+                remote_command_router_task
+                    .spawn_forwarded_command(request_id, requester_node_id, reply_via, command, caller, session_id)
+                    .await;
+            }
+            PostHandleAction::CommandCancelRequested { cancel_id, requester_node_id, reply_via, command_request_id } => {
+                remote_command_router_task.spawn_forwarded_cancel(cancel_id, requester_node_id, reply_via, command_request_id);
+            }
+            PostHandleAction::CommandEventReceived { request_id, responder_node_id, event } => {
+                remote_command_router_task.emit_remote_command_event(request_id, responder_node_id, event).await;
+            }
+            PostHandleAction::CommandResponseReceived { request_id, responder_node_id, result } => {
+                remote_command_router_task.complete_remote_command(request_id, responder_node_id, result).await;
+            }
+            PostHandleAction::CommandCancelResponseReceived { cancel_id, error } => {
+                remote_command_router_task.complete_remote_cancel(cancel_id, error).await;
+            }
+            PostHandleAction::RemoteStepRequested { request_id, requester_node_id, reply_via, repo_identity, step_offset, steps } => {
+                let local_event_repo =
+                    peer_daemon.preferred_local_path_for_identity(&repo_identity).await.map(ExecutionEnvironmentPath::new);
+                if local_event_repo.is_none() {
+                    warn!(%repo_identity, "forwarded remote step request has no local event repo path on responder");
+                }
+                remote_command_router_task
+                    .spawn_forwarded_remote_step_batch(
+                        request_id,
+                        requester_node_id,
+                        reply_via,
+                        RemoteStepBatchRequest {
+                            command_id: request_id,
+                            target_node_id: peer_daemon.node_id().clone(),
+                            repo_identity,
+                            repo: local_event_repo,
+                            step_offset,
+                            steps,
+                        },
+                    )
+                    .await;
+            }
+            PostHandleAction::RemoteStepEventReceived {
+                request_id,
+                responder_node_id,
+                batch_step_index,
+                batch_step_count,
+                description,
+                status,
+            } => {
+                remote_command_router_task
+                    .emit_remote_step_event(request_id, responder_node_id, batch_step_index, batch_step_count, description, status)
+                    .await;
+            }
+            PostHandleAction::RemoteStepResponseReceived { request_id, responder_node_id, outcomes } => {
+                remote_command_router_task.complete_remote_step(request_id, responder_node_id, outcomes).await;
+            }
+            PostHandleAction::RemoteStepCancelRequested { cancel_id, requester_node_id, reply_via, remote_step_request_id } => {
+                remote_command_router_task.spawn_forwarded_remote_step_cancel(
+                    cancel_id,
+                    requester_node_id,
+                    reply_via,
+                    remote_step_request_id,
+                );
+            }
+            PostHandleAction::RemoteStepCancelResponseReceived { cancel_id, error } => {
+                remote_command_router_task.complete_remote_step_cancel(cancel_id, error).await;
+            }
+            PostHandleAction::Ignored => {}
+        }
+        sync_peer_query_state(peer_manager_task, peer_daemon).await;
+    }
+    .instrument(span)
+    .await;
+}
 
 pub(super) enum ForwardResult {
     Disconnected,
@@ -424,176 +562,7 @@ impl PeerRuntime {
                         }
                         maybe_env = rx.recv() => {
                             let Some(env) = maybe_env else { break };
-                            let span = env.msg.trace_context().map(flotilla_tracing::receive).unwrap_or_else(tracing::Span::none);
-                            async {
-                            let (post_handle_action, pending_sends) = {
-                                let mut pm = peer_manager_task.lock().await;
-                                let post_handle_action = match pm.handle_inbound(env).await {
-                                    HandleResult::ReconnectSuppressed { peer } => PostHandleAction::ReconnectSuppressed { peer },
-                                    HandleResult::CommandRequested { request_id, requester_node_id, reply_via, command, caller, session_id } => {
-                                        PostHandleAction::CommandRequested { request_id, requester_node_id, reply_via, command, caller, session_id }
-                                    }
-                                    HandleResult::CommandCancelRequested { cancel_id, requester_node_id, reply_via, command_request_id } => {
-                                        PostHandleAction::CommandCancelRequested { cancel_id, requester_node_id, reply_via, command_request_id }
-                                    }
-                                    HandleResult::CommandEventReceived { request_id, responder_node_id, event } => {
-                                        PostHandleAction::CommandEventReceived { request_id, responder_node_id, event }
-                                    }
-                                    HandleResult::CommandResponseReceived { request_id, responder_node_id, result } => {
-                                        PostHandleAction::CommandResponseReceived { request_id, responder_node_id, result }
-                                    }
-                                    HandleResult::CommandCancelResponseReceived { cancel_id, responder_node_id: _, error } => {
-                                        PostHandleAction::CommandCancelResponseReceived { cancel_id, error }
-                                    }
-                                    HandleResult::RemoteStepRequested {
-                                        request_id,
-                                        requester_node_id,
-                                        reply_via,
-                                        repo_identity,
-                                        step_offset,
-                                        steps,
-                                    } => PostHandleAction::RemoteStepRequested {
-                                        request_id,
-                                        requester_node_id,
-                                        reply_via,
-                                        repo_identity,
-                                        step_offset,
-                                        steps,
-                                    },
-                                    HandleResult::RemoteStepEventReceived {
-                                        request_id,
-                                        responder_node_id,
-                                        batch_step_index,
-                                        batch_step_count,
-                                        description,
-                                        status,
-                                    } => PostHandleAction::RemoteStepEventReceived {
-                                        request_id,
-                                        responder_node_id,
-                                        batch_step_index,
-                                        batch_step_count,
-                                        description,
-                                        status,
-                                    },
-                                    HandleResult::RemoteStepResponseReceived { request_id, responder_node_id, outcomes } => {
-                                        PostHandleAction::RemoteStepResponseReceived { request_id, responder_node_id, outcomes }
-                                    }
-                                    HandleResult::RemoteStepCancelRequested {
-                                        cancel_id,
-                                        requester_node_id,
-                                        reply_via,
-                                        remote_step_request_id,
-                                    } => PostHandleAction::RemoteStepCancelRequested {
-                                        cancel_id,
-                                        requester_node_id,
-                                        reply_via,
-                                        remote_step_request_id,
-                                    },
-                                    HandleResult::RemoteStepCancelResponseReceived { cancel_id, responder_node_id: _, error } => {
-                                        PostHandleAction::RemoteStepCancelResponseReceived { cancel_id, error }
-                                    }
-                                    HandleResult::Ignored => PostHandleAction::Ignored,
-                                };
-                                let pending_sends = pm.take_pending_sends();
-                                (post_handle_action, pending_sends)
-                            };
-                            dispatch_pending_sends(pending_sends).await;
-
-                            match post_handle_action {
-                                PostHandleAction::ReconnectSuppressed { peer } => {
-                                    info!(peer = %peer, "peer requested reconnect suppression");
-                                }
-                                PostHandleAction::CommandRequested { request_id, requester_node_id, reply_via, command, caller, session_id } => {
-                                    remote_command_router_task
-                                        .spawn_forwarded_command(request_id, requester_node_id, reply_via, command, caller, session_id)
-                                        .await;
-                                }
-                                PostHandleAction::CommandCancelRequested { cancel_id, requester_node_id, reply_via, command_request_id } => {
-                                    remote_command_router_task
-                                        .spawn_forwarded_cancel(cancel_id, requester_node_id, reply_via, command_request_id);
-                                }
-                                PostHandleAction::CommandEventReceived { request_id, responder_node_id, event } => {
-                                    remote_command_router_task.emit_remote_command_event(request_id, responder_node_id, event).await;
-                                }
-                                PostHandleAction::CommandResponseReceived { request_id, responder_node_id, result } => {
-                                    remote_command_router_task.complete_remote_command(request_id, responder_node_id, result).await;
-                                }
-                                PostHandleAction::CommandCancelResponseReceived { cancel_id, error } => {
-                                    remote_command_router_task.complete_remote_cancel(cancel_id, error).await;
-                                }
-                                PostHandleAction::RemoteStepRequested {
-                                    request_id,
-                                    requester_node_id,
-                                    reply_via,
-                                    repo_identity,
-                                    step_offset,
-                                    steps,
-                                } => {
-                                    let local_event_repo = peer_daemon
-                                        .preferred_local_path_for_identity(&repo_identity)
-                                        .await
-                                        .map(ExecutionEnvironmentPath::new);
-                                    if local_event_repo.is_none() {
-                                        warn!(%repo_identity, "forwarded remote step request has no local event repo path on responder");
-                                    }
-                                    remote_command_router_task
-                                        .spawn_forwarded_remote_step_batch(
-                                            request_id,
-                                            requester_node_id,
-                                            reply_via,
-                                            RemoteStepBatchRequest {
-                                                command_id: request_id,
-                                                target_node_id: peer_daemon.node_id().clone(),
-                                                repo_identity,
-                                                repo: local_event_repo,
-                                                step_offset,
-                                                steps,
-                                            },
-                                        )
-                                        .await;
-                                }
-                                PostHandleAction::RemoteStepEventReceived {
-                                    request_id,
-                                    responder_node_id,
-                                    batch_step_index,
-                                    batch_step_count,
-                                    description,
-                                    status,
-                                } => {
-                                    remote_command_router_task
-                                        .emit_remote_step_event(
-                                            request_id,
-                                            responder_node_id,
-                                            batch_step_index,
-                                            batch_step_count,
-                                            description,
-                                            status,
-                                        )
-                                        .await;
-                                }
-                                PostHandleAction::RemoteStepResponseReceived { request_id, responder_node_id, outcomes } => {
-                                    remote_command_router_task.complete_remote_step(request_id, responder_node_id, outcomes).await;
-                                }
-                                PostHandleAction::RemoteStepCancelRequested {
-                                    cancel_id,
-                                    requester_node_id,
-                                    reply_via,
-                                    remote_step_request_id,
-                                } => {
-                                    remote_command_router_task.spawn_forwarded_remote_step_cancel(
-                                        cancel_id,
-                                        requester_node_id,
-                                        reply_via,
-                                        remote_step_request_id,
-                                    );
-                                }
-                                PostHandleAction::RemoteStepCancelResponseReceived { cancel_id, error } => {
-                                    remote_command_router_task.complete_remote_step_cancel(cancel_id, error).await;
-                                }
-                                PostHandleAction::Ignored => {}
-                            }
-                            sync_peer_query_state(&peer_manager_task, &peer_daemon).await;
-                            }.instrument(span).await;
+                            handle_peer_envelope(env, &peer_manager_task, &peer_daemon, &remote_command_router_task).await;
                         }
                     }
                 }

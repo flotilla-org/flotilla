@@ -141,6 +141,21 @@ pub enum RoutedPeerMessage {
 }
 
 impl PeerWireMessage {
+    /// Drop non-W3C baggage and oversized values before relaying a request.
+    /// The frame limits allocation at decode; this limits retained/forwarded data.
+    pub fn sanitize_trace_context(&mut self) {
+        let context = match self {
+            Self::Routed(
+                RoutedPeerMessage::CommandRequest { trace_context, .. }
+                | RoutedPeerMessage::RemoteStepRequest { trace_context, .. }
+                | RoutedPeerMessage::CommandCancelRequest { trace_context, .. }
+                | RoutedPeerMessage::RemoteStepCancelRequest { trace_context, .. },
+            ) => trace_context,
+            _ => return,
+        };
+        context.retain(|key, value| matches!(key.as_str(), "traceparent" | "tracestate") && value.len() <= 512 && value.is_ascii());
+    }
+
     pub fn trace_context(&self) -> Option<&std::collections::BTreeMap<String, String>> {
         match self {
             Self::Routed(
@@ -567,6 +582,51 @@ mod tests {
                 assert_eq!(error.as_deref(), Some("remote step not found"));
             }
             other => panic!("expected RemoteStepCancelResponse, got {:?}", other),
+        }
+    }
+    // Peer ingress keeps only bounded W3C context before forwarding; generated
+    // sizes cross the empty/512-byte boundary, including arbitrary extra keys.
+    #[hegel::test]
+    fn routed_trace_context_is_bounded_at_ingress(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let size = tc.draw(gs::integers::<usize>().min_value(0).max_value(514));
+        let unicode = tc.draw(gs::booleans());
+        for size in [0, 1, 511, 512, 513, 514, size] {
+            let value = if unicode { "é".repeat(size) } else { "a".repeat(size) };
+            let context = std::collections::BTreeMap::from([
+                ("traceparent".into(), value.clone()),
+                ("tracestate".into(), value.clone()),
+                ("baggage".into(), "x".repeat(1024)),
+                ("unknown".into(), "opaque".into()),
+            ]);
+            for cancel in [false, true] {
+                let mut message = PeerWireMessage::Routed(if cancel {
+                    RoutedPeerMessage::CommandCancelRequest {
+                        trace_context: context.clone(),
+                        cancel_id: 1,
+                        requester_node_id: NodeId::new("a"),
+                        target_node_id: NodeId::new("b"),
+                        remaining_hops: 2,
+                        command_request_id: 1,
+                    }
+                } else {
+                    RoutedPeerMessage::RemoteStepCancelRequest {
+                        trace_context: context.clone(),
+                        cancel_id: 1,
+                        requester_node_id: NodeId::new("a"),
+                        target_node_id: NodeId::new("b"),
+                        remaining_hops: 2,
+                        remote_step_request_id: 1,
+                    }
+                });
+                message.sanitize_trace_context();
+                let retained = message.trace_context().expect("request context").clone();
+                assert!(!retained.contains_key("baggage") && !retained.contains_key("unknown"));
+                assert_eq!(retained.contains_key("traceparent"), value.len() <= 512 && value.is_ascii());
+                assert_eq!(retained.contains_key("tracestate"), value.len() <= 512 && value.is_ascii());
+                message.sanitize_trace_context();
+                assert_eq!(message.trace_context().expect("idempotent"), &retained);
+            }
         }
     }
 }

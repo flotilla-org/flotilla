@@ -66,6 +66,8 @@ fn queued_ids(identity: &str) -> (TraceId, SpanId) {
 /// Admission is the deterministic root; subsequent phases parent to that root
 /// even after a restart or a move to another host. The identity must be globally
 /// qualified when the caller does not already have a globally stable ID.
+/// Replayed admissions intentionally re-export the logical root's same ID;
+/// collectors may coalesce its timestamps/attributes. Phase spans remain unique.
 pub fn queued_span(identity: &str, phase: &'static str) -> Span {
     let identity = identity.rsplit_once("/message:").map_or(identity, |(_, id)| id);
     let ids = queued_ids(identity);
@@ -112,8 +114,11 @@ pub fn inject() -> WireContext {
     carrier
 }
 pub fn receive(carrier: &WireContext) -> Span {
-    let span = tracing::info_span!(parent: None, "peer.receive");
     let context = TraceContextPropagator::new().extract_with_context(&Context::new(), &Carrier(carrier));
+    if !context.span().span_context().is_valid() {
+        return Span::none();
+    }
+    let span = tracing::info_span!(parent: None, "peer.receive");
     let _ = span.set_parent(context);
     span
 }
@@ -198,6 +203,10 @@ mod tests {
         tracing::subscriber::with_default(tracing_subscriber::registry().with(layer().with_tracer(b.tracer("b"))), || {
             let duplicate = queued_span(&identity, "admission").context();
             assert_eq!(root, *duplicate.span().span_context());
+            // Qualified engine addresses and producer record IDs must agree.
+            let address = format!("project:fleet/role:reader/message:{identity}");
+            let addressed = queued_span(&address, "admission").context();
+            assert_eq!(root, *addressed.span().span_context());
             let phase = queued_span(&identity, "attempt").context();
             assert_eq!(root.trace_id(), phase.span().span_context().trace_id());
             assert_eq!(root.is_sampled(), phase.span().span_context().is_sampled());
@@ -210,7 +219,7 @@ mod tests {
     }
 
     // W3C propagation is transient: injection/extraction preserves a parent's
-    // trace and connects a receiver span; invalid context starts a fresh trace.
+    // trace and connects a receiver span; invalid context creates no span.
     #[test]
     fn wire_context_round_trip_and_invalid_context() {
         let exporter = InMemorySpanExporter::default();
@@ -222,7 +231,10 @@ mod tests {
             let child = receive(&carrier);
             assert_eq!(root.context().span().span_context().trace_id(), child.context().span().span_context().trace_id());
             let invalid = root.in_scope(|| receive(&WireContext::from([("traceparent".into(), "invalid".into())])));
-            assert_ne!(root.context().span().span_context().trace_id(), invalid.context().span().span_context().trace_id());
+            assert!(invalid.is_disabled());
+            assert!(receive(&WireContext::new()).is_disabled());
+            let unsampled = WireContext::from([("traceparent".into(), "00-11111111111111111111111111111111-2222222222222222-00".into())]);
+            assert!(!receive(&unsampled).is_disabled(), "valid unsampled parents still identify logs");
         });
         let spans = exporter.get_finished_spans().expect("spans");
         let root = spans.iter().find(|s| s.name == "request").expect("root");

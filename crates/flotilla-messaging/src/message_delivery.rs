@@ -1,4 +1,3 @@
-use tracing::Instrument;
 // Receiver-side batching and durable transport accounting.
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
@@ -9,6 +8,7 @@ use chrono::{DateTime, Utc};
 use flotilla_agent_connector::{
     Delivery, DeliveryTarget, HarnessRef, Operation, Routed, SubmissionRef, TransportId, TransportOutcome, TransportRouter,
 };
+use tracing::Instrument;
 
 use crate::{
     apply_status_patch,
@@ -918,12 +918,16 @@ impl MessageInbox {
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<(), ResourceError> {
+        let current = self.messages.get(&message.metadata.name).await?;
+        let mut status = status_for(&current);
+        let previous = status.clone();
+        MessageStatusPatch::Wait { phase, reason: reason.into(), at: now }.apply(&mut status);
+        if status == previous {
+            return Ok(());
+        }
         let trace_span = flotilla_tracing::queued_span(&message.metadata.name, "waiting");
         async {
             tracing::info!(%reason, "message waiting");
-            let current = self.messages.get(&message.metadata.name).await?;
-            let mut status = status_for(&current);
-            MessageStatusPatch::Wait { phase, reason: reason.into(), at: now }.apply(&mut status);
             self.write(&current, &status).await
         }
         .instrument(trace_span)
@@ -1166,6 +1170,52 @@ mod framing_tests {
             admitted.status.as_ref().expect("admitted status").accepted_sequence
         );
         assert_eq!(current.status.expect("status").phase, MessagePhase::Deliverable);
+    }
+
+    #[derive(Clone, Default)]
+    struct WaitSpans(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl tracing::Subscriber for WaitSpans {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    // Review #3715: repeated waits with the same phase/reason emit one span;
+    // a changed reason emits another state entry, and preserves the audit time.
+    #[tokio::test]
+    async fn unchanged_wait_does_not_emit_more_spans() {
+        use tracing::instrument::WithSubscriber;
+        let backend = crate::ResourceBackend::new(flotilla_store_testkit::memory_backend());
+        let inbox = MessageInbox::new(backend.clone(), "project");
+        let stored = backend.using::<Message>("project");
+        let message = stored.create(&InputMeta::builder().name("waiting".into()).build(), &messages().remove(0)).await.expect("intent");
+        let spans = WaitSpans::default();
+        async {
+            let first = Utc::now();
+            for offset in 0..8 {
+                inbox
+                    .wait(&message, MessagePhase::Deliverable, "holder unavailable", first + chrono::Duration::seconds(offset))
+                    .await
+                    .expect("wait");
+                assert_eq!(spans.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+            assert_eq!(stored.get("waiting").await.expect("record").status.expect("status").since, first);
+            inbox
+                .wait(&message, MessagePhase::Deliverable, "transport unavailable", first + chrono::Duration::seconds(10))
+                .await
+                .expect("new reason");
+            assert_eq!(spans.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+        .with_subscriber(spans.clone())
+        .await;
     }
 
     fn messages() -> Vec<MessageSpec> {

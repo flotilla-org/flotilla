@@ -74,6 +74,11 @@ async fn cross_host_message_has_connected_trace_and_correlated_logs() {
             "missing {phase}"
         );
     }
+    assert_eq!(
+        work.iter().filter(|s| s.attributes.iter().any(|a| a.key.as_str() == "message.phase" && a.value.as_str() == "waiting")).count(),
+        1,
+        "repeated pending polls must not emit more waiting spans"
+    );
     assert!(work.iter().any(|s| s.name == "peer.receive"), "the remote request carries the queue trace");
     for span in &work {
         if span.span_context.span_id() != root.span_context.span_id() {
