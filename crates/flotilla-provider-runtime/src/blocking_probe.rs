@@ -4,6 +4,10 @@ use std::{sync::Arc, time::Duration};
 
 use tokio::sync::Semaphore;
 
+// Match rigging-process/src/probe.rs: blocking() owns eight process-wide
+// slots. Rigging does not currently expose its capacity as a constant.
+const ISOLATED_PROBE_CAPACITY: usize = 8;
+
 #[derive(Clone, Default)]
 pub struct BlockingProbe {
     slots: Option<Arc<Semaphore>>,
@@ -12,8 +16,9 @@ pub struct BlockingProbe {
 impl BlockingProbe {
     /// A fresh eight-call budget, shared by clones but independent of other
     /// instances. Use for a simulated host, not for each request on one host.
+    #[doc(hidden)]
     pub fn isolated() -> Self {
-        Self { slots: Some(Arc::new(Semaphore::new(8))) }
+        Self { slots: Some(Arc::new(Semaphore::new(ISOLATED_PROBE_CAPACITY))) }
     }
 
     pub async fn run<T: Send + 'static>(
@@ -78,7 +83,12 @@ mod tests {
                 .await
         });
         started.await.unwrap();
+        // Advance past the deadline by a full tick margin: timers round up
+        // to millisecond boundaries. Resume before starting any more OS work.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
         let result = task.await.unwrap();
+        tokio::time::resume();
         assert_eq!(result, Err("blocked probe timed out after 5s".into()));
         assert_eq!(runner.run("retry", Duration::from_secs(1), || Ok(())).await, Err("retry probe capacity exhausted".into()));
         release.send(()).unwrap();

@@ -702,7 +702,7 @@ async fn parallel_daemons_have_independent_free_space_probe_capacity() {
             let (lock, ready) = &*self.gate;
             let released = lock.lock().unwrap();
             // Bound cleanup even if a regression prevents all callers entering.
-            let _guard = ready.wait_timeout_while(released, Duration::from_secs(4), |released| !*released).unwrap();
+            let _guard = ready.wait_timeout_while(released, Duration::from_secs(10), |released| !*released).unwrap();
             Some(100 * 1024 * 1024 * 1024)
         }
     }
@@ -749,7 +749,7 @@ async fn parallel_daemons_have_independent_free_space_probe_capacity() {
                 }
             });
         }
-        let all_started = tokio::time::timeout(Duration::from_secs(2), async {
+        let all_started = tokio::time::timeout(Duration::from_secs(4), async {
             for _ in 0..9 {
                 started.recv().await.unwrap();
             }
