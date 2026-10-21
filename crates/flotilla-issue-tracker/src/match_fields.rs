@@ -1,6 +1,7 @@
 //! Exact, client-side project selectors over native issue fields.
 //!
-//! Field names address top-level REST issue fields. Scalars compare exactly;
+//! Field names address top-level REST issue fields. Names and string values are
+//! case-sensitive, including labels and logins. Scalars compare exactly;
 //! arrays use membership, with every requested value required (as in ADR 0020's
 //! creation subset rule). Labels project `name`, assignees/users project `login`,
 //! and milestones project `title`. Missing/null fields never match. No field is
@@ -55,6 +56,8 @@ mod tests {
         }
         let fields = [("labels".into(), expected), ("component".into(), vec!["terminal".into()])].into();
         let issue = json!({"labels": values(mask).iter().map(|name| json!({"name":name})).collect::<Vec<_>>(), "component": if missing { Value::Null } else { json!("terminal") }});
+        // An empty required set creates an empty value list, which cannot match
+        // (unlike an empty field map, which imposes no constraints).
         assert_eq!(matches(&issue, &fields), !missing && required != 0 && mask & required == required);
     }
 
