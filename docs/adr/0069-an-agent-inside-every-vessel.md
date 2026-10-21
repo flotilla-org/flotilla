@@ -1,6 +1,6 @@
 # 69. An agent inside every vessel
 
-**Status:** Accepted, not yet implemented (owner rulings, 2026-10-18; #3246, #3472, #3478)
+**Status:** Accepted, not yet implemented (owner rulings, 2026-10-18; #3246, #3472, #3478). Amended 2026-10-21: drydock owns the one vessel agent (ADR 0070).
 **Date:** 2026-10-18
 **Amends:** [ADR 0056](0056-action-recipes-are-platform-independent-addresses.md): attach resolves one hop at a time, and entering a vessel no longer uses `docker exec`
 **Relates to:**
@@ -109,3 +109,16 @@ Later features are each filed when a consumer needs them:
 - **One stream transport per vessel** (revised in ADR 0070's API-review amendment). The host opens streams to the agent and accepts streams from it. Kinds with cheap two-way connections use them natively (vsock, Docker's sockets, SSH channels with local and remote forwards). Dial and Relay run yamux over their single stream. Each link is a long-lived HTTP/2 connection over its own stream.
 - **The hello no longer carries the environment ID.** The host already knows which vessel it connected to. The hello carries the build fingerprint and supported features, and the host pushes the rest after connecting.
 - **The agent becomes a drydock component.** It is likely to move to [flotilla-org/drydock](https://github.com/flotilla-org/drydock), with a generic bridge that in-vessel tools use to reach whatever controls the vessel. flotilla's CLI, hooks and MCP reaching flotillad become one use of that bridge.
+
+## Amendment (2026-10-21, drydock owns the agent)
+
+[ADR 0070's 2026-10-21 amendment](0070-drydock-out-of-process-environment-adaptors.md) records the owner's rulings: one vessel agent, owned by drydock as its own binary, with flotilla adding a cut-down flotilla CLI. It replaces these parts of this ADR:
+- **"One vessel-side binary":** the agent is drydock's binary, not `flotilla vessel-agent`. The vessel tools split: drydock's are its agent; flotilla's layer is the cut-down CLI and, by default, cleat.
+- **"HTTP on two links":** the agent-to-host link that carries the CLI, hooks and MCP becomes a forward of flotillad's endpoint for the vessel. Cleat attach and port forwards become host-to-guest forwards. Forwards are arranged however suits the kind.
+- **Lifecycle, "a small init supervises and restarts it":** drydock never touches the image's init. Each module starts the agent alongside it through the provider's own mechanism, and drydock specifies only the outcome.
+- **Lifecycle, fleet rolls:** drydock upgrades its agent; flotilla pushes its CLI layer as files without restarting the agent.
+- **Tender, "the agent reports in-vessel services":** the host publishes the list of forwards instead. A service started later gets a forward added then.
+- **Attach, "the vessel's cleat server":** cleat is optional. Without it a shell comes from the kind natively or from the fallback runner.
+- **Egress, "TLS interception happens only for hosts where the proxy swaps credentials":** already replaced by ADR 0044's P4a, which decrypts all HTTPS under enforced egress.
+
+Everything else stands: the control API's trust rule, the hello as readiness, exec with no terminal, egress capture and the tested isolation invariant.
