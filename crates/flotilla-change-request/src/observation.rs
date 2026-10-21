@@ -355,22 +355,45 @@ fn substantive_feedback(item: &serde_json::Value, review_bot_login: &str) -> boo
         && !(item["author"]["login"].as_str() == Some(review_bot_login) && bot_reports_no_findings(raw))
 }
 
-/// Openings with which the review bot reports nothing new to act on.
-const NO_FINDINGS_OPENINGS: [&str; 5] = ["no new issues", "no new findings", "found no issues", "no issues found", "no findings"];
+/// Opening sentences with which the review bot reports nothing new to act on.
+const NO_FINDINGS_SENTENCES: [&str; 8] = [
+    "no new issues found",
+    "no new issues",
+    "i found no new issues",
+    "no new findings",
+    "i found no new findings",
+    "no issues found",
+    "i found no issues",
+    "no findings",
+];
 
-/// True when a review-bot comment reports no findings for the crew. Its
-/// `<!-- review-findings: N -->` marker is authoritative; without one, the
-/// bot's opening lines (after any heading) must say it found nothing new.
+/// Section headings that carry findings, even after a quiet opening sentence.
+const FINDINGS_SECTIONS: [&str; 5] = ["things to consider", "worth addressing", "non-blocking", "findings", "issues"];
+
+/// True when a review-bot comment reports no findings for the crew.
+///
+/// A `<!-- review-findings: N -->` marker on the comment's last line is
+/// authoritative; a marker elsewhere (quoted, say) is not. Without one, the
+/// first sentence after any heading must be exactly a no-findings sentence,
+/// and no later heading may introduce findings.
 fn bot_reports_no_findings(body: &str) -> bool {
-    let marked = body
-        .split("<!--")
-        .skip(1)
-        .find_map(|part| part.split_once("-->")?.0.trim().strip_prefix("review-findings:")?.trim().parse::<u64>().ok());
+    let lines = body.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
+    let marked = lines.last().and_then(|last| {
+        last.strip_prefix("<!--")?.strip_suffix("-->")?.trim().strip_prefix("review-findings:")?.trim().parse::<u64>().ok()
+    });
     if let Some(findings) = marked {
         return findings == 0;
     }
-    let opening = body.lines().map(str::trim).filter(|line| !line.is_empty()).take(3).collect::<Vec<_>>().join(" ").to_ascii_lowercase();
-    NO_FINDINGS_OPENINGS.iter().any(|phrase| opening.contains(phrase))
+    let heading = |line: &str| line.starts_with('#') || (line.len() > 4 && line.starts_with("**") && line.ends_with("**"));
+    let plain = |line: &str| line.trim_matches(|c: char| matches!(c, '#' | '*' | '_') || c.is_whitespace()).to_ascii_lowercase();
+    let Some(opening) = lines.iter().copied().find(|line| !heading(line)) else { return false };
+    let opening = plain(opening);
+    let first_sentence = opening.split(['.', '!', '?', ':', ';']).next().unwrap_or_default().trim();
+    NO_FINDINGS_SENTENCES.contains(&first_sentence)
+        && !lines.iter().copied().filter(|line| heading(line)).any(|line| {
+            let title = plain(line);
+            FINDINGS_SECTIONS.iter().any(|section| title.starts_with(section))
+        })
 }
 
 fn github_comment_id(comment: &serde_json::Value) -> Option<u64> {
@@ -581,6 +604,12 @@ mod tests {
             "**Re-review**\n\n1. `retry_at` can overflow when attempts exceed 63.",
             "**Review: episode limit**\n\nNo correctness bugs found.\n\n**Things to consider**\n\n1. `episodes` is now unbounded.",
             "No new issues found in the parser.\n\n1. The new cap drops queued episodes.\n\n<!-- review-findings: 1 -->",
+            // A quiet-sounding opening that goes on to a finding.
+            "No issues found in the parser, but the cache invalidation is wrong: it never expires.",
+            "No findings are blocking. However, 1. the retry loop never ends.",
+            "**Review**\n\nNo issues found.\n\n**Things to consider**\n\n1. `episodes` is now unbounded.",
+            // Only a marker on the last line is authoritative; a quoted one is not.
+            "Please fix the race.\n\nThe bot now ends with `<!-- review-findings: 0 -->`.\n\n1. Rename `run`.",
         ] {
             assert!(observe(finding, "claude", "Bot"), "{finding}");
         }
