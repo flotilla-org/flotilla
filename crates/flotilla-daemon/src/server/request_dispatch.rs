@@ -629,6 +629,7 @@ pub(super) async fn handle_agent_hook(
         AgentEventType::Active | AgentEventType::ToolActive => flotilla_resources::TerminalAttentionState::Working,
         AgentEventType::Idle | AgentEventType::Started => flotilla_resources::TerminalAttentionState::Idle,
         AgentEventType::WaitingForPermission => flotilla_resources::TerminalAttentionState::NeedsInput,
+        // Interrupted changes only the gated AgentSession observation; preserve legacy terminal attention.
         AgentEventType::Ended | AgentEventType::NoChange | AgentEventType::Interrupted => return Ok(()),
     };
     if !event.native_codex_hook {
