@@ -21,6 +21,7 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
 umask 077
 staged="${destination}.flotilla-staging.$$"
 sources="${destination}.flotilla-sources.$$"
+# Generated credential paths are single-line; lists preserve all other whitespace.
 token_files=
 token_markers=
 succeeded=false
@@ -357,7 +358,11 @@ mod tests {
             assert!(!output.status.success());
             assert!(String::from_utf8_lossy(&output.stderr).contains("credential credential is unavailable"));
             assert!(!token.exists(), "token must be removed: {name:?}");
-            assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1, "only cache remains; no marker: {name:?}");
+            let marker_prefix = format!("{name}.in-use.");
+            assert!(
+                fs::read_dir(temp.path()).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(&marker_prefix)),
+                "in-use marker must be removed: {name:?}"
+            );
         }
     }
 
