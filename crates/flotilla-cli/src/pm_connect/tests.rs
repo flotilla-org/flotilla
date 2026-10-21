@@ -172,6 +172,13 @@ fn rebuild_prefers_awareness_transport_when_available() {
         !patches.iter().any(|patch| patch.target == independent_entity("scratch")),
         "raw independent fallback is not projected once awareness is available"
     );
+    state.apply_event(&awareness_set(2, vec![]));
+    let patches = state.rebuild(&mint());
+    assert!(
+        patches.iter().any(|patch| patch.target == independent_entity("scratch")),
+        "removing the last awareness node restores raw fallback"
+    );
+    assert_incremental_matches_full(&state, chrono::Utc::now());
 }
 
 struct RecordingSink {
@@ -1833,7 +1840,7 @@ async fn query_gap_preserves_other_queries_and_their_next_deltas() {
 fn assert_incremental_matches_full(state: &ConnectorState, now: flotilla_protocol::result_set::Timestamp) {
     use flotilla_manifest::projection::{project_catalog_with_ttl, CatalogInput};
     let mut convoys: Vec<_> = state.convoys.values().cloned().collect();
-    convoys.sort_by_key(|row| projection::Node::Convoy(row.resource.clone()));
+    convoys.sort_by_key(|row| projection::Node::Convoy(row.resource.clone().into()));
     let independents: Vec<_> = state.independents.values().cloned().collect();
     let roles: Vec<_> = state.standing_roles.values().cloned().collect();
     let projects: Vec<_> = state.project_repositories.values().cloned().collect();
@@ -2025,4 +2032,38 @@ fn duplicate_snapshot_keys_keep_the_last_row() {
         vec![independent_row("same", SessionPhase::Stopped), independent_row("same", SessionPhase::Running)],
     ));
     assert_eq!(state.independents[&independent_row("same", SessionPhase::Running).resource].phase, SessionPhase::Running);
+}
+
+// A connection snapshot replaces both the PM and the acknowledged local mirror;
+// prior facts cannot survive merely because reassertion has no unset list.
+#[tokio::test]
+async fn first_connection_snapshot_matches_the_projected_catalog() {
+    let connector = Connector::default();
+    let mut state = ConnectorState { catalog: connector.catalog.clone(), ..ConnectorState::default() };
+    state.apply_event(&independents_set(1, vec![independent_row("old", SessionPhase::Running)]));
+    state.rebuild(&mint());
+    state.apply_event(&independents_set(2, vec![independent_row("new", SessionPhase::Running)]));
+    let mut sink = RecordingSink::new();
+    sink.mode = LivenessMode::Connection;
+    publish(&mut state, &sink, &mint(), &connector, false).await.expect("snapshot acknowledged");
+    assert_eq!(&*state.catalog.lock().expect("acknowledged"), state.projection.catalog());
+    assert!(sink.publications.lock().expect("publications")[0].0, "first connection publication replaces the PM snapshot");
+}
+
+// Setup failure leaves the current and unstarted namespaces pending. Production
+// session failure also cancels partial watches before rebuilding fresh state.
+#[tokio::test]
+async fn failed_watch_setup_preserves_unfinished_namespaces() {
+    let daemon = Arc::new(MockDaemon::new(vec![]));
+    *daemon.list_failure.lock().expect("failure") = Some("forges".into());
+    let handle: Arc<dyn DaemonHandle> = daemon;
+    let mut state = ConnectorState::default();
+    state.pending_namespaces.insert("later".into());
+    let expected = state.pending_namespaces.clone();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let error = ensure_resource_watches(&handle, &mut state, &mut BTreeSet::new(), &mut tasks, &tx).await.expect_err("watch setup fails");
+    assert!(error.contains("transient list failure"));
+    assert_eq!(state.pending_namespaces, expected);
+    tasks.shutdown().await;
 }

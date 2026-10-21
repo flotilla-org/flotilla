@@ -389,7 +389,7 @@ impl ConnectorState {
         if row.is_some() && self.known_namespaces.insert(key.namespace.clone()) {
             self.pending_namespaces.insert(key.namespace.clone());
         }
-        let node = projection::Node::Convoy(key.clone());
+        let node = projection::Node::Convoy(key.clone().into());
         self.projection.change(node.clone(), row.as_ref().map(projection::convoy_links));
         self.projection.expire_at(
             node.clone(),
@@ -413,7 +413,7 @@ impl ConnectorState {
         if self.independents.get(&key) == row.as_ref() {
             return;
         }
-        let node = projection::Node::Independent(key.clone());
+        let node = projection::Node::Independent(key.clone().into());
         self.projection.change(node.clone(), row.as_ref().map(|_| Vec::new()));
         match row {
             Some(row) => {
@@ -432,7 +432,7 @@ impl ConnectorState {
         if row.is_some() && self.known_namespaces.insert(key.namespace.clone()) {
             self.pending_namespaces.insert(key.namespace.clone());
         }
-        let node = projection::Node::Role(key.clone());
+        let node = projection::Node::Role(key.clone().into());
         self.projection.change(
             node.clone(),
             row.as_ref().map(|row| vec![projection::Dependency::Role(row.resource.namespace.clone(), row.resource.name.clone())]),
@@ -454,7 +454,7 @@ impl ConnectorState {
         if row.is_some() && self.known_namespaces.insert(key.namespace.clone()) {
             self.pending_namespaces.insert(key.namespace.clone());
         }
-        let node = projection::Node::Membership(key.clone());
+        let node = projection::Node::Membership(key.clone().into());
         self.projection.change(node.clone(), row.as_ref().map(|_| Vec::new()));
         match row {
             Some(row) => {
@@ -551,6 +551,8 @@ async fn publish(
         deliver(sink, &patches, first && mode == LivenessMode::Connection).await?;
         let mut catalog = state.catalog.lock().expect("published catalog");
         if first && mode == LivenessMode::Connection {
+            // reassert_patches is a complete replacing snapshot; its acknowledged
+            // local mirror must likewise replace all prior facts.
             *catalog = Catalog::default();
         }
         catalog.apply_patches(&patches, ttl_ms);
@@ -626,10 +628,10 @@ async fn ensure_resource_watches(
     use flotilla_client::resource::{ResourceClient, ResourceWatchRequest};
     // Scope follows the named-query graph. Namespaces with no convoy, role or
     // project membership are intentionally outside this subject projection.
-    let namespaces = std::mem::take(&mut state.pending_namespaces);
     let client = ResourceClient::new(Arc::clone(daemon));
-    for namespace in namespaces {
+    while let Some(namespace) = state.pending_namespaces.first().cloned() {
         if watched.contains(&namespace) {
+            state.pending_namespaces.remove(&namespace);
             continue;
         }
         for kind in resources::KINDS {
@@ -701,6 +703,7 @@ async fn ensure_resource_watches(
         }
         // A setup error returns to run_reconnecting, dropping this JoinSet;
         // this function never retries a partially admitted namespace in place.
+        state.pending_namespaces.remove(&namespace);
         watched.insert(namespace);
     }
     Ok(())

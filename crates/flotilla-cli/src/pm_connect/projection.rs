@@ -15,61 +15,41 @@ use flotilla_protocol::{
 use super::{resources::RecordKey, ConnectorState};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ResourceIdentity(ResourceRef);
+
+impl From<ResourceRef> for ResourceIdentity {
+    fn from(resource: ResourceRef) -> Self {
+        Self(resource)
+    }
+}
+impl Ord for ResourceIdentity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        resource_order(&self.0).cmp(&resource_order(&other.0))
+    }
+}
+impl PartialOrd for ResourceIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Node {
     Configuration,
-    Convoy(ResourceRef),
-    Independent(ResourceRef),
-    Role(ResourceRef),
+    Convoy(ResourceIdentity),
+    Independent(ResourceIdentity),
+    Role(ResourceIdentity),
     Record(RecordKey),
     Entry(String, String),
     Header(String),
-    Membership(ResourceRef),
+    Membership(ResourceIdentity),
 }
 
-impl Node {
-    fn rank(&self) -> u8 {
-        match self {
-            Self::Configuration => 0,
-            Self::Convoy(_) => 1,
-            Self::Independent(_) => 2,
-            Self::Role(_) => 3,
-            Self::Record(_) => 4,
-            Self::Entry(..) => 5,
-            Self::Header(_) => 6,
-            Self::Membership(_) => 7,
-        }
-    }
-}
 // Exhaustive destructuring makes adding any ResourceRef field a compile error
 // here, so node ordering cannot silently omit a new identity component.
 fn resource_order(resource: &ResourceRef) -> (&str, &str, &str, &str, Option<&str>, Option<&str>) {
     let ResourceRef { api_version, kind, namespace, name, host, subresource } = resource;
     (api_version, kind, namespace, name, host.as_ref().map(|host| host.as_str()), subresource.as_deref())
-}
-
-impl Ord for Node {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let rank = self.rank().cmp(&other.rank());
-        if !rank.is_eq() {
-            return rank;
-        }
-        match (self, other) {
-            (Self::Convoy(a), Self::Convoy(b))
-            | (Self::Independent(a), Self::Independent(b))
-            | (Self::Role(a), Self::Role(b))
-            | (Self::Membership(a), Self::Membership(b)) => resource_order(a).cmp(&resource_order(b)),
-            (Self::Record(a), Self::Record(b)) => a.cmp(b),
-            (Self::Entry(a, b), Self::Entry(c, d)) => (a, b).cmp(&(c, d)),
-            (Self::Header(a), Self::Header(b)) => a.cmp(b),
-            (Self::Configuration, Self::Configuration) => std::cmp::Ordering::Equal,
-            _ => unreachable!("different node variants must have distinct ranks"),
-        }
-    }
-}
-impl PartialOrd for Node {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -348,10 +328,10 @@ impl Projection {
                 }
             }
             match member {
-                Node::Convoy(key) => convoys.extend(state.convoys.get(key).cloned()),
-                Node::Independent(key) => independents.extend(state.independents.get(key).cloned()),
-                Node::Role(key) => roles.extend(state.standing_roles.get(key).cloned()),
-                Node::Membership(key) => projects.extend(state.project_repositories.get(key).cloned()),
+                Node::Convoy(key) => convoys.extend(state.convoys.get(&key.0).cloned()),
+                Node::Independent(key) => independents.extend(state.independents.get(&key.0).cloned()),
+                Node::Role(key) => roles.extend(state.standing_roles.get(&key.0).cloned()),
+                Node::Membership(key) => projects.extend(state.project_repositories.get(&key.0).cloned()),
                 Node::Record(key) => records.push(key.clone()),
                 Node::Header(id) => {
                     let (header, visible) = &self.headers[id];
@@ -451,7 +431,12 @@ mod tests {
             Node::Header("header".into()),
         ];
         for row in refs {
-            nodes.extend([Node::Convoy(row.clone()), Node::Independent(row.clone()), Node::Role(row.clone()), Node::Membership(row)]);
+            nodes.extend([
+                Node::Convoy(row.clone().into()),
+                Node::Independent(row.clone().into()),
+                Node::Role(row.clone().into()),
+                Node::Membership(row.into()),
+            ]);
         }
         for left in &nodes {
             for right in &nodes {
