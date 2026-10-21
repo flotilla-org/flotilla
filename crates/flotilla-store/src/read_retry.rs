@@ -5,6 +5,8 @@ use std::{collections::hash_map::RandomState, future::Future, hash::BuildHasher,
 
 /// Retry only a refused store-busy read. The caller owns cancellation; dropping
 /// this future cancels backoff. Stream failures and write errors are never retried.
+/// Observability starts at the first explicit busy refusal; a read that hangs
+/// before returning busy is outside this signal's detection scope.
 /// The backoff window starts at 25 ms and doubles to 1 s. Equal jitter samples
 /// its upper half independently per consumer, avoiding synchronized retries.
 /// Records process-wide `WatchView` metrics; controllers and replication use
@@ -18,6 +20,7 @@ where
 }
 
 /// Retry with a bounded consumer-class label in the process load metrics.
+/// Like [`retry_store_read`], this observes only reads that return store-busy.
 pub async fn retry_store_read_for<T, F, Fut>(consumer: crate::load_metrics::ReadRetryConsumer, read: F) -> Result<T, ResourceError>
 where
     F: FnMut() -> Fut,

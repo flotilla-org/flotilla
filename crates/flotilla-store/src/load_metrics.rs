@@ -184,6 +184,7 @@ impl Peak {
 
 /// Retry labels are a fixed process-wide set: no resource, peer or view IDs.
 #[derive(Debug, Clone, Copy)]
+#[repr(usize)]
 pub enum ReadRetryConsumer {
     Controller,
     WatchView,
@@ -191,12 +192,18 @@ pub enum ReadRetryConsumer {
 }
 
 impl ReadRetryConsumer {
-    fn index(self) -> usize {
+    pub const ALL: [Self; 3] = [Self::Controller, Self::WatchView, Self::Replication];
+
+    pub const fn label(self) -> &'static str {
         match self {
-            Self::Controller => 0,
-            Self::WatchView => 1,
-            Self::Replication => 2,
+            Self::Controller => "controller",
+            Self::WatchView => "watch_view",
+            Self::Replication => "replication",
         }
+    }
+
+    fn index(self) -> usize {
+        self as usize
     }
 }
 
@@ -230,16 +237,32 @@ pub struct ReadRetrySnapshot {
     pub recoveries: u64,
     pub failures: u64,
     pub cancellations: u64,
+    /// Highest consecutive refusal count of any single call since start.
     pub peak_consecutive: u64,
     pub active: u64,
     pub prolonged: u64,
+    /// Sum of consecutive refusal counts across currently active calls.
     pub consecutive: u64,
     pub oldest_millis: u64,
 }
 
 impl ReadRetryMetrics {
+    // Instrumentation must remain usable in Drop and health reporting even if
+    // a prior panic poisoned the lock; metrics must not cause a second panic.
+    fn state(&self) -> std::sync::MutexGuard<'_, ReadRetryState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub fn snapshot(&self) -> ReadRetrySnapshot {
-        let state = self.state.lock().expect("read retry metrics");
+        let state = self.state();
+        let now = tokio::time::Instant::now();
+        let (mut prolonged, mut consecutive, mut oldest) = (0, 0, Duration::ZERO);
+        for (at, count) in state.active.values() {
+            let age = now.saturating_duration_since(*at);
+            prolonged += u64::from(age >= READ_RETRY_PROLONGED);
+            consecutive += count;
+            oldest = oldest.max(age);
+        }
         ReadRetrySnapshot {
             retries: state.retries,
             recoveries: state.recoveries,
@@ -247,14 +270,9 @@ impl ReadRetryMetrics {
             cancellations: state.cancellations,
             peak_consecutive: state.peak_consecutive,
             active: state.active.len() as u64,
-            prolonged: state.active.values().filter(|(at, _)| at.elapsed() >= READ_RETRY_PROLONGED).count() as u64,
-            consecutive: state.active.values().map(|(_, count)| count).sum(),
-            oldest_millis: state
-                .active
-                .values()
-                .map(|(at, _)| at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
-                .max()
-                .unwrap_or(0),
+            prolonged,
+            consecutive,
+            oldest_millis: u64::try_from(oldest.as_millis()).unwrap_or(u64::MAX),
         }
     }
 
@@ -270,7 +288,7 @@ pub(crate) struct ReadRetryGuard<'a> {
 
 impl ReadRetryGuard<'_> {
     pub(crate) fn busy(&mut self) {
-        let mut state = self.metrics.state.lock().expect("read retry metrics");
+        let mut state = self.metrics.state();
         let id = *self.id.get_or_insert_with(|| {
             let id = state.next_id;
             state.next_id += 1;
@@ -287,7 +305,7 @@ impl ReadRetryGuard<'_> {
 
     pub(crate) fn finish(&mut self, recovered: bool) {
         if let Some(id) = self.id.take() {
-            let mut state = self.metrics.state.lock().expect("read retry metrics");
+            let mut state = self.metrics.state();
             state.active.remove(&id);
             if recovered {
                 state.recoveries += 1;
@@ -301,15 +319,15 @@ impl ReadRetryGuard<'_> {
 impl Drop for ReadRetryGuard<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.id {
-            let mut state = self.metrics.state.lock().expect("read retry metrics");
+            let mut state = self.metrics.state();
             state.active.remove(&id);
             state.cancellations += 1;
         }
     }
 }
 
-fn read_retry_metrics() -> &'static [ReadRetryMetrics; 3] {
-    static METRICS: std::sync::OnceLock<[ReadRetryMetrics; 3]> = std::sync::OnceLock::new();
+fn read_retry_metrics() -> &'static [ReadRetryMetrics; ReadRetryConsumer::ALL.len()] {
+    static METRICS: std::sync::OnceLock<[ReadRetryMetrics; ReadRetryConsumer::ALL.len()]> = std::sync::OnceLock::new();
     METRICS.get_or_init(Default::default)
 }
 
@@ -320,7 +338,7 @@ pub(crate) fn read_retry_metrics_for(consumer: ReadRetryConsumer) -> &'static Re
 /// All retries in this process, including remote replication reads. These are
 /// process metrics, independent of which backend a read uses.
 pub fn read_retry_snapshot() -> BTreeMap<&'static str, ReadRetrySnapshot> {
-    ["controller", "watch_view", "replication"].into_iter().zip(read_retry_metrics().iter().map(ReadRetryMetrics::snapshot)).collect()
+    ReadRetryConsumer::ALL.into_iter().map(|consumer| (consumer.label(), read_retry_metrics_for(consumer).snapshot())).collect()
 }
 
 /// One durable store's single writer and its reader pool.
@@ -714,6 +732,27 @@ mod read_retry_tests {
             drop(guards);
             assert_eq!(metrics.snapshot().active, 0);
         });
+    }
+
+    // A poisoned instrumentation lock must not disable snapshots, retry
+    // accounting or cancellation cleanup. One example covers the lock adapter.
+    #[test]
+    fn read_retry_poisoned_lock_remains_observable() {
+        let metrics = ReadRetryMetrics::default();
+        let poisoned = std::panic::catch_unwind(|| {
+            let _state = metrics.state.lock().unwrap();
+            panic!("poison instrumentation lock");
+        });
+        assert!(poisoned.is_err());
+        assert_eq!(metrics.snapshot(), ReadRetrySnapshot::default());
+        let mut recovered = metrics.retrying();
+        recovered.busy();
+        recovered.finish(true);
+        let mut cancelled = metrics.retrying();
+        cancelled.busy();
+        drop(cancelled);
+        let end = metrics.snapshot();
+        assert_eq!((end.retries, end.recoveries, end.cancellations, end.active), (2, 1, 1, 0));
     }
 
     // The 30-second boundary includes exactly 30s, even when the next read is

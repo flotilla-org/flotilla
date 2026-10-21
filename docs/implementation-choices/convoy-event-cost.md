@@ -163,7 +163,8 @@ retry calls retain bookkeeping, released when the future returns or is dropped.
 `retries`, `recoveries`, `failures`, and `cancellations` are cumulative counters;
 `peak_consecutive` is a per-call high-water mark. `active`, `prolonged`,
 `consecutive` (sum across active calls), and `oldest_millis` are current gauges.
-The first busy refusal starts a retry episode. Success counts one recovery;
+The first busy refusal starts a retry episode; a read that hangs before any
+busy refusal is outside this signal's detection scope. Success counts one recovery;
 a non-busy error counts one failure; dropping a retry counts one cancellation.
 All three outcomes clear that call's current gauges. Reads that never encounter
 store-busy do not affect the metrics.

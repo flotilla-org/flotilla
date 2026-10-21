@@ -993,3 +993,38 @@ fn quarantine_withdraws_only_for_observation_records(tc: hegel::TestCase) {
     assert!(condition.blocks_readiness());
     assert_eq!(condition.blocks_forge_observation(), kind != 0);
 }
+
+// Heartbeats publish a JSON object with exactly three consumer-class keys and
+// numeric counters/gauges. Glue: one real heartbeat pins this serialization seam.
+#[tokio::test]
+async fn heartbeat_publishes_store_read_retry_capability_shape() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"read-retry-capability-root\"\n").expect("daemon config");
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path().to_path_buf()))).await;
+    let host_id = daemon.local_host_id().expect("Host identity").to_string();
+    let backend = daemon.resource_backend();
+    ensure_host_exists(&backend, NAMESPACE, &host_id, "local").await.expect("register Host");
+    apply_host_heartbeat(&daemon, NAMESPACE, &manual_profile(&host_id, false), &test_health_identity()).await.expect("heartbeat");
+    let host = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("Host");
+    let status = host.status.expect("Host status");
+    let retries = status.capabilities["store_read_retries"].as_object().expect("retry metrics object");
+    assert_eq!(retries.keys().map(String::as_str).collect::<BTreeSet<_>>(), BTreeSet::from(["controller", "watch_view", "replication"]));
+    for metrics in retries.values() {
+        let metrics = metrics.as_object().expect("class metrics object");
+        assert_eq!(
+            metrics.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "retries",
+                "recoveries",
+                "failures",
+                "cancellations",
+                "peak_consecutive",
+                "active",
+                "prolonged",
+                "consecutive",
+                "oldest_millis"
+            ])
+        );
+        assert!(metrics.values().all(|value| value.as_u64().is_some()), "counters and gauges must be unsigned integers");
+    }
+}
