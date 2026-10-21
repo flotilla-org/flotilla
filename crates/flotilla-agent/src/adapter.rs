@@ -1378,6 +1378,9 @@ mod tests {
         .content;
 
         // Glue: every dispatched brief carries the canonical guidance without a project checkout.
+        // The renderer may demote the document title, but must preserve the artifact heading.
+        assert!(include_str!("../../../docs/agents/decision-ledger.md").starts_with("# Decision ledger\n"));
+        assert!(content.contains("```markdown\n## Decision ledger\n"));
         let guidance = include_str!("../../../docs/agents/decision-ledger.md").replacen(
             "# Decision ledger\n",
             "### Ledger template and guidance\n",
