@@ -367,18 +367,9 @@ mod tests {
 
     #[cfg(unix)]
     mod zellij {
-        use std::{os::unix::fs::PermissionsExt, path::Path};
+        use std::{os::unix::fs::symlink, path::Path};
 
         use super::*;
-
-        fn write_fake_zellij(dir: &Path, script: &str) -> String {
-            let script_path = dir.join("zellij");
-            std::fs::write(&script_path, script).expect("write fake zellij");
-            let mut permissions = std::fs::metadata(&script_path).expect("fake zellij metadata").permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&script_path, permissions).expect("make fake zellij executable");
-            script_path.to_string_lossy().into_owned()
-        }
 
         enum FakeZellijMode {
             Stream,
@@ -400,45 +391,14 @@ mod tests {
 
         fn fake_zellij(dir: &Path, mode: FakeZellijMode) -> String {
             std::fs::write(dir.join("mode"), mode.as_str()).expect("write fake zellij mode");
-            write_fake_zellij(
-                dir,
-                r#"#!/bin/sh
-set -eu
-dir=$(dirname "$0")
-mode=$(cat "$dir/mode")
-printf 'spawn\n' >> "$dir/spawns"
-printf '%s\n' "$@" >> "$dir/args"
-case "$mode" in
-    close-first-child-stdin)
-        if [ ! -e "$dir/first-child" ]; then
-            touch "$dir/first-child"
-            IFS= read -r first_line
-            exec 0<&-
-            touch "$dir/stdin-closed"
-            sleep 5
-            exit 0
-        fi
-        ;;
-    exit-first-child)
-        if [ ! -e "$dir/first-child" ]; then
-            touch "$dir/first-child"
-            IFS= read -r first_line
-            touch "$dir/first-child-exited"
-            exit 0
-        fi
-        ;;
-    block-stdin)
-        touch "$dir/blocked"
-        while [ ! -e "$dir/unblock" ]; do
-            sleep 0.01
-        done
-        ;;
-esac
-while IFS= read -r line; do
-    printf '%s\n' "$line" >> "$dir/lines"
-done
-"#,
-            )
+            // Stand in for the zellij process boundary without writing an executable:
+            // another test's concurrent fork can inherit a newly written script's
+            // write fd and make exec fail with ETXTBSY. The fixture is immutable
+            // throughout the test binary's lifetime. $0 keeps state local to dir.
+            let script_path = dir.join("zellij");
+            symlink(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-zellij.sh"), &script_path)
+                .expect("link fake zellij fixture");
+            script_path.to_string_lossy().into_owned()
         }
 
         async fn wait_for_line_count(path: &Path, expected: usize) -> Vec<String> {
