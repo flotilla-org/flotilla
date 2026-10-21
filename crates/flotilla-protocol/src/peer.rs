@@ -42,6 +42,9 @@ pub enum GoodbyeReason {
 #[serde(tag = "routed_type")]
 pub enum RoutedPeerMessage {
     CommandRequest {
+        /// Transient W3C traceparent/tracestate carrier, never stored.
+        #[serde(default)]
+        trace_context: std::collections::BTreeMap<String, String>,
         request_id: u64,
         requester_node_id: NodeId,
         target_node_id: NodeId,
@@ -55,6 +58,8 @@ pub enum RoutedPeerMessage {
         session_id: Option<uuid::Uuid>,
     },
     CommandCancelRequest {
+        #[serde(default)]
+        trace_context: std::collections::BTreeMap<String, String>,
         cancel_id: u64,
         requester_node_id: NodeId,
         target_node_id: NodeId,
@@ -83,6 +88,8 @@ pub enum RoutedPeerMessage {
         error: Option<String>,
     },
     RemoteStepRequest {
+        #[serde(default)]
+        trace_context: std::collections::BTreeMap<String, String>,
         request_id: u64,
         requester_node_id: NodeId,
         target_node_id: NodeId,
@@ -116,6 +123,8 @@ pub enum RoutedPeerMessage {
         outcomes: Vec<StepOutcome>,
     },
     RemoteStepCancelRequest {
+        #[serde(default)]
+        trace_context: std::collections::BTreeMap<String, String>,
         cancel_id: u64,
         requester_node_id: NodeId,
         target_node_id: NodeId,
@@ -129,6 +138,20 @@ pub enum RoutedPeerMessage {
         remaining_hops: u8,
         error: Option<String>,
     },
+}
+
+impl PeerWireMessage {
+    pub fn trace_context(&self) -> Option<&std::collections::BTreeMap<String, String>> {
+        match self {
+            Self::Routed(
+                RoutedPeerMessage::CommandRequest { trace_context, .. }
+                | RoutedPeerMessage::RemoteStepRequest { trace_context, .. }
+                | RoutedPeerMessage::CommandCancelRequest { trace_context, .. }
+                | RoutedPeerMessage::RemoteStepCancelRequest { trace_context, .. },
+            ) => Some(trace_context),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +252,10 @@ mod tests {
     #[test]
     fn routed_command_request_roundtrip() {
         let msg = RoutedPeerMessage::CommandRequest {
+            trace_context: std::collections::BTreeMap::from([
+                ("traceparent".into(), "00-11111111111111111111111111111111-2222222222222222-01".into()),
+                ("tracestate".into(), "vendor=value".into()),
+            ]),
             request_id: 42,
             requester_node_id: NodeId::new("workstation"),
             target_node_id: NodeId::new("feta"),
@@ -250,6 +277,9 @@ mod tests {
         assert_eq!(json_value["requester_node_id"], "workstation");
         assert_eq!(json_value["target_node_id"], "feta");
         let json = serde_json::to_string(&msg).expect("serialize");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("wire JSON");
+        assert_eq!(value["trace_context"]["tracestate"], "vendor=value");
+        assert!(value["trace_context"]["traceparent"].as_str().expect("traceparent").starts_with("00-"));
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
             RoutedPeerMessage::CommandRequest { request_id, requester_node_id, target_node_id, remaining_hops, caller, .. } => {
@@ -289,6 +319,7 @@ mod tests {
     #[test]
     fn routed_command_cancel_request_roundtrip() {
         let msg = RoutedPeerMessage::CommandCancelRequest {
+            trace_context: Default::default(),
             cancel_id: 7,
             requester_node_id: NodeId::new("workstation"),
             target_node_id: NodeId::new("feta"),
@@ -299,6 +330,7 @@ mod tests {
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
             RoutedPeerMessage::CommandCancelRequest {
+                trace_context: _,
                 cancel_id,
                 requester_node_id,
                 target_node_id,
@@ -381,6 +413,7 @@ mod tests {
     #[test]
     fn routed_remote_step_request_roundtrip() {
         let msg = RoutedPeerMessage::RemoteStepRequest {
+            trace_context: Default::default(),
             request_id: 43,
             requester_node_id: NodeId::new("workstation"),
             target_node_id: NodeId::new("feta"),
@@ -401,6 +434,7 @@ mod tests {
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
             RoutedPeerMessage::RemoteStepRequest {
+                trace_context: _,
                 request_id,
                 requester_node_id,
                 target_node_id,
@@ -485,6 +519,7 @@ mod tests {
     #[test]
     fn routed_remote_step_cancel_request_roundtrip() {
         let msg = RoutedPeerMessage::RemoteStepCancelRequest {
+            trace_context: Default::default(),
             cancel_id: 7,
             requester_node_id: NodeId::new("workstation"),
             target_node_id: NodeId::new("feta"),
@@ -495,6 +530,7 @@ mod tests {
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
             RoutedPeerMessage::RemoteStepCancelRequest {
+                trace_context: _,
                 cancel_id,
                 requester_node_id,
                 target_node_id,

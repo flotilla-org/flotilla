@@ -1,5 +1,6 @@
 //! Crew outcomes, lifecycle teardown, and serialized crew message delivery.
 use flotilla_resources::{credential_refresh_alert_for_vessel, LANDING_EVIDENCE_TTL};
+use tracing::Instrument;
 
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_resources::convoy_address::convoy_address;
@@ -3216,6 +3217,15 @@ impl CrewService {
     }
 
     pub async fn publish_message_intent(
+        &self,
+        namespace: &str,
+        name: &str,
+        intent: &flotilla_resources::MessageSpec,
+    ) -> Result<ResourceRef, String> {
+        self.publish_message_intent_traced(namespace, name, intent).instrument(flotilla_tracing::queued_span(name, "send")).await
+    }
+
+    async fn publish_message_intent_traced(
         &self,
         namespace: &str,
         name: &str,

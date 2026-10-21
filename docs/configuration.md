@@ -340,6 +340,36 @@ host only after sync reaches a fleet store. On startup, sync recovers pending
 uploads from local blobs and per-store markers; later passes process new writes
 and cache fills without walking the full local blob directory.
 
+## OpenTelemetry traces
+
+Span export is off until `[tracing]` is present in `daemon.toml`. Restart the
+daemon after changing it:
+
+```toml
+[tracing]
+endpoint = "http://collector:4318/v1/traces"
+service_name = "flotilla-daemon" # default
+sampling = 1.0                  # probability in [0, 1], default 1
+```
+
+The endpoint is the complete OTLP/HTTP protobuf traces URL. Export uses a bounded
+background batch processor and flushes on graceful shutdown. Sampling uses the
+trace ID so every host makes the same decision for queued work; use the same
+sampling probability across the mesh. The existing logging filter also controls
+which tracing spans reach the exporter.
+
+JSON events inside spans include top-level `trace_id` and `span_id`, including
+when export is disabled or a trace is not sampled. Peer command and remote-step
+request envelopes carry W3C `traceparent` and `tracestate`. Message admission,
+waiting, delivery attempts and receipts use a trace ID derived from the stable
+message ID; retries and host changes keep that identity. Context stays in memory
+and in transient envelopes, never in stored or replicated resources.
+
+The `otel_trace` daemon test runs the two-home router scenario with an in-memory
+exporter and checks connected spans and their JSON log IDs. **Operator, after
+the roll:** send one message across hosts, find its trace in VictoriaTraces,
+and confirm its linked log lines in VictoriaLogs through Alloy.
+
 ## Daemon logging
 
 Each daemon writes structured JSON-lines to

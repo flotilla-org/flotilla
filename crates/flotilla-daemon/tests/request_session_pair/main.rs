@@ -4990,3 +4990,8 @@ fn generated_capabilities_queries_use_session_home(tc: hegel::TestCase) {
 }
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
+
+#[tokio::test]
+async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject() {
+    message_homes::messages_are_homed_at_the_receiver_and_replies_route_by_subject().await;
+}

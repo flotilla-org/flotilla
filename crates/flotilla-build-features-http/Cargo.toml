@@ -28,7 +28,7 @@ mio = { version = "1", features = ["net", "os-ext", "os-poll"] }
 once_cell = { version = "1", features = ["std"] }
 percent-encoding = { version = "2" }
 rand = { version = "0.9", features = ["small_rng"] }
-reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "json", "query", "rustls-no-provider", "stream", "system-proxy"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "charset", "http2", "json", "query", "rustls-no-provider", "stream", "system-proxy"] }
 ring = { version = "0.17", features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }

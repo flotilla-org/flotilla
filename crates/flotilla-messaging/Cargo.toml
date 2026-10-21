@@ -11,6 +11,7 @@ aws-lc-provider = []
 skip-no-sandbox-tests = []
 
 [dependencies]
+flotilla-tracing = { path = "../flotilla-tracing" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-protocol = { path = "../flotilla-protocol" }

@@ -10,6 +10,8 @@ aws-lc-provider = ["flotilla-core/aws-lc-provider", "rigging-tls/aws-lc-provider
 skip-no-sandbox-tests = ["flotilla-executor/skip-no-sandbox-tests", "flotilla-core/skip-no-sandbox-tests", "flotilla-store/skip-no-sandbox-tests", "flotilla-store-testkit/skip-no-sandbox-tests", "flotilla-credentials/skip-no-sandbox-tests", "flotilla-projections/skip-no-sandbox-tests"]
 
 [dependencies]
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+flotilla-tracing = { path = "../flotilla-tracing" }
 flotilla-cbor = { path = "../flotilla-cbor" }
 flotilla-admission = { path = "../flotilla-admission" }
 flotilla-crew = { path = "../flotilla-crew" }
@@ -88,6 +90,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 flotilla-forge-github = { path = "../flotilla-forge-github" }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
 rigging-replay-testkit = { workspace = true }
 flotilla-load-driver = { path = "../flotilla-load-driver" }
 flotilla-change-request = { path = "../flotilla-change-request" }

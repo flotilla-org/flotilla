@@ -12,6 +12,8 @@ use flotilla_config::{
 use flotilla_discovery::DiscoveryRuntime;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_policy::PathPolicy;
+use flotilla_tracing::TracerProvider as _;
+use flotilla_tracing::{KeyValue, QueueIdGenerator, Resource, Sampler, SdkTracerProvider};
 use tracing::{info, Subscriber};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -57,9 +59,13 @@ pub async fn run(
     // Detached daemons redirect stderr to an unrotated panic log. Keep the
     // human-readable layer for interactive runs without duplicating the
     // structured stream into that file.
+    let host_name =
+        daemon_config.host_name.clone().map(flotilla_protocol::HostName::new).unwrap_or_else(flotilla_protocol::HostName::local);
+    let trace_provider = trace_provider(daemon_config.tracing.as_ref(), host_name.as_str())?;
+    let trace_layer = flotilla_tracing::layer().with_tracer(trace_provider.tracer("flotilla-daemon"));
     let stderr_layer = std::io::stderr().is_terminal().then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
-    let file_layer = tracing_subscriber::fmt::layer().json().with_ansi(false).with_writer(file_appender);
-    init_daemon_tracing(tracing_subscriber::registry().with(filter).with(stderr_layer).with(file_layer))?;
+    let file_layer = flotilla_tracing::json_layer(file_appender);
+    init_daemon_tracing(tracing_subscriber::registry().with(filter).with(trace_layer).with(stderr_layer).with(file_layer))?;
     raise_file_descriptor_limit();
 
     let timeout = if timeout_secs == 0 { Duration::from_secs(u64::MAX) } else { Duration::from_secs(timeout_secs) };
@@ -107,10 +113,41 @@ pub async fn run(
     // timeout, and explicit shutdown return Ok and clear the lifecycle marker;
     // a server error deliberately leaves it behind as an abnormal exit.
     runtime.shutdown();
+    if let Err(error) = trace_provider.shutdown() {
+        tracing::warn!(%error, "trace exporter shutdown failed");
+    }
     if result.is_ok() {
         lifecycle.finish()?;
     }
     result
+}
+
+fn trace_provider(config: Option<&flotilla_config::DaemonTracingConfig>, host_name: &str) -> Result<SdkTracerProvider, String> {
+    use opentelemetry_otlp::WithExportConfig;
+    let mut builder = SdkTracerProvider::builder().with_id_generator(QueueIdGenerator::default());
+    if let Some(config) = config {
+        if !config.sampling.is_finite() || !(0.0..=1.0).contains(&config.sampling) {
+            return Err("tracing sampling must be between 0 and 1".into());
+        }
+        let endpoint = url::Url::parse(&config.endpoint).map_err(|error| format!("invalid tracing endpoint: {error}"))?;
+        if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+            return Err("tracing endpoint must be an HTTP(S) URL".into());
+        }
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(&config.endpoint)
+            .build()
+            .map_err(|error| format!("initialize trace exporter: {error}"))?;
+        builder = builder.with_batch_exporter(exporter).with_sampler(Sampler::TraceIdRatioBased(config.sampling)).with_resource(
+            Resource::builder()
+                .with_attributes([
+                    KeyValue::new("service.name", config.service_name.clone()),
+                    KeyValue::new("host.name", host_name.to_owned()),
+                ])
+                .build(),
+        );
+    }
+    Ok(builder.build())
 }
 
 fn stable_socket_discovery_path() -> PathBuf {
@@ -126,6 +163,25 @@ fn init_daemon_tracing(subscriber: impl Subscriber + Send + Sync) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    // Invalid export settings fail startup instead of silently exporting with
+    // different sampling or an unusable endpoint. Off needs no endpoint.
+    #[test]
+    fn tracing_export_configuration_is_validated() {
+        assert!(super::trace_provider(None, "test-host").is_ok());
+        for sampling in [-1.0, 1.01, f64::NAN, f64::INFINITY] {
+            let config = flotilla_config::DaemonTracingConfig {
+                endpoint: "http://localhost:4318/v1/traces".into(),
+                service_name: "test".into(),
+                sampling,
+            };
+            assert!(super::trace_provider(Some(&config), "test-host").is_err());
+        }
+        for endpoint in ["", "garbage", "file:///tmp/traces"] {
+            let config = flotilla_config::DaemonTracingConfig { endpoint: endpoint.into(), service_name: "test".into(), sampling: 1.0 };
+            assert!(super::trace_provider(Some(&config), "test-host").is_err());
+        }
+    }
+
     use std::{fs, os::fd::AsRawFd};
 
     use flotilla_config::log_file::{rotating_log_writer, DAEMON_LOG_FILE};

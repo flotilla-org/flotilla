@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tracing::Instrument;
 
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_executor::step::RemoteStepBatchRequest;
@@ -423,6 +424,8 @@ impl PeerRuntime {
                         }
                         maybe_env = rx.recv() => {
                             let Some(env) = maybe_env else { break };
+                            let span = env.msg.trace_context().map(flotilla_tracing::receive).unwrap_or_else(tracing::Span::none);
+                            async {
                             let (post_handle_action, pending_sends) = {
                                 let mut pm = peer_manager_task.lock().await;
                                 let post_handle_action = match pm.handle_inbound(env).await {
@@ -590,6 +593,7 @@ impl PeerRuntime {
                                 PostHandleAction::Ignored => {}
                             }
                             sync_peer_query_state(&peer_manager_task, &peer_daemon).await;
+                            }.instrument(span).await;
                         }
                     }
                 }

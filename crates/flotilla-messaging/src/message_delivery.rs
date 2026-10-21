@@ -1,3 +1,4 @@
+use tracing::Instrument;
 // Receiver-side batching and durable transport accounting.
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
@@ -448,6 +449,34 @@ impl MessageInbox {
         all: &[ResourceObject<Message>],
         now: DateTime<Utc>,
     ) -> Result<(), ResourceError> {
+        let Some(first) = pending.first() else {
+            return Ok(());
+        };
+        // A shared transport submission still belongs to every member's trace.
+        let _batch_spans: Vec<_> = pending
+            .iter()
+            .skip(1)
+            .map(|message| {
+                let span = flotilla_tracing::queued_span(&message.metadata.name, "attempt");
+                span.in_scope(|| tracing::info!("message delivery attempt"));
+                span
+            })
+            .collect();
+        self.deliver_group_traced(receivers, router, holder, pending, all, now)
+            .instrument(flotilla_tracing::queued_span(&first.metadata.name, "attempt"))
+            .await
+    }
+
+    async fn deliver_group_traced(
+        &self,
+        receivers: &MessageReceiverSnapshot,
+        router: &TransportRouter,
+        holder: &ResourceObject<TerminalSession>,
+        pending: &[ResourceObject<Message>],
+        all: &[ResourceObject<Message>],
+        now: DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        tracing::info!("message delivery attempt");
         let pending = &self.supersede_held_system_turns(receivers, pending, all, now).await?;
         if pending.is_empty() {
             return Ok(());
@@ -792,13 +821,18 @@ impl MessageInbox {
         receiver: &ResolvedMessageReceiver,
     ) -> Result<(), ResourceError> {
         for member in members {
-            apply_status_patch(
-                &self.messages,
-                &member.metadata.name,
-                &MessageStatusPatch::Delivered { receiver: receiver.clone(), at: receiver.delivered_at },
-            )
+            async {
+                tracing::info!("message received");
+                apply_status_patch(
+                    &self.messages,
+                    &member.metadata.name,
+                    &MessageStatusPatch::Delivered { receiver: receiver.clone(), at: receiver.delivered_at },
+                )
+                .await?;
+                self.clear_signal(receivers, member).await
+            }
+            .instrument(flotilla_tracing::queued_span(&member.metadata.name, "receipt"))
             .await?;
-            self.clear_signal(receivers, member).await?;
         }
         Ok(())
     }
@@ -884,10 +918,16 @@ impl MessageInbox {
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<(), ResourceError> {
-        let current = self.messages.get(&message.metadata.name).await?;
-        let mut status = status_for(&current);
-        MessageStatusPatch::Wait { phase, reason: reason.into(), at: now }.apply(&mut status);
-        self.write(&current, &status).await
+        let trace_span = flotilla_tracing::queued_span(&message.metadata.name, "waiting");
+        async {
+            tracing::info!(%reason, "message waiting");
+            let current = self.messages.get(&message.metadata.name).await?;
+            let mut status = status_for(&current);
+            MessageStatusPatch::Wait { phase, reason: reason.into(), at: now }.apply(&mut status);
+            self.write(&current, &status).await
+        }
+        .instrument(trace_span)
+        .await
     }
 
     async fn write(&self, message: &ResourceObject<Message>, status: &MessageStatus) -> Result<(), ResourceError> {

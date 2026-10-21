@@ -797,6 +797,9 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             Some(name) => name,
             None => state.home.log_mut().next_name(&spec.inbox, &spec.sender)?,
         };
+        let span = flotilla_tracing::queued_span(&name, "admission");
+        let _entered = span.enter();
+        tracing::info!("message admission");
         let empty = state.bindings.get(&inbox).is_none_or(|value| value.open == 0);
         world.run(self.observations.as_ref(), |world| state.home.create(&name, spec, world, now).map(|_| ()))??;
         Self::open_inbox(state, &inbox, now);
@@ -818,6 +821,9 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
     }
 
     fn receive_locked(&self, state: &mut State<L>, consumer: &Receiver, message: &str, transport: Transport) -> Result<(), Error> {
+        let span = flotilla_tracing::queued_span(message, "receipt");
+        let _entered = span.enter();
+        tracing::info!("message receipt attempt");
         Self::load(state, message)?;
         let resource = state.home.get(message).ok_or_else(|| Error::Message(WriteError::Unknown(message.into())))?;
         match resource.state() {
@@ -1008,6 +1014,9 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
                 let result = backend
                     .access(move |backend, state| {
                         while let Some(name) = Self::next_pending(state, &query_inbox, &mut query)? {
+                            let span = flotilla_tracing::queued_span(&name, "waiting");
+                            let _entered = span.enter();
+                            tracing::info!("message pending");
                             let resource = state.home.get(&name).expect("pending candidate");
                             let allowed = backend.world(state, Some(&name))?.run(backend.observations.as_ref(), |world| {
                                 resource.judge(world, backend.observations.now(), |h| pending_for(h, &query_consumer)).value
@@ -1040,7 +1049,13 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
     }
     async fn deliver(&self, message: &str, edge: Deliver) -> Result<(), Error> {
         let message = message.to_owned();
-        self.access(move |backend, state| backend.apply_locked(state, &message, edge)).await
+        self.access(move |backend, state| {
+            let span = flotilla_tracing::queued_span(&message, "attempt");
+            let _entered = span.enter();
+            tracing::info!("message delivery attempt");
+            backend.apply_locked(state, &message, edge)
+        })
+        .await
     }
     async fn settle(&self, message: &str, edge: Settle) -> Result<(), Error> {
         let message = message.to_owned();
