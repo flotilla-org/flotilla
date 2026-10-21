@@ -12,12 +12,12 @@ use flotilla_schema_sqlite::{AboutCursor, Read, Stamp, Store, StoreError};
 use flotilla_state_machines::{
     machines::{
         agent_session::AgentSession,
-        awaiting_reply::{AwaitingReplyEdgeKind, AwaitingReplySpec},
+        awaiting_reply::AwaitingReply,
         consumer::Consumer,
         convoy,
         message::{Message, ReceiptLog},
     },
-    Declared, EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, Version,
+    EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, StoredWrite, Version,
 };
 
 /// The kinds the `[primitives]` switch moves: Message, and the minimal
@@ -46,17 +46,14 @@ pub fn registry() -> Result<KindRegistry, RegistryError> {
     Ok(machine_registry()?.kinds)
 }
 
-/// The kinds the Convoy stack moves (#3587), declared ahead of their machines
-/// for the owner's schema look-over: Convoy, with its seats, promises,
-/// submissions and duties as its tables, and AwaitingReply. Convoy's code is
-/// the production registry's, and AwaitingReply's `ar` is held by no
-/// production kind. Nothing opens a store with these yet; layer 4's
-/// machines replace the declarations, keeping their tables, and join
-/// [`machine_registry`].
+/// The kinds the Convoy stack moves (#3587): Convoy, with its seats,
+/// promises, submissions and duties as its records, and AwaitingReply. Both
+/// codes are the production registry's. Nothing opens a store with these
+/// yet; the write path (layer 6) moves them into [`machine_registry`].
 pub fn convoy_registry() -> Result<KindRegistry, RegistryError> {
     let mut kinds = KindRegistry::new();
-    kinds.register::<Declared<convoy::work::ConvoySpec, convoy::work::ConvoyEdgeKind>>()?;
-    kinds.register::<Declared<AwaitingReplySpec, AwaitingReplyEdgeKind>>()?;
+    kinds.register::<Resource<convoy::Convoy>>()?;
+    kinds.register::<Resource<AwaitingReply>>()?;
     Ok(kinds)
 }
 
@@ -159,6 +156,7 @@ where
     M: Machine,
     M::Spec: KindSpec<State = M::State>,
     M::State: StateData + Labelled<Label = Label<M>>,
+    M::Write: StoredWrite<Resource<M>>,
     EdgePayload<M::Edge>: Cbor,
 {
     fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<M>, reads: &[InputRead]) -> Result<Version, LogError> {
@@ -170,9 +168,20 @@ where
         Ok(Version(stamp.version))
     }
     fn edge(&mut self, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
+        self.edge_with_writes(previous, next, event, &[])
+    }
+
+    fn edge_with_writes(
+        &mut self,
+        previous: &StoredState<M>,
+        next: &Resource<M>,
+        event: &EdgeEventOf<M>,
+        writes: &[M::Write],
+    ) -> Result<Version, LogError> {
         // An edge's master is a Message homed beside its consumer (ADR 0064).
         let master = |name: &str| Identity { kind: Resource::<Message>::CODE, name: name.to_owned(), home: self.home.clone() };
         let edge = next.stored_edge_about(previous, event, master).map_err(refused)?;
+        let edge = writes.iter().try_fold(edge, |edge, write| write.store(edge)).map_err(refused)?;
         let mut store = self.store.lock().expect("store writer");
         let mut write = store.write().map_err(refused)?;
         let id =

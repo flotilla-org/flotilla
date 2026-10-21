@@ -16,7 +16,7 @@ use flotilla_schema::{EdgeEvent, State, Timestamp};
 
 use crate::{
     Admission, DefError, Edge, EdgeEventOf, EdgeKind, EdgePayload, Fault, Handle, InputRead, Judged, Label, Log, LogError, Machine,
-    MachineDef, MemoryLog, StateValue, StepError, StoredState, Version,
+    MachineDef, MemoryLog, RecordWrite, StateValue, StepError, StoredState, Version,
 };
 
 /// One resource at its home: its name, spec, current state (with the time its label was entered)
@@ -300,8 +300,10 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
     /// and the gate's and effect's reads. The log takes the write (the
     /// previous state, the resource in its next state and the event) and gives
     /// its version, which the resource adopts (#3373 ruling R2): the home
-    /// mints none. Returns the event. When the log refuses, the resource is
-    /// left as it was, with [`WriteError::Log`].
+    /// mints none. The effect's records writes are applied once the log has
+    /// taken them, an appended row stamped with that version. Returns the
+    /// event. When the log refuses, the resource is left as it was, with
+    /// [`WriteError::Log`].
     pub fn apply(
         &mut self,
         name: &str,
@@ -313,7 +315,14 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
         let resource = self.resources.get(name).ok_or_else(|| WriteError::Unknown(name.to_string()))?;
         let mut handle = Handle::on(resource, world, now);
         let next = self.definition.step(&mut handle, &edge)?;
+        let writes = handle.take_writes();
         let reads = handle.judged(()).reads;
+        // The writes must fit before the log takes them: a full record table
+        // refuses the whole write.
+        if !writes.is_empty() {
+            let mut trial = resource.spec.clone();
+            writes.iter().try_for_each(|write| write.apply(&mut trial, 0)).map_err(|full| WriteError::Log(LogError::new(full)))?;
+        }
         // The step borrowed the resource immutably; this second lookup of the
         // same name under `&mut self` cannot miss.
         let resource = self.resources.get_mut(name).ok_or_else(|| WriteError::Unknown(name.to_string()))?;
@@ -322,9 +331,13 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
         let since = if from == to { resource.state.since } else { now };
         let previous = std::mem::replace(&mut resource.state, State::new(next, since));
         let event = EdgeEvent { edge: edge.kind(), from, to, writer: self.writer.clone(), at: now, payload: EdgePayload { edge, reads } };
-        match self.log.edge(&previous, resource, &event) {
+        match self.log.edge_with_writes(&previous, resource, &event, &writes) {
             Ok(version) => {
                 resource.version = version;
+                for write in &writes {
+                    // The trial above applied the same writes, so none is refused here.
+                    let _ = write.apply(&mut resource.spec, version.0);
+                }
                 Ok(event)
             }
             Err(error) => {

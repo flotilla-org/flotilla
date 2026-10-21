@@ -1,8 +1,8 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -136,7 +136,7 @@
-           else if (not(holdingDuties(w).contains(a.duty))) Refused(UnknownDuty)
-           else Moved(Open({ ...w, retired: w.retired.union(Set(a.duty)) }))
+@@ -177,7 +177,7 @@
+           else if (not(w.seats.keys().contains(a.seat))) Refused(UnknownSeat)
+           else Moved(Open({ ...w, seats: w.seats.put(a.seat, { ...w.seats.get(a.seat), supervisedBy: a.supervisedBy }) }))
        | Deliver => val outstanding = w.promises.keys().filter(p => open(w.promises.get(p)))
 -          if (outstanding.size() > 0) Refused(PromisesOutstanding(outstanding))
 +          if (outstanding.filter(p => w.promises.get(p).state == Pending).size() > 0) Refused(PromisesOutstanding(outstanding))

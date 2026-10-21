@@ -73,7 +73,7 @@ fn units(v: &Value) -> Units {
 fn request_of(v: &Value) -> Request {
     Request {
         convoy: ConvoyId::new(count(&v["convoy"]).to_string(), "home"),
-        class: VesselClass(count(&v["class"])),
+        class: VesselClass::new(count(&v["class"]).to_string()),
         shape: units(&v["shape"]),
         priority: Priority(count(&v["priority"])),
     }
@@ -85,7 +85,7 @@ fn units_value(units: &Units) -> Value {
 
 fn request_value(r: &Request) -> Value {
     let convoy: i64 = r.convoy.name.parse().expect("conformance convoy name");
-    json!({ "convoy": int(convoy), "class": int(r.class.0.into()), "shape": units_value(&r.shape), "priority": int(r.priority.0.into()) })
+    json!({ "convoy": int(convoy), "class": int(r.class.0.parse().expect("model class")), "shape": units_value(&r.shape), "priority": int(r.priority.0.into()) })
 }
 
 fn placement_value(lease: &Lease) -> Value {
@@ -111,7 +111,7 @@ fn ledger_for(id: &VesselId, request: &Request, evidence: &Evidence) -> Option<L
     }
     let mut ledger = Ledger::new();
     ledger.add_host(evidence.host, evidence.available.clone()).expect("a new host");
-    ledger.set_caps(request.convoy.clone(), [(request.class, evidence.cap)].into());
+    ledger.set_caps(request.convoy.clone(), [(request.class.clone(), evidence.cap)].into());
     if evidence.live == 1 {
         // Leased before anything else waits, so nothing outranks it.
         // Room to spare, so the live vessel's own fit is never in question.

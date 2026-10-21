@@ -6,6 +6,13 @@ module convoy {
   // A seat: one occupied instance of a role in a convoy (#3574 decision 3). The
   // machine compares seats only for equality; seat relations are the caller's.
   type Seat = str
+  // A seat's place in its convoy (#3587 seat-relations ruling; proposal for
+  // the layer 4 ruling): the seat it was created under (Root for a seat
+  // admission creates) and who supervises it, an address that may name a
+  // seat, the convoy's supervisor role or an operator. Seats are records of
+  // the convoy and are never removed, so a seat name is never reused.
+  type Parent = Root | Under(Seat)
+  type SeatRecord = { parent: Parent, supervisedBy: str }
   type Promise = { kind: str, target: str }
   // Where a promise came from, recorded when it is created. Retraction and
   // verdict authority follow it (#3587 spec ruling 5).
@@ -32,11 +39,13 @@ module convoy {
   // projectKnown is admission's recorded read of the project address, like
   // `authorised` on Readmit: the project need not be a resource here.
   type ConvoyRequest = { project: str, projectKnown: bool, promises: PromiseId -> AdmittedPromise,
-    duties: DutyId -> Duty, quota: VesselClass -> int, priority: int }
+    duties: DutyId -> Duty, seats: Seat -> SeatRecord, quota: VesselClass -> int, priority: int }
   // What admission fixes for the convoy's life. Promises are work state,
-  // since Declare adds them; the quota in force is work state too.
+  // since Declare adds them; seats (AddSeat, Resupervise) and the quota in
+  // force are work state too.
   type ConvoySpec = { project: str, duties: DutyId -> Duty, priority: int }
-  type Work = { spec: ConvoySpec, promises: PromiseId -> PromiseRecord, retired: Set[DutyId], quota: VesselClass -> int }
+  type Work = { spec: ConvoySpec, promises: PromiseId -> PromiseRecord, seats: Seat -> SeatRecord, retired: Set[DutyId],
+    quota: VesselClass -> int }
   type State = Open(Work) | Delivered(Work) | Abandoned({ work: Work, reason: str })
   // Observed: the kind's keeping observation, naming the submission it saw.
   // Verdict: an attributed decision with a reason, from Pending or Submitted.
@@ -49,19 +58,41 @@ module convoy {
     | Retract({ promise: PromiseId, by: Seat, authority: Authority, reason: str })
     | Reassign({ promise: PromiseId, to: Seat, by: Seat, authority: Authority })
     | RetireDuty({ duty: DutyId, authorised: bool })
+    // Seat edges (proposal): fan-out creates a seat under an existing one,
+    // and a supervision change re-points `supervisedBy`. The caller records
+    // `authorised` from seat relations, as for Abandon.
+    | AddSeat({ seat: Seat, parent: Seat, supervisedBy: str, authorised: bool })
+    | Resupervise({ seat: Seat, supervisedBy: str, authorised: bool })
     | Deliver | Abandon({ authorised: bool, reason: str })
     | Readmit({ quota: VesselClass -> int, authorised: bool })
   type Refusal = NoObligations | UnknownProject | InvalidQuota | NotOpen | UnknownPromise | PromiseSettled
     | PromisesOutstanding(Set[PromiseId]) | Unauthorised | QuotaNotIncrease | PromiseExists | NotOwner | NotDurable
-    | NotSubmitted | StaleEvidence | UnknownDuty | DutyHolds(Set[DutyId])
+    | NotSubmitted | StaleEvidence | UnknownDuty | DutyHolds(Set[DutyId]) | UnknownSeat | SeatExists | SeatCycle
   type Next = Moved(State) | Refused(Refusal)
   pure def validQuota(q: VesselClass -> int): bool = q.keys().forall(c => q.get(c) >= 0)
   pure def lifetime(d: Duty): bool = match d.scope { | Lifetime => true | WhileOpen(_) => false }
+  // The seats a seat was created under, transitively: its parent, its
+  // parent's parent and so on, as far as the seats go.
+  pure def above(seats: Seat -> SeatRecord, seat: Seat): Set[Seat] = {
+    pure def parents(s: Set[Seat]): Set[Seat] = s.map(q => match seats.get(q).parent { | Root => Set() | Under(p) => Set(p) })
+      .flatten().filter(p => seats.keys().contains(p))
+    seats.keys().fold(parents(Set(seat)), (found, _) => found.union(parents(found)))
+  }
+  // No seat is above itself: admission's seats form a tree. AddSeat keeps it
+  // one, since a new seat's parent already exists.
+  pure def acyclic(seats: Seat -> SeatRecord): bool = seats.keys().forall(s => not(above(seats, s).contains(s)))
+  // Every owner admission names, and every parent, is one of the admitted seats.
+  pure def seatsClosed(r: ConvoyRequest): bool =
+    r.promises.keys().forall(p => r.seats.keys().contains(r.promises.get(p).owner))
+    and r.duties.keys().forall(d => r.seats.keys().contains(r.duties.get(d).owner))
+    and r.seats.keys().forall(s => match r.seats.get(s).parent { | Root => true | Under(q) => r.seats.keys().contains(q) })
   pure def admit(r: ConvoyRequest): Next =
     if (r.promises.keys().size() == 0 and not(r.duties.keys().exists(d => lifetime(r.duties.get(d))))) Refused(NoObligations)
     else if (not(r.projectKnown)) Refused(UnknownProject)
     else if (not(validQuota(r.quota))) Refused(InvalidQuota)
-    else Moved(Open({ spec: { project: r.project, duties: r.duties, priority: r.priority },
+    else if (not(seatsClosed(r))) Refused(UnknownSeat)
+    else if (not(acyclic(r.seats))) Refused(SeatCycle)
+    else Moved(Open({ spec: { project: r.project, duties: r.duties, priority: r.priority }, seats: r.seats,
       promises: r.promises.keys().mapBy(p => { promise: r.promises.get(p).promise, source: r.promises.get(p).source,
         owner: r.promises.get(p).owner, state: Pending, submissions: [] }),
       retired: Set(), quota: r.quota }))
@@ -111,6 +142,7 @@ module convoy {
   pure def step(s: State, e: Event): Next = match s {
     | Open(w) => match e {
       | Declare(d) => if (w.promises.keys().contains(d.promise)) Refused(PromiseExists)
+          else if (not(w.seats.keys().contains(d.owner))) Refused(UnknownSeat)
           else withPromise(w, d.promise, { promise: d.definition, source: Crew, owner: d.owner, state: Pending, submissions: [] })
       | Submit(a) => onOpen(w, a.promise, p =>
           if (a.by != p.owner) Refused(NotOwner)
@@ -131,10 +163,19 @@ module convoy {
           else withPromise(w, a.promise, { ...p, state: Retracted }))
       | Reassign(a) => onOpen(w, a.promise, p =>
           if (not(mayReassign(p, a.by, a.authority))) Refused(Unauthorised)
+          else if (not(w.seats.keys().contains(a.to))) Refused(UnknownSeat)
           else withPromise(w, a.promise, { ...p, owner: a.to }))
       | RetireDuty(a) => if (not(a.authorised)) Refused(Unauthorised)
           else if (not(holdingDuties(w).contains(a.duty))) Refused(UnknownDuty)
           else Moved(Open({ ...w, retired: w.retired.union(Set(a.duty)) }))
+      | AddSeat(a) => if (not(a.authorised)) Refused(Unauthorised)
+          else if (w.seats.keys().contains(a.seat)) Refused(SeatExists)
+          else if (not(w.seats.keys().contains(a.parent))) Refused(UnknownSeat)
+          else Moved(Open({ ...w, seats: w.seats.put(a.seat, { parent: Under(a.parent), supervisedBy: a.supervisedBy }) }))
+      // Re-pointing to the current supervisor is an accepted no-op edge.
+      | Resupervise(a) => if (not(a.authorised)) Refused(Unauthorised)
+          else if (not(w.seats.keys().contains(a.seat))) Refused(UnknownSeat)
+          else Moved(Open({ ...w, seats: w.seats.put(a.seat, { ...w.seats.get(a.seat), supervisedBy: a.supervisedBy }) }))
       | Deliver => val outstanding = w.promises.keys().filter(p => open(w.promises.get(p)))
           if (outstanding.size() > 0) Refused(PromisesOutstanding(outstanding))
           else if (holdingDuties(w).size() > 0) Refused(DutyHolds(holdingDuties(w)))
@@ -160,7 +201,7 @@ module convoy {
       Keep(Observed({ promise: p, submission: r.submissions.length() })),
       Keep(Verdict({ promise: p, by: "operator", authority: Operator, reason: "decision" })),
       Retract({ promise: p, by: "operator", authority: Operator, reason: "decision" }),
-      Reassign({ promise: p, to: "other", by: "operator", authority: Operator })
+      Reassign({ promise: p, to: r.owner, by: "operator", authority: Operator })
     ).forall(e => not(moved(step(s, e))))
   })
   // Resource-kind store. Refused rules disable actions and append nothing.
@@ -192,6 +233,10 @@ module convoy {
   action reassign(id: int, p: int, seat: Seat, by: Seat, authority: Authority): bool =
     fire(id, Reassign({ promise: p, to: seat, by: by, authority: authority }))
   action retireDuty(id: int, d: int, auth: bool): bool = fire(id, RetireDuty({ duty: d, authorised: auth }))
+  action addSeat(id: int, seat: Seat, parent: Seat, supervisedBy: str, auth: bool): bool =
+    fire(id, AddSeat({ seat: seat, parent: parent, supervisedBy: supervisedBy, authorised: auth }))
+  action resupervise(id: int, seat: Seat, supervisedBy: str, auth: bool): bool =
+    fire(id, Resupervise({ seat: seat, supervisedBy: supervisedBy, authorised: auth }))
   action deliver(id: int): bool = fire(id, Deliver)
   action abandon(id: int, auth: bool, reason: str): bool = fire(id, Abandon({ authorised: auth, reason: reason }))
   action readmit(id: int, quota: VesselClass -> int, auth: bool): bool = fire(id, Readmit({ quota: quota, authorised: auth }))

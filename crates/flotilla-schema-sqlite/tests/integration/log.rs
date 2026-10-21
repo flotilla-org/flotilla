@@ -15,7 +15,8 @@ use flotilla_state_machines::machines::message::MessageSpec;
 use crate::fixtures::{
     addr, message as messages, origin, registry, store,
     synthetic::{workflow, InputValue},
-    AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, Ticket, Vessel, LOCAL,
+    AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, Ticket, Vessel,
+    LOCAL,
 };
 
 const REPLICA: &str = "replica";
@@ -101,6 +102,7 @@ fn slots() -> Vec<(KindCode, String)> {
     [
         Resource::<Message>::CODE,
         Resource::<AgentSession>::CODE,
+        Resource::<AwaitingReply>::CODE,
         Resource::<Convoy>::CODE,
         Resource::<Ensure>::CODE,
         TerminalSession::CODE,
@@ -168,6 +170,7 @@ fn the_log_replays_into_another_store(tc: TestCase) {
         match *code {
             Resource::<Message>::CODE => step::<Resource<Message>>(&tc, &mut write, live, name, last),
             Resource::<AgentSession>::CODE => step::<Resource<AgentSession>>(&tc, &mut write, live, name, last),
+            Resource::<AwaitingReply>::CODE => step::<Resource<AwaitingReply>>(&tc, &mut write, live, name, last),
             Resource::<Convoy>::CODE => step::<Resource<Convoy>>(&tc, &mut write, live, name, last),
             Resource::<Ensure>::CODE => step::<Resource<Ensure>>(&tc, &mut write, live, name, last),
             Ticket::CODE => step::<Ticket>(&tc, &mut write, live, name, last),
@@ -447,6 +450,7 @@ fn snapshot_plus_tail<K: Fixture>(tc: &TestCase) {
 fn a_snapshot_plus_its_tail_is_the_newest_snapshot(tc: TestCase) {
     snapshot_plus_tail::<Resource<Message>>(&tc);
     snapshot_plus_tail::<Resource<AgentSession>>(&tc);
+    snapshot_plus_tail::<Resource<AwaitingReply>>(&tc);
     snapshot_plus_tail::<Resource<Convoy>>(&tc);
     snapshot_plus_tail::<Resource<Ensure>>(&tc);
     snapshot_plus_tail::<TerminalSession>(&tc);

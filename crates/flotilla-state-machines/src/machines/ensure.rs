@@ -26,8 +26,8 @@ use flotilla_schema::{Address, Stored};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    attempt, edges, states, Admission, AttemptPolicy, EdgeDef, Ended, Failure, Handle, Kind, Machine, MachineDef, Outcome, Ref, Source,
-    Table, Version, WrongState,
+    attempt, edges, states, Admission, AttemptPolicy, EdgeDef, Ended, Failure, Handle, Kind, Machine, MachineDef, NoRecords, Outcome, Ref,
+    Source, Table, Version, WrongState,
 };
 
 /// Fulfiller references, in name order. Fulfiller names are addresses: plain
@@ -366,6 +366,7 @@ impl Machine for Ensure {
     type Spec = EnsureSpec;
     type State = EnsureState;
     type Edge = EnsureEdge;
+    type Write = NoRecords;
     type Refusal = EnsureRefusal;
     type World = dyn EnsureWorld;
 

@@ -184,6 +184,7 @@ fn a_home_refuses_an_invalid_declaration() {
         type Spec = ();
         type State = Latch;
         type Edge = LatchEdge;
+        type Write = flotilla_state_machines::NoRecords;
         type Refusal = LatchRefusal;
         type World = Table<Signal>;
         fn definition() -> MachineDef<Self> {
@@ -209,6 +210,7 @@ fn admission_outside_the_initial_label_is_a_fault() {
         type Spec = ();
         type State = Latch;
         type Edge = LatchEdge;
+        type Write = flotilla_state_machines::NoRecords;
         type Refusal = LatchRefusal;
         type World = Table<Signal>;
         fn definition() -> MachineDef<Self> {

@@ -1,83 +1,108 @@
-//! Convoy (spec `machines/convoy.qnt`; ADR 0064 "A convoy ends when its work is delivered").
+//! Convoy (spec `machines/convoy.qnt`; ADR 0064 "A convoy ends when its work is delivered", "Records").
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{Address, Code, CodeEnum, Timestamp};
+use flotilla_schema::{Address, Code, CodeEnum, Frozen, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
-        Abandon, Authority, Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoyState, Deliver, Keep,
-        MemoryConvoyWorld, Priority, Promise, PromiseId,
-        PromiseState::{self, Kept, Pending, Retracted},
-        Quota, Readmit, Retract, VesselClass,
+        Abandon, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoyState,
+        Declare, Deliver, Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority, Progress, PromiseId, PromiseKinds, PromiseSource,
+        Quota, Readmit, Reassign, Reject, Resupervise, RetireDuty, Retract, Seat, SeatName, Submit, Terms, VesselClass,
     },
-    Coded, Diagram, EdgePayload, Home, InputRead, Kind, Machine, Ref, StateValue, Version, WriteError,
+    Coded, Diagram, Home, InputRead, Machine, Ref, StateValue, Version, WriteError,
 };
 
 const YES: &str = "yes";
 const NO: &str = "no";
 
-fn quota(counts: &[(u32, u32)]) -> Quota {
-    counts.iter().map(|(class, count)| (VesselClass(*class), *count)).collect()
-}
-
-fn promises(states: &[(u32, PromiseState)]) -> BTreeMap<PromiseId, PromiseState> {
-    states.iter().map(|(id, state)| (PromiseId(*id), *state)).collect()
+fn quota(counts: &[(&str, u32)]) -> Quota {
+    counts.iter().map(|(class, count)| (VesselClass::new(*class), *count)).collect()
 }
 
 fn project() -> Address {
-    Address::project("flotilla").expect("project address")
+    Address::project("p").expect("project")
 }
 
-fn target() -> Address {
-    "forge:github/repo:flotilla-org%2Fflotilla/cr:1".parse().expect("canonical address")
+fn address(text: &str) -> Address {
+    Address::project(text).expect("address")
 }
 
-fn request(promises: &[u32], counts: &[(u32, u32)]) -> ConvoyRequest {
+fn seat(role: &str) -> SeatName {
+    SeatName::new(role, "")
+}
+
+fn seat_row(role: &str, parent: Option<&str>) -> Seat {
+    Seat { role: role.into(), seat: String::new(), parent: parent.map(seat), supervised_by: address("supervisor") }
+}
+
+fn admitted(source: PromiseSource, owner: &str) -> AdmittedPromise {
+    AdmittedPromise { kind: "pr".into(), target: address("target"), source, owner: seat(owner) }
+}
+
+fn lifetime(owner: &str) -> Duty {
+    Duty { owner: seat(owner), scope: DutyScope::Lifetime, terms: Terms::default() }
+}
+
+/// A convoy whose seat `coder` owns the given promises, under `lead`.
+fn request(promises: &[(u32, PromiseSource)]) -> ConvoyRequest {
     ConvoyRequest {
         project: project(),
-        promises: promises.iter().map(|id| (PromiseId(*id), Promise { kind: "opaque".into(), target: target() })).collect(),
-        quota: quota(counts),
+        promises: promises.iter().map(|(id, source)| (PromiseId(*id), admitted(*source, "coder"))).collect(),
+        duties: BTreeMap::new(),
+        seats: vec![seat_row("lead", None), seat_row("coder", Some("lead"))],
+        quota: quota(&[("standard", 1)]),
         priority: Priority(1),
+        kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
     }
 }
 
-// The project exists; an authority `yes` that is authorised and one `no` that is not; anything
-// else is absent.
+// The project exists; authority and durability `yes` hold and `no` do not;
+// anything else is absent.
 fn world() -> MemoryConvoyWorld {
     let mut world = MemoryConvoyWorld::default().with_project(&project());
-    world.authority.put(&Ref::new(YES), true);
-    world.authority.put(&Ref::new(NO), false);
+    for (name, holds) in [(YES, true), (NO, false)] {
+        world.authority.put(&Ref::new(name), holds);
+        world.durable.put(&Ref::new(name), holds);
+    }
     world
 }
 
 fn convoy(request: ConvoyRequest) -> Home<Convoy> {
-    let mut home = Home::<Convoy>::new("home").expect("valid declaration");
-    home.create("c", request, &world(), at()).expect("admitted");
+    let mut home = Home::new("home").expect("valid declaration");
+    let world: &<Convoy as Machine>::World = &world();
+    home.create("c", request, world, Timestamp(0)).expect("admitted");
     home
 }
 
-fn state(home: &Home<Convoy>) -> &ConvoyState {
-    home.get("c").expect("exists").state()
-}
-
 fn at() -> Timestamp {
-    Timestamp::from_micros(1)
+    Timestamp(5)
 }
 
-fn retract(promise: u32, authority: &str) -> Retract {
-    Retract { promise: PromiseId(promise), by: "lead".into(), authority: Ref::new(authority) }
+fn apply(
+    home: &mut Home<Convoy>,
+    edge: impl Into<flotilla_state_machines::machines::convoy::ConvoyEdge>,
+) -> Result<(), WriteError<Convoy>> {
+    home.apply("c", edge, &world(), at()).map(drop)
 }
 
-fn abandon(reason: &str, authority: &str) -> Abandon {
-    Abandon { by: "lead".into(), reason: reason.into(), authority: Ref::new(authority) }
+fn refused(refusal: ConvoyRefusal) -> Result<(), WriteError<Convoy>> {
+    Err(WriteError::Refused(refusal))
 }
 
-fn readmit(counts: &[(u32, u32)], authority: &str) -> Readmit {
-    Readmit { quota: quota(counts), by: "lead".into(), authority: Ref::new(authority) }
+fn progress(home: &Home<Convoy>, id: u32) -> Progress {
+    home.get("c").expect("exists").spec().promise(PromiseId(id)).expect("promise").1.progress.value
 }
 
-fn refused(refusal: ConvoyRefusal) -> Option<WriteError<Convoy>> {
-    Some(WriteError::Refused(refusal))
+fn submit(id: u32, by: &str, durable: &str) -> Submit {
+    Submit { promise: PromiseId(id), by: seat(by), address: address("change"), revision: "abc".into(), durable: Ref::new(durable) }
+}
+
+fn retract(id: u32, by: &str, authority: Authority) -> Retract {
+    Retract { promise: PromiseId(id), by: seat(by), authority, reason: "decision".into() }
+}
+
+fn verdict(id: u32, authority: Authority) -> Keep {
+    Keep::Verdict { promise: PromiseId(id), by: seat("decider"), authority, reason: "decision".into() }
 }
 
 // The declaration obeys the engine's rules.
@@ -87,225 +112,285 @@ fn the_declaration_is_valid() {
 }
 
 // State and edge codes are stable: renames never change them. Every label
-// carries the work; Abandoned also carries its reason.
+// carries the quota in force and the retired duties; Abandoned also carries
+// its reason. Codes kept from the earlier machine stay (`ke`, `rt`, `de`,
+// `ab`, `ra`).
 #[test]
 fn codes_are_pinned() {
     let labels: Vec<_> = ConvoyLabel::ALL.iter().map(|s| (s.name(), s.code(), ConvoyState::fields(*s))).collect();
     let expected: [(&str, Code, &[&str]); 3] = [
-        ("Open", Code::new("op"), &["resolution", "quota"]),
-        ("Delivered", Code::new("de"), &["resolution", "quota"]),
-        ("Abandoned", Code::new("ab"), &["resolution", "quota", "reason"]),
+        ("Open", Code::new("op"), &["quota", "retired"]),
+        ("Delivered", Code::new("de"), &["quota", "retired"]),
+        ("Abandoned", Code::new("ab"), &["quota", "retired", "reason"]),
     ];
     assert_eq!(labels, expected);
-    let edges: Vec<_> = ConvoyEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
-    assert_eq!(
-        edges,
-        [
-            ("keep", Code::new("ke")),
-            ("retract", Code::new("rt")),
-            ("deliver", Code::new("de")),
-            ("abandon", Code::new("ab")),
-            ("readmit", Code::new("ra"))
-        ]
-    );
+    let edges: Vec<_> = ConvoyEdgeKind::ALL.iter().map(|k| (k.name(), k.code().as_str().to_owned())).collect();
+    let expected = [
+        ("declare", "dc"),
+        ("submit", "su"),
+        ("reject", "rj"),
+        ("keep", "ke"),
+        ("retract", "rt"),
+        ("reassign", "rs"),
+        ("retire_duty", "rd"),
+        ("add_seat", "as"),
+        ("resupervise", "sv"),
+        ("deliver", "de"),
+        ("abandon", "ab"),
+        ("readmit", "ra"),
+    ];
+    assert_eq!(edges, expected.map(|(name, code)| (name, code.to_owned())));
 }
 
 // The diagram is drawn from the declaration: every edge with the data it
-// changes, and both ends. The label drawing leaves out the edges that keep
-// Open and change only data.
+// changes and the records it writes, and both ends.
 #[test]
 fn the_diagram_is_pinned() {
-    let head = "---
-title: Convoy
----
-stateDiagram-v2
-  direction LR
-  [*] --> Open
-";
-    let tail = "  Delivered --> [*]
-  note right of Delivered: the convoy delivered its promises
-  Abandoned --> [*]
-  note right of Abandoned: the convoy was abandoned
-";
-    let full = "  Open --> Open: keep [resolution]
-  Open --> Open: retract [resolution]
-  Open --> Delivered: deliver
-  Open --> Abandoned: abandon [reason]
-  Open --> Open: readmit [quota]
-";
-    let labels = "  Open --> Delivered: deliver
-  Open --> Abandoned: abandon [reason]
-";
-    assert_eq!(Convoy::definition().mermaid(Diagram::Full), format!("{head}{full}{tail}"));
-    assert_eq!(Convoy::definition().mermaid(Diagram::Labels), format!("{head}{labels}{tail}"));
+    let full = Convoy::definition().mermaid(Diagram::Full);
+    for line in [
+        "  Open --> Open: declare writes promises\n",
+        "  Open --> Open: submit writes promises\n",
+        "  Open --> Open: retire_duty [retired]\n",
+        "  Open --> Open: add_seat writes seats\n",
+        "  Open --> Open: resupervise writes seats\n",
+        "  Open --> Delivered: deliver\n",
+        "  Open --> Abandoned: abandon [reason]\n",
+        "  Open --> Open: readmit [quota]\n",
+        "  note right of Delivered: the convoy delivered its work\n",
+    ] {
+        assert!(full.contains(line), "missing {line:?} in\n{full}");
+    }
+    let labels = Convoy::definition().mermaid(Diagram::Labels);
+    assert!(!labels.contains("Open --> Open"), "{labels}");
 }
 
-// Every convoy promises something: admission refuses an empty promise map,
-// and admits a nonempty one Open with every promise Pending under the
-// admitted quota. The quota is state, not spec.
+// A convoy needs an obligation: a promise, or a convoy-lifetime duty alone.
+// A duty while promises are open is not one.
 #[test]
-fn admission_requires_a_promise() {
-    let mut home: Home<Convoy> = Home::new("home").expect("valid");
-    assert_eq!(home.create("empty", request(&[], &[(0, 1)]), &world(), at()).err(), refused(ConvoyRefusal::NoPromises));
-    let admitted = home.create("c", request(&[0, 1], &[(0, 1)]), &world(), at()).expect("admitted").resource;
-    assert_eq!(admitted.state(), &ConvoyState::Open { resolution: promises(&[(0, Pending), (1, Pending)]), quota: quota(&[(0, 1)]) });
-    assert_eq!((admitted.spec().promises.len(), admitted.spec().priority), (2, Priority(1)));
+fn admission_requires_an_obligation() {
+    let mut home = Home::<Convoy>::new("home").expect("valid declaration");
+    let mut empty = request(&[]);
+    assert_eq!(home.create("a", empty.clone(), &world(), Timestamp(0)).err(), Some(WriteError::Refused(ConvoyRefusal::NoObligations)));
+    empty.duties = [(DutyId(0), Duty { scope: DutyScope::WhileOpen { promises: BTreeSet::new() }, ..lifetime("coder") })].into();
+    assert_eq!(home.create("b", empty.clone(), &world(), Timestamp(0)).err(), Some(WriteError::Refused(ConvoyRefusal::NoObligations)));
+    empty.duties = [(DutyId(0), lifetime("coder"))].into();
+    let created = home.create("c", empty, &world(), Timestamp(0)).expect("a lifetime duty is an obligation");
+    assert_eq!(created.resource.state(), &ConvoyState::Open { quota: quota(&[("standard", 1)]), retired: BTreeSet::new() });
 }
 
-// #3392 G1: the project is a definitions-class kind named by address, so its existence is a
-// recorded read at admission, not a foreign key. An unknown project is refused and creates
-// nothing; a known one is admitted, and the create carries the version admission saw.
+// #3392 G1: the project is read by address at admission, and the create
+// carries the version it saw; an unknown project creates nothing.
 #[test]
 fn admission_reads_the_project_by_address() {
-    let mut home: Home<Convoy> = Home::new("home").expect("valid");
-    let empty = MemoryConvoyWorld::default();
-    assert_eq!(home.create("c", request(&[0], &[]), &empty, at()).err(), refused(ConvoyRefusal::UnknownProject));
-    assert!(home.get("c").is_none(), "a refused admission creates nothing");
-    assert_eq!(home.log().last_sequence(), 0, "and writes nothing to the log");
-    let other = MemoryConvoyWorld::default().with_project(&Address::project("elsewhere").expect("project"));
-    assert_eq!(home.create("c", request(&[0], &[]), &other, at()).err(), refused(ConvoyRefusal::UnknownProject));
-    let mut world = MemoryConvoyWorld::default();
-    world.projects.put(&Ref::new("project:noise"), ());
-    let version = world.projects.put(&Ref::new(project().as_str()), ());
-    let created = home.create("c", request(&[0], &[]), &world, at()).expect("admitted");
-    assert_eq!(created.reads, [InputRead { kind: "project".into(), name: "project:flotilla".into(), version: Some(version) }]);
-    assert_eq!(created.resource.spec().project, project());
-    assert_eq!(version, Version(2));
+    let mut home = Home::<Convoy>::new("home").expect("valid declaration");
+    let unknown = MemoryConvoyWorld::default();
+    let refusal = home.create("c", request(&[(0, PromiseSource::Template)]), &unknown, Timestamp(0)).err();
+    assert_eq!(refusal, Some(WriteError::Refused(ConvoyRefusal::UnknownProject)));
+    assert!(home.get("c").is_none());
+    let mut known = MemoryConvoyWorld::default();
+    let version = known.projects.put(&Ref::new(project().as_str()), ());
+    let created = home.create("c", request(&[(0, PromiseSource::Template)]), &known, Timestamp(0)).expect("admitted");
+    assert_eq!(created.reads, [InputRead { kind: "project".into(), name: "project:p".into(), version: Some(version) }]);
 }
 
-// Keep settles a known pending promise and stays Open; an unknown promise is
-// refused, and a settled one (kept or retracted) refuses a further keep: Kept
-// is final.
+// Every owner and every parent is an admitted seat, and seat names are unique.
 #[test]
-fn keep_settles_a_pending_promise_once() {
-    let mut home = convoy(request(&[0, 1], &[]));
-    let w = world();
-    assert_eq!(home.apply("c", Keep { promise: PromiseId(9) }, &w, at()).err(), refused(ConvoyRefusal::UnknownPromise));
-    home.apply("c", Keep { promise: PromiseId(0) }, &w, at()).expect("kept");
-    assert_eq!(state(&home), &ConvoyState::Open { resolution: promises(&[(0, Kept), (1, Pending)]), quota: quota(&[]) });
-    assert_eq!(home.apply("c", Keep { promise: PromiseId(0) }, &w, at()).err(), refused(ConvoyRefusal::PromiseSettled));
-    home.apply("c", retract(1, YES), &w, at()).expect("retracted");
-    assert_eq!(home.apply("c", Keep { promise: PromiseId(1) }, &w, at()).err(), refused(ConvoyRefusal::PromiseSettled));
-    assert_eq!(state(&home), &ConvoyState::Open { resolution: promises(&[(0, Kept), (1, Retracted)]), quota: quota(&[]) });
+fn admission_refuses_an_owner_that_is_no_seat() {
+    let mut home = Home::<Convoy>::new("home").expect("valid declaration");
+    let mut orphan = request(&[(0, PromiseSource::Template)]);
+    orphan.promises.insert(PromiseId(1), admitted(PromiseSource::Template, "nobody"));
+    let mut unparented = request(&[(0, PromiseSource::Template)]);
+    unparented.seats.push(seat_row("reviewer", Some("nobody")));
+    let mut twice = request(&[(0, PromiseSource::Template)]);
+    twice.seats.push(seat_row("coder", None));
+    let mut unowned = request(&[]);
+    unowned.duties = [(DutyId(0), lifetime("nobody"))].into();
+    for (name, bad) in [("a", orphan), ("b", unparented), ("c", twice), ("d", unowned)] {
+        assert_eq!(home.create(name, bad, &world(), Timestamp(0)).err(), Some(WriteError::Refused(ConvoyRefusal::UnknownSeat)), "{name}");
+    }
 }
 
-// A data-only edge keeps its label: keep moves Open to Open, and its event
-// records the same label on both sides while the promises change.
+// Admission's seats form a tree: a seat that is its own parent, or two seats under each other,
+// are refused, where a chain of parents is admitted in any order.
 #[test]
-fn keep_changes_only_the_promises() {
-    let mut home = convoy(request(&[0], &[(0, 2)]));
-    let event = home.apply("c", Keep { promise: PromiseId(0) }, &world(), at()).expect("kept");
-    assert_eq!((event.from, event.to), (ConvoyLabel::Open, ConvoyLabel::Open));
-    assert_eq!(state(&home).quota(), &quota(&[(0, 2)]));
-    assert_eq!(state(&home).resolution(), &promises(&[(0, Kept)]));
+fn admission_refuses_a_seat_cycle() {
+    let mut home = Home::<Convoy>::new("home").expect("valid declaration");
+    let cycle = |seats: Vec<Seat>| ConvoyRequest { seats, ..request(&[(0, PromiseSource::Template)]) };
+    let own = cycle(vec![seat_row("coder", Some("coder"))]);
+    let pair = cycle(vec![seat_row("lead", Some("coder")), seat_row("coder", Some("lead"))]);
+    for (name, bad) in [("a", own), ("b", pair)] {
+        assert_eq!(home.create(name, bad, &world(), Timestamp(0)).err(), Some(WriteError::Refused(ConvoyRefusal::SeatCycle)), "{name}");
+    }
+    let chain = cycle(vec![seat_row("coder", Some("lead")), seat_row("reviewer", Some("coder")), seat_row("lead", None)]);
+    home.create("c", chain, &world(), Timestamp(0)).expect("a chain in any order");
 }
 
-// AcceptRetraction checks authority first: an unauthorised or absent
-// authority refuses Unauthorised even for an unknown or settled promise.
+// The crew declares a promise owned by a seat; an id ever used is refused,
+// retracted ones included, and so is an owner that is no seat.
 #[test]
-fn retraction_checks_authority_before_the_promise() {
-    let mut home = convoy(request(&[0], &[]));
-    let w = world();
-    assert_eq!(home.apply("c", retract(9, NO), &w, at()).err(), refused(ConvoyRefusal::Unauthorised));
-    assert_eq!(home.apply("c", retract(0, "absent"), &w, at()).err(), refused(ConvoyRefusal::Unauthorised));
-    assert_eq!(home.apply("c", retract(9, YES), &w, at()).err(), refused(ConvoyRefusal::UnknownPromise));
-    home.apply("c", Keep { promise: PromiseId(0) }, &w, at()).expect("kept");
-    assert_eq!(home.apply("c", retract(0, NO), &w, at()).err(), refused(ConvoyRefusal::Unauthorised));
-    assert_eq!(home.apply("c", retract(0, YES), &w, at()).err(), refused(ConvoyRefusal::PromiseSettled));
+fn declare_adds_a_crew_promise_once() {
+    let mut home = convoy(request(&[(0, PromiseSource::Template)]));
+    let declare = |id: u32, owner: &str| Declare { promise: PromiseId(id), kind: "pr".into(), target: address("t"), owner: seat(owner) };
+    assert_eq!(apply(&mut home, declare(1, "nobody")), refused(ConvoyRefusal::UnknownSeat));
+    apply(&mut home, declare(1, "coder")).expect("declared");
+    let promise = home.get("c").expect("exists").spec().promise(PromiseId(1)).expect("row").1.clone();
+    assert_eq!((promise.source, promise.progress.value, promise.progress.since), (PromiseSource::Crew, Progress::Pending, at()));
+    assert_eq!(apply(&mut home, declare(1, "coder")), refused(ConvoyRefusal::PromiseExists));
+    apply(&mut home, retract(1, "coder", Authority::Owner)).expect("the owner retracts before submitting");
+    assert_eq!(apply(&mut home, declare(1, "coder")), refused(ConvoyRefusal::PromiseExists));
 }
 
-// Deliver requires every promise kept or retracted, naming the outstanding
-// ones, and carries the work over unchanged; once delivered the convoy is
-// ended and refuses everything NotOpen.
+// Only the owner submits, and only a durable reference. A submission is a
+// row under the promise; submitting again keeps the earlier row, and the
+// promise stays Submitted from the first.
 #[test]
-fn deliver_waits_for_every_promise() {
-    let mut home = convoy(request(&[0, 1, 2], &[(0, 1)]));
-    let w = world();
-    home.apply("c", Keep { promise: PromiseId(1) }, &w, at()).expect("kept");
-    let outstanding = BTreeSet::from([PromiseId(0), PromiseId(2)]);
-    assert_eq!(home.apply("c", Deliver, &w, at()).err(), refused(ConvoyRefusal::PromisesOutstanding(outstanding)));
-    home.apply("c", retract(0, YES), &w, at()).expect("retracted");
-    home.apply("c", Keep { promise: PromiseId(2) }, &w, at()).expect("kept");
-    home.apply("c", Deliver, &w, at()).expect("delivered");
-    let delivered = ConvoyState::Delivered { resolution: promises(&[(0, Retracted), (1, Kept), (2, Kept)]), quota: quota(&[(0, 1)]) };
-    assert_eq!(state(&home), &delivered);
-    let not_open = refused(ConvoyRefusal::NotOpen);
-    assert_eq!(home.apply("c", Deliver, &w, at()).err(), not_open);
-    assert_eq!(home.apply("c", Keep { promise: PromiseId(9) }, &w, at()).err(), not_open);
-    assert_eq!(home.apply("c", retract(0, NO), &w, at()).err(), not_open);
-    assert_eq!(home.apply("c", abandon("why", YES), &w, at()).err(), not_open);
-    assert_eq!(home.apply("c", readmit(&[(0, 1)], YES), &w, at()).err(), not_open);
+fn the_owner_submits_durable_references() {
+    let mut home = convoy(request(&[(0, PromiseSource::Template)]));
+    assert_eq!(apply(&mut home, submit(0, "lead", YES)), refused(ConvoyRefusal::NotOwner));
+    assert_eq!(apply(&mut home, submit(0, "coder", NO)), refused(ConvoyRefusal::NotDurable));
+    assert_eq!(apply(&mut home, submit(0, "coder", "absent")), refused(ConvoyRefusal::NotDurable));
+    assert_eq!(apply(&mut home, submit(9, "coder", YES)), refused(ConvoyRefusal::UnknownPromise));
+    apply(&mut home, submit(0, "coder", YES)).expect("submitted");
+    home.apply("c", submit(0, "coder", YES), &world(), Timestamp(9)).expect("submitted again");
+    let promise = home.get("c").expect("exists").spec().promise(PromiseId(0)).expect("row").1.clone();
+    assert_eq!(promise.submissions.len(), 2);
+    assert_eq!(promise.submissions.get(flotilla_schema::Position(1)).expect("second").version, 3, "stamped with the write's version");
+    assert_eq!((promise.progress.value, promise.progress.since), (Progress::Submitted, at()));
 }
 
-// Abandon is always an authorised decision with a reason; an unauthorised
-// decision or an empty reason is refused Unauthorised. The state carries the
-// reason beside the work as it stood.
+// Reject returns a Submitted promise to Pending and keeps its submissions.
 #[test]
-fn abandon_is_an_authorised_decision_with_a_reason() {
-    let mut home = convoy(request(&[0, 1], &[(0, 1)]));
-    let w = world();
-    home.apply("c", Keep { promise: PromiseId(1) }, &w, at()).expect("kept");
-    assert_eq!(home.apply("c", abandon("no longer wanted", NO), &w, at()).err(), refused(ConvoyRefusal::Unauthorised));
-    assert_eq!(home.apply("c", abandon("", YES), &w, at()).err(), refused(ConvoyRefusal::Unauthorised));
-    assert_eq!(state(&home).reason(), None);
-    home.apply("c", abandon("no longer wanted", YES), &w, at()).expect("abandoned");
-    let abandoned = ConvoyState::Abandoned {
-        resolution: promises(&[(0, Pending), (1, Kept)]),
-        quota: quota(&[(0, 1)]),
-        reason: "no longer wanted".into(),
+fn reject_returns_a_submission() {
+    let mut home = convoy(request(&[(0, PromiseSource::Template)]));
+    assert_eq!(apply(&mut home, Reject { promise: PromiseId(0) }), refused(ConvoyRefusal::NotSubmitted));
+    apply(&mut home, submit(0, "coder", YES)).expect("submitted");
+    apply(&mut home, Reject { promise: PromiseId(0) }).expect("rejected");
+    assert_eq!(progress(&home, 0), Progress::Pending);
+    assert_eq!(home.get("c").expect("exists").spec().promise(PromiseId(0)).expect("row").1.submissions.len(), 1);
+}
+
+// Observed keeping names the current submission of a Submitted promise; a
+// verdict follows the promise's source and needs a reason; Kept is final.
+#[test]
+fn keep_reads_current_evidence_or_a_verdict() {
+    let mut home = convoy(request(&[(0, PromiseSource::Template), (1, PromiseSource::Dispatch)]));
+    let observed = |submission: u32| Keep::Observed { promise: PromiseId(0), submission };
+    assert_eq!(apply(&mut home, observed(0)), refused(ConvoyRefusal::StaleEvidence));
+    apply(&mut home, submit(0, "coder", YES)).expect("submitted");
+    apply(&mut home, submit(0, "coder", YES)).expect("submitted again");
+    assert_eq!(apply(&mut home, observed(1)), refused(ConvoyRefusal::StaleEvidence));
+    apply(&mut home, observed(2)).expect("kept on the current submission");
+    assert_eq!(apply(&mut home, verdict(0, Authority::Operator)), refused(ConvoyRefusal::PromiseSettled));
+    assert_eq!(apply(&mut home, verdict(1, Authority::ConvoySupervisor)), refused(ConvoyRefusal::Unauthorised));
+    let unreasoned = Keep::Verdict { promise: PromiseId(1), by: seat("decider"), authority: Authority::Dispatcher, reason: String::new() };
+    assert_eq!(apply(&mut home, unreasoned), refused(ConvoyRefusal::Unauthorised));
+    apply(&mut home, verdict(1, Authority::Dispatcher)).expect("the dispatcher keeps its promise");
+    assert_eq!((progress(&home, 0), progress(&home, 1)), (Progress::Kept, Progress::Kept));
+}
+
+// A crew promise is its owner's to retract before any submission, and its
+// owner's supervisor's after; a template promise is the convoy supervisor's.
+#[test]
+fn retraction_follows_the_source() {
+    let mut home = convoy(request(&[(0, PromiseSource::Template)]));
+    let declare = Declare { promise: PromiseId(1), kind: "pr".into(), target: address("t"), owner: seat("coder") };
+    apply(&mut home, declare).expect("declared");
+    assert_eq!(apply(&mut home, retract(0, "coder", Authority::Owner)), refused(ConvoyRefusal::Unauthorised));
+    assert_eq!(apply(&mut home, retract(1, "lead", Authority::Owner)), refused(ConvoyRefusal::Unauthorised), "not its owner");
+    assert_eq!(apply(&mut home, retract(1, "lead", Authority::OwnerSupervisor)), refused(ConvoyRefusal::Unauthorised), "nothing submitted");
+    apply(&mut home, submit(1, "coder", YES)).expect("submitted");
+    assert_eq!(apply(&mut home, retract(1, "coder", Authority::Owner)), refused(ConvoyRefusal::Unauthorised), "submitted");
+    apply(&mut home, retract(1, "lead", Authority::OwnerSupervisor)).expect("the supervisor retracts");
+    apply(&mut home, retract(0, "lead", Authority::ConvoySupervisor)).expect("the convoy supervisor retracts");
+    assert_eq!((progress(&home, 0), progress(&home, 1)), (Progress::Retracted, Progress::Retracted));
+}
+
+// A handoff moves the promise and its submissions to another seat; only the
+// owner, its supervisor or an operator hands off, and only to a seat.
+#[test]
+fn reassign_moves_an_open_promise_to_a_seat() {
+    let mut home = convoy(request(&[(0, PromiseSource::Template)]));
+    apply(&mut home, submit(0, "coder", YES)).expect("submitted");
+    let reassign = |to: &str, by: &str, authority| Reassign { promise: PromiseId(0), to: seat(to), by: seat(by), authority };
+    assert_eq!(apply(&mut home, reassign("lead", "lead", Authority::Owner)), refused(ConvoyRefusal::Unauthorised));
+    assert_eq!(apply(&mut home, reassign("lead", "x", Authority::Dispatcher)), refused(ConvoyRefusal::Unauthorised));
+    assert_eq!(apply(&mut home, reassign("nobody", "coder", Authority::Owner)), refused(ConvoyRefusal::UnknownSeat));
+    apply(&mut home, reassign("lead", "coder", Authority::Owner)).expect("handed off");
+    let promise = home.get("c").expect("exists").spec().promise(PromiseId(0)).expect("row").1.clone();
+    assert_eq!((promise.owner, promise.progress.value, promise.submissions.len()), (seat("lead"), Progress::Submitted, 1));
+    let version = home.get("c").expect("exists").version();
+    apply(&mut home, reassign("lead", "lead", Authority::Owner)).expect("to the current owner");
+    assert_eq!(home.get("c").expect("exists").version(), Version(version.0 + 1), "an accepted edge that writes nothing");
+}
+
+// Fan-out adds a seat under an existing one; a name is never reused; a
+// supervision change re-points one seat. Both are authorised decisions.
+#[test]
+fn seats_are_added_and_resupervised() {
+    let mut home = convoy(request(&[(0, PromiseSource::Template)]));
+    let add = |name: &str, parent: &str, authority: &str| AddSeat {
+        seat: seat(name),
+        parent: seat(parent),
+        supervised_by: address("lead"),
+        by: seat("lead"),
+        authority: Ref::new(authority),
     };
-    assert_eq!(state(&home), &abandoned);
-    assert_eq!(home.apply("c", Keep { promise: PromiseId(0) }, &w, at()).err(), refused(ConvoyRefusal::NotOpen));
+    assert_eq!(apply(&mut home, add("reviewer", "lead", NO)), refused(ConvoyRefusal::Unauthorised));
+    assert_eq!(apply(&mut home, add("coder", "lead", YES)), refused(ConvoyRefusal::SeatExists));
+    assert_eq!(apply(&mut home, add("reviewer", "nobody", YES)), refused(ConvoyRefusal::UnknownSeat));
+    apply(&mut home, add("reviewer", "lead", YES)).expect("added");
+    let change =
+        |name: &str| Resupervise { seat: seat(name), supervised_by: address("operator"), by: seat("lead"), authority: Ref::new(YES) };
+    assert_eq!(apply(&mut home, change("nobody")), refused(ConvoyRefusal::UnknownSeat));
+    apply(&mut home, change("reviewer")).expect("re-pointed");
+    let spec = home.get("c").expect("exists").spec().clone();
+    let reviewer = spec.seat(&seat("reviewer")).expect("row").1;
+    assert_eq!((reviewer.parent.clone(), reviewer.supervised_by.clone()), (Some(seat("lead")), address("operator")));
+    assert_eq!(spec.seats.len(), 3);
 }
 
-// Readmission raises the quota: it needs authority, keeps the class domain
-// and lowers no count, compared with the quota in force (the last readmit's),
-// and it leaves the promises as they are.
+// Deliver waits for every promise, naming the open ones, then for every
+// lifetime duty, naming the holding ones; an authorised retirement releases
+// a duty. Once delivered the convoy refuses everything NotOpen.
+#[test]
+fn deliver_waits_for_promises_then_duties() {
+    let mut with_duty = request(&[(0, PromiseSource::Template)]);
+    with_duty.duties = [(DutyId(0), lifetime("lead"))].into();
+    let mut home = convoy(with_duty);
+    assert_eq!(apply(&mut home, Deliver), refused(ConvoyRefusal::PromisesOutstanding([PromiseId(0)].into())));
+    apply(&mut home, verdict(0, Authority::Operator)).expect("kept");
+    assert_eq!(apply(&mut home, Deliver), refused(ConvoyRefusal::DutyHolds([DutyId(0)].into())));
+    let retire = |duty: u32, authority: &str| RetireDuty { duty: DutyId(duty), by: seat("lead"), authority: Ref::new(authority) };
+    assert_eq!(apply(&mut home, retire(0, NO)), refused(ConvoyRefusal::Unauthorised));
+    assert_eq!(apply(&mut home, retire(1, YES)), refused(ConvoyRefusal::UnknownDuty));
+    apply(&mut home, retire(0, YES)).expect("retired");
+    assert_eq!(apply(&mut home, retire(0, YES)), refused(ConvoyRefusal::UnknownDuty), "already retired");
+    apply(&mut home, Deliver).expect("delivered");
+    let state = home.get("c").expect("exists").state().clone();
+    assert_eq!(state, ConvoyState::Delivered { quota: quota(&[("standard", 1)]), retired: [DutyId(0)].into() });
+    assert_eq!(apply(&mut home, submit(0, "coder", YES)), refused(ConvoyRefusal::NotOpen));
+}
+
+// Abandon is an authorised decision with a reason, kept beside the work.
+#[test]
+fn abandon_is_an_authorised_decision() {
+    let mut home = convoy(request(&[(0, PromiseSource::Template)]));
+    let abandon = |reason: &str, authority: &str| Abandon { by: seat("lead"), reason: reason.into(), authority: Ref::new(authority) };
+    assert_eq!(apply(&mut home, abandon("decision", NO)), refused(ConvoyRefusal::Unauthorised));
+    assert_eq!(apply(&mut home, abandon("", YES)), refused(ConvoyRefusal::Unauthorised));
+    apply(&mut home, abandon("decision", YES)).expect("abandoned");
+    assert_eq!(home.get("c").expect("exists").state().reason(), Some("decision"));
+}
+
+// Readmission raises the quota over the same classes, never lowering a count.
 #[test]
 fn readmission_only_raises_the_quota() {
-    let mut home = convoy(request(&[0], &[(0, 1), (1, 1)]));
-    let w = world();
-    assert_eq!(home.apply("c", readmit(&[(0, 2), (1, 1)], NO), &w, at()).err(), refused(ConvoyRefusal::Unauthorised));
-    for (case, q) in [("missing class", vec![(0, 2)]), ("extra class", vec![(0, 2), (1, 1), (2, 1)]), ("lower", vec![(0, 0), (1, 3)])] {
-        assert_eq!(home.apply("c", readmit(&q, YES), &w, at()).err(), refused(ConvoyRefusal::QuotaNotIncrease), "{case}");
-    }
-    home.apply("c", readmit(&[(0, 1), (1, 1)], YES), &w, at()).expect("unchanged quota is no decrease");
-    home.apply("c", Keep { promise: PromiseId(0) }, &w, at()).expect("kept");
-    home.apply("c", readmit(&[(0, 3), (1, 1)], YES), &w, at()).expect("raised");
-    assert_eq!(state(&home), &ConvoyState::Open { resolution: promises(&[(0, Kept)]), quota: quota(&[(0, 3), (1, 1)]) });
-    // Above the admitted quota but below the readmitted one.
-    assert_eq!(home.apply("c", readmit(&[(0, 2), (1, 1)], YES), &w, at()).err(), refused(ConvoyRefusal::QuotaNotIncrease));
-}
-
-// Only `Authority` is read for an authorised decision: an absent authority is
-// never authorised, and the read is recorded on the event.
-#[test]
-fn an_authorised_edge_records_its_authority_read() {
-    let mut home = convoy(request(&[0], &[]));
-    let w = world();
-    let event = home.apply("c", retract(0, YES), &w, at()).expect("retracted");
-    assert!(event.payload.reads.iter().any(|read| read.kind == <Authority as Kind>::NAME && read.name == YES));
-}
-
-// Every convoy edge's event is storable as it is: the log entry's payload is an inline CBOR
-// document, whose profile takes text map keys only, so a readmission's quota (keyed by vessel
-// class) travels as a list of pairs, and each payload decodes to the one the home appended.
-#[test]
-fn convoy_edge_events_round_trip_through_the_schema_codec() {
-    let mut home = Home::<Convoy>::new("home").expect("valid");
-    home.create("c", request(&[0, 1], &[(0, 1), (3, 2)]), &world(), at()).expect("admitted");
-    let world = world();
-    let edges: [(ConvoyEdge, i64); 4] = [
-        (readmit(&[(0, 2), (3, 2)], YES).into(), 1),
-        (Keep { promise: PromiseId(0) }.into(), 2),
-        (Retract { promise: PromiseId(1), by: "lead".into(), authority: Ref::new(YES) }.into(), 3),
-        (Deliver.into(), 4),
-    ];
-    for (edge, at) in edges {
-        let previous = home.get("c").expect("exists").stored_state().clone();
-        let event = home.apply("c", edge, &world, Timestamp(at)).expect("applied");
-        let header = home.get("c").expect("exists").stored_edge(&previous, &event).expect("edge").into_parts().event;
-        assert_eq!((header.edge, header.from, header.to), (event.edge.code(), event.from.code(), event.to.code()));
-        assert_eq!(header.payload::<EdgePayload<ConvoyEdge>>().expect("decodes"), event.payload);
-    }
+    let mut home = convoy(request(&[(0, PromiseSource::Template)]));
+    let readmit =
+        |counts: &[(&str, u32)], authority: &str| Readmit { quota: quota(counts), by: seat("lead"), authority: Ref::new(authority) };
+    assert_eq!(apply(&mut home, readmit(&[("standard", 2)], NO)), refused(ConvoyRefusal::Unauthorised));
+    assert_eq!(apply(&mut home, readmit(&[("standard", 0)], YES)), refused(ConvoyRefusal::QuotaNotIncrease));
+    assert_eq!(apply(&mut home, readmit(&[("standard", 2), ("large", 1)], YES)), refused(ConvoyRefusal::QuotaNotIncrease));
+    apply(&mut home, readmit(&[("standard", 2)], YES)).expect("readmitted");
+    assert_eq!(home.get("c").expect("exists").state().quota(), &quota(&[("standard", 2)]));
 }

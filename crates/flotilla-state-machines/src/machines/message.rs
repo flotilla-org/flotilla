@@ -57,8 +57,8 @@ use crate::{
         consumer::{Consumer, ConsumerKind},
         convoy::ConvoyRequest,
     },
-    states, Admission, EdgeDef, EdgePayload, Ended, Handle, Kind, Machine, MachineDef, Ref, Resource, Source, Table, Transport, Version,
-    WrongState,
+    states, Admission, EdgeDef, EdgePayload, Ended, Handle, Kind, Machine, MachineDef, NoRecords, Ref, Resource, Source, Table, Transport,
+    Version, WrongState,
 };
 
 /// What would settle the message. `Nothing` settles on delivery.
@@ -104,9 +104,10 @@ pub enum MessageBody {
 /// The typed request bodies. Admission's convoy request is the first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestBody {
-    /// A convoy request to the admission role (ADR 0064 "Admission and capacity").
+    /// A convoy request to the admission role (ADR 0064 "Admission and capacity"),
+    /// boxed for its size: the stored body is the request itself.
     #[serde(rename = "cv")]
-    Convoy(ConvoyRequest),
+    Convoy(Box<ConvoyRequest>),
 }
 
 /// A thing the message refers to, at a revision (ADR 0066 §4). At most one
@@ -612,6 +613,7 @@ impl Machine for Message {
     type Spec = MessageSpec;
     type State = MessageState;
     type Edge = MessageEdge;
+    type Write = NoRecords;
     type Refusal = MessageRefusal;
     type World = dyn MessageWorld;
 

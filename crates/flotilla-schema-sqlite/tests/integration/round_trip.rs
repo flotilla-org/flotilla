@@ -7,8 +7,8 @@ use hegel::{generators as gs, TestCase};
 
 use crate::fixtures::terminal::Terminal;
 use crate::fixtures::{
-    origin, store, AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, Ticket, Vessel,
-    LOCAL,
+    origin, store, AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession,
+    Ticket, Vessel, LOCAL,
 };
 
 /// Inserts `first`, then evolves it through `steps` writes: mostly generated edges, and a spec
@@ -88,6 +88,11 @@ fn agent_session_evolves_by_edges_and_spec_edits(tc: TestCase) {
 }
 
 #[hegel::test]
+fn awaiting_reply_evolves_by_edges_and_spec_edits(tc: TestCase) {
+    drawn::<Resource<AwaitingReply>>(&tc);
+}
+
+#[hegel::test]
 fn convoy_evolves_by_edges_and_spec_edits(tc: TestCase) {
     drawn::<Resource<Convoy>>(&tc);
 }
@@ -126,6 +131,7 @@ fn ticket_evolves_by_transitions_and_spec_edits(tc: TestCase) {
 fn every_variant_round_trips_and_switches_through_writes(tc: TestCase) {
     covering::<Resource<Message>>(&tc);
     covering::<Resource<AgentSession>>(&tc);
+    covering::<Resource<AwaitingReply>>(&tc);
     covering::<Resource<Convoy>>(&tc);
     covering::<Resource<Ensure>>(&tc);
     covering::<TerminalSession>(&tc);
@@ -166,6 +172,7 @@ fn all_edges<M: Machine>() -> BTreeSet<&'static str> {
 fn engine_fixtures_reach_every_declared_edge(tc: TestCase) {
     assert_eq!(edges_reached::<Message>(&tc), all_edges::<Message>());
     assert_eq!(edges_reached::<AgentSession>(&tc), all_edges::<AgentSession>());
+    assert_eq!(edges_reached::<AwaitingReply>(&tc), all_edges::<AwaitingReply>());
     assert_eq!(edges_reached::<Convoy>(&tc), all_edges::<Convoy>());
     assert_eq!(edges_reached::<Ensure>(&tc), all_edges::<Ensure>());
     assert_eq!(edges_reached::<Lifecycle<Terminal>>(&tc), all_edges::<Lifecycle<Terminal>>());

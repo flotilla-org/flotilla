@@ -16,7 +16,7 @@ use std::{
     marker::PhantomData,
 };
 
-use flotilla_schema::{Code, CodeEnum};
+use flotilla_schema::{Code, CodeEnum, RecordsFull};
 
 use crate::{code::changed, Admission, Coded, Edge, EdgeArg, Handle, StateValue};
 
@@ -27,11 +27,15 @@ pub trait Machine: Sized + 'static {
     const NAME: &'static str;
     /// What a caller asks for when it creates a resource.
     type Request;
-    /// What never changes after admission.
-    type Spec;
+    /// What admission fixes. Its columns and collections never change after
+    /// admission; its `records` change only through edges' [`Machine::Write`]s.
+    type Spec: Clone;
     /// The current state: a label plus its data.
     type State: StateValue;
     type Edge: Edge;
+    /// A write to the spec's records an effect may make ([`Handle::write`]);
+    /// [`NoRecords`] for a machine whose spec holds none.
+    type Write: RecordWrite<Self::Spec>;
     /// Why a write was refused. Engine-detected refusals (an end, the wrong
     /// state) convert into it, so a caller sees one type per machine, with the
     /// same variants as the machine's specification.
@@ -47,6 +51,33 @@ pub trait Machine: Sized + 'static {
     /// Whatever the request names by address that must exist is read through
     /// `admission`, which records each read for the create (#3392 G1).
     fn admit(admission: &mut Admission<'_, Self>, request: Self::Request) -> Result<(Self::Spec, Self::State), Self::Refusal>;
+}
+
+/// A write to a resource's records (ADR 0064 "Records"): spec rows that only
+/// edges append, or change a field of. An effect makes it through
+/// [`Handle::write`] and its edge declares the field ([`EdgeDef::writes`]);
+/// the home applies it to its value once the log has taken the edge, and a
+/// store log writes it as the edge's rows.
+pub trait RecordWrite<S>: Clone + Debug {
+    /// The records field the write appends to or changes a row of.
+    fn field(&self) -> &'static str;
+    /// Applies the write to `spec`, stamping an appended row with `version`,
+    /// the write's version.
+    fn apply(&self, spec: &mut S, version: u64) -> Result<(), RecordsFull>;
+}
+
+/// The writes of a machine whose spec holds no records: there are none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoRecords {}
+
+impl<S> RecordWrite<S> for NoRecords {
+    fn field(&self) -> &'static str {
+        match *self {}
+    }
+
+    fn apply(&self, _: &mut S, _: u64) -> Result<(), RecordsFull> {
+        match *self {}
+    }
 }
 
 /// The label enum of machine `M`'s states.
@@ -88,6 +119,7 @@ pub struct EdgeDef<M: Machine, A> {
     from: Vec<Label<M>>,
     to: Vec<Label<M>>,
     changes: Vec<&'static str>,
+    writes: Vec<&'static str>,
     check: Option<Check<M>>,
     effect: Option<Box<EffectFn<M>>>,
     master: Option<Box<MasterFn<M>>>,
@@ -96,7 +128,16 @@ pub struct EdgeDef<M: Machine, A> {
 
 impl<M: Machine, A: EdgeArg<Edge = M::Edge>> EdgeDef<M, A> {
     pub fn new() -> Self {
-        EdgeDef { from: Vec::new(), to: Vec::new(), changes: Vec::new(), check: None, effect: None, master: None, arg: PhantomData }
+        EdgeDef {
+            from: Vec::new(),
+            to: Vec::new(),
+            changes: Vec::new(),
+            writes: Vec::new(),
+            check: None,
+            effect: None,
+            master: None,
+            arg: PhantomData,
+        }
     }
 
     /// Labels this edge leaves. May be called more than once.
@@ -120,6 +161,13 @@ impl<M: Machine, A: EdgeArg<Edge = M::Edge>> EdgeDef<M, A> {
     /// with the old label.
     pub fn changes(mut self, data: impl IntoIterator<Item = &'static str>) -> Self {
         self.changes.extend(data);
+        self
+    }
+
+    /// The spec's `records` fields this edge's effect writes ([`Handle::write`]):
+    /// a write to an undeclared field is a declaration fault.
+    pub fn writes(mut self, fields: impl IntoIterator<Item = &'static str>) -> Self {
+        self.writes.extend(fields);
         self
     }
 
@@ -181,6 +229,7 @@ pub struct DeclaredEdge<M: Machine> {
     pub from: Vec<Label<M>>,
     pub to: Vec<Label<M>>,
     pub changes: Vec<&'static str>,
+    pub writes: Vec<&'static str>,
     check: Option<Check<M>>,
     effect: Option<Box<EffectFn<M>>>,
     master: Option<Box<MasterFn<M>>>,
@@ -248,8 +297,9 @@ pub enum DefError {
     EdgeWithoutEffect(&'static str),
     EdgeWithoutTarget(&'static str),
     EdgeWithoutSource(&'static str),
-    /// Neither changes data nor leaves its label, and names no master: it
-    /// could never alter the state, and its entry would be about nothing.
+    /// Neither changes data, writes records nor leaves its label, and names no
+    /// master: it could never alter the resource, and its entry would be about
+    /// nothing.
     InertEdge(&'static str),
     /// A changed datum that no target label carries.
     UnknownData {
@@ -289,6 +339,9 @@ pub enum Fault<L, K> {
     Target { edge: K, target: L },
     /// The effect changed data the edge does not declare.
     Changes { edge: K, data: Vec<&'static str> },
+    /// The effect wrote records the edge does not declare, or the gate wrote
+    /// any (`fields` names them).
+    Writes { edge: K, fields: Vec<&'static str> },
     /// Admission produced a label other than the declared initial one.
     Initial { state: L },
 }
@@ -343,6 +396,7 @@ impl<M: Machine> MachineDef<M> {
             from: edge.from,
             to: edge.to,
             changes: edge.changes,
+            writes: edge.writes,
             check: edge.check,
             effect: edge.effect,
             master: edge.master,
@@ -414,6 +468,7 @@ impl<M: Machine> MachineDef<M> {
                 errors.insert(DefError::EdgeWithoutSource(name));
             }
             if edge.changes.is_empty()
+                && edge.writes.is_empty()
                 && edge.master.is_none()
                 && !edge.from.is_empty()
                 && !edge.to.is_empty()
@@ -481,13 +536,15 @@ impl<M: Machine> MachineDef<M> {
     }
 
     /// The legibility test: the declaration drawn as a Mermaid state diagram.
-    /// Each transition names its edge and the data it changes, and each end
-    /// carries its reason. [`Diagram::Labels`] leaves out the edges that keep
-    /// their label and change only data.
+    /// Each transition names its edge, the data it changes and the records it
+    /// writes, and each end carries its reason. [`Diagram::Labels`] leaves out
+    /// the edges that keep their label.
     pub fn mermaid(&self, diagram: Diagram) -> String {
         let mut out = format!("---\ntitle: {}\n---\nstateDiagram-v2\n  direction LR\n  [*] --> {}\n", M::NAME, self.initial.name());
         for edge in &self.edges {
             let changes = if edge.changes.is_empty() { String::new() } else { format!(" [{}]", edge.changes.join(", ")) };
+            let writes = if edge.writes.is_empty() { String::new() } else { format!(" writes {}", edge.writes.join(", ")) };
+            let changes = format!("{changes}{writes}");
             for from in &edge.from {
                 for to in &edge.to {
                     if diagram == Diagram::Labels && from == to {
@@ -520,13 +577,23 @@ impl<M: Machine> MachineDef<M> {
         if !declared.from.contains(&label) {
             return Err(StepError::Refused(WrongState { state: label, edge: kind }.into()));
         }
+        let written = handle.writes().len();
         match &declared.check {
             Some(Check::Gate { gate, .. }) => gate(handle, edge).ok_or_else(undeclared)?.map_err(StepError::Refused)?,
             Some(Check::Ungated { .. }) => {}
             None => return Err(undeclared()),
         }
+        if handle.writes().len() != written {
+            let fields = handle.writes()[written..].iter().map(RecordWrite::field).collect();
+            return Err(StepError::Fault(Fault::Writes { edge: kind, fields }));
+        }
         let effect = declared.effect.as_ref().ok_or_else(undeclared)?;
         let next = effect(handle, state.clone(), edge).ok_or_else(undeclared)?;
+        let stray: Vec<&'static str> =
+            handle.writes()[written..].iter().map(RecordWrite::field).filter(|field| !declared.writes.contains(field)).collect();
+        if !stray.is_empty() {
+            return Err(StepError::Fault(Fault::Writes { edge: kind, fields: stray }));
+        }
         if !declared.to.contains(&next.label()) {
             return Err(StepError::Fault(Fault::Target { edge: kind, target: next.label() }));
         }

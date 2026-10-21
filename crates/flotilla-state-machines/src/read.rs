@@ -299,18 +299,28 @@ pub struct Handle<'a, M: Machine> {
     now: Timestamp,
     reads: Vec<InputRead>,
     valid_until: Option<Timestamp>,
+    writes: Vec<M::Write>,
 }
 
 impl<'a, M: Machine> Handle<'a, M> {
     /// A handle for a pure step or judgement over a spec and state alone,
     /// with no resource: its name is empty.
     pub fn new(spec: &'a M::Spec, state: &'a M::State, world: &'a M::World, now: Timestamp) -> Self {
-        Handle { own: None, spec, state, world, now, reads: Vec::new(), valid_until: None }
+        Handle { own: None, spec, state, world, now, reads: Vec::new(), valid_until: None, writes: Vec::new() }
     }
 
     /// A handle on a resource, at `now`.
     pub fn on(resource: &'a Resource<M>, world: &'a M::World, now: Timestamp) -> Self {
-        Handle { own: Some(resource), spec: resource.spec(), state: resource.state(), world, now, reads: Vec::new(), valid_until: None }
+        Handle {
+            own: Some(resource),
+            spec: resource.spec(),
+            state: resource.state(),
+            world,
+            now,
+            reads: Vec::new(),
+            valid_until: None,
+            writes: Vec::new(),
+        }
     }
 
     /// The resource's own name, or empty for a pure handle. Fixed, so unrecorded.
@@ -362,6 +372,24 @@ impl<'a, M: Machine> Handle<'a, M> {
     /// The distinct reads recorded so far, in order.
     pub fn reads(&self) -> &[InputRead] {
         &self.reads
+    }
+
+    /// Writes the resource's records (ADR 0064 "Records"): an effect appends a
+    /// row or changes a field of one. The spec it reads stays as it was
+    /// before the edge; the home applies the writes once the log takes the
+    /// edge. A gate never writes.
+    pub fn write(&mut self, write: M::Write) {
+        self.writes.push(write);
+    }
+
+    /// The records writes made so far, in order.
+    pub fn writes(&self) -> &[M::Write] {
+        &self.writes
+    }
+
+    /// Takes the records writes made so far, for the write that persists them.
+    pub fn take_writes(&mut self) -> Vec<M::Write> {
+        std::mem::take(&mut self.writes)
     }
 
     /// Finishes a judgement, returning `value` with its validity and inputs.

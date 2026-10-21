@@ -80,6 +80,12 @@ impl<R> Records<R> {
         self.rows.get(position.0 as usize)
     }
 
+    /// The record at `position`, to change in place: how a resource's holder applies an edge that
+    /// sets a field of an existing row (`Edge::set_in`). Its position and stamp never change.
+    pub fn get_mut(&mut self, position: Position) -> Option<&mut R> {
+        self.rows.get_mut(position.0 as usize).map(|row| &mut row.record)
+    }
+
     pub fn last(&self) -> Option<&RecordRow<R>> {
         self.rows.last()
     }

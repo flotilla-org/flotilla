@@ -7,12 +7,18 @@
 // template or dispatch (alone, beside a convoy-lifetime duty, or beside a duty
 // while it is open), or admit only a lifetime duty, which the crew's Declare
 // of promise 0 then joins; promise 1 is never known. Every admitted owner is
-// the seat "a"; Reassign moves a promise to "b". The deciding seat matters
+// the seat "a", admitted at the root beside "b" under it; Reassign moves a
+// promise to "b", and an operator to the unknown "z". The deciding seat matters
 // only for the Owner authority class, so the other classes decide as "s", and
 // an empty reason is probed for the operator only. A crew-declared promise
 // takes up to two submissions (so resubmission and its stale evidence are
 // reached), others one; Submit leaves the domain at that bound. A quota
-// increase is probed only while the convoy holds no promise.
+// increase is probed only while the convoy holds no promise. The seat edges
+// that move (AddSeat of "c", Resupervise of "b") are probed only in a convoy
+// admitted for them, marked by an extra seat "y", where Declare is not
+// probed; their refusals are probed always, once each. One request names an
+// owner that is not a seat, and two admit seats in a cycle: a seat under
+// itself, and two seats under each other.
 module convoy_conformance {
   import convoy(IDS = Set()) as C from "../machines/convoy"
   type Probe = Admitted({ request: C::ConvoyRequest, result: C::Next })
@@ -23,12 +29,19 @@ module convoy_conformance {
   pure def admitted(source: C::Source): C::PromiseId -> C::AdmittedPromise = Map(0 -> { promise: definition, source: source, owner: "a" })
   pure val lifetime = Map(0 -> { owner: "a", scope: C::Lifetime, terms: "terms" })
   pure val whileOpen = Map(0 -> { owner: "a", scope: C::WhileOpen(Set(0)), terms: "terms" })
+  pure val seats = Map("a" -> { parent: C::Root, supervisedBy: "op" }, "b" -> { parent: C::Under("a"), supervisedBy: "a" })
   pure def request(promises: C::PromiseId -> C::AdmittedPromise, duties: C::DutyId -> C::Duty, known: bool): C::ConvoyRequest =
-    { project: "project", projectKnown: known, promises: promises, duties: duties, quota: Map(0 -> 1, 1 -> 1), priority: 1 }
+    { project: "project", projectKnown: known, promises: promises, duties: duties, seats: seats, quota: Map(0 -> 1, 1 -> 1), priority: 1 }
   pure val requests = Set(
     request(Map(), Map(), true), request(Map(), whileOpen, true), request(Map(), lifetime, true), request(Map(), lifetime, false),
     request(admitted(C::Template), Map(), true), request(admitted(C::Template), Map(), false), request(admitted(C::Dispatch), Map(), true),
-    request(admitted(C::Template), lifetime, true), request(admitted(C::Template), whileOpen, true))
+    request(admitted(C::Template), lifetime, true), request(admitted(C::Template), whileOpen, true),
+    { ...request(admitted(C::Template), Map(), true), seats: Map("b" -> { parent: C::Root, supervisedBy: "op" }) },
+    { ...request(admitted(C::Template), Map(), true), seats: Map("a" -> { parent: C::Under("b"), supervisedBy: "op" }, "b" -> { parent: C::Under("a"), supervisedBy: "op" }) },
+    { ...request(admitted(C::Template), Map(), true), seats: Map("a" -> { parent: C::Under("a"), supervisedBy: "op" }) },
+    { ...request(Map(), lifetime, true), seats: seats.put("y", { parent: C::Root, supervisedBy: "op" }) })
+  // The convoy admitted for the moving seat edges: its extra seat "y" marks it.
+  pure def seatProbe(w: C::Work): bool = w.seats.keys().contains("y")
   // Quotas: an increase, a decrease and a changed class domain. Negative counts
   // are omitted: Rust quota counts are unsigned, so InvalidQuota is unrepresentable.
   pure val increase = Map(0 -> 2, 1 -> 1)
@@ -40,7 +53,7 @@ module convoy_conformance {
   pure def bound(r: C::PromiseRecord): int = if (r.source == C::Crew) 2 else 1
   pure def submittable(w: C::Work, p: int): bool = not(w.promises.keys().contains(p)) or w.promises.get(p).submissions.length() < bound(w.promises.get(p))
   pure def events(w: C::Work): Set[C::Event] =
-    Set(C::Declare({ promise: 0, definition: definition, owner: "a" }))
+    (if (seatProbe(w)) Set() else Set("a", "z").map(o => C::Declare({ promise: 0, definition: definition, owner: o })))
     .union(ids.filter(p => submittable(w, p)).map(p => Set("a", "b").map(by => Set(true, false).map(d =>
       C::Submit({ promise: p, by: by, reference: "ref", durable: d }))).flatten()).flatten())
     .union(ids.map(p => C::Reject({ promise: p })))
@@ -52,7 +65,15 @@ module convoy_conformance {
       C::Retract({ promise: p, by: by, authority: a, reason: r })))).flatten().flatten()).flatten())
     .union(ids.map(p => authorities.map(a => deciders(a).map(by =>
       C::Reassign({ promise: p, to: "b", by: by, authority: a }))).flatten()).flatten())
+    .union(ids.map(p => C::Reassign({ promise: p, to: "z", by: "s", authority: C::Operator })))
     .union(Set(0, 1).map(d => Set(true, false).map(a => C::RetireDuty({ duty: d, authorised: a }))).flatten())
+    .union(Set(C::AddSeat({ seat: "c", parent: "a", supervisedBy: "a", authorised: false }),
+      C::AddSeat({ seat: "a", parent: "a", supervisedBy: "a", authorised: true }),
+      C::AddSeat({ seat: "c", parent: "z", supervisedBy: "a", authorised: true }),
+      C::Resupervise({ seat: "b", supervisedBy: "s", authorised: false }),
+      C::Resupervise({ seat: "z", supervisedBy: "s", authorised: true })))
+    .union(if (seatProbe(w)) Set(C::AddSeat({ seat: "c", parent: "a", supervisedBy: "a", authorised: true }),
+      C::Resupervise({ seat: "b", supervisedBy: "s", authorised: true })) else Set())
     .union(Set(C::Deliver))
     .union(Set(true, false).map(a => Set("", "decision").map(r => C::Abandon({ authorised: a, reason: r }))).flatten())
     .union((if (w.promises.keys().size() == 0) quotas.union(Set(increase)) else quotas).map(q =>

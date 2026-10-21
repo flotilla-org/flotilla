@@ -102,6 +102,7 @@ impl Machine for LatchMachine {
     type Spec = bool;
     type State = Latch;
     type Edge = LatchEdge;
+    type Write = flotilla_state_machines::NoRecords;
     type Refusal = LatchRefusal;
     type World = Table<Signal>;
 

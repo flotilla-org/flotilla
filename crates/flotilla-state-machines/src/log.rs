@@ -57,6 +57,24 @@ pub trait Log<M: Machine> {
     /// must find stored, so a log over the store applies the edge under that
     /// stamp ([`Resource::stored_edge`]).
     fn edge(&mut self, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError>;
+
+    /// [`Log::edge`] for an edge that also wrote the resource's records:
+    /// `next` holds its next state and its records as they were before the
+    /// edge, and `writes` the rows the edge appends or changes. A log for
+    /// machines whose specs hold no records keeps this default, which refuses
+    /// any write rather than drop it.
+    fn edge_with_writes(
+        &mut self,
+        previous: &StoredState<M>,
+        next: &Resource<M>,
+        event: &EdgeEventOf<M>,
+        writes: &[M::Write],
+    ) -> Result<Version, LogError> {
+        if !writes.is_empty() {
+            return Err(LogError::new("this log does not store records writes"));
+        }
+        self.edge(previous, next, event)
+    }
 }
 
 /// Why a log did not take a write: the store's refusal, such as a version
@@ -142,6 +160,17 @@ impl<M: Machine> Log<M> for MemoryLog<M> {
         let version = self.next(next.version());
         self.edges.insert((next.name().to_owned(), version.0), event.clone());
         Ok(version)
+    }
+
+    /// The memory log keeps events only; the home holds the records the writes change.
+    fn edge_with_writes(
+        &mut self,
+        previous: &StoredState<M>,
+        next: &Resource<M>,
+        event: &EdgeEventOf<M>,
+        _: &[M::Write],
+    ) -> Result<Version, LogError> {
+        self.edge(previous, next, event)
     }
 }
 

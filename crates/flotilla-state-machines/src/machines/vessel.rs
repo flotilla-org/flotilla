@@ -71,7 +71,8 @@ pub struct VesselSpec {
 impl VesselSpec {
     /// The lease the vessel was created with.
     pub fn lease(&self) -> Lease {
-        let request = Request { convoy: self.convoy.clone(), class: self.class, shape: self.shape.clone(), priority: self.priority };
+        let request =
+            Request { convoy: self.convoy.clone(), class: self.class.clone(), shape: self.shape.clone(), priority: self.priority };
         Lease { request, host: self.host }
     }
 }

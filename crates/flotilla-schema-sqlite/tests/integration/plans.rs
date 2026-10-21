@@ -92,10 +92,22 @@ fn the_enumeration_covers_every_kind_and_index() {
         "message set receiver",
         "message set state state",
         "message label state",
-        "convoy_resolution upsert",
+        "convoy_retired insert",
+        "convoy_promises last position",
+        "convoy_promises_submissions last position",
+        "convoy_promises set progress",
+        "convoy_promises set owner",
+        "convoy_seats last position",
+        "convoy_seats set supervised_by",
         "convoy_quota insert",
         "convoy_quota delete",
         "convoy label state",
+        "awaiting_reply label state",
+        "awaiting_reply scan",
+        "index awaiting_reply_open_by_sender first",
+        "index awaiting_reply_open_by_subject after",
+        "index awaiting_reply_by_message after",
+        "index awaiting_reply_deadline first",
         "ensure_recorded insert",
         "ensure set bound",
         "terminal_session_labels select",
@@ -131,11 +143,11 @@ fn the_enumeration_covers_every_kind_and_index() {
     ] {
         assert!(labels.contains(&expected), "missing {expected}");
     }
-    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 13 + 3);
-    assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 9);
+    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 17 + 3);
+    assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 10);
     assert!(!labels.iter().any(|label| label.contains("_edges")), "no kind has an edge-log table");
     assert!(
-        !labels.iter().any(|label| label.starts_with("convoy_promises ") && label.ends_with(" last position")),
+        !labels.iter().any(|label| label.starts_with("convoy_duties ") && label.ends_with(" last position")),
         "spec collections take no positions from edges"
     );
     assert!(

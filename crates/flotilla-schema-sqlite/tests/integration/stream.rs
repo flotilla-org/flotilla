@@ -204,7 +204,7 @@ fn generated_partition_resume(tc: hegel::TestCase) {
 // streaming-row protocol. The generator selects among all fixture kinds and their full shapes.
 #[hegel::test]
 fn snapshot_chunks_preserve_all_kind_shapes(tc: hegel::TestCase) {
-    use crate::fixtures::{AgentSession, Convoy, Dossier, Ensure, Fixture, Pick, Referral, TerminalSession, Ticket, Vessel};
+    use crate::fixtures::{AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Pick, Referral, TerminalSession, Ticket, Vessel};
     fn check<K: Fixture>(tc: &hegel::TestCase) {
         let mut a = store("a");
         let mut b = store("b");
@@ -218,7 +218,7 @@ fn snapshot_chunks_preserve_all_kind_shapes(tc: hegel::TestCase) {
         let id = read.resolve(K::CODE, "m", "a").expect("identity").expect("id");
         assert_eq!(read.load_snapshot(id).expect("snapshot"), expected);
     }
-    match tc.draw(gs::integers::<u8>().max_value(8)) {
+    match tc.draw(gs::integers::<u8>().max_value(9)) {
         0 => check::<Resource<Message>>(&tc),
         1 => check::<Resource<Convoy>>(&tc),
         2 => check::<Resource<Ensure>>(&tc),
@@ -227,6 +227,7 @@ fn snapshot_chunks_preserve_all_kind_shapes(tc: hegel::TestCase) {
         5 => check::<TerminalSession>(&tc),
         6 => check::<Ticket>(&tc),
         7 => check::<Dossier>(&tc),
+        8 => check::<Resource<AwaitingReply>>(&tc),
         _ => check::<Referral>(&tc),
     }
 }

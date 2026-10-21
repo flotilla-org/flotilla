@@ -1,7 +1,7 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -137,7 +137,7 @@
-           else Moved(Open({ ...w, retired: w.retired.union(Set(a.duty)) }))
+@@ -178,7 +178,7 @@
+           else Moved(Open({ ...w, seats: w.seats.put(a.seat, { ...w.seats.get(a.seat), supervisedBy: a.supervisedBy }) }))
        | Deliver => val outstanding = w.promises.keys().filter(p => open(w.promises.get(p)))
            if (outstanding.size() > 0) Refused(PromisesOutstanding(outstanding))
 -          else if (holdingDuties(w).size() > 0) Refused(DutyHolds(holdingDuties(w)))
