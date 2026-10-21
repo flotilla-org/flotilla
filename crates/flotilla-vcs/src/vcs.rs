@@ -128,6 +128,8 @@ pub enum CheckoutPreservationReason {
     DifferentBranch,
     NotCreatedForConvoy,
     DirtyCheckout,
+    /// The worktree registration was pruned; its contents cannot be verified.
+    OrphanedCheckout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,6 +521,12 @@ pub trait Vcs: Send + Sync {
     async fn continue_fresh_clone(&self, _url: &str, _branch: &str, _target: &str) -> Result<CheckoutMaterialisation, String> {
         Err("branch continuation is unavailable".into())
     }
+    /// Whether a linked checkout's gitdir pointer names a missing registration.
+    /// This filesystem probe also works when Git cannot open the checkout.
+    async fn orphaned_worktree(&self, _target: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
     async fn remove_materialised_checkout(&self, _branch: &str, _target: &str) -> Result<CheckoutRemoval, String> {
         Err("checkout removal is unavailable".into())
     }
@@ -660,8 +668,17 @@ impl FlotillaVcs {
         let backend = GitCliBackend::checkout_root(Path::new(target), &*self.runner);
         let preserve = |reason| Some(CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason });
         let current = match backend.current_branch().await {
-            Err(error) if error.contains("not a git repository") => return Ok(None),
-            Err(_) => return Ok(preserve(CheckoutPreservationReason::DifferentBranch)),
+            Err(error) => {
+                // Probe before the generic "not a git repository" fallback:
+                // a dangling gitdir pointer can produce that same error.
+                if self.orphaned_worktree_after_failure(target, &error).await? {
+                    return Ok(preserve(CheckoutPreservationReason::OrphanedCheckout));
+                }
+                if error.contains("not a git repository") {
+                    return Ok(None);
+                }
+                return Ok(preserve(CheckoutPreservationReason::DifferentBranch));
+            }
             Ok(current) => current,
         };
         let status = backend.working_tree_status(false).await?;
@@ -681,6 +698,10 @@ impl FlotillaVcs {
             }
         }
         Ok(None)
+    }
+
+    async fn orphaned_worktree_after_failure(&self, target: &str, error: &str) -> Result<bool, String> {
+        self.orphaned_worktree(target).await.map_err(|probe_error| format!("{error}; orphaned worktree probe failed: {probe_error}"))
     }
 
     fn cli(&self) -> GitCliBackend<'_> {
@@ -1028,6 +1049,25 @@ impl Vcs for FlotillaVcs {
         Ok(CheckoutMaterialisation { commit: Some(commit), provenance: CheckoutBranchProvenance::PreExisting })
     }
 
+    async fn orphaned_worktree(&self, target: &str) -> Result<bool, String> {
+        let entry = Path::new(target).join(".git");
+        let entry = entry.to_str().ok_or_else(|| "git entry is not UTF-8".to_string())?;
+        let output = self.runner.run_output("cat", &["--", entry], Path::new("/"), &command_channel_label("cat", &["--", entry])).await?;
+        if !output.success() {
+            // A directory, unreadable pointer or transient failure is not proof
+            // of an orphan. Preserve the caller's existing refusal/retry policy.
+            return Ok(false);
+        }
+        let Some(pointer) = output.stdout.trim().strip_prefix("gitdir: ") else { return Ok(false) };
+        if pointer.is_empty() {
+            return Ok(false);
+        }
+        // Relative gitdir pointers are relative to the .git file, in the
+        // runner's filesystem world, never the daemon's working directory.
+        let admin = Path::new(target).join(pointer);
+        Ok(!self.runner.path_exists(&admin).await?)
+    }
+
     async fn remove_materialised_checkout(&self, branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
         if self.runner.path_exists(Path::new(target)).await? {
             if let Some(preserved) = self.checkout_removal_guard(branch, target).await? {
@@ -1151,6 +1191,12 @@ impl Vcs for FlotillaVcs {
                 self.runner.run("rm", &["-rf", staging_path], Path::new("/"), &flotilla_provider_runtime::ChannelLabel::Default).await
             {
                 return Err(format!("{error}; failed to remove partial archive at {staging_path}: {cleanup_error}"));
+            }
+            if self.orphaned_worktree_after_failure(target, &error).await? {
+                return Ok(CheckoutRemoval::PreservedCheckout {
+                    path: target.to_string(),
+                    reason: CheckoutPreservationReason::OrphanedCheckout,
+                });
             }
             return Err(error);
         }
@@ -3368,6 +3414,90 @@ mod tests {
         );
         std::fs::remove_file(dirty_file).expect("remove dirty file");
         assert_eq!(vcs.remove_materialised_checkout("feature/new", target).await.expect("remove clean clone"), CheckoutRemoval::Removed);
+    }
+
+    // A pruned admin directory must produce a typed preservation result for both
+    // normal and forced teardown, keeping all files when Git cannot verify them.
+    #[tokio::test]
+    async fn orphaned_worktree_teardown_preserves_unverifiable_contents() {
+        // Runner boundary: fail the filesystem probe after Git has failed on
+        // the pruned registration. Both diagnostic causes must be retained.
+        struct FailOrphanProbeRunner;
+        #[async_trait]
+        impl CommandRunner for FailOrphanProbeRunner {
+            async fn run(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &flotilla_provider_runtime::ChannelLabel,
+            ) -> Result<String, String> {
+                flotilla_provider_runtime::ProcessCommandRunner.run(cmd, args, cwd, label).await
+            }
+            async fn run_output(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &flotilla_provider_runtime::ChannelLabel,
+            ) -> Result<CommandOutput, String> {
+                if cmd == "cat" {
+                    return Err("orphan probe unavailable".into());
+                }
+                flotilla_provider_runtime::ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+            }
+            async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+                flotilla_provider_runtime::ProcessCommandRunner.exists(cmd, args).await
+            }
+        }
+        for relative in [false, true] {
+            for dirty in [false, true] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let source = dir.path().join("source");
+                let target = dir.path().join("checkout");
+                std::fs::create_dir(&source).expect("source");
+                git(&source, &["init", "-b", "main"]);
+                std::fs::write(source.join("README.md"), "initial\n").expect("tracked file");
+                git(&source, &["add", "."]);
+                git(&source, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"]);
+                let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
+                let vcs = test_fl(&source, runner, true);
+                let path = target.to_str().expect("path");
+                vcs.materialise_checkout("convoy/work", Some("main"), path, "managed").await.expect("materialise");
+                let metadata = vcs.worktree_metadata(&target).await.expect("metadata");
+                if relative {
+                    let name = metadata.admin_dir.file_name().expect("admin name").to_str().expect("name");
+                    std::fs::write(target.join(".git"), format!("gitdir: ../source/.git/worktrees/{name}\n")).expect("relative pointer");
+                }
+                std::fs::remove_dir_all(metadata.admin_dir).expect("prune worktree admin directory");
+                if dirty {
+                    std::fs::write(target.join("README.md"), "changed\n").expect("tracked change");
+                    std::fs::write(target.join("untracked"), "keep me").expect("untracked file");
+                }
+                let failing = test_fl(&source, Arc::new(FailOrphanProbeRunner), true);
+                let normal_error = failing.remove_materialised_checkout("convoy/work", path).await.expect_err("normal probes fail");
+                assert!(
+                    normal_error.contains("resolve shared Git directory") && normal_error.contains("orphan probe unavailable"),
+                    "both normal failures must be retained: {normal_error}"
+                );
+                let force_error = failing.force_remove_materialised_checkout("convoy/work", path).await.expect_err("forced probes fail");
+                assert!(
+                    force_error.contains("resolve shared Git directory") && force_error.contains("orphan probe unavailable"),
+                    "both forced failures must be retained: {force_error}"
+                );
+                let expected =
+                    CheckoutRemoval::PreservedCheckout { path: path.into(), reason: CheckoutPreservationReason::OrphanedCheckout };
+                for _ in 0..2 {
+                    assert_eq!(vcs.remove_materialised_checkout("convoy/work", path).await.expect("normal teardown"), expected);
+                    assert_eq!(vcs.force_remove_materialised_checkout("convoy/work", path).await.expect("forced teardown"), expected);
+                    assert_eq!(
+                        std::fs::read_to_string(target.join("README.md")).expect("preserved contents"),
+                        if dirty { "changed\n" } else { "initial\n" }
+                    );
+                    assert_eq!(target.join("untracked").exists(), dirty);
+                }
+            }
+        }
     }
 
     // #2682: Git allocates distinct admin names for colliding target basenames.

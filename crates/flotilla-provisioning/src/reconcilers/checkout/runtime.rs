@@ -193,7 +193,13 @@ impl CheckoutControllerRuntime {
                 // the last path from which its VCS can still be discovered.
                 let registration = if runner.path_exists(&Path::new(target_path).join(".git")).await? {
                     let vcs = controller_vcs(&self.vcs, &self.runner, target_path)?;
-                    vcs.checkout_registration(target_path, CheckoutRegistration::Release).await?;
+                    if let Err(error) = vcs.checkout_registration(target_path, CheckoutRegistration::Release).await {
+                        return match vcs.orphaned_worktree(target_path).await {
+                            Ok(true) => Ok(CheckoutRemovalOutcome::PreservedOrphanedCheckout { path: target_path.to_string() }),
+                            Ok(false) => Err(error),
+                            Err(probe_error) => Err(format!("{error}; orphaned worktree probe failed: {probe_error}")),
+                        };
+                    }
                     Some(vcs)
                 } else {
                     None
@@ -250,6 +256,10 @@ impl CheckoutControllerRuntime {
                         };
                         Ok(CheckoutRemovalOutcome::PreservedBranch { branch, reason })
                     }
+                    core_vcs::CheckoutRemoval::PreservedCheckout {
+                        path,
+                        reason: core_vcs::CheckoutPreservationReason::OrphanedCheckout,
+                    } => Ok(CheckoutRemovalOutcome::PreservedOrphanedCheckout { path }),
                     core_vcs::CheckoutRemoval::PreservedCheckout { path, reason } => Err(format!("checkout {path} preserved: {reason:?}")),
                 }
             }

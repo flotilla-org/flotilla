@@ -50,6 +50,7 @@ pub enum CheckoutRemovalOutcome {
     Removed,
     ArchivedAndRemoved { archive_path: String },
     PreservedBranch { branch: String, reason: BranchPreservationReason },
+    PreservedOrphanedCheckout { path: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -791,6 +792,23 @@ where
             {
                 warn!(%error, %archive_path, "could not record checkout archive location event");
             }
+        }
+        if let CheckoutRemovalOutcome::PreservedOrphanedCheckout { path } = &outcome {
+            // Persist the location before releasing the finalizer. Unlike a
+            // transient Git failure, a pruned registration cannot heal on retry.
+            EventRecorder::new(self.backend.clone())
+                .record(
+                    ObjectEvent::for_object(
+                        obj,
+                        "OrphanedCheckoutPreserved",
+                        format!(
+                            "checkout {path} preserved: Git admin directory is missing; inspect and recover the files before removing it"
+                        ),
+                    ),
+                    self.clock.now(),
+                )
+                .await?;
+            warn!(%path, "preserved orphaned checkout during cleanup");
         }
         if let CheckoutRemovalOutcome::PreservedBranch { branch, reason } = outcome {
             warn!(%branch, ?reason, "preserved branch during checkout cleanup");

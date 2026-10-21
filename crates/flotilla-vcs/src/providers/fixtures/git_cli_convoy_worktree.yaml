@@ -1,19 +1,29 @@
 rounds:
 - interactions:
   - channel: command
+    cmd: cat
+    args:
+    - --
+    - '{root}/convoy-new/.git'
+    cwd: /
+    stdout: |
+      gitdir: {root}/repo/.git/worktrees/convoy-new
+    stderr: ''
+    exit_code: 0
+  - channel: command
     cmd: find
     args:
-    - '.'
-    - '-path'
-    - './.git'
-    - '-prune'
-    - '-o'
-    - '-mindepth'
+    - .
+    - -path
+    - ./.git
+    - -prune
+    - -o
+    - -mindepth
     - '2'
-    - '-name'
-    - '.git'
-    - '-print'
-    - '-prune'
+    - -name
+    - .git
+    - -print
+    - -prune
     cwd: '{root}/convoy-new'
     stdout: ''
     stderr: ''
@@ -21,11 +31,11 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - show-ref
-    - '--verify'
-    - '--quiet'
+    - --verify
+    - --quiet
     - refs/heads/convoy/new
     cwd: /
     stderr: ''
@@ -33,7 +43,7 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - remote
     - get-url
@@ -45,10 +55,10 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - ls-remote
-    - '--heads'
+    - --heads
     - origin
     - refs/heads/convoy/new
     cwd: /
@@ -57,11 +67,11 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - show-ref
-    - '--verify'
-    - '--quiet'
+    - --verify
+    - --quiet
     - refs/remotes/origin/convoy/new
     cwd: /
     stderr: ''
@@ -69,22 +79,22 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - fetch
     - origin
-    - '+main:refs/remotes/origin/main'
+    - +main:refs/remotes/origin/main
     cwd: /
     stdout: ''
     exit_code: 0
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - show-ref
-    - '--verify'
-    - '--quiet'
+    - --verify
+    - --quiet
     - refs/remotes/origin/main
     cwd: /
     stdout: ''
@@ -92,61 +102,61 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - worktree
     - add
-    - '--lock'
-    - '--reason'
+    - --lock
+    - --reason
     - 'flotilla-managed: convoy/new'
-    - '-b'
+    - -b
     - convoy/new
     - '{root}/convoy-new'
     - origin/main
     cwd: /
     stdout: |
       branch 'convoy/new' set up to track 'origin/main'.
-      HEAD is now at 885b93d initial
+      HEAD is now at a17f51f initial
     exit_code: 0
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/convoy-new'
-    - '--git-dir=.git'
+    - --git-dir=.git
     - rev-parse
     - HEAD
     cwd: /
     stdout: |
-      885b93deb9a32f734e5e4454d37b6a94d4fc1021
+      a17f51fc42007eaae38e6b637c569e284de7f152
     exit_code: 0
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - update-ref
     - refs/flotilla/bootstrap/convoy/new
-    - '885b93deb9a32f734e5e4454d37b6a94d4fc1021'
+    - a17f51fc42007eaae38e6b637c569e284de7f152
     cwd: /
     stdout: ''
     exit_code: 0
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - worktree
     - list
-    - '--porcelain'
-    - '-z'
+    - --porcelain
+    - -z
     cwd: /
-    stdout: "worktree {root}/repo\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
+    stdout: "worktree {root}/repo\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
     exit_code: 0
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - worktree
     - repair
@@ -157,24 +167,24 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - worktree
     - list
-    - '--porcelain'
-    - '-z'
+    - --porcelain
+    - -z
     cwd: /
-    stdout: "worktree {root}/repo\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
+    stdout: "worktree {root}/repo\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
     exit_code: 0
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/convoy-new'
-    - '--git-dir=.git'
+    - --git-dir=.git
     - symbolic-ref
-    - '--quiet'
-    - '--short'
+    - --quiet
+    - --short
     - HEAD
     cwd: /
     stdout: |
@@ -183,11 +193,11 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/convoy-new'
-    - '--git-dir=.git'
+    - --git-dir=.git
     - status
-    - '--porcelain'
+    - --porcelain
     cwd: /
     stdout: |
       ?? untracked.txt
@@ -196,12 +206,12 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/convoy-new'
-    - '--git-dir=.git'
+    - --git-dir=.git
     - symbolic-ref
-    - '--quiet'
-    - '--short'
+    - --quiet
+    - --short
     - HEAD
     cwd: /
     stderr: ''
@@ -209,12 +219,12 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/convoy-new'
-    - '--git-dir=.git'
+    - --git-dir=.git
     - symbolic-ref
-    - '--quiet'
-    - '--short'
+    - --quiet
+    - --short
     - HEAD
     cwd: /
     stdout: |
@@ -223,11 +233,11 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/convoy-new'
-    - '--git-dir=.git'
+    - --git-dir=.git
     - status
-    - '--porcelain'
+    - --porcelain
     cwd: /
     stdout: ''
     stderr: ''
@@ -235,31 +245,31 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - worktree
     - list
-    - '--porcelain'
-    - '-z'
+    - --porcelain
+    - -z
     cwd: /
-    stdout: "worktree {root}/repo\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
+    stdout: "worktree {root}/repo\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
     exit_code: 0
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - worktree
     - list
-    - '--porcelain'
-    - '-z'
+    - --porcelain
+    - -z
     cwd: /
-    stdout: "worktree {root}/repo\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
+    stdout: "worktree {root}/repo\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
     exit_code: 0
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - worktree
     - unlock
@@ -270,11 +280,11 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - worktree
     - remove
-    - '--force'
+    - --force
     - '{root}/convoy-new'
     cwd: /
     stdout: ''
@@ -283,7 +293,7 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - worktree
     - prune
@@ -293,64 +303,64 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - rev-parse
-    - '--verify'
+    - --verify
     - refs/heads/convoy/new
     cwd: /
     stdout: |
-      885b93deb9a32f734e5e4454d37b6a94d4fc1021
+      a17f51fc42007eaae38e6b637c569e284de7f152
     stderr: ''
     exit_code: 0
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - rev-parse
-    - '--verify'
+    - --verify
     - refs/flotilla/bootstrap/convoy/new
     cwd: /
     stdout: |
-      885b93deb9a32f734e5e4454d37b6a94d4fc1021
+      a17f51fc42007eaae38e6b637c569e284de7f152
     stderr: ''
     exit_code: 0
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - worktree
     - list
-    - '--porcelain'
+    - --porcelain
     cwd: /
     stdout: |+
       worktree {root}/repo
-      HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021
+      HEAD a17f51fc42007eaae38e6b637c569e284de7f152
       branch refs/heads/main
 
     exit_code: 0
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - branch
-    - '--delete'
-    - '--force'
+    - --delete
+    - --force
     - convoy/new
     cwd: /
     stdout: |
-      Deleted branch convoy/new (was 885b93d).
+      Deleted branch convoy/new (was a17f51f).
     exit_code: 0
   - channel: command
     cmd: git
     args:
-    - '-C'
+    - -C
     - '{root}/repo'
     - update-ref
-    - '-d'
+    - -d
     - refs/flotilla/bootstrap/convoy/new
     cwd: /
     stdout: ''
@@ -358,7 +368,7 @@ rounds:
   - channel: command
     cmd: rm
     args:
-    - '-rf'
+    - -rf
     - '{root}/convoy-new'
     cwd: /
     stdout: ''
@@ -366,7 +376,7 @@ rounds:
   - channel: command
     cmd: test
     args:
-    - '-L'
+    - -L
     - '{root}/convoy-new'
     cwd: /
     stdout: ''
@@ -375,7 +385,7 @@ rounds:
   - channel: command
     cmd: test
     args:
-    - '-e'
+    - -e
     - '{root}/convoy-new'
     cwd: /
     stdout: ''
@@ -384,7 +394,7 @@ rounds:
   - channel: command
     cmd: test
     args:
-    - '-e'
+    - -e
     - '{root}/convoy-new'
     cwd: /
     stdout: ''
@@ -393,7 +403,7 @@ rounds:
   - channel: command
     cmd: test
     args:
-    - '-e'
+    - -e
     - '{root}/convoy-new'
     cwd: /
     stdout: ''
@@ -402,7 +412,7 @@ rounds:
   - channel: command
     cmd: test
     args:
-    - '-e'
+    - -e
     - '{root}/convoy-new'
     cwd: /
     stdout: ''
@@ -411,7 +421,16 @@ rounds:
   - channel: command
     cmd: test
     args:
-    - '-e'
+    - -e
+    - '{root}/repo/.git/worktrees/convoy-new'
+    cwd: /
+    stdout: ''
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: test
+    args:
+    - -e
     - '{root}/convoy-new'
     cwd: /
     stdout: ''
@@ -420,7 +439,7 @@ rounds:
   - channel: command
     cmd: test
     args:
-    - '-e'
+    - -e
     - '{root}/convoy-new'
     cwd: /
     stdout: ''
@@ -429,7 +448,7 @@ rounds:
   - channel: command
     cmd: test
     args:
-    - '-e'
+    - -e
     - '{root}/convoy-new'
     cwd: /
     stdout: ''
@@ -438,7 +457,7 @@ rounds:
   - channel: command
     cmd: test
     args:
-    - '-e'
+    - -e
     - '{root}/convoy-new'
     cwd: /
     stdout: ''
