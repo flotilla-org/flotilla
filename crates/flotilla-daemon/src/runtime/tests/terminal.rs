@@ -641,7 +641,8 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
                 message: None,
             },
             cwd: session_cwd.display().to_string(),
-            env: BTreeMap::new(),
+            // A declared environment claim never makes the daemon host's own session contained.
+            env: BTreeMap::from([("FLOTILLA_ENVIRONMENT_ID".to_string(), "declared-claim".to_string())]),
             pool: "fake-terminals".to_string(),
         };
         let session_name = "terminal-demo-work-coder";

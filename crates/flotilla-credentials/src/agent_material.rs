@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -355,16 +355,27 @@ done"#,
                     .rev()
                     .find(|(key, _)| key == variable)
                     .map(|(_, value)| PathBuf::from(value))
-                    .filter(|home| home.is_absolute() && home.starts_with(&config_base));
+                    // `starts_with` compares components lexically, so a `..`
+                    // could climb out of the base while appearing inside it.
+                    .filter(|home| {
+                        home.is_absolute()
+                            && home.starts_with(&config_base)
+                            && home.components().all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+                    });
                 let home = match delivered {
                     Some(home) => home,
                     None => config_base.join("agent-homes").join(environment_ref).join(adapter.host_home_name()),
                 };
                 let home_text = home.to_string_lossy().into_owned();
                 runner
-                    .run("mkdir", &["-p", "-m", "700", &home_text], Path::new("/"), &ChannelLabel::Default)
+                    .run("mkdir", &["-p", &home_text], Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|error| format!("create {} home {home_text}: {error}", adapter.id()))?;
+                // Owner-only even when an earlier generation created the home.
+                runner
+                    .run("chmod", &["700", &home_text], Path::new("/"), &ChannelLabel::Default)
+                    .await
+                    .map_err(|error| format!("protect {} home {home_text}: {error}", adapter.id()))?;
                 adapter.adopt_ambient_login(&home, runner).await?;
                 result.retain(|(key, _)| key != variable);
                 result.push((variable.into(), home_text));
@@ -1664,9 +1675,10 @@ esac
     // #3655: an agentless session's harness homes live under the host runner's
     // writable base. A delivered credential home there is kept (and gains the
     // per-crew home); a home outside it, such as the host user's own config,
-    // or none at all is replaced by the environment's flotilla-owned home, and
-    // only Codex adopts the host login. Cases: delivered, host-pointing and
-    // absent homes for both harnesses.
+    // one escaping it through `..`, or none at all is replaced by the
+    // environment's flotilla-owned home, and
+    // only Codex adopts the host login. Cases: delivered, host-pointing,
+    // escaping and absent homes for both harnesses.
     #[tokio::test]
     async fn host_harness_homes_are_flotilla_owned_under_the_runner_base() {
         let registry = test_registry(Arc::new(TestEnvVars::new([("HOME", "/controller-home")])));
@@ -1681,6 +1693,12 @@ esac
             (
                 Some("/home/crew/.claude"),
                 Some("/home/crew/.codex"),
+                "/host/state/flotilla/agent-homes/host-direct-b3/claude/crews/coder",
+                "/host/state/flotilla/agent-homes/host-direct-b3/codex",
+            ),
+            (
+                Some("/host/state/flotilla/../../../home/crew/.claude"),
+                Some("/host/state/flotilla/credentials/../../../home/crew/.codex"),
                 "/host/state/flotilla/agent-homes/host-direct-b3/claude/crews/coder",
                 "/host/state/flotilla/agent-homes/host-direct-b3/codex",
             ),
@@ -1711,7 +1729,8 @@ esac
             let claude_home =
                 Path::new(expected_claude).parent().and_then(Path::parent).expect("claude home").to_string_lossy().into_owned();
             for home in [&claude_home, &expected_codex.to_string()] {
-                assert!(calls.iter().any(|call| call == &["mkdir", "-p", "-m", "700", home]), "{home} created: {calls:?}");
+                assert!(calls.iter().any(|call| call == &["mkdir", "-p", home]), "{home} created: {calls:?}");
+                assert!(calls.iter().any(|call| call == &["chmod", "700", home]), "{home} owner-only: {calls:?}");
             }
             let adoptions =
                 calls.iter().filter(|call| call.get(3).map(String::as_str) == Some("flotilla-codex-ambient-login")).collect::<Vec<_>>();

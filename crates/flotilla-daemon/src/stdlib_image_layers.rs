@@ -119,7 +119,10 @@ pub(crate) fn harness_session_environment() -> &'static [(String, String)] {
 
 /// Literal `ENV NAME=value` assignments of the harness layers. Values that
 /// expand variables or name image-only paths (`/opt/flotilla`) cannot hold on
-/// a bare host and are left out with the host-owned names.
+/// a bare host and are left out with the host-owned names. Only the
+/// single-assignment form is read: an unquoted value holding whitespace (a
+/// multi-pair `ENV A=1 B=2` line, or the legacy `ENV A 1` form) is skipped
+/// rather than mis-split, and the pinned test below then reports the loss.
 fn harness_environment_from(directories: &[EmbeddedLayerDirectory]) -> Vec<(String, String)> {
     let mut environment: Vec<(String, String)> = Vec::new();
     for layer in HARNESS_ENVIRONMENT_LAYERS {
@@ -132,7 +135,11 @@ fn harness_environment_from(directories: &[EmbeddedLayerDirectory]) -> Vec<(Stri
                 continue;
             };
             let value = value.trim();
-            let value = value.strip_prefix('"').and_then(|value| value.strip_suffix('"')).unwrap_or(value);
+            let value = match value.strip_prefix('"').and_then(|value| value.strip_suffix('"')) {
+                Some(quoted) => quoted,
+                None if value.contains(char::is_whitespace) => continue,
+                None => value,
+            };
             let literal_name = !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
             if !literal_name || HOST_OWNED_ENVIRONMENT.contains(&name) || value.contains('$') || value.contains("/opt/flotilla") {
                 continue;
@@ -196,7 +203,7 @@ mod tests {
 
     // Image-only values (expansions, `/opt/flotilla` paths) and host-owned
     // names never reach a bare host; a later layer's value wins; layers outside
-    // the harness set and malformed lines contribute nothing.
+    // the harness set and malformed or multi-pair lines contribute nothing.
     #[test]
     fn harness_environment_keeps_only_literal_host_applicable_assignments() {
         static LAYERS: &[EmbeddedLayerDirectory] = &[
@@ -204,7 +211,7 @@ mod tests {
                 directory: "base-ubuntu-24.04",
                 files: &[(
                     "Dockerfile.fragment",
-                    b"FROM ${BASE}\nENV SHELL=/bin/bash\nENV LANG=C.UTF-8\nENV TERMINFO_DIRS=/opt/flotilla/share/terminfo\nENV PATH=\"/usr/bin\"\nENV broken\n",
+                    b"FROM ${BASE}\nENV SHELL=/bin/bash\nENV LANG=C.UTF-8\nENV TERMINFO_DIRS=/opt/flotilla/share/terminfo\nENV PATH=\"/usr/bin\"\nENV broken\nENV A=1 B=2\n",
                     false,
                 )],
             },

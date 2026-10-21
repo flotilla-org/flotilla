@@ -123,7 +123,9 @@ not from the login user's own configuration:
 - Claude Code uses the delivered credential's config directory
   (`<base>/credentials/<credential>/claude`), with a per-crew
   `crews/<role>` home inside it. Onboarding, workspace trust for the checkout
-  and attribution suppression are seeded there.
+  and attribution suppression are seeded there. A Claude crew needs a granted
+  `claude-oauth` credential: the login user's own Claude login is not used, and
+  a launch without one is refused with that reason.
 - Codex uses `<base>/agent-homes/<environment>/codex`, or a delivered Codex key's
   home. Workspace trust is seeded in that home's `config.toml`, and the host's
   existing Codex login (`auth.json`) is linked into it.
@@ -131,8 +133,10 @@ not from the login user's own configuration:
   `DISABLE_INSTALLATION_CHECKS`, `GH_NO_UPDATE_NOTIFIER`, `LANG`), read from the
   stdlib image layers.
 
-The login user's `~/.claude`, `~/.claude.json` and `~/.codex/config.toml` are
-never written. Skills are not staged on agentless hosts yet.
+Flotilla never writes the login user's `~/.claude`, `~/.claude.json` or
+`~/.codex/config.toml`. The linked Codex `auth.json` is the exception by
+design: a crew that refreshes its token updates the host's one login file.
+Skills are not staged on agentless hosts yet.
 
 The admission free-space floor below is checked against the SSH host's
 `~/dev/flotilla-repos` checkout volume using its remote `df` result.

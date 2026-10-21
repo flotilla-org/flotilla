@@ -442,6 +442,10 @@ impl TerminalRuntime for TerminalControllerRuntime {
             // the session states it too, so the harness sees what it runs in.
             credential_env.retain(|(key, _)| key != FLOTILLA_ENVIRONMENT_ID_ENV);
             credential_env.push((FLOTILLA_ENVIRONMENT_ID_ENV.to_string(), spec.env_ref.clone()));
+        } else {
+            // The daemon host's own session is never contained, whatever a
+            // declared or delivered environment claims.
+            credential_env.retain(|(key, _)| key != FLOTILLA_ENVIRONMENT_ID_ENV);
         }
         let (command, mut env, crew) = match &spec.source {
             TerminalSessionSource::Tool { command } => (command.clone(), credential_env.clone(), None),
@@ -483,6 +487,13 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 // #3655: an agentless crew's harness home is flotilla-owned and
                 // lives on the host, under its runner's writable base.
                 if let Some(profile) = agentless {
+                    if requirement.adapter == "claude-code" && !credential_env.iter().any(|(key, _)| key == "CLAUDE_CODE_OAUTH_TOKEN") {
+                        return Err(format!(
+                            "agentless Claude Code crews on {} require a delivered Claude OAuth credential (grant a `claude-oauth` \
+                             credential to the crew); the host login's own Claude configuration is not used",
+                            spec.env_ref
+                        ));
+                    }
                     let material = self
                         .state
                         .agent_material

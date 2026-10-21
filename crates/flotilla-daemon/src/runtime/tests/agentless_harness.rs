@@ -193,6 +193,11 @@ impl AgentlessLaunch {
 /// `codex` have never been run, through the terminal runtime's real launch
 /// path with the fake host behind the SSH runner.
 async fn launch_on_agentless_host(adapter: &str) -> AgentlessLaunch {
+    try_launch_on_agentless_host(adapter, adapter == "claude-code").await.expect("launch agentless crew")
+}
+
+/// As [`launch_on_agentless_host`], optionally without the Claude credential grant.
+async fn try_launch_on_agentless_host(adapter: &str, grant_claude: bool) -> Result<AgentlessLaunch, String> {
     let temp = TempDir::new().expect("tempdir");
     let config_dir = temp.path().join("config");
     fs::create_dir_all(&config_dir).expect("config directory");
@@ -306,15 +311,20 @@ async fn launch_on_agentless_host(adapter: &str) -> AgentlessLaunch {
         env: BTreeMap::new(),
         pool: "cleat".to_string(),
     };
-    let tags = if adapter == "claude-code" {
+    let tags = if grant_claude {
         vec![TerminalSessionTag { key: CREDENTIAL_REF_SESSION_TAG.to_string(), value: "claude-max".to_string() }]
     } else {
         Vec::new()
     };
-    TerminalControllerRuntime { state }.ensure_session("terminal-demo-work-coder", &spec, &tags).await.expect("launch agentless crew");
+    let launched = TerminalControllerRuntime { state }.ensure_session("terminal-demo-work-coder", &spec, &tags).await;
     let ensured = pool.ensured.lock().await;
+    if let Err(error) = launched {
+        assert!(ensured.is_empty(), "a refused launch started a session");
+        assert_host_harness_untouched(&AgentlessLaunch { host, env: Vec::new() });
+        return Err(error);
+    }
     let [launch] = ensured.as_slice() else { panic!("expected one launch, got {}", ensured.len()) };
-    AgentlessLaunch { host, env: launch.env_vars.clone() }
+    Ok(AgentlessLaunch { host, env: launch.env_vars.clone() })
 }
 
 fn agentless_socket_service(state: &Path) -> EnvironmentSocketService {
@@ -393,4 +403,16 @@ async fn agentless_codex_crew_starts_in_a_prepared_flotilla_home() {
     assert_eq!(launch.host.entry(format!("{home}/auth.json")), Some(HostEntry::Link(PathBuf::from("/home/crew/.codex/auth.json"))));
     assert_image_harness_environment(&launch);
     assert_host_harness_untouched(&launch);
+}
+
+// Review #3659: an agentless Claude crew has no ambient-login fallback, since
+// the host login's configuration is never selected. Without a delivered OAuth
+// credential the launch is refused with a reason naming the missing grant,
+// and nothing starts or touches the host's configuration.
+#[tokio::test]
+async fn agentless_claude_crew_without_a_delivered_credential_is_refused_with_the_reason() {
+    let Err(error) = try_launch_on_agentless_host("claude-code", false).await else {
+        panic!("an agentless Claude crew without a credential must not launch");
+    };
+    assert!(error.contains("require a delivered Claude OAuth credential") && error.contains("claude-oauth"), "{error}");
 }
