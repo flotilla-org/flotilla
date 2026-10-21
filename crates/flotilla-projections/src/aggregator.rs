@@ -1996,6 +1996,7 @@ impl Aggregator {
             unchanged
         });
         let Some(resolver) = self.attach_resolver.clone() else {
+            self.attach_refresh_inputs = inputs;
             self.attachable_sessions.clear();
             return;
         };
@@ -2012,13 +2013,20 @@ impl Aggregator {
             let task = self.attach_refresh_tasks.spawn(async move {
                 let targets = [(name, host)];
                 let mut delay = Duration::from_millis(250);
+                let mut warned = false;
                 loop {
-                    match resolver.resolvable_attach_targets(&targets).await {
+                    let error = match resolver.resolvable_attach_targets(&targets).await {
                         Ok(resolved) if resolved.len() == 1 => {
                             return AttachCapabilityResolution { generation, key: result_key, attachable: resolved[0] };
                         }
-                        Ok(_) => tracing::warn!("terminal capability resolver returned an invalid result count; retrying"),
-                        Err(error) => tracing::warn!(%error, "terminal capability check failed; retrying"),
+                        Ok(_) => "terminal capability resolver returned an invalid result count".to_string(),
+                        Err(error) => error,
+                    };
+                    if warned {
+                        tracing::debug!(%error, "terminal capability check still failing; retrying");
+                    } else {
+                        tracing::warn!(%error, "terminal capability check failed; retrying");
+                        warned = true;
                     }
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(Duration::from_secs(30));
@@ -6872,6 +6880,30 @@ mod tests {
         async fn resolvable_attach_targets(&self, _: &[(String, HostName)]) -> Result<Vec<bool>, String> {
             self.0.lock().await.clone()
         }
+    }
+
+    // A resolver installed after sessions were observed must verify them on the
+    // next refresh. Replacement with identical attach inputs keeps that verified
+    // capability: resource metadata is not part of the terminal's attach target.
+    #[tokio::test]
+    async fn late_attach_resolver_and_identical_target_replacement() {
+        let state = AggregatorProjectionState::new();
+        let (tx, _) = broadcast::channel(64);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
+        aggregator.replace_session_source(LocalSource::Durable, vec![session_object("same-target").await]).await;
+        assert!(state.independents_result_set(&None).await.rows.as_independents().unwrap()[0].attach.is_none());
+        let resolver = Arc::new(CountingAttachResolver::new());
+        aggregator = aggregator.with_attach_resolver(resolver.clone());
+        aggregator.rebuild_independents_projection().await;
+        settle_attach_refresh(&mut aggregator).await;
+        assert!(state.independents_result_set(&None).await.rows.as_independents().unwrap()[0].attach.is_some());
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        let mut replacement = session_object("same-target").await;
+        replacement.metadata.resource_version = "replacement-version".into();
+        aggregator.replace_session_source(LocalSource::Durable, vec![replacement]).await;
+        settle_attach_refresh(&mut aggregator).await;
+        assert!(state.independents_result_set(&None).await.rows.as_independents().unwrap()[0].attach.is_some());
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
     }
 
     // Ordinary running-status updates must preserve a verified opening action
