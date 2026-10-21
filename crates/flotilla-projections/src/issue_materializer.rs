@@ -322,6 +322,8 @@ impl SharedIssueRefresh {
     }
 
     fn retain_sources(&self, query: &QueryId, bindings: &[ResolvedIssueSourceBinding]) {
+        // register inserts the first cursor while holding sources; an empty
+        // cursor map therefore always means there is no remaining query demand.
         let mut sources = self.sources.lock().expect("shared issue sources lock poisoned");
         sources.retain(|source, entry| {
             let mut cursors = entry.cursors.lock().expect("shared issue cursors lock poisoned");
@@ -957,10 +959,12 @@ mod tests {
 
     use super::*;
 
+    // Stand-in for the outbound forge/provider I/O boundary.
     struct ScriptedProvider {
         pages: Mutex<VecDeque<IssueResultPage>>,
         changes: Mutex<VecDeque<IssueChangeset>>,
         errors: Mutex<VecDeque<String>>,
+        query_errors: Mutex<VecDeque<String>>,
         seen_since: Mutex<Vec<String>>,
         seen_queries: Mutex<Vec<IssueQuery>>,
     }
@@ -971,6 +975,7 @@ mod tests {
                 pages: Mutex::new(pages.into()),
                 changes: Mutex::new(changes.into()),
                 errors: Mutex::new(VecDeque::new()),
+                query_errors: Mutex::new(VecDeque::new()),
                 seen_since: Mutex::new(Vec::new()),
                 seen_queries: Mutex::new(Vec::new()),
             }
@@ -1018,6 +1023,9 @@ mod tests {
 
         async fn query(&self, source: &IssueSource, params: &IssueQuery, _page: u32, _count: usize) -> Result<IssueResultPage, String> {
             self.seen_queries.lock().await.push(params.clone());
+            if let Some(error) = self.query_errors.lock().await.pop_front() {
+                return Err(error);
+            }
             let mut page = self.pages.lock().await.pop_front().expect("scripted issue page");
             for issue in &mut page.items {
                 issue.reference.source = source.clone();
@@ -1927,6 +1935,98 @@ mod tests {
         let DaemonEvent::ResultDelta(delta) = next_event(&mut events).await else { panic!("fetch-more must emit a delta") };
         assert!(delta.changes.as_issues().expect("issue changes").is_empty());
         assert!(!delta.state.and_then(|state| state.demand).expect("demand metadata").has_more);
+    }
+
+    // A failed refresh is shared unavailability, not removal of either query's
+    // registration. Only removal of the last demand releases the provider.
+    #[tokio::test(start_paused = true)]
+    async fn shared_source_survives_one_query_failure_and_other_query_removal() {
+        let state = AggregatorProjectionState::new();
+        let first = project_query("first");
+        let second = project_query("second");
+        let source = IssueSource { service: "fake".into(), scope: "shared".into() };
+        let provider = Arc::new(ScriptedProvider::new(vec![page(&["ONE"], false)], vec![]));
+        let resolver = FixedResolver { sources: vec![source.clone()], provider: provider.clone() };
+        subscribe(&state, &first);
+        subscribe(&state, &second);
+        let shared = SharedIssueRefresh::default();
+        let (tx, _) = broadcast::channel(64);
+        let sink: Arc<dyn EventSink> = Arc::new(BroadcastEventSink::new(tx));
+        let mut first_window = load_window(&first, generation(&state, &first), &resolver, &shared, &state, &sink).await;
+        let mut second_window = load_window(&second, generation(&state, &second), &resolver, &shared, &state, &sink).await;
+        let entry = shared.sources.lock().expect("sources")[&source].clone();
+        provider.errors.lock().await.push_back("temporary network error".into());
+        refresh_window(&first, generation(&state, &first), &resolver, &shared, &mut first_window, &state, &sink).await;
+        refresh_window(&second, generation(&state, &second), &resolver, &shared, &mut second_window, &state, &sink).await;
+        assert_eq!(entry.cursors.lock().expect("cursors").len(), 2);
+        assert_eq!(provider.seen_since.lock().await.len(), 1, "queries share the failed observation and retry budget");
+        assert_eq!(entry.pages.lock().await.len(), 1);
+        shared.unregister(&first);
+        assert!(Arc::ptr_eq(&entry, &shared.sources.lock().expect("sources")[&source]));
+        assert_eq!(entry.cursors.lock().expect("cursors").len(), 1);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        refresh_window(&second, generation(&state, &second), &resolver, &shared, &mut second_window, &state, &sink).await;
+        assert!(second_window.conditions.is_empty());
+        assert_eq!(provider.seen_queries.lock().await.len(), 1, "remaining query recovers without a full reload");
+        shared.unregister(&second);
+        assert!(shared.sources.lock().expect("sources").is_empty());
+    }
+
+    // A successful binding list proves removal of one source while preserving
+    // another source's registration and cached first page.
+    #[tokio::test(start_paused = true)]
+    async fn successful_binding_list_releases_only_departed_source() {
+        let state = AggregatorProjectionState::new();
+        let query = project_query("membership");
+        let first = IssueSource { service: "fake".into(), scope: "first".into() };
+        let second = IssueSource { service: "fake".into(), scope: "second".into() };
+        let provider = Arc::new(ScriptedProvider::new(vec![page(&["ONE"], false), page(&["TWO"], false)], vec![]));
+        let mut resolver = FixedResolver { sources: vec![first.clone(), second.clone()], provider: provider.clone() };
+        subscribe(&state, &query);
+        let shared = SharedIssueRefresh::default();
+        let (tx, _) = broadcast::channel(64);
+        let sink: Arc<dyn EventSink> = Arc::new(BroadcastEventSink::new(tx));
+        load_window(&query, generation(&state, &query), &resolver, &shared, &state, &sink).await;
+        let retained = shared.sources.lock().expect("sources")[&second].clone();
+        resolver.sources = vec![second.clone()];
+        let window = load_window(&query, generation(&state, &query), &resolver, &shared, &state, &sink).await;
+        {
+            let sources = shared.sources.lock().expect("sources");
+            assert!(!sources.contains_key(&first));
+            assert!(Arc::ptr_eq(&retained, &sources[&second]));
+        }
+        assert_eq!(window.sources.len(), 1);
+        assert_eq!(window.sources[0].source, second);
+        assert_eq!(provider.seen_queries.lock().await.len(), 2, "retained source reuses its cached page");
+    }
+
+    // An initial query failure retains the registered provider, but still needs
+    // an initial page; recovery must retry query before using changed-since.
+    #[tokio::test(start_paused = true)]
+    async fn initial_load_failure_retains_provider_until_initial_page_recovers() {
+        let state = AggregatorProjectionState::new();
+        let query = project_query("initial-error");
+        let source = IssueSource { service: "fake".into(), scope: "initial-error".into() };
+        let provider = Arc::new(ScriptedProvider::new(vec![page(&["ONE"], false)], vec![]));
+        provider.query_errors.lock().await.push_back("temporary query failure".into());
+        let resolver = FixedResolver { sources: vec![source.clone()], provider: provider.clone() };
+        subscribe(&state, &query);
+        let shared = SharedIssueRefresh::default();
+        let (tx, _) = broadcast::channel(64);
+        let sink: Arc<dyn EventSink> = Arc::new(BroadcastEventSink::new(tx));
+        let mut window = load_window(&query, generation(&state, &query), &resolver, &shared, &state, &sink).await;
+        assert!(window.needs_full_reload);
+        assert_eq!(window.conditions.len(), 1);
+        let entry = shared.sources.lock().expect("sources")[&source].clone();
+        refresh_window(&query, generation(&state, &query), &resolver, &shared, &mut window, &state, &sink).await;
+        assert!(Arc::ptr_eq(&entry, &shared.sources.lock().expect("sources")[&source]));
+        assert!(!window.needs_full_reload);
+        assert!(window.conditions.is_empty());
+        assert_eq!(window.sources[0].rows.len(), 1);
+        assert_eq!(provider.seen_queries.lock().await.len(), 2, "failed initial page is retried once");
+        refresh_window(&query, generation(&state, &query), &resolver, &shared, &mut window, &state, &sink).await;
+        assert_eq!(provider.seen_queries.lock().await.len(), 2);
+        assert_eq!(provider.seen_since.lock().await.len(), 1);
     }
 
     // A transient refresh failure must preserve the provider, page cache and
