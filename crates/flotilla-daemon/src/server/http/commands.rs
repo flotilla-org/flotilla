@@ -150,6 +150,12 @@ struct CommandState {
     completion_scope: CompletionScope,
 }
 
+// Quotas follow the stable crew identity, not per-request session metadata.
+// Record access continues to use its existing full caller identity check.
+fn owner_key(caller: &CommandCaller) -> Option<(&str, &str)> {
+    caller.crew.as_ref().map(|crew| (crew.namespace.as_str(), crew.crew_id.as_str()))
+}
+
 impl Commands {
     pub(super) fn new(router: RemoteCommandRouter, shutdown: mpsc::UnboundedSender<()>, socket_path: PathBuf) -> Self {
         Self {
@@ -170,7 +176,8 @@ impl Commands {
         owner: &CommandCaller,
         now: Instant,
     ) -> Result<Option<Uuid>, &'static str> {
-        let owner_full = owner.crew.is_some() && records.values().filter(|r| r.owner.crew == owner.crew).count() >= CREW_RECORD_LIMIT;
+        let owner_full =
+            owner.crew.is_some() && records.values().filter(|r| owner_key(&r.owner) == owner_key(owner)).count() >= CREW_RECORD_LIMIT;
         let crew_full =
             owner.crew.is_some() && records.values().filter(|r| r.owner.crew.is_some()).count() >= RECORD_LIMIT - OPERATOR_RESERVED_RECORDS;
         if !owner_full && !crew_full && self.capacity.available_permits() > 0 {
@@ -178,9 +185,11 @@ impl Commands {
         }
         // One eviction must satisfy every exhausted quota. Crew pressure cannot
         // consume the operator reservation, even across many distinct owners.
+        // This reserves active capacity, not completed-result retention: at global
+        // exhaustion a crew may evict an eligible operator record.
         records
             .iter()
-            .filter(|(_, r)| !owner_full || r.owner.crew == owner.crew)
+            .filter(|(_, r)| !owner_full || owner_key(&r.owner) == owner_key(owner))
             .filter(|(_, r)| !crew_full || r.owner.crew.is_some())
             .filter_map(|(id, r)| r.state.borrow().evictable_order(now).map(|order| (*id, order)))
             .min_by_key(|(_, order)| *order)
@@ -202,16 +211,6 @@ impl Commands {
             records.remove(&id);
         }
         self.capacity.clone().try_acquire_owned().map_err(|_| RECORD_CAPACITY_ERROR)
-    }
-
-    #[cfg(test)]
-    async fn reserve(&self) -> Result<OwnedSemaphorePermit, &'static str> {
-        self.reserve_at(Instant::now()).await
-    }
-
-    #[cfg(test)]
-    async fn reserve_at(&self, now: Instant) -> Result<OwnedSemaphorePermit, &'static str> {
-        self.reserve_for_at(&CommandCaller { principal_ref: PrincipalRef::default(), process: None, crew: None }, now).await
     }
 }
 
@@ -455,7 +454,7 @@ pub(super) async fn handle(
     let _admission = if kind == "execute" {
         let guard = commands.admission.lock().await;
         if !commands.has_capacity(&caller).await {
-            return encoding.error(StatusCode::CONFLICT, "HTTP command record capacity is occupied by active or pending commands");
+            return encoding.error(StatusCode::CONFLICT, RECORD_CAPACITY_ERROR);
         }
         Some(guard)
     } else {
@@ -463,6 +462,9 @@ pub(super) async fn handle(
     };
     // Hold routing admission across dispatch, not the record table: immediate
     // completions wait here until their watch sender has been registered.
+    // Admission is already serialized. While dispatch holds this lock, progress
+    // for all records queues in the bounded broadcast buffer; lag marks every
+    // active observation unknown, and a later completion can recover it.
     let mut collector_slot = if kind == "execute" { Some(commands.collector.lock().await) } else { None };
     let collector = collector_slot
         .as_mut()
@@ -508,6 +510,8 @@ pub(super) async fn handle(
         let (sender, receiver) = watch::channel(initial);
         let registration = command_id.map(|command_id| {
             let routes = routes.as_mut().expect("execute collector");
+            // Closing the daemon event bus is permanent for this Commands instance;
+            // later records must report unknown rather than pretend observation works.
             if routes.closed {
                 sender.send_modify(|s| {
                     s.observation_lost(
@@ -903,7 +907,7 @@ mod tests {
             let id = Uuid::new_v4();
             ids.push(id);
             let (_, state) = watch::channel(CommandState::new(id, Some(CommandValue::Cancelled), &h.commands.eviction_sequence));
-            let permit = h.commands.reserve().await.unwrap();
+            let permit = h.commands.reserve_for(&user()).await.unwrap();
             h.commands.records.lock().await.insert(
                 id,
                 Record {
@@ -1689,6 +1693,29 @@ mod tests {
         }
     }
 
+    // Behaviour: session/role metadata cannot mint another quota bucket for
+    // the same stable crew; another namespace or crew ID remains independent.
+    #[tokio::test]
+    async fn owner_quota_uses_stable_crew_identity() {
+        let h = Harness::new().await;
+        let owner = crew_owner(0);
+        for _ in 0..CREW_RECORD_LIMIT {
+            insert_live(&h.commands, owner.clone()).await;
+        }
+        for terminal in [None, Some("terminal-a"), Some("terminal-b")] {
+            let mut alias = owner.clone();
+            let crew = alias.crew.as_mut().unwrap();
+            crew.terminal_session = terminal.map(str::to_string);
+            crew.role = "changed-role".into();
+            crew.convoy = "changed-convoy".into();
+            assert!(h.commands.reserve_for(&alias).await.is_err());
+        }
+        let mut other_namespace = owner.clone();
+        other_namespace.crew.as_mut().unwrap().namespace = "other".into();
+        assert!(h.commands.reserve_for(&other_namespace).await.is_ok());
+        assert!(h.commands.reserve_for(&crew_owner(1)).await.is_ok());
+    }
+
     // Behaviour: many independent crews cannot consume the reserved operator
     // slots. Every crew remains within its own quota at the aggregate boundary.
     #[tokio::test]
@@ -1797,13 +1824,14 @@ mod tests {
     }
 
     // Full capacity rejects live work; when completions exist, completion order rather
-    // than UUID order selects eviction, including completions with a reserved permit.
+    // than UUID order selects eviction, including a crew replacing a completed
+    // operator record at global exhaustion while its new permit is reserved.
     #[tokio::test]
     async fn record_capacity_evicts_oldest_completion() {
         let h = Harness::new().await;
         for n in 0..RECORD_LIMIT {
             let id = Uuid::from_u128((RECORD_LIMIT - n) as u128);
-            let permit = h.commands.reserve().await.unwrap();
+            let permit = h.commands.reserve_for(&user()).await.unwrap();
             let (_, receiver) = watch::channel(CommandState::new(id, None, &h.commands.eviction_sequence));
             h.commands
                 .records
@@ -1811,14 +1839,14 @@ mod tests {
                 .await
                 .insert(id, Record { _permit: permit, command_id: Some(n as u64), owner: user(), state: receiver, _registration: None });
         }
-        assert!(h.commands.reserve().await.is_err());
+        assert!(h.commands.reserve_for(&user()).await.is_err());
         let oldest_id = Uuid::from_u128(RECORD_LIMIT as u128);
         for id in [oldest_id, Uuid::from_u128(1)] {
             let (sender, receiver) = watch::channel(CommandState::new(id, Some(CommandValue::Cancelled), &h.commands.eviction_sequence));
             h.commands.records.lock().await.get_mut(&id).unwrap().state = receiver;
             drop(sender);
         }
-        let permit = h.commands.reserve().await.unwrap();
+        let permit = h.commands.reserve_for(&crew_owner(0)).await.unwrap();
         let records = h.commands.records.lock().await;
         assert!(!records.contains_key(&oldest_id));
         assert!(records.contains_key(&Uuid::from_u128(1)));
@@ -1889,7 +1917,7 @@ mod tests {
         let h = Harness::new().await;
         let id = Uuid::new_v4();
         let (_, receiver) = watch::channel(CommandState::new(id, None, &h.commands.eviction_sequence));
-        let permit = h.commands.reserve().await.unwrap();
+        let permit = h.commands.reserve_for(&user()).await.unwrap();
         h.commands
             .records
             .lock()
@@ -1909,7 +1937,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (events, receiver) = broadcast::channel(4);
         let (sender, state) = watch::channel(CommandState::new(id, None, &h.commands.eviction_sequence));
-        let permit = h.commands.reserve().await.unwrap();
+        let permit = h.commands.reserve_for(&user()).await.unwrap();
         h.commands
             .records
             .lock()
@@ -1973,7 +2001,7 @@ mod tests {
         let collector = ProgressCollector::new(events.subscribe(), h.commands.eviction_sequence.clone());
         for n in 0..RECORD_LIMIT {
             let id = Uuid::from_u128((RECORD_LIMIT - n) as u128);
-            let permit = h.commands.reserve_at(now).await.unwrap();
+            let permit = h.commands.reserve_for_at(&user(), now).await.unwrap();
             let mut state = CommandState::new(id, None, &h.commands.eviction_sequence);
             state.observation_lost("lost completion".into(), false, &h.commands.eviction_sequence);
             state.unknown_since = Some(now);
@@ -1990,8 +2018,8 @@ mod tests {
                 Record { _permit: permit, command_id: Some(n as u64), owner: user(), state: receiver, _registration: registration },
             );
         }
-        assert!(h.commands.reserve_at(now + UNKNOWN_RETENTION - Duration::from_nanos(1)).await.is_err());
-        let permit = h.commands.reserve_at(now + UNKNOWN_RETENTION).await.unwrap();
+        assert!(h.commands.reserve_for_at(&user(), now + UNKNOWN_RETENTION - Duration::from_nanos(1)).await.is_err());
+        let permit = h.commands.reserve_for_at(&user(), now + UNKNOWN_RETENTION).await.unwrap();
         assert!(!h.commands.records.lock().await.contains_key(&Uuid::from_u128(RECORD_LIMIT as u128)));
         assert_eq!(h.commands.records.lock().await.len(), RECORD_LIMIT - 1);
         let mut first_state = first_state.unwrap();
@@ -2018,7 +2046,7 @@ mod tests {
             let collector = ProgressCollector::new(input, h.commands.eviction_sequence.clone());
             collector.routes.lock().await.senders.insert(77, sender);
             let registration = Some(collector.registration(77));
-            let permit = h.commands.reserve().await.unwrap();
+            let permit = h.commands.reserve_for(&user()).await.unwrap();
             h.commands
                 .records
                 .lock()
@@ -2060,7 +2088,7 @@ mod tests {
         drop(events);
         collect_progress(input, 77, sender, h.commands.eviction_sequence.clone(), CompletionScope::default()).await;
         assert!(receiver.borrow().evictable_order(Instant::now()).is_some());
-        let permit = h.commands.reserve().await.unwrap();
+        let permit = h.commands.reserve_for(&user()).await.unwrap();
         h.commands
             .records
             .lock()
