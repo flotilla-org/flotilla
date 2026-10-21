@@ -172,6 +172,13 @@ fn rebuild_prefers_awareness_transport_when_available() {
         !patches.iter().any(|patch| patch.target == independent_entity("scratch")),
         "raw independent fallback is not projected once awareness is available"
     );
+    state.apply_event(&awareness_set(2, vec![]));
+    let patches = state.rebuild(&mint());
+    assert!(
+        patches.iter().any(|patch| patch.target == independent_entity("scratch")),
+        "removing the last awareness node restores raw fallback"
+    );
+    assert_incremental_matches_full(&state, chrono::Utc::now());
 }
 
 struct RecordingSink {
@@ -839,8 +846,10 @@ async fn connector_bootstraps_replicated_subjects_and_publishes_watch_updates() 
     let _ = handle.await;
 }
 
+// Configuration changes must invalidate both the definition snapshot and per-source
+// aliases. Removing the last source input releases its cached resolution.
 #[tokio::test]
-async fn connector_uses_project_aliases_for_previous_generation_remote_repositories() {
+async fn connector_refreshes_configuration_and_retires_source_aliases() {
     use flotilla_resources::{
         Forge, ForgeKind, ForgeSpec, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository,
         RepositorySpec, Resource,
@@ -896,13 +905,63 @@ async fn connector_uses_project_aliases_for_previous_generation_remote_repositor
         rows: Rows::Convoys { scope: None, rows: vec![linked_subject_convoy()] },
         state: Default::default(),
     })));
-    for envelope in [subject_envelope(), forge, repository, project] {
-        state.apply_resource_records(&envelope).expect("apply resource");
+    state.apply_resource_records(&subject_envelope()).expect("subject");
+    for envelope in [&forge, &repository, &project] {
+        state.apply_resource_records(envelope).expect("apply resource");
     }
     let target = MetadataTarget::Entity(entity::change_request("github.com", "org/flotilla", "42"));
     let patches = state.rebuild(&mint());
     let facts = patches.iter().find(|patch| patch.target == target).expect("request entity");
     assert_eq!(facts.set["display.label"].value, MetadataValue::text("f!42"));
+    let now = chrono::Utc::now();
+    assert_incremental_matches_full(&state, now);
+    assert_eq!(state.resources.cached_source_count(), 1);
+
+    let before = state.resources.configuration();
+    let mut changed = project.clone();
+    changed.records[0].record_type = flotilla_protocol::ResourceRecordType::Modified;
+    changed.records[0].object.as_mut().expect("project")["spec"]["repositories"][0]["alias"] = serde_json::json!("renamed");
+    state.apply_resource_records(&changed).expect("project alias update");
+    assert!(!Arc::ptr_eq(&before, &state.resources.configuration()), "project updates invalidate the definition cache");
+    let patches = state.rebuild_at(&mint(), now);
+    assert_eq!(
+        patches.iter().find(|patch| patch.target == target).expect("alias update").set["display.label"].value,
+        MetadataValue::text("renamed!42")
+    );
+    assert_incremental_matches_full(&state, now);
+
+    let mut removed = repository.clone();
+    removed.records[0].record_type = flotilla_protocol::ResourceRecordType::Deleted;
+    state.apply_resource_records(&removed).expect("repository removal");
+    let patches = state.rebuild_at(&mint(), now);
+    assert_ne!(
+        patches.iter().find(|patch| patch.target == target).expect("alias retraction").set["display.label"].value,
+        MetadataValue::text("renamed!42")
+    );
+    assert_incremental_matches_full(&state, now);
+    state.apply_resource_records(&repository).expect("repository restored");
+    state.rebuild_at(&mint(), now);
+    assert_incremental_matches_full(&state, now);
+
+    let mut changed = forge;
+    changed.records[0].record_type = flotilla_protocol::ResourceRecordType::Modified;
+    changed.records[0].object.as_mut().expect("forge")["spec"]["https_url"] = serde_json::json!("https://code.example");
+    state.apply_resource_records(&changed).expect("forge URL update");
+    let patches = state.rebuild_at(&mint(), now);
+    let forge_target = MetadataTarget::Entity(entity::forge("github"));
+    assert_eq!(
+        patches.iter().find(|patch| patch.target == forge_target).expect("forge update").set["flotilla.forge.web_url"].value,
+        MetadataValue::text("https://code.example")
+    );
+    assert_incremental_matches_full(&state, now);
+
+    ResourceUpdate::Snapshot { namespace: "flotilla".into(), kind: "changerequests".into(), envelopes: vec![] }
+        .apply(&mut state)
+        .expect("source record removed");
+    state.apply_event(&convoys_set(2));
+    state.rebuild_at(&mint(), now);
+    assert_eq!(state.resources.cached_source_count(), 0, "last source input retires the source cache");
+    assert_incremental_matches_full(&state, now);
 }
 
 #[test]
@@ -1776,4 +1835,235 @@ async fn query_gap_preserves_other_queries_and_their_next_deltas() {
     assert_eq!(daemon.subscribe_calls.load(Ordering::SeqCst), 1);
     assert_eq!(daemon.watch_starts.load(Ordering::SeqCst), resources::KINDS.len());
     handle.abort();
+}
+
+fn assert_incremental_matches_full(state: &ConnectorState, now: flotilla_protocol::result_set::Timestamp) {
+    use flotilla_manifest::projection::{project_catalog_with_ttl, CatalogInput};
+    let mut convoys: Vec<_> = state.convoys.values().cloned().collect();
+    convoys.sort_by_key(|row| projection::Node::Convoy(row.resource.clone().into()));
+    let independents: Vec<_> = state.independents.values().cloned().collect();
+    let roles: Vec<_> = state.standing_roles.values().cloned().collect();
+    let projects: Vec<_> = state.project_repositories.values().cloned().collect();
+    let mut awareness: Vec<_> = state.awareness.values().cloned().collect();
+    awareness.sort_by(|a, b| (&a.label, &a.id).cmp(&(&b.label, &b.id)));
+    let mut subjects = state.resources.projection();
+    subjects.now = Some(now);
+    let expected = project_catalog_with_ttl(
+        &CatalogInput {
+            subjects: Some(&subjects),
+            awareness: (!awareness.is_empty()).then_some(awareness.as_slice()),
+            convoys: &convoys,
+            independents: &independents,
+            standing_roles: &roles,
+            project_repositories: &projects,
+        },
+        &mint(),
+        Some(CATALOG_TTL_MS),
+    );
+    let actual = state.catalog.lock().expect("published");
+    assert!(
+        *actual == expected,
+        "incremental/full differences: {:?}",
+        expected.diff_patches(&actual).into_iter().take(6).collect::<Vec<_>>()
+    );
+}
+
+// One changed key must project only that key and its actual joins, independent
+// of unrelated catalog size. This exhausts the small/empty boundaries and a
+// 1,000-convoy target-scale project with awareness enabled and disabled.
+#[test]
+fn projection_work_tracks_changed_keys_instead_of_catalog_size() {
+    for count in [1, 8, 1_000] {
+        for aware in [false, true] {
+            let mut state = ConnectorState::default();
+            let now = chrono::Utc::now();
+            let rows: Vec<_> = (0..count)
+                .map(|index| {
+                    let mut row = linked_subject_convoy();
+                    row.resource.name = format!("convoy-{index}");
+                    row.name = row.resource.name.clone();
+                    row.subjects.clear();
+                    row
+                })
+                .collect();
+            state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
+                seq: 1,
+                rows: Rows::Convoys { scope: None, rows: rows.clone() },
+                state: Default::default(),
+            })));
+            if aware {
+                let mut node = awareness_node();
+                node.entries = rows
+                    .iter()
+                    .map(|row| {
+                        AwarenessEntry::builder()
+                            .id(format!("convoy/{}/{}", row.resource.namespace, row.resource.name))
+                            .kind(AwarenessKind::Convoy)
+                            .label(row.name.clone())
+                            .state(AwarenessState::Active)
+                            .as_of(now)
+                            .build()
+                    })
+                    .collect();
+                node.counts.total = count;
+                state.apply_event(&awareness_set(1, vec![node]));
+            }
+            state.rebuild_at(&mint(), now);
+            assert_incremental_matches_full(&state, now);
+            let before = state.projection.projected_nodes;
+            assert!(state.rebuild_at(&mint(), now).is_empty());
+            assert_eq!(state.projection.projected_nodes, before, "idle publish must not project");
+            let mut changed = rows[0].clone();
+            changed.message = Some("needs attention".into());
+            state.apply_event(&DaemonEvent::ResultDelta(Box::new(ResultDelta {
+                seq: 2,
+                changes: QueryChanges::Convoys { scope: None, changed: vec![changed], removed: vec![] },
+                state: None,
+            })));
+            state.rebuild_at(&mint(), now);
+            assert_eq!(state.projection.projected_nodes - before, if aware { 2 } else { 1 }, "unrelated rows must not project");
+            assert_incremental_matches_full(&state, now);
+            if aware {
+                let before = state.projection.projected_nodes;
+                let mut header = state.awareness.values().next().expect("one node").clone();
+                header.state = AwarenessState::Failed;
+                state.apply_event(&awareness_set(2, vec![header]));
+                state.rebuild_at(&mint(), now);
+                assert_eq!(state.projection.projected_nodes - before, 1, "a header-only change must not rebuild its entries");
+                assert_incremental_matches_full(&state, now);
+            }
+            state.apply_event(&DaemonEvent::ResultDelta(Box::new(ResultDelta {
+                seq: 3,
+                changes: QueryChanges::Convoys { scope: None, changed: vec![], removed: vec![rows[0].resource.clone()] },
+                state: None,
+            })));
+            state.rebuild_at(&mint(), now);
+            assert_incremental_matches_full(&state, now);
+        }
+    }
+}
+
+// A subject/role is a shared dependency, not a single-row fact. Removing a
+// bridge must split components and retract only the removed contributor.
+#[test]
+fn shared_subject_updates_and_component_splits_match_full_projection() {
+    let now = chrono::Utc::now();
+    let mut state = ConnectorState::default();
+    let first = linked_subject_convoy();
+    let mut second = first.clone();
+    second.resource.name = "second".into();
+    second.name = "second".into();
+    let event = |seq, rows| {
+        DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Convoys { scope: None, rows }, state: Default::default() }))
+    };
+    state.apply_event(&event(1, vec![first.clone(), second.clone()]));
+    state.apply_resource_records(&subject_envelope()).expect("observation");
+    state.rebuild_at(&mint(), now);
+    assert_incremental_matches_full(&state, now);
+    ResourceUpdate::Snapshot { namespace: "flotilla".into(), kind: "changerequests".into(), envelopes: vec![] }
+        .apply(&mut state)
+        .expect("empty replacement snapshot");
+    state.rebuild_at(&mint(), now);
+    assert_incremental_matches_full(&state, now);
+    state.apply_resource_records(&subject_envelope()).expect("restored observation");
+    state.rebuild_at(&mint(), now);
+    assert_incremental_matches_full(&state, now);
+    second.subjects.clear();
+    state.apply_event(&event(2, vec![first.clone(), second.clone()]));
+    state.rebuild_at(&mint(), now);
+    assert_incremental_matches_full(&state, now);
+    state.apply_event(&event(3, vec![second]));
+    state.rebuild_at(&mint(), now);
+    assert_incremental_matches_full(&state, now);
+    state.apply_event(&event(4, vec![]));
+    state.rebuild_at(&mint(), now);
+    assert_incremental_matches_full(&state, now);
+}
+
+struct CountingMint {
+    inner: FlotillaRecipes,
+    calls: AtomicUsize,
+}
+
+impl RecipeMint for CountingMint {
+    fn attach(&self, attach_ref: &str, host: &HostName) -> Option<flotilla_manifest::recipe::Recipe> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.attach(attach_ref, host)
+    }
+    fn checkout_terminal(&self, path: &str, host: &HostName) -> Option<flotilla_manifest::recipe::Recipe> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.checkout_terminal(path, host)
+    }
+    fn scoped_view(&self, target: &flotilla_protocol::ViewAddress) -> Option<flotilla_manifest::recipe::Recipe> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.scoped_view(target)
+    }
+}
+
+// Count calls at the real projection collaborator, not only invalidation flags:
+// one changed session mints one recipe at both target and ceiling catalog sizes.
+#[test]
+fn one_changed_session_mints_one_recipe_at_fleet_scale() {
+    for count in [1, 1_000, 10_000] {
+        let mut state = ConnectorState::default();
+        let recipes = CountingMint { inner: mint(), calls: AtomicUsize::new(0) };
+        let now = chrono::Utc::now();
+        state.apply_event(&independents_set(
+            1,
+            (0..count).map(|index| independent_row(&format!("session-{index}"), SessionPhase::Running)).collect(),
+        ));
+        state.rebuild_at(&recipes, now);
+        assert_eq!(recipes.calls.swap(0, Ordering::Relaxed), count);
+        state.apply_event(&independents_delta(2, vec![independent_row("session-0", SessionPhase::Stopped)], vec![]));
+        state.rebuild_at(&recipes, now);
+        assert_eq!(recipes.calls.swap(0, Ordering::Relaxed), 1, "only the changed key mints a recipe");
+        assert!(state.rebuild_at(&recipes, now).is_empty());
+        assert_eq!(recipes.calls.load(Ordering::Relaxed), 0, "idle publication does no projection work");
+    }
+}
+
+// Snapshot key replacement must preserve wire order even when a key is repeated.
+#[test]
+fn duplicate_snapshot_keys_keep_the_last_row() {
+    let mut state = ConnectorState::default();
+    state.apply_event(&independents_set(1, vec![independent_row("same", SessionPhase::Running)]));
+    state.apply_event(&independents_set(
+        2,
+        vec![independent_row("same", SessionPhase::Stopped), independent_row("same", SessionPhase::Running)],
+    ));
+    assert_eq!(state.independents[&independent_row("same", SessionPhase::Running).resource].phase, SessionPhase::Running);
+}
+
+// A connection snapshot replaces both the PM and the acknowledged local mirror;
+// prior facts cannot survive merely because reassertion has no unset list.
+#[tokio::test]
+async fn first_connection_snapshot_matches_the_projected_catalog() {
+    let connector = Connector::default();
+    let mut state = ConnectorState { catalog: connector.catalog.clone(), ..ConnectorState::default() };
+    state.apply_event(&independents_set(1, vec![independent_row("old", SessionPhase::Running)]));
+    state.rebuild(&mint());
+    state.apply_event(&independents_set(2, vec![independent_row("new", SessionPhase::Running)]));
+    let mut sink = RecordingSink::new();
+    sink.mode = LivenessMode::Connection;
+    publish(&mut state, &sink, &mint(), &connector, false).await.expect("snapshot acknowledged");
+    assert_eq!(&*state.catalog.lock().expect("acknowledged"), state.projection.catalog());
+    assert!(sink.publications.lock().expect("publications")[0].0, "first connection publication replaces the PM snapshot");
+}
+
+// Setup failure leaves the current and unstarted namespaces pending. Production
+// session failure also cancels partial watches before rebuilding fresh state.
+#[tokio::test]
+async fn failed_watch_setup_preserves_unfinished_namespaces() {
+    let daemon = Arc::new(MockDaemon::new(vec![]));
+    *daemon.list_failure.lock().expect("failure") = Some("forges".into());
+    let handle: Arc<dyn DaemonHandle> = daemon;
+    let mut state = ConnectorState::default();
+    state.pending_namespaces.insert("later".into());
+    let expected = state.pending_namespaces.clone();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let error = ensure_resource_watches(&handle, &mut state, &mut BTreeSet::new(), &mut tasks, &tx).await.expect_err("watch setup fails");
+    assert!(error.contains("transient list failure"));
+    assert_eq!(state.pending_namespaces, expected);
+    tasks.shutdown().await;
 }

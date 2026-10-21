@@ -594,11 +594,18 @@ pub fn query_for(address: &ViewAddress, source_search: Option<&str>) -> Option<Q
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static PROJECTION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView, String> {
     project_at(address, data, chrono::Utc::now())
 }
 
 fn project_at(address: &ViewAddress, data: &TableRows<'_>, now: Timestamp) -> Result<TableView, String> {
+    #[cfg(test)]
+    PROJECTION_CALLS.with(|count| count.set(count.get() + 1));
     match address {
         ViewAddress::Convoys { namespace, scope } => {
             let query = query_for(address, data.source_search).expect("convoys address has a query");

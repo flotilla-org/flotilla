@@ -34,7 +34,7 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_manifest::{
     keys::{CATALOG_TTL_MS, REASSERT_INTERVAL_MS},
     pm::PmInstance,
-    projection::{project_catalog_with_ttl, Catalog, CatalogInput},
+    projection::Catalog,
     recipe::{FlotillaRecipes, RecipeMint},
     sink::{LivenessMode, PatchSink},
     wire::MetadataPatch,
@@ -155,13 +155,15 @@ pub enum Applied {
 }
 
 mod lifetime;
+mod projection;
 mod resources;
 
 /// The connector's held state: fleet-merged rows per query, per-query
 /// cursors, and the catalog as last published.
 pub struct ConnectorState {
     resources: resources::Records,
-    awareness: Vec<AwarenessNode>,
+    awareness: HashMap<String, AwarenessNode>,
+    projection: projection::Projection,
     convoys: HashMap<ResourceRef, ConvoyRow>,
     independents: HashMap<ResourceRef, IndependentRow>,
     standing_roles: HashMap<ResourceRef, StandingRoleRow>,
@@ -171,13 +173,16 @@ pub struct ConnectorState {
     subscriber_id: uuid::Uuid,
     uncovered_services: BTreeSet<String>,
     snapshots: HashSet<QueryId>,
+    known_namespaces: BTreeSet<String>,
+    pending_namespaces: BTreeSet<String>,
 }
 
 impl Default for ConnectorState {
     fn default() -> Self {
         Self {
             resources: resources::Records::default(),
-            awareness: Vec::new(),
+            awareness: HashMap::new(),
+            projection: projection::Projection::default(),
             convoys: HashMap::new(),
             independents: HashMap::new(),
             standing_roles: HashMap::new(),
@@ -187,14 +192,41 @@ impl Default for ConnectorState {
             subscriber_id: uuid::Uuid::new_v4(),
             uncovered_services: Default::default(),
             snapshots: HashSet::new(),
+            known_namespaces: BTreeSet::from(["flotilla".to_owned()]),
+            pending_namespaces: BTreeSet::from(["flotilla".to_owned()]),
         }
     }
+}
+
+// Full snapshots replace membership; keyed updaters skip unchanged values.
+// Retaining wire order also preserves last-row-wins for duplicate snapshot keys.
+fn snapshot_updates<K: Eq + std::hash::Hash + Clone, R: Clone>(
+    held: &HashMap<K, R>,
+    rows: &[R],
+    key: impl Fn(&R) -> K,
+) -> Vec<(K, Option<R>)> {
+    let retained: HashSet<_> = rows.iter().map(&key).collect();
+    let mut updates: Vec<_> = held.keys().filter(|key| !retained.contains(*key)).map(|key| (key.clone(), None)).collect();
+    updates.extend(rows.iter().map(|row| (key(row), Some(row.clone()))));
+    updates
 }
 
 impl ConnectorState {
     /// Apply a resource list/watch envelope, including replicated records.
     pub fn apply_resource_records(&mut self, envelope: &flotilla_protocol::ResourceReadEnvelope) -> Result<(), String> {
-        self.resources.apply(envelope)
+        self.resources.apply(envelope)?;
+        self.sync_resource_changes();
+        Ok(())
+    }
+
+    fn sync_resource_changes(&mut self) {
+        for key in self.resources.take_changes() {
+            if matches!(key.0.as_str(), "forges" | "repositories" | "projects") {
+                self.projection.invalidate_all();
+            } else {
+                self.projection.change(projection::Node::Record(key.clone()), self.resources.links(&key));
+            }
+        }
     }
 
     pub fn apply_event(&mut self, event: &DaemonEvent) -> Applied {
@@ -215,23 +247,33 @@ impl ConnectorState {
         }
         match &set.rows {
             Rows::Convoys { scope: None, rows } => {
-                self.convoys = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
+                for (key, row) in snapshot_updates(&self.convoys, rows, |row| row.resource.clone()) {
+                    self.update_convoy(key, row);
+                }
             }
             Rows::Convoys { scope: Some(_), .. } => return Applied::Ignored,
             Rows::Independents { scope: None, rows } => {
-                self.independents = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
+                for (key, row) in snapshot_updates(&self.independents, rows, |row| row.resource.clone()) {
+                    self.update_independent(key, row);
+                }
             }
             Rows::Independents { scope: Some(_), .. } => return Applied::Ignored,
             Rows::StandingRoles { scope: None, rows } => {
-                self.standing_roles = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
+                for (key, row) in snapshot_updates(&self.standing_roles, rows, |row| row.resource.clone()) {
+                    self.update_role(key, row);
+                }
             }
             Rows::StandingRoles { scope: Some(_), .. } => return Applied::Ignored,
             Rows::ProjectRepositories { scope: None, rows } => {
-                self.project_repositories = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
+                for (key, row) in snapshot_updates(&self.project_repositories, rows, |row| row.resource.clone()) {
+                    self.update_membership(key, row);
+                }
             }
             Rows::ProjectRepositories { scope: Some(_), .. } => return Applied::Ignored,
             Rows::Awareness { rows, .. } => {
-                self.awareness = rows.clone();
+                for (key, row) in snapshot_updates(&self.awareness, rows, |row| row.id.clone()) {
+                    self.update_awareness(key, row);
+                }
             }
             Rows::DispatchReady { .. } | Rows::Issues { .. } | Rows::Checkouts { .. } => {
                 self.seqs.insert(query, set.seq);
@@ -259,50 +301,47 @@ impl ConnectorState {
         match &delta.changes {
             QueryChanges::Convoys { scope: None, changed: rows, removed } => {
                 for row in rows {
-                    self.convoys.insert(row.resource.clone(), row.clone());
+                    self.update_convoy(row.resource.clone(), Some(row.clone()));
                 }
                 for removed in removed {
-                    self.convoys.remove(removed);
+                    self.update_convoy(removed.clone(), None);
                 }
             }
             QueryChanges::Convoys { scope: Some(_), .. } => return Applied::Ignored,
             QueryChanges::Independents { scope: None, changed: rows, removed } => {
                 for row in rows {
-                    self.independents.insert(row.resource.clone(), row.clone());
+                    self.update_independent(row.resource.clone(), Some(row.clone()));
                 }
                 for removed in removed {
-                    self.independents.remove(removed);
+                    self.update_independent(removed.clone(), None);
                 }
             }
             QueryChanges::Independents { scope: Some(_), .. } => return Applied::Ignored,
             QueryChanges::StandingRoles { scope: None, changed: rows, removed } => {
                 for row in rows {
-                    self.standing_roles.insert(row.resource.clone(), row.clone());
+                    self.update_role(row.resource.clone(), Some(row.clone()));
                 }
                 for removed in removed {
-                    self.standing_roles.remove(removed);
+                    self.update_role(removed.clone(), None);
                 }
             }
             QueryChanges::StandingRoles { scope: Some(_), .. } => return Applied::Ignored,
             QueryChanges::ProjectRepositories { scope: None, changed, removed } => {
                 for row in changed {
-                    self.project_repositories.insert(row.resource.clone(), row.clone());
+                    self.update_membership(row.resource.clone(), Some(row.clone()));
                 }
                 for resource in removed {
-                    self.project_repositories.remove(resource);
+                    self.update_membership(resource.clone(), None);
                 }
             }
             QueryChanges::ProjectRepositories { scope: Some(_), .. } => return Applied::Ignored,
             QueryChanges::Awareness { changed: rows, removed, .. } => {
-                self.awareness.retain(|node| !removed.contains(&node.id));
-                for row in rows {
-                    if let Some(existing) = self.awareness.iter_mut().find(|node| node.id == row.id) {
-                        *existing = row.clone();
-                    } else {
-                        self.awareness.push(row.clone());
-                    }
+                for key in removed {
+                    self.update_awareness(key.clone(), None);
                 }
-                self.awareness.sort_by(|left, right| (&left.label, &left.id).cmp(&(&right.label, &right.id)));
+                for row in rows {
+                    self.update_awareness(row.id.clone(), Some(row.clone()));
+                }
             }
             QueryChanges::DispatchReady { .. } | QueryChanges::Issues { .. } | QueryChanges::Checkouts { .. } => {
                 self.seqs.insert(query, delta.seq);
@@ -321,35 +360,126 @@ impl ConnectorState {
 
     /// Reproject at a supplied clock instant for expiry, replay and tests.
     pub fn rebuild_at(&mut self, mint: &dyn RecipeMint, now: flotilla_protocol::result_set::Timestamp) -> Vec<MetadataPatch> {
-        let next = self.project_at(mint, now, Some(CATALOG_TTL_MS));
-        let mut catalog = self.catalog.lock().expect("published catalog");
-        let patches = next.diff_patches(&catalog);
-        *catalog = next;
+        let patches = self.project_patches_at(mint, now, Some(CATALOG_TTL_MS));
+        self.catalog.lock().expect("published catalog").apply_patches(&patches, Some(CATALOG_TTL_MS));
         patches
     }
 
-    fn project_at(&mut self, mint: &dyn RecipeMint, now: flotilla_protocol::result_set::Timestamp, ttl_ms: Option<u64>) -> Catalog {
-        let convoys: Vec<ConvoyRow> = self.convoys.values().cloned().collect();
-        let independents: Vec<IndependentRow> = self.independents.values().cloned().collect();
-        let standing_roles: Vec<StandingRoleRow> = self.standing_roles.values().cloned().collect();
-        let project_repositories: Vec<ProjectRepositoriesRow> = self.project_repositories.values().cloned().collect();
-        let awareness = (!self.awareness.is_empty()).then_some(self.awareness.as_slice());
-        let mut subjects = self.resources.projection();
-        subjects.now = Some(now);
-        let next = project_catalog_with_ttl(
-            &CatalogInput {
-                subjects: Some(&subjects),
-                awareness,
-                convoys: &convoys,
-                independents: &independents,
-                standing_roles: &standing_roles,
-                project_repositories: &project_repositories,
-            },
-            mint,
-            ttl_ms,
+    fn project_patches_at(
+        &mut self,
+        mint: &dyn RecipeMint,
+        now: flotilla_protocol::result_set::Timestamp,
+        ttl_ms: Option<u64>,
+    ) -> Vec<MetadataPatch> {
+        let mut projection = std::mem::take(&mut self.projection);
+        let initial = !projection.initialized();
+        let mut patches = projection.project(self, mint, now, ttl_ms);
+        if initial {
+            patches = projection.catalog().diff_patches(&self.catalog.lock().expect("published catalog"));
+        }
+        self.uncovered_services = projection.catalog().warn_new_uncovered_services(&self.uncovered_services);
+        self.projection = projection;
+        patches
+    }
+
+    fn update_convoy(&mut self, key: ResourceRef, row: Option<ConvoyRow>) {
+        if self.convoys.get(&key) == row.as_ref() {
+            return;
+        }
+        if row.is_some() && self.known_namespaces.insert(key.namespace.clone()) {
+            self.pending_namespaces.insert(key.namespace.clone());
+        }
+        let node = projection::Node::Convoy(key.clone().into());
+        self.projection.change(node.clone(), row.as_ref().map(projection::convoy_links));
+        self.projection.expire_at(
+            node.clone(),
+            row.as_ref()
+                .filter(|row| row.phase == flotilla_protocol::result_set::ConvoyPhase::Landed)
+                .and_then(|row| row.finished_at)
+                .map(|at| at + chrono::Duration::hours(24)),
         );
-        self.uncovered_services = next.warn_new_uncovered_services(&self.uncovered_services);
-        next
+
+        match row {
+            Some(row) => {
+                self.convoys.insert(key, row);
+            }
+            None => {
+                self.convoys.remove(&key);
+            }
+        }
+    }
+
+    fn update_independent(&mut self, key: ResourceRef, row: Option<IndependentRow>) {
+        if self.independents.get(&key) == row.as_ref() {
+            return;
+        }
+        let node = projection::Node::Independent(key.clone().into());
+        self.projection.change(node.clone(), row.as_ref().map(|_| Vec::new()));
+        match row {
+            Some(row) => {
+                self.independents.insert(key, row);
+            }
+            None => {
+                self.independents.remove(&key);
+            }
+        }
+    }
+
+    fn update_role(&mut self, key: ResourceRef, row: Option<StandingRoleRow>) {
+        if self.standing_roles.get(&key) == row.as_ref() {
+            return;
+        }
+        if row.is_some() && self.known_namespaces.insert(key.namespace.clone()) {
+            self.pending_namespaces.insert(key.namespace.clone());
+        }
+        let node = projection::Node::Role(key.clone().into());
+        self.projection.change(
+            node.clone(),
+            row.as_ref().map(|row| vec![projection::Dependency::Role(row.resource.namespace.clone(), row.resource.name.clone())]),
+        );
+        match row {
+            Some(row) => {
+                self.standing_roles.insert(key, row);
+            }
+            None => {
+                self.standing_roles.remove(&key);
+            }
+        }
+    }
+
+    fn update_membership(&mut self, key: ResourceRef, row: Option<ProjectRepositoriesRow>) {
+        if self.project_repositories.get(&key) == row.as_ref() {
+            return;
+        }
+        if row.is_some() && self.known_namespaces.insert(key.namespace.clone()) {
+            self.pending_namespaces.insert(key.namespace.clone());
+        }
+        let node = projection::Node::Membership(key.clone().into());
+        self.projection.change(node.clone(), row.as_ref().map(|_| Vec::new()));
+        match row {
+            Some(row) => {
+                self.project_repositories.insert(key, row);
+            }
+            None => {
+                self.project_repositories.remove(&key);
+            }
+        }
+    }
+
+    fn update_awareness(&mut self, key: String, row: Option<AwarenessNode>) {
+        let had_awareness = !self.awareness.is_empty();
+        self.projection.awareness(self.awareness.get(&key), row.as_ref());
+        match row {
+            Some(row) => {
+                self.awareness.insert(key, row);
+            }
+            None => {
+                self.awareness.remove(&key);
+            }
+        }
+        if had_awareness != !self.awareness.is_empty() {
+            self.projection.invalidate_all();
+        }
     }
 
     fn snapshots_complete(&self) -> bool {
@@ -403,23 +533,29 @@ async fn publish(
 ) -> Result<(), SessionFailure> {
     let mode = connector.mode(sink);
     let ttl_ms = (mode == LivenessMode::Ttl).then_some(CATALOG_TTL_MS);
-    let next = state.project_at(mint, chrono::Utc::now(), ttl_ms);
+    let changes = state.project_patches_at(mint, chrono::Utc::now(), ttl_ms);
+    let next = state.projection.catalog();
     let first = !connector.published.load(std::sync::atomic::Ordering::SeqCst);
     let patches = if first && mode == LivenessMode::Connection {
         next.reassert_patches()
     } else if full && mode == LivenessMode::Ttl {
-        let prior = state.catalog.lock().expect("published catalog");
-        let mut patches: BTreeMap<_, _> = next.diff_patches(&prior).into_iter().map(|patch| (patch.target.clone(), patch)).collect();
+        let mut patches: BTreeMap<_, _> = changes.into_iter().map(|patch| (patch.target.clone(), patch)).collect();
         for patch in next.reassert_patches() {
             patches.entry(patch.target.clone()).and_modify(|diff| diff.set = patch.set.clone()).or_insert(patch);
         }
         patches.into_values().collect()
     } else {
-        next.diff_patches(&state.catalog.lock().expect("published catalog"))
+        changes
     };
     if !patches.is_empty() || first {
         deliver(sink, &patches, first && mode == LivenessMode::Connection).await?;
-        *state.catalog.lock().expect("published catalog") = next;
+        let mut catalog = state.catalog.lock().expect("published catalog");
+        if first && mode == LivenessMode::Connection {
+            // reassert_patches is a complete replacing snapshot; its acknowledged
+            // local mirror must likewise replace all prior facts.
+            *catalog = Catalog::default();
+        }
+        catalog.apply_patches(&patches, ttl_ms);
         connector.published.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     Ok(())
@@ -469,6 +605,7 @@ impl ResourceUpdate {
             Self::Delta(envelope) => state.apply_resource_records(&envelope),
             Self::Snapshot { namespace, kind, envelopes } => {
                 state.resources.clear_scope(&namespace, &kind);
+                state.sync_resource_changes();
                 for envelope in envelopes {
                     state.apply_resource_records(&envelope)?;
                 }
@@ -491,20 +628,10 @@ async fn ensure_resource_watches(
     use flotilla_client::resource::{ResourceClient, ResourceWatchRequest};
     // Scope follows the named-query graph. Namespaces with no convoy, role or
     // project membership are intentionally outside this subject projection.
-    let namespaces: BTreeSet<_> = ["flotilla".to_string()]
-        .into_iter()
-        .chain(
-            state
-                .convoys
-                .keys()
-                .chain(state.standing_roles.keys())
-                .chain(state.project_repositories.keys())
-                .map(|resource| resource.namespace.clone()),
-        )
-        .collect();
     let client = ResourceClient::new(Arc::clone(daemon));
-    for namespace in namespaces {
+    while let Some(namespace) = state.pending_namespaces.first().cloned() {
         if watched.contains(&namespace) {
+            state.pending_namespaces.remove(&namespace);
             continue;
         }
         for kind in resources::KINDS {
@@ -576,6 +703,7 @@ async fn ensure_resource_watches(
         }
         // A setup error returns to run_reconnecting, dropping this JoinSet;
         // this function never retries a partially admitted namespace in place.
+        state.pending_namespaces.remove(&namespace);
         watched.insert(namespace);
     }
     Ok(())
