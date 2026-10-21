@@ -915,6 +915,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         .map(|cascade| format!("\nResolved defaults:\n{}\n", serde_json::to_string_pretty(cascade).expect("serialize cascade")))
         .unwrap_or_default();
     let mut output = format!("Convoy: {}/{}\nPhase: {}\n", explanation.namespace, explanation.convoy, explanation.phase);
+    for held in &explanation.held_deliveries {
+        let _ = writeln!(output, "HELD DELIVERY: {}", held.description);
+    }
     for warning in &explanation.warnings {
         let _ = writeln!(output, "Warning: {warning}");
     }
@@ -1345,6 +1348,13 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
             format!("brief queued for turn end; displaced brief:\n{displaced}")
         }
         CommandValue::ConvoyBriefQueued { displaced: None } => "brief queued for turn end".to_string(),
+        CommandValue::ConvoyBriefHeld { displaced, held } => {
+            let mut output = format!("brief queued, not for turn end: {held}");
+            if let Some(displaced) = displaced {
+                output.push_str(&format!("\ndisplaced brief:\n{displaced}"));
+            }
+            output
+        }
         CommandValue::ConvoyBriefWithdrawn { withdrawn: Some(withdrawn) } => format!("pending brief withdrawn:\n{withdrawn}"),
         CommandValue::ConvoyBriefWithdrawn { withdrawn: None } => "no pending brief to withdraw".to_string(),
         CommandValue::RepoTracked { path, resolved_from, identity_change } => {

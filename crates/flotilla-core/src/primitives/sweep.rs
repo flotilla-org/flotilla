@@ -341,9 +341,69 @@ impl TurnHolds {
     }
 }
 
+/// The held turns a due operator or supervisor turn supersedes (#3455), and
+/// that successor. The engine path never makes a later turn wait behind a
+/// held one, but a held system turn would be typed again once its hold runs
+/// out, after a person has already spoken. Superseding drops it instead, with
+/// the successor recorded as `Dropped(Superseded { by })`. A held turn from
+/// anyone other than flotilla stays held: only an operator closes it.
+///
+/// Holds here are per message, unlike the live store's per-batch hold: a
+/// typed turn that mixed system and other messages holds each member, and an
+/// engine hold ends by retyping, not by an operator closing it. Dropping the
+/// system members leaves the others to be retyped exactly as before.
+pub fn held_turns_superseded<'a>(
+    due: &'a [(String, flotilla_resources::MessageSpec)],
+    held: &'a [(String, flotilla_resources::MessageSpec)],
+) -> Option<(&'a str, Vec<&'a str>)> {
+    let (successor, _) = due.iter().find(|(_, spec)| spec.is_operator_or_supervisor())?;
+    let older: Vec<_> = held.iter().filter(|(_, spec)| spec.is_system_turn()).map(|(name, _)| name.as_str()).collect();
+    (!older.is_empty()).then_some((successor.as_str(), older))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Behaviour (#3455): only a due operator or supervisor turn supersedes,
+    // and only the held turns flotilla itself sent. Generates empty through
+    // mixed due and held sets over every relation and sender kind.
+    #[hegel::test]
+    fn operator_turns_supersede_only_held_system_turns(tc: hegel::TestCase) {
+        use flotilla_resources::{MessageRelation, MessageSpec};
+        use hegel::generators as gs;
+        let senders = ["system:turn-rules", "system:stall-judge", "principal:operator", "flotilla/convoy/work/bosun"];
+        let relations = [MessageRelation::System, MessageRelation::Supervisor, MessageRelation::Peer];
+        let draw = |prefix: &str| {
+            let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+            (0..count)
+                .map(|index| {
+                    let sender = senders[tc.draw(gs::integers::<usize>().min_value(0).max_value(senders.len() - 1))];
+                    let relation = relations[tc.draw(gs::integers::<usize>().min_value(0).max_value(relations.len() - 1))];
+                    let spec = MessageSpec::builder()
+                        .sender(sender.into())
+                        .receiver("flotilla/convoy/work/coder".into())
+                        .relation(relation)
+                        .body("turn".into())
+                        .build();
+                    (format!("{prefix}-{index}"), spec)
+                })
+                .collect::<Vec<_>>()
+        };
+        let due = draw("due");
+        let held = draw("held");
+        let successor = due.iter().find(|(_, spec)| {
+            !spec.sender.starts_with("system:") && (spec.relation == MessageRelation::Supervisor || spec.sender.starts_with("principal:"))
+        });
+        let system: Vec<_> = held.iter().filter(|(_, spec)| spec.sender.starts_with("system:")).map(|(name, _)| name.as_str()).collect();
+        match held_turns_superseded(&due, &held) {
+            Some((by, older)) => {
+                assert_eq!(Some(by), successor.map(|(name, _)| name.as_str()));
+                assert_eq!(older, system);
+            }
+            None => assert!(successor.is_none() || system.is_empty()),
+        }
+    }
 
     // Behaviour: a held message is not retyped until its hold runs out; a
     // confirmed turn releases it at once.

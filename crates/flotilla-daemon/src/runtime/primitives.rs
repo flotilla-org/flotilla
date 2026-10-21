@@ -21,7 +21,7 @@ use std::{
 use chrono::Utc;
 use flotilla_address::Address;
 use flotilla_core::primitives::{
-    sweep::{OpenMessages, SweepReport, TurnHolds},
+    sweep::{held_turns_superseded, OpenMessages, SweepReport, TurnHolds},
     view::old_view,
     MessagePrimitives,
 };
@@ -254,11 +254,42 @@ impl MessageDelivery {
         self.held.expire(std::time::Instant::now());
     }
 
+    /// A due operator or supervisor turn supersedes this session's held
+    /// system turns (#3455), so they are dropped, with the successor named in
+    /// the engine's audit, rather than typed again once their hold runs out.
+    async fn supersede_held_system_turns(
+        &mut self,
+        due: &[(String, flotilla_resources::MessageSpec)],
+        held: Vec<String>,
+        roles: &flotilla_core::primitives::roles::FleetRoles,
+        records: &flotilla_core::primitives::OldStoreRecords,
+    ) -> Result<(), String> {
+        if held.is_empty() || !due.iter().any(|(_, spec)| spec.is_operator_or_supervisor()) {
+            return Ok(());
+        }
+        let inbox = self.primitives.inbox();
+        let mut views = Vec::new();
+        for message in held {
+            let Some(resource) = inbox.get_async(&message).await.map_err(|error| error.to_string())? else { continue };
+            if let Ok(view) = old_view(&resource, &self.namespace, roles, records) {
+                views.push((message, view.spec));
+            }
+        }
+        let Some((successor, older)) = held_turns_superseded(due, &views) else { return Ok(()) };
+        for message in older {
+            tracing::info!(%message, %successor, "operator turn supersedes a held system turn");
+            self.primitives.supersede(message, successor).await;
+            self.held.release(message);
+        }
+        Ok(())
+    }
+
     /// Types one session's pending turns as one turn, through the same
     /// terminal reservation every other turn takes.
     async fn start_turn(&mut self, holder: &Holder) -> Result<(), String> {
         let inbox = self.primitives.inbox();
         let mut turns = Vec::new();
+        let mut held = Vec::new();
         for address in &holder.inboxes {
             let pending: Vec<_> = inbox
                 .pending(address, &holder.consumer, &delivery_rules())
@@ -276,7 +307,9 @@ impl MessageDelivery {
                     }
                     continue;
                 }
-                if !self.held.is_held(&item.message) {
+                if self.held.is_held(&item.message) {
+                    held.push(item.message);
+                } else {
                     turns.push(item.message);
                 }
             }
@@ -289,10 +322,14 @@ impl MessageDelivery {
         let records = self.primitives.records(&self.namespace).await.map_err(|error| error.to_string())?;
         let mut members = Vec::new();
         let mut texts = Vec::new();
+        let mut due = Vec::new();
         for message in turns {
             let Some(resource) = inbox.get_async(&message).await.map_err(|error| error.to_string())? else { continue };
             match old_view(&resource, &self.namespace, &roles, &*records) {
-                Ok(view) => texts.push(flotilla_messaging::frame_message(&view.spec)),
+                Ok(view) => {
+                    texts.push(flotilla_messaging::frame_message(&view.spec));
+                    due.push((message.clone(), view.spec));
+                }
                 Err(error) => {
                     debug!(%message, %error, "framing an engine turn without its old spelling");
                     texts.push(format!("[from {}]\n\n{:?}", resource.spec().sender, resource.spec().body.value()));
@@ -300,6 +337,7 @@ impl MessageDelivery {
             }
             members.push(message);
         }
+        self.supersede_held_system_turns(&due, held, &roles, &records).await?;
         let runtime = TerminalControllerRuntime { state: Arc::clone(&self.state) };
         let pool = runtime.pool_for_spec(&holder.terminal.spec)?;
         let adapter = runtime.adapter_for_spec(&holder.terminal.spec)?;

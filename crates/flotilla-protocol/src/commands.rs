@@ -477,6 +477,9 @@ pub struct ConvoyExplanation {
     pub crew_deliveries: Vec<ExplainedCrewDelivery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<crate::query::CrewMessageView>,
+    /// Message batches held for an operator; later Messages wait behind them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_deliveries: Vec<ExplainedHeldDelivery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_turns: Vec<ExplainedQueuedTurn>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -489,6 +492,19 @@ pub struct ConvoyExplanation {
     pub recent_events: Vec<ExplainedEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_mutations: Vec<ExplainedLifecycleMutation>,
+}
+
+/// One held Message batch (#3455): what it is, why it is held, and the
+/// operator command that closes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedHeldDelivery {
+    pub batch: String,
+    pub receiver: String,
+    pub members: Vec<String>,
+    pub reason: String,
+    pub clear_command: String,
+    /// The plain sentence attention also shows.
+    pub description: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1424,6 +1440,13 @@ pub enum CommandValue {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         displaced: Option<String>,
     },
+    /// Queued while a held Message batch is ahead of it for the same crew
+    /// (#3455); `held` names the batch and what happens to it.
+    ConvoyBriefHeld {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        displaced: Option<String>,
+        held: String,
+    },
     ConvoyBriefWithdrawn {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         withdrawn: Option<String>,
@@ -1874,6 +1897,7 @@ mod tests {
             },
             CommandValue::ConvoyBriefDelivered { displaced: Some("older instruction".into()) },
             CommandValue::ConvoyBriefQueued { displaced: Some("older instruction".into()) },
+            CommandValue::ConvoyBriefHeld { displaced: None, held: "message batch `b` is held".into() },
             CommandValue::ConvoyBriefWithdrawn { withdrawn: Some("latest instruction".into()) },
             CommandValue::RepoTracked {
                 path: PathBuf::from("/new/repo"),

@@ -1681,6 +1681,75 @@ mod tests {
         assert!(delivered[0].reason.is_none());
     }
 
+    // #3455: explain's held deliveries name each held batch once, why it is
+    // held and the command that clears it; a retrying batch is not held.
+    #[tokio::test]
+    async fn message_evidence_names_held_batches() {
+        use flotilla_messaging::MessageInbox;
+        use flotilla_resources::{
+            ControllerRetry, ControllerRetryDisposition, Message, MessageRelation, MessageSpec, MessageStatus, MessageSubmission,
+        };
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let inbox = MessageInbox::new(backend.clone(), "flotilla");
+        let now = Utc::now();
+        for name in ["held-0", "held-1", "retrying"] {
+            let intent = MessageSpec::builder()
+                .sender("system:turn-rules".into())
+                .receiver("project/convoy/work/coder".into())
+                .relation(MessageRelation::System)
+                .body(name.into())
+                .build();
+            inbox.accept(&InputMeta::builder().name(name.into()).build(), &intent, now).await.expect("admit");
+            let messages = backend.using::<Message>("flotilla");
+            let current = messages.get(name).await.expect("admitted");
+            let held = name != "retrying";
+            let status = MessageStatus {
+                reason: Some("delivery held: held pending acceptance evidence: not confirmed; attempt 1/3".into()),
+                submission: held.then(|| {
+                    MessageSubmission::builder()
+                        .batch_id("batch-held-0-0".into())
+                        .crew_id("crew".into())
+                        .session("session".into())
+                        .started_at(now)
+                        .members(vec!["held-0".into(), "held-1".into()])
+                        .build()
+                }),
+                retry: Some(ControllerRetry {
+                    attempts: 1,
+                    first_failure_at: now,
+                    disposition: if held {
+                        ControllerRetryDisposition::Terminal { needs: "acceptance evidence".into() }
+                    } else {
+                        ControllerRetryDisposition::Retryable { next_attempt_at: now }
+                    },
+                }),
+                ..current.status.clone().expect("status")
+            };
+            messages.update_status(name, &current.metadata.resource_version, &status).await.expect("status");
+        }
+        let receivers = flotilla_messaging::MessageReceiverSnapshot::load(&backend, "flotilla").await.expect("receivers");
+        let (views, held) = message_evidence(
+            &backend,
+            "flotilla",
+            &super::super::projection_ports::MessageReceiverEvidence(receivers, None),
+            None,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("evidence");
+        assert_eq!(views.len(), 3);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].batch, "batch-held-0-0");
+        assert_eq!(held[0].members, ["held-0", "held-1"]);
+        assert!(held[0].system_only);
+        let description = held[0].describe("flotilla");
+        assert!(description.starts_with("message batch `batch-held-0-0` is held for project/convoy/work/coder (2 messages: held-0, held-1): delivery held: held pending acceptance evidence"), "{description}");
+        assert!(
+            description.ends_with("clear it with `flotilla resource fail-message-batch held-0 --namespace flotilla --reason '<why>'`"),
+            "{description}"
+        );
+    }
+
     // #3009: one unresolvable receiver does not fail the whole read. Invalid
     // adoption claims and ambiguous holders read as `receiver_error` beside the
     // valid and missing candidates; delivery remains strict and refuses them.

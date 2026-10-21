@@ -2396,6 +2396,29 @@ impl Aggregator {
                 vessel.surface_state = SurfaceState::Available;
             }
         }
+        // #3455: a held message batch for one of this convoy's crews names
+        // itself, why it is held and the command that clears it.
+        let delivery_hold = self
+            .convoy_sessions(&resource.namespace, &resource.name)
+            .flat_map(|session| {
+                let session = &session.object.metadata;
+                self.convoy_demands(&session.namespace, &session.name).filter(move |demand| {
+                    let target = &demand.spec.originating_work_ref;
+                    target.kind == "TerminalSession" && target.namespace == session.namespace && target.name == session.name
+                })
+            })
+            .filter(|demand| {
+                matches!(
+                    demand.status.as_ref().map_or(DemandState::Raised, |status| status.state),
+                    DemandState::Raised | DemandState::Escalated
+                )
+            })
+            .filter_map(|demand| demand.metadata.annotations.get(flotilla_resources::delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION))
+            // Several held crews show one, chosen lexicographically so the row is stable;
+            // explain lists every held batch.
+            .min()
+            .cloned()
+            .filter(|_| !phase.is_terminal());
         let attention_demand = self
             .convoy_demands(&resource.namespace, &resource.name)
             .filter(|demand| {
@@ -2427,6 +2450,7 @@ impl Aggregator {
         // Preserve unrelated convoy attention and demands even after settlement;
         // only the crew's working surface is suppressed for terminal convoys.
         let surface_state = if !subject_conflicts.is_empty()
+            || delivery_hold.is_some()
             || attention_demand.is_some()
             || convoy_attention.is_some()
             || !holds.is_empty()
@@ -2476,15 +2500,17 @@ impl Aggregator {
             .maybe_placement_decision(status.and_then(|status| status.placement_decision.clone()))
             .initializing(convoy_is_initializing(status))
             .maybe_message(
-                attention_demand
-                    .and_then(|demand| {
-                        demand
-                            .metadata
-                            .annotations
-                            .get(RECLAIM_REFUSAL_REASON_ANNOTATION)
-                            .or_else(|| demand.metadata.annotations.get(ENSURE_CONFIG_DRIFT_REASON_ANNOTATION))
-                            .or_else(|| demand.metadata.annotations.get("flotilla.work/credential-refresh-reason"))
-                            .cloned()
+                delivery_hold
+                    .or_else(|| {
+                        attention_demand.and_then(|demand| {
+                            demand
+                                .metadata
+                                .annotations
+                                .get(RECLAIM_REFUSAL_REASON_ANNOTATION)
+                                .or_else(|| demand.metadata.annotations.get(ENSURE_CONFIG_DRIFT_REASON_ANNOTATION))
+                                .or_else(|| demand.metadata.annotations.get("flotilla.work/credential-refresh-reason"))
+                                .cloned()
+                        })
                     })
                     .or_else(|| {
                         (!subject_conflicts.is_empty()).then(|| {
@@ -3185,6 +3211,51 @@ mod tests {
         let convoy = &result_set.rows.as_convoys().expect("convoy rows")[0];
         assert!(!convoy.surface_state.needs_attention());
         assert!(!convoy.vessels[0].surface_state.needs_attention());
+    }
+
+    // #3455: a held message batch for a crew names itself at the top of the
+    // convoy's attention instead of a generic "needs you", and clears with it.
+    #[tokio::test]
+    async fn held_message_batch_names_itself_in_convoy_attention() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        state
+            .replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: QueryId::Convoys { scope: None }, since: None }]);
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+        let mut session = session_object("terminal-convoy-a-implement").await;
+        session.metadata.labels =
+            BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
+        let mut other = session_object("terminal-convoy-b-implement").await;
+        other.metadata.labels =
+            BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-b".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        let description = "message batch `message-0` is held for flotilla/convoy-a/implement/coder (1 message: message-0): delivery held: \
+            terminal was not ready before submission; attempt 3/3; clear it with \
+            `flotilla resource fail-message-batch message-0 --namespace flotilla --reason '<why>'`";
+        let gate = |session: &ResourceObject<TerminalSession>| {
+            let (meta, spec) = flotilla_resources::delivery_hold::delivery_demand(session);
+            let mut metadata = attention_meta(&meta.name, Utc::now());
+            metadata.annotations =
+                BTreeMap::from([(flotilla_resources::delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION.to_string(), description.to_string())]);
+            ResourceObject { metadata, spec, status: None }
+        };
+        // Another convoy's held crew does not reach this convoy.
+        aggregator.apply_demand_event(WatchEvent::Added(gate(&other))).await;
+        let result_set = state.result_set().await;
+        assert!(!result_set.rows.as_convoys().expect("convoy rows")[0].surface_state.needs_attention());
+
+        aggregator.apply_demand_event(WatchEvent::Added(gate(&session))).await;
+        let result_set = state.result_set().await;
+        let convoy = &result_set.rows.as_convoys().expect("convoy rows")[0];
+        assert_eq!(convoy.surface_state, SurfaceState::NeedsYou);
+        assert_eq!(convoy.message.as_deref(), Some(description));
+
+        aggregator.apply_demand_event(WatchEvent::Deleted(gate(&session))).await;
+        let result_set = state.result_set().await;
+        let convoy = &result_set.rows.as_convoys().expect("convoy rows")[0];
+        assert!(!convoy.surface_state.needs_attention());
+        assert_ne!(convoy.message.as_deref(), Some(description));
     }
 
     #[tokio::test]
