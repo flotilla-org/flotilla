@@ -521,3 +521,107 @@ fn landing_digest_evidence_obligations_follow_observations(tc: hegel::TestCase) 
         assert!(convoys.get("digest").await.unwrap().status.unwrap().stalled.is_some());
     });
 }
+
+// #3595: a cached actor row can outlive its session during Landing teardown.
+// Deletion, a stopped session, and an already removed record are not dead actors;
+// Active session loss must still be supervised, including without a project.
+#[hegel::test]
+fn landing_session_teardown_does_not_stall(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    // Repeat fresh idle observations across the debounce and idle grace, with
+    // generated extra residence after teardown. No sleeps or process doubles.
+    let residence = tc.draw(gs::integers::<i64>().min_value(1).max_value(600));
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        for (phase, complete) in
+            [(ConvoyPhase::Active, false), (ConvoyPhase::Active, true), (ConvoyPhase::Landing, false), (ConvoyPhase::Landing, true)]
+        {
+            let teardown = phase == ConvoyPhase::Landing && complete;
+            for ending in ["stopped", "absent", "deleting"] {
+                let (backend, wake, _) = actor_nudge_scenario(&[]).await;
+                let convoys = backend.using::<Convoy>("flotilla");
+                let convoy = convoys.get("stalled-work").await.unwrap();
+                let mut spec = convoy.spec.clone();
+                spec.project_ref = None;
+                convoys.update(&InputMeta::from(&convoy.metadata), &convoy.metadata.resource_version, &spec).await.unwrap();
+                let start = Utc::now();
+                observe_actor(&backend, &wake, TerminalAttentionState::Working, start).await;
+                update_convoy(&backend, "stalled-work", |status| {
+                    status.phase = phase;
+                    if complete {
+                        status.work.get_mut("work").unwrap().phase = WorkPhase::Complete;
+                    }
+                })
+                .await;
+                let sessions = backend.using::<TerminalSession>("flotilla");
+                let session = sessions.get("resumed-coder").await.unwrap();
+                if ending == "absent" {
+                    sessions.delete("resumed-coder").await.unwrap();
+                } else if ending == "deleting" {
+                    // A finalizer retains the record while teardown ends the runtime.
+                    let mut meta = InputMeta::from(&session.metadata);
+                    meta.finalizers = vec!["flotilla.work/terminal-teardown".into()];
+                    sessions.update(&meta, &session.metadata.resource_version, &session.spec).await.unwrap();
+                    sessions.delete("resumed-coder").await.unwrap();
+                    assert!(sessions.get("resumed-coder").await.unwrap().metadata.deletion_timestamp.is_some());
+                } else {
+                    let mut status = session.status.unwrap();
+                    flotilla_resources::TerminalSessionStatusPatch::MarkStopped {
+                        stopped_at: start + chrono::Duration::seconds(1),
+                        inner_command_status: None,
+                        inner_exit_code: None,
+                        message: None,
+                    }
+                    .apply(&mut status);
+                    sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.unwrap();
+                }
+                let mut observed_stall = false;
+                for seconds in [1, 10, 60, 120, 180, 240, 300, 300 + residence] {
+                    let now = start + chrono::Duration::seconds(seconds);
+                    if ending == "deleting" {
+                        // observe_actor persists fresh attention and invokes judge_stalls_at.
+                        observe_actor(&backend, &wake, TerminalAttentionState::Idle, now).await;
+                    } else {
+                        let convoy = convoys.get("stalled-work").await.unwrap();
+                        wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.unwrap();
+                    }
+                    let status = convoys.get("stalled-work").await.unwrap().status.unwrap();
+                    if teardown {
+                        assert!(status.stalled.is_none(), "{phase:?}/{ending} at {seconds}s: {:?}", status.stalled);
+                    } else if let Some(stall) = status.stalled {
+                        observed_stall = true;
+                        // Missing-governor diagnostics remain useful on a real stall.
+                        if stall.rung == StallRung::Nudge {
+                            assert_eq!(ending, "deleting");
+                            assert_eq!(stall.source, StallEvidenceSource::Screen);
+                            assert_eq!(stall.evidence, "idle");
+                        } else {
+                            assert!(stall.evidence.contains("cannot find governor: convoy has no project_ref"), "{}", stall.evidence);
+                        }
+                    }
+                }
+                if !teardown {
+                    assert!(observed_stall, "{ending} must still stall outside completed Landing work");
+                }
+                if teardown {
+                    // Retiring a stale actor must not hide a real controller failure.
+                    let id = uuid::Uuid::new_v4();
+                    let mut row = wake.subscriptions.rows().await.into_iter().next().unwrap();
+                    row.id = id;
+                    row.maker = LeafMaker::Controller {
+                        resource_kind: "CredentialDelivery".into(),
+                        name: Some("env".into()),
+                        retry: ControllerRetry::terminal(None, start, "credential controller refused"),
+                        ceiling: RetryCeiling::default(),
+                    };
+                    wake.subscriptions.inner.rows.lock().await.insert(id, row);
+                    let convoy = convoys.get("stalled-work").await.unwrap();
+                    wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), start + chrono::Duration::hours(1))
+                        .await
+                        .unwrap();
+                    let stall = convoys.get("stalled-work").await.unwrap().status.unwrap().stalled.unwrap();
+                    assert!(stall.evidence.contains("credential controller refused"), "{}", stall.evidence);
+                }
+            }
+        }
+    });
+}
