@@ -10,3 +10,9 @@ tests/
 *.md
 .github/
 .vscode/
+# Canonical guidance embedded by flotilla-agent at compile time.
+!docs/
+docs/*
+!docs/agents/
+docs/agents/*
+!docs/agents/decision-ledger.md

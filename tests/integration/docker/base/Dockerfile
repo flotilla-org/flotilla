@@ -9,6 +9,7 @@ FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY crates/ crates/
+COPY docs/agents/decision-ledger.md docs/agents/decision-ledger.md
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -18,6 +19,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY assets/ assets/
 COPY src/ src/
 COPY crates/ crates/
+COPY docs/agents/decision-ledger.md docs/agents/decision-ledger.md
 RUN cargo build --release
 
 # === Shared runtime base (used by both full and dev) ===

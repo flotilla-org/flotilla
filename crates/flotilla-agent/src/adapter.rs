@@ -276,6 +276,11 @@ pub fn build_convoy_crew_brief_with_options(
 
 fn render_crew_brief_template(options: &CrewBriefRenderOptions, context: &CrewBriefTemplateContext<'_>) -> Result<String, String> {
     let mut env = minijinja::Environment::new();
+    // Demote only the document title; preserve the fenced artifact heading verbatim.
+    env.add_global(
+        "decision_ledger_guidance",
+        include_str!("../../../docs/agents/decision-ledger.md").replacen("# Decision ledger\n", "### Ledger template and guidance\n", 1),
+    );
     env.add_template(BUILTIN_CREW_BRIEF_TEMPLATE_NAME, BUILTIN_CREW_BRIEF_TEMPLATE)
         .map_err(|err| format!("load built-in crew brief template: {err}"))?;
     env.add_template(BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE_NAME, BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE)
@@ -1372,16 +1377,31 @@ mod tests {
         )
         .content;
 
+        // Glue: every dispatched brief carries the canonical guidance without a project checkout.
+        // The renderer may demote the document title, but must preserve the artifact heading.
+        assert!(include_str!("../../../docs/agents/decision-ledger.md").starts_with("# Decision ledger\n"));
+        assert!(content.contains("```markdown\n## Decision ledger\n"));
+        let guidance = include_str!("../../../docs/agents/decision-ledger.md").replacen(
+            "# Decision ledger\n",
+            "### Ledger template and guidance\n",
+            1,
+        );
+        assert!(content.contains(guidance.trim()));
+        assert_eq!(content.matches("**Brief silence:**").count(), 1);
+        assert!(!content.contains("\n# Decision ledger\n"));
+        assert!(!content.contains("\n\n\nFor repository assignments"));
+        assert!(!content.contains("See `docs/agents/decision-ledger.md`"));
         assert!(content.contains("## Decision ledger"));
         assert!(content.contains("ordered least-confident first"));
         assert!(content.contains("**Brief silence:**"));
         assert!(content.contains("**Choice:**"));
         assert!(content.contains("**Alternative:**"));
         assert!(content.contains("**If asking were free:**"));
-        assert!(content.contains("Optionally append a `### Friction` section after all numbered decisions"));
+        assert!(content.contains("The trailing `### Friction` section is optional"));
         assert!(content.contains("flotilla artifact put --kind decision-ledger <path>"));
         // Settlement admits the ledger only after a clean final shepherd snapshot.
-        let settlement = content.split("\n## Decision ledger\n").nth(1).expect("ledger section");
+        // Select the brief section before the canonical fenced example, which repeats its heading.
+        let settlement = content.split_once("\n## Decision ledger\n").expect("ledger section").1;
         // #2690: settlement gives pending checks a yield path before the clean snapshot gate.
         // Glue: fixed brief wording is checked through the real template renderer.
         assert!(settlement.contains(SETTLEMENT_YIELD));
@@ -1649,7 +1669,8 @@ mod tests {
         assert!(brief.contains("claim's linked `## Decision ledger` comment"));
         // #2690: count both occurrences: inherited settlement and the shepherd delivery block's readiness gate.
         assert_eq!(brief.matches(SETTLEMENT_YIELD).count(), 2);
-        let settlement = brief.split("\n## Decision ledger\n").nth(1).expect("ledger section");
+        // Select the inherited brief section before the fenced ledger example, which repeats its heading.
+        let settlement = brief.split_once("\n## Decision ledger\n").expect("ledger section").1;
         assert!(settlement.contains(SETTLEMENT_YIELD));
         assert!(brief.contains("A completion without a ledger is refused"));
         assert!(brief.contains("park the verified commit"));
