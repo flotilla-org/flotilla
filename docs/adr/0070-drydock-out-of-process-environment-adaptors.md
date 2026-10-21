@@ -104,8 +104,8 @@ flotilla's own metering is the primary usage source, and `observe` is what it co
   - `QuotaExhausted`: feeds placement back pressure;
   - `CredentialRejected`: a provider HTTP 401 rejects the key; the instance becomes not ready with "missing credential", retaining the masked rejection diagnostic;
   - `Internal`: an adaptor bug, carrying the provider's raw error text.
-- **Provider messages reach the operator.** CLI errors, warn-level host logs and conformance reports include the category, reason, upstream HTTP status when present, provider explanation, operation and provider. The host masks anything matching a configured credential value, including proxy placeholder tokens, before returning or logging diagnostics. Provider explanations are ordinary diagnostic text, not secret fields. Credentials, tokens and reach recipes retain their redacting types. Permission denials use `Refused`; no distinct permission error is needed.
-- **Polling waits for readiness.** An undelivered credential does not cause a spurious failed provider call; credential delivery wakes observation immediately.
+- **Provider messages reach the operator.** CLI errors, warn-level host logs and conformance reports include the category, reason, upstream HTTP status when present, provider explanation, operation and provider. The host masks anything matching a configured nonempty credential value, including proxy placeholder tokens, before returning or logging diagnostics. Empty values are skipped; nonempty values are masked regardless of length. Provider explanations are ordinary diagnostic text, not secret fields. Credentials, tokens and reach recipes retain their redacting types. Permission denials use `Refused`; no distinct permission error is needed.
+- **Polling waits for readiness.** An undelivered credential does not cause a spurious failed provider call; credential delivery wakes the host-owned observer immediately. See [drydock#46](https://github.com/flotilla-org/drydock/pull/46) for the implementation and regression coverage.
 - **Adaptors do not retry.** Modules turn off the SDK's internal retries where they can.
 
 ### Encoding
