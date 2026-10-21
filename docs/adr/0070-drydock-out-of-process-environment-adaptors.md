@@ -30,7 +30,7 @@ The map had left "a declared provider mechanism" as a later follow-on. This ADR 
 - reaches the agent inside each vessel (ADR 0069);
 - carries the vessel's egress to the per-vessel listener.
 
-flotillad embeds it. A bare `drydock launch` uses the same pieces without a store.
+flotillad embeds it. **Superseded by the daemon-homes amendment below:** embedding versus delegation is now undecided. A bare `drydock launch` uses the same pieces without a store.
 
 ### Parties and state
 
@@ -325,7 +325,11 @@ embeds drydock and the earlier host-oriented CLI/configuration examples.
   uses a trait matching the provider API so either implementation fits. Several
   independent drydocks per flotillad are not designed now.
 - **The CLI is a daemon client.** It finds the companion daemon beside itself
-  and starts it on demand, following flotilla/flotillad. Managed host supervision,
+  and starts it on demand, following flotilla/flotillad's
+  [`connect_or_spawn`](../../crates/flotilla-client/src/lib.rs) path: probe for a
+  compatible daemon, acquire a spawn lock, recheck, then spawn. A separate
+  [`DaemonLifecycle`](../../crates/flotilla-daemon/src/restart_history.rs) lock
+  keeps competing launchers from owning the same daemon. Managed host supervision,
   polling, status caching and credential refresh continue between commands.
 - **The daemon serves the provider API**, `/v1/providers/{provider}/…`, and
   routes providers to their language hosts. When flotillad is that daemon, it
@@ -341,7 +345,8 @@ embeds drydock and the earlier host-oriented CLI/configuration examples.
 The standalone config follows rigging's XDG policy at
 `~/.config/drydock/drydock.toml`. Its Unix socket intentionally lives at
 `run/drydock.sock` under the config directory, following flotillad's current
-layout; designing a separate runtime directory is deferred. Admission checks
+layout; designing a separate runtime directory is tracked in
+[drydock#59](https://github.com/flotilla-org/drydock/issues/59). Admission checks
 kernel peer credentials. Commands use the provider and its opaque `id`; labels
 remain client environment IDs, not operator handles.
 
@@ -353,4 +358,7 @@ agent/tools build dependency. Bare `ubuntu:24.04` launch acceptance belongs to
 [drydock#54](https://github.com/flotilla-org/drydock/issues/54). Standalone launch
 prepares implicitly, merges per-provider defaults with flags, generates a vessel
 label and SSH key, and defaults to Open egress (Advisory with today's modules).
-The low-level provider protocol retains deny-all as its default.
+The low-level provider protocol retains deny-all as its default. The standalone
+Open default is the owner's explicit convenience choice for today's interactive
+launches; callers wanting restricted egress choose `--egress deny-all`, while
+low-level clients must opt in to Open.
