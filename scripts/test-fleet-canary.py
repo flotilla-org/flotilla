@@ -507,6 +507,7 @@ elif args[:2] == ['artifact', 'put']:
     assert Path(os.environ['CANARY_COMPLETE_LOG'] + '.promise').exists()
     ledger = Path(args[4])
     assert ledger.is_file() and ledger.parent == Path(os.environ['HOME'])
+    assert not ledger.resolve().is_relative_to(Path.cwd().resolve()), 'ledger must be outside checkout'
     text = ledger.read_text()
     for field in ['## Decision ledger', '1. **Brief silence:**', '**Choice:**',
                   '**Alternative:**', '**If asking were free:**']:
@@ -524,7 +525,10 @@ else:
             if broken_toolchain:
                 (bin_dir / 'cargo').write_text('#!/bin/bash\necho "cargo 1.99.0 (stand-in)"\n'
                                                'echo "error: no default toolchain configured" >&2\nexit 1\n')
-            subprocess.check_call(['git', '-C', str(root), 'init', '-q'])
+            # Evidence lives outside the checkout, as it does in the vessel.
+            checkout = root / 'checkout'
+            checkout.mkdir()
+            subprocess.check_call(['git', '-C', str(checkout), 'init', '-q'])
             completion = root / 'completion'
             # HOME excludes user global config; NOSYSTEM excludes system config.
             environment = {'PATH': f'{bin_dir}:/usr/local/bin:/usr/bin:/bin', 'HOME': str(root),
@@ -537,7 +541,7 @@ else:
                 # Refuse Git's guessed identity so the real git var failure is exercised.
                 environment.update(GIT_CONFIG_COUNT='4', GIT_CONFIG_KEY_3='user.useConfigOnly', GIT_CONFIG_VALUE_3='true')
             stub = Path(__file__).with_name('fleet-canary-agent.sh')
-            process = subprocess.Popen(['bash', str(stub), str(root)], cwd=root, env=environment,
+            process = subprocess.Popen(['bash', str(stub), str(root)], cwd=checkout, env=environment,
                                        start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             try:
                 deadline = time.monotonic() + 5
