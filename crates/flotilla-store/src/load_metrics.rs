@@ -91,6 +91,19 @@ pub struct HistogramSnapshot {
 }
 
 impl HistogramSnapshot {
+    /// Inclusive bucket bounds in microseconds and cumulative counts.
+    pub fn cumulative_buckets(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let mut total = 0;
+        self.buckets.iter().enumerate().map(move |(index, count)| {
+            total += count;
+            (bucket_upper(index), total)
+        })
+    }
+
+    pub fn sum_micros(&self) -> u64 {
+        self.sum_micros
+    }
+
     pub fn count(&self) -> u64 {
         self.buckets.iter().sum()
     }
@@ -344,6 +357,8 @@ pub fn read_retry_snapshot() -> BTreeMap<&'static str, ReadRetrySnapshot> {
 /// One durable store's single writer and its reader pool.
 #[derive(Debug, Default)]
 pub struct StoreLoadMetrics {
+    /// Reads refused as busy, once per refusal returned to a caller.
+    pub read_contention: Counter,
     /// Time from a write's submission until the writer thread starts it.
     pub write_wait: LatencyHistogram,
     pub write_execution: LatencyHistogram,
@@ -369,6 +384,7 @@ impl StoreLoadMetrics {
             read_execution: self.read_execution.snapshot(),
             read_queue_peak: self.read_queue_peak.get(),
             reads_shed: self.reads_shed.get(),
+            read_contention: self.read_contention.get(),
         }
     }
 }
@@ -382,6 +398,7 @@ pub struct StoreLoadSnapshot {
     pub read_execution: HistogramSnapshot,
     pub read_queue_peak: u64,
     pub reads_shed: u64,
+    pub read_contention: u64,
 }
 
 impl StoreLoadSnapshot {
@@ -394,6 +411,7 @@ impl StoreLoadSnapshot {
             read_execution: self.read_execution.since(&earlier.read_execution),
             read_queue_peak: self.read_queue_peak,
             reads_shed: self.reads_shed.saturating_sub(earlier.reads_shed),
+            read_contention: self.read_contention.saturating_sub(earlier.read_contention),
         }
     }
 }

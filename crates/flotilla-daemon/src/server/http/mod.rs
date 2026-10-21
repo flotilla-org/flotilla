@@ -11,6 +11,7 @@ mod commands;
 mod hook_tests;
 mod hooks;
 mod login;
+pub(in crate::server) mod metrics;
 mod resource_api;
 mod table_api;
 #[cfg(test)]
@@ -56,6 +57,9 @@ pub(in crate::server) const LOGOUT_PATH: &str = "/logout";
 #[derive(bon::Builder)]
 pub(in crate::server) struct HttpRouter {
     backend: ResourceBackend,
+    #[builder(default)]
+    metrics_enabled: bool,
+    load_metrics: Option<Arc<metrics::LoadMetrics>>,
     #[builder(skip)]
     commands: Option<Arc<commands::Commands>>,
     daemon: Option<Arc<InProcessDaemon>>,
@@ -101,6 +105,8 @@ impl HttpRouter {
     pub(in crate::server) fn for_daemon(daemon: Arc<InProcessDaemon>, logins: Arc<LoginStore>, tcp_origin: ListenerOrigin) -> Self {
         Self {
             backend: daemon.resource_backend(),
+            metrics_enabled: false,
+            load_metrics: None,
             agent_state_store: Some(Arc::clone(daemon.agent_state_store())),
             commands: None,
             daemon: Some(daemon),
@@ -109,6 +115,12 @@ impl HttpRouter {
             tcp_origin,
             change_stream_deadline: super::change_stream::CONSUMER_DEADLINE,
         }
+    }
+
+    pub(in crate::server) fn with_load_metrics(mut self, metrics: Arc<metrics::LoadMetrics>, enabled: bool) -> Self {
+        self.load_metrics = Some(metrics);
+        self.metrics_enabled = enabled;
+        self
     }
 
     pub(in crate::server) fn with_commands(
@@ -123,6 +135,7 @@ impl HttpRouter {
 
     pub(in crate::server) fn into_router(self) -> Router {
         Router::new()
+            .route("/metrics", get(metrics::handle))
             .route(HELLO_PATH, get(hello))
             .route("/tables", get(table_api::list))
             .route("/tables/{table}", get(table_api::describe))

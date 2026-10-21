@@ -4038,6 +4038,10 @@ impl InProcessDaemon {
         self.read_projections().fulfilment_list(&self.provisioning_namespace().await).await
     }
 
+    pub fn forge_budget_counter_rows(&self) -> Vec<flotilla_protocol::ForgeBudgetRow> {
+        self.forge_budgets.counter_rows(self.host_name().as_str())
+    }
+
     pub fn forge_budget_rows(&self) -> Vec<flotilla_protocol::ForgeBudgetRow> {
         self.forge_budgets.rows(self.host_name().as_str())
     }

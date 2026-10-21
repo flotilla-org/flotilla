@@ -1453,8 +1453,14 @@ impl SqliteBackend {
             result => result,
         };
         match result {
-            Ok(result) => result,
+            Ok(result) => {
+                if result.as_ref().is_err_and(|error| error.is_store_busy()) {
+                    self.load_metrics.read_contention.increment();
+                }
+                result
+            }
             Err(_) => {
+                self.load_metrics.read_contention.increment();
                 ReadWarnings::warn(&self.read_warnings, 0, 0, 1, operation_name);
                 Err(ResourceError::store_busy_read_deadline())
             }
@@ -3975,6 +3981,7 @@ mod latency_tests {
     #[tokio::test]
     async fn busy_read_returns_an_error_before_client_timeout() {
         let backend = SqliteBackend::open_in_memory().expect("open in-memory store");
+        let metrics = backend.load_metrics();
         let hosts = ResourceBackend::new(backend.clone()).using::<Host>("flotilla");
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -3996,6 +4003,8 @@ mod latency_tests {
         writer.await.expect("writer task");
         let error = result.expect("read must answer before client timeout").expect_err("store must report busy");
         // Exercise the actual producer, not a separately spelled test error.
+        // One refusal returned to the caller is one read_contention event.
+        assert_eq!(metrics.read_contention.get(), 1);
         assert!(error.is_store_busy(), "SQLite's deadline must retain its retry category: {error}");
         assert_eq!(error.to_string(), crate::ResourceError::STORE_BUSY_READ_DEADLINE_MESSAGE);
     }

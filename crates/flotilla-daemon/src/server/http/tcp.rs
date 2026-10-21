@@ -158,13 +158,20 @@ impl TcpListener {
 }
 
 /// How a TCP request authenticates, after rigging has checked its Host and any Origin:
-/// - an `Authorization` header must be exactly `Bearer <file token>` (compared in constant
+/// - GET /metrics is anonymous; its handler checks whether exposition is enabled;
+/// - on other routes, an `Authorization` header must be exactly `Bearer <file token>` (compared in constant
 ///   time), or `Bearer <hook token>` on a hook route, and never falls back to a cookie;
 /// - otherwise a live session cookie from the login store, reported as cookie-based so
 ///   rigging requires the listener's Origin on unsafe methods and upgrades;
 /// - otherwise only the login exchange is reachable, anonymously. Anything else is 401.
 fn authenticate(request: &Request, token: &[u8; 32], hooks: &HookKey, logins: &LoginStore) -> Option<Authentication<CallerAuth>> {
     let admit = |caller: CallerAuth, uses_cookie: bool| Some(Authentication { caller: Caller::Custom(caller), uses_cookie });
+    // The router gates exposition behind daemon config. Host and Origin checks
+    // have already run; this listener can only bind loopback. As a public local
+    // route, it deliberately ignores supplied credentials, including invalid tokens.
+    if request.method() == axum::http::Method::GET && request.uri().path() == "/metrics" {
+        return admit(CallerAuth::Anonymous, false);
+    }
     let headers = request.headers();
     if headers.contains_key(header::AUTHORIZATION) {
         let mut values = headers.get_all(header::AUTHORIZATION).iter();

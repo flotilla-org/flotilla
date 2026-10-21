@@ -99,6 +99,7 @@ pub async fn run(
         },
     )
     .await?;
+    server.install_controller_metrics(Arc::clone(&runtime.controller_metrics));
     server.install_blob_store(Arc::clone(&runtime.blob_store))?;
 
     let result = server.run().await;
