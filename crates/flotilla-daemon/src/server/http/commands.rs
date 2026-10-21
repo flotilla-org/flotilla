@@ -40,6 +40,9 @@ use crate::server::{
 const COMMAND_LIMIT: usize = 1024 * 1024;
 const SMALL_LIMIT: usize = 64 * 1024;
 const RECORD_LIMIT: usize = 1024;
+const CREW_RECORD_LIMIT: usize = 64;
+const OPERATOR_RESERVED_RECORDS: usize = 128;
+const RECORD_CAPACITY_ERROR: &str = "HTTP command record capacity is occupied by active or pending commands";
 const MAX_WAIT: f64 = 300.0;
 const MAX_STEPS: usize = 256;
 const MAX_PROGRESS_BYTES: usize = 256 * 1024;
@@ -61,6 +64,7 @@ pub(super) struct Commands {
     admission: Mutex<()>,
     capacity: Arc<Semaphore>,
     eviction_sequence: Arc<AtomicU64>,
+    collector: Mutex<Option<ProgressCollector>>,
 }
 
 struct Record {
@@ -68,16 +72,49 @@ struct Record {
     command_id: Option<u64>,
     owner: CommandCaller,
     state: watch::Receiver<CommandState>,
-    collector: Option<JoinHandle<()>>,
+    _registration: Option<Registration>,
 }
 
-impl Drop for Record {
+// Removing a record retires only observation, never the daemon execution.
+struct Registration {
+    command_id: u64,
+    retire: mpsc::UnboundedSender<u64>,
+}
+
+impl Drop for Registration {
     fn drop(&mut self) {
-        // Evicting an uncertain record must not leave an orphan event collector.
-        // It deliberately does not cancel the underlying daemon execution.
-        if let Some(collector) = &self.collector {
-            collector.abort();
-        }
+        let _ = self.retire.send(self.command_id);
+    }
+}
+
+#[derive(Default)]
+struct ProgressRoutes {
+    senders: BTreeMap<u64, watch::Sender<CommandState>>,
+    closed: bool,
+}
+
+struct ProgressCollector {
+    routes: Arc<Mutex<ProgressRoutes>>,
+    retire: mpsc::UnboundedSender<u64>,
+    task: JoinHandle<()>,
+}
+
+impl ProgressCollector {
+    fn new(events: broadcast::Receiver<DaemonEvent>, order: Arc<AtomicU64>) -> Self {
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (retire, retired) = mpsc::unbounded_channel();
+        let task = tokio::spawn(collect_all_progress(events, routes.clone(), order, retired, false));
+        Self { routes, retire, task }
+    }
+
+    fn registration(&self, command_id: u64) -> Registration {
+        Registration { command_id, retire: self.retire.clone() }
+    }
+}
+
+impl Drop for ProgressCollector {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -123,31 +160,58 @@ impl Commands {
             admission: Mutex::new(()),
             capacity: Arc::new(Semaphore::new(RECORD_LIMIT)),
             eviction_sequence: Arc::new(AtomicU64::new(0)),
+            collector: Mutex::new(None),
         }
     }
 
-    async fn has_capacity(&self) -> bool {
-        self.capacity.available_permits() > 0
-            || self.records.lock().await.values().any(|r| r.state.borrow().evictable_order(Instant::now()).is_some())
+    fn eviction_candidate(
+        &self,
+        records: &BTreeMap<Uuid, Record>,
+        owner: &CommandCaller,
+        now: Instant,
+    ) -> Result<Option<Uuid>, &'static str> {
+        let owner_full = owner.crew.is_some() && records.values().filter(|r| r.owner.crew == owner.crew).count() >= CREW_RECORD_LIMIT;
+        let crew_full =
+            owner.crew.is_some() && records.values().filter(|r| r.owner.crew.is_some()).count() >= RECORD_LIMIT - OPERATOR_RESERVED_RECORDS;
+        if !owner_full && !crew_full && self.capacity.available_permits() > 0 {
+            return Ok(None);
+        }
+        // One eviction must satisfy every exhausted quota. Crew pressure cannot
+        // consume the operator reservation, even across many distinct owners.
+        records
+            .iter()
+            .filter(|(_, r)| !owner_full || r.owner.crew == owner.crew)
+            .filter(|(_, r)| !crew_full || r.owner.crew.is_some())
+            .filter_map(|(id, r)| r.state.borrow().evictable_order(now).map(|order| (*id, order)))
+            .min_by_key(|(_, order)| *order)
+            .map(|(id, _)| Some(id))
+            .ok_or(RECORD_CAPACITY_ERROR)
     }
 
+    async fn has_capacity(&self, owner: &CommandCaller) -> bool {
+        self.eviction_candidate(&*self.records.lock().await, owner, Instant::now()).is_ok()
+    }
+
+    async fn reserve_for(&self, owner: &CommandCaller) -> Result<OwnedSemaphorePermit, &'static str> {
+        self.reserve_for_at(owner, Instant::now()).await
+    }
+
+    async fn reserve_for_at(&self, owner: &CommandCaller, now: Instant) -> Result<OwnedSemaphorePermit, &'static str> {
+        let mut records = self.records.lock().await;
+        if let Some(id) = self.eviction_candidate(&records, owner, now)? {
+            records.remove(&id);
+        }
+        self.capacity.clone().try_acquire_owned().map_err(|_| RECORD_CAPACITY_ERROR)
+    }
+
+    #[cfg(test)]
     async fn reserve(&self) -> Result<OwnedSemaphorePermit, &'static str> {
         self.reserve_at(Instant::now()).await
     }
 
+    #[cfg(test)]
     async fn reserve_at(&self, now: Instant) -> Result<OwnedSemaphorePermit, &'static str> {
-        let mut records = self.records.lock().await;
-        if self.capacity.available_permits() == 0 {
-            let oldest = records
-                .iter()
-                .filter_map(|(id, record)| record.state.borrow().evictable_order(now).map(|order| (*id, order)))
-                .min_by_key(|(_, order)| *order);
-            // Each submission reserves one permit, so evicting one record is sufficient.
-            if let Some((id, _)) = oldest {
-                records.remove(&id);
-            }
-        }
-        self.capacity.clone().try_acquire_owned().map_err(|_| "HTTP command record capacity is occupied by active or pending commands")
+        self.reserve_for_at(&CommandCaller { principal_ref: PrincipalRef::default(), process: None, crew: None }, now).await
     }
 }
 
@@ -390,14 +454,23 @@ pub(super) async fn handle(
     // dispatch succeeds so a caller error cannot destroy an earlier outcome.
     let _admission = if kind == "execute" {
         let guard = commands.admission.lock().await;
-        if !commands.has_capacity().await {
+        if !commands.has_capacity(&caller).await {
             return encoding.error(StatusCode::CONFLICT, "HTTP command record capacity is occupied by active or pending commands");
         }
         Some(guard)
     } else {
         None
     };
-    let events = daemon.subscribe();
+    // Hold routing admission across dispatch, not the record table: immediate
+    // completions wait here until their watch sender has been registered.
+    let mut collector_slot = if kind == "execute" { Some(commands.collector.lock().await) } else { None };
+    let collector = collector_slot
+        .as_mut()
+        .map(|slot| slot.get_or_insert_with(|| ProgressCollector::new(daemon.subscribe(), commands.eviction_sequence.clone())));
+    let mut routes = match collector.as_ref() {
+        Some(collector) => Some(collector.routes.lock().await),
+        None => None,
+    };
     let dispatcher = RequestDispatcher::new_with_caller(
         daemon,
         &commands.router,
@@ -425,19 +498,34 @@ pub(super) async fn handle(
             RpcResponse::QueryResult { value, .. } => (None, Some(value)),
             _ => return encoding.error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected execute response"),
         };
-        let permit = commands.reserve().await.expect("serialized admission retains an eligible slot");
+        let permit = commands.reserve_for(&caller).await.expect("serialized admission retains an eligible slot");
         let completion_scope = CompletionScope {
             transport_bound,
             project: scope.map(|project| (caller.crew.as_ref().expect("authorized crew").namespace.clone(), project)),
         };
         let mut initial = CommandState::new(id, outcome, &commands.eviction_sequence);
         initial.completion_scope = completion_scope;
-        let completion_scope = initial.completion_scope.clone();
         let (sender, receiver) = watch::channel(initial);
-        let collector = command_id.map(|command_id| {
-            tokio::spawn(collect_progress(events, command_id, sender, commands.eviction_sequence.clone(), completion_scope))
+        let registration = command_id.map(|command_id| {
+            let routes = routes.as_mut().expect("execute collector");
+            if routes.closed {
+                sender.send_modify(|s| {
+                    s.observation_lost(
+                        "command progress unavailable: channel closed; do not retry blindly".into(),
+                        true,
+                        &commands.eviction_sequence,
+                    )
+                });
+            } else {
+                routes.senders.insert(command_id, sender);
+            }
+            collector.as_ref().expect("execute collector").registration(command_id)
         });
-        commands.records.lock().await.insert(id, Record { _permit: permit, command_id, owner: caller, state: receiver, collector });
+        commands
+            .records
+            .lock()
+            .await
+            .insert(id, Record { _permit: permit, command_id, owner: caller, state: receiver, _registration: registration });
         let url = format!("/v1/commands/{id}");
         let mut response = encoding.render(StatusCode::ACCEPTED, json!({"id": id, "command_id": command_id, "url": url}));
         response.headers_mut().insert(header::LOCATION, url.parse().expect("UUID URL"));
@@ -513,51 +601,85 @@ struct CompletionScope {
     project: Option<(String, String)>,
 }
 
-async fn collect_progress(
+async fn collect_all_progress(
     mut events: broadcast::Receiver<DaemonEvent>,
+    routes: Arc<Mutex<ProgressRoutes>>,
+    order: Arc<AtomicU64>,
+    mut retired: mpsc::UnboundedReceiver<u64>,
+    stop_when_empty: bool,
+) {
+    loop {
+        let event = tokio::select! {
+            id = retired.recv() => {
+                let Some(id) = id else { break };
+                routes.lock().await.senders.remove(&id);
+                continue;
+            }
+            event = events.recv() => event,
+        };
+        let mut routes = routes.lock().await;
+        match event {
+            Err(error) => {
+                let closed = matches!(error, RecvError::Closed);
+                for sender in routes.senders.values() {
+                    sender.send_modify(|s| {
+                        s.observation_lost(format!("command progress unavailable: {error}; do not retry blindly"), closed, &order)
+                    });
+                }
+                if closed {
+                    routes.closed = true;
+                    routes.senders.clear();
+                    break;
+                }
+            }
+            Ok(mut event) => {
+                let command_id = match &event {
+                    DaemonEvent::CommandFinished { command_id, .. } | DaemonEvent::CommandStepUpdate { command_id, .. } => *command_id,
+                    _ => continue,
+                };
+                let Some(sender) = routes.senders.get(&command_id) else { continue };
+                let scope = sender.borrow().completion_scope.clone();
+                if let Some((namespace, project)) = &scope.project {
+                    environment_supervision::scope_completion(&mut event, namespace, project);
+                }
+                match event {
+                    DaemonEvent::CommandFinished { result, .. } => {
+                        sender.send_modify(|s| {
+                            s.state = "finished";
+                            s.outcome = Some(result);
+                            s.eviction_order = Some(order.fetch_add(1, Ordering::Relaxed));
+                            s.observation_error = None;
+                            s.unknown_since = None;
+                            s.collector_closed = true;
+                        });
+                        routes.senders.remove(&command_id);
+                    }
+                    event @ DaemonEvent::CommandStepUpdate { .. } if !scope.transport_bound => sender.send_modify(|s| s.push_step(event)),
+                    _ => {}
+                }
+            }
+        }
+        if stop_when_empty && routes.senders.is_empty() {
+            break;
+        }
+    }
+}
+
+// Focused lifecycle tests use the same multiplexed loop with one route.
+#[cfg(test)]
+async fn collect_progress(
+    events: broadcast::Receiver<DaemonEvent>,
     command_id: u64,
     sender: watch::Sender<CommandState>,
     order: Arc<AtomicU64>,
     scope: CompletionScope,
 ) {
-    loop {
-        let mut event = match events.recv().await {
-            Ok(event) => event,
-            Err(error) => {
-                sender.send_modify(|s| {
-                    s.observation_lost(
-                        format!("command progress unavailable: {error}; do not retry blindly"),
-                        matches!(error, RecvError::Closed),
-                        &order,
-                    )
-                });
-                match error {
-                    RecvError::Lagged(_) => continue,
-                    RecvError::Closed => break,
-                }
-            }
-        };
-        if let Some((namespace, project)) = &scope.project {
-            environment_supervision::scope_completion(&mut event, namespace, project);
-        }
-        match event {
-            DaemonEvent::CommandFinished { command_id: finished, result, .. } if finished == command_id => {
-                sender.send_modify(|s| {
-                    s.state = "finished";
-                    s.outcome = Some(result);
-                    s.eviction_order = Some(order.fetch_add(1, Ordering::Relaxed));
-                    s.observation_error = None;
-                    s.unknown_since = None;
-                    s.collector_closed = true;
-                });
-                break;
-            }
-            event @ DaemonEvent::CommandStepUpdate { command_id: updated, .. } if updated == command_id && !scope.transport_bound => {
-                sender.send_modify(|s| s.push_step(event))
-            }
-            _ => {}
-        }
-    }
+    sender.send_modify(|s| s.completion_scope = scope);
+    let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+    routes.lock().await.senders.insert(command_id, sender);
+    let (retire, retired) = mpsc::unbounded_channel();
+    collect_all_progress(events, routes, order, retired, true).await;
+    drop(retire);
 }
 
 fn cancel_status(class: DispatcherErrorClass, state: &CommandState) -> StatusCode {
@@ -789,7 +911,7 @@ mod tests {
                     command_id: None,
                     owner: CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace("flotilla"), process: None, crew: None },
                     state,
-                    collector: None,
+                    _registration: None,
                 },
             );
         }
@@ -895,8 +1017,8 @@ mod tests {
             {
                 let mut records = h.commands.records.lock().await;
                 let record = records.get_mut(&id).unwrap();
-                if let Some(collector) = record.collector.take() {
-                    collector.abort();
+                if let Some(collector) = record._registration.take() {
+                    drop(collector);
                 }
                 record.state = state.clone();
             }
@@ -1519,6 +1641,161 @@ mod tests {
         }
     }
 
+    fn crew_owner(n: usize) -> CommandCaller {
+        CommandCaller {
+            crew: Some(flotilla_protocol::CallerCrew {
+                namespace: "flotilla".into(),
+                convoy: format!("convoy-{n}"),
+                vessel: "work".into(),
+                role: "coder".into(),
+                crew_id: format!("crew-{n}"),
+                terminal_session: None,
+            }),
+            ..user()
+        }
+    }
+
+    async fn insert_live(commands: &Commands, owner: CommandCaller) -> Uuid {
+        let permit = commands.reserve_for(&owner).await.unwrap();
+        let id = Uuid::new_v4();
+        let (_, state) = watch::channel(CommandState::new(id, None, &commands.eviction_sequence));
+        commands.records.lock().await.insert(id, Record { _permit: permit, command_id: None, owner, state, _registration: None });
+        id
+    }
+
+    // Behaviour: a supervisor exhausting its live-record quota gets 409 while
+    // the authenticated operator can still submit real daemon work (#3602).
+    #[tokio::test]
+    async fn crew_quota_leaves_operator_http_capacity() {
+        for cbor in [false, true] {
+            let (temp, daemon) = supervisor_daemon().await;
+            let h = Harness::from_daemon(temp, daemon);
+            let caller =
+                CallerAuth::Environment { environment: flotilla_protocol::EnvironmentId::new("supervisor-environment"), peer: None };
+            let command =
+                serde_json::to_value(Command::builder().action(CommandAction::QueryCrewList { context: Default::default() }).build())
+                    .unwrap();
+            let first = h.call("POST", "/v1/commands", Some(command.clone()), cbor, caller.clone()).await;
+            assert_eq!(first.0, StatusCode::ACCEPTED, "{}", first.1);
+            let owner = h.commands.records.lock().await.values().next().unwrap().owner.clone();
+            h.commands.records.lock().await.clear();
+            for _ in 0..CREW_RECORD_LIMIT {
+                insert_live(&h.commands, owner.clone()).await;
+            }
+            let refused = h.call("POST", "/v1/commands", Some(command), cbor, caller).await;
+            assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
+            let operator = h.call("POST", "/v1/commands", Some(watch_command()), cbor, CallerAuth::Bearer).await;
+            assert_eq!(operator.0, StatusCode::ACCEPTED, "{}", operator.1);
+        }
+    }
+
+    // Behaviour: many independent crews cannot consume the reserved operator
+    // slots. Every crew remains within its own quota at the aggregate boundary.
+    #[tokio::test]
+    async fn aggregate_crew_quota_reserves_operator_slots() {
+        let h = Harness::new().await;
+        for n in 0..RECORD_LIMIT - OPERATOR_RESERVED_RECORDS {
+            insert_live(&h.commands, crew_owner(n / CREW_RECORD_LIMIT)).await;
+        }
+        assert!(h.commands.reserve_for(&crew_owner(usize::MAX)).await.is_err());
+        let mut permits = Vec::new();
+        for _ in 0..OPERATOR_RESERVED_RECORDS {
+            permits.push(h.commands.reserve_for(&user()).await.unwrap());
+        }
+        assert!(h.commands.reserve_for(&user()).await.is_err());
+        assert_eq!(h.commands.records.lock().await.len(), RECORD_LIMIT - OPERATOR_RESERVED_RECORDS);
+    }
+
+    // Behaviour: admission/completion/removal sequences preserve per-owner
+    // quotas, while a finished record may be replaced without evicting live work.
+    #[hegel::test]
+    fn generated_owner_quota_lifecycle(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Explicit operations straddle the full boundary for two distinct owners.
+        let operations: Vec<_> = (0..tc.draw(gs::integers::<usize>().min_value(1).max_value(16)))
+            .map(|_| {
+                (tc.draw(gs::integers::<usize>().min_value(0).max_value(1)), tc.draw(gs::integers::<usize>().min_value(0).max_value(2)))
+            })
+            .collect();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let h = Harness::new().await;
+            for n in 0..2 {
+                for _ in 0..CREW_RECORD_LIMIT {
+                    insert_live(&h.commands, crew_owner(n)).await;
+                }
+            }
+            for (n, operation) in operations {
+                let owner = crew_owner(n);
+                if operation == 0 {
+                    if h.commands.has_capacity(&owner).await {
+                        insert_live(&h.commands, owner.clone()).await;
+                    } else {
+                        assert!(h.commands.reserve_for(&owner).await.is_err());
+                    }
+                } else {
+                    let mut records = h.commands.records.lock().await;
+                    let id = records.iter().find(|(_, r)| r.owner.crew == owner.crew).map(|(id, _)| *id);
+                    if let Some(id) = id {
+                        if operation == 1 {
+                            let (_, state) =
+                                watch::channel(CommandState::new(id, Some(CommandValue::Cancelled), &h.commands.eviction_sequence));
+                            records.get_mut(&id).unwrap().state = state;
+                        } else {
+                            records.remove(&id);
+                        }
+                    }
+                }
+                let records = h.commands.records.lock().await;
+                for n in 0..2 {
+                    assert!(records.values().filter(|r| r.owner.crew == crew_owner(n).crew).count() <= CREW_RECORD_LIMIT);
+                }
+                assert_eq!(records.len() + h.commands.capacity.available_permits(), RECORD_LIMIT);
+                drop(records);
+                assert!(h.commands.has_capacity(&user()).await);
+            }
+        });
+    }
+
+    // Behaviour: one broadcast subscription routes interleaved progress and
+    // out-of-order completions only to the matching record, and survives empty periods.
+    #[tokio::test]
+    async fn shared_collector_routes_many_commands_with_one_subscription() {
+        let (events, input) = broadcast::channel(64);
+        let order = Arc::new(AtomicU64::new(0));
+        let collector = ProgressCollector::new(input, order.clone());
+        let mut states = Vec::new();
+        for id in 0..8 {
+            let (sender, state) = watch::channel(CommandState::new(Uuid::new_v4(), None, &order));
+            collector.routes.lock().await.senders.insert(id, sender);
+            states.push(state);
+        }
+        assert_eq!(events.receiver_count(), 1);
+        for id in (0..8).rev() {
+            let mut progress = step(format!("step-{id}"));
+            let DaemonEvent::CommandStepUpdate { command_id, .. } = &mut progress else { unreachable!() };
+            *command_id = id;
+            events.send(progress).unwrap();
+            let mut completion = finished();
+            let DaemonEvent::CommandFinished { command_id, .. } = &mut completion else { unreachable!() };
+            *command_id = id;
+            events.send(completion.clone()).unwrap();
+            // Duplicate completion must not mutate another route.
+            events.send(completion).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), states[id as usize].wait_for(|s| s.outcome.is_some())).await.unwrap().unwrap();
+            for (n, state) in states.iter().enumerate() {
+                assert_eq!(state.borrow().outcome.is_some(), n >= id as usize);
+                assert_eq!(state.borrow().steps.len(), usize::from(n >= id as usize));
+            }
+            assert_eq!(events.receiver_count(), 1);
+        }
+        let (sender, mut state) = watch::channel(CommandState::new(Uuid::new_v4(), None, &order));
+        collector.routes.lock().await.senders.insert(99, sender);
+        drop(events);
+        tokio::time::timeout(Duration::from_secs(1), state.wait_for(|s| s.collector_closed)).await.unwrap().unwrap();
+        assert_eq!(state.borrow().state, "unknown");
+        assert!(state.borrow().outcome.is_none());
+    }
+
     // Full capacity rejects live work; when completions exist, completion order rather
     // than UUID order selects eviction, including completions with a reserved permit.
     #[tokio::test]
@@ -1532,7 +1809,7 @@ mod tests {
                 .records
                 .lock()
                 .await
-                .insert(id, Record { _permit: permit, command_id: Some(n as u64), owner: user(), state: receiver, collector: None });
+                .insert(id, Record { _permit: permit, command_id: Some(n as u64), owner: user(), state: receiver, _registration: None });
         }
         assert!(h.commands.reserve().await.is_err());
         let oldest_id = Uuid::from_u128(RECORD_LIMIT as u128);
@@ -1617,7 +1894,7 @@ mod tests {
             .records
             .lock()
             .await
-            .insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state: receiver, collector: None });
+            .insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state: receiver, _registration: None });
         for cbor in [false, true] {
             let reply = h.call("DELETE", &format!("/v1/commands/{id}"), None, cbor, CallerAuth::Bearer).await;
             assert_eq!(reply.0, StatusCode::CONFLICT);
@@ -1633,7 +1910,11 @@ mod tests {
         let (events, receiver) = broadcast::channel(4);
         let (sender, state) = watch::channel(CommandState::new(id, None, &h.commands.eviction_sequence));
         let permit = h.commands.reserve().await.unwrap();
-        h.commands.records.lock().await.insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state, collector: None });
+        h.commands
+            .records
+            .lock()
+            .await
+            .insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state, _registration: None });
         let task = tokio::spawn(collect_progress(receiver, 77, sender, h.commands.eviction_sequence.clone(), CompletionScope::default()));
         let url = format!("/v1/commands/{id}");
         let running = h.call("GET", &format!("{url}?wait=0.001"), None, false, CallerAuth::Bearer).await;
@@ -1682,13 +1963,14 @@ mod tests {
     }
 
     // Unknown records retain a bounded recovery window. At full capacity, the grace
-    // boundary releases the oldest uncertain slot and aborts its orphan collector.
+    // boundary releases the oldest uncertain slot and unregisters its observation route.
     #[tokio::test]
-    async fn unknown_records_expire_and_eviction_stops_collectors() {
+    async fn unknown_records_expire_and_eviction_retires_routes() {
         let h = Harness::new().await;
         let now = Instant::now();
         let (events, _) = broadcast::channel(1);
         let mut first_state = None;
+        let collector = ProgressCollector::new(events.subscribe(), h.commands.eviction_sequence.clone());
         for n in 0..RECORD_LIMIT {
             let id = Uuid::from_u128((RECORD_LIMIT - n) as u128);
             let permit = h.commands.reserve_at(now).await.unwrap();
@@ -1701,18 +1983,12 @@ mod tests {
             if n == 0 {
                 first_state = Some(receiver.clone());
             }
-            let collector = Some(tokio::spawn(collect_progress(
-                events.subscribe(),
-                n as u64,
-                sender,
-                h.commands.eviction_sequence.clone(),
-                CompletionScope::default(),
-            )));
-            h.commands
-                .records
-                .lock()
-                .await
-                .insert(id, Record { _permit: permit, command_id: Some(n as u64), owner: user(), state: receiver, collector });
+            collector.routes.lock().await.senders.insert(n as u64, sender);
+            let registration = Some(collector.registration(n as u64));
+            h.commands.records.lock().await.insert(
+                id,
+                Record { _permit: permit, command_id: Some(n as u64), owner: user(), state: receiver, _registration: registration },
+            );
         }
         assert!(h.commands.reserve_at(now + UNKNOWN_RETENTION - Duration::from_nanos(1)).await.is_err());
         let permit = h.commands.reserve_at(now + UNKNOWN_RETENTION).await.unwrap();
@@ -1721,7 +1997,7 @@ mod tests {
         let mut first_state = first_state.unwrap();
         assert!(
             tokio::time::timeout(Duration::from_secs(1), first_state.changed()).await.unwrap().is_err(),
-            "eviction must abort the collector and close its watch sender"
+            "eviction must retire the route and close its watch sender"
         );
         assert!(first_state.borrow().outcome.is_none(), "eviction cannot invent an execution outcome");
         drop(permit);
@@ -1739,14 +2015,15 @@ mod tests {
             let (sender, receiver) = watch::channel(state);
             let observer = sender.clone();
             let (events, input) = broadcast::channel(4);
-            let collector =
-                Some(tokio::spawn(collect_progress(input, 77, sender, h.commands.eviction_sequence.clone(), CompletionScope::default())));
+            let collector = ProgressCollector::new(input, h.commands.eviction_sequence.clone());
+            collector.routes.lock().await.senders.insert(77, sender);
+            let registration = Some(collector.registration(77));
             let permit = h.commands.reserve().await.unwrap();
             h.commands
                 .records
                 .lock()
                 .await
-                .insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state: receiver, collector });
+                .insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state: receiver, _registration: registration });
             let url = format!("/v1/commands/{id}?wait=2");
             let mut request = Box::pin(h.call("GET", &url, None, cbor, CallerAuth::Bearer));
             tokio::time::timeout(Duration::from_secs(1), async {
@@ -1788,7 +2065,7 @@ mod tests {
             .records
             .lock()
             .await
-            .insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state: receiver, collector: None });
+            .insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state: receiver, _registration: None });
         let url = format!("/v1/commands/{id}?wait=300");
         let reply = tokio::time::timeout(Duration::from_secs(1), h.call("GET", &url, None, true, CallerAuth::Bearer)).await.unwrap();
         assert_eq!(reply.1["state"], "unknown");
