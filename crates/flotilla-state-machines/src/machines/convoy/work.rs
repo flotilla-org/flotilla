@@ -141,9 +141,9 @@ pub enum DutyScope {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Terms {
     /// Answer each message within this many microseconds.
-    pub reply_within: Option<i64>,
+    pub reply_within: Option<u64>,
     /// Show activity at least this often, in microseconds.
-    pub heartbeat: Option<i64>,
+    pub heartbeat: Option<u64>,
     /// Anything else, as prose for the owner.
     pub note: Option<String>,
 }

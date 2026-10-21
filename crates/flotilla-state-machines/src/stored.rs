@@ -19,6 +19,8 @@
 //! `Log` with the home deciding and `apply_edge` persisting in one
 //! transaction, is a later layer.
 
+use std::{fmt, marker::PhantomData};
+
 use flotilla_schema::{
     adapt::{Adapter, AsColumns},
     Cbor, CodeEnum, ColumnOf, DecodeError, Decoder, Edge, EdgeError, Element, EncodeError, Encoder, Identity, Kind, KindCode, KindRegistry,
@@ -82,7 +84,31 @@ where
 pub struct Declared<S: KindSpec, E> {
     pub spec: S,
     pub state: State<<S as KindSpec>::State>,
-    edges: std::marker::PhantomData<fn() -> E>,
+    edges: PhantomData<fn() -> E>,
+}
+
+impl<S: KindSpec, E> Declared<S, E> {
+    pub fn new(spec: S, state: State<S::State>) -> Self {
+        Declared { spec, state, edges: PhantomData }
+    }
+}
+
+impl<S: KindSpec + fmt::Debug, E> fmt::Debug for Declared<S, E>
+where
+    S::State: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Declared").field("spec", &self.spec).field("state", &self.state).finish()
+    }
+}
+
+impl<S: KindSpec + PartialEq, E> PartialEq for Declared<S, E>
+where
+    S::State: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.spec == other.spec && self.state == other.state
+    }
 }
 
 impl<S, E> Element for Declared<S, E>
@@ -108,7 +134,7 @@ where
         let state = <AsColumns as Adapter<State<S::State>>>::decode(d)
             .map_err(|error| error.at("state"))?
             .ok_or_else(|| DecodeError::missing("state"))?;
-        Ok(Declared { spec, state, edges: std::marker::PhantomData })
+        Ok(Declared::new(spec, state))
     }
 }
 
