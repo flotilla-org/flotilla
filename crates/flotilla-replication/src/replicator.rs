@@ -1,4 +1,4 @@
-use flotilla_store::retry_store_read;
+use flotilla_store::{load_metrics::ReadRetryConsumer, retry_store_read_for};
 use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use chrono::Utc;
@@ -537,17 +537,19 @@ pub async fn replicate_kind_direct<T: Resource>(
 ) -> Result<(), String> {
     let remote = remote.using::<T>(REPLICATION_NAMESPACE);
     let writer = store.backend(host).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
-    let mut cursor = retry_store_read(|| writer.cursor()).await.map_err(|error| error.to_string())?;
+    let mut cursor = retry_store_read_for(ReadRetryConsumer::Replication, || writer.cursor()).await.map_err(|error| error.to_string())?;
     let mut repaired = false;
     loop {
         if cursor.is_none() {
-            let listed = retry_store_read(|| remote.list()).await.map_err(|error| error.to_string())?;
-            retry_store_read(|| async { store.backend(host).including_replicas::<T>(REPLICATION_NAMESPACE).list().await })
-                .await
-                .map_err(|error| error.to_string())?;
+            let listed = retry_store_read_for(ReadRetryConsumer::Replication, || remote.list()).await.map_err(|error| error.to_string())?;
+            retry_store_read_for(ReadRetryConsumer::Replication, || async {
+                store.backend(host).including_replicas::<T>(REPLICATION_NAMESPACE).list().await
+            })
+            .await
+            .map_err(|error| error.to_string())?;
             writer.replace(&listed, Utc::now()).await.map_err(|error| error.to_string())?;
             host.metrics().snapshots.increment();
-            cursor = retry_store_read(|| writer.cursor()).await.map_err(|error| error.to_string())?;
+            cursor = retry_store_read_for(ReadRetryConsumer::Replication, || writer.cursor()).await.map_err(|error| error.to_string())?;
         }
         let prefix = cursor.as_ref().ok_or_else(|| "snapshot did not establish replica prefix".to_string())?;
         let start = match &prefix.generation {
@@ -556,7 +558,7 @@ pub async fn replicate_kind_direct<T: Resource>(
             }
             None => WatchStart::FromVersion(prefix.resource_version.clone()),
         };
-        let result = match retry_store_read(|| remote.watch(start.clone())).await {
+        let result = match retry_store_read_for(ReadRetryConsumer::Replication, || remote.watch(start.clone())).await {
             Ok(watch) => {
                 host.health().healthy(peer, &store.health_kind::<T>()).await;
                 apply_direct_watch(watch, &writer, prefix.resource_version.clone(), &remote, peer, host.metrics()).await
@@ -599,7 +601,7 @@ async fn apply_direct_watch<T: Resource>(
         let event = tokio::select! {
             event = watch.next() => match event { Some(event) => event, None => return Ok(()) },
             _ = digest_tick.tick() => {
-                let result=reconcile_digest::<T, _, _>(writer, peer, |query| async move { retry_store_read(|| remote.digest(&query)).await.map_err(|error| error.to_string()) }).await;
+                let result=reconcile_digest::<T, _, _>(writer, peer, |query| async move { retry_store_read_for(ReadRetryConsumer::Replication, || remote.digest(&query)).await.map_err(|error| error.to_string()) }).await;
                 digest_failures.report::<T>(peer,&result);
                 match result {
                     // Reopen from the proven cut, discarding buffered older events.
@@ -662,7 +664,7 @@ where
     if remote.origin != *peer || remote.kind != T::API_PATHS.kind || remote.namespace != REPLICATION_NAMESPACE {
         return Err("digest authority identity mismatch".into());
     }
-    let previous = retry_store_read(|| writer.cursor())
+    let previous = retry_store_read_for(ReadRetryConsumer::Replication, || writer.cursor())
         .await
         .map_err(|error| error.to_string())?
         .ok_or("digest needs an established replica prefix")?;
@@ -672,7 +674,9 @@ where
     if generation != remote.generation {
         return Err("digest generation changed; log reconnect required".into());
     }
-    let local = retry_store_read(|| writer.digest(generation.clone())).await.map_err(|error| error.to_string())?;
+    let local = retry_store_read_for(ReadRetryConsumer::Replication, || writer.digest(generation.clone()))
+        .await
+        .map_err(|error| error.to_string())?;
     if local.root == remote.root {
         return Ok(false);
     }
@@ -721,7 +725,7 @@ async fn fetch_routed_digest<T: Resource>(
     store: ReplicationStore,
     query: DigestQuery,
 ) -> Result<PartitionDigest, String> {
-    retry_store_read(|| async {
+    retry_store_read_for(ReadRetryConsumer::Replication, || async {
         routed
             .digest(peer, RoutedDigestRequest { namespace: REPLICATION_NAMESPACE.into(), kind: store.kind::<T>(), query: query.clone() })
             .await
@@ -760,11 +764,13 @@ async fn replicate_kind_over_routed_watch<T: Resource>(
     store: ReplicationStore,
     digest_control: Option<Arc<DigestControl>>,
 ) -> Result<(), String> {
-    retry_store_read(|| async { store.backend(host).including_replicas::<T>(REPLICATION_NAMESPACE).list().await })
-        .await
-        .map_err(|error| error.to_string())?;
+    retry_store_read_for(ReadRetryConsumer::Replication, || async {
+        store.backend(host).including_replicas::<T>(REPLICATION_NAMESPACE).list().await
+    })
+    .await
+    .map_err(|error| error.to_string())?;
     let writer = store.backend(host).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
-    let mut cursor = retry_store_read(|| writer.cursor()).await.map_err(|error| error.to_string())?;
+    let mut cursor = retry_store_read_for(ReadRetryConsumer::Replication, || writer.cursor()).await.map_err(|error| error.to_string())?;
     let mut repaired = false;
     loop {
         match run_routed_watch::<T>(routed, host, peer, store, cursor, digest_control.clone()).await {
@@ -804,9 +810,11 @@ async fn run_routed_watch<T: Resource>(
         replica_sources: false,
         cursor: prefix.clone(),
     };
-    let mut events = retry_store_read(|| async { routed.watch(peer, request.clone()).await.map_err(ResourceError::other) })
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut events = retry_store_read_for(ReadRetryConsumer::Replication, || async {
+        routed.watch(peer, request.clone()).await.map_err(ResourceError::other)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
     host.health().healthy(peer, &store.health_kind::<T>()).await;
     let writer = store.backend(host).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut initial = Vec::<ResourceObject<T>>::new();
@@ -920,9 +928,11 @@ async fn replicate_relay_over_routed_watch<T: Resource>(
 ) -> Result<(), String> {
     let request =
         RoutedWatchRequest { namespace: REPLICATION_NAMESPACE.to_string(), kind: store.kind::<T>(), replica_sources: true, cursor: None };
-    let mut events = retry_store_read(|| async { routed.watch(peer, request.clone()).await.map_err(ResourceError::other) })
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut events = retry_store_read_for(ReadRetryConsumer::Replication, || async {
+        routed.watch(peer, request.clone()).await.map_err(ResourceError::other)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
     loop {
         match events.next().await {
             RoutedWatchItem::Response(response) => {
@@ -1160,7 +1170,7 @@ mod tests {
         let mut invalid = record.clone();
         invalid.object = None;
         assert!(apply_response(&writer, &mut Vec::new(), &mut false, envelope(vec![record.clone(), invalid])).await.is_err());
-        assert_eq!(retry_store_read(|| writer.cursor()).await.unwrap().unwrap().resource_version, "0");
+        assert_eq!(retry_store_read_for(ReadRetryConsumer::Replication, || writer.cursor()).await.unwrap().unwrap().resource_version, "0");
         assert!(backend
             .store()
             .list_replicas_raw(flotilla_store::ResourceKind::of::<Host>(), REPLICATION_NAMESPACE)
@@ -1168,7 +1178,7 @@ mod tests {
             .unwrap()
             .is_empty());
         apply_response(&writer, &mut Vec::new(), &mut false, envelope(vec![record])).await.unwrap();
-        assert_eq!(retry_store_read(|| writer.cursor()).await.unwrap().unwrap().resource_version, "1");
+        assert_eq!(retry_store_read_for(ReadRetryConsumer::Replication, || writer.cursor()).await.unwrap().unwrap().resource_version, "1");
         assert_eq!(
             backend.store().list_replicas_raw(flotilla_store::ResourceKind::of::<Host>(), REPLICATION_NAMESPACE).await.unwrap().len(),
             1

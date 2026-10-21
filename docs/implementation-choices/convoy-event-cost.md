@@ -151,3 +151,28 @@ returns `WatchExpired` rather than allocating an unbounded queue. A real SQLite
 writer-pressure test failed before this separation and now checks the raw API
 returns store-busy within three seconds. Prolonged retry observability is tracked
 separately in #3615.
+
+### Consumer read-retry observability (#3615)
+
+`load_metrics::read_retry_snapshot()` reports process-wide retry metrics in three
+fixed classes: `controller`, `watch_view`, and `replication`. These include remote
+replication reads and are independent of any particular store backend. Labels
+never contain a resource name, namespace, peer, or view identifier. Only active
+retry calls retain bookkeeping, released when the future returns or is dropped.
+
+`retries`, `recoveries`, `failures`, and `cancellations` are cumulative counters;
+`peak_consecutive` is a per-call high-water mark. `active`, `prolonged`,
+`consecutive` (sum across active calls), and `oldest_millis` are current gauges.
+The first busy refusal starts a retry episode. Success counts one recovery;
+a non-busy error counts one failure; dropping a retry counts one cancellation.
+All three outcomes clear that call's current gauges. Reads that never encounter
+store-busy do not affect the metrics.
+
+A call is prolonged at 30 seconds from its first busy refusal, including backoff
+and time waiting for its subsequent read. Each Host heartbeat publishes the
+snapshot in `capabilities.store_read_retries` and recomputes the informational
+`ResourceStore/ReadRetries` condition (`StoreBusyReadRetriesProlonged`) when any
+class has a prolonged call. The condition disappears on the next heartbeat after
+all prolonged calls finish or are cancelled. It blocks neither readiness nor
+forge observation and changes no retry, restart, or warning policy. A daemon too
+busy to publish a heartbeat still falls under existing heartbeat freshness checks.
