@@ -121,13 +121,15 @@ impl flotilla_issue_tracker::IssueProvider for ForgejoIssueProvider {
         if let Some(search) = &params.search {
             query.push(("q", search.clone()));
         }
-        for (field, values) in &params.match_fields {
-            query.push((field, values.join(",")));
-        }
         let (value, has_more) = self.forge.get_json(&format!("repos/{}/issues", source.scope), &query).await?;
         let fetched_at = Utc::now();
         let raw_items = value.as_array().ok_or("Forgejo issue list response was not an array")?;
-        let items = raw_items.iter().filter_map(|value| parse_issue(source, value, fetched_at)).collect();
+        let items = raw_items
+            .iter()
+            .filter(|value| flotilla_issue_tracker::match_fields::matches(value, &params.match_fields))
+            .filter_map(|value| parse_issue(source, value, fetched_at))
+            .collect();
+        // Keep the native cursor even when client-side selectors empty a page.
         Ok(IssueResultPage { items, total: None, has_more })
     }
 
@@ -413,35 +415,59 @@ mod tests {
         assert_no_refusals(&fake);
     }
 
-    // Finding (#3374): `IssueQuery.match_fields` sends each project-declared
-    // field name as a query parameter. Forgejo silently ignores parameters it
-    // does not know, so the provider's match fields filter nothing there; the
-    // fake refuses the unrecorded shape instead, which makes the latent
-    // behaviour visible. This pins the refusal; the provider is unchanged.
+    // ADR 0020: project fields filter native issue values client-side and
+    // never become URL parameters. The strict fake rejects unknown parameters;
+    // keep that refusal contract while teaching the provider to avoid them.
     #[tokio::test]
-    async fn fake_forge_refuses_match_field_parameters() {
+    async fn fake_forge_match_fields_are_interpreted_by_the_provider() {
         let fake = RecordedWorld::ZellijIssues.seed(FAKE_URL, "lab", FAKE_TOKEN);
         let (provider, source) = fake_provider(&fake);
-        let query = IssueQuery { match_fields: [("priority".to_string(), vec!["high".to_string()])].into(), ..IssueQuery::default() };
-        let error = provider.query(&source, &query, 1, 30).await.expect_err("unrecorded parameter");
-        assert!(error.contains("400"), "{error}");
-        let (refusals, count) = fake.refusals();
-        assert_eq!(count, 1);
-        assert!(refusals[0].reason.contains("`priority`"), "{refusals:?}");
+        for search in [None, Some("Forgejo".to_string())] {
+            for (field, value, expected) in [
+                ("labels", "ready", vec!["9"]),
+                ("labels", "absent", vec![]),
+                ("component", "terminal", vec![]),
+                ("priority", "high", vec![]),
+                ("sort", "oldest", vec![]),
+            ] {
+                let query = IssueQuery {
+                    search: search.clone(),
+                    match_fields: [(field.into(), vec![value.into()])].into(),
+                    ..IssueQuery::default()
+                };
+                let page = provider.query(&source, &query, 1, 30).await.expect("client-side selector");
+                assert_eq!(ids(&page.items), expected);
+                assert_eq!(page.total, None);
+                assert!(!page.has_more);
+            }
+        }
+        // Empty value lists fail closed through the provider too (ADR 0020).
+        let empty_values = IssueQuery { match_fields: [("labels".into(), vec![])].into(), ..IssueQuery::default() };
+        assert!(provider.query(&source, &empty_values, 1, 30).await.expect("empty selector values").items.is_empty());
+        // A fully filtered page still carries the forge's continuation cursor.
+        let query = IssueQuery { match_fields: [("labels".into(), vec!["provider".into()])].into(), ..IssueQuery::default() };
+        let first = provider.query(&source, &query, 1, 1).await.expect("first page");
+        assert!(first.items.is_empty());
+        assert!(first.has_more);
+        let second = provider.query(&source, &query, 2, 1).await.expect("second page");
+        assert_eq!(ids(&second.items), ["8"]);
+        assert!(!second.has_more);
+        assert_no_refusals(&fake);
     }
 
     const LABELS: [&str; 3] = ["ready", "provider", "bug"];
 
     // Behaviour (#3374): paging through a filtered query with the provider
-    // against the fake yields exactly the open issues carrying the label,
-    // most recently updated first, each page full until the last, with
-    // `has_more` (from the `Link` next relation) false only on the last page.
+    // against the fake yields exactly the open issues satisfying every selector,
+    // most recently updated first. The native `has_more` cursor is preserved
+    // even when an intermediate page has no matching issues.
     // The generator draws 0..=12 issues, each with any subset of three labels,
     // open or closed, some edited later so update order differs from number
     // order; a label filter or none; and a page size of 1..=5, so listings fit
-    // one page, fill pages exactly, and spill over.
+    // one page, fill pages exactly, and spill over. Project selectors draw every
+    // subset of the labels plus absent fields; native pages may filter to empty.
     #[hegel::test]
-    fn fake_forge_paged_label_queries_agree_with_the_forge(tc: hegel::TestCase) {
+    fn fake_forge_paged_selectors_agree_with_the_forge(tc: hegel::TestCase) {
         use hegel::generators as gs;
         let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(12));
         let issues: Vec<(usize, bool, bool)> = (0..count)
@@ -449,6 +475,8 @@ mod tests {
             .collect();
         let label = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
         let label = LABELS.get(label).copied();
+        let required = tc.draw(gs::integers::<usize>().min_value(0).max_value(7));
+        let missing = tc.draw(gs::booleans());
         let page_size = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
@@ -477,11 +505,30 @@ mod tests {
                 .iter()
                 .map(|number| fake.item(&repo, *number).expect("issue"))
                 .filter(|item| item.state == ItemState::Open && label.is_none_or(|label| item.labels.iter().any(|name| name == label)))
+                .filter(|item| {
+                    !missing
+                        && LABELS
+                            .iter()
+                            .enumerate()
+                            .all(|(bit, name)| required & (1 << bit) == 0 || item.labels.iter().any(|actual| actual == name))
+                })
                 .collect();
             expected.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
 
             let (provider, source) = fake_provider(&fake);
-            let query = IssueQuery { label: label.map(str::to_string), ..IssueQuery::default() };
+            let mut match_fields = std::collections::BTreeMap::new();
+            if required != 0 {
+                match_fields.insert(
+                    "labels".into(),
+                    LABELS.iter().enumerate().filter(|(bit, _)| required & (1 << bit) != 0).map(|(_, name)| name.to_string()).collect(),
+                );
+            }
+            if missing {
+                // The fake's native issue payload has no component field; this
+                // deliberately exercises absent-field nonmatching, not labels.
+                match_fields.insert("component".into(), vec!["terminal".into()]);
+            }
+            let query = IssueQuery { label: label.map(str::to_string), match_fields, ..IssueQuery::default() };
             let mut seen: Vec<(String, Vec<String>, DateTime<Utc>)> = Vec::new();
             for page_number in 1..=20 {
                 let page = provider.query(&source, &query, page_number, page_size).await.expect("page");
@@ -489,7 +536,11 @@ mod tests {
                 if !page.has_more {
                     break;
                 }
-                assert_eq!(page.items.len(), page_size, "a page with more after it is full");
+                if query.match_fields.is_empty() {
+                    assert_eq!(page.items.len(), page_size, "an unfiltered page with more after it is full");
+                } else {
+                    assert!(page.items.len() <= page_size, "client filtering never expands a native page");
+                }
             }
             let expected: Vec<_> = expected.into_iter().map(|item| (item.number.to_string(), item.labels, item.updated_at)).collect();
             assert_eq!(seen, expected);
