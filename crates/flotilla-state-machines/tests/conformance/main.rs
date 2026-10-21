@@ -19,13 +19,15 @@
 //! `Resource::state()`, plus the immutable spec where the Quint state carries
 //! request data, plus the `Attempted` log entries where its history is
 //! attempts) in the spec's ITF shape, and the comparison is equality with the
-//! spec's state. Only the Ensure adaptor reads edge events, for that history,
-//! and no spec state is projected before comparison. Each adaptor's module doc lists the field mapping and every
+//! spec's state. Only the Ensure adaptor reads edge events for that history,
+//! and the AwaitingReply adaptor for the reply an answer named, and no spec
+//! state is projected before comparison. Each adaptor's module doc lists the field mapping and every
 //! remaining encoding choice.
 
 use flotilla_quint_testkit::{graph, itf};
 
 mod agent_session;
+mod awaiting_reply;
 mod convoy;
 mod ensure;
 mod lifecycle;

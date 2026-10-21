@@ -37,6 +37,64 @@ CREATE TABLE stream_history (
 CREATE TABLE codes (
   kind TEXT NOT NULL, field TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
   PRIMARY KEY (kind, field, code)) STRICT, WITHOUT ROWID;
+CREATE TABLE "awaiting_reply" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "message" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
+  "sender" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "recipient" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "subject" INTEGER REFERENCES "strings" ("id"),
+  "kind" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "awaited" TEXT NOT NULL CHECK ("awaited" IN ('ou', 're')),
+  "deadline" INTEGER,
+  "state" TEXT NOT NULL CHECK ("state" IN ('an', 'ex', 'op', 'wd')),
+  "state_since" INTEGER NOT NULL,
+  "reason" TEXT,
+  CHECK (CASE WHEN "state" = 'op'
+      THEN "reason" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 'an'
+      THEN "reason" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 'ex'
+      THEN "reason" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 'wd'
+      THEN "reason" IS NOT NULL
+      END)
+) STRICT;
+CREATE INDEX "awaiting_reply_by_message" ON "awaiting_reply" ("message");
+CREATE INDEX "awaiting_reply_deadline" ON "awaiting_reply" ("deadline") WHERE "state" IN ('op') AND "deadline" IS NOT NULL;
+CREATE INDEX "awaiting_reply_open_by_sender" ON "awaiting_reply" ("sender") WHERE "state" IN ('op');
+CREATE INDEX "awaiting_reply_open_by_subject" ON "awaiting_reply" ("subject") WHERE "state" IN ('op') AND "subject" IS NOT NULL;
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('ar', 'awaited', 'ou', 'Outcome'),
+  ('ar', 'awaited', 're', 'Reply'),
+  ('ar', 'state', 'an', 'Answered'),
+  ('ar', 'state', 'ex', 'Expired'),
+  ('ar', 'state', 'op', 'Open'),
+  ('ar', 'state', 'wd', 'Withdrawn'),
+  ('ar', 'log:edge', 'an', 'Answer'),
+  ('ar', 'log:edge', 'ex', 'Expire'),
+  ('ar', 'log:edge', 'wd', 'Withdraw'),
+  ('ar', 'log:label', 'an', 'Answered'),
+  ('ar', 'log:label', 'ex', 'Expired'),
+  ('ar', 'log:label', 'op', 'Open'),
+  ('ar', 'log:label', 'wd', 'Withdrawn');
+CREATE VIEW "awaiting_reply_view" AS SELECT
+  "awaiting_reply"."id",
+  "awaiting_reply"."version",
+  "awaiting_reply"."message",
+  (SELECT "s" FROM "strings" WHERE "id" = "awaiting_reply"."sender") AS "sender",
+  (SELECT "s" FROM "strings" WHERE "id" = "awaiting_reply"."recipient") AS "recipient",
+  (SELECT "s" FROM "strings" WHERE "id" = "awaiting_reply"."subject") AS "subject",
+  (SELECT "s" FROM "strings" WHERE "id" = "awaiting_reply"."kind") AS "kind",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ar' AND "field" = 'awaited' AND "code" = "awaiting_reply"."awaited") AS "awaited",
+  "awaiting_reply"."deadline",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ar' AND "field" = 'state' AND "code" = "awaiting_reply"."state") AS "state",
+  "awaiting_reply"."state_since",
+  "awaiting_reply"."reason"
+FROM "awaiting_reply";
 CREATE TABLE "agent_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

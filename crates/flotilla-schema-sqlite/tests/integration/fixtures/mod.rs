@@ -1,10 +1,10 @@
 //! Fixture kinds and helpers.
 //!
 //! The stored kinds are the engine's machine declarations (#3319, #3373 ruling 4): Message,
-//! AgentSession, Convoy, Vessel and Ensure from `flotilla_state_machines::machines`, registered
-//! through the engine's production registry, and `TerminalSession`, a lifecycle kind whose request
-//! is declared here (`terminal`); each is stored as the engine's `Resource`, declared by its spec
-//! (#3392 ruling D5). Their edges are real transitions: each fixture's [`Fixture::edge`] builds a
+//! AgentSession, Convoy, Vessel, Ensure and AwaitingReply from
+//! `flotilla_state_machines::machines`, registered through the engine's production registry, and
+//! `TerminalSession`, a lifecycle kind whose request is declared here (`terminal`); each is stored
+//! as the engine's `Resource`, declared by its spec (#3392 ruling D5). Their edges are real transitions: each fixture's [`Fixture::edge`] builds a
 //! home holding the stored resource, a world that makes a drawn edge pass its gate, applies the
 //! edge through the engine, and turns the result into the stored edge ([`engine::drive`]). Every
 //! stored transition is one the engine's rules allow. The resources' specs, states and history are
@@ -26,6 +26,7 @@
 //! store writes instead.
 
 pub mod agent_session;
+pub mod awaiting_reply;
 pub mod convoy;
 pub mod engine;
 pub mod ensure;
@@ -41,7 +42,9 @@ use chrono::{DateTime, Utc};
 use flotilla_schema::{Address, Edge, EdgeEvent, Identity, Kind, KindCode, KindRegistry, Origin, Position, Records, Ref, Timestamp};
 use flotilla_schema_sqlite::Store;
 pub use flotilla_state_machines::{
-    machines::{agent_session::AgentSession, convoy::Convoy, ensure::Ensure, message::Message, vessel::Vessel},
+    machines::{
+        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, vessel::Vessel,
+    },
     Resource,
 };
 use hegel::{generators as gs, TestCase};

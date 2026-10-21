@@ -12,12 +12,12 @@ use flotilla_schema_sqlite::{AboutCursor, Read, Stamp, Store, StoreError};
 use flotilla_state_machines::{
     machines::{
         agent_session::AgentSession,
-        awaiting_reply::{AwaitingReplyEdgeKind, AwaitingReplySpec},
+        awaiting_reply::AwaitingReply,
         consumer::Consumer,
         convoy,
         message::{Message, ReceiptLog},
     },
-    Declared, EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, StoredWrite, Version,
+    EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, StoredWrite, Version,
 };
 
 /// The kinds the `[primitives]` switch moves: Message, and the minimal
@@ -46,17 +46,14 @@ pub fn registry() -> Result<KindRegistry, RegistryError> {
     Ok(machine_registry()?.kinds)
 }
 
-/// The kinds the Convoy stack moves (#3587), declared ahead of their machines
-/// for the owner's schema look-over: Convoy, with its seats, promises,
-/// submissions and duties as its tables, and AwaitingReply. Convoy's code is
-/// the production registry's, and AwaitingReply's `ar` is held by no
-/// production kind. Nothing opens a store with these yet; layer 4's
-/// machines replace the declarations, keeping their tables, and join
-/// [`machine_registry`].
+/// The kinds the Convoy stack moves (#3587): Convoy, with its seats,
+/// promises, submissions and duties as its records, and AwaitingReply. Both
+/// codes are the production registry's. Nothing opens a store with these
+/// yet; the write path (layer 6) moves them into [`machine_registry`].
 pub fn convoy_registry() -> Result<KindRegistry, RegistryError> {
     let mut kinds = KindRegistry::new();
     kinds.register::<Resource<convoy::Convoy>>()?;
-    kinds.register::<Declared<AwaitingReplySpec, AwaitingReplyEdgeKind>>()?;
+    kinds.register::<Resource<AwaitingReply>>()?;
     Ok(kinds)
 }
 

@@ -12,7 +12,7 @@ use flotilla_state_machines::{
     kinds,
     machines::{
         agent_session::{AgentSession, MemoryAgentSessionWorld},
-        awaiting_reply::{AwaitingReplyEdgeKind, AwaitingReplySpec},
+        awaiting_reply::AwaitingReply,
         convoy::{
             AdmittedPromise, Authority, Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyRequest, Deliver, Duty, DutyId, DutyScope, Keep,
             MemoryConvoyWorld, Priority, PromiseId, PromiseKinds, PromiseSource, RetireDuty, Seat, SeatName, Submit, Terms, VesselClass,
@@ -26,7 +26,7 @@ use flotilla_state_machines::{
         vessel::{live_leases, Vessel},
     },
     placement::{Dimension, Host, Lease, Ledger, LedgerError, Request, VesselId},
-    AttemptPolicy, Declared, EdgePayload, Home, Label, Machine, Outcome, Ref, Resource, Version,
+    AttemptPolicy, EdgePayload, Home, Label, Machine, Outcome, Ref, Resource, Version,
 };
 
 // Kind codes are stored with every identity and change, so the production registry pins them,
@@ -38,6 +38,7 @@ fn kind_codes_are_pinned() {
     pinned.sort();
     let declared = [
         (Resource::<AgentSession>::KIND, Resource::<AgentSession>::CODE),
+        (Resource::<AwaitingReply>::KIND, Resource::<AwaitingReply>::CODE),
         (Resource::<Convoy>::KIND, Resource::<Convoy>::CODE),
         (Resource::<Ensure>::KIND, Resource::<Ensure>::CODE),
         (Resource::<Message>::KIND, Resource::<Message>::CODE),
@@ -45,6 +46,7 @@ fn kind_codes_are_pinned() {
     ];
     let expected = [
         ("AgentSession", KindCode::new("as")),
+        ("AwaitingReply", KindCode::new("ar")),
         ("Convoy", KindCode::new("cv")),
         ("Ensure", KindCode::new("en")),
         ("Message", KindCode::new("ms")),
@@ -52,11 +54,6 @@ fn kind_codes_are_pinned() {
     ];
     assert_eq!(declared, expected);
     assert_eq!(pinned, expected.map(|(kind, code)| (kind.to_owned(), code)));
-    // Declared ahead of its machine (#3587 layer 3): layer 4 registers `Resource<AwaitingReply>`
-    // under this code, which no production kind holds meanwhile.
-    let ahead = (Declared::<AwaitingReplySpec, AwaitingReplyEdgeKind>::KIND, Declared::<AwaitingReplySpec, AwaitingReplyEdgeKind>::CODE);
-    assert_eq!(ahead, ("AwaitingReply", KindCode::new("ar")));
-    assert!(registry.iter().all(|set| set.code != ahead.1));
 }
 
 fn project() -> Address {
@@ -335,14 +332,14 @@ fn live_leases_and_the_live_by_host_index_agree() {
     }
 }
 
-// Behaviour (#3587 layers 3 and 4): Convoy and the declared AwaitingReply round-trip through
-// their row codec with every table filled (seats, promises with nested submissions, duties with
-// a WhileOpen scope and terms, the frozen kinds, quota and retired duties).
+// Behaviour (#3587 layers 3 and 4): Convoy and AwaitingReply round-trip through their row codec
+// with every table filled (seats, promises with nested submissions, duties with a WhileOpen scope
+// and terms, the frozen kinds, quota and retired duties).
 #[test]
-fn declared_convoy_and_awaiting_reply_round_trip() {
+fn convoy_and_awaiting_reply_round_trip() {
     use flotilla_schema::Records;
     use flotilla_state_machines::machines::{
-        awaiting_reply::{Awaited, AwaitingReplySpec, AwaitingReplyState},
+        awaiting_reply::{Awaited, AwaitingReply, AwaitingReplySpec, AwaitingReplyState},
         convoy::{ConvoySpec, ConvoyState, Progress, Promise, PromiseKind, Submission},
     };
 
@@ -405,11 +402,12 @@ fn declared_convoy_and_awaiting_reply_round_trip() {
         awaited: Awaited::Reply,
         deadline: Some(Timestamp(9)),
     };
-    let record = Declared::<AwaitingReplySpec, AwaitingReplyEdgeKind>::new(
+    let record = Resource::<AwaitingReply>::stored(
+        "",
         spec,
         State::new(AwaitingReplyState::Withdrawn { reason: "superseded".into() }, Timestamp(4)),
+        Version(0),
     );
-    let decoded: Declared<AwaitingReplySpec, AwaitingReplyEdgeKind> =
-        Decoder::decode(Encoder::encode(&record).expect("encodes")).expect("decodes");
+    let decoded: Resource<AwaitingReply> = Decoder::decode(Encoder::encode(&record).expect("encodes")).expect("decodes");
     assert_eq!(decoded, record);
 }

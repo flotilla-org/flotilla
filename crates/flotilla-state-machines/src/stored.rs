@@ -19,8 +19,6 @@
 //! `Log` with the home deciding and `apply_edge` persisting in one
 //! transaction, is a later layer.
 
-use std::{fmt, marker::PhantomData};
-
 use flotilla_schema::{
     adapt::{Adapter, AsColumns},
     Cbor, CodeEnum, ColumnOf, DecodeError, Decoder, Edge, EdgeError, Element, EncodeError, Encoder, Identity, Kind, KindCode, KindRegistry,
@@ -28,7 +26,9 @@ use flotilla_schema::{
 };
 
 use crate::{
-    machines::{agent_session::AgentSession, convoy::Convoy, ensure::Ensure, message::Message, vessel::Vessel},
+    machines::{
+        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, vessel::Vessel,
+    },
     EdgeEventOf, EdgeKind, EdgePayload, Label, Machine, NoRecords, Resource, Version,
 };
 
@@ -46,13 +46,12 @@ pub fn kinds() -> Result<KindRegistry, RegistryError> {
     registry.register::<Resource<Convoy>>()?;
     registry.register::<Resource<Vessel>>()?;
     registry.register::<Resource<Ensure>>()?;
+    registry.register::<Resource<AwaitingReply>>()?;
     Ok(registry)
 }
 
 /// The tables of a kind stored through a holder: the spec's row, then its state as the field
-/// `state`, the spec's indexes and the kind's edge codes. [`Resource`] and [`Declared`] both lay
-/// out through it, so a kind declared ahead of its machine keeps its tables when the machine's
-/// `Resource<M>` replaces the declaration.
+/// `state`, the spec's indexes and the kind's edge codes.
 fn holder_tables<S, E>() -> TableSet
 where
     S: KindSpec,
@@ -65,82 +64,6 @@ where
     S::layout_indexes(&mut layout);
     layout.edges(E::CODES, E::NAMES);
     layout.finish()
-}
-
-/// A kind declared by its spec, its state and its edge codes ahead of its machine, for a schema
-/// look-over before anything writes it (CLAUDE.md "Schema review before build"; #3587 layer 3).
-/// Its tables are exactly those of the machine's `Resource<M>` with the same spec and edges.
-/// Nothing stores one: it is registered for the schema and replaced by `Resource<M>` once the
-/// machine exists.
-pub struct Declared<S: KindSpec, E> {
-    pub spec: S,
-    pub state: State<<S as KindSpec>::State>,
-    edges: PhantomData<fn() -> E>,
-}
-
-impl<S: KindSpec, E> Declared<S, E> {
-    pub fn new(spec: S, state: State<S::State>) -> Self {
-        Declared { spec, state, edges: PhantomData }
-    }
-}
-
-impl<S: KindSpec + fmt::Debug, E> fmt::Debug for Declared<S, E>
-where
-    S::State: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Declared").field("spec", &self.spec).field("state", &self.state).finish()
-    }
-}
-
-impl<S: KindSpec + PartialEq, E> PartialEq for Declared<S, E>
-where
-    S::State: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.spec == other.spec && self.state == other.state
-    }
-}
-
-impl<S, E> Element for Declared<S, E>
-where
-    S: KindSpec,
-    S::State: StateData + Labelled,
-    E: CodeEnum,
-{
-    const TABLES: usize = S::TABLES + <AsColumns as Adapter<State<S::State>>>::TABLES;
-
-    fn layout_row(layout: &mut Layout) {
-        S::layout_row(layout);
-        <AsColumns as Adapter<State<S::State>>>::layout(layout, "state", true, None);
-    }
-
-    fn encode_row(&self, e: &mut Encoder) -> Result<(), EncodeError> {
-        self.spec.encode_row(e)?;
-        <AsColumns as Adapter<State<S::State>>>::encode(&self.state, e).map_err(|error| error.at("state"))
-    }
-
-    fn decode_row(d: &mut Decoder) -> Result<Self, DecodeError> {
-        let spec = S::decode_row(d)?;
-        let state = <AsColumns as Adapter<State<S::State>>>::decode(d)
-            .map_err(|error| error.at("state"))?
-            .ok_or_else(|| DecodeError::missing("state"))?;
-        Ok(Declared::new(spec, state))
-    }
-}
-
-impl<S, E> Kind for Declared<S, E>
-where
-    S: KindSpec,
-    S::State: StateData + Labelled,
-    E: CodeEnum,
-{
-    const KIND: &'static str = S::KIND;
-    const CODE: KindCode = S::CODE;
-
-    fn table_set() -> TableSet {
-        holder_tables::<S, E>()
-    }
 }
 
 /// A records write as a stored edge's rows: an [`Edge::append`] or

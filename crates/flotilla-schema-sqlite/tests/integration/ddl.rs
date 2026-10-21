@@ -66,6 +66,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
         names,
         [
             "agent_session",
+            "awaiting_reply",
             "codes",
             "convoy",
             "convoy_promises",

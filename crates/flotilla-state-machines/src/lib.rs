@@ -73,4 +73,4 @@ pub use machine::{
 };
 pub use read::{Admission, Handle, InputRead, Judged, Kind, Ref, Source, Table, Version};
 pub use record::{EdgeEventOf, EdgePayload, Transport};
-pub use stored::{kinds, Declared, StoredState, StoredWrite};
+pub use stored::{kinds, StoredState, StoredWrite};

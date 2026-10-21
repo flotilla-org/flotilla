@@ -53,14 +53,12 @@ fn convoy_store_schema_view_matches_the_snapshot() {
 }
 
 // Behaviour (#3373 ruling 6): the Convoy stack's codes are the production registry's: Convoy
-// holds `cv` there, and AwaitingReply's `ar`, which layer 4 registers, is held by no other kind.
+// holds `cv` there and AwaitingReply `ar`, each under the same kind.
 #[test]
 fn convoy_store_codes_are_the_production_codes() {
     let production = flotilla_state_machines::kinds().expect("production registry");
     for kind in convoy_registry().expect("registry").iter() {
-        match production.iter().find(|set| set.code == kind.code) {
-            Some(held) => assert_eq!(held.kind, kind.kind),
-            None => assert_eq!((kind.kind.as_str(), kind.code.as_str()), ("AwaitingReply", "ar"), "{} has no production code", kind.kind),
-        }
+        let held = production.iter().find(|set| set.code == kind.code);
+        assert_eq!(held.map(|set| set.kind.as_str()), Some(kind.kind.as_str()), "{} has no production code", kind.kind);
     }
 }

@@ -1,6 +1,6 @@
 //! Quint ITF trace replay through the engine (#3220, #3319).
 //!
-//! `specs/primitives/check.sh` simulates the seven scenarios in
+//! `specs/primitives/check.sh` simulates the eight scenarios in
 //! `specs/primitives/scenarios/` and writes one ITF file per trace; nothing
 //! here is a stored fixture. Each trace drives the real single writer
 //! ([`Home::apply`]: attempts and receipts are edges too) and the placement
@@ -54,6 +54,11 @@
 //!   in `inbox_delivery`; the controller's kind has no Rust machine yet, so its
 //!   receipt rows are the evidence, read as a [`ConsumerKind::Controller`]
 //!   receiver's, and the model's controller store is not compared.
+//! - **AwaitingReply `Answered` and `Expired`.** The model's `Answered({reply})`
+//!   and `Expired({at})` carry what Rust keeps outside the label: the reply is
+//!   the record's `Answer` log entry's, and the time the state's `since`. The
+//!   sender's inbox is the world's [`MemoryAwaitingReplyWorld`], each message
+//!   in it landed in the sender's inbox replying to the message it names.
 //! - **Vessels.** A vessel is a placement at the [`Ledger`] plus a lifecycle
 //!   resource. The ledger forgets a vessel when it returns the lease, so the
 //!   harness keeps each returned lease to render the model's `Gone(placement)`.
@@ -78,7 +83,7 @@ use session_value::session_value;
 use flotilla_quint_testkit::message::MessageSubject;
 use flotilla_quint_testkit::{
     itf,
-    replay::{at_address, constant, id_of, moment, same, slot_at, store, Step, Stream, Trace, INBOX, OWNER},
+    replay::{at_address, constant, id_of, moment, same, slot_at, store, Step, Stream, Trace, INBOX, OWNER, UNIT},
 };
 const ONE: &str = "1";
 
@@ -89,10 +94,13 @@ use std::{
     time::Instant,
 };
 
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Address, Timestamp};
 use flotilla_state_machines::{
     machines::{
         agent_session::{AgentSession, AgentSessionEdge, Attach, Detach, End, EndReason, MemoryAgentSessionWorld, Receive},
+        awaiting_reply::{
+            self, Awaited, AwaitingReply, AwaitingReplyEdge, AwaitingReplySpec, AwaitingReplyState, MemoryAwaitingReplyWorld,
+        },
         consumer::ConsumerKind,
         convoy::{
             self, Convoy, ConvoyEdge, ConvoyId, ConvoyRequest, ConvoyState, MemoryConvoyWorld, Priority, PromiseId, PromiseSource, Quota,
@@ -100,7 +108,10 @@ use flotilla_state_machines::{
         },
         ensure::{self, Ensure, EnsureEdge, EnsureSpec, EnsureState, FulfillerPhase, FulfillerStatus, MemoryEnsureWorld, UnbindReason},
         lifecycle::{self, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed},
-        message::{self, DropReason, InboxBinding, MemoryMessageWorld, Message, MessageEdge, MessageEdgeKind, MessageSpec, MessageState},
+        message::{
+            self, DropReason, InboxBinding, MemoryMessageWorld, Message, MessageEdge, MessageEdgeKind, MessageRef, MessageSpec,
+            MessageState,
+        },
     },
     placement::{self, Dimension, Evidence, Host, Lease, Ledger, LedgerError, Units, VesselId},
     AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Ref, Resource, Transport, Version, WriteError,
@@ -619,7 +630,7 @@ fn seat_text(seat: &SeatName) -> Value {
 
 /// A map keyed by text: TLC and the simulator print it as a record, and an
 /// empty one as an empty sequence.
-fn named(v: &Value) -> Vec<(&str, &Value)> {
+fn text_keyed(v: &Value) -> Vec<(&str, &Value)> {
     match v {
         Value::Object(fields) if !fields.contains_key("#map") => fields.iter().map(|(key, value)| (key.as_str(), value)).collect(),
         Value::Array(items) if items.is_empty() => Vec::new(),
@@ -676,7 +687,7 @@ fn convoy_request(state: &Value) -> ConvoyRequest {
             (convoy::DutyId(small(&pair[0])), convoy::Duty { owner: seat(&duty["owner"]), scope, terms })
         })
         .collect();
-    let mut seats: Vec<convoy::Seat> = named(&work["seats"])
+    let mut seats: Vec<convoy::Seat> = text_keyed(&work["seats"])
         .into_iter()
         .map(|(name, record)| convoy::Seat {
             role: name.into(),
@@ -729,17 +740,14 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
         });
         (int(promise.id.0.into()), record)
     });
-    let seats: serde_json::Map<String, Value> = spec
-        .seats
-        .iter()
-        .map(|row| {
-            let parent = match &row.record.parent {
-                None => constant("Root"),
-                Some(parent) => variant("Under", seat_text(parent)),
-            };
-            (row.record.role.clone(), json!({ "parent": parent, "supervisedBy": row.record.supervised_by.name() }))
-        })
-        .collect();
+    // The simulator prints a map keyed by text as a map, not a record.
+    let seats = map_of(spec.seats.iter().map(|row| {
+        let parent = match &row.record.parent {
+            None => constant("Root"),
+            Some(parent) => variant("Under", seat_text(parent)),
+        };
+        (seat_text(&row.record.name()), json!({ "parent": parent, "supervisedBy": row.record.supervised_by.name() }))
+    }));
     let duties = spec.duties.iter().map(|(id, duty)| {
         let scope = match &duty.scope {
             convoy::DutyScope::Lifetime => constant("Lifetime"),
@@ -753,7 +761,7 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
     let work = json!({
         "spec": { "project": spec.project.name(), "duties": map_of(duties), "priority": int(spec.priority.0.into()) },
         "promises": map_of(promises),
-        "seats": Value::Object(seats),
+        "seats": seats,
         "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
         "quota": quota_value(state.quota()),
     });
@@ -854,15 +862,19 @@ fn convoy_deliver(trace: &Trace, tally: &mut Tally) {
     let mut home = Home::<Convoy>::new("home").expect("declaration");
     for step in trace.steps() {
         tally.steps += 1;
-        let id = step.chosen("id");
+        // The scenario has one convoy, 1.
+        let id = 1;
         let name = id.to_string();
         let now = moment(number(&step.before["now"]));
-        let world = convoy_world(step.yes("auth"), step.yes("durable"));
+        // `durable` is picked only inside the submit branch.
+        let durable = matches!(&step.after["mbt::nondetPicks"]["durable"], picked if picked.get("tag").and_then(Value::as_str) == Some("Some") && boolean(payload(picked)));
+        let world = convoy_world(step.yes("auth"), durable);
         let promise = || PromiseId(small(step.pick("p")));
         let picked_seat = || seat(step.pick("seat"));
         let reason = || text(step.pick("reason")).to_owned();
         match step.action() {
-            "admitRequest" => admit(&mut home, &step, id, tally),
+            // The scenario's `admit` draws the request and admits it.
+            "admit" => admit(&mut home, &step, id, tally),
             // The scenario declares promise 1 with its one definition.
             "declare" => {
                 let edge = convoy::Declare {
@@ -1691,6 +1703,155 @@ fn message_race<S: flotilla_quint_testkit::message::MessageSubject>(trace: &Trac
 }
 
 // ---------------------------------------------------------------------------
+// reply_exchange (spec `machines/awaiting_reply.qnt`)
+
+/// Model message `id`, as the sender's home holds it.
+fn reply_message(id: i64) -> MessageRef {
+    MessageRef::new(id.to_string(), "receiver")
+}
+
+/// A harness name as the project address whose name it is.
+fn named(name: &str) -> Address {
+    Address::project(name).unwrap_or_else(|error| panic!("{name} as a project: {error}"))
+}
+
+/// The request the model's send recorded, from the record it wrote.
+fn awaiting_spec(record: &Value) -> AwaitingReplySpec {
+    let request = &record["request"];
+    AwaitingReplySpec {
+        message: reply_message(number(&request["message"])),
+        sender: named(text(&request["sender"])),
+        recipient: named(text(&request["recipient"])),
+        subject: Some(named(text(&request["subject"]))),
+        kind: text(&request["kind"]).into(),
+        awaited: match tag(&request["expectation"]) {
+            "Reply" => Awaited::Reply,
+            "Outcome" => Awaited::Outcome,
+            other => panic!("expectation {other}"),
+        },
+        deadline: match tag(&request["deadline"]) {
+            "Never" => None,
+            "At" => Some(moment(number(payload(&request["deadline"])))),
+            other => panic!("deadline {other}"),
+        },
+    }
+}
+
+/// The spec's `Record = { request, state }`: the resource's spec, and its
+/// state with the reply its `Answer` edge named (from its log) and its
+/// expiry's time (the state's `since`).
+fn awaiting_value(home: &Home<AwaitingReply>, resource: &Resource<AwaitingReply>) -> Value {
+    let spec = resource.spec();
+    let request = json!({
+        "message": int(id_of(&spec.message.name)),
+        "sender": spec.sender.name(),
+        "recipient": spec.recipient.name(),
+        "subject": spec.subject.as_ref().expect("the scenario's subject").name(),
+        "kind": spec.kind,
+        "expectation": constant(match spec.awaited {
+            Awaited::Reply => "Reply",
+            Awaited::Outcome => "Outcome",
+        }),
+        "deadline": spec.deadline.map_or_else(|| constant("Never"), |deadline| variant("At", int(deadline.0 / UNIT))),
+    });
+    let state = match resource.state() {
+        AwaitingReplyState::Open => constant("Open"),
+        AwaitingReplyState::Answered => {
+            let history = home.log().history(resource.name(), Version(0), usize::MAX);
+            let reply = history.iter().find_map(|(_, event)| match &event.payload.edge {
+                AwaitingReplyEdge::Answer(answer) => Some(id_of(&answer.reply.name)),
+                _ => None,
+            });
+            variant("Answered", json!({ "reply": int(reply.expect("an answered record's log holds its answer")) }))
+        }
+        AwaitingReplyState::Expired => variant("Expired", json!({ "at": int(resource.since().0 / UNIT) })),
+        AwaitingReplyState::Withdrawn { reason } => variant("Withdrawn", json!({ "reason": reason })),
+    };
+    json!({ "request": request, "state": state })
+}
+
+/// The sender's inbox as the scenario's state holds it: each message landed
+/// there, replying to the message it names, and the authority reading `authorised`.
+fn inbox_world(state: &Value, sender: &Address, authorised: bool) -> MemoryAwaitingReplyWorld {
+    let mut world = MemoryAwaitingReplyWorld::default();
+    for message in set(&state["inbox"]) {
+        world.land(&reply_message(number(&message["id"])), sender, Some(&reply_message(number(&message["inReplyTo"]))));
+    }
+    world.authority.put(&owner(), authorised);
+    world
+}
+
+fn withdraw(reason: &str) -> awaiting_reply::Withdraw {
+    awaiting_reply::Withdraw { by: named("sender"), reason: reason.into(), authority: owner() }
+}
+
+/// From the reached state: an ended record refuses everything; an open one
+/// is answered only by a reply in the sender's inbox (`answeredByReply`),
+/// expires only past its deadline with no reply there (`expiredBeforeReply`),
+/// and refuses the negative picks: an unrelated message or an absent reply as
+/// an answer, an unauthorised withdrawal and an empty reason.
+fn probe_awaiting(home: &mut Home<AwaitingReply>, state: &Value, step: &Step, tally: &mut Tally) {
+    let Some(record) = slot_at(state, "::records", 1) else { return };
+    let spec = home.get(ONE).expect("record").spec().clone();
+    let now = moment(number(&state["now"]));
+    let world = inbox_world(state, &spec.sender, true);
+    let inbox: BTreeSet<(i64, i64)> = set(&state["inbox"]).iter().map(|m| (number(&m["id"]), number(&m["inReplyTo"]))).collect();
+    if tag(&record["state"]) != "Open" {
+        let probes =
+            vec![awaiting_reply::Answer { reply: reply_message(2) }.into(), awaiting_reply::Expire.into(), withdraw("withdrawn").into()];
+        assert_end_refuses(home, ONE, probes, &world, now, step, tally);
+        return;
+    }
+    for id in [2, 3] {
+        if would_accept(home, ONE, awaiting_reply::Answer { reply: reply_message(id) }, &world, now, tally) {
+            assert!(inbox.contains(&(id, 1)), "{step}: answered by {id}, no reply to the message in the sender's inbox");
+        }
+    }
+    let empty = MemoryAwaitingReplyWorld::default();
+    let absent = awaiting_reply::Answer { reply: reply_message(2) };
+    assert!(!would_accept(home, ONE, absent, &empty, now, tally), "{step}: answered by an absent reply");
+    if would_accept(home, ONE, awaiting_reply::Expire, &world, now, tally) {
+        assert!(spec.deadline.is_some_and(|deadline| now > deadline), "{step}: expired before its deadline");
+        assert!(!inbox.iter().any(|(_, in_reply_to)| *in_reply_to == 1), "{step}: expired with a reply in the inbox");
+    }
+    let refused = inbox_world(state, &spec.sender, false);
+    assert!(!would_accept(home, ONE, withdraw("withdrawn"), &refused, now, tally), "{step}: withdrawn without authority");
+    assert!(!would_accept(home, ONE, withdraw(""), &world, now, tally), "{step}: withdrawn without a reason");
+}
+
+fn reply_exchange(trace: &Trace, tally: &mut Tally) {
+    let mut home = Home::<AwaitingReply>::new("sender").expect("declaration");
+    for step in trace.steps() {
+        tally.steps += 1;
+        let now = moment(number(&step.before["now"]));
+        let sender = || home.get(ONE).expect("record").spec().sender.clone();
+        match step.action() {
+            "send" => {
+                let record = slot_at(step.after, "::records", 1).expect("sent record");
+                create(&mut home, ONE, awaiting_spec(record), &MemoryAwaitingReplyWorld::default(), &step, tally);
+            }
+            "answer" => {
+                let world = inbox_world(step.before, &sender(), true);
+                let edge = awaiting_reply::Answer { reply: reply_message(number(&step.pick("message")["id"])) };
+                accept(&mut home, ONE, edge, &world, now, &step, tally);
+            }
+            "expire" => {
+                let world = inbox_world(step.before, &sender(), true);
+                accept(&mut home, ONE, awaiting_reply::Expire, &world, now, &step, tally);
+            }
+            "withdraw" => {
+                let world = inbox_world(step.before, &sender(), step.yes("auth"));
+                accept(&mut home, ONE, withdraw(text(step.pick("reason"))), &world, now, &step, tally);
+            }
+            "writeReply" | "landReply" | "landUnrelated" | "tick" => {}
+            other => panic!("{step}: reply_exchange operation {other}"),
+        }
+        check_store(&home, store(step.after, "::records"), awaiting_value, &step, "awaiting reply");
+        probe_awaiting(&mut home, step.after, &step, tally);
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 type Scenario = fn(&Trace, &mut Tally);
 
@@ -1703,13 +1864,6 @@ type Scenario = fn(&Trace, &mut Tally);
 /// every edge and record and change nothing; every edge the Rust gates would
 /// accept from a reached state keeps the scenario's safety properties; and
 /// the scenarios' negative picks are refused. Every scenario must supply traces.
-/// Scenarios specified ahead of the engine (#3587 layer 2): the Convoy
-/// machine's owned promises and duties, which `admission_placement` admits
-/// too, and the AwaitingReply machine. Their traces are generated and
-/// checked in Quint and left unread here until the engine implements them
-/// (layer 4), which empties this list.
-const AWAITING_ENGINE: &[&str] = &["convoy_deliver", "admission_placement", "reply_exchange"];
-
 fn scenario_of<'a>(file: &str, prefix: &'a str) -> Option<&'a str> {
     file.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('-')).then_some(prefix)
 }
@@ -1719,7 +1873,7 @@ fn scenario_of<'a>(file: &str, prefix: &'a str) -> Option<&'a str> {
 fn replay_quint_itf_traces() {
     let directory =
         std::env::var("QUINT_TRACE_DIR").expect("QUINT_TRACE_DIR names a directory of ITF traces from specs/primitives/check.sh");
-    let scenarios: [(&str, Scenario); 7] = [
+    let scenarios: [(&str, Scenario); 8] = [
         ("convoy_deliver", convoy_deliver),
         ("ensure_bind", ensure_bind),
         ("inbox_delivery", inbox_delivery),
@@ -1727,8 +1881,9 @@ fn replay_quint_itf_traces() {
         ("controller_delivery", controller_delivery),
         ("machine_edges", machine_edges),
         ("admission_placement", admission_placement),
+        ("reply_exchange", reply_exchange),
     ];
-    let mut tallies = [Tally::default(); 7];
+    let mut tallies = [Tally::default(); 8];
     let mut paths: Vec<_> = fs::read_dir(Path::new(&directory))
         .unwrap_or_else(|error| panic!("read {directory}: {error}"))
         .map(|entry| entry.expect("entry").path())
@@ -1737,7 +1892,7 @@ fn replay_quint_itf_traces() {
     let started = Instant::now();
     for path in paths {
         let file = path.file_name().expect("file name").to_string_lossy().into_owned();
-        if !file.ends_with(".itf.json") || AWAITING_ENGINE.iter().any(|prefix| scenario_of(&file, prefix).is_some()) {
+        if !file.ends_with(".itf.json") {
             continue;
         }
         let index = scenarios
@@ -1756,7 +1911,7 @@ fn replay_quint_itf_traces() {
     }
     eprintln!("{:>20}: {total} in {:.1?}", "replayed", started.elapsed());
     for ((name, _), tally) in scenarios.iter().zip(&tallies) {
-        assert!(tally.traces > 0 || AWAITING_ENGINE.contains(name), "{name} supplied no traces in {directory}");
+        assert!(tally.traces > 0, "{name} supplied no traces in {directory}");
     }
 }
 
