@@ -1769,6 +1769,30 @@ mod tests {
         assert!(view("d-ambiguous").receiver_error.as_deref().is_some_and(|error| error.contains("multiple")), "{views:?}");
         // Delivery itself stays strict: the ambiguous address still refuses.
         assert!(flotilla_messaging::resolve_message_receiver(&backend, "flotilla", "root/pair").await.is_err());
+
+        // Convoy-scoped explain keeps an errored Message only on evidence that
+        // ties its address to this convoy: here, terminal claims labelled with it.
+        let convoys = backend.using::<ResourceConvoy>("flotilla");
+        for name in ["attending", "elsewhere"] {
+            convoys
+                .create(
+                    &InputMeta::builder().name(name.into()).build(),
+                    &ConvoySpec::builder().workflow_ref("work".into()).project_ref("root".into()).build(),
+                )
+                .await
+                .expect("convoy");
+        }
+        let receivers = flotilla_messaging::MessageReceiverSnapshot::load(&backend, "flotilla").await.expect("receivers");
+        let evidence = super::super::projection_ports::MessageReceiverEvidence(receivers, None);
+        // Explain passes the role addresses claimed by the convoy's terminals as aliases.
+        let claimed = BTreeSet::from(["root/attended".to_string(), "root/pair".to_string(), "root/plain".to_string()]);
+        for (convoy, aliases, expected) in
+            [("attending", claimed, vec!["a-valid", "c-invalid", "d-ambiguous"]), ("elsewhere", BTreeSet::new(), vec![])]
+        {
+            let convoy = convoys.get(convoy).await.expect("convoy");
+            let views = message_views(&backend, "flotilla", &evidence, Some(&convoy), &aliases).await.expect("convoy view");
+            assert_eq!(views.iter().map(|view| view.name.as_str()).collect::<Vec<_>>(), expected, "{}", convoy.metadata.name);
+        }
     }
 }
 

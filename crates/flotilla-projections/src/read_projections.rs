@@ -2161,8 +2161,10 @@ pub async fn message_views(
         if let Some(convoy) = convoy {
             let direct = message.spec.receiver.split('/').collect::<Vec<_>>();
             let is_direct = matches!(direct.as_slice(), [_, name, _, _] if *name == convoy.metadata.name);
-            // An errored candidate already passed the convoy filter above; keep
-            // it so the ambiguity stays visible rather than hidden.
+            // An unresolvable receiver has no holder to confirm the convoy, so
+            // keep it on the evidence `may_address_convoy` already required: a
+            // four-part address naming this convoy, or a role declaration or
+            // terminal claim pointing at it. Hiding it would hide the ambiguity.
             if !is_direct
                 && receiver_error.is_none()
                 && !current_receiver.as_deref().is_some_and(|receiver| receiver.split('/').nth(1) == Some(convoy.metadata.name.as_str()))
