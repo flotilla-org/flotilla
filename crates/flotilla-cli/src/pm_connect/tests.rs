@@ -839,8 +839,10 @@ async fn connector_bootstraps_replicated_subjects_and_publishes_watch_updates() 
     let _ = handle.await;
 }
 
+// Configuration changes must invalidate both the definition snapshot and per-source
+// aliases. Removing the last source input releases its cached resolution.
 #[tokio::test]
-async fn connector_uses_project_aliases_for_previous_generation_remote_repositories() {
+async fn connector_refreshes_configuration_and_retires_source_aliases() {
     use flotilla_resources::{
         Forge, ForgeKind, ForgeSpec, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository,
         RepositorySpec, Resource,
@@ -896,13 +898,63 @@ async fn connector_uses_project_aliases_for_previous_generation_remote_repositor
         rows: Rows::Convoys { scope: None, rows: vec![linked_subject_convoy()] },
         state: Default::default(),
     })));
-    for envelope in [subject_envelope(), forge, repository, project] {
-        state.apply_resource_records(&envelope).expect("apply resource");
+    state.apply_resource_records(&subject_envelope()).expect("subject");
+    for envelope in [&forge, &repository, &project] {
+        state.apply_resource_records(envelope).expect("apply resource");
     }
     let target = MetadataTarget::Entity(entity::change_request("github.com", "org/flotilla", "42"));
     let patches = state.rebuild(&mint());
     let facts = patches.iter().find(|patch| patch.target == target).expect("request entity");
     assert_eq!(facts.set["display.label"].value, MetadataValue::text("f!42"));
+    let now = chrono::Utc::now();
+    assert_incremental_matches_full(&state, now);
+    assert_eq!(state.resources.cached_source_count(), 1);
+
+    let before = state.resources.configuration();
+    let mut changed = project.clone();
+    changed.records[0].record_type = flotilla_protocol::ResourceRecordType::Modified;
+    changed.records[0].object.as_mut().expect("project")["spec"]["repositories"][0]["alias"] = serde_json::json!("renamed");
+    state.apply_resource_records(&changed).expect("project alias update");
+    assert!(!Arc::ptr_eq(&before, &state.resources.configuration()), "project updates invalidate the definition cache");
+    let patches = state.rebuild_at(&mint(), now);
+    assert_eq!(
+        patches.iter().find(|patch| patch.target == target).expect("alias update").set["display.label"].value,
+        MetadataValue::text("renamed!42")
+    );
+    assert_incremental_matches_full(&state, now);
+
+    let mut removed = repository.clone();
+    removed.records[0].record_type = flotilla_protocol::ResourceRecordType::Deleted;
+    state.apply_resource_records(&removed).expect("repository removal");
+    let patches = state.rebuild_at(&mint(), now);
+    assert_ne!(
+        patches.iter().find(|patch| patch.target == target).expect("alias retraction").set["display.label"].value,
+        MetadataValue::text("renamed!42")
+    );
+    assert_incremental_matches_full(&state, now);
+    state.apply_resource_records(&repository).expect("repository restored");
+    state.rebuild_at(&mint(), now);
+    assert_incremental_matches_full(&state, now);
+
+    let mut changed = forge;
+    changed.records[0].record_type = flotilla_protocol::ResourceRecordType::Modified;
+    changed.records[0].object.as_mut().expect("forge")["spec"]["https_url"] = serde_json::json!("https://code.example");
+    state.apply_resource_records(&changed).expect("forge URL update");
+    let patches = state.rebuild_at(&mint(), now);
+    let forge_target = MetadataTarget::Entity(entity::forge("github"));
+    assert_eq!(
+        patches.iter().find(|patch| patch.target == forge_target).expect("forge update").set["flotilla.forge.web_url"].value,
+        MetadataValue::text("https://code.example")
+    );
+    assert_incremental_matches_full(&state, now);
+
+    ResourceUpdate::Snapshot { namespace: "flotilla".into(), kind: "changerequests".into(), envelopes: vec![] }
+        .apply(&mut state)
+        .expect("source record removed");
+    state.apply_event(&convoys_set(2));
+    state.rebuild_at(&mint(), now);
+    assert_eq!(state.resources.cached_source_count(), 0, "last source input retires the source cache");
+    assert_incremental_matches_full(&state, now);
 }
 
 #[test]
@@ -1961,4 +2013,16 @@ fn one_changed_session_mints_one_recipe_at_fleet_scale() {
         assert!(state.rebuild_at(&recipes, now).is_empty());
         assert_eq!(recipes.calls.load(Ordering::Relaxed), 0, "idle publication does no projection work");
     }
+}
+
+// Snapshot key replacement must preserve wire order even when a key is repeated.
+#[test]
+fn duplicate_snapshot_keys_keep_the_last_row() {
+    let mut state = ConnectorState::default();
+    state.apply_event(&independents_set(1, vec![independent_row("same", SessionPhase::Running)]));
+    state.apply_event(&independents_set(
+        2,
+        vec![independent_row("same", SessionPhase::Stopped), independent_row("same", SessionPhase::Running)],
+    ));
+    assert_eq!(state.independents[&independent_row("same", SessionPhase::Running).resource].phase, SessionPhase::Running);
 }

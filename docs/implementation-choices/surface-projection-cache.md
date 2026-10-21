@@ -27,7 +27,9 @@ into changed header/entry keys. Shared subject reverse links and standing-role
 attempts are recomputed together. Removing a bridge retires the old component
 and projects its surviving components separately. Definition changes can affect
 aliases throughout the catalog and deliberately invalidate the graph. Liveness
-mode changes also invalidate it. These are explicit global inputs, not ordinary
+mode changes also invalidate it. The transition between empty and nonempty
+awareness changes the fallback source for the whole catalog and likewise
+invalidates every component once. These are explicit global inputs, not ordinary
 row changes.
 
 ## Candidate walk and cost
