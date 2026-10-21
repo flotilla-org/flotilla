@@ -5063,8 +5063,11 @@ impl InProcessDaemon {
         // The inner box moves each large helper future off this poll frame.
         // Boxing only the helper call still builds that future on the caller stack.
         macro_rules! boxed_action {
+            (typed $future:expr) => {
+                Box::pin(async { Box::pin($future).await }).await
+            };
             ($future:expr) => {
-                Box::pin(async { Box::pin($future).await }).await.map_err(flotilla_protocol::DispatcherError::from)
+                boxed_action!(typed $future).map_err(flotilla_protocol::DispatcherError::from)
             };
         }
 
@@ -5149,9 +5152,7 @@ impl InProcessDaemon {
             CommandAction::ProjectRefresh { .. } => return boxed_action!(admission.execute_action_project_refresh(id, &command)),
             CommandAction::ImageCheck { .. } => return boxed_action!(admission.execute_action_image_check(id, &command)),
             CommandAction::TrackRepoPath { .. } => return boxed_action!(executor.execute_action_track_repo_path(id, &command)),
-            CommandAction::UntrackRepo { .. } => {
-                return Box::pin(async { Box::pin(executor.execute_action_untrack_repo(id, &command)).await }).await
-            }
+            CommandAction::UntrackRepo { .. } => return boxed_action!(typed executor.execute_action_untrack_repo(id, &command)),
             CommandAction::OpenChangeRequest { .. }
             | CommandAction::CloseChangeRequest { .. }
             | CommandAction::MergeChangeRequest { .. }
@@ -5159,9 +5160,7 @@ impl InProcessDaemon {
             | CommandAction::LinkIssuesToChangeRequest { .. } => {
                 return boxed_action!(executor.execute_action_repository_forge(id, &command))
             }
-            CommandAction::Refresh { repo: Some(_) } => {
-                return Box::pin(async { Box::pin(executor.execute_action_refresh_repo(id, &command)).await }).await
-            }
+            CommandAction::Refresh { repo: Some(_) } => return boxed_action!(typed executor.execute_action_refresh_repo(id, &command)),
             _ => {}
         }
 

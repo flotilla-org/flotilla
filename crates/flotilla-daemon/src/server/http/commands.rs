@@ -563,6 +563,8 @@ async fn collect_progress(
 fn cancel_status(class: DispatcherErrorClass, state: &CommandState) -> StatusCode {
     // A retained record proves prior existence: missing execution means it is
     // no longer cancellable, even if its completion event has not arrived yet.
+    // Any Missing refusal (including from a remote execution) is interpreted
+    // relative to this retained record; its cause cannot make the record absent.
     if state.outcome.is_some() || class == DispatcherErrorClass::Missing {
         error_status(DispatcherErrorClass::Conflict)
     } else {
@@ -1313,6 +1315,20 @@ mod tests {
                     .await;
                 assert_eq!(reply.0, StatusCode::INTERNAL_SERVER_ERROR, "{text}: {}", reply.1);
                 assert_eq!(reply.1["message"], text);
+            }
+        }
+    }
+
+    // Behaviour: a non-artifact repository command preserves a typed missing
+    // target as HTTP 404, regardless of status-like text in the caller's path.
+    #[tokio::test]
+    async fn missing_repository_command_preserves_http_class() {
+        let h = Harness::new().await;
+        for cbor in [false, true] {
+            for path in ["/missing", "/unauthorized: caller", "/resource conflict for caller"] {
+                let reply = h.call("POST", "/v1/repos/refresh", Some(json!({"repo":path})), cbor, CallerAuth::Bearer).await;
+                assert_eq!(reply.0, StatusCode::NOT_FOUND, "{path}: {}", reply.1);
+                assert_eq!(reply.1["message"], format!("no Repository matches '{path}'"));
             }
         }
     }
