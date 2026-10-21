@@ -47,7 +47,7 @@ use flotilla_agent::{
     HarnessHookParser,
 };
 use flotilla_protocol::{AgentHarness, AgentHookEvent, AgentHookTerminalRef};
-use flotilla_resources::TerminalSession;
+use flotilla_resources::{ResourceError, TerminalSession};
 use flotilla_store::ResourceBackend;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -230,6 +230,7 @@ impl HookEndpoint {
                 return None;
             }
         };
+        // Instance generations must round-trip losslessly through every backing store.
         let generation = session.metadata.creation_timestamp.to_rfc3339();
         Some(HookLaunch { base_url: format!("{origin}{HOOKS_PATH}/claude-code"), token: key.mint(&terminal, &generation) })
     }
@@ -277,7 +278,11 @@ async fn handle(
             match session {
                 Ok(session)
                     if session.metadata.creation_timestamp.to_rfc3339() == generation && session.metadata.deletion_timestamp.is_none() => {}
-                _ => return auth::unauthenticated(),
+                Ok(_) | Err(ResourceError::NotFound { .. }) => return auth::unauthenticated(),
+                Err(error) => {
+                    tracing::warn!(namespace = %terminal.namespace, session_name = %terminal.session_name, %error, "failed to validate hook token session");
+                    return auth::unauthenticated();
+                }
             }
             (Some(terminal), HookIdentityPolicy::PlacedTerminal)
         }
