@@ -343,7 +343,10 @@ impl SocketDaemon {
                         tracing::info!("daemon connection closed; notifying subscribers");
                         let mut map = reader_context.pending.lock().await;
                         for (_, tx) in map.drain() {
-                            let _ = tx.send(ResponseResult::Err { message: "daemon connection closed".into() });
+                            let _ = tx.send(ResponseResult::Err {
+                                class: flotilla_protocol::DispatcherErrorClass::DaemonFault,
+                                message: "daemon connection closed".into(),
+                            });
                         }
                         break;
                     }
@@ -351,7 +354,10 @@ impl SocketDaemon {
                         warn!(err = %e, "error reading from daemon session; notifying subscribers");
                         let mut map = reader_context.pending.lock().await;
                         for (_, tx) in map.drain() {
-                            let _ = tx.send(ResponseResult::Err { message: format!("daemon read error: {e}") });
+                            let _ = tx.send(ResponseResult::Err {
+                                class: flotilla_protocol::DispatcherErrorClass::DaemonFault,
+                                message: format!("daemon read error: {e}"),
+                            });
                         }
                         break;
                     }
@@ -976,7 +982,7 @@ fn encode_replay_cursors(last_seen: &HashMap<StreamKey, u64>) -> Vec<ReplayCurso
 fn into_success_response(result: ResponseResult) -> Result<Response, String> {
     match result {
         ResponseResult::Ok { response } => Ok(*response),
-        ResponseResult::Err { message } => Err(message),
+        ResponseResult::Err { message, .. } => Err(message),
     }
 }
 

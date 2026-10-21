@@ -545,11 +545,64 @@ pub enum Response {
     },
 }
 
+/// Stable error semantics shared by framed dispatch and surface adapters.
+/// This is a wire type, not a stored resource shape (ADR 0047).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatcherErrorClass {
+    InvalidInput,
+    Forbidden,
+    Missing,
+    Conflict,
+    DaemonFault,
+}
+
+/// A user-facing message and its independently assigned error class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatcherError {
+    pub class: DispatcherErrorClass,
+    pub message: String,
+}
+
+impl DispatcherError {
+    pub fn new(class: DispatcherErrorClass, message: impl Into<String>) -> Self {
+        Self { class, message: message.into() }
+    }
+}
+
+impl std::fmt::Display for DispatcherError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DispatcherError {}
+
+// Unclassified infrastructure/provider errors fail closed. Never inspect prose:
+// providers and caller-supplied paths can contain arbitrary status-like text.
+impl From<String> for DispatcherError {
+    fn from(message: String) -> Self {
+        Self::new(DispatcherErrorClass::DaemonFault, message)
+    }
+}
+
+impl From<DispatcherError> for String {
+    fn from(error: DispatcherError) -> Self {
+        error.message
+    }
+}
+
+impl From<&str> for DispatcherError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ResponseResult {
     Ok { response: Box<Response> },
-    Err { message: String },
+    Err { class: DispatcherErrorClass, message: String },
 }
 
 /// Crew identity variables a client may claim in-band ([`Message::Hello`]).
@@ -604,8 +657,9 @@ impl Message {
     }
 
     /// Build an error response.
-    pub fn error_response(id: u64, message: impl Into<String>) -> Self {
-        Message::Response { id, response: Box::new(ResponseResult::Err { message: message.into() }) }
+    pub fn error_response(id: u64, error: impl Into<DispatcherError>) -> Self {
+        let DispatcherError { class, message } = error.into();
+        Message::Response { id, response: Box::new(ResponseResult::Err { class, message }) }
     }
 }
 

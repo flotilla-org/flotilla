@@ -39,14 +39,31 @@ impl InProcessDaemon {
     pub(super) async fn repository_for_selector(
         &self,
         selector: &flotilla_protocol::RepoSelector,
-    ) -> Result<ResourceObject<Repository>, String> {
-        let key = self.resolve_repository_selector(selector).await?.ok_or_else(|| format!("no Repository matches '{selector}'"))?;
+    ) -> Result<ResourceObject<Repository>, flotilla_protocol::DispatcherError> {
+        let key = self.resolve_repository_selector(selector).await?.ok_or_else(|| {
+            flotilla_protocol::DispatcherError::new(
+                flotilla_protocol::DispatcherErrorClass::Missing,
+                format!("no Repository matches '{selector}'"),
+            )
+        })?;
         self.resource_backend
             .including_replicas::<Repository>(&self.provisioning_namespace().await)
             .get(&key.to_string())
             .await
             .map(|source| source.object)
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                use flotilla_protocol::{DispatcherError, DispatcherErrorClass as Class};
+                let class = match &error {
+                    ResourceError::NotFound { .. } => Class::Missing,
+                    ResourceError::Conflict { .. } | ResourceError::FieldOwnership { .. } => Class::Conflict,
+                    ResourceError::Invalid { .. } => Class::InvalidInput,
+                    ResourceError::Unauthorized { .. } => Class::Forbidden,
+                    // Fail closed for infrastructure failures and future variants;
+                    // only known caller/state refusals receive a non-500 class.
+                    _ => Class::DaemonFault,
+                };
+                DispatcherError::new(class, error.to_string())
+            })
     }
 
     pub(super) async fn local_checkout_for_repository(&self, key: &RepositoryKey) -> Result<Option<PathBuf>, String> {

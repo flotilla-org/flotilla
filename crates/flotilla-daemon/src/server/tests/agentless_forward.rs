@@ -213,7 +213,7 @@ async fn request(session: &MessageSession, id: u64, request: Request) -> Message
 fn refusal(message: Message) -> String {
     match message {
         Message::Response { response, .. } => match *response {
-            ResponseResult::Err { message } => message,
+            ResponseResult::Err { message, .. } => message,
             ResponseResult::Ok { response } => panic!("expected refusal, got {response:?}"),
         },
         other => panic!("expected response, got {other:?}"),

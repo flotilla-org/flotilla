@@ -709,7 +709,7 @@ fn ok_response(msg: Message, expected_id: u64) -> Response {
             assert_eq!(id, expected_id);
             match *response {
                 ResponseResult::Ok { response } => *response,
-                ResponseResult::Err { message } => panic!("expected ok response, got error: {message}"),
+                ResponseResult::Err { message, .. } => panic!("expected ok response, got error: {message}"),
             }
         }
         other => panic!("expected response, got {other:?}"),
@@ -4134,7 +4134,7 @@ async fn unavailable_main_peer_reports_named_error_before_hello() {
     ));
     client.write(current_client_hello()).await.unwrap();
     let Message::Response { response, .. } = read_session_message(&client).await else { panic!("identity refusal precedes Hello") };
-    assert!(matches!(*response, ResponseResult::Err { message } if message.starts_with("CallerIdentityUnavailable:")));
+    assert!(matches!(*response, ResponseResult::Err { message, .. } if message.starts_with("CallerIdentityUnavailable:")));
     task.await.unwrap();
 }
 
@@ -4509,7 +4509,7 @@ async fn wire_generation_mismatched_client_cannot_request_rich_rpc() {
     let response = reader.next_line().await.expect("read response").expect("error response payload");
     match serde_json::from_str::<Message>(&response).expect("parse response") {
         Message::Response { id: 8, response } => match *response {
-            ResponseResult::Err { message } => assert!(message.contains("only daemon shutdown"), "unexpected error: {message}"),
+            ResponseResult::Err { message, .. } => assert!(message.contains("only daemon shutdown"), "unexpected error: {message}"),
             other => panic!("expected error response, got {other:?}"),
         },
         other => panic!("expected response, got {other:?}"),
@@ -5936,7 +5936,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
     forged_client.write(Message::Request { id: 44, request: Request::GetStatus }).await.unwrap();
     let Message::Response { id, response } = read_session_message(&forged_client).await else { panic!("expected refusal") };
     assert_eq!(id, 44);
-    assert!(matches!(*response, ResponseResult::Err { message } if message.starts_with("CallerIdentityMismatch:")));
+    assert!(matches!(*response, ResponseResult::Err { message, .. } if message.starts_with("CallerIdentityMismatch:")));
     drop(forged_client);
     forged_task.await.unwrap();
 
@@ -5968,7 +5968,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
         client.write(Message::Request { id: index as u64, request }).await.expect("request");
         match read_session_message(&client).await {
             Message::Response { response, .. } => {
-                assert!(matches!(response.as_ref(), ResponseResult::Err { message } if message.starts_with("Environment")))
+                assert!(matches!(response.as_ref(), ResponseResult::Err { message, .. } if message.starts_with("Environment")))
             }
             other => panic!("unexpected response {other:?}"),
         }
@@ -5989,7 +5989,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
     client.write(Message::Request { id: 9, request: serde_json::from_value(artifact).unwrap() }).await.unwrap();
     let Message::Response { response, .. } = read_session_message(&client).await else { panic!("artifact response") };
     assert!(
-        matches!(response.as_ref(), ResponseResult::Err { message } if message == "artifact environment placed-environment is unavailable")
+        matches!(response.as_ref(), ResponseResult::Err { message, .. } if message == "artifact environment placed-environment is unavailable")
     );
     // An admitted promise must reach the dispatcher, relay only its completion,
     // and persist the promised work in the caller's convoy.
