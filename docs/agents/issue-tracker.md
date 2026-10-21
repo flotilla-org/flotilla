@@ -34,12 +34,12 @@ Triage-role labels are mapped in `docs/agents/triage-labels.md`. Topic labels (`
 
 ## Crew pull request guidance
 
-New platform test coverage belongs in `ci/platform-tests/selectors.txt`, run by
-`ci/platform-tests/run.sh`; shared Windows/macOS coverage uses `all`. Adding or
-removing a selected test must not edit `.github/workflows/`. Add a new CI job
-only for a new runner type or OS, or for deliberate isolation; otherwise fit
-checks into an existing job on the same runner. Workflow jobs, runners,
-triggers, permissions and secrets remain operator-managed.
+Platform-specific code gets cfg-gated tests in its own crate; platform jobs
+pick them up through their fixed crate scope. Do not add lines to
+`ci/platform-tests/selectors.txt` (being retired, #2909). Adding or removing a
+test must not edit `.github/workflows/`. Add a new CI job only for a new runner
+type or OS; otherwise fit checks into an existing job on the same runner.
+Workflow jobs, runners, triggers, permissions and secrets remain operator-managed.
 
 ## Pull requests as a triage surface
 
