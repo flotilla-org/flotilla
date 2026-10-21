@@ -101,11 +101,14 @@ flotilla's own metering is the primary usage source, and `observe` is what it co
 
 - **Every call is idempotent by environment ID.** Provision for an existing environment ID returns the existing sandbox found by its tag, and destroying something already gone succeeds.
 - **Errors are typed, each with a reason:**
-  - `Refused`: the request cannot be met as asked;
+  - `Refused`: the request cannot be met as asked, including a provider HTTP 403 permission denial; the reason names the operation and the provider stays ready;
   - `Unavailable` and `RateLimited`: with `retry_after` when known;
   - `QuotaExhausted`: feeds placement back pressure;
-  - `CredentialRejected`: the instance becomes not ready with "missing credential";
+  - `CredentialRejected`: a provider HTTP 401 rejects the key; the instance becomes not ready with "missing credential", retaining the masked rejection diagnostic;
   - `Internal`: an adaptor bug, carrying the provider's raw error text.
+- **Provider messages reach the operator.** CLI errors, warn-level host logs and conformance reports include the category, reason, upstream HTTP status when present, provider explanation, operation and provider. The host masks currently configured nonempty credential values, including proxy placeholder tokens, plus a bounded window of the 32 most recent distinct replaced values before returning or logging diagnostics. Values older than that window are evicted; an in-flight call additionally masks the credential it used even if evicted. Empty values are skipped; nonempty values are masked regardless of length. Provider explanations are ordinary diagnostic text, not secret fields. Credentials, tokens and reach recipes retain their redacting types; malformed-response diagnostics omit reach recipes and guest output. Permission denials use `Refused`; no distinct permission error is needed.
+- **Wire version:** this diagnostic and permission-error contract requires protocol version 6; protocol-5 peers must upgrade with the host.
+- **Polling waits for readiness.** An undelivered credential does not cause a spurious failed provider call; credential delivery wakes the host-owned observer immediately. See the [host observer implementation](https://github.com/flotilla-org/drydock/blob/aa035b350afae25f99d4487e28200b4169d631f5/crates/drydock-host/src/observer.rs) for the credential-triggered wake-up.
 - **Adaptors do not retry.** Modules turn off the SDK's internal retries where they can.
 
 ### Encoding
