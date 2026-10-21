@@ -466,10 +466,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
                                 .vessel("work".to_string())
                                 .role("coder".to_string())
                                 .build())
-                            .brief(
-                                "Rebase onto the current base branch and file a fresh settlement claim; the previous claim is superseded."
-                                    .to_string(),
-                            )
+                            .brief("Rebase onto the current base branch and continue shepherding the PR.".to_string())
                             .hold(flotilla_resources::HoldAct::State)
                             .build(),
                     )]),

@@ -518,7 +518,7 @@ async fn conflicting_mergeability_delivers_once_per_head_past_the_episode_limit(
         "conflicting",
         false,
         flotilla_resources::ObservedMergeability::Conflicting,
-        "Rebase onto the current base branch, resolve additively, run pinned CI, push the same branch, process review, and file a fresh settlement claim; the previous claim is superseded.",
+        "Rebase onto the current base branch, resolve additively, run pinned CI, push the same branch, and continue shepherding the PR through review.",
     )
     .await;
 }

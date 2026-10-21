@@ -174,7 +174,7 @@ impl LeafSubscriptionTable {
                     }
                 };
                 let mut brief = if active_conflict {
-                    format!("{}\n\nPR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, then file a settlement claim.", rule.brief.trim())
+                    format!("{}\n\nPR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, and continue shepherding the PR.", rule.brief.trim())
                 } else if active_probe {
                     let checks = match cr.checks.value {
                         Some(ObservedChecks::Pass) => "pass",
