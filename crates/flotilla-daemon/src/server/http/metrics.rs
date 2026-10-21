@@ -31,6 +31,8 @@ pub(super) async fn handle(State(RouterState(state)): State<RouterState>) -> Res
     let (Some(metrics), Some(daemon)) = (&state.load_metrics, &state.daemon) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    // Serve only Prometheus 0.0.4 text, without OpenMetrics negotiation. Recheck
+    // histogram-family and separate _max gauge names before changing formats.
     let text = render(metrics, daemon);
     ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], text).into_response()
 }
