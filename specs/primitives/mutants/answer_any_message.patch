@@ -1,0 +1,11 @@
+--- a/machines/awaiting_reply.qnt
++++ b/machines/awaiting_reply.qnt
+@@ -29,7 +29,7 @@
+   pure def step(r: Request, s: State, e: Event): Next = match s {
+     | Open => match e {
+       | Answer(a) => if (not(a.present)) Refused(ReplyAbsent)
+-          else if (a.inReplyTo != r.message) Refused(NotAReply)
++          else if (false) Refused(NotAReply)
+           else Moved(Answered({ reply: a.reply }))
+       // A reply present in the inbox wins over a passed deadline.
+       | Expire(x) => match r.deadline {

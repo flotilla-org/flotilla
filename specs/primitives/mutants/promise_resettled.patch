@@ -1,11 +1,11 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -27,7 +27,7 @@
+@@ -106,7 +106,7 @@
+   // Spec order for an existing promise: unknown, then settled, then the edge's rule.
+   pure def onOpen(w: Work, id: PromiseId, rule: PromiseRecord => Next): Next =
+     if (not(w.promises.keys().contains(id))) Refused(UnknownPromise)
+-    else if (not(open(w.promises.get(id)))) Refused(PromiseSettled)
++    else if (false) Refused(PromiseSettled)
+     else rule(w.promises.get(id))
    pure def step(s: State, e: Event): Next = match s {
      | Open(w) => match e {
-       | Keep(p) => if (not(w.promises.keys().contains(p))) Refused(UnknownPromise)
--          else if (w.promises.get(p) != Pending) Refused(PromiseSettled)
-+          else if (false) Refused(PromiseSettled)
-           else Moved(Open({ ...w, promises: w.promises.set(p, Kept) }))
-       | AcceptRetraction(a) => if (not(a.authorised)) Refused(Unauthorised)
-           else if (not(w.promises.keys().contains(a.promise))) Refused(UnknownPromise)

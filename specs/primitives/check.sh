@@ -14,7 +14,7 @@ jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
 mkdir -p build
 quint test tests/stream_properties.qnt --backend typescript
 run=$(mktemp -d "$PWD/build/fast.XXXXXX")
-for scenario in agent_activity convoy_deliver ensure_bind inbox_delivery message_race controller_delivery machine_edges admission_placement; do
+for scenario in agent_activity convoy_deliver ensure_bind inbox_delivery message_race controller_delivery machine_edges admission_placement reply_exchange; do
   # Assignment coverage is mandatory even for branches unreachable at depth one.
   # Simulation/typecheck alone can silently lose an unassigned world variable.
   quint verify "scenarios/$scenario.qnt" --invariant safety --max-steps 1 > "$run/$scenario.frames.log" 2>&1
@@ -36,8 +36,13 @@ done
 python3 conformance/test_dump2json.py
 ./conformance/export.sh "$run/graphs"
 # Workspace CI runs the crate's fmt, Clippy and unit tests; these two need Quint's output.
+# The Convoy machine's owned promises and duties, and the AwaitingReply
+# machine, are specified ahead of the engine (#3587 layer 2): their graphs and
+# traces are generated and checked above, and the engine replays them once it
+# implements them (layer 4). Until then the engine skips the Convoy graph,
+# and its replay leaves the Convoy and reply scenarios' traces unread.
 QUINT_TRACE_DIR="$run" QUINT_GRAPH_DIR="$run/graphs" cargo test -p flotilla-state-machines --locked \
-  --test conformance --test quint_replay -- --ignored --nocapture 2>&1 | tee "$run/engine.log"
+  --test conformance --test quint_replay -- --ignored --nocapture --skip convoy_follows_the_full_graph 2>&1 | tee "$run/engine.log"
 # Backends share the trace mapping but replay only the Message race; full-graph
 # conformance remains with the engine above.
 QUINT_TRACE_DIR="$run" cargo test -p flotilla-inbox --locked \

@@ -1495,6 +1495,17 @@ type Scenario = fn(&Trace, &mut Tally);
 /// every edge and record and change nothing; every edge the Rust gates would
 /// accept from a reached state keeps the scenario's safety properties; and
 /// the scenarios' negative picks are refused. Every scenario must supply traces.
+/// Scenarios specified ahead of the engine (#3587 layer 2): the Convoy
+/// machine's owned promises and duties, which `admission_placement` admits
+/// too, and the AwaitingReply machine. Their traces are generated and
+/// checked in Quint and left unread here until the engine implements them
+/// (layer 4), which empties this list.
+const AWAITING_ENGINE: &[&str] = &["convoy_deliver", "admission_placement", "reply_exchange"];
+
+fn scenario_of<'a>(file: &str, prefix: &'a str) -> Option<&'a str> {
+    file.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('-')).then_some(prefix)
+}
+
 #[test]
 #[ignore = "generate traces with specs/primitives/check.sh"]
 fn replay_quint_itf_traces() {
@@ -1518,12 +1529,12 @@ fn replay_quint_itf_traces() {
     let started = Instant::now();
     for path in paths {
         let file = path.file_name().expect("file name").to_string_lossy().into_owned();
-        if !file.ends_with(".itf.json") {
+        if !file.ends_with(".itf.json") || AWAITING_ENGINE.iter().any(|prefix| scenario_of(&file, prefix).is_some()) {
             continue;
         }
         let index = scenarios
             .iter()
-            .position(|(prefix, _)| file.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('-')))
+            .position(|(prefix, _)| scenario_of(&file, prefix).is_some())
             .unwrap_or_else(|| panic!("{file} names no scenario"));
         let trace: Value = serde_json::from_slice(&fs::read(&path).expect("read trace")).unwrap_or_else(|error| panic!("{file}: {error}"));
         let trace = Trace { file: &file, states: list(&trace["states"]) };
@@ -1537,7 +1548,7 @@ fn replay_quint_itf_traces() {
     }
     eprintln!("{:>20}: {total} in {:.1?}", "replayed", started.elapsed());
     for ((name, _), tally) in scenarios.iter().zip(&tallies) {
-        assert!(tally.traces > 0, "{name} supplied no traces in {directory}");
+        assert!(tally.traces > 0 || AWAITING_ENGINE.contains(name), "{name} supplied no traces in {directory}");
     }
 }
 

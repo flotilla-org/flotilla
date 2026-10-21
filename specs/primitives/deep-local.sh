@@ -9,7 +9,7 @@ mkdir -p build/deep
 : > build/deep/results.txt
 jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
 status=0
-for scenario in convoy_deliver ensure_bind inbox_delivery message_race admission_placement; do
+for scenario in convoy_deliver ensure_bind inbox_delivery message_race admission_placement reply_exchange; do
   sed 's/pure val maxRows = [0-9]*/pure val maxRows = 6/' "scenarios/$scenario.qnt" > "build/deep_$scenario.qnt"
   if [[ "$scenario" = inbox_delivery || "$scenario" = message_race ]]; then
     grep -q '^  pure val maxRows = 6$' "build/deep_$scenario.qnt" || {

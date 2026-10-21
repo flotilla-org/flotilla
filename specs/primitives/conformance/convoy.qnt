@@ -1,23 +1,62 @@
 // Full-graph conformance harness for the Convoy machine: TLC enumerates every
 // reachable state, and each dumped state records one admission or one step
 // probe (from-state, event, result) for the Rust conformance test.
+//
+// Features are spread across requests rather than multiplied, which keeps the
+// graph near the Ensure harness's size. Requests admit promise 0 from a
+// template or dispatch (alone, beside a convoy-lifetime duty, or beside a duty
+// while it is open), or admit only a lifetime duty, which the crew's Declare
+// of promise 0 then joins; promise 1 is never known. Every admitted owner is
+// the seat "a"; Reassign moves a promise to "b". The deciding seat matters
+// only for the Owner authority class, so the other classes decide as "s", and
+// an empty reason is probed for the operator only. A crew-declared promise
+// takes up to two submissions (so resubmission and its stale evidence are
+// reached), others one; Submit leaves the domain at that bound. A quota
+// increase is probed only while the convoy holds no promise.
 module convoy_conformance {
   import convoy(IDS = Set()) as C from "../machines/convoy"
   type Probe = Admitted({ request: C::ConvoyRequest, result: C::Next })
     | Stepped({ from: C::State, event: C::Event, result: C::Next })
   var slot: C::Slot
   var probe: Probe
-  pure val promiseSets = Set(Set(), Set(0), Set(0, 1))
-  pure val requests = promiseSets.map(ps => Set(true, false).map(known =>
-    { project: "project", projectKnown: known, promises: ps.mapBy(_ => { kind: "opaque", target: "target" }), quota: Map(0 -> 1, 1 -> 1), priority: 1 })).flatten()
+  pure val definition = { kind: "opaque", target: "target" }
+  pure def admitted(source: C::Source): C::PromiseId -> C::AdmittedPromise = Map(0 -> { promise: definition, source: source, owner: "a" })
+  pure val lifetime = Map(0 -> { owner: "a", scope: C::Lifetime, terms: "terms" })
+  pure val whileOpen = Map(0 -> { owner: "a", scope: C::WhileOpen(Set(0)), terms: "terms" })
+  pure def request(promises: C::PromiseId -> C::AdmittedPromise, duties: C::DutyId -> C::Duty, known: bool): C::ConvoyRequest =
+    { project: "project", projectKnown: known, promises: promises, duties: duties, quota: Map(0 -> 1, 1 -> 1), priority: 1 }
+  pure val requests = Set(
+    request(Map(), Map(), true), request(Map(), whileOpen, true), request(Map(), lifetime, true), request(Map(), lifetime, false),
+    request(admitted(C::Template), Map(), true), request(admitted(C::Template), Map(), false), request(admitted(C::Dispatch), Map(), true),
+    request(admitted(C::Template), lifetime, true), request(admitted(C::Template), whileOpen, true))
   // Quotas: an increase, a decrease and a changed class domain. Negative counts
   // are omitted: Rust quota counts are unsigned, so InvalidQuota is unrepresentable.
-  pure val quotas = Set(Map(0 -> 2, 1 -> 1), Map(0 -> 0, 1 -> 1), Map(0 -> 1))
-  pure val events = Set(0, 1, 2).map(p => C::Keep(p))
-    .union(Set(0, 1, 2).map(p => Set(true, false).map(a => C::AcceptRetraction({ promise: p, authorised: a }))).flatten())
+  pure val increase = Map(0 -> 2, 1 -> 1)
+  pure val quotas = Set(Map(0 -> 0, 1 -> 1), Map(0 -> 1))
+  pure val authorities = Set(C::Operator, C::ConvoySupervisor, C::Dispatcher, C::Owner, C::OwnerSupervisor)
+  pure def deciders(a: C::Authority): Set[C::Seat] = if (a == C::Owner) Set("a", "b") else Set("s")
+  pure def reasons(a: C::Authority): Set[str] = if (a == C::Operator) Set("", "decision") else Set("decision")
+  pure val ids = Set(0, 1)
+  pure def bound(r: C::PromiseRecord): int = if (r.source == C::Crew) 2 else 1
+  pure def submittable(w: C::Work, p: int): bool = not(w.promises.keys().contains(p)) or w.promises.get(p).submissions.length() < bound(w.promises.get(p))
+  pure def events(w: C::Work): Set[C::Event] =
+    Set(C::Declare({ promise: 0, definition: definition, owner: "a" }))
+    .union(ids.filter(p => submittable(w, p)).map(p => Set("a", "b").map(by => Set(true, false).map(d =>
+      C::Submit({ promise: p, by: by, reference: "ref", durable: d }))).flatten()).flatten())
+    .union(ids.map(p => C::Reject({ promise: p })))
+    .union(Set(0, 1, 2).map(n => C::Keep(C::Observed({ promise: 0, submission: n }))))
+    .union(Set(C::Keep(C::Observed({ promise: 1, submission: 1 }))))
+    .union(ids.map(p => authorities.map(a => reasons(a).map(r =>
+      C::Keep(C::Verdict({ promise: p, by: "s", authority: a, reason: r })))).flatten()).flatten())
+    .union(ids.map(p => authorities.map(a => deciders(a).map(by => reasons(a).map(r =>
+      C::Retract({ promise: p, by: by, authority: a, reason: r })))).flatten().flatten()).flatten())
+    .union(ids.map(p => authorities.map(a => deciders(a).map(by =>
+      C::Reassign({ promise: p, to: "b", by: by, authority: a }))).flatten()).flatten())
+    .union(Set(0, 1).map(d => Set(true, false).map(a => C::RetireDuty({ duty: d, authorised: a }))).flatten())
     .union(Set(C::Deliver))
     .union(Set(true, false).map(a => Set("", "decision").map(r => C::Abandon({ authorised: a, reason: r }))).flatten())
-    .union(quotas.map(q => Set(true, false).map(a => C::Readmit({ quota: q, authorised: a }))).flatten())
+    .union((if (w.promises.keys().size() == 0) quotas.union(Set(increase)) else quotas).map(q =>
+      Set(true, false).map(a => C::Readmit({ quota: q, authorised: a }))).flatten())
   action init = {
     nondet r = requests.oneOf()
     val n = C::admit(r)
@@ -26,7 +65,7 @@ module convoy_conformance {
   action step = match slot {
     | Absent => all { slot' = slot, probe' = probe }
     | Present(s) => {
-        nondet e = events.oneOf()
+        nondet e = events(C::work(s)).oneOf()
         val n = C::step(s, e)
         all { slot' = C::target(n, slot), probe' = Stepped({ from: s, event: e, result: n }) }
       }
