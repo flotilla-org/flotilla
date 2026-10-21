@@ -11,7 +11,16 @@ pub(crate) async fn execute(
 ) -> Result<serde_json::Value, ObservationError> {
     let request = forge.repository_request(repo, reqwest::Method::GET, path, query, None)?;
     let response = http_execute!(forge.http, request)?;
-    check_response(&forge.config.service_url, response.status(), response.headers(), response.body())?;
+    check_response(&forge.config.service_url, response.status(), response.headers(), response.body()).map_err(|error| {
+        // Absence is meaningful only on the requested pull, not review/check reads.
+        if response.status() == reqwest::StatusCode::NOT_FOUND
+            && path.strip_prefix("pulls/").is_some_and(|number| number.parse::<u64>().is_ok())
+        {
+            ObservationError::NotFound(error.to_string())
+        } else {
+            error
+        }
+    })?;
     serde_json::from_slice(response.body()).map_err(|error| ObservationError::Failed(error.to_string()))
 }
 

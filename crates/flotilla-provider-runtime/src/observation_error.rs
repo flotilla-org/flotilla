@@ -4,14 +4,20 @@ use chrono::{DateTime, Utc};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObservationError {
     Failed(String),
-    RateLimited { budget: String, retry_at: Option<DateTime<Utc>>, detail: String },
+    /// The forge explicitly reports that the requested resource does not exist.
+    NotFound(String),
+    RateLimited {
+        budget: String,
+        retry_at: Option<DateTime<Utc>>,
+        detail: String,
+    },
 }
 
 impl ObservationError {
     pub fn retry_at(&self) -> Option<DateTime<Utc>> {
         match self {
             Self::RateLimited { retry_at, .. } => *retry_at,
-            Self::Failed(_) => None,
+            Self::Failed(_) | Self::NotFound(_) => None,
         }
     }
 }
@@ -28,7 +34,7 @@ impl From<&str> for ObservationError {
 impl std::fmt::Display for ObservationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Failed(error) => f.write_str(error),
+            Self::Failed(error) | Self::NotFound(error) => f.write_str(error),
             Self::RateLimited { detail, .. } => f.write_str(detail),
         }
     }

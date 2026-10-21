@@ -11,3 +11,7 @@ Requests with a producing link remain stored after their last demand is released
 The catalog marks an observed open or draft request `flotilla.orphaned = true` when its history names a departed producing convoy. It keeps `flotilla.subject_of` and the relationship-specific reverse edges pointing to the historical convoy's exact entity identity. A terminal request without live or recent-landed subject links leaves the catalog. Historical edges do not synthesize a departed convoy entity.
 
 ChangeRequest records are authored by daemon observers. There are no known out-of-repository manifest authors of this resource shape; existing external API authors can omit the new history field.
+
+Explicit forge absence collects an undemanded retained request and stops its refresh task. Only a pull-endpoint 404 or a matching GraphQL `NOT_FOUND` path establishes absence; authentication, rate limiting, transport failures, and missing check/review endpoints do not. Active demand retains its diagnostic and retry behavior.
+
+Convoy demand reconciliation and startup collection release history entries for explicit `status.unlinked_subjects` assertions. Other convoy holders remain, and a missing convoy still preserves history. Once no history or active demand holds the subject, local records are collected. This processes explicit unlink assertions without deriving all history from live links (#3646).

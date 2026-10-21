@@ -1211,7 +1211,7 @@ mod tests {
         fake.set_draft(&repo, 2, false).expect("ready");
         let missing = provider.observe_bound(&[2, 99], &Default::default()).await.expect("observe bound");
         assert!(missing[&2].is_ok());
-        assert!(missing[&99].as_ref().expect_err("missing pull request").to_string().contains("404"));
+        assert!(matches!(missing[&99], Err(ObservationError::NotFound(_))));
 
         // Merge one request, close the other.
         let second = open_through_api(&provider, "feature/two", "Second change", "").await;
