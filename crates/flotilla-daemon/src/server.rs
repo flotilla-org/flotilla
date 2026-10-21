@@ -363,6 +363,14 @@ struct ClientActivityLease {
     notify: Arc<Notify>,
 }
 
+impl ClientActivityLease {
+    fn acquire(count: Arc<AtomicUsize>, notify: Arc<Notify>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        notify.notify_one();
+        Self { count, notify }
+    }
+}
+
 impl Drop for ClientActivityLease {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::SeqCst);
@@ -401,9 +409,7 @@ impl DaemonServer {
                                     let environment = environment.clone();
                                     let shutdown = shutdown.clone();
                                     let http_router = http_router.clone();
-                                    client_count.fetch_add(1, Ordering::SeqCst);
-                                    client_notify.notify_one();
-                                    let lease = ClientActivityLease { count: client_count.clone(), notify: client_notify.clone() };
+                                    let lease = ClientActivityLease::acquire(client_count.clone(), client_notify.clone());
                                     connections.spawn(async move {
                                         let _lease = lease;
                                         let mut stream = stream;
@@ -607,9 +613,7 @@ impl DaemonServer {
                 let count = count.clone();
                 let notify = notify.clone();
                 async move {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    notify.notify_one();
-                    let _lease = ClientActivityLease { count, notify };
+                    let _lease = ClientActivityLease::acquire(count, notify);
                     next.run(request).await
                 }
             }));
