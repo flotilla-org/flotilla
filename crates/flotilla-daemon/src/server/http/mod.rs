@@ -42,7 +42,6 @@ pub(in crate::server) use login::LoginStore;
 use resource_api::Reply;
 use rigging_http_serve::Caller;
 
-use crate::server::caller::PeerCredential;
 pub(in crate::server) use tcp::{ListenAddress, TcpListener};
 pub(in crate::server) use unix::{is_http_preface, serve_sniffed};
 
@@ -149,13 +148,13 @@ impl HttpRouter {
 }
 
 /// rigging-http-serve installs `Caller<CallerAuth>`; routes read the `CallerAuth` inside.
-/// Every flotilla listener supplies `Caller::Custom`. rigging's own variants are mapped
-/// conservatively, and a request with no caller at all reaches routes unauthenticated.
+/// Every flotilla listener supplies `Caller::Custom`. An unmapped Unix peer grants no
+/// application identity; it and a request with no caller reach routes anonymously.
 async fn caller_from_listener(mut request: Request, next: Next) -> Response {
     if let Some(caller) = request.extensions_mut().remove::<Caller<CallerAuth>>() {
         let caller = match caller {
             Caller::Custom(caller) => caller,
-            Caller::Unix(peer) => CallerAuth::Socket(Some(PeerCredential::from_kernel(peer.uid, peer.pid))),
+            Caller::Unix(_) => CallerAuth::Anonymous,
             Caller::Bearer => CallerAuth::Bearer,
             Caller::Cookie => CallerAuth::Anonymous,
         };

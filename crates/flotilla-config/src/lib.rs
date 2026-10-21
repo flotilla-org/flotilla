@@ -345,6 +345,7 @@ impl DaemonConfig {
 
 /// `[http]` in `daemon.toml`. `flotillad --http-listen` overrides `listen`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpListenerConfig {
     /// `host:port`; the host must be loopback or resolve only to loopback.
     #[serde(default, skip_serializing_if = "Option::is_none")]

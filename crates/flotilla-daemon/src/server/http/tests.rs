@@ -695,3 +695,19 @@ async fn listen_address_must_be_loopback() {
         assert!(ListenAddress::resolve_with(malformed, resolving(&["127.0.0.1:7878"])).await.is_err(), "{malformed}");
     }
 }
+
+// Glue: rigging's default Unix caller carries kernel credentials but no flotilla
+// listener identity. It must reach the protected hello route as Anonymous (401).
+#[tokio::test]
+async fn unknown_unix_listener_caller_is_anonymous() {
+    let daemon = Incarnation::new();
+    let mut request = get("/v1/hello");
+    request.extensions_mut().insert(rigging_http_serve::Caller::<CallerAuth>::Unix(rigging_http_serve::PeerCredentials {
+        uid: 1000,
+        gid: 1000,
+        pid: Some(42),
+    }));
+    let reply = Reply::from(daemon.router.oneshot(request).await.expect("router")).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reply.json()["message"], "authentication required");
+}
