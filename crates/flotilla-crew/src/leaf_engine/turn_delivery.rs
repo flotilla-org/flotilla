@@ -492,7 +492,11 @@ impl LeafSubscriptionTable {
     }
 }
 /// True when an episode's recorded revision is `progress` itself or a repeat
-/// firing at it (`{progress}@{discriminator}`).
+/// firing at it (`{progress}@{discriminator}`). Progress values never contain
+/// `@` themselves where a discriminator follows: PR heads are SHAs, and
+/// artifact turn rules bind their subject to the convoy name or the PR head
+/// (`ArtifactSubjectBinding`). An issue's `address@updated-at` key is its own
+/// progress and carries no discriminator.
 fn same_progress(subject_revision: &str, progress: &str) -> bool {
     subject_revision.strip_prefix(progress).is_some_and(|rest| rest.is_empty() || rest.starts_with('@'))
 }

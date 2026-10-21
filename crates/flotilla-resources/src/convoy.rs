@@ -1352,6 +1352,21 @@ pub struct TurnDeliveryStatus {
 }
 
 impl TurnDeliveryStatus {
+    /// Retained episodes per source. The episode limit judges only the latest
+    /// run at one revision, so older rounds are kept for dedupe and explanation
+    /// and then dropped; a convoy with many review rounds stays bounded.
+    pub const EPISODE_HISTORY: usize = 32;
+
+    /// Appends a new episode (one per subject revision) and drops the oldest past the bound.
+    pub fn record_episode(&mut self, episode: &TurnDeliveryEpisode) {
+        if self.episodes.iter().rev().any(|existing| existing.subject_revision == episode.subject_revision) {
+            return;
+        }
+        self.episodes.push(episode.clone());
+        let excess = self.episodes.len().saturating_sub(Self::EPISODE_HISTORY);
+        self.episodes.drain(..excess);
+    }
+
     /// The source's standing hold: the explicit state field, or a previous-generation
     /// refusal that is still the latest episode. A later delivery supersedes a refusal.
     pub fn held(&self, source: &str) -> Option<ConvoyAttention> {
@@ -2670,11 +2685,11 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::RecordTurnDelivery { source, episode, vessel, role, prompt } => {
                 let delivery = status.turn_deliveries.entry(source.clone()).or_default();
                 delivery.failure = None;
-                // A delivery after a hold means the subject moved on (#3565).
+                // Only accepted deliveries are recorded through this patch (refusals
+                // use RefuseTurnDelivery), and the engine admits one only after the
+                // subject moved on, so it releases the source's hold (#3565).
                 delivery.hold = None;
-                if !delivery.episodes.iter().any(|existing| existing.subject_revision == episode.subject_revision) {
-                    delivery.episodes.push(episode.clone());
-                }
+                delivery.record_episode(episode);
                 if matches!(episode.outcome, TurnDeliveryOutcome::MessageAccepted { new_turn: false, .. }) {
                     if status.attention.as_ref().is_some_and(|attention| attention.source == *source) {
                         status.attention = None;
@@ -2761,9 +2776,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::RefuseTurnDelivery { source, episode, attention } => {
                 let delivery = status.turn_deliveries.entry(source.clone()).or_default();
                 delivery.failure = None;
-                if !delivery.episodes.iter().any(|existing| existing.subject_revision == episode.subject_revision) {
-                    delivery.episodes.push(episode.clone());
-                }
+                delivery.record_episode(episode);
                 status.attention = Some(attention.clone());
             }
             Self::RollUpWork { work, phase, transitioned_at, message } => {
@@ -4045,6 +4058,28 @@ mod turn_delivery_hold_release_tests {
         }
         .apply(&mut status);
         assert_eq!(status.attention, Some(other));
+    }
+
+    // Review rounds no longer latch, so episode history is bounded by count:
+    // the newest rounds survive and a repeated revision is still one episode.
+    #[test]
+    fn episode_history_keeps_the_newest_rounds() {
+        let at = DateTime::<Utc>::UNIX_EPOCH;
+        let accepted = || TurnDeliveryOutcome::MessageAccepted {
+            new_turn: true,
+            message: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "turn"),
+            rung: TurnDeliveryRung::WarmSession,
+            accepted_at: at,
+        };
+        let mut delivery = TurnDeliveryStatus::default();
+        let rounds = TurnDeliveryStatus::EPISODE_HISTORY + 5;
+        for round in 0..rounds {
+            delivery.record_episode(&episode(&format!("head-{round}"), accepted()));
+            delivery.record_episode(&episode(&format!("head-{round}"), accepted()));
+        }
+        assert_eq!(delivery.episodes.len(), TurnDeliveryStatus::EPISODE_HISTORY);
+        assert_eq!(delivery.episodes.first().expect("oldest").subject_revision, "head-5");
+        assert_eq!(delivery.episodes.last().expect("newest").subject_revision, format!("head-{}", rounds - 1));
     }
 }
 
