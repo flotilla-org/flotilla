@@ -392,6 +392,9 @@ fn stdlib_layers_provide_and_probe_crew_shells() {
     let generated = generate_build(&[base.clone(), utilities.clone()], "amd64").expect("shell layers generate");
     assert!(generated.dockerfile.lines().any(|line| line == "ENV SHELL=/bin/bash"));
     assert!(base.probe.contains("test \"$SHELL\" = /bin/bash"));
-    assert!(utilities.fragment.contains("        zsh"));
-    assert!(utilities.probe.contains(" zsh; do"));
+    let packages =
+        utilities.fragment.split("apt-get install").nth(1).expect("utility packages").split(';').next().expect("install command");
+    assert!(packages.split_whitespace().any(|package| package == "zsh"));
+    let tools = utilities.probe.lines().find_map(|line| line.trim().strip_prefix("for tool in ")).expect("tool probe loop");
+    assert!(tools.split(';').next().expect("probed tools").split_whitespace().any(|tool| tool == "zsh"));
 }

@@ -35,8 +35,9 @@ supplies `HOME`. Writable state lives under `HOME`: Cargo and rustup state,
 npm, uv, Zig and gh caches, and on-demand toolchains. Static environment is
 image `ENV` set by each layer's fragment, so every exec path on every provider
 sees it. The base sets `SHELL=/bin/bash`, matching the crew launch shell;
-`crew-utilities` also installs zsh for projects whose tests need it. Preludes in `/etc/flotilla/prelude.d/` only perform actions at launch,
-such as starting Xvfb.
+`crew-utilities` also installs zsh for projects whose tests need it.
+Preludes in `/etc/flotilla/prelude.d/` only perform actions at launch, such as
+starting Xvfb.
 
 ### Never in an image
 
