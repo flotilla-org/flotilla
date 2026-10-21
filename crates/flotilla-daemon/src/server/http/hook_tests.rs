@@ -55,7 +55,10 @@ struct Daemon {
 
 impl Daemon {
     async fn new() -> Self {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        Self::with_backend(ResourceBackend::new(InMemoryBackend::default())).await
+    }
+
+    async fn with_backend(backend: ResourceBackend) -> Self {
         for session in [CODER, REVIEWER] {
             running_crew_terminal(&backend, session).await;
         }
@@ -75,6 +78,11 @@ impl Daemon {
         let mut request = request;
         request.extensions_mut().insert(caller);
         self.router.clone().oneshot(request).await.expect("router is infallible").status()
+    }
+
+    async fn hook_caller(&self, name: &str) -> CallerAuth {
+        let session = self.backend.clone().using::<TerminalSession>(NAMESPACE).get(name).await.expect("session");
+        CallerAuth::Hook { terminal: terminal(name), generation: session.metadata.creation_timestamp.to_rfc3339() }
     }
 
     async fn attention(&self, session_name: &str) -> Option<TerminalAttentionState> {
@@ -288,8 +296,8 @@ impl Listening {
 
     /// Claude Code as a host-direct crew in `session_name` runs it: the settings overlay and
     /// launch environment the runtime gives that session.
-    fn claude_code(&self, session_name: &str) -> ClaudeCode {
-        let launch = self.hooks.claude_code_launch(NAMESPACE, session_name).expect("listener is bound");
+    async fn claude_code(&self, backend: &ResourceBackend, session_name: &str) -> ClaudeCode {
+        let launch = self.hooks.claude_code_launch(backend, NAMESPACE, session_name).await.expect("listener is bound");
         assert_eq!(launch.base_url, format!("http://127.0.0.1:{}/v1/hooks/claude-code", self.port));
         let environment = [
             (flotilla_agent::CLAUDE_CODE_HOOK_URL_ENV.to_owned(), launch.base_url.clone()),
@@ -334,7 +342,7 @@ async fn host_direct_claude_code_hooks_update_their_terminal_over_http() {
     let daemon = Daemon::new().await;
     let state = tempfile::tempdir().expect("state dir");
     let tcp = Listening::start(&daemon, state.path()).await;
-    let claude = tcp.claude_code(CODER);
+    let claude = tcp.claude_code(&daemon.backend, CODER).await;
     let coder = attachable(CODER);
 
     let start = claude.fire("SessionStart", "startup", &hook_input("SessionStart", "s-1", serde_json::json!({"source": "startup"}))).await;
@@ -382,11 +390,11 @@ async fn host_direct_claude_code_hooks_update_their_terminal_over_http() {
 async fn hook_posts_reach_the_session_their_caller_authenticates() {
     let daemon = Daemon::new().await;
     let reviewer_stop = hook_input("Stop", "reviewer-session", serde_json::json!({"stop_hook_active": false}));
-    assert_eq!(daemon.call(CallerAuth::Hook(terminal(REVIEWER)), hook_post("user-prompt-submit", &reviewer_stop)).await, StatusCode::OK);
+    assert_eq!(daemon.call(daemon.hook_caller(REVIEWER).await, hook_post("user-prompt-submit", &reviewer_stop)).await, StatusCode::OK);
     assert_eq!(daemon.attention(REVIEWER).await, Some(TerminalAttentionState::Working));
 
     // The coder's token, with the reviewer's native session ID in the body.
-    assert_eq!(daemon.call(CallerAuth::Hook(terminal(CODER)), hook_post("stop", &reviewer_stop)).await, StatusCode::OK);
+    assert_eq!(daemon.call(daemon.hook_caller(CODER).await, hook_post("stop", &reviewer_stop)).await, StatusCode::OK);
     assert_eq!(daemon.attention(CODER).await, Some(TerminalAttentionState::Idle));
     assert_eq!(daemon.attention(REVIEWER).await, Some(TerminalAttentionState::Working), "the reviewer is not aliased");
     assert_eq!(daemon.agent(&attachable(REVIEWER)).map(|(status, _)| status), Some(AgentStatus::Active));
@@ -413,7 +421,7 @@ async fn hook_posts_reach_the_session_their_caller_authenticates() {
         assert_eq!(daemon.call(caller.clone(), hook_post("stop", &unmanaged)).await, status, "{caller:?}");
     }
 
-    let hook = CallerAuth::Hook(terminal(CODER));
+    let hook = daemon.hook_caller(CODER).await;
     assert_eq!(daemon.call(hook.clone(), Request::get("/v1/hello").body(Body::empty()).expect("request")).await, StatusCode::FORBIDDEN);
     let resources = Request::get("/apis/flotilla.work/v1/namespaces/flotilla/convoys").body(Body::empty()).expect("request");
     assert_eq!(daemon.call(hook.clone(), resources).await, StatusCode::FORBIDDEN);
@@ -426,7 +434,7 @@ async fn hook_posts_reach_the_session_their_caller_authenticates() {
 #[tokio::test]
 async fn hook_routes_take_json_for_known_events() {
     let daemon = Daemon::new().await;
-    let hook = CallerAuth::Hook(terminal(CODER));
+    let hook = daemon.hook_caller(CODER).await;
     let input = hook_input("Stop", "s-1", serde_json::json!({}));
     let text =
         Request::post("/v1/hooks/claude-code/stop").header(header::CONTENT_TYPE, "text/plain").body(Body::from("{}")).expect("request");
@@ -453,7 +461,7 @@ async fn hook_tokens_are_bound_to_their_terminal_and_survive_restarts() {
     let daemon = Daemon::new().await;
     let state = tempfile::tempdir().expect("state dir");
     let first = Listening::start(&daemon, state.path()).await;
-    let token = first.hooks.claude_code_launch(NAMESPACE, CODER).expect("endpoint").token;
+    let token = first.hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("endpoint").token;
     let stop = "/v1/hooks/claude-code/stop";
     assert_eq!(first.post(stop, Some(&format!("Bearer {token}"))).await, 200);
     assert_eq!(first.post(stop, Some(&format!("Bearer {}", first.file_token))).await, 200, "the user's file token");
@@ -464,7 +472,7 @@ async fn hook_tokens_are_bound_to_their_terminal_and_survive_restarts() {
     parts[2] = &reviewer;
     assert_eq!(first.post(stop, Some(&format!("Bearer {}", parts.join(".")))).await, 401, "terminal changed under the signature");
     let elsewhere = tempfile::tempdir().expect("other key");
-    let foreign = HookKey::load_or_create(elsewhere.path()).expect("other key").mint(&terminal(CODER));
+    let foreign = HookKey::load_or_create(elsewhere.path()).expect("other key").mint(&terminal(CODER), "foreign-generation");
     assert_eq!(first.post(stop, Some(&format!("Bearer {foreign}"))).await, 401, "signed by another key");
     assert_eq!(first.post(stop, Some(&format!("Bearer {token}x"))).await, 401, "tampered signature");
     assert_eq!(first.post("/v1/hello", Some(&format!("Bearer {token}"))).await, 401, "hook token off the hook routes");
@@ -476,13 +484,14 @@ async fn hook_tokens_are_bound_to_their_terminal_and_survive_restarts() {
     let restarted = Listening::start(&daemon, state.path()).await;
     assert_ne!(restarted.file_token, file_token, "the file token is replaced at each start");
     assert_eq!(restarted.post(stop, Some(&format!("Bearer {token}"))).await, 200, "a running crew's token still verifies");
-    assert_eq!(restarted.hooks.claude_code_launch(NAMESPACE, CODER).expect("endpoint").token, token);
+    assert_eq!(restarted.hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("endpoint").token, token);
 }
 
 // Without a TCP listener there is no hook endpoint, and launches keep command hooks.
-#[test]
-fn no_listener_means_no_hook_endpoint() {
-    assert_eq!(HookEndpoint::default().claude_code_launch(NAMESPACE, CODER), None);
+#[tokio::test]
+async fn no_listener_means_no_hook_endpoint() {
+    let daemon = Daemon::new().await;
+    assert_eq!(HookEndpoint::default().claude_code_launch(&daemon.backend, NAMESPACE, CODER).await, None);
 }
 
 // The hook URL is fixed into each crew's settings at launch, so only a listener with a
@@ -490,13 +499,14 @@ fn no_listener_means_no_hook_endpoint() {
 // launches keep command hooks rather than post to a dead port.
 #[tokio::test]
 async fn only_a_fixed_listen_port_serves_hooks() {
+    let daemon = Daemon::new().await;
     let state = tempfile::tempdir().expect("state directory");
     let logins = Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock)));
     let ephemeral = ListenAddress::resolve_with("127.0.0.1:0", |_, _| async { Ok(Vec::new()) }).await.expect("listen address");
     let listener = TcpListener::bind(&ephemeral, state.path(), Arc::clone(&logins)).await.expect("bind port 0");
     let hooks = HookEndpoint::default();
     hooks.publish(&listener);
-    assert_eq!(hooks.claude_code_launch(NAMESPACE, CODER), None, "port 0 keeps command hooks");
+    assert_eq!(hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await, None, "port 0 keeps command hooks");
     drop(listener);
 
     // A probed free port can be taken before the listener binds it; probe again if so.
@@ -513,7 +523,7 @@ async fn only_a_fixed_listen_port_serves_hooks() {
     };
     let hooks = HookEndpoint::default();
     hooks.publish(&listener);
-    let launch = hooks.claude_code_launch(NAMESPACE, CODER).expect("a fixed port serves hooks");
+    let launch = hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("a fixed port serves hooks");
     assert_eq!(launch.base_url, format!("http://127.0.0.1:{port}/v1/hooks/claude-code"));
 }
 
@@ -524,12 +534,92 @@ fn concurrent_hook_key_creation_agrees_on_one_key() {
     let directory = tempfile::tempdir().expect("key directory");
     let terminal = terminal(CODER);
     let tokens: Vec<String> = std::thread::scope(|scope| {
-        let creators: Vec<_> =
-            (0..8).map(|_| scope.spawn(|| HookKey::load_or_create(directory.path()).expect("hook key").mint(&terminal))).collect();
+        let creators: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| HookKey::load_or_create(directory.path()).expect("hook key").mint(&terminal, "generation")))
+            .collect();
         creators.into_iter().map(|creator| creator.join().expect("creator")).collect()
     });
-    let reloaded = HookKey::load_or_create(directory.path()).expect("reload").mint(&terminal);
+    let reloaded = HookKey::load_or_create(directory.path()).expect("reload").mint(&terminal, "generation");
     assert!(tokens.iter().all(|token| token == &reloaded), "every creator holds the published key");
     let leftovers: Vec<_> = std::fs::read_dir(directory.path()).expect("list").map(|entry| entry.expect("entry").file_name()).collect();
     assert_eq!(leftovers, [std::ffi::OsString::from(HOOK_KEY_FILE)], "no staged files remain");
+}
+
+// A token belongs to one creation generation, even when a deleted name is reused.
+#[tokio::test]
+async fn recreated_terminal_refuses_old_hook_token() {
+    let database = tempfile::tempdir().expect("database");
+    for backend in [
+        ResourceBackend::new(InMemoryBackend::default()),
+        ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open(database.path().join("sessions.sqlite")).expect("SQLite")),
+    ] {
+        let daemon = Daemon::with_backend(backend).await;
+        let state = tempfile::tempdir().expect("state");
+        let listener = Listening::start(&daemon, state.path()).await;
+        let old = listener.hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("launch");
+        let route = "/v1/hooks/claude-code/stop";
+        assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 200);
+        daemon.backend.clone().using::<TerminalSession>(NAMESPACE).delete(CODER).await.expect("delete");
+        assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 401);
+        running_crew_terminal(&daemon.backend, CODER).await;
+        assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 401);
+        assert_eq!(daemon.attention(CODER).await, None);
+        let fresh = listener.hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("new launch");
+        assert_eq!(listener.post(route, Some(&format!("Bearer {}", fresh.token))).await, 200);
+    }
+}
+
+// Internal processing failures are logged and returned as a generic 500 body.
+// Glue: poisoning the real store lock exercises the handler's error delegation.
+#[tokio::test]
+async fn hook_internal_error_is_not_returned() {
+    let daemon = Daemon::new().await;
+    let agents = Arc::clone(&daemon.agents);
+    let _ = std::thread::spawn(move || {
+        let _guard = agents.lock().expect("store");
+        panic!("private failure detail");
+    })
+    .join();
+    let mut request = hook_post("stop", &hook_input("Stop", "s", serde_json::json!({})));
+    request.extensions_mut().insert(CallerAuth::Bearer);
+    let response = daemon.router.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json, serde_json::json!({"message": "failed to process agent hook event"}));
+    assert!(!String::from_utf8_lossy(&body).contains("lock poisoned"));
+}
+
+// The MAC binds every identity component, including the creation generation; changing
+// any component invalidates it. Pure token logic needs no daemon or socket harness.
+#[hegel::test]
+fn hook_mac_binds_generation(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    // Covers empty, short and long identity components, including separator characters.
+    let length = tc.draw(gs::integers::<usize>().min_value(0).max_value(128));
+    let generation = tc.draw(gs::integers::<u64>());
+    let terminal = AgentHookTerminalRef { namespace: "n.".repeat(length), session_name: "s/".repeat(length) };
+    let key = HookKey::load_or_create(tempfile::tempdir().expect("key dir").path()).expect("key");
+    let token = key.mint(&terminal, &generation.to_string());
+    if length == 0 {
+        assert!(key.verify(&token).is_none(), "empty terminal identities are refused");
+    } else {
+        assert_eq!(key.verify(&token), Some((terminal.clone(), generation.to_string())));
+        let mut parts: Vec<String> = token.split('.').map(str::to_owned).collect();
+        for index in 1..=4 {
+            let original = parts[index].clone();
+            parts[index] = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, "changed");
+            assert!(key.verify(&parts.join(".")).is_none(), "component {index} is authenticated");
+            parts[index] = original;
+        }
+    }
+}
+
+// Glue: a bound endpoint cannot mint an instance token for a missing session;
+// the launch retains command hooks and reports the lookup failure in the daemon log.
+#[tokio::test]
+async fn missing_terminal_keeps_command_hooks() {
+    let daemon = Daemon::new().await;
+    let endpoint = HookEndpoint::listening_at("http://127.0.0.1:7878");
+    assert_eq!(endpoint.claude_code_launch(&daemon.backend, NAMESPACE, "missing").await, None);
 }

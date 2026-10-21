@@ -24,7 +24,7 @@ pub(in crate::server) enum CallerAuth {
     Session(SessionId),
     /// Loopback TCP carrying a hook token: an agent in this managed terminal. It reaches
     /// only the hook routes, and only as that terminal.
-    Hook(AgentHookTerminalRef),
+    Hook { terminal: AgentHookTerminalRef, generation: String },
     /// Loopback TCP without credentials. It reaches only the login exchange.
     Anonymous,
 }
@@ -36,7 +36,7 @@ impl CallerAuth {
         match self {
             Self::Socket(_) | Self::Bearer | Self::Session(_) => None,
             Self::Environment { .. } => Some((StatusCode::FORBIDDEN, "this route is not available to an environment")),
-            Self::Hook(_) => Some((StatusCode::FORBIDDEN, "a hook token reaches only the hook routes")),
+            Self::Hook { .. } => Some((StatusCode::FORBIDDEN, "a hook token reaches only the hook routes")),
             Self::Anonymous => Some((StatusCode::UNAUTHORIZED, "authentication required")),
         }
     }
@@ -49,7 +49,7 @@ impl CallerAuth {
     pub(super) fn refusal_unless_authenticated(&self) -> Option<Response> {
         match self {
             Self::Anonymous => Some(unauthenticated()),
-            Self::Hook(_) => Some(refusal(StatusCode::FORBIDDEN, "a hook token reaches only the hook routes")),
+            Self::Hook { .. } => Some(refusal(StatusCode::FORBIDDEN, "a hook token reaches only the hook routes")),
             _ => None,
         }
     }

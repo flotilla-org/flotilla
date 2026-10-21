@@ -177,7 +177,10 @@ fn authenticate(request: &Request, token: &[u8; 32], hooks: &HookKey, logins: &L
             return admit(CallerAuth::Bearer, false);
         }
         let hook_route = request.uri().path().strip_prefix(HOOKS_PATH).is_some_and(|rest| rest.starts_with('/'));
-        return hook_route.then(|| hooks.verify(presented)).flatten().and_then(|terminal| admit(CallerAuth::Hook(terminal), false));
+        return hook_route
+            .then(|| hooks.verify(presented))
+            .flatten()
+            .and_then(|(terminal, generation)| admit(CallerAuth::Hook { terminal, generation }, false));
     }
     if let Some(session) = logins.session(headers) {
         return admit(CallerAuth::Session(session), true);
