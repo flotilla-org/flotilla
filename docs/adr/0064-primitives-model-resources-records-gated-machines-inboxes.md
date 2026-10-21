@@ -45,6 +45,10 @@ Convoys assumed that their vessels were co-located and fixed. Many writers could
   Attempts and receipts are not separate records: each is an edge on the resource that made it, so every write to history goes through the one edge path (#3392 R4).
 
   A convoy's seats, promises, submissions and duties are records of the Convoy, not their own kinds. A generated parent key is named after its root table (#3627 look-over ruling).
+
+  ADR 0064 seats: fan-out adds a seat under an existing one (`AddSeat`, names never reused) and `Resupervise` is the only edge that changes `supervised_by`; admission refuses unknown owners, unknown parents and cycles. Seat retirement is not yet modelled.
+
+  ADR 0064 Convoy records: a change-request observation finds its submission through a full index on the submission address (one lookup per event); there is no partial index on open convoys.
 - **A judgement** is computed and never stored. Examples are ready, stalled, landing, kept, retry count, next attempt, stale and drift. Each judgement is a declared function with declared inputs, and it returns a value and the moment it could next change. The same function gates edges and renders listings, so the two cannot disagree.
 - **No host writes another home's resource.** It sends a message to that home, or it publishes a record of its own that the home observes.
 
