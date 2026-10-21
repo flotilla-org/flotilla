@@ -191,6 +191,11 @@ impl LeafSubscriptionTable {
         issues: IssueRefresher,
         episode_limit: u32,
     ) -> Self {
+        // The limit judges the latest run of retained episodes (at most limit+1).
+        assert!(
+            (episode_limit as usize) < flotilla_resources::TurnDeliveryStatus::EPISODE_HISTORY,
+            "turn-delivery episode limit must stay below the retained episode history"
+        );
         let (reconciler_tx, _) = broadcast::channel(32);
         Self {
             inner: Arc::new(LeafSubscriptionTableInner {

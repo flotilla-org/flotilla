@@ -1354,7 +1354,8 @@ pub struct TurnDeliveryStatus {
 impl TurnDeliveryStatus {
     /// Retained episodes per source. The episode limit judges only the latest
     /// run at one revision, so older rounds are kept for dedupe and explanation
-    /// and then dropped; a convoy with many review rounds stays bounded.
+    /// and then dropped; a convoy with many review rounds stays bounded. It must
+    /// hold the leaf engine's longest run (episode limit + 1), which its constructor asserts.
     pub const EPISODE_HISTORY: usize = 32;
 
     /// Appends a new episode (one per subject revision) and drops the oldest past the bound.
