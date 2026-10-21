@@ -401,8 +401,9 @@ async fn supervisor_decision_survives_authority_disappearing_after_publication()
 }
 
 // #2758: holds persist convoy/session facts and admit exactly one plain supervisor
-// Message across retries, with no forge collaborator available. Cover local and project
-// supervisors, no PR binding, and retries carrying newer head identities.
+// Message, plus one notice to the held crew (#3565), across retries, with no forge
+// collaborator available. Cover local and project supervisors, no PR binding, and
+// retries carrying newer head identities.
 #[hegel::test]
 fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
     use hegel::generators as gs;
@@ -440,8 +441,12 @@ fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
         let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
         assert_eq!(session.status.expect("status").turn_delivery_hold.expect("hold").reason, "episode limit");
         let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages");
-        assert_eq!(messages.items.len(), 1, "retries cannot duplicate supervisor signals");
-        let message = &messages.items[0];
+        assert_eq!(messages.items.len(), 2, "retries cannot duplicate the supervisor signal or the crew notice");
+        // #3565: the held crew is told why its wakes stopped.
+        let notice = messages.items.iter().find(|message| message.spec.receiver == "flotilla/crew/work/coder").expect("crew notice");
+        assert_eq!(notice.spec.relation, flotilla_resources::MessageRelation::System);
+        assert!(notice.spec.body.contains("`checks-settled` turns for you are held") && notice.spec.body.contains("episode limit"));
+        let message = messages.items.iter().find(|message| message.spec.receiver != "flotilla/crew/work/coder").expect("supervisor signal");
         assert_eq!(message.spec.receiver, if address_supervisor { "flotilla/attended" } else if local_supervisor { "flotilla/crew/work/bosun" } else { "flotilla/governor" });
         assert_eq!(message.spec.relation, flotilla_resources::MessageRelation::System);
         assert_eq!(message.spec.expectation, flotilla_resources::MessageExpectation::None);
@@ -540,7 +545,8 @@ async fn remote_session_hold_retries_through_existing_mutation_router() {
     }
     let session = receiver.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
     assert_eq!(session.status.expect("status").turn_delivery_hold.expect("hold").raised_at, raised_at);
-    assert_eq!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items.len(), 1);
+    // One supervisor signal and one crew notice, however many retries.
+    assert_eq!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items.len(), 2);
 }
 
 // All terminal convoy outcomes refuse resume and turn admission with an explicit
