@@ -4,10 +4,10 @@
 //! inside a provisioned environment, and across command transports.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fmt,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime},
 };
 
@@ -42,15 +42,8 @@ fn is_revision_cache(name: &str, directory: &Path) -> bool {
 }
 
 fn object_cache_lock(directory: &Path) -> Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
-    let mut locks = LOCKS.get_or_init(Mutex::default).lock().expect("object cache locks poisoned");
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(directory).and_then(Weak::upgrade) {
-        return lock;
-    }
-    let lock = Arc::new(tokio::sync::Mutex::new(()));
-    locks.insert(directory.to_path_buf(), Arc::downgrade(&lock));
-    lock
+    static LOCKS: OnceLock<flotilla_provider_runtime::weak_registry::WeakRegistry<PathBuf, tokio::sync::Mutex<()>>> = OnceLock::new();
+    LOCKS.get_or_init(Default::default).get(directory)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

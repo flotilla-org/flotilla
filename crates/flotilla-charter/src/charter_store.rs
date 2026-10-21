@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     io::Read,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime},
 };
 
@@ -214,15 +214,8 @@ impl RevisionedTree for GitRevisionedTree<'_> {
 /// Share exclusion across timer, explicit refresh and candidate reads. Weak
 /// entries keep transient source identities from retaining locks indefinitely.
 pub fn reconciliation_lock(identity: &str) -> Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
-    let mut locks = LOCKS.get_or_init(Mutex::default).lock().expect("charter lock registry poisoned");
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(identity).and_then(Weak::upgrade) {
-        return lock;
-    }
-    let lock = Arc::new(tokio::sync::Mutex::new(()));
-    locks.insert(identity.to_string(), Arc::downgrade(&lock));
-    lock
+    static LOCKS: OnceLock<flotilla_provider_runtime::weak_registry::WeakRegistry<String, tokio::sync::Mutex<()>>> = OnceLock::new();
+    LOCKS.get_or_init(Default::default).get(identity)
 }
 
 /// Fleet and legacy project writers share one exclusion during pointer cut-over.

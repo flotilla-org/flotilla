@@ -1,5 +1,6 @@
 //! Flotilla process policy and helper scripts over Rigging's shared runtime.
 pub mod observation_error;
+pub mod weak_registry;
 pub use observation_error::ObservationError;
 mod git_config_guard;
 pub mod ssh_runner;
