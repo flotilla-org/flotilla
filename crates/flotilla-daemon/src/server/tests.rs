@@ -6023,14 +6023,17 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
 // releasing or aborting it wakes the idle watcher. Explicit shutdown is independent.
 #[tokio::test]
 async fn environment_client_lease_releases_idle_accounting() {
-    let count = Arc::new(AtomicUsize::new(1));
+    let count = Arc::new(AtomicUsize::new(0));
     let notify = Arc::new(Notify::new());
+    let lease = super::ClientActivityLease::acquire(count.clone(), notify.clone());
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    // Consume acquisition's wakeup so it cannot mask a missing release wakeup.
+    tokio::time::timeout(Duration::from_secs(1), notify.notified()).await.expect("acquisition wakes idle watcher");
     let notified = notify.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
-    let lease = super::ClientActivityLease { count: count.clone(), notify: notify.clone() };
     drop(lease);
-    notified.await;
+    tokio::time::timeout(Duration::from_secs(1), notified).await.expect("release wakes idle watcher");
     assert_eq!(count.load(Ordering::SeqCst), 0);
 }
 
