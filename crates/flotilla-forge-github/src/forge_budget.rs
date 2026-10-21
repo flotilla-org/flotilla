@@ -77,7 +77,9 @@ impl ForgeBudgets {
         let now = Utc::now();
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.expire_cooldowns();
-        let row = state.rows.entry(format!("{identity}/{budget}")).or_insert_with(|| ForgeBudgetRow {
+        let BudgetState { rows, totals, deadlines } = &mut *state;
+        let key = format!("{identity}/{budget}");
+        let row = rows.entry(key.clone()).or_insert_with(|| ForgeBudgetRow {
             host: String::new(),
             identity: identity.into(),
             budget: budget.into(),
@@ -115,18 +117,11 @@ impl ForgeBudgets {
             .and_then(|value| value.parse().ok())
             .or_else(|| document["data"]["rateLimit"]["remaining"].as_u64())
             .or(row.remaining);
-        let total_key = format!("{identity}/{budget}");
-        let total_row = row.clone();
-        let totals = state.totals.entry(total_key).or_insert_with(|| ForgeBudgetRow {
-            calls: 0,
-            reported_cost: 0,
-            unreported_calls: 0,
-            ..total_row
-        });
+        let totals =
+            totals.entry(key.clone()).or_insert_with(|| ForgeBudgetRow { calls: 0, reported_cost: 0, unreported_calls: 0, ..row.clone() });
         totals.calls += 1;
         totals.reported_cost += cost.unwrap_or(0);
         totals.unreported_calls += u64::from(cost.is_none());
-        let row = state.rows.get_mut(&format!("{identity}/{budget}")).expect("budget row exists");
         let retry_at = github_rate_limit(raw, now)
             .map(|limit| limit.retry_at.unwrap_or(now + chrono::Duration::minutes(1)))
             .or_else(|| (budget == "GraphQL").then(|| low_graphql_budget(raw, &document)).flatten());
@@ -134,7 +129,7 @@ impl ForgeBudgets {
             row.retry_at = Some(retry_at);
             if let Some(reset) = row.retry_at {
                 let delay = reset.signed_duration_since(now).to_std().unwrap_or_default();
-                state.deadlines.insert(format!("{identity}/{budget}"), tokio::time::Instant::now() + delay);
+                deadlines.insert(key, tokio::time::Instant::now() + delay);
             }
         }
     }

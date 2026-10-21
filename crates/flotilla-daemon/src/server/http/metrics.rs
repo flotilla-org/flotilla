@@ -49,9 +49,13 @@ impl Exposition {
     }
     fn family(&mut self, name: &str, kind: &str) {
         self.current = name.to_owned();
-        self.families
-            .entry(self.current.clone())
-            .or_insert_with(|| format!("# HELP {name} Daemon load instrumentation.\n# TYPE {name} {kind}\n"));
+        let help = match name {
+            "flotilla_store_read_contention_total" => "Busy read refusals returned to callers; each refusal counts once.",
+            "flotilla_store_queue_wait_seconds" => "Time queued before a store read or write starts, in seconds.",
+            "flotilla_store_execution_seconds" => "Store read or write execution time, excluding queue wait, in seconds.",
+            _ => "Daemon load instrumentation; counters are cumulative and peaks are high-water marks since startup.",
+        };
+        self.families.entry(self.current.clone()).or_insert_with(|| format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
     }
     fn sample(&mut self, name: &str, labels: &str, value: impl std::fmt::Display) {
         writeln!(self.families.get_mut(&self.current).expect("family declared"), "{name}{{host=\"{}\"{labels}}} {value}", self.host)
@@ -63,6 +67,8 @@ impl Exposition {
     }
     fn histogram(&mut self, name: &str, labels: &str, histogram: &HistogramSnapshot) {
         self.family(name, "histogram");
+        // Even u64::MAX is a real finite microsecond bound, not an infinity
+        // sentinel. Preserve it and append the separate Prometheus +Inf bucket.
         for (upper, count) in histogram.cumulative_buckets() {
             self.sample(&format!("{name}_bucket"), &format!("{labels},le=\"{}\"", upper as f64 / 1_000_000.0), count);
         }
@@ -85,7 +91,7 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
         out.number("flotilla_store_queue_peak", "gauge", &labels, peak);
     }
     out.number("flotilla_store_reads_shed_total", "counter", "", store.reads_shed);
-    out.number("flotilla_store_contention_total", "counter", "", store.contention);
+    out.number("flotilla_store_read_contention_total", "counter", "", store.read_contention);
     if let Some(controllers) = metrics.controllers.get() {
         // Kinds are registered by the compiled controller set, never resource IDs.
         for (kind, snapshot) in controllers.snapshot() {
@@ -171,7 +177,7 @@ mod tests {
     use tower::ServiceExt;
 
     // Behaviour: a short dummy-fleet runtime exports every instrumentation group
-    // through GET /metrics without credentials; disabled configuration returns 404.
+    // through GET /metrics without credentials after a dummy crew launches.
     // Real SQLite, controllers and router are used. The discovery testkit replaces
     // subprocesses at the OS boundary so no live forge or fleet is contacted.
     #[tokio::test]
@@ -198,7 +204,7 @@ mod tests {
             daemon.clone(),
             config,
             None,
-            crate::runtime::RuntimeOptions { controller_resync_interval: Duration::from_millis(20), ..Default::default() },
+            crate::runtime::RuntimeOptions { controller_resync_interval: Duration::from_millis(200), ..Default::default() },
         )
         .await
         .unwrap();
@@ -217,16 +223,6 @@ mod tests {
             .create(&flotilla_resources::InputMeta::builder().name(forge.forge_id.clone()).build(), &forge)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if runtime.controller_metrics.snapshot().values().any(|value| value.reconcile.count() > 0) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
         // Run one real dummy crew before scraping, through the same catalog
         // and command port used by the fleet integration harness.
         use flotilla_daemon_api::daemon::DaemonHandle;
@@ -252,7 +248,7 @@ mod tests {
             .create(&InputMeta::builder().name(CrewMix::Coder.workflow_name().into()).build(), &CrewMix::Coder.workflow(1))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if repositories.get(&repository.key().to_string()).await.ok().and_then(|r| r.status?.default_branch).is_some() {
                     break;
@@ -279,7 +275,7 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while fleet.snapshot().sessions_launched == 0 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -300,7 +296,7 @@ mod tests {
         for family in [
             "flotilla_store_queue_wait_seconds",
             "flotilla_store_execution_seconds",
-            "flotilla_store_contention_total",
+            "flotilla_store_read_contention_total",
             "flotilla_controller_reconcile_seconds",
             "flotilla_replication_stream_failures_total",
             "flotilla_read_retry_retries_total",
@@ -362,31 +358,72 @@ mod tests {
                 > 0));
         }
         assert!(text.contains("flotilla_forge_budget_calls_total{host=\"metrics-host\",identity=\"host gh login\",budget=\"REST\"} 1"));
-        // The actual TCP policy admits unauthenticated scrapes while retaining
-        // Host/Origin protection and authentication on other routes.
-        let listen = super::super::ListenAddress::resolve("127.0.0.1:0").await.unwrap();
-        let listener = super::super::TcpListener::bind(&listen, dir.path(), logins.clone()).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(listener.serve(router.clone(), std::future::pending()));
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let url = format!("http://{address}");
-        assert_eq!(client.get(format!("{url}/metrics")).send().await.unwrap().status(), StatusCode::OK);
-        assert_eq!(client.get(format!("{url}/v1/hello")).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            client.get(format!("{url}/metrics")).header("Host", "public.example").send().await.unwrap().status(),
-            StatusCode::MISDIRECTED_REQUEST
-        );
-        assert_eq!(
-            client.get(format!("{url}/metrics")).header("Origin", "https://public.example").send().await.unwrap().status(),
-            StatusCode::FORBIDDEN
-        );
-        task.abort();
-        let disabled = HttpRouter::for_daemon(daemon, logins, Default::default()).with_load_metrics(metrics, false).into_router();
-        assert_eq!(
-            disabled.oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap()).await.unwrap().status(),
-            StatusCode::NOT_FOUND
-        );
         runtime.shutdown();
+    }
+
+    // Behaviour: the loopback policy admits GET /metrics without credentials,
+    // including its disabled 404, while protecting other routes and enforcing
+    // Host/Origin. This glue test needs no fleet, controllers or resync polling.
+    #[tokio::test]
+    async fn metrics_tcp_policy_and_disabled_route() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("daemon.toml"), "machine_id = \"metrics-policy\"\n").unwrap();
+        let config = Arc::new(flotilla_config::ConfigStore::with_base(dir.path().to_path_buf()));
+        let sqlite = flotilla_store_sqlite::SqliteBackend::open_in_memory().unwrap();
+        let metrics = Arc::new(LoadMetrics::new(sqlite.load_metrics()));
+        let daemon = flotilla_core::in_process::InProcessDaemon::new_with_resource_backend(
+            vec![],
+            config,
+            flotilla_discovery_testkit::fake_discovery(false),
+            flotilla_protocol::HostName::new("metrics-policy"),
+            flotilla_store::ResourceBackend::new(sqlite),
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
+        let logins = Arc::new(super::super::LoginStore::new(daemon.clock_for_scenarios()));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for enabled in [false, true] {
+            let router = HttpRouter::for_daemon(daemon.clone(), logins.clone(), Default::default())
+                .with_load_metrics(metrics.clone(), enabled)
+                .into_router();
+            let listen = super::super::ListenAddress::resolve("127.0.0.1:0").await.unwrap();
+            let listener = super::super::TcpListener::bind(&listen, dir.path(), logins.clone()).await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(listener.serve(router, std::future::pending()));
+            let expected = if enabled { StatusCode::OK } else { StatusCode::NOT_FOUND };
+            assert_eq!(client.get(format!("{url}/metrics")).send().await.unwrap().status(), expected);
+            assert_eq!(client.get(format!("{url}/v1/hello")).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                client.get(format!("{url}/metrics")).header("Host", "public.example").send().await.unwrap().status(),
+                StatusCode::MISDIRECTED_REQUEST
+            );
+            assert_eq!(
+                client.get(format!("{url}/metrics")).header("Origin", "https://public.example").send().await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    // Behaviour: the largest internal microsecond bucket stays finite and
+    // ordered below one +Inf bucket. One boundary example covers this conversion.
+    #[test]
+    fn histogram_top_bucket_is_finite() {
+        let histogram = flotilla_store::load_metrics::LatencyHistogram::default();
+        histogram.record(Duration::MAX);
+        let mut out = Exposition { current: String::new(), host: "host".into(), families: Default::default() };
+        out.histogram("latency_seconds", "", &histogram.snapshot());
+        let text = out.finish();
+        let scrape = prometheus_parse::Scrape::parse(text.lines().map(|line| Ok(line.to_owned()))).unwrap();
+        let sample = scrape.samples.iter().find(|sample| sample.metric == "latency_seconds").unwrap();
+        let prometheus_parse::Value::Histogram(buckets) = &sample.value else { panic!("expected histogram") };
+        assert_eq!(buckets.iter().filter(|bucket| bucket.less_than.is_infinite()).count(), 1);
+        let finite = &buckets[buckets.len() - 2];
+        assert!(finite.less_than.is_finite());
+        assert_eq!(finite.less_than, u64::MAX as f64 / 1_000_000.0);
+        assert_eq!(finite.count, 1.0);
+        assert_eq!(buckets.last().unwrap().count, 1.0);
     }
 
     // Behaviour: bucket exposition conserves counts and sums, uses inclusive

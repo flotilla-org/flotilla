@@ -11,7 +11,10 @@ metrics = true
 `metrics` defaults to false. The existing HTTP listener rejects public bind
 addresses, including hostnames that resolve to any non-loopback address.
 Alloy can scrape `http://127.0.0.1:7878/metrics` without credentials. Existing
-Host and Origin checks still apply. The endpoint is also available through the
+Host and Origin checks still apply. Any local process can read the metrics,
+including fixed forge identity labels such as `host gh login`. Anonymous
+GET requests are admitted on this path even when metrics are disabled, and
+then return 404. The endpoint is also available through the
 main daemon Unix HTTP socket when enabled.
 
 All series have a `host` label. Other labels are limited to store operation
@@ -29,7 +32,7 @@ Key series for a load run:
 - `flotilla_store_queue_wait_seconds` and `flotilla_store_execution_seconds`,
   each with separate read/write series;
 - `flotilla_read_retry_retries_total` by consumer;
-- `flotilla_store_contention_total`: busy read refusals returned to callers,
+- `flotilla_store_read_contention_total`: busy read refusals returned to callers,
   counted once even if a queued read is later shed;
 - `flotilla_replication_stream_failures_total` and
   `flotilla_replication_lag_resets_total`.

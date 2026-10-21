@@ -450,8 +450,11 @@ impl DaemonServer {
         )
     }
 
+    /// Attach the runtime registry before serving; controller families are absent until installed.
+    /// Installing a second registry is a composition error, diagnosed in debug builds.
     pub fn install_controller_metrics(&self, metrics: Arc<flotilla_store::load_metrics::ControllerMetricsRegistry>) {
-        let _ = self.load_metrics.controllers.set(metrics);
+        let installed = self.load_metrics.controllers.set(metrics).is_ok();
+        debug_assert!(installed, "controller metrics registry already installed");
     }
 
     pub fn install_blob_store(&self, store: Arc<crate::blob_store::TieredBlobStore>) -> Result<(), String> {

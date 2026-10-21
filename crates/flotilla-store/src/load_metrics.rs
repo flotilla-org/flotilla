@@ -358,7 +358,7 @@ pub fn read_retry_snapshot() -> BTreeMap<&'static str, ReadRetrySnapshot> {
 #[derive(Debug, Default)]
 pub struct StoreLoadMetrics {
     /// Reads refused as busy, once per refusal returned to a caller.
-    pub contention: Counter,
+    pub read_contention: Counter,
     /// Time from a write's submission until the writer thread starts it.
     pub write_wait: LatencyHistogram,
     pub write_execution: LatencyHistogram,
@@ -384,7 +384,7 @@ impl StoreLoadMetrics {
             read_execution: self.read_execution.snapshot(),
             read_queue_peak: self.read_queue_peak.get(),
             reads_shed: self.reads_shed.get(),
-            contention: self.contention.get(),
+            read_contention: self.read_contention.get(),
         }
     }
 }
@@ -398,7 +398,7 @@ pub struct StoreLoadSnapshot {
     pub read_execution: HistogramSnapshot,
     pub read_queue_peak: u64,
     pub reads_shed: u64,
-    pub contention: u64,
+    pub read_contention: u64,
 }
 
 impl StoreLoadSnapshot {
@@ -411,7 +411,7 @@ impl StoreLoadSnapshot {
             read_execution: self.read_execution.since(&earlier.read_execution),
             read_queue_peak: self.read_queue_peak,
             reads_shed: self.reads_shed.saturating_sub(earlier.reads_shed),
-            contention: self.contention.saturating_sub(earlier.contention),
+            read_contention: self.read_contention.saturating_sub(earlier.read_contention),
         }
     }
 }
