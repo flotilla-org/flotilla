@@ -99,11 +99,13 @@ flotilla's own metering is the primary usage source, and `observe` is what it co
 
 - **Every call is idempotent by environment ID.** Provision for an existing environment ID returns the existing sandbox found by its tag, and destroying something already gone succeeds.
 - **Errors are typed, each with a reason:**
-  - `Refused`: the request cannot be met as asked;
+  - `Refused`: the request cannot be met as asked, including a provider HTTP 403 permission denial; the reason names the operation and the provider stays ready;
   - `Unavailable` and `RateLimited`: with `retry_after` when known;
   - `QuotaExhausted`: feeds placement back pressure;
-  - `CredentialRejected`: the instance becomes not ready with "missing credential";
+  - `CredentialRejected`: a provider HTTP 401 rejects the key; the instance becomes not ready with "missing credential", retaining the masked rejection diagnostic;
   - `Internal`: an adaptor bug, carrying the provider's raw error text.
+- **Provider messages reach the operator.** CLI errors, warn-level host logs and conformance reports include the category, reason, upstream HTTP status when present, provider explanation, operation and provider. The host masks anything matching a configured credential value, including proxy placeholder tokens, before returning or logging diagnostics. Provider explanations are ordinary diagnostic text, not secret fields. Credentials, tokens and reach recipes retain their redacting types. Permission denials use `Refused`; no distinct permission error is needed.
+- **Polling waits for readiness.** An undelivered credential does not cause a spurious failed provider call; credential delivery wakes observation immediately.
 - **Adaptors do not retry.** Modules turn off the SDK's internal retries where they can.
 
 ### Encoding
