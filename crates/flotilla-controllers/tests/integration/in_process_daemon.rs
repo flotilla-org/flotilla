@@ -2317,6 +2317,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
     assert_eq!(
         recv_command_finished(&mut events, overridden_id).await,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
             name: "overridden@zellij".into(),
             attach_plan: None,
@@ -2328,6 +2329,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
     assert_eq!(
         recv_command_finished(&mut events, admitted_id).await,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
             name: "reviewed@zellij".into(),
             attach_plan: None,
@@ -2511,6 +2513,7 @@ async fn exercise_existing_pr_admission(continuing: bool) {
     assert_eq!(
         recv_command_finished(&mut events, command_id).await,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::DeterministicFallback {
                 reason: "change-request admission uses deterministic naming".into()
             }),
@@ -3577,6 +3580,59 @@ async fn requested_model_selects_host_direct_without_an_observed_version_floor()
     assert!(!matches!(admitted, CommandValue::Error { .. }), "a partial rejection must not refuse: {admitted:?}");
 }
 
+// #3645: invalid tracker needs admit with an operator-visible warning in both
+// the command result and explain; their placement matches an unlabeled dispatch.
+#[tokio::test]
+async fn invalid_issue_need_admits_with_warning_in_result_and_explain() {
+    let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+    let reference = IssueRef { source: source.clone(), id: "3397".into() };
+    let mut issue = TestIssue::new("Multi-host bug").id("3397").with_labels(vec!["needs:multi-host".into()]).build();
+    issue.reference = reference.clone();
+    let provider = Arc::new(FakeIssueProvider::new());
+    provider.add_issues(vec![(reference.id.clone(), issue)]).await;
+    let discovery = fake_discovery_with_provider_set(
+        FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_issue_tracker::IssueProvider>),
+    );
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, Some(source)).await;
+    let baseline = start_capability_convoy(&daemon, "baseline", |_| {}).await;
+    assert!(matches!(baseline, CommandValue::ConvoyStarted { .. }), "{baseline:?}");
+    let result = start_capability_convoy(&daemon, "triage-label", |intent| {
+        intent.issues.push(IssueSelector::Reference(reference));
+    })
+    .await;
+    let CommandValue::ConvoyStarted { warnings, .. } = result else { panic!("tracker label refused admission: {result:?}") };
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].contains("3397")
+            && warnings[0].contains("needs:multi-host")
+            && warnings[0].contains("invalid namespaced capability `multi-host`"),
+        "{warnings:?}"
+    );
+    let frozen_needs = |convoy: &flotilla_resources::ResourceObject<ResourceConvoy>| {
+        convoy.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).unwrap().clone()
+    };
+    let baseline = admitted_convoy(&backend, "baseline").await;
+    let admitted = admitted_convoy(&backend, "triage-label").await;
+    let baseline = backend.definitions::<WorkflowTemplate>("flotilla").get(&frozen_needs(&baseline)).await.unwrap();
+    let frozen = backend.definitions::<WorkflowTemplate>("flotilla").get(&frozen_needs(&admitted)).await.unwrap();
+    assert_eq!(frozen.spec.vessels, baseline.spec.vessels);
+    let result = daemon
+        .execute_query(
+            Command::builder()
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: "triage-label".into() })
+                .build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("explain query");
+    let CommandValue::ConvoyExplanation(explanation) = result else { panic!("{result:?}") };
+    assert_eq!(explanation.warnings, warnings);
+    let refused = start_capability_convoy(&daemon, "explicit-invalid", |intent| intent.needs.push("multi-host".into())).await;
+    assert!(matches!(refused, CommandValue::Error { message } if message.contains("invalid namespaced capability `multi-host`")));
+}
+
 #[tokio::test]
 async fn issue_platform_need_refuses_without_a_covering_kind() {
     let source = IssueSource { service: "https://github.com".to_string(), scope: "flotilla-org/flotilla".to_string() };
@@ -3701,6 +3757,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
     assert_eq!(
         implicit_result,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
             name: "local-default@flotilla".into(),
             attach_plan: None,
@@ -3753,6 +3810,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
     assert_eq!(
         result,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
             name: "explicit-default@flotilla".into(),
             attach_plan: None,
@@ -4031,6 +4089,7 @@ async fn convoy_start_accepts_project_list_identifier() {
         assert_eq!(
             recv_command_finished(&mut events, start_id).await,
             CommandValue::ConvoyStarted {
+                warnings: Vec::new(),
                 naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
                 name: format!("{name}@flotilla"),
                 attach_plan: None,
@@ -4359,6 +4418,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(
         result,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
             name: "issue-732@flotilla".into(),
             attach_plan: None,
@@ -4450,6 +4510,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             assert_eq!(
                 result,
                 CommandValue::ConvoyStarted {
+                    warnings: Vec::new(),
                     naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
                     name: format!("{name}@flotilla"),
                     attach_plan: None,
@@ -4528,6 +4589,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(
         recv_command_finished(&mut events, default_id).await,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
             name: "default-regard@flotilla".into(),
             attach_plan: None,
@@ -4593,6 +4655,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(
         batch_result,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
             name: "batch-732-733@flotilla".into(),
             attach_plan: None,
@@ -4653,6 +4716,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(
         fallback_result,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::DeterministicFallback { reason: "counting-ai: utility unavailable".into() }),
             name: "start-convoy-from-an-issue-732@flotilla".into(),
             attach_plan: None,
@@ -4763,6 +4827,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(
         explicit_result,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
             name: "explicit-workflow@explicit-workflow".into(),
             attach_plan: None,
@@ -4966,6 +5031,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
     assert_eq!(
         result,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::AiUtility { utility: "counting-ai".into() }),
             name: "generated-convoy@flotilla".into(),
             attach_plan: None,
@@ -5001,6 +5067,7 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
     assert_eq!(
         recv_command_finished(&mut events, first_id).await,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
             name: "governor@flotilla".to_string(),
             attach_plan: None,
@@ -5518,6 +5585,7 @@ async fn convoy_start_worker_panic_finishes_the_command_and_allows_retry() {
     assert_eq!(
         retry_result,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::AiUtility { utility: "panic-once-ai".into() }),
             name: "retried-convoy@flotilla".into(),
             attach_plan: None,

@@ -3393,6 +3393,7 @@ async fn convoy_start_routes_to_placement_when_presentation_membership_is_stale(
     assert_eq!(
         await_command_result(&mut events, command_id).await,
         CommandValue::ConvoyStarted {
+            warnings: Vec::new(),
             naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
             name: "remote-work@flotilla".to_string(),
             attach_plan: None,
@@ -3562,6 +3563,7 @@ async fn lagging_start_placement_scenario(explicit: bool, destination_holds_cred
         assert_eq!(
             result,
             CommandValue::ConvoyStarted {
+                warnings: Vec::new(),
                 naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
                 name: "kiwi-to-feta@flotilla".to_string(),
                 attach_plan: None,

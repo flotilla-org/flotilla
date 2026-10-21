@@ -3246,7 +3246,7 @@ impl InProcessDaemon {
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
         dispatching_principal_ref: &PrincipalRef,
-    ) -> Result<(String, String, Option<flotilla_protocol::ConvoyNaming>), String> {
+    ) -> Result<(String, String, Option<flotilla_protocol::ConvoyNaming>, Vec<String>), String> {
         self.admission.admit_convoy_start(namespace, intent, dispatching_principal_ref).await
     }
 
@@ -3339,10 +3339,11 @@ impl InProcessDaemon {
         }
         let auto_attach = self.should_auto_attach(intent.auto_attach);
         match self.admit_convoy_start(&namespace, &intent, &dispatching_principal_ref).await {
-            Ok((record_name, address, naming)) if auto_attach => {
+            Ok((record_name, address, naming, warnings)) if auto_attach => {
                 match self.wait_for_convoy_attach(&namespace, &record_name, &address).await {
                     Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
                         name: address,
+                        warnings,
                         naming,
                         attach_plan: Some(resolved.plan),
                         binding: resolved.binding,
@@ -3350,8 +3351,8 @@ impl InProcessDaemon {
                     Err(message) => flotilla_protocol::CommandValue::Error { message },
                 }
             }
-            Ok((_record_name, address, naming)) => {
-                flotilla_protocol::CommandValue::ConvoyStarted { name: address, naming, attach_plan: None, binding: None }
+            Ok((_record_name, address, naming, warnings)) => {
+                flotilla_protocol::CommandValue::ConvoyStarted { name: address, naming, warnings, attach_plan: None, binding: None }
             }
             Err(message) => flotilla_protocol::CommandValue::Error { message },
         }

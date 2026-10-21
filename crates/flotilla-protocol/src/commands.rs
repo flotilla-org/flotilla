@@ -423,6 +423,9 @@ pub enum ConvoyNaming {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyExplanation {
+    /// Invalid tracker capability labels skipped during admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// Current mission ranking for each served ticket, keyed by source-qualified identity.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub dispatch_scores: std::collections::BTreeMap<String, crate::DispatchScore>,
@@ -1524,6 +1527,8 @@ pub enum CommandValue {
     },
     ConvoyStarted {
         name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         naming: Option<ConvoyNaming>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

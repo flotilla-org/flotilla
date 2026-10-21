@@ -915,6 +915,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         .map(|cascade| format!("\nResolved defaults:\n{}\n", serde_json::to_string_pretty(cascade).expect("serialize cascade")))
         .unwrap_or_default();
     let mut output = format!("Convoy: {}/{}\nPhase: {}\n", explanation.namespace, explanation.convoy, explanation.phase);
+    for warning in &explanation.warnings {
+        let _ = writeln!(output, "Warning: {warning}");
+    }
     for (issue, score) in &explanation.dispatch_scores {
         let _ = writeln!(output, "Dispatch {issue}: {}", format_dispatch_score(score));
     }
@@ -1516,8 +1519,12 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
             }
             output
         }
-        CommandValue::ConvoyStarted { name, attach_plan, .. } => {
-            format!("convoy started: {name}{}", if attach_plan.is_some() { " (crew ready)" } else { "" })
+        CommandValue::ConvoyStarted { name, attach_plan, warnings, .. } => {
+            let mut output = format!("convoy started: {name}{}", if attach_plan.is_some() { " (crew ready)" } else { "" });
+            for warning in warnings {
+                let _ = write!(output, "\nWarning: {warning}");
+            }
+            output
         }
         CommandValue::WorkflowTemplateApplied { name } => format!("workflow template applied: {name}"),
         CommandValue::ProjectAdded { name } => format!("project added: {name}"),
