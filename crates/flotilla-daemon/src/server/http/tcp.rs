@@ -180,7 +180,7 @@ fn authenticate(request: &Request, token: &[u8; 32], hooks: &HookKey, logins: &L
         return hook_route
             .then(|| hooks.verify(presented))
             .flatten()
-            .and_then(|(terminal, generation)| admit(CallerAuth::Hook(terminal, generation), false));
+            .and_then(|(terminal, generation)| admit(CallerAuth::Hook { terminal, generation }, false));
     }
     if let Some(session) = logins.session(headers) {
         return admit(CallerAuth::Session(session), true);

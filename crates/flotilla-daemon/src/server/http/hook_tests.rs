@@ -55,7 +55,10 @@ struct Daemon {
 
 impl Daemon {
     async fn new() -> Self {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        Self::with_backend(ResourceBackend::new(InMemoryBackend::default())).await
+    }
+
+    async fn with_backend(backend: ResourceBackend) -> Self {
         for session in [CODER, REVIEWER] {
             running_crew_terminal(&backend, session).await;
         }
@@ -79,7 +82,7 @@ impl Daemon {
 
     async fn hook_caller(&self, name: &str) -> CallerAuth {
         let session = self.backend.clone().using::<TerminalSession>(NAMESPACE).get(name).await.expect("session");
-        CallerAuth::Hook(terminal(name), session.metadata.creation_timestamp.to_rfc3339())
+        CallerAuth::Hook { terminal: terminal(name), generation: session.metadata.creation_timestamp.to_rfc3339() }
     }
 
     async fn attention(&self, session_name: &str) -> Option<TerminalAttentionState> {
@@ -545,19 +548,25 @@ fn concurrent_hook_key_creation_agrees_on_one_key() {
 // A token belongs to one creation generation, even when a deleted name is reused.
 #[tokio::test]
 async fn recreated_terminal_refuses_old_hook_token() {
-    let daemon = Daemon::new().await;
-    let state = tempfile::tempdir().expect("state");
-    let listener = Listening::start(&daemon, state.path()).await;
-    let old = listener.hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("launch");
-    let route = "/v1/hooks/claude-code/stop";
-    assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 200);
-    daemon.backend.clone().using::<TerminalSession>(NAMESPACE).delete(CODER).await.expect("delete");
-    assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 401);
-    running_crew_terminal(&daemon.backend, CODER).await;
-    assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 401);
-    assert_eq!(daemon.attention(CODER).await, None);
-    let fresh = listener.hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("new launch");
-    assert_eq!(listener.post(route, Some(&format!("Bearer {}", fresh.token))).await, 200);
+    let database = tempfile::tempdir().expect("database");
+    for backend in [
+        ResourceBackend::new(InMemoryBackend::default()),
+        ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open(database.path().join("sessions.sqlite")).expect("SQLite")),
+    ] {
+        let daemon = Daemon::with_backend(backend).await;
+        let state = tempfile::tempdir().expect("state");
+        let listener = Listening::start(&daemon, state.path()).await;
+        let old = listener.hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("launch");
+        let route = "/v1/hooks/claude-code/stop";
+        assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 200);
+        daemon.backend.clone().using::<TerminalSession>(NAMESPACE).delete(CODER).await.expect("delete");
+        assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 401);
+        running_crew_terminal(&daemon.backend, CODER).await;
+        assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 401);
+        assert_eq!(daemon.attention(CODER).await, None);
+        let fresh = listener.hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("new launch");
+        assert_eq!(listener.post(route, Some(&format!("Bearer {}", fresh.token))).await, 200);
+    }
 }
 
 // Internal processing failures are logged and returned as a generic 500 body.
@@ -597,11 +606,20 @@ fn hook_mac_binds_generation(tc: hegel::TestCase) {
     } else {
         assert_eq!(key.verify(&token), Some((terminal.clone(), generation.to_string())));
         let mut parts: Vec<String> = token.split('.').map(str::to_owned).collect();
-        for index in 1..=3 {
+        for index in 1..=4 {
             let original = parts[index].clone();
             parts[index] = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, "changed");
             assert!(key.verify(&parts.join(".")).is_none(), "component {index} is authenticated");
             parts[index] = original;
         }
     }
+}
+
+// Glue: a bound endpoint cannot mint an instance token for a missing session;
+// the launch retains command hooks and reports the lookup failure in the daemon log.
+#[tokio::test]
+async fn missing_terminal_keeps_command_hooks() {
+    let daemon = Daemon::new().await;
+    let endpoint = HookEndpoint::listening_at("http://127.0.0.1:7878");
+    assert_eq!(endpoint.claude_code_launch(&daemon.backend, NAMESPACE, "missing").await, None);
 }

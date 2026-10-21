@@ -3,13 +3,14 @@
 //! parser and records it through the same handling the framed `AgentHook` request uses, then
 //! answers with an empty 2xx (a command hook that printed nothing).
 //!
-//! A host-direct crew session authenticates with a hook token bound to its terminal. The
-//! token is an HMAC of the terminal's namespace, session name and creation timestamp under
-//! a key kept in the state directory, so it outlives flotillad restarts that replace the listener's file
-//! token, as running crews do. It authenticates only these routes, and only for its own
-//! terminal instance: the caller's identity comes from the token, never from the request
-//! body. The route refuses tokens for missing, deleting or recreated sessions. Legacy v1
-//! tokens lack the instance binding and are refused; those crews must relaunch once.
+//! A host-direct crew session authenticates with a hook token bound to its terminal.
+//! The token is an HMAC of the terminal's namespace, session name and creation
+//! timestamp under a key kept in the state directory, so it outlives flotillad restarts
+//! that replace the listener's file token, as running crews do. It authenticates only
+//! these routes, and only for its own terminal instance: the caller's identity comes
+//! from the token, never from the request body. The route refuses tokens for missing,
+//! deleting or recreated sessions. Legacy v1 tokens lack the instance binding and are
+//! refused; those crews must relaunch once.
 //!
 //! Tokens do not expire. To rotate the key, stop flotillad, delete `http/hook-key` beneath
 //! its state directory and start it again: a fresh key is created, every token minted
@@ -222,7 +223,13 @@ impl HookEndpoint {
     pub async fn claude_code_launch(&self, backend: &ResourceBackend, namespace: &str, session_name: &str) -> Option<HookLaunch> {
         let (origin, key) = self.0.get()?;
         let terminal = AgentHookTerminalRef { namespace: namespace.to_owned(), session_name: session_name.to_owned() };
-        let session = backend.clone().using::<TerminalSession>(namespace).get(session_name).await.ok()?;
+        let session = match backend.clone().using::<TerminalSession>(namespace).get(session_name).await {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(%namespace, %session_name, %error, "cannot mint HTTP hook token; launch keeps command hooks");
+                return None;
+            }
+        };
         let generation = session.metadata.creation_timestamp.to_rfc3339();
         Some(HookLaunch { base_url: format!("{origin}{HOOKS_PATH}/claude-code"), token: key.mint(&terminal, &generation) })
     }
@@ -263,7 +270,9 @@ async fn handle(
     harness: AgentHarness,
 ) -> Response {
     let (terminal, policy) = match caller {
-        CallerAuth::Hook(terminal, generation) => {
+        CallerAuth::Hook { terminal, generation } => {
+            // Revocation checks the live instance once per event. A deletion after this
+            // read can race an already-admitted event; subsequent events are refused.
             let session = state.backend.clone().using::<TerminalSession>(&terminal.namespace).get(&terminal.session_name).await;
             match session {
                 Ok(session)
