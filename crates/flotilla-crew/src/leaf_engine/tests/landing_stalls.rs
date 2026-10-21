@@ -578,6 +578,7 @@ fn landing_session_teardown_does_not_stall(tc: hegel::TestCase) {
                 for seconds in [1, 10, 60, 120, 180, 240, 300, 300 + residence] {
                     let now = start + chrono::Duration::seconds(seconds);
                     if ending == "deleting" {
+                        // observe_actor persists fresh attention and invokes judge_stalls_at.
                         observe_actor(&backend, &wake, TerminalAttentionState::Idle, now).await;
                     } else {
                         let convoy = convoys.get("stalled-work").await.unwrap();
@@ -589,9 +590,13 @@ fn landing_session_teardown_does_not_stall(tc: hegel::TestCase) {
                     } else if let Some(stall) = status.stalled {
                         observed_stall = true;
                         // Missing-governor diagnostics remain useful on a real stall.
-                        assert!(
-                            stall.evidence.contains("cannot find governor: convoy has no project_ref") || stall.rung == StallRung::Nudge
-                        );
+                        if stall.rung == StallRung::Nudge {
+                            assert_eq!(ending, "deleting");
+                            assert_eq!(stall.source, StallEvidenceSource::Screen);
+                            assert_eq!(stall.evidence, "idle");
+                        } else {
+                            assert!(stall.evidence.contains("cannot find governor: convoy has no project_ref"), "{}", stall.evidence);
+                        }
                     }
                 }
                 if !teardown {

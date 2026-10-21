@@ -11,7 +11,7 @@ use flotilla_resources::{
     select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, CrewWorkPhase, LeafMaker, NudgeObligation, ResourceObject,
     StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition, SupervisionTarget, TerminalAttention,
     TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule,
-    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::sources::freshest_change_request_refs;
@@ -618,10 +618,13 @@ impl ReconcilerWake {
                                 StallEvidenceSource::Crew,
                             ))
                         } else if status.phase == ConvoyPhase::Landing
-                            && status.work.get(vessel).is_some_and(|work| work.phase == flotilla_resources::WorkPhase::Complete)
+                            && status.work.get(vessel).is_some_and(|work| work.phase == WorkPhase::Complete)
                             && session.is_none_or(|session| {
                                 session.metadata.deletion_timestamp.is_some()
-                                    || session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Stopped)
+                                    || session
+                                        .status
+                                        .as_ref()
+                                        .is_some_and(|session_status| session_status.phase == TerminalSessionPhase::Stopped)
                             })
                         {
                             // A cached actor row can outlive completed work and
