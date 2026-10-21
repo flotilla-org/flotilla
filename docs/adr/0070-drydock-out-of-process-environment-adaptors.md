@@ -298,6 +298,8 @@ This replaces "an init that starts the agent" under Bootstrap above, and ADR 006
 This replaces "the agent, cleat, and an init" under Bootstrap above.
 - **Drydock's tools are its agent.** They are published as an OCI image, and the tools digest is that image's digest. The tools layer only adds files under `/opt/drydock`.
 - **Prepare builds the prepared form as the base image plus the tools layer.** Each module builds at the provider where the provider can, or appends the layer itself; the filesystem is the same either way.
+- **Each module decides its prepared form's key** (owner, flotilla-org/drydock#44). The key always includes the image and tools digests, and the module adds whatever else its provider fixes at prepare: Daytona adds the size, since it refuses resources on a sandbox created from a snapshot. The key never comes from configuration. Callers always prepare, then provision, and provision refuses a request that does not match its prepared form. This replaces "keyed by the image digest and the tools digest" under Bootstrap and "the image and tools digest pair" under Events and prepare.
+- **Flotilla's layer sits outside the prepared form, for now.** Flotilla pushes its cut-down CLI and cleat as files after the hello, so a prepared form holds only drydock's tools; flotilla's crew image may also carry a copy. A general tool-bundle mechanism, below, may replace this.
 - **Static (musl) builds are not required yet.** For at least the next couple of months the bases are Ubuntu, so the tools are built against an Ubuntu-compatible glibc. Static builds come later, off the critical path.
 
 ### Not decided yet
