@@ -165,6 +165,11 @@ impl TcpListener {
 /// - otherwise only the login exchange is reachable, anonymously. Anything else is 401.
 fn authenticate(request: &Request, token: &[u8; 32], hooks: &HookKey, logins: &LoginStore) -> Option<Authentication<CallerAuth>> {
     let admit = |caller: CallerAuth, uses_cookie: bool| Some(Authentication { caller: Caller::Custom(caller), uses_cookie });
+    // The router gates exposition behind daemon config. Host and Origin checks
+    // have already run; this listener can only bind loopback.
+    if request.method() == axum::http::Method::GET && request.uri().path() == "/metrics" {
+        return admit(CallerAuth::Anonymous, false);
+    }
     let headers = request.headers();
     if headers.contains_key(header::AUTHORIZATION) {
         let mut values = headers.get_all(header::AUTHORIZATION).iter();

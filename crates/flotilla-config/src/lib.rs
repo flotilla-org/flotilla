@@ -347,6 +347,9 @@ impl DaemonConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpListenerConfig {
+    /// Export load metrics at GET /metrics on the loopback listener.
+    #[serde(default)]
+    pub metrics: bool,
     /// `host:port`; the host must be loopback or resolve only to loopback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,

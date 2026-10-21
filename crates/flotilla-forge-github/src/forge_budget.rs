@@ -30,6 +30,7 @@ pub struct ForgeBudgets {
 #[derive(Default)]
 struct BudgetState {
     rows: BTreeMap<String, ForgeBudgetRow>,
+    totals: BTreeMap<String, ForgeBudgetRow>,
     deadlines: BTreeMap<String, tokio::time::Instant>,
 }
 impl BudgetState {
@@ -114,6 +115,18 @@ impl ForgeBudgets {
             .and_then(|value| value.parse().ok())
             .or_else(|| document["data"]["rateLimit"]["remaining"].as_u64())
             .or(row.remaining);
+        let total_key = format!("{identity}/{budget}");
+        let total_row = row.clone();
+        let totals = state.totals.entry(total_key).or_insert_with(|| ForgeBudgetRow {
+            calls: 0,
+            reported_cost: 0,
+            unreported_calls: 0,
+            ..total_row
+        });
+        totals.calls += 1;
+        totals.reported_cost += cost.unwrap_or(0);
+        totals.unreported_calls += u64::from(cost.is_none());
+        let row = state.rows.get_mut(&format!("{identity}/{budget}")).expect("budget row exists");
         let retry_at = github_rate_limit(raw, now)
             .map(|limit| limit.retry_at.unwrap_or(now + chrono::Duration::minutes(1)))
             .or_else(|| (budget == "GraphQL").then(|| low_graphql_budget(raw, &document)).flatten());
@@ -124,6 +137,19 @@ impl ForgeBudgets {
                 state.deadlines.insert(format!("{identity}/{budget}"), tokio::time::Instant::now() + delay);
             }
         }
+    }
+    /// Process lifetime counters; unlike fleet window rows these never reset hourly.
+    pub fn counter_rows(&self, host: &str) -> Vec<ForgeBudgetRow> {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .totals
+            .values()
+            .cloned()
+            .map(|mut row| {
+                row.host = host.into();
+                row
+            })
+            .collect()
     }
     pub fn rows(&self, host: &str) -> Vec<ForgeBudgetRow> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -318,6 +344,11 @@ mod tests {
         budgets.after("gh", &["api", "graphql"], &raw);
         assert_eq!(budgets.rows("host")[0].calls, 1);
         assert_eq!(budgets.rows("host")[0].reported_cost, cost);
+        // Lifetime counters survive the hourly window reset, including unknown costs.
+        let total = &budgets.counter_rows("host")[0];
+        assert_eq!(total.calls, count + 2);
+        assert_eq!(total.reported_cost, cost * (count + 1));
+        assert_eq!(total.unreported_calls, 1);
     }
     // #2928: successful GraphQL responses below the reserve pause subsequent
     // requests until reset, with accounting retained in the shared budget row.

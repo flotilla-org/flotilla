@@ -111,6 +111,7 @@ flotilla-test-support = { path = "../flotilla-test-support" }
 hegeltest = { workspace = true }
 http = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
+prometheus-parse = "0.2"
 
 [lints]
 workspace = true

@@ -439,6 +439,9 @@ fn http_listener_is_optional_and_off_by_default() {
     let config: DaemonConfig = toml::from_str("host_name = \"my-host\"").expect("pre-[http] daemon config");
     assert_eq!(config.http, HttpListenerConfig::default());
     assert_eq!(config.http.listen, None);
+    assert!(!config.http.metrics);
+    let enabled: DaemonConfig = toml::from_str("[http]\nlisten = \"127.0.0.1:7878\"\nmetrics = true").unwrap();
+    assert!(enabled.http.metrics);
     let config: DaemonConfig = toml::from_str("[http]\nlisten = \"127.0.0.1:7878\"").expect("[http] daemon config");
     assert_eq!(config.http.listen.as_deref(), Some("127.0.0.1:7878"));
     let config: DaemonConfig = toml::from_str("[http]").expect("empty [http] table");

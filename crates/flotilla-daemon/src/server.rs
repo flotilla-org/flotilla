@@ -251,7 +251,9 @@ fn build_peer_manager(
     Ok(Arc::new(Mutex::new(peer_manager)))
 }
 
-async fn build_embedded_resource_backend(config: &ConfigStore) -> Result<ResourceBackend, String> {
+async fn build_embedded_resource_backend(
+    config: &ConfigStore,
+) -> Result<(ResourceBackend, Arc<flotilla_store::load_metrics::StoreLoadMetrics>), String> {
     let path = config.state_dir().as_path().join("resources.sqlite");
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -260,7 +262,10 @@ async fn build_embedded_resource_backend(config: &ConfigStore) -> Result<Resourc
     }
     SqliteBackend::open_async(&path)
         .await
-        .map(ResourceBackend::new)
+        .map(|store| {
+            let metrics = store.load_metrics();
+            (ResourceBackend::new(store), metrics)
+        })
         .map_err(|err| format!("open embedded resource store {}: {err}", path.display()))
 }
 
@@ -350,6 +355,7 @@ pub struct DaemonServer {
     /// The one HTTP router (ADR 0065), served on the main socket, environment sockets and
     /// the optional loopback TCP listener.
     http_router: axum::Router,
+    load_metrics: Arc<http::metrics::LoadMetrics>,
     logins: Arc<http::LoginStore>,
     tcp_origin: http::ListenerOrigin,
     hook_endpoint: http::HookEndpoint,
@@ -444,6 +450,10 @@ impl DaemonServer {
         )
     }
 
+    pub fn install_controller_metrics(&self, metrics: Arc<flotilla_store::load_metrics::ControllerMetricsRegistry>) {
+        let _ = self.load_metrics.controllers.set(metrics);
+    }
+
     pub fn install_blob_store(&self, store: Arc<crate::blob_store::TieredBlobStore>) -> Result<(), String> {
         self.remote_command_router.install_blob_store(store)
     }
@@ -475,7 +485,8 @@ impl DaemonServer {
     ) -> Result<Self, String> {
         let daemon_config = config.load_daemon_config()?;
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
-        let resource_backend = phase("open_resource_backend", build_embedded_resource_backend(&config)).await?;
+        let (resource_backend, store_metrics) = phase("open_resource_backend", build_embedded_resource_backend(&config)).await?;
+        let load_metrics = Arc::new(http::metrics::LoadMetrics::new(store_metrics));
         let daemon = phase(
             "initialize_in_process_daemon",
             InProcessDaemon::new_with_resource_backend(
@@ -500,11 +511,13 @@ impl DaemonServer {
         let logins = Arc::new(http::LoginStore::new(daemon.clock_for_scenarios()));
         let tcp_origin = http::ListenerOrigin::default();
         let http_router = http::HttpRouter::for_daemon(Arc::clone(&daemon), Arc::clone(&logins), tcp_origin.clone())
+            .with_load_metrics(Arc::clone(&load_metrics), daemon_config.http.metrics)
             .with_commands(remote_command_router.clone(), shutdown_request_tx.clone(), socket_path.clone())
             .into_router();
         let state_dir = config.state_dir().as_path().to_path_buf();
         Ok(Self {
             daemon,
+            load_metrics,
             socket_path,
             socket_discovery_path,
             idle_timeout,
@@ -673,14 +686,16 @@ impl DaemonServer {
         });
 
         let peer_manager = self.peer_manager;
-        let (peer_runtime_handle, peer_connected_tx) = spawn_peer_networking_runtime(
+        let (peer_runtime_handle, peer_connected_tx) = PeerRuntime::new(
             Arc::clone(&daemon),
             Arc::clone(&peer_manager),
             inbound_peer_rx,
             inbound_peer_tx.clone(),
             remote_command_router.clone(),
             Some(peer_resource_socket_dir),
-        );
+        )
+        .with_replication_metrics(Arc::clone(&self.load_metrics.replication))
+        .spawn();
 
         // SIGTERM handler
         let mut sigterm =
