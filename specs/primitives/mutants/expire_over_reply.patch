@@ -1,6 +1,6 @@
 --- a/machines/awaiting_reply.qnt
 +++ b/machines/awaiting_reply.qnt
-@@ -30,7 +30,7 @@
+@@ -34,7 +34,7 @@
        // A reply present in the inbox wins over a passed deadline.
        | Expire(x) => match r.deadline {
            | Never => Refused(NoDeadline)

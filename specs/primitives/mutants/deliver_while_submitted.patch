@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -128,7 +128,7 @@
+@@ -136,7 +136,7 @@
            else if (not(holdingDuties(w).contains(a.duty))) Refused(UnknownDuty)
            else Moved(Open({ ...w, retired: w.retired.union(Set(a.duty)) }))
        | Deliver => val outstanding = w.promises.keys().filter(p => open(w.promises.get(p)))

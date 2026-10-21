@@ -24,6 +24,8 @@ module convoy {
   // convoy-lifetime duty holds Deliver until it is retired; a duty while some
   // promises are open has no edges and ends with them. Terms are opaque here:
   // a breach of terms is a message, not an edge.
+  // A WhileOpen set is not checked against the promises: no rule reads it,
+  // and it ends once none of the promises it names is open.
   type DutyScope = Lifetime | WhileOpen(Set[PromiseId])
   type Duty = { owner: Seat, scope: DutyScope, terms: str }
   type AdmittedPromise = { promise: Promise, source: Source, owner: Seat }
@@ -78,7 +80,9 @@ module convoy {
     | OwnerSupervisor => p.source == Crew and p.submissions.length() > 0
   }
   // A verdict that keeps follows the same source rule; an owner never keeps
-  // its own promise by verdict.
+  // its own promise by verdict. Unlike retraction, the owner's supervisor may
+  // keep a crew-declared promise before anything is submitted: the
+  // submission window only limits the owner's unilateral retraction (#3094).
   pure def mayKeep(p: PromiseRecord, a: Authority): bool = match a {
     | Operator => true
     | ConvoySupervisor => p.source == Template
@@ -86,7 +90,11 @@ module convoy {
     | Owner => false
     | OwnerSupervisor => p.source == Crew
   }
-  // Handoff: the owner, its supervisor or an operator.
+  // Handoff: the owner, its supervisor or an operator. The promise keeps its
+  // state and submissions (ruling 6: the submission moves with the promise),
+  // so the new owner may see an earlier owner's submission kept by
+  // observation. Reassigning to the current owner is an accepted no-op edge;
+  // seat names are the caller's.
   pure def mayReassign(p: PromiseRecord, by: Seat, a: Authority): bool = match a {
     | Operator => true
     | Owner => by == p.owner

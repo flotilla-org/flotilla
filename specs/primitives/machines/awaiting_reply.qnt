@@ -6,6 +6,7 @@
 // record is a separate kind. A stall is an open record whose kind is "stall".
 module awaiting_reply {
   type Expectation = Reply | Outcome
+  // At(d): the record may expire only once the clock is strictly past d.
   type Deadline = Never | At(int)
   // What the send records: the message awaited, who sent it to whom, what it
   // is about, the record's kind (opaque, "stall" among them) and its deadline.
@@ -14,8 +15,11 @@ module awaiting_reply {
   type State = Open | Answered({ reply: int }) | Expired({ at: int }) | Withdrawn({ reason: str })
   // Each event carries the local evidence its gate reads. A reply is read from
   // the sender's own inbox: present when the inbox holds it, with the message
-  // it answers. An expiry reads the sender home's clock and whether any reply
-  // to the message is present in that inbox.
+  // it answers. The caller reads only that inbox, so `present` already means
+  // "in the sender's inbox"; who wrote the reply is not part of the gate
+  // (the ruling gates Answered on the reply's presence alone). An expiry
+  // reads the sender home's clock and whether any reply to the message is
+  // present in that inbox.
   type Event = Answer({ reply: int, inReplyTo: int, present: bool })
     | Expire({ now: int, replyPresent: bool })
     | Withdraw({ authorised: bool, reason: str })
