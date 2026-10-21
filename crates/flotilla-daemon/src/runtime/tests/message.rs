@@ -1381,7 +1381,7 @@ async fn delivery_wait_names_an_idle_crew_composer_obstruction() {
         ..Default::default()
     };
     let mut version = created.metadata.resource_version;
-    for obstruction in [None, Some(ScreenObstruction::ComposerText { text: "6;24;9t".into(), terminal_reply: true })] {
+    for obstruction in [None, Some(ScreenObstruction::ComposerText { reply: Some("6;24;9t".into()), chars: 7 })] {
         status.screen_obstruction = obstruction.clone();
         version = sessions.update_status("crew-terminal", &version, &status).await.expect("status").metadata.resource_version;
         let observation = runtime.observe(&target, None).await.expect("observation");

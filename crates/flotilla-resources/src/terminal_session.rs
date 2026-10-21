@@ -470,10 +470,16 @@ impl TerminalSessionDegradedCondition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScreenObstruction {
-    /// The composer holds text nobody submitted. `terminal_reply` marks text
-    /// shaped like a terminal's answer to a query whose escape prefix was
-    /// consumed (for example `6;24;9t`, the reply to CSI 16t).
-    ComposerText { text: String, terminal_reply: bool },
+    /// The composer holds `chars` characters nobody submitted. `reply` keeps
+    /// the text only when it is shaped like a terminal's answer to a query
+    /// whose escape prefix was consumed (for example `6;24;9t`, the reply to
+    /// CSI 16t). A person's draft is never copied out of the terminal: these
+    /// surfaces replicate and are read more widely than the terminal is.
+    ComposerText {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply: Option<String>,
+        chars: usize,
+    },
     /// The transcript is scrolled back ("Back to bottom"); the live composer
     /// is not where the screen classifier can read it.
     ScrolledBack,
@@ -497,12 +503,12 @@ impl ScreenObstruction {
     pub fn describe(&self, session: &str) -> String {
         let command = self.recovery_command(session);
         match self {
-            Self::ComposerText { text, terminal_reply: true } => format!(
-                "idle, composer holds unsent text `{text}` that looks like a stray terminal reply; \
+            Self::ComposerText { reply: Some(reply), .. } => format!(
+                "idle, composer holds unsent text `{reply}` that looks like a stray terminal reply; \
                  clear it with `{command}` inside the crew's environment"
             ),
-            Self::ComposerText { text, terminal_reply: false } => format!(
-                "idle, composer holds unsent text `{text}`; if nobody is drafting there, \
+            Self::ComposerText { reply: None, chars } => format!(
+                "idle, composer holds {chars} characters of unsent text; if nobody is drafting there, \
                  clear it with `{command}` inside the crew's environment"
             ),
             Self::ScrolledBack => {
@@ -924,7 +930,7 @@ mod tests {
         let at = Utc.timestamp_opt(100, 0).single().expect("time");
         let unobservable =
             TerminalAttention { state: TerminalAttentionState::Unobservable, as_of: at, source: TerminalAttentionSource::Screen };
-        let stray = ScreenObstruction::ComposerText { text: "6;24;9t".into(), terminal_reply: true };
+        let stray = ScreenObstruction::ComposerText { reply: Some("6;24;9t".into()), chars: 7 };
         let observe = |obstruction| TerminalSessionStatusPatch::Observe {
             attention: Some(unobservable.clone()),
             obstruction,
@@ -942,6 +948,8 @@ mod tests {
         assert!(described.starts_with("idle, composer holds unsent text `6;24;9t` that looks like a stray terminal reply"), "{described}");
         assert!(described.contains("`cleat send-keys crew-session C-u`"), "{described}");
         assert!(ScreenObstruction::ScrolledBack.describe("crew-session").contains("`cleat send-keys crew-session Escape`"));
+        let draft = ScreenObstruction::ComposerText { reply: None, chars: 26 }.describe("crew-session");
+        assert!(draft.starts_with("idle, composer holds 26 characters of unsent text; if nobody is drafting there"), "{draft}");
         // Hook evidence of a working agent hides the stale screen obstruction.
         status.attention =
             Some(TerminalAttention { state: TerminalAttentionState::Working, as_of: at, source: TerminalAttentionSource::Hook });

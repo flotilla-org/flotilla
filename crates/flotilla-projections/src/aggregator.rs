@@ -2697,6 +2697,8 @@ impl Aggregator {
                 let name = status.session_id.as_deref().unwrap_or(&session.object.metadata.name);
                 Some(format!("{}: {}", session.object.spec.role, status.idle_obstruction()?.describe(name)))
             })
+            // Several blocked sessions on one vessel show one, chosen
+            // lexicographically (role first) so the row is stable.
             .min();
         let surface_state = if credential_attention.is_some() || completion_pending.is_some() || obstruction.is_some() {
             SurfaceState::NeedsYou
@@ -3242,8 +3244,7 @@ mod tests {
             as_of: Utc::now(),
             source: TerminalAttentionSource::Screen,
         });
-        status.screen_obstruction =
-            Some(flotilla_resources::ScreenObstruction::ComposerText { text: "6;24;9t".into(), terminal_reply: true });
+        status.screen_obstruction = Some(flotilla_resources::ScreenObstruction::ComposerText { reply: Some("6;24;9t".into()), chars: 7 });
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
         let result_set = state.result_set().await;
         let convoy = &result_set.rows.as_convoys().expect("convoy rows")[0];

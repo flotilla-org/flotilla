@@ -1007,15 +1007,14 @@ fn codex_obstruction(screen: &str) -> Option<flotilla_resources::ScreenObstructi
         return None;
     }
     let text = lines.iter().rev().find_map(|line| line.strip_prefix('›')).map(str::trim)?;
-    if text.is_empty() || text.starts_with(|character: char| character.is_ascii_digit() && text.contains(". ")) {
-        return None;
-    }
-    if CODEX_COMPOSER_PLACEHOLDERS.contains(&text) {
+    // A selection row is a digit run then ". " (`› 1. Yes`), not a draft that starts with a number.
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    if text.is_empty() || (digits > 0 && text[digits..].starts_with(". ")) || CODEX_COMPOSER_PLACEHOLDERS.contains(&text) {
         return None;
     }
     Some(flotilla_resources::ScreenObstruction::ComposerText {
-        text: text.chars().take(80).collect(),
-        terminal_reply: flotilla_resources::looks_like_terminal_reply(text),
+        reply: flotilla_resources::looks_like_terminal_reply(text).then(|| text.to_string()),
+        chars: text.chars().count(),
     })
 }
 
@@ -2820,13 +2819,14 @@ mod tests {
         assert_eq!(codex.classify_screen_attention(stray), Some(TerminalAttentionState::Unobservable));
         assert_eq!(
             codex.classify_screen_obstruction(stray),
-            Some(ScreenObstruction::ComposerText { text: "6;24;9t".into(), terminal_reply: true })
+            Some(ScreenObstruction::ComposerText { reply: Some("6;24;9t".into()), chars: 7 })
         );
-        let draft = stray.replace("› 6;24;9t", "› please also check the docs");
-        assert_eq!(
-            codex.classify_screen_obstruction(&draft),
-            Some(ScreenObstruction::ComposerText { text: "please also check the docs".into(), terminal_reply: false })
-        );
+        // A person's draft is counted, never copied, including one that starts
+        // with a number like a selection row does.
+        for (draft, chars) in [("please also check the docs", 26), ("3 tests fail. please fix", 24), ("12.5% slower", 12)] {
+            let screen = stray.replace("› 6;24;9t", &format!("› {draft}"));
+            assert_eq!(codex.classify_screen_obstruction(&screen), Some(ScreenObstruction::ComposerText { reply: None, chars }), "{draft}");
+        }
         let hidden = include_str!("fixtures/codex-3460/scrolled-back-composer-hidden.txt");
         assert_eq!(codex.classify_screen_attention(hidden), Some(TerminalAttentionState::Unobservable));
         assert_eq!(codex.classify_screen_obstruction(hidden), Some(ScreenObstruction::ScrolledBack));

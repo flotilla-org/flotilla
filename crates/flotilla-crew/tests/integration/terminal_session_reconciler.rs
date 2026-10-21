@@ -2209,7 +2209,7 @@ async fn screen_obstruction_is_recorded_while_attention_is_debounced() {
     let status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, attention: Some(unobservable(0)), ..Default::default() };
     sessions.update_status("stray-crew", &created.metadata.resource_version, &status).await.expect("running session");
     let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
-    let stray = flotilla_resources::ScreenObstruction::ComposerText { text: "6;24;9t".into(), terminal_reply: true };
+    let stray = flotilla_resources::ScreenObstruction::ComposerText { reply: Some("6;24;9t".into()), chars: 7 };
     for (second, obstruction, changed) in
         [(1, Some(stray.clone()), true), (2, Some(stray.clone()), false), (3, None, true), (4, None, false)]
     {
