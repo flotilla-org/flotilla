@@ -27,6 +27,19 @@ fn context() -> ResolutionContext {
     }
 }
 
+// Keep cleanup fast without accidentally matching a future `sleep 10` or
+// silently retaining production delays when the watchdog text changes.
+#[cfg(unix)]
+fn fast_docker_cleanup_wrapper(wrapper: &str) -> String {
+    let mut wrapper = wrapper.to_owned();
+    for seconds in [5, 1] {
+        let original = format!("        sleep {seconds}\n");
+        assert_eq!(wrapper.matches(&original).count(), 1, "expected one cleanup watchdog sleep: {original:?}");
+        wrapper = wrapper.replace(&original, "        sleep 0.05\n");
+    }
+    wrapper
+}
+
 fn command(action: &ResolvedAction) -> &[Arg] {
     let ResolvedAction::Command(args) = action;
     args
@@ -279,7 +292,7 @@ fn docker_attach_cleanup_is_bounded_when_transport_hangs() {
     resolver.resolve_wrap(&environment, &mut context).expect("known environment");
     let [ResolvedAction::Command(args)] = context.actions.as_slice() else { panic!("expected one supervised command") };
     let Arg::Quoted(wrapper) = &args[2] else { panic!("wrapper must be a quoted shell program") };
-    let wrapper = wrapper.replace("sleep 5", "sleep 0.05").replace("sleep 1", "sleep 0.05");
+    let wrapper = fast_docker_cleanup_wrapper(wrapper);
 
     let temp = tempfile::tempdir().expect("fake Docker directory");
     let docker = temp.path().join("docker");
@@ -415,5 +428,96 @@ fn resolved_ssh_connections_preserve_lookup_and_multiplex(tc: hegel::TestCase) {
         assert!(args.contains(&Arg::Quoted(target.into())));
         assert!(!args.contains(&Arg::Quoted("duplicate.example".into())));
         assert_eq!(args.contains(&Arg::Literal("ControlMaster=auto".into())), multiplex);
+    }
+}
+
+// An empty command enters the image's login shell (or /bin/sh if SHELL is
+// absent/empty) at the requested directory. Explicit commands retain their
+// arguments, directory and exit status instead of entering a login shell.
+#[cfg(unix)]
+#[test]
+fn docker_empty_command_enters_login_shell_at_workdir() {
+    use std::{
+        fs,
+        io::Write,
+        os::unix::fs::PermissionsExt,
+        process::{Command, Stdio},
+    };
+
+    let temp = tempfile::tempdir().expect("shell hop directory");
+    let workdir = temp.path().join("working directory");
+    fs::create_dir(&workdir).expect("workdir");
+    let shell = temp.path().join("chosen shell");
+    fs::write(&shell, "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = -l ] || exit 91\nprintf 'chosen:%s\\n' \"$PWD\"\nexit 17\n").expect("shell");
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).expect("executable shell");
+
+    // Process boundary: emulate docker exec's -w/-e options while executing
+    // the actual client and inner attach wrappers in real child shells.
+    let docker = temp.path().join("docker");
+    fs::write(
+        &docker,
+        r#"#!/bin/sh
+[ "$1" = exec ] || exit 90
+shift
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -it) shift ;;
+        -w) cd "$2" || exit; shift 2 ;;
+        -e) export "$2"; shift 2 ;;
+        *) break ;;
+    esac
+done
+[ "$1" = crew-container ] || exit 92
+shift
+exec "$@"
+"#,
+    )
+    .expect("docker shim");
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).expect("executable docker");
+    let path = format!("{}:{}", temp.path().display(), std::env::var("PATH").unwrap_or_default());
+    let environment = EnvironmentId::new("crew-box");
+    let resolver = HopResolver::new(
+        Arc::new(ssh_resolver()),
+        Arc::new(DockerEnvironmentHopResolver::new(HashMap::from([(environment.clone(), "crew-container".to_string())]))),
+    );
+    for (shell_env, inner, marker) in [
+        (Some(shell.as_os_str()), vec![], "chosen"),
+        (None, vec![], "fallback"),
+        (Some(std::ffi::OsStr::new("")), vec![], "fallback"),
+        (
+            Some(shell.as_os_str()),
+            vec![
+                Arg::Literal("sh".into()),
+                Arg::Literal("-c".into()),
+                Arg::Quoted("printf 'explicit:%s:%s:%s\\n' \"$PWD\" \"$1\" \"$2\"; exit 17".into()),
+                Arg::Literal("test".into()),
+                Arg::Quoted("space ' quote".into()),
+                Arg::Quoted("".into()),
+            ],
+            "explicit",
+        ),
+    ] {
+        let plan = HopPlan(vec![
+            Hop::EnterEnvironment { env_id: environment.clone(), provider: "docker".into() },
+            Hop::RunCommand { command: inner },
+        ]);
+        let mut context = context();
+        context.working_directory = Some(ExecutionEnvironmentPath::new(workdir.clone()));
+        let resolved = resolver.resolve(&plan, &mut context).expect("resolve shell hop");
+        let mut child = Command::new("sh");
+        // Shorten only the cleanup watchdog, as in the other wrapper tests.
+        let rendered = fast_docker_cleanup_wrapper(&flatten(command(&resolved.0[0]), 0));
+        child.args(["-c", &rendered]).env("PATH", &path).env_remove("SHELL");
+        if let Some(value) = shell_env {
+            child.env("SHELL", value);
+        }
+        let mut child = child.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("execute hop");
+        // A fallback shell reads stdin. The selected shell and explicit command
+        // deliberately ignore it, so an early exit may close the pipe.
+        let _ = child.stdin.take().expect("stdin").write_all(b"printf 'fallback:%s\\n' \"$PWD\"; exit 17\n");
+        let output = child.wait_with_output().expect("shell hop output");
+        assert_eq!(output.status.code(), Some(17), "{}", String::from_utf8_lossy(&output.stderr));
+        let suffix = if marker == "explicit" { ":space ' quote:" } else { "" };
+        assert_eq!(String::from_utf8_lossy(&output.stdout), format!("{marker}:{}{suffix}\n", workdir.display()));
     }
 }
