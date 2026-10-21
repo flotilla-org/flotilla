@@ -1,8 +1,10 @@
 # 70. Drydock: out-of-process environment adaptors
 
-**Status:** Accepted, not yet implemented (owner rulings, 2026-10-19; #3503, #3514)
+**Status:** Accepted, not yet implemented (owner rulings, 2026-10-19; #3503, #3514). Amended 2026-10-21: one drydock-owned vessel agent, and the drydock daemon.
 **Date:** 2026-10-19
-**Amends:** [ADR 0069](0069-an-agent-inside-every-vessel.md): one multiplexed pipe per vessel carries both agent links
+**Amends:** [ADR 0069](0069-an-agent-inside-every-vessel.md):
+- one stream transport per vessel carries both agent links (2026-10-19);
+- drydock owns the one vessel agent, replacing the parts of ADR 0069 its 2026-10-21 amendment lists (2026-10-21).
 **Relates to:**
 - [ADR 0058](0058-environment-providers-own-lifecycle-and-runtime-capabilities.md): the kind-neutral provider seam (2026-10-18 section), which adaptors serve;
 - [ADR 0063](0063-cbor-is-the-stack-binary-format.md): CBOR, a later second presentation;
@@ -248,3 +250,62 @@ The owner ruled on drydock#8, from the design review of drydock#18. This refines
 - **Flotilla reshapes its side first (#3521).** The environment reconciler's port becomes kind-neutral, and an Environment's provider becomes an address resolved through the registry ([ADR 0058, environment providers](0058-environment-providers-own-lifecycle-and-runtime-capabilities.md), 2026-10-20 section). Drydock then extracts the seam traits and built-in providers and builds against that port, so neither side reworks the other.
 - **Drydock work in progress does not conflict with this.** Its protocol, language hosts and provider modules sit behind the adaptor-client provider, which is one entry in the registry #3521 resolves against.
 - **A drydock provider's name is the `provider:` segment** of flotilla's provider address. Its place is the account that its `credential_reference` identifies, so two providers on one account share that account's capacity pool and are told apart by name.
+
+## Amendment (2026-10-21, one vessel agent and the drydock daemon; owner, while trying Daytona)
+
+The owner ruled these after trying the drydock CLI against Daytona, and after a pass over every requirement the record puts on the vessel agent, checked against the cloud sandbox survey's per-provider findings. They settle "The vessel agent likely becomes a drydock component" above, and replace the parts of ADR 0069 listed in its 2026-10-21 amendment.
+
+### The daemon and the CLI
+
+- **The long-lived part of drydock has two homes.** "Optional standalone daemon" means optional because flotillad can be the daemon. Standalone, a drydock daemon binary wraps the same crate. Either way the hosts live as long as the daemon, so polling, the status cache and credential refresh keep running.
+- **The `drydock` CLI is a client of the daemon.** It finds the daemon beside it and starts it when it is absent, the way `flotilla` finds and starts `flotillad`. Today's CLI, which starts a host for each command and stops it on exit, is replaced (drydock#41).
+- **The daemon serves the provider API** (`/v1/providers/{provider}/…`), routing each provider to the host that serves it. When flotillad is the daemon it serves the same API (#3622), so one CLI works against either.
+- **Flotilla calls drydock through a trait that matches this API,** so it can embed drydock or delegate to the daemon (#3620). Which one is decided later. Several independent drydocks per flotillad are not designed now.
+- **Configuration names providers only:** each provider's module, its `settings` and its credential. Drydock asks its hosts which modules they can load and decides the process layout, as "Language hosts and modules" says. Hosts and modules never appear in a provider's configuration. The file is TOML at XDG paths, with the shared path policy in rigging (rigging#24).
+- **`settings` stays opaque to drydock.** Drydock forwards it to the host unread and only the module parses it, so a TypeScript or Python module never needs Rust types to be configured. The credential sits beside `settings` and is resolved by drydock.
+
+### One agent, owned by drydock
+
+- **There is one vessel agent, and drydock owns it as its own binary.** It is generic enough for everything flotilla needs. There is never a second, flotilla-side agent.
+- **Flotilla adds a cut-down flotilla CLI** through its use of drydock. The CLI, hooks and MCP inside the vessel talk to flotillad through a socket the agent forwards. `flotilla hook` stays a command in that CLI, for SessionStart and for Codex until #3581.
+- **The agent has three features:**
+  1. **Its control API:** the hello, then configuration pushed by the host (egress table, CA, features, forwards, process environment); upgrade by push plus re-exec; exec with no terminal; files written then renamed, read-back and flush. It is served only on the host-facing side.
+  2. **Forwards,** in both directions. Guest to host: a guest Unix socket, optionally also loopback TCP, reaching a host endpoint. Host to guest: a stream to a guest Unix socket or TCP port. A forward carries bytes, so HTTP, upgrades and streaming pass through it untouched. Destination policy sits at the receiver. Forwards are added and removed at any time, for example when a crew starts a web server.
+  3. **Egress capture,** as ADR 0069's Egress section and ADR 0044's P4 and P4a describe: the redirect, fake-address DNS, and `CONNECT host:port` to an upstream the controller supplies. The agent forwards and never enforces.
+- **Forwards are arranged however suits the kind:** natively where it has cheap two-way connections (a mounted socket on Docker, vsock, SSH forwards, a provider's own port exposure), or by the agent over drydock's stream transport where it has nothing better. Nothing requires every forward to go over one multiplexed stream.
+- **Every flotilla need is one of these.** The CLI, hooks and MCP reaching flotillad are one guest-to-host forward to flotillad's endpoint for that vessel. Cleat attach and port forwards are host-to-guest forwards. The in-vessel services ADR 0069 had the agent report for Tender are the list of forwards, which the host publishes.
+- **The agent checks nothing on what it forwards.** The vessel's identity comes from where a stream arrives, so this rests on one invariant: **the host end of every guest-to-host forward is bound to one vessel and never shared, and only the host chooses forward targets**, so a vessel cannot point a forward at another vessel's endpoint. ADR 0069's tested isolation invariant, run once per kind, covers this too. Flotillad keeps checking its per-terminal hook tokens, which travel inside the bytes. The agent holds no token and no per-vessel start configuration.
+- **The agent sets the process environment** (`HTTPS_PROXY`, the CA variables, placeholder tokens) on every process it launches, from the configuration pushed after the hello. Crew processes are always launched through the agent. Cleat's server is one of them, so every terminal session inherits the environment from it. Egress capture does not depend on these variables: a process without them fails at TLS, it does not bypass the redirect. This holds for now.
+- **Versions are separate.** Drydock versions its agent: the fingerprint is in the hello, and upgrade is push plus re-exec. Flotilla pushes its CLI layer as files on its own cycle, with no agent re-exec.
+- **Cleat is not a drydock requirement.** It goes in flotilla's layer by default, and attaching is a host-to-guest forward to its socket. Without cleat a shell comes from the kind natively (an SSH session where there is one) or from the fallback runner. The agent grows no terminal, so ADR 0069's "exec has no terminal" holds. Making cleat easy to opt into, even without flotilla, comes later.
+
+### Starting the agent
+
+This replaces "an init that starts the agent" under Bootstrap above, and ADR 0069's Lifecycle "a small init supervises and restarts it".
+- **Drydock never touches the image's entrypoint or init.** It sets no entrypoint or command, never takes PID 1, and installs nothing into the image's own init.
+- **Each module starts the agent alongside whatever the image and provider run,** through the provider's own mechanism: a devbox service, a detached command, or exec after every start. The cloud sandbox survey (`guest.init_resident`) shows why this must be per provider:
+  - several providers own PID 1 (Daytona, Docker Cloud Sandboxes, E2B);
+  - some never run the image's entrypoint (Vercel);
+  - some kill processes on stop (Daytona, Runloop);
+  - some impose their own entrypoint contract (AgentCore, Azure, Blaxel).
+- **Drydock specifies the outcome:** the agent runs with its fixed flags, comes back after a crash and after every start or resume, and the vessel is ready when it says hello. Conformance tests that outcome.
+
+### Vessel tools
+
+This replaces "the agent, cleat, and an init" under Bootstrap above.
+- **Drydock's tools are its agent.** They are published as an OCI image, and the tools digest is that image's digest. The tools layer only adds files under `/opt/drydock`.
+- **Prepare builds the prepared form as the base image plus the tools layer.** Each module builds at the provider where the provider can, or appends the layer itself; the filesystem is the same either way.
+- **Static (musl) builds are not required yet.** For at least the next couple of months the bases are Ubuntu, so the tools are built against an Ubuntu-compatible glibc. Static builds come later, off the critical path.
+
+### Not decided yet
+
+These are named as later work, not ruled out:
+- whether flotilla embeds drydock or delegates to the daemon (#3620);
+- when static (musl) tool builds arrive;
+- a general mechanism for tool bundles that any drydock user can attach, pushed or baked;
+- making cleat easy to opt into without flotilla;
+- rehoming a vessel between controllers, where exactly one controller may push its configuration at a time;
+- further controllers connecting to a vessel directly, rather than through Tender and the owning controller;
+- shared host endpoints, which would need guest-to-host streams that carry the vessel's identity.
+
+The last three need coordination between controllers when they are designed.
