@@ -489,15 +489,15 @@ fn delivery_failures_are_durable_and_log_once() {
 }
 
 #[tokio::test]
-async fn held_source_stays_latched_across_many_new_heads() {
+async fn checks_settled_turns_keep_flowing_across_many_new_heads() {
     for role in ["coder", "reviewer"] {
         active_checks_scenario(&[false; 12], false, role).await;
     }
 }
 
 #[tokio::test]
-async fn actionable_review_turn_delivery_enforces_head_identity_records_rungs_and_escalates() {
-    assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates(
+async fn actionable_review_turn_delivery_enforces_head_identity_and_keeps_delivering_new_heads() {
+    assert_turn_delivery_enforces_head_identity_and_records_rungs(
         "review",
         "$cr.review.actionable-at-head == true",
         ".review.actionable-at-head",
@@ -510,8 +510,8 @@ async fn actionable_review_turn_delivery_enforces_head_identity_records_rungs_an
 }
 
 #[tokio::test]
-async fn conflicting_mergeability_delivers_once_per_episode_and_escalates_to_hold() {
-    assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates(
+async fn conflicting_mergeability_delivers_once_per_head_past_the_episode_limit() {
+    assert_turn_delivery_enforces_head_identity_and_records_rungs(
         "conflicting",
         "$cr.mergeable == conflicting",
         ".mergeable",
@@ -1149,4 +1149,322 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
             issues.release(id).await;
         }
     });
+}
+
+/// Active stock-workflow convoy with a produced PR, and its armed turn rows by source.
+async fn review_rounds_fixture() -> (ResourceBackend, ReconcilerWake, Arc<RecordingTurnDelivery>, String) {
+    use flotilla_protocol::Relationship;
+    use flotilla_resources::SubjectDiscoverySource;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let wake = supervision_wake(&backend);
+    let actuator = Arc::new(RecordingTurnDelivery::default());
+    wake.subscriptions.set_turn_delivery_actuator(actuator.clone()).await;
+    let workflow = flotilla_resources::single_agent_workflow_spec();
+    let convoys = backend.using::<Convoy>("flotilla");
+    let created = convoys
+        .create(&InputMeta::builder().name("rounds".into()).build(), &ConvoySpec::builder().workflow_ref("single-agent".into()).build())
+        .await
+        .expect("convoy");
+    let base = Utc::now() - chrono::Duration::seconds(2);
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        started_at: Some(base),
+        workflow_snapshot: Some(WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: workflow.stall_nudges,
+            supervision: workflow.supervision,
+            exit: workflow.exit,
+            turn_delivery: workflow.turn_delivery,
+            vessels: workflow.vessels,
+        }),
+        work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
+        crew_work: BTreeMap::from([(
+            "work".into(),
+            BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+        )]),
+        ..Default::default()
+    };
+    status.discover_subject(
+        flotilla_protocol::Subject {
+            kind: flotilla_protocol::SubjectKind::ChangeRequest,
+            source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+            id: "3557".into(),
+        },
+        Relationship::Produces,
+        SubjectDiscoverySource::Claim,
+        base,
+    );
+    let updated = convoys.update_status("rounds", &created.metadata.resource_version, &status).await.expect("active crew");
+    let name = cr_name("github.com", "flotilla-org/flotilla", 3557);
+    backend
+        .using::<ChangeRequest>("flotilla")
+        .create(
+            &InputMeta::builder().name(name.clone()).build(),
+            &flotilla_resources::ChangeRequestSpec::builder()
+                .service("github.com".into())
+                .scope("flotilla-org/flotilla".into())
+                .number(3557)
+                .observing_authority("authority".into())
+                .build(),
+        )
+        .await
+        .expect("PR record");
+    wake.sync_rows("flotilla", &HashMap::from([("rounds".into(), updated)])).await.expect("turn rows");
+    // Drive each firing deterministically rather than through background watches.
+    for task in wake.subscriptions.inner.tasks.lock().await.drain().map(|(_, task)| task) {
+        task.abort();
+    }
+    (backend, wake, actuator, name)
+}
+
+async fn turn_row(wake: &ReconcilerWake, wanted: &str) -> LeafSubscriptionRow {
+    wake.subscriptions
+        .rows()
+        .await
+        .into_iter()
+        .find(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { source, .. } if source == wanted))
+        .unwrap_or_else(|| panic!("armed `{wanted}` row"))
+}
+
+async fn fire_turn_row(wake: &ReconcilerWake, row: &LeafSubscriptionRow) {
+    let LeafWatcher::TurnDelivery { source, rule, .. } = &row.watcher else { unreachable!() };
+    wake.subscriptions.deliver_turn(row.id, "rounds", source, rule, &row.leaves[0]).await.expect("turn firing");
+}
+
+// #3565 (PR #3557): a crew pushing review fixes is making progress. Four
+// rounds, each a new head with a review and settled checks, all reach the
+// crew past the episode limit, including the round whose checks went green.
+#[tokio::test]
+async fn four_review_rounds_deliver_the_green_checks_on_the_last_round() {
+    let (backend, wake, actuator, name) = review_rounds_fixture().await;
+    let records = backend.using::<ChangeRequest>("flotilla");
+    let checks = turn_row(&wake, "checks-settled").await;
+    let review = turn_row(&wake, "actionable-review").await;
+    let heads = ["ae5be374", "51844bae", "765a01ce", "a2bc4085"];
+    for (round, head) in heads.into_iter().enumerate() {
+        let green = round == heads.len() - 1;
+        let current = records.get(&name).await.expect("record");
+        let observed_at = Utc::now();
+        let observed = flotilla_resources::ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
+            state: Observation::known(ObservedChangeRequestState::Open, observed_at),
+            head_sha: Observation::known(head.to_string(), observed_at),
+            checks: Observation::known(if green { ObservedChecks::Pass } else { ObservedChecks::Fail }, observed_at),
+            review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Observation::known(!green, observed_at) },
+            mergeable: Observation::known(ObservedMergeability::Mergeable, observed_at),
+        };
+        records.update_status(&name, &current.metadata.resource_version, &observed).await.expect("observe round");
+        if !green {
+            fire_turn_row(&wake, &review).await;
+        }
+        fire_turn_row(&wake, &checks).await;
+        // A repeat firing at the same head stays one episode.
+        fire_turn_row(&wake, &checks).await;
+    }
+    let requests = actuator.requests.lock().expect("requests").clone();
+    let sources = requests.iter().map(|request| (request.source.as_str(), request.subject_revision.as_str())).collect::<Vec<_>>();
+    assert_eq!(
+        sources,
+        [
+            ("actionable-review", "ae5be374"),
+            ("checks-settled", "ae5be374"),
+            ("actionable-review", "51844bae"),
+            ("checks-settled", "51844bae"),
+            ("actionable-review", "765a01ce"),
+            ("checks-settled", "765a01ce"),
+            ("checks-settled", "a2bc4085"),
+        ]
+    );
+    let last = &requests.last().expect("green turn").brief;
+    assert!(last.contains("- Head SHA: `a2bc4085`") && last.contains("- Checks: pass"), "{last}");
+    assert_eq!(actuator.holds.load(Ordering::SeqCst), 0);
+    let status = backend.using::<Convoy>("flotilla").get("rounds").await.expect("convoy").status.expect("status");
+    assert_eq!(status.turn_deliveries["checks-settled"].episodes.len(), 4);
+    assert!(status.turn_delivery_holds().is_empty());
+    assert!(status.attention.is_none());
+}
+
+// #3565: the limit still catches a loop that makes no progress. Review-round
+// artifacts republished about one head hold the fourth turn; further rounds at
+// that head stay held, and a new head clears the hold and delivers.
+#[tokio::test]
+async fn artifact_rounds_at_one_head_hold_until_the_head_moves() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let wake = supervision_wake(&backend);
+    let table = &wake.subscriptions;
+    let actuator = Arc::new(RecordingTurnDelivery::default());
+    table.set_turn_delivery_actuator(actuator.clone()).await;
+    let source = "review-round";
+    let rule = TurnDeliveryRule::builder()
+        .on(flotilla_resources::parse_leaf_template(
+            "$artifact(reviewer,review-round,change-request-head).summary.disposition == changes-requested",
+        )
+        .expect("artifact leaf"))
+        .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
+        .brief("Address the review round.".into())
+        .hold(HoldAct::State)
+        .build();
+    let repo_ref = RepositoryKey("repo".into());
+    let spec = ConvoySpec::builder()
+        .workflow_ref("workflow".into())
+        .repositories(vec![ConvoyRepositorySpec::builder()
+            .url("https://github.com/flotilla-org/flotilla".into())
+            .repo_ref(repo_ref.clone())
+            .source_ref("feature/rounds".into())
+            .target_ref("main".into())
+            .workspace_slug("flotilla".into())
+            .subpaths(Vec::new())
+            .build()])
+        .change_request(BoundChangeRequest::builder().id("1392".into()).repository_ref(repo_ref).title("rounds".into()).build())
+        .build();
+    let convoys = backend.using::<Convoy>("flotilla");
+    let created = convoys.create(&InputMeta::builder().name("rounds".into()).build(), &spec).await.expect("convoy");
+    let base = Utc::now();
+    convoys
+        .update_status(
+            "rounds",
+            &created.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Landing,
+                work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Complete).build())]),
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Done).finished_at(base).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("landing status");
+    let records = backend.using::<ChangeRequest>("flotilla");
+    let cr = records
+        .create(
+            &InputMeta::builder().name(cr_name("github.com", "flotilla-org/flotilla", 1392)).build(),
+            &flotilla_resources::ChangeRequestSpec::builder()
+                .service("github.com".into())
+                .scope("flotilla-org/flotilla".into())
+                .number(1392)
+                .observing_authority("authority".into())
+                .build(),
+        )
+        .await
+        .expect("change request");
+    let artifacts = backend.using::<Artifact>("flotilla");
+    let mut cr_version = cr.metadata.resource_version;
+    let mut observed_head = None;
+    let rounds = [("aaa", 3, 1), ("aaa", 3, 1), ("bbb", 4, 1)];
+    let mut round = 0;
+    for (head, expected_requests, expected_holds) in rounds {
+        // The head stays put for the first five republished rounds.
+        let repeats = if observed_head.is_none() { 4 } else { 1 };
+        if observed_head != Some(head) {
+            let now = Utc::now();
+            let updated = records
+                .update_status(
+                    &cr_name("github.com", "flotilla-org/flotilla", 1392),
+                    &cr_version,
+                    &flotilla_resources::ChangeRequestStatus {
+                        title: Default::default(),
+                        author: Default::default(),
+                        review_decision: Default::default(),
+                        review_requested_from_owner: Default::default(),
+                        state: Observation::known(ObservedChangeRequestState::Open, now),
+                        head_sha: Observation::known(head.to_string(), now),
+                        checks: Observation::known(ObservedChecks::Fail, now),
+                        review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, now) },
+                        mergeable: Observation::known(ObservedMergeability::Mergeable, now),
+                    },
+                )
+                .await
+                .expect("observe head");
+            cr_version = updated.metadata.resource_version;
+            observed_head = Some(head);
+        }
+        for _ in 0..repeats {
+            round += 1;
+            // The crew answers each round and claims again before the next.
+            let claim_at = base + chrono::Duration::seconds(round * 2);
+            update_convoy(&backend, "rounds", |status| {
+                let coder = status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("coder");
+                coder.phase = CrewWorkPhase::Done;
+                coder.finished_at = Some(claim_at);
+                status.work.get_mut("work").expect("work").phase = WorkPhase::Complete;
+                status.phase = ConvoyPhase::Landing;
+            })
+            .await;
+            let record_name = flotilla_resources::address::record_name(
+                &flotilla_resources::address::artifact_address("rounds", "reviewer", "review-round", head).expect("artifact address"),
+            )
+            .expect("record name");
+            let spec = flotilla_resources::ArtifactSpec::builder()
+                .convoy("rounds".into())
+                .producer("reviewer".into())
+                .kind("review-round".into())
+                .subject(head.into())
+                .summary(BTreeMap::from([("disposition".into(), serde_json::json!("changes-requested"))]))
+                .digest(format!("round-{round}"))
+                .size(1)
+                .media_type("text/markdown".into())
+                .recorded_at(claim_at + chrono::Duration::seconds(1))
+                .expires_at(claim_at + chrono::Duration::days(1))
+                .build();
+            match artifacts.get(&record_name).await {
+                Ok(current) => artifacts
+                    .update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec)
+                    .await
+                    .expect("republish"),
+                Err(_) => artifacts.create(&InputMeta::builder().name(record_name).build(), &spec).await.expect("publish"),
+            };
+            let leaf = Leaf {
+                address: LeafAddress::Artifact {
+                    convoy: "rounds".into(),
+                    producer: "reviewer".into(),
+                    kind: "review-round".into(),
+                    subject: head.into(),
+                },
+                field_path: ".summary.disposition".into(),
+                operator: LeafOperator::Equal,
+                literal: "changes-requested".into(),
+            };
+            let id = uuid::Uuid::new_v4();
+            table.inner.rows.lock().await.insert(
+                id,
+                LeafSubscriptionRow {
+                    id,
+                    namespace: "flotilla".into(),
+                    leaves: vec![leaf.clone()],
+                    watcher: LeafWatcher::TurnDelivery { convoy: "rounds".into(), source: source.into(), rule: Box::new(rule.clone()) },
+                    maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
+                    freshness_demand: None,
+                    created_at: base,
+                    episode_key: Default::default(),
+                },
+            );
+            table.deliver_turn(id, "rounds", source, &rule, &leaf).await.expect("artifact turn");
+            if round == 4 {
+                // The production actuator records the hold state field beside the refusal.
+                let status = convoys.get("rounds").await.expect("convoy").status.expect("status");
+                let refusal = status.turn_deliveries[source].episodes.last().expect("refusal");
+                let TurnDeliveryOutcome::Refused { reason, refused_at, hold_executed: true } = &refusal.outcome else {
+                    panic!("fourth round at one head is refused: {refusal:?}");
+                };
+                assert!(reason.contains("at subject revision `aaa`"), "{reason}");
+                let hold = ConvoyAttention { source: source.into(), reason: reason.clone(), raised_at: *refused_at };
+                update_convoy(&backend, "rounds", |status| {
+                    flotilla_resources::ConvoyStatusPatch::HoldTurnDelivery { source: source.into(), hold }.apply(status)
+                })
+                .await;
+            }
+        }
+        assert_eq!(actuator.requests.lock().expect("requests").len(), expected_requests, "head {head}");
+        assert_eq!(actuator.holds.load(Ordering::SeqCst), expected_holds, "head {head}");
+        let status = convoys.get("rounds").await.expect("convoy").status.expect("status");
+        assert_eq!(status.turn_delivery_holds().is_empty(), head == "bbb", "head {head}");
+        assert_eq!(status.attention.is_none(), head == "bbb", "head {head}");
+    }
+    let requests = actuator.requests.lock().expect("requests");
+    assert_eq!(requests.last().expect("new head turn").subject_revision, "bbb@round-6");
 }

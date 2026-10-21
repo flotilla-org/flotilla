@@ -130,7 +130,10 @@ impl LeafSubscriptionTable {
             return Ok(());
         }
         let active_conflict = active_probe && is_conflict_probe(leaf);
-        let (subject_revision, evidence_at, brief, message_subject) = match &leaf.address {
+        // `progress` is the revision the crew can advance (a PR head, an issue
+        // update, an artifact's subject); `subject_revision` also names what
+        // distinguishes repeat firings at it (an artifact digest).
+        let (subject_revision, progress, evidence_at, brief, message_subject) = match &leaf.address {
             LeafAddress::ChangeRequest { service, scope, number } => {
                 let record_name = leaf_record_name(&leaf.address, &forges)?;
                 let record = self
@@ -230,7 +233,7 @@ impl LeafSubscriptionTable {
                         revision: head.clone(),
                     },
                 );
-                (revision, evidence_at, brief, Some(subject))
+                (revision.clone(), revision, evidence_at, brief, Some(subject))
             }
             LeafAddress::Issue { service, scope, number } => {
                 let record_name = leaf_record_name(&leaf.address, &forges)?;
@@ -274,8 +277,10 @@ impl LeafSubscriptionTable {
                         )
                     })
                     .unwrap_or_default();
+                let revision = format!("{}@{}", leaf.address, updated_at.to_rfc3339());
                 (
-                    format!("{}@{}", leaf.address, updated_at.to_rfc3339()),
+                    revision.clone(),
+                    revision,
                     evidence_at,
                     brief,
                     Some(flotilla_resources::MessageReference::Issue {
@@ -356,6 +361,7 @@ impl LeafSubscriptionTable {
                     .unwrap_or_default();
                 (
                     format!("{subject}@{}", artifact.spec.digest),
+                    subject.clone(),
                     evidence_at,
                     brief,
                     Some(flotilla_resources::MessageReference::Artifact {
@@ -373,9 +379,11 @@ impl LeafSubscriptionTable {
         {
             return Ok(());
         }
-        // A hold remains latched across new observations.
-        if status.turn_deliveries.get(source).is_some_and(|delivery| {
-            delivery.episodes.iter().any(|episode| matches!(episode.outcome, TurnDeliveryOutcome::Refused { hold_executed: true, .. }))
+        // A hold stays latched while the subject stays put; a new subject
+        // revision is progress and reopens delivery (#3565).
+        if status.turn_deliveries.get(source).and_then(|delivery| delivery.episodes.last()).is_some_and(|episode| {
+            matches!(episode.outcome, TurnDeliveryOutcome::Refused { hold_executed: true, .. })
+                && same_progress(&episode.subject_revision, &progress)
         }) {
             return Ok(());
         }
@@ -414,11 +422,13 @@ impl LeafSubscriptionTable {
             .maybe_message_subject(message_subject)
             .delivery_condition(leaf.clone())
             .build();
-        let prior_episodes = status.turn_deliveries.get(source).map_or(0, |delivery| delivery.episodes.len()) as u32;
+        let run = status.turn_deliveries.get(source).map_or(0, |delivery| unprogressed_run(&delivery.episodes, &progress));
         let now = Utc::now();
-        let patch = if prior_episodes >= self.inner.episode_limit {
-            let reason =
-                format!("turn delivery refused after {} consecutive episodes for condition source `{source}`", self.inner.episode_limit);
+        let patch = if run >= self.inner.episode_limit as usize {
+            let reason = format!(
+                "turn delivery refused after {} consecutive episodes for condition source `{source}` at subject revision `{progress}`; a new subject revision or a resume clears this hold",
+                self.inner.episode_limit
+            );
             let actuator = self.inner.turn_delivery.lock().await.clone();
             actuator.hold(&request, &rule.hold, &reason).await?;
             external_patches::refuse_turn_delivery(
@@ -481,6 +491,18 @@ impl LeafSubscriptionTable {
         Ok(())
     }
 }
+/// True when an episode's recorded revision is `progress` itself or a repeat
+/// firing at it (`{progress}@{discriminator}`).
+fn same_progress(subject_revision: &str, progress: &str) -> bool {
+    subject_revision.strip_prefix(progress).is_some_and(|rest| rest.is_empty() || rest.starts_with('@'))
+}
+
+/// Latest consecutive episodes recorded while the subject stayed at `progress`.
+/// The episode limit bounds this run, not the condition's lifetime turns.
+fn unprogressed_run(episodes: &[TurnDeliveryEpisode], progress: &str) -> usize {
+    episodes.iter().rev().take_while(|episode| same_progress(&episode.subject_revision, progress)).count()
+}
+
 pub(super) fn compose_change_request_turn_brief(
     convoy: &ResourceObject<Convoy>,
     source: &str,

@@ -3270,30 +3270,48 @@ impl CrewService {
             })
             .unwrap_or_else(|| "principal:operator".into());
         let sender = "system:turn-rules";
-        // Producer identity follows the persisted hold, independent of receiver changes
-        // or new observations racing a lost acceptance response.
-        let name = flotilla_resources::message_record_name(
-            "system:hold",
-            sender,
-            &format!(
-                "hold:{}:{}:{}:{}:{}",
-                request.convoy,
-                request.vessel,
-                request.role,
-                request.source,
-                attention.raised_at.timestamp_micros()
-            ),
-        );
-        match self.message_record(&request.namespace, &name).await {
-            Ok(_) => return Ok(()),
-            Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(error.to_string()),
-        }
+        let hold_key =
+            format!("{}:{}:{}:{}:{}", request.convoy, request.vessel, request.role, request.source, attention.raised_at.timestamp_micros());
         let mut references = request.references.clone();
         references.push(flotilla_resources::MessageReference::ControlRecord {
             resource: ResourceRef::new("flotilla.work/v1", "Convoy", &request.namespace, &request.convoy),
             revision: convoy.metadata.resource_version.clone(),
         });
+        // The held crew hears why its wakes stopped, rather than waiting on one
+        // that will not come (#3565). Published before the supervisor signal so a
+        // retry after a lost acceptance completes both.
+        let crew = crew_role_address(project, &request.convoy, &request.vessel, &request.role);
+        let notice = flotilla_resources::message_record_name("system:hold", sender, &format!("hold-notice:{hold_key}"));
+        let notified = match self.message_record(&request.namespace, &notice).await {
+            Ok(_) => true,
+            Err(ResourceError::NotFound { .. }) => false,
+            Err(error) => return Err(error.to_string()),
+        };
+        if crew != receiver && !notified {
+            let intent = flotilla_resources::MessageSpec::builder()
+                .sender(sender.into())
+                .receiver(crew)
+                .relation(flotilla_resources::MessageRelation::System)
+                .body(format!(
+                    "Automatic `{}` turns for you are held.\n\n{reason}\n\nYou will not be woken for this condition again until its \
+                     subject moves on (for example a new commit on your PR) or `{receiver}` resumes you. Do not wait for that wake: \
+                     carry on with your work, or stall if you are blocked.",
+                    request.source
+                ))
+                .references(references.clone())
+                .maybe_subject(request.message_subject.clone())
+                .maybe_delivery_condition(request.delivery_condition.clone())
+                .build();
+            self.publish_message_intent(&request.namespace, &notice, &intent).await?;
+        }
+        // Producer identity follows the persisted hold, independent of receiver changes
+        // or new observations racing a lost acceptance response.
+        let name = flotilla_resources::message_record_name("system:hold", sender, &format!("hold:{hold_key}"));
+        match self.message_record(&request.namespace, &name).await {
+            Ok(_) => return Ok(()),
+            Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => return Err(error.to_string()),
+        }
         let intent = flotilla_resources::MessageSpec::builder()
             .sender(sender.into())
             .receiver(receiver.clone())

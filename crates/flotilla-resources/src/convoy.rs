@@ -880,19 +880,7 @@ impl ConvoyStatus {
     /// Durable holds, including previous-generation refusal episodes that predate
     /// the explicit state field. Surfaces share this projection without inventing policy.
     pub fn turn_delivery_holds(&self) -> Vec<ConvoyAttention> {
-        self.turn_deliveries
-            .iter()
-            .filter_map(|(source, delivery)| {
-                delivery.hold.clone().or_else(|| {
-                    delivery.episodes.iter().rev().find_map(|episode| match &episode.outcome {
-                        TurnDeliveryOutcome::Refused { reason, refused_at, .. } => {
-                            Some(ConvoyAttention { source: source.clone(), reason: reason.clone(), raised_at: *refused_at })
-                        }
-                        _ => None,
-                    })
-                })
-            })
-            .collect()
+        self.turn_deliveries.iter().filter_map(|(source, delivery)| delivery.held(source)).collect()
     }
 
     /// Whether shared attention originates from turn delivery rather than settlement.
@@ -1361,6 +1349,19 @@ pub struct TurnDeliveryStatus {
     /// the compatibility default one fleet roll after this field is deployed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_supervisor_turn: Option<PendingSupervisorTurn>,
+}
+
+impl TurnDeliveryStatus {
+    /// The source's standing hold: the explicit state field, or a previous-generation
+    /// refusal that is still the latest episode. A later delivery supersedes a refusal.
+    pub fn held(&self, source: &str) -> Option<ConvoyAttention> {
+        self.hold.clone().or_else(|| match self.episodes.last().map(|episode| &episode.outcome) {
+            Some(TurnDeliveryOutcome::Refused { reason, refused_at, .. }) => {
+                Some(ConvoyAttention { source: source.to_string(), reason: reason.clone(), raised_at: *refused_at })
+            }
+            _ => None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2597,12 +2598,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     .into_iter()
                     .flat_map(|snapshot| &snapshot.turn_delivery)
                     .filter(|(_, rule)| rule.to.vessel == *vessel && rule.to.role == *role)
-                    .filter(|(source, _)| {
-                        status.turn_deliveries.get(*source).is_some_and(|delivery| {
-                            delivery.hold.is_some()
-                                || delivery.episodes.iter().any(|episode| matches!(episode.outcome, TurnDeliveryOutcome::Refused { .. }))
-                        })
-                    })
+                    .filter(|(source, _)| status.turn_deliveries.get(*source).is_some_and(|delivery| delivery.held(source).is_some()))
                     .map(|(source, _)| source.clone())
                     .collect();
                 for source in held_sources {
@@ -2674,10 +2670,15 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::RecordTurnDelivery { source, episode, vessel, role, prompt } => {
                 let delivery = status.turn_deliveries.entry(source.clone()).or_default();
                 delivery.failure = None;
+                // A delivery after a hold means the subject moved on (#3565).
+                delivery.hold = None;
                 if !delivery.episodes.iter().any(|existing| existing.subject_revision == episode.subject_revision) {
                     delivery.episodes.push(episode.clone());
                 }
                 if matches!(episode.outcome, TurnDeliveryOutcome::MessageAccepted { new_turn: false, .. }) {
+                    if status.attention.as_ref().is_some_and(|attention| attention.source == *source) {
+                        status.attention = None;
+                    }
                     return;
                 }
                 status.attention = None;
@@ -3974,6 +3975,76 @@ mod hold_state_tests {
         .apply(&mut status);
         assert!(!status.turn_deliveries.contains_key("checks-settled"));
         assert!(status.attention.is_none());
+    }
+}
+
+#[cfg(test)]
+mod turn_delivery_hold_release_tests {
+    use super::*;
+
+    fn episode(revision: &str, outcome: TurnDeliveryOutcome) -> TurnDeliveryEpisode {
+        let at = DateTime::<Utc>::UNIX_EPOCH;
+        TurnDeliveryEpisode::builder().subject_revision(revision.into()).evidence_at(at).judged_claim_at(at).outcome(outcome).build()
+    }
+
+    // #3565: a delivery for a new subject revision releases the source's hold,
+    // both the state field and a previous-generation refusal episode, while
+    // unrelated attention survives a suppressed (no new turn) admission.
+    #[test]
+    fn new_revision_delivery_releases_a_latched_hold() {
+        let at = DateTime::<Utc>::UNIX_EPOCH;
+        for (explicit, new_turn) in [(true, true), (false, true), (true, false), (false, false)] {
+            let refused = TurnDeliveryOutcome::Refused { reason: "episode limit".into(), refused_at: at, hold_executed: true };
+            let hold = ConvoyAttention { source: "checks-settled".into(), reason: "episode limit".into(), raised_at: at };
+            let mut status = ConvoyStatus {
+                attention: Some(hold.clone()),
+                turn_deliveries: BTreeMap::from([(
+                    "checks-settled".into(),
+                    TurnDeliveryStatus {
+                        hold: explicit.then(|| hold.clone()),
+                        episodes: vec![episode("old", refused)],
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            };
+            assert_eq!(status.turn_delivery_holds(), vec![hold.clone()]);
+            let accepted = TurnDeliveryOutcome::MessageAccepted {
+                new_turn,
+                message: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "turn"),
+                rung: TurnDeliveryRung::WarmSession,
+                accepted_at: at,
+            };
+            ConvoyStatusPatch::RecordTurnDelivery {
+                source: "checks-settled".into(),
+                episode: episode("new", accepted),
+                vessel: "work".into(),
+                role: "coder".into(),
+                prompt: "continue".into(),
+            }
+            .apply(&mut status);
+            assert!(status.turn_delivery_holds().is_empty(), "explicit={explicit} new_turn={new_turn}");
+            assert!(status.attention.is_none(), "explicit={explicit} new_turn={new_turn}");
+        }
+        let other = ConvoyAttention { source: "operator".into(), reason: "look".into(), raised_at: at };
+        let mut status = ConvoyStatus { attention: Some(other.clone()), ..Default::default() };
+        ConvoyStatusPatch::RecordTurnDelivery {
+            source: "checks-settled".into(),
+            episode: episode(
+                "new",
+                TurnDeliveryOutcome::MessageAccepted {
+                    new_turn: false,
+                    message: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "turn"),
+                    rung: TurnDeliveryRung::WarmSession,
+                    accepted_at: at,
+                },
+            ),
+            vessel: "work".into(),
+            role: "coder".into(),
+            prompt: "continue".into(),
+        }
+        .apply(&mut status);
+        assert_eq!(status.attention, Some(other));
     }
 }
 

@@ -142,7 +142,7 @@ async fn active_produced_pr_checks_settle_to_pass_or_fail_once_per_head() {
 // generation budget; retain coverage and the other health checks.
 #[hegel::test(suppress_health_check = [hegel::HealthCheck::TooSlow])]
 fn generated_active_checks_settlement_deduplicates_heads(tc: hegel::TestCase) {
-    // Generate pass/fail sequences across the delivery ceiling (3), including
+    // Generate pass/fail sequences past the episode limit (3), including
     // coder/reviewer roles, new heads, unknown and pending observations, and duplicate settlement.
     let role = if tc.draw(hegel::generators::booleans()) { "reviewer" } else { "coder" };
     let count = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(12));

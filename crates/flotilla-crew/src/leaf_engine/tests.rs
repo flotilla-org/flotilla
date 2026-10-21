@@ -1271,7 +1271,7 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
                     tokio::time::timeout(Duration::from_secs(2), async {
                         loop {
                             let current = convoys.get("checks-wake").await.expect("convoy").status.expect("status");
-                            if current.turn_deliveries.get(source).is_some_and(|state| state.episodes.len() == (index + 1).min(4)) {
+                            if current.turn_deliveries.get(source).is_some_and(|state| state.episodes.len() == index + 1) {
                                 break;
                             }
                             convoy_watch.next().await.expect("delivery watch open").expect("delivery event");
@@ -1286,9 +1286,11 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
             }
             let status = convoys.get("checks-wake").await.expect("convoy").status.expect("status");
             let settled = checks.is_some_and(|value| value != ObservedChecks::Pending);
-            assert_eq!(status.turn_deliveries.get(source).map_or(0, |state| state.episodes.len()), (index + usize::from(settled)).min(4));
-            assert_eq!(actuator.requests.lock().expect("requests").len(), (index + usize::from(settled)).min(3));
-            if settled && index < 3 {
+            // Each new head is progress: the episode limit never holds a
+            // crew that keeps pushing review rounds (#3565).
+            assert_eq!(status.turn_deliveries.get(source).map_or(0, |state| state.episodes.len()), index + usize::from(settled));
+            assert_eq!(actuator.requests.lock().expect("requests").len(), index + usize::from(settled));
+            if settled {
                 // Agent-facing observations use the same plain status words
                 // as the leaf vocabulary, including unknown review evidence.
                 let requests = actuator.requests.lock().expect("requests");
@@ -1298,7 +1300,7 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
             }
         }
     }
-    assert_eq!(actuator.holds.load(Ordering::SeqCst), usize::from(outcomes.len() > 3));
+    assert_eq!(actuator.holds.load(Ordering::SeqCst), 0);
     {
         let requests = actuator.requests.lock().expect("requests");
         assert!(requests[0].brief.contains("Head SHA: `head-0`"));
@@ -1389,7 +1391,7 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
     }
 }
 
-async fn assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates(
+async fn assert_turn_delivery_enforces_head_identity_and_records_rungs(
     source: &str,
     condition: &str,
     field_path: &str,
@@ -1542,7 +1544,11 @@ async fn assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates
             review_requested_from_owner: Default::default(),
             state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, observed_at),
             head_sha: flotilla_resources::Observation::known(head.to_string(), observed_at),
-            checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Fail, observed_at),
+            // The fourth review round turns the checks green.
+            checks: flotilla_resources::Observation::known(
+                if index == 3 { flotilla_resources::ObservedChecks::Pass } else { flotilla_resources::ObservedChecks::Fail },
+                observed_at,
+            ),
             review: flotilla_resources::ChangeRequestReviewObservation {
                 actionable_at_head: flotilla_resources::Observation::known(actionable_review, observed_at),
             },
@@ -1566,10 +1572,14 @@ async fn assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates
     assert!(
         matches!(&episodes[1].outcome, TurnDeliveryOutcome::MessageAccepted { rung: TurnDeliveryRung::FreshAgent, message, .. } if message.kind == "Message")
     );
-    assert!(matches!(episodes[3].outcome, TurnDeliveryOutcome::Refused { hold_executed: true, .. }));
-    assert_eq!(actuator.requests.lock().expect("requests").len(), 3);
-    assert_eq!(actuator.holds.load(Ordering::SeqCst), 1);
-    assert!(status.attention.is_some());
+    // Each round is a new head, so no run reaches the episode limit (#3565).
+    assert!(episodes.iter().all(|episode| matches!(episode.outcome, TurnDeliveryOutcome::MessageAccepted { .. })));
+    assert_eq!(actuator.requests.lock().expect("requests").len(), 4);
+    assert_eq!(actuator.holds.load(Ordering::SeqCst), 0);
+    assert!(status.attention.is_none());
+    assert!(status.turn_delivery_holds().is_empty());
+    let last_brief = actuator.requests.lock().expect("requests")[3].brief.clone();
+    assert!(last_brief.contains("Head SHA: `ddd`") && last_brief.contains("- Checks: Some(Pass)"), "{last_brief}");
     let first_brief = &actuator.requests.lock().expect("requests")[0].brief;
     assert!(first_brief.contains("Head SHA: `aaa`"));
     assert_eq!(
