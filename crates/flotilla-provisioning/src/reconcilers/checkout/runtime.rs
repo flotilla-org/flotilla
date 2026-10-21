@@ -243,17 +243,15 @@ impl CheckoutControllerRuntime {
                 };
                 match result {
                     core_vcs::CheckoutRemoval::Removed => Ok(CheckoutRemovalOutcome::Removed),
-                    core_vcs::CheckoutRemoval::ArchivedAndRemoved { archive_path } => {
+                    core_vcs::CheckoutRemoval::ArchivedAndRemoved { archive_path, preserved_branch } => {
                         tracing::warn!(checkout = %target_path, archive = %archive_path, "checkout archive saved before forced removal");
-                        Ok(CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path })
+                        let preserved_branch = preserved_branch
+                            .map(|(branch, reason)| branch_preservation_reason(reason).map(|reason| (branch, reason)))
+                            .transpose()?;
+                        Ok(CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path, preserved_branch })
                     }
                     core_vcs::CheckoutRemoval::PreservedBranch { branch, reason } => {
-                        let reason = match reason {
-                            core_vcs::CheckoutPreservationReason::CommitsPastBase => BranchPreservationReason::CommitsPastBase,
-                            core_vcs::CheckoutPreservationReason::CheckedOutElsewhere => BranchPreservationReason::CheckedOutElsewhere,
-                            core_vcs::CheckoutPreservationReason::NotCreatedForConvoy => BranchPreservationReason::NotCreatedForConvoy,
-                            other => return Err(format!("checkout branch {branch} preserved: {other:?}")),
-                        };
+                        let reason = branch_preservation_reason(reason)?;
                         Ok(CheckoutRemovalOutcome::PreservedBranch { branch, reason })
                     }
                     core_vcs::CheckoutRemoval::PreservedCheckout {
@@ -402,6 +400,15 @@ impl CheckoutControllerRuntime {
     }
     pub fn vcs(&self, checkout: &str) -> Result<Arc<dyn Vcs>, String> {
         controller_vcs(&self.vcs, &self.runner, checkout)
+    }
+}
+
+fn branch_preservation_reason(reason: core_vcs::CheckoutPreservationReason) -> Result<BranchPreservationReason, String> {
+    match reason {
+        core_vcs::CheckoutPreservationReason::CommitsPastBase => Ok(BranchPreservationReason::CommitsPastBase),
+        core_vcs::CheckoutPreservationReason::CheckedOutElsewhere => Ok(BranchPreservationReason::CheckedOutElsewhere),
+        core_vcs::CheckoutPreservationReason::NotCreatedForConvoy => Ok(BranchPreservationReason::NotCreatedForConvoy),
+        other => Err(format!("unexpected branch preservation reason: {other:?}")),
     }
 }
 

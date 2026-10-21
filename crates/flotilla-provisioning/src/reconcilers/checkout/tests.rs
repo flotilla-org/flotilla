@@ -252,7 +252,7 @@ async fn convoy_parent_cleanup_contract() {
             })
             .await
             .expect("test fixture operation succeeds");
-        let CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path } = outcome else { panic!("forced removal must archive first") };
+        let CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path, .. } = outcome else { panic!("forced removal must archive first") };
         assert!(Path::new(&archive_path).join("worktree.tar.gz").exists());
         assert!(!target.exists());
         assert_eq!(parent.exists(), extra.is_some());
@@ -833,7 +833,7 @@ async fn checkout_runtime_removes_a_shared_bootstrap_branch_in_either_teardown_o
 }
 
 #[tokio::test]
-async fn checkout_runtime_refuses_existing_local_branch_and_recovers_existing_target() {
+async fn checkout_runtime_refuses_unverified_base_and_recovers_existing_target() {
     let temp = TempDir::new().expect("tempdir");
     let missing_origin = temp.path().join("missing-origin.git");
     let clone =
@@ -842,12 +842,12 @@ async fn checkout_runtime_refuses_existing_local_branch_and_recovers_existing_ta
     let runtime =
         CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
 
-    // #2698: refuse new work on an existing branch without contacting its unavailable origin.
+    // #3340: refuse adoption when the configured origin cannot verify the base.
     let error = runtime
         .create_worktree(clone.path().to_str().expect("clone"), "main", Some("main"), target.to_str().expect("target"))
         .await
         .expect_err("branch conflict");
-    assert!(error.contains("main") && error.contains("already exists"), "{error}");
+    assert!(error.contains("verify checkout branch main base main"), "{error}");
     assert!(!target.exists());
     // Existing targets are reconciliation retries, so recovery and cleanup
     // still preserve a branch that the convoy did not create.

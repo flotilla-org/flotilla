@@ -135,7 +135,7 @@ pub enum CheckoutPreservationReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutRemoval {
     Removed,
-    ArchivedAndRemoved { archive_path: String },
+    ArchivedAndRemoved { archive_path: String, preserved_branch: Option<(String, CheckoutPreservationReason)> },
     PreservedBranch { branch: String, reason: CheckoutPreservationReason },
     PreservedCheckout { path: String, reason: CheckoutPreservationReason },
 }
@@ -290,6 +290,7 @@ pub enum CheckoutOwnership {
     PreExisting,
     Advanced,
     CheckedOutElsewhere,
+    /// Owned branch has no commits beyond its recorded bootstrap commit.
     OwnedAtBase,
 }
 
@@ -704,6 +705,25 @@ impl FlotillaVcs {
         self.orphaned_worktree(target).await.map_err(|probe_error| format!("{error}; orphaned worktree probe failed: {probe_error}"))
     }
 
+    async fn cleanup_convoy_branch(&self, branch: &str) -> Result<CheckoutRemoval, String> {
+        match self.controller_cli().branch_ownership(branch, CheckoutSharing::Shared).await? {
+            CheckoutOwnership::Missing => Ok(CheckoutRemoval::Removed),
+            CheckoutOwnership::PreExisting => {
+                Ok(CheckoutRemoval::PreservedBranch { branch: branch.to_string(), reason: CheckoutPreservationReason::NotCreatedForConvoy })
+            }
+            CheckoutOwnership::Advanced => {
+                Ok(CheckoutRemoval::PreservedBranch { branch: branch.to_string(), reason: CheckoutPreservationReason::CommitsPastBase })
+            }
+            CheckoutOwnership::CheckedOutElsewhere => {
+                Ok(CheckoutRemoval::PreservedBranch { branch: branch.to_string(), reason: CheckoutPreservationReason::CheckedOutElsewhere })
+            }
+            CheckoutOwnership::OwnedAtBase => {
+                self.controller_cli().delete_owned_branch(branch).await?;
+                Ok(CheckoutRemoval::Removed)
+            }
+        }
+    }
+
     fn cli(&self) -> GitCliBackend<'_> {
         let backend = if self.explicit_checkout {
             GitCliBackend::explicit_checkout(self.checkout.as_path(), &*self.runner)
@@ -1087,26 +1107,16 @@ impl Vcs for FlotillaVcs {
         self.controller_cli().worktree_prune().await?;
         remove_empty_worktree_parents(&*self.runner, clone_path, target).await?;
 
-        match self.controller_cli().branch_ownership(branch, CheckoutSharing::Shared).await? {
-            CheckoutOwnership::Missing => Ok(CheckoutRemoval::Removed),
-            CheckoutOwnership::PreExisting => {
-                Ok(CheckoutRemoval::PreservedBranch { branch: branch.to_string(), reason: CheckoutPreservationReason::NotCreatedForConvoy })
-            }
-            CheckoutOwnership::Advanced => {
-                Ok(CheckoutRemoval::PreservedBranch { branch: branch.to_string(), reason: CheckoutPreservationReason::CommitsPastBase })
-            }
-            CheckoutOwnership::CheckedOutElsewhere => {
-                Ok(CheckoutRemoval::PreservedBranch { branch: branch.to_string(), reason: CheckoutPreservationReason::CheckedOutElsewhere })
-            }
-            CheckoutOwnership::OwnedAtBase => {
-                self.controller_cli().delete_owned_branch(branch).await?;
-                Ok(CheckoutRemoval::Removed)
-            }
-        }
+        self.cleanup_convoy_branch(branch).await
     }
 
-    async fn force_remove_materialised_checkout(&self, _branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
+    async fn force_remove_materialised_checkout(&self, branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
         if !self.runner.path_exists(Path::new(target)).await? {
+            if matches!(self.strategy, GitCheckoutStrategy::Worktree(_)) && self.runner.path_exists(self.checkout.as_path()).await? {
+                self.controller_cli().remove_protected_worktree(target).await?;
+                self.controller_cli().worktree_prune().await?;
+                return self.cleanup_convoy_branch(branch).await;
+            }
             return Ok(CheckoutRemoval::Removed);
         }
         let path = Path::new(target);
@@ -1214,7 +1224,16 @@ impl Vcs for FlotillaVcs {
             self.controller_cli().worktree_prune().await?;
         }
         warn!(checkout = %target, archive = %archive_path, "forced checkout removal archived local state");
-        Ok(CheckoutRemoval::ArchivedAndRemoved { archive_path: archive_path.to_string() })
+        let preserved_branch = if matches!(self.strategy, GitCheckoutStrategy::Worktree(_)) {
+            match self.cleanup_convoy_branch(branch).await? {
+                CheckoutRemoval::PreservedBranch { branch, reason } => Some((branch, reason)),
+                CheckoutRemoval::Removed => None,
+                _ => unreachable!("branch cleanup cannot return a checkout result"),
+            }
+        } else {
+            None
+        };
+        Ok(CheckoutRemoval::ArchivedAndRemoved { archive_path: archive_path.to_string(), preserved_branch })
     }
 
     async fn is_clean(&self) -> VcsCheck {
@@ -1884,8 +1903,12 @@ impl VcsBackend for GitCliBackend<'_> {
             return Ok(CheckoutOwnership::PreExisting);
         }
         if head.stdout.trim() != bootstrap.stdout.trim() {
-            self.delete_ref(&bootstrap_ref).await?;
-            return Ok(CheckoutOwnership::Advanced);
+            // Rewinding to an ancestor adds no commits beyond the recorded base.
+            let ancestry = self.output(&["merge-base", "--is-ancestor", head.stdout.trim(), bootstrap.stdout.trim()]).await?;
+            if !ancestry.success() {
+                self.delete_ref(&bootstrap_ref).await?;
+                return Ok(CheckoutOwnership::Advanced);
+            }
         }
         if sharing == CheckoutSharing::Shared && self.worktree_list().await?.lines().any(|line| line == format!("branch {branch_ref}")) {
             return Ok(CheckoutOwnership::CheckedOutElsewhere);
@@ -2025,7 +2048,31 @@ impl VcsBackend for GitCliBackend<'_> {
         }
         let remote_exists = self.ref_exists(&remote_ref).await;
         if local_exists {
-            return Err(existing_checkout_branch_error(branch, None));
+            let base = base_ref.ok_or_else(|| existing_checkout_branch_error(branch, None))?;
+            let remote_base = format!("refs/remotes/origin/{base}");
+            if self.remote_url("origin").await.is_ok() {
+                // Adoption uses a verified base, never a failed fetch's stale tip.
+                self.fetch("origin", &format!("+{base}:{remote_base}"))
+                    .await
+                    .map_err(|error| format!("verify checkout branch {branch} base {base}: {error}"))?;
+            }
+            let base = if self.ref_exists(&remote_base).await { remote_base.as_str() } else { base };
+            let ancestry = self.output(&["merge-base", "--is-ancestor", &local_ref, base]).await?;
+            if !ancestry.success() {
+                return Err(format!("checkout branch {branch} has commits beyond base {base}, or ancestry cannot be verified; preserve or push its work before reusing it: {}", ancestry.stderr.trim()));
+            }
+            // Git refuses physical holders without --force; adoption never
+            // moves the branch and never claims ownership of a pre-existing ref.
+            self.run(&["worktree", "add", "--lock", "--reason", registration_reason, target, branch]).await?;
+            let provenance = if self.ref_exists(&bootstrap_branch_ref(branch)).await {
+                CheckoutBranchProvenance::CreatedForConvoy
+            } else {
+                CheckoutBranchProvenance::PreExisting
+            };
+            return Ok(CheckoutMaterialisation {
+                commit: Some(GitCliBackend::checkout_root(Path::new(target), self.runner).head_commit_text().await?.trim().to_string()),
+                provenance,
+            });
         }
         if remote_exists {
             return Err(existing_checkout_branch_error(branch, Some(&remote_ref)));
@@ -2963,8 +3010,185 @@ mod tests {
         assert!(!divergent.exists());
     }
 
-    // #2698: a new convoy checkout must refuse an existing branch, whether
-    // unoccupied or held by another worktree, without adopting its stale tip.
+    // #3340: an unoccupied leftover branch with no commits beyond the base can
+    // be adopted, while unique commits and physical worktree holders are kept.
+    #[tokio::test]
+    async fn leftover_branch_adoption_and_teardown_contract() {
+        for behind in [false, true] {
+            for unique in [false, true] {
+                for occupied in [false, true] {
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let root = dir.path();
+                    git(root, &["init", "-b", "main"]);
+                    git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+                    git(root, &["branch", "governor"]);
+                    if unique {
+                        git(root, &["switch", "governor"]);
+                        git(
+                            root,
+                            &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "unique work"],
+                        );
+                        git(root, &["switch", "main"]);
+                    }
+                    if behind {
+                        git(
+                            root,
+                            &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "advance base"],
+                        );
+                    }
+                    if occupied {
+                        git(root, &["worktree", "add", root.join("holder").to_str().expect("holder"), "governor"]);
+                    }
+                    let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
+                    let vcs = test_fl(root, runner.clone(), true);
+                    let target = root.join("new");
+                    let path = target.to_str().expect("path");
+                    let result = vcs.materialise_checkout("governor", Some("main"), path, "managed").await;
+                    if unique || occupied {
+                        let error = result.err().expect("unsafe adoption refuses").to_string();
+                        assert!(error.contains("governor"), "{error}");
+                        if unique {
+                            assert!(error.contains("commits beyond"), "{error}");
+                        }
+                        assert!(!target.exists());
+                    } else {
+                        let created = result.expect("adopt leftover branch");
+                        assert_eq!(created.provenance, CheckoutBranchProvenance::PreExisting);
+                        assert_eq!(
+                            vcs.materialise_checkout("governor", Some("main"), path, "managed").await.expect("retry").commit,
+                            created.commit
+                        );
+                        assert!(matches!(
+                            vcs.remove_materialised_checkout("governor", path).await.expect("teardown"),
+                            CheckoutRemoval::PreservedBranch { reason: CheckoutPreservationReason::NotCreatedForConvoy, .. }
+                        ));
+                    }
+                    assert!(
+                        GitCliBackend::new(root, &*runner).ref_exists("refs/heads/governor").await,
+                        "adopted or refused branches retain ownership"
+                    );
+                }
+            }
+        }
+    }
+
+    // #3340: adoption compares with the fetched base, not a stale local main.
+    #[tokio::test]
+    async fn leftover_branch_adoption_fetches_remote_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir(&source).expect("source");
+        git(dir.path(), &["init", "--bare", remote.to_str().expect("remote")]);
+        git(&source, &["init", "-b", "main"]);
+        for message in ["initial", "remote base"] {
+            git(&source, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", message]);
+        }
+        git(&source, &["remote", "add", "origin", remote.to_str().expect("remote")]);
+        git(&source, &["push", "origin", "main"]);
+        git(&source, &["branch", "governor"]);
+        git(&source, &["reset", "--hard", "HEAD^"]);
+        git(&source, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
+        let vcs = test_fl(&source, runner.clone(), true);
+        let target = dir.path().join("checkout");
+        let result = vcs
+            .materialise_checkout("governor", Some("main"), target.to_str().expect("target"), "managed")
+            .await
+            .expect("adopt at fetched base");
+        let base = GitCliBackend::new(&source, &*runner).resolve_ref("refs/remotes/origin/main").await.expect("fetched base");
+        assert_eq!(result.commit.as_deref(), Some(base.trim()));
+        assert_eq!(result.provenance, CheckoutBranchProvenance::PreExisting);
+    }
+
+    // #3340: forced teardown cleans an untouched convoy-created branch even
+    // when the checkout switched branches or its directory disappeared already.
+    #[tokio::test]
+    async fn forced_teardown_removes_owned_leftover_branches() {
+        for rewound in [false, true] {
+            for missing in [false, true] {
+                for switched in [false, true] {
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let root = dir.path();
+                    git(root, &["init", "-b", "main"]);
+                    git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+                    git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "base"]);
+                    let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
+                    let vcs = test_fl(root, runner.clone(), true);
+                    let target = root.join("checkout");
+                    let path = target.to_str().expect("path");
+                    vcs.materialise_checkout("governor", Some("main"), path, "managed").await.expect("materialise");
+                    if rewound {
+                        git(&target, &["reset", "--hard", "HEAD^"]);
+                    }
+                    if switched {
+                        git(&target, &["switch", "--detach"]);
+                    }
+                    if missing {
+                        std::fs::remove_dir_all(&target).expect("remove checkout out of band");
+                    }
+                    vcs.force_remove_materialised_checkout("governor", path).await.expect("forced teardown");
+                    let cli = GitCliBackend::new(root, &*runner);
+                    assert!(!cli.ref_exists("refs/heads/governor").await, "untouched owned branch must be deleted");
+                    assert!(!cli.ref_exists(&bootstrap_branch_ref("governor")).await, "ownership marker must be deleted");
+                    assert!(!target.exists());
+                    assert_eq!(vcs.force_remove_materialised_checkout("governor", path).await.expect("repeat"), CheckoutRemoval::Removed);
+                }
+            }
+        }
+    }
+
+    // #3340: archiving a checkout must still report and preserve branches with
+    // unique commits, pre-existing ownership, or another physical holder.
+    #[tokio::test]
+    async fn forced_teardown_reports_preserved_branches() {
+        for unique in [false, true] {
+            for owned in [false, true] {
+                for elsewhere in [false, true] {
+                    if !unique && owned && !elsewhere {
+                        continue;
+                    }
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let root = dir.path();
+                    git(root, &["init", "-b", "main"]);
+                    git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+                    let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
+                    let vcs = test_fl(root, runner.clone(), true);
+                    let target = root.join("checkout");
+                    let path = target.to_str().expect("path");
+                    vcs.materialise_checkout("governor", Some("main"), path, "managed").await.expect("create");
+                    if !owned {
+                        git(root, &["update-ref", "-d", &bootstrap_branch_ref("governor")]);
+                    }
+                    if unique {
+                        git(
+                            &target,
+                            &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "unique work"],
+                        );
+                    }
+                    if elsewhere {
+                        git(root, &["worktree", "add", "--force", root.join("holder").to_str().expect("holder"), "governor"]);
+                    }
+                    let expected = if !owned {
+                        CheckoutPreservationReason::NotCreatedForConvoy
+                    } else if unique {
+                        CheckoutPreservationReason::CommitsPastBase
+                    } else {
+                        CheckoutPreservationReason::CheckedOutElsewhere
+                    };
+                    let result = vcs.force_remove_materialised_checkout("governor", path).await.expect("force");
+                    let CheckoutRemoval::ArchivedAndRemoved { archive_path, preserved_branch } = result else { panic!("archive expected") };
+                    assert!(Path::new(&archive_path).join("history.bundle").exists());
+                    assert_eq!(preserved_branch, Some(("governor".into(), expected)));
+                    assert!(GitCliBackend::new(root, &*runner).ref_exists("refs/heads/governor").await);
+                    assert!(!target.exists());
+                }
+            }
+        }
+    }
+
+    // #2698/#3340: unique commits on an existing branch are never adopted,
+    // whether unoccupied or held by another worktree.
     #[tokio::test]
     async fn convoy_checkout_refuses_reused_branch() {
         for occupied in [false, true] {
@@ -3821,7 +4045,7 @@ mod tests {
         std::fs::write(Path::new(target).join("target/big.bin"), vec![42; 1024 * 1024]).expect("build output");
 
         let outcome = vcs.force_remove_materialised_checkout("convoy/work", target).await.expect("forced removal");
-        let CheckoutRemoval::ArchivedAndRemoved { archive_path } = outcome else { panic!("expected archive of work at risk") };
+        let CheckoutRemoval::ArchivedAndRemoved { archive_path, .. } = outcome else { panic!("expected archive of work at risk") };
         let archive = Path::new(&archive_path);
         assert_eq!(archive.parent(), Some(root.join(".flotilla-archives").as_path()));
         assert!(archive.join("history.bundle").exists(), "unpushed commit must remain recoverable");
@@ -3898,7 +4122,7 @@ mod tests {
             println!("forced clean checkout teardown with large ignored target finished in {:?}", started.elapsed());
             assert!(started.elapsed() < std::time::Duration::from_secs(10), "large ignored output must not delay teardown");
         }
-        let CheckoutRemoval::ArchivedAndRemoved { archive_path } = outcome else { panic!("expected archive") };
+        let CheckoutRemoval::ArchivedAndRemoved { archive_path, .. } = outcome else { panic!("expected archive") };
         let archive = Path::new(&archive_path);
         assert!(archive.join("history.bundle").exists());
         assert_eq!(
