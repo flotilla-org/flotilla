@@ -827,7 +827,7 @@ async fn forced_convoy_deletion_directs_checkout_authority_to_archive_before_rem
     // #3340: archiving still reports unique branch commits to the operator.
     assert!(events.items.iter().any(|event| event.spec.reason == "CheckoutBranchPreserved"
         && event.spec.message.contains("feature/cleanup")
-        && event.spec.message.contains("CommitsPastBase")));
+        && event.spec.message.contains("commits beyond the recorded base")));
 }
 
 #[tokio::test]

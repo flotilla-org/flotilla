@@ -45,6 +45,16 @@ pub enum BranchPreservationReason {
     NotCreatedForConvoy,
 }
 
+impl std::fmt::Display for BranchPreservationReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CommitsPastBase => "has commits beyond the recorded base",
+            Self::CheckedOutElsewhere => "is checked out in another worktree",
+            Self::NotCreatedForConvoy => "was not created for this convoy",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutRemovalOutcome {
     Removed,
@@ -816,13 +826,16 @@ where
             _ => None,
         };
         if let Some((branch, reason)) = preserved_branch {
-            EventRecorder::new(self.backend.clone())
+            if let Err(error) = EventRecorder::new(self.backend.clone())
                 .record(
-                    ObjectEvent::for_object(obj, "CheckoutBranchPreserved", format!("branch {branch} preserved: {reason:?}")),
+                    ObjectEvent::for_object(obj, "CheckoutBranchPreserved", format!("branch {branch} preserved: {reason}")),
                     self.clock.now(),
                 )
-                .await?;
-            warn!(%branch, ?reason, "preserved branch during checkout cleanup");
+                .await
+            {
+                warn!(%error, %branch, "could not record preserved branch event");
+            }
+            warn!(%branch, %reason, "preserved branch during checkout cleanup");
         }
         Ok(())
     }
