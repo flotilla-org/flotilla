@@ -819,6 +819,29 @@ pub struct ConvoyIssue {
     pub snapshot: IssueSnapshot,
 }
 
+impl ConvoyIssue {
+    /// Tracker labels are hints: only valid ad-hoc needs affect placement.
+    /// Derive warnings from the frozen snapshot so explain retains admission evidence.
+    pub fn placement_needs(&self) -> (BTreeSet<crate::CapabilityNeed>, Vec<String>) {
+        let mut needs = BTreeSet::new();
+        let mut warnings = Vec::new();
+        for label in &self.snapshot.labels {
+            if let Some(value) = label.strip_prefix("needs:") {
+                match crate::CapabilityNeed::parse_ad_hoc(value) {
+                    Ok(need) => {
+                        needs.insert(need);
+                    }
+                    Err(error) => warnings.push(format!(
+                        "issue {} / {}#{}: skipped label `{label}`: {error}",
+                        self.reference.source.service, self.reference.source.scope, self.reference.id
+                    )),
+                }
+            }
+        }
+        (needs, warnings)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeclaredSubject {
     pub subject: Subject,
@@ -4158,5 +4181,48 @@ mod task_assignment_tests {
             patch.apply(&mut status);
             assert_eq!(status.crew_work["work"]["governor"].task_assigned, assigned);
         }
+    }
+}
+
+#[cfg(test)]
+mod issue_placement_label_tests {
+    use super::*;
+
+    // #3645: labels that cannot be ad-hoc needs never change placement; valid
+    // needs still compose. Duplicates deduplicate needs, not skipped-label evidence.
+    #[hegel::test]
+    fn issue_labels_partition_into_needs_and_warnings(tc: hegel::TestCase) {
+        // Cover empty and repeated input, all reported triage labels, an empty
+        // suffix, and the workflow-only matrix placeholder.
+        let invalid = ["multi-host", "live-repro", "quiet-window", "owner-machine", "macos", "cloud-credentials", "", "platform:$matrix"];
+        let invalid = invalid[tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(invalid.len() - 1))];
+        let copies = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3));
+        let valid = tc.draw(hegel::generators::booleans());
+        let mut labels = vec![format!("needs:{invalid}"); copies];
+        labels.push("bug".into());
+        if valid {
+            labels.extend(["needs:platform:windows".into(), "needs:platform:windows".into()]);
+        }
+        let issue = ConvoyIssue {
+            reference: IssueRef {
+                source: flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+                id: "3397".into(),
+            },
+            repository_ref: None,
+            snapshot: IssueSnapshot { title: "Example".into(), body: None, state: IssueState::Open, labels, as_of: Utc::now() },
+        };
+        let (needs, warnings) = issue.placement_needs();
+        let expected = if valid { BTreeSet::from([crate::CapabilityNeed::Platform("windows".into())]) } else { BTreeSet::new() };
+        assert_eq!(needs, expected);
+        assert_eq!(warnings.len(), copies);
+        for warning in &warnings {
+            assert!(warning.contains("https://github.com / flotilla-org/flotilla#3397"), "{warning}");
+            assert!(warning.contains(&format!("skipped label `needs:{invalid}`")), "{warning}");
+            assert!(warning.contains(&crate::CapabilityNeed::parse_ad_hoc(invalid).unwrap_err()), "{warning}");
+        }
+        // Existing frozen issue data is sufficient to reproduce explain warnings.
+        let frozen: ConvoyIssue = serde_json::from_value(serde_json::to_value(&issue).unwrap()).unwrap();
+        assert_eq!(frozen.placement_needs(), (needs, warnings));
+        assert!(crate::CapabilityNeed::parse_ad_hoc(invalid).is_err());
     }
 }

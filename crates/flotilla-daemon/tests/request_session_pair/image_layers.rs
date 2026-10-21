@@ -1,6 +1,6 @@
 use flotilla_resources::{
     image_build_name, single_agent_workflow_spec, DockerImageSource, ImageBuild, ImageDelivery, ImageLayer, ImageLayerSource,
-    ImageLayerSpec, ImageLayerTier, ResourceObject,
+    ImageLayerSpec, ImageLayerTier, Project, ResourceObject,
 };
 
 use super::*;
@@ -33,7 +33,29 @@ async fn frozen_image(backend: &ResourceBackend, convoy: &ResourceObject<Convoy>
 // declares the same need share ONE ImageBuild named by identity; an
 // unresolvable need refuses routing with no convoy; the issuer authors nothing.
 async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
-    let hosts = vec![empty_daemon_named("image-home").await, empty_daemon_named("image-issuer").await];
+    // The fake provider stands in for the external issue tracker. Both routing
+    // and admission resolve the same source-qualified issue through real ports.
+    let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+    let reference = IssueRef { source: source.clone(), id: "3397".into() };
+    let mut hosts = Vec::new();
+    for name in ["image-home", "image-issuer"] {
+        let provider = Arc::new(flotilla_discovery_testkit::FakeIssueProvider::new());
+        let mut issue = TestIssue::new("Triage label").id("3397").with_labels(vec!["needs:multi-host".into()]).build();
+        issue.reference = reference.clone();
+        provider.add_issues(vec![(reference.id.clone(), issue)]).await;
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_issue_tracker(provider));
+        let config = test_config_store(tempfile::tempdir().unwrap().keep());
+        hosts.push(
+            InProcessDaemon::new(
+                vec![],
+                config,
+                discovery,
+                HostName::new(name),
+                Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+            )
+            .await,
+        );
+    }
     let home = Arc::clone(&hosts[0]);
     seed_host_capacity(&home, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
     home.set_local_placement_capabilities(&BTreeSet::from(["codex".into()]), &["cleat".into()]).await;
@@ -114,8 +136,25 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
         .expect("leg-need workflow");
     for host in &hosts {
         seed_trusted_remote_convoy_project(host, "flotilla").await;
+        let projects = host.resource_backend().using::<Project>("flotilla");
+        let mut project = projects.get("flotilla").await.unwrap();
+        let mut binding = flotilla_resources::IssueSourceBindingSpec::from(source.clone());
+        binding.alias = Some("flotilla".into());
+        project.spec.issue_source_bindings = vec![binding];
+        projects
+            .update(&InputMeta::builder().name("flotilla".into()).build(), &project.metadata.resource_version, &project.spec)
+            .await
+            .unwrap();
     }
     let mesh = spawn_in_memory_request_mesh(hosts).await.expect("mesh");
+    // Run the production demand service on either possible source owner; the
+    // paused-clock generated scenarios must not wait on an absent refresher.
+    let mut forge_services = Vec::new();
+    for host in &mesh.hosts {
+        let (service, ready) = flotilla_daemon::runtime::spawn_forge_read_demand_task(host.clone(), "flotilla".into());
+        forge_services.push(tokio_util::task::AbortOnDropHandle::new(service));
+        ready.await.expect("forge demand watches ready");
+    }
     eventually(Duration::from_secs(5), Duration::from_millis(10), "image catalogue and placement replicate", || async {
         let issuer = mesh.hosts[issuer].resource_backend();
         let mut replicated = issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
@@ -135,6 +174,7 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
                 .name(name.into())
                 .branch(format!("test/{name}"))
                 .needs(vec![need.into()])
+                .issues(vec![flotilla_protocol::IssueSelector::Reference(reference.clone())])
                 .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                 .build(),
         ),
@@ -157,7 +197,9 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     let command_id =
         mesh.clients[issuer].execute(Command::builder().action(start("composed-work")).build()).await.expect("dispatch composed admission");
     let result = await_command_result(&mut events, command_id).await;
-    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+    let CommandValue::ConvoyStarted { warnings, .. } = result else { panic!("{result:?}") };
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("3397") && warnings[0].contains("needs:multi-host"), "{warnings:?}");
     let convoys = backend.using::<Convoy>("flotilla").list().await.expect("convoys").items;
     assert_eq!(convoys.len(), 1);
     assert!(!convoys[0].metadata.annotations.contains_key("flotilla.work/frozen-image-layers"), "the retired annotation is never written");

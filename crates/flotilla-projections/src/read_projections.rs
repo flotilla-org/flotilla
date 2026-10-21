@@ -1655,6 +1655,7 @@ impl ReadProjections<'_> {
 
         let messages = message_views(self.backend, namespace, receivers.as_ref(), Some(&convoy), &receiver_aliases).await?;
         Ok(ConvoyExplanation {
+            warnings: convoy.spec.issues.iter().flat_map(|issue| issue.placement_needs().1).collect(),
             dispatch_scores: BTreeMap::new(),
             dispatch_score_error: None,
             degraded_checkouts: selected_vessels

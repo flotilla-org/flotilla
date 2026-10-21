@@ -188,6 +188,7 @@ fn fulfilment_list_distinguishes_image_and_host_model_support() {
 #[test]
 fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     let explanation = ConvoyExplanation {
+        warnings: Vec::new(),
         dispatch_scores: Default::default(),
         dispatch_score_error: None,
         degraded_checkouts: Default::default(),
@@ -359,6 +360,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
 #[test]
 fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
     let explanation = ConvoyExplanation {
+        warnings: vec!["issue flotilla#3397: skipped label `needs:multi-host`: invalid namespaced capability `multi-host`".into()],
         dispatch_scores: Default::default(),
         dispatch_score_error: None,
         degraded_checkouts: BTreeMap::from([("vessel-local/checkout-local".into(), "objects copied across filesystems".into())]),
@@ -410,6 +412,17 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
     };
 
     let output = format_convoy_explanation_human(&explanation);
+    // Glue: both human surfaces print the admission diagnostic verbatim.
+    assert!(output.contains(&format!("Warning: {}", explanation.warnings[0])));
+    let started = super::format_command_result(&flotilla_protocol::CommandValue::ConvoyStarted {
+        name: "triage-label@flotilla".into(),
+        naming: None,
+        warnings: explanation.warnings.clone(),
+        attach_plan: None,
+        binding: None,
+    });
+    assert!(started.contains(&format!("\nWarning: {}", explanation.warnings[0])));
+
     // #3090: the non-fatal copy fallback must remain visible in human explain.
     assert!(output.contains("Degraded checkout vessel-local/checkout-local: objects copied across filesystems"));
     assert!(output.contains("Fulfilment: macos-scarce on comte"), "{output}");

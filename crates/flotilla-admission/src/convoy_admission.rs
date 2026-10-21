@@ -709,7 +709,7 @@ impl ConvoyAdmission {
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
         dispatching_principal_ref: &PrincipalRef,
-    ) -> Result<(String, String, Option<ConvoyNaming>), String> {
+    ) -> Result<(String, String, Option<ConvoyNaming>, Vec<String>), String> {
         let mut admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
         self.check_prepared_placement_floors(namespace, &admission).await?;
         let _admission_guard = self.lock().await;
@@ -742,7 +742,8 @@ impl ConvoyAdmission {
         .await?;
         self.record_admission_naming(namespace, &admission.name, admission.naming.clone()).await;
         let address = convoy_address(&admission.spec.role, admission.spec.project_ref.as_deref());
-        Ok((admission.name, address, admission.naming))
+        let warnings = admission.spec.issues.iter().flat_map(|issue| issue.placement_needs().1).collect();
+        Ok((admission.name, address, admission.naming, warnings))
     }
 
     pub async fn check_local_free_space_floor(&self) -> Result<(), String> {
@@ -2434,11 +2435,7 @@ impl AdmissionReadContext<'_> {
     ) -> Result<BTreeSet<CapabilityNeed>, String> {
         let mut common = BTreeSet::new();
         for issue in issues {
-            for label in &issue.snapshot.labels {
-                if let Some(value) = label.strip_prefix("needs:") {
-                    common.insert(parse_ad_hoc_capability_need(value).map_err(|error| format!("issue {}: {error}", issue.reference.id))?);
-                }
-            }
+            common.extend(issue.placement_needs().0);
         }
         for value in &intent.needs {
             common.insert(parse_ad_hoc_capability_need(value)?);
@@ -4959,11 +4956,7 @@ pub fn validate_convoy_branch(branch: &str) -> Result<(), String> {
 }
 
 pub fn parse_ad_hoc_capability_need(value: &str) -> Result<CapabilityNeed, String> {
-    let need = value.parse::<CapabilityNeed>()?;
-    if matches!(&need, CapabilityNeed::Platform(platform) if platform == Platform::MATRIX_PLACEHOLDER) {
-        return Err("platform:$matrix is only valid on workflow roles or Project role needs".to_string());
-    }
-    Ok(need)
+    CapabilityNeed::parse_ad_hoc(value)
 }
 
 /// Image acquisition is a placement cost, after host liveness and before other
@@ -5906,6 +5899,57 @@ mod tests {
             let right = candidate("right", right.3, right.0, right.1, right.2);
             assert_eq!(placement_tiebreak.compare(&left, &right).is_lt(), left_wins, "{label}");
         }
+    }
+
+    // Issue #3645: tracker labels are untrusted hints; malformed needs must
+    // leave placement unchanged, while the same explicit --need is refused.
+    #[tokio::test]
+    async fn invalid_issue_need_does_not_refuse_admission() {
+        let fixture = handler_contract_fixture().await;
+        let project = ProjectSpec::builder().display_name("Example".into()).build();
+        let mut intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("example".into()).build();
+        let workflow = WorkflowTemplateSpec::builder()
+            .vessels(vec![VesselRequirement::builder()
+                .name("work".into())
+                .crew(vec![CrewSpec::builder()
+                    .role("coder".into())
+                    .source(CrewSource::Tool { command: "true".into() })
+                    .needs(BTreeSet::from([CapabilityNeed::Gpu]))
+                    .build()])
+                .build()])
+            .build();
+        let mut issue = ConvoyIssue {
+            reference: flotilla_protocol::IssueRef {
+                source: flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+                id: "3397".into(),
+            },
+            repository_ref: None,
+            snapshot: flotilla_resources::IssueSnapshot {
+                title: "Example".into(),
+                body: None,
+                state: flotilla_protocol::IssueState::Open,
+                labels: vec!["needs:multi-host".into()],
+                as_of: chrono::Utc::now(),
+            },
+        };
+        let mut composed = workflow.clone();
+        let needs = fixture
+            .owner
+            .compose_convoy_needs("flotilla", &project, &[issue.clone()], &intent, &mut composed)
+            .await
+            .expect("tracker label cannot refuse admission");
+        assert_eq!(needs, BTreeSet::from([CapabilityNeed::Gpu]));
+        assert_eq!(composed, workflow);
+        issue.snapshot.labels = vec!["needs:platform:windows".into()];
+        let needs = fixture.owner.compose_convoy_needs("flotilla", &project, &[issue], &intent, &mut composed).await.expect("valid label");
+        assert_eq!(needs, BTreeSet::from([CapabilityNeed::Gpu, CapabilityNeed::Platform("windows".into())]));
+        intent.needs.push("multi-host".into());
+        assert!(fixture
+            .owner
+            .compose_convoy_needs("flotilla", &project, &[], &intent, &mut composed)
+            .await
+            .unwrap_err()
+            .contains("invalid namespaced capability `multi-host`"));
     }
 
     // Placement matches every vessel's crew needs and policy independently.

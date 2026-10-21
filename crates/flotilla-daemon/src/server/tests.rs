@@ -2690,6 +2690,7 @@ expected_host_name = "feta"
                 repo_identity: RepoIdentity { authority: String::new(), path: String::new() },
                 repo: None,
                 result: CommandValue::ConvoyStarted {
+                    warnings: Vec::new(),
                     naming: None,
                     name: "remote-work".to_string(),
                     attach_plan: Some(flotilla_protocol::ResolvedAttachPlan::shell_command("cleat attach remote-session")),

@@ -137,6 +137,17 @@ impl FromStr for CapabilityNeed {
     }
 }
 
+impl CapabilityNeed {
+    /// Parse a dispatch need. Matrix placeholders belong only in authored roles.
+    pub fn parse_ad_hoc(value: &str) -> Result<Self, String> {
+        let need = value.parse::<Self>()?;
+        if matches!(&need, Self::Platform(platform) if platform == crate::Platform::MATRIX_PLACEHOLDER) {
+            return Err("platform:$matrix is only valid on workflow roles or Project role needs".to_string());
+        }
+        Ok(need)
+    }
+}
+
 impl fmt::Display for CapabilityNeed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
