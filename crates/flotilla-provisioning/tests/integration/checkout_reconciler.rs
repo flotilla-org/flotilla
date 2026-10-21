@@ -80,6 +80,7 @@ struct RecordingCheckoutRuntime {
     release_removal: Arc<Notify>,
     removal_blocked: Arc<Notify>,
     archive_path: Option<String>,
+    orphaned_path: Option<String>,
     path_exists: Option<bool>,
     protection_error: Option<String>,
     validation_failures: Mutex<usize>,
@@ -229,6 +230,9 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         }
         if self.failed_removal_target.as_deref() == Some(target_path) {
             return Err("permission denied removing root-owned debris".to_string());
+        }
+        if let Some(path) = &self.orphaned_path {
+            return Ok(CheckoutRemovalOutcome::PreservedOrphanedCheckout { path: path.clone() });
         }
         if let Some(archive_path) = &self.archive_path {
             return Ok(CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path: archive_path.clone() });
@@ -1682,4 +1686,34 @@ async fn ready_local_sibling_authorises_shared_branch_only_within_its_convoy() {
         matches!(reconciler.prepare(&foreign).await.expect("foreign prepare"), CheckoutPrepared::Failed(message) if message.contains("conflicts with Checkout"))
     );
     assert_eq!(runtime.local_clone_intents.lock().expect("intents").len(), 1);
+}
+
+// #2932: preservation is terminal and leaves a durable operator-visible event,
+// rather than keeping checkout deletion in a permanent error/retry loop.
+#[tokio::test]
+async fn orphaned_checkout_finalizer_records_preserved_path_and_finishes() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let path = "/checkouts/orphan";
+    let checkout = backend
+        .clone()
+        .using::<Checkout>(NAMESPACE)
+        .create(
+            &meta("orphan"),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-a".into(),
+                r#ref: "convoy/work".into(),
+                base_ref: Some("main".into()),
+                target_path: path.into(),
+                clone_ref: "missing-clone".into(),
+            }),
+        )
+        .await
+        .expect("checkout");
+    let runtime = Arc::new(RecordingCheckoutRuntime { orphaned_path: Some(path.into()), ..Default::default() });
+    let reconciler = CheckoutReconciler::new(runtime.clone(), backend.clone(), NAMESPACE);
+    reconciler.run_finalizer(&checkout).await.expect("terminal preservation finishes finalization");
+    let events = backend.using::<Event>(NAMESPACE).list().await.expect("events");
+    assert!(events.items.iter().any(|event| event.spec.reason == "OrphanedCheckoutPreserved" && event.spec.message.contains(path)));
+    assert!(matches!(runtime.removals.lock().expect("removals").as_slice(), [CheckoutRemoval::OrphanedWorktree { .. }]));
 }

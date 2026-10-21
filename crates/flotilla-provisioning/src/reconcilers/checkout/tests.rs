@@ -1131,6 +1131,43 @@ async fn checkout_runtime_removes_an_interrupted_fresh_clone() {
     assert!(!Path::new(&staging_path).exists());
 }
 
+// #2932: teardown terminates with an explicit preservation outcome after the
+// admin directory is pruned, including forced removal and a lost Clone resource.
+#[tokio::test]
+async fn pruned_worktree_registration_preserves_checkout_without_retry_error() {
+    let temp = TempDir::new().expect("tempdir");
+    let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+    let target = temp.path().join("orphan");
+    let runtime =
+        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let path = target.to_str().expect("target");
+    runtime.create_worktree(source.path().to_str().expect("source"), "convoy/work", Some("main"), path).await.expect("create");
+    fs::remove_dir_all(source.path().join(".git/worktrees/orphan")).expect("prune admin directory");
+    fs::write(target.join("untracked"), "recover me").expect("untracked work");
+    let removals = [
+        CheckoutRemoval::Worktree {
+            clone_path: source.path().to_str().expect("source").into(),
+            branch: "convoy/work".into(),
+            target_path: path.into(),
+        },
+        CheckoutRemoval::ForcedWorktree {
+            clone_path: source.path().to_str().expect("source").into(),
+            branch: "convoy/work".into(),
+            target_path: path.into(),
+        },
+        CheckoutRemoval::OrphanedWorktree { target_path: path.into() },
+    ];
+    for removal in removals {
+        for _ in 0..2 {
+            assert_eq!(
+                runtime.remove_checkout(&removal).await.expect("terminal preservation"),
+                CheckoutRemovalOutcome::PreservedOrphanedCheckout { path: path.into() }
+            );
+            assert_eq!(fs::read_to_string(target.join("untracked")).expect("preserved work"), "recover me");
+        }
+    }
+}
+
 // Issue #2675: losing the Clone resource must not strand a locked
 // registration when its remaining checkout is finalized.
 #[tokio::test]
