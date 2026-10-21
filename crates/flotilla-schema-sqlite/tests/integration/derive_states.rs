@@ -253,7 +253,7 @@ fn a_label_state_is_one_label_column_and_shared_data() {
     let ddl = render_ddl(&set);
     assert!(
         ddl.contains(
-            "CREATE TABLE \"ticket_notes\" (\n  \"owner\" INTEGER NOT NULL,\n  \"key\" TEXT NOT NULL,\n  \"value\" TEXT NOT NULL,"
+            "CREATE TABLE \"ticket_notes\" (\n  \"ticket\" INTEGER NOT NULL,\n  \"key\" TEXT NOT NULL,\n  \"value\" TEXT NOT NULL,"
         ),
         "{ddl}"
     );

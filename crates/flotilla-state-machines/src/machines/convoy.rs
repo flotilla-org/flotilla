@@ -22,6 +22,8 @@
 //! the resolution and quota as child tables of state data, which `keep`,
 //! `retract` and `readmit` change a row at a time), and the edge log.
 
+pub mod work;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_schema::{Address, Stored};

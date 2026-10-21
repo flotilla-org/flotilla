@@ -12,6 +12,7 @@ use flotilla_state_machines::{
     kinds,
     machines::{
         agent_session::{AgentSession, MemoryAgentSessionWorld},
+        awaiting_reply::{AwaitingReplyEdgeKind, AwaitingReplySpec},
         convoy::{
             Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyRequest, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId, VesselClass,
         },
@@ -24,7 +25,7 @@ use flotilla_state_machines::{
         vessel::{live_leases, Vessel},
     },
     placement::{Dimension, Host, Lease, Ledger, LedgerError, Request, VesselId},
-    AttemptPolicy, EdgePayload, Home, Label, Machine, Outcome, Ref, Resource, Version,
+    AttemptPolicy, Declared, EdgePayload, Home, Label, Machine, Outcome, Ref, Resource, Version,
 };
 
 // Kind codes are stored with every identity and change, so the production registry pins them,
@@ -50,6 +51,11 @@ fn kind_codes_are_pinned() {
     ];
     assert_eq!(declared, expected);
     assert_eq!(pinned, expected.map(|(kind, code)| (kind.to_owned(), code)));
+    // Declared ahead of its machine (#3587 layer 3): layer 4 registers `Resource<AwaitingReply>`
+    // under this code, which no production kind holds meanwhile.
+    let ahead = (Declared::<AwaitingReplySpec, AwaitingReplyEdgeKind>::KIND, Declared::<AwaitingReplySpec, AwaitingReplyEdgeKind>::CODE);
+    assert_eq!(ahead, ("AwaitingReply", KindCode::new("ar")));
+    assert!(registry.iter().all(|set| set.code != ahead.1));
 }
 
 fn project() -> Address {
@@ -295,4 +301,86 @@ fn live_leases_and_the_live_by_host_index_agree() {
     for state in states {
         assert_eq!(state.live(), codes.contains(&<LifecycleLabel as CodeEnum>::code(state.label())), "{state:?}");
     }
+}
+
+// Behaviour (#3587 layer 3): the declared Convoy and AwaitingReply kinds round-trip through their
+// row codec with every table filled (seats, promises with nested submissions, duties with a
+// WhileOpen scope and terms, the frozen kinds, quota and retired duties), so layer 4's machines
+// inherit working codecs. In memory only: nothing stores a declaration.
+#[test]
+fn declared_convoy_and_awaiting_reply_round_trip() {
+    use flotilla_schema::Records;
+    use flotilla_state_machines::machines::{
+        awaiting_reply::{Awaited, AwaitingReplySpec, AwaitingReplyState},
+        convoy::work::{
+            ConvoyEdgeKind as WorkEdgeKind, ConvoySpec as WorkSpec, ConvoyState as WorkState, Duty, DutyId, DutyScope, Progress,
+            Promise as WorkPromise, PromiseKind, PromiseKinds, Seat, SeatName, Source, Submission, Terms, VesselClass as Class,
+        },
+    };
+
+    let seat = |role: &str, seat: &str| SeatName { role: role.into(), seat: seat.into() };
+    let mut submissions = Records::new();
+    submissions.append(2, Submission { address: project(), revision: "abc".into(), by: seat("coder", "") }).expect("room");
+    let mut promises = Records::new();
+    promises
+        .append(
+            1,
+            WorkPromise {
+                id: PromiseId(0),
+                kind: "pr".into(),
+                target: project(),
+                source: Source::Dispatch,
+                owner: seat("coder", ""),
+                progress: State::new(Progress::Submitted, Timestamp(2)),
+                submissions,
+            },
+        )
+        .expect("room");
+    let mut seats = Records::new();
+    seats.append(1, Seat { role: "lead".into(), seat: String::new(), parent: None, supervised_by: project() }).expect("room");
+    seats
+        .append(1, Seat { role: "coder".into(), seat: "a".into(), parent: Some(seat("lead", "")), supervised_by: project() })
+        .expect("room");
+    let duties = [
+        (DutyId(0), Duty { owner: seat("lead", ""), scope: DutyScope::Lifetime, terms: Terms { heartbeat: Some(60), ..Terms::default() } }),
+        (
+            DutyId(1),
+            Duty {
+                owner: seat("coder", "a"),
+                scope: DutyScope::WhileOpen { promises: BTreeSet::from([PromiseId(0)]) },
+                terms: Terms { note: Some("answer reviews".into()), ..Terms::default() },
+            },
+        ),
+    ]
+    .into();
+    let kinds = PromiseKinds { kinds: [("pr".to_owned(), PromiseKind::default())].into() };
+    let spec = WorkSpec { project: project(), priority: Priority(3), kinds: Frozen::new(kinds).expect("frozen"), duties, seats, promises };
+    let state = State::new(
+        WorkState::Abandoned {
+            quota: [(Class("standard".into()), 2)].into(),
+            retired: BTreeSet::from([DutyId(0)]),
+            reason: "decision".into(),
+        },
+        Timestamp(5),
+    );
+    let convoy = Declared::<WorkSpec, WorkEdgeKind>::new(spec, state);
+    let decoded: Declared<WorkSpec, WorkEdgeKind> = Decoder::decode(Encoder::encode(&convoy).expect("encodes")).expect("decodes");
+    assert_eq!(decoded, convoy);
+
+    let spec = AwaitingReplySpec {
+        message: MessageRef::new("m1", "receiver-home"),
+        sender: project(),
+        recipient: project(),
+        subject: Some(project()),
+        kind: "stall".into(),
+        awaited: Awaited::Reply,
+        deadline: Some(Timestamp(9)),
+    };
+    let record = Declared::<AwaitingReplySpec, AwaitingReplyEdgeKind>::new(
+        spec,
+        State::new(AwaitingReplyState::Withdrawn { reason: "superseded".into() }, Timestamp(4)),
+    );
+    let decoded: Declared<AwaitingReplySpec, AwaitingReplyEdgeKind> =
+        Decoder::decode(Encoder::encode(&record).expect("encodes")).expect("decodes");
+    assert_eq!(decoded, record);
 }

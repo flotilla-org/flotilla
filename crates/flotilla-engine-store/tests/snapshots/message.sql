@@ -172,13 +172,13 @@ CREATE TABLE "message" (
       END)
 ) STRICT;
 CREATE TABLE "message_references" (
-  "owner" INTEGER NOT NULL,
+  "message" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "address" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "revision" TEXT NOT NULL,
   "subject" INTEGER NOT NULL CHECK ("subject" IN (0, 1)),
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "message" ("id") ON DELETE CASCADE
+  PRIMARY KEY ("message", "pos"),
+  FOREIGN KEY ("message") REFERENCES "message" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "message_by_reply" ON "message" ("in_reply_to") WHERE "in_reply_to" IS NOT NULL;
 CREATE INDEX "message_by_supersedes" ON "message" ("supersedes") WHERE "supersedes" IS NOT NULL;
@@ -237,7 +237,7 @@ CREATE VIEW "message_view" AS SELECT
   "message"."watermark"
 FROM "message";
 CREATE VIEW "message_references_view" AS SELECT
-  "message_references"."owner",
+  "message_references"."message",
   "message_references"."pos",
   (SELECT "s" FROM "strings" WHERE "id" = "message_references"."address") AS "address",
   "message_references"."revision",

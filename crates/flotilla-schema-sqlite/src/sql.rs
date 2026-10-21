@@ -297,12 +297,13 @@ impl TableSql {
             )
         } else {
             let key_match: Vec<String> = key_names.iter().enumerate().map(|(n, key)| format!(" AND {key} = ?{}", n + 2)).collect();
-            let insert = format!("INSERT INTO {name} (\"owner\"{}) VALUES (?1{})", prefixed(&names), prefixed_placeholders(2, names.len()));
+            let owner = quote_ident(set.parent_key_column());
+            let insert = format!("INSERT INTO {name} ({owner}{}) VALUES (?1{})", prefixed(&names), prefixed_placeholders(2, names.len()));
             // A collection row is put by its key: inserted, or its values replaced in place, so the
             // rows nested in it stay.
             let upsert = match table.role {
                 TableRole::Child | TableRole::State => {
-                    let conflict = format!("ON CONFLICT (\"owner\"{}) DO", prefixed(key_names));
+                    let conflict = format!("ON CONFLICT ({owner}{}) DO", prefixed(key_names));
                     if data.is_empty() {
                         format!("{insert} {conflict} NOTHING")
                     } else {
@@ -321,14 +322,14 @@ impl TableSql {
             (
                 insert,
                 upsert,
-                format!("DELETE FROM {name} WHERE \"owner\" = ?1{}", key_match.concat()),
-                format!("SELECT {} FROM {name} WHERE \"owner\" = ?1 ORDER BY {}", exprs.join(", "), key_names.join(", ")),
+                format!("DELETE FROM {name} WHERE {owner} = ?1{}", key_match.concat()),
+                format!("SELECT {} FROM {name} WHERE {owner} = ?1 ORDER BY {}", exprs.join(", "), key_names.join(", ")),
             )
         };
         let state_columns = table.fields.iter().filter(|field| field.state).flat_map(|field| field.columns.clone()).collect();
         let (mut fields, groups): (Vec<FieldSql>, Vec<GroupSql>) = match table.role {
             TableRole::Root | TableRole::Records => {
-                (table.fields.iter().map(|field| FieldSql::render(table, field)).collect(), GroupSql::render_all(table))
+                (table.fields.iter().map(|field| FieldSql::render(set, table, field)).collect(), GroupSql::render_all(set, table))
             }
             TableRole::Child | TableRole::History | TableRole::State => (Vec::new(), Vec::new()),
         };
@@ -338,7 +339,7 @@ impl TableSql {
             }
         }
         let last_position = match (table.role, table.parent) {
-            (TableRole::Records | TableRole::History, Some(parent)) => last_position(&set.tables[parent], table),
+            (TableRole::Records | TableRole::History, Some(parent)) => last_position(set, &set.tables[parent], table),
             _ => String::new(),
         };
         TableSql {
@@ -364,7 +365,7 @@ impl TableSql {
 }
 
 impl FieldSql {
-    fn render(table: &Table, field: &FieldColumns) -> FieldSql {
+    fn render(set: &TableSet, table: &Table, field: &FieldColumns) -> FieldSql {
         let name = quote_ident(&table.name);
         let columns = &table.columns[field.columns.clone()];
         let update = if table.parent.is_none() {
@@ -372,11 +373,11 @@ impl FieldSql {
             let next = 2 + columns.len();
             format!("UPDATE {name} SET \"version\" = ?1, {} WHERE \"id\" = ?{next} AND \"version\" = ?{}", set.join(", "), next + 1)
         } else {
-            let set = assignments(columns, 1);
+            let assigned = assignments(columns, 1);
             let owner = 1 + columns.len();
             let key: Vec<String> =
                 table.key.iter().enumerate().map(|(n, key)| format!(" AND {} = ?{}", quote_ident(&key.name), owner + 1 + n)).collect();
-            format!("UPDATE {name} SET {} WHERE \"owner\" = ?{owner}{}", set.join(", "), key.concat())
+            format!("UPDATE {name} SET {} WHERE {} = ?{owner}{}", assigned.join(", "), quote_ident(set.parent_key_column()), key.concat())
         };
         FieldSql {
             name: field.name.clone(),
@@ -391,7 +392,7 @@ impl FieldSql {
 
 impl GroupSql {
     /// One group per label field that has column datums.
-    fn render_all(table: &Table) -> Vec<GroupSql> {
+    fn render_all(set: &TableSet, table: &Table) -> Vec<GroupSql> {
         table
             .fields
             .iter()
@@ -401,12 +402,12 @@ impl GroupSql {
                 let datums = table.fields.iter().enumerate().filter(|(_, datum)| datum.datum_of.as_deref() == Some(field.name.as_str()));
                 let mut members = vec![label];
                 members.extend(datums.map(|(index, _)| index));
-                (members.len() > 1).then(|| GroupSql::render(table, members))
+                (members.len() > 1).then(|| GroupSql::render(set, table, members))
             })
             .collect()
     }
 
-    fn render(table: &Table, fields: Vec<usize>) -> GroupSql {
+    fn render(set: &TableSet, table: &Table, fields: Vec<usize>) -> GroupSql {
         let name = quote_ident(&table.name);
         let root = table.parent.is_none();
         let mut next = if root { 2 } else { 1 };
@@ -425,7 +426,7 @@ impl GroupSql {
         } else {
             let key: Vec<String> =
                 table.key.iter().enumerate().map(|(n, key)| format!(" AND {} = ?{}", quote_ident(&key.name), next + 1 + n)).collect();
-            format!("UPDATE {name} SET {} WHERE \"owner\" = ?{next}{}", sets.join(", "), key.concat())
+            format!("UPDATE {name} SET {} WHERE {} = ?{next}{}", sets.join(", "), quote_ident(set.parent_key_column()), key.concat())
         };
         GroupSql { fields, update }
     }
@@ -434,7 +435,8 @@ impl GroupSql {
 /// The last position of `table` under one row of `parent`, read backwards through the primary
 /// key's range so it is one index probe however long the table is. The outer select by the
 /// parent's primary key returns no row when the parent row is missing.
-fn last_position(parent: &Table, table: &Table) -> String {
+fn last_position(set: &TableSet, parent: &Table, table: &Table) -> String {
+    let owner = quote_ident(set.parent_key_column());
     let inner_key: Vec<String> =
         table.parent_key().iter().enumerate().map(|(n, key)| format!(" AND {} = ?{}", quote_ident(&key.name), n + 2)).collect();
     let outer = if parent.parent.is_none() {
@@ -442,10 +444,10 @@ fn last_position(parent: &Table, table: &Table) -> String {
     } else {
         let key: Vec<String> =
             parent.key.iter().enumerate().map(|(n, key)| format!(" AND {} = ?{}", quote_ident(&key.name), n + 2)).collect();
-        format!("\"owner\" = ?1{}", key.concat())
+        format!("{owner} = ?1{}", key.concat())
     };
     format!(
-        "SELECT (SELECT \"pos\" FROM {} WHERE \"owner\" = ?1{} ORDER BY \"pos\" DESC LIMIT 1) FROM {} WHERE {outer}",
+        "SELECT (SELECT \"pos\" FROM {} WHERE {owner} = ?1{} ORDER BY \"pos\" DESC LIMIT 1) FROM {} WHERE {outer}",
         quote_ident(&table.name),
         inner_key.concat(),
         quote_ident(&parent.name)
@@ -514,16 +516,16 @@ mod tests {
              FROM \"convoy\" WHERE \"id\" = ?1"
         );
         let steps = &sql.tables[1];
-        assert_eq!(steps.insert, "INSERT INTO \"convoy_steps\" (\"owner\", \"pos\", \"label\") VALUES (?1, ?2, ?3)");
+        assert_eq!(steps.insert, "INSERT INTO \"convoy_steps\" (\"convoy\", \"pos\", \"label\") VALUES (?1, ?2, ?3)");
         assert_eq!(
             steps.upsert,
-            "INSERT INTO \"convoy_steps\" (\"owner\", \"pos\", \"label\") VALUES (?1, ?2, ?3) \
-             ON CONFLICT (\"owner\", \"pos\") DO UPDATE SET \"label\" = excluded.\"label\""
+            "INSERT INTO \"convoy_steps\" (\"convoy\", \"pos\", \"label\") VALUES (?1, ?2, ?3) \
+             ON CONFLICT (\"convoy\", \"pos\") DO UPDATE SET \"label\" = excluded.\"label\""
         );
-        assert_eq!(steps.delete, "DELETE FROM \"convoy_steps\" WHERE \"owner\" = ?1 AND \"pos\" = ?2");
+        assert_eq!(steps.delete, "DELETE FROM \"convoy_steps\" WHERE \"convoy\" = ?1 AND \"pos\" = ?2");
         assert_eq!(
             steps.select,
-            "SELECT \"convoy_steps\".\"pos\", \"convoy_steps\".\"label\" FROM \"convoy_steps\" WHERE \"owner\" = ?1 ORDER BY \"pos\""
+            "SELECT \"convoy_steps\".\"pos\", \"convoy_steps\".\"label\" FROM \"convoy_steps\" WHERE \"convoy\" = ?1 ORDER BY \"pos\""
         );
     }
 
@@ -556,17 +558,17 @@ mod tests {
         );
         assert_eq!(
             deliverables.fields[0].update,
-            "UPDATE \"convoy_deliverables\" SET \"state\" = ?1 WHERE \"owner\" = ?2 AND \"pos\" = ?3"
+            "UPDATE \"convoy_deliverables\" SET \"state\" = ?1 WHERE \"convoy\" = ?2 AND \"pos\" = ?3"
         );
         assert_eq!(
             deliverables.last_position,
-            "SELECT (SELECT \"pos\" FROM \"convoy_deliverables\" WHERE \"owner\" = ?1 ORDER BY \"pos\" DESC LIMIT 1) \
+            "SELECT (SELECT \"pos\" FROM \"convoy_deliverables\" WHERE \"convoy\" = ?1 ORDER BY \"pos\" DESC LIMIT 1) \
              FROM \"convoy\" WHERE \"id\" = ?1"
         );
         assert_eq!(
             evidence.last_position,
-            "SELECT (SELECT \"pos\" FROM \"convoy_deliverables_evidence\" WHERE \"owner\" = ?1 AND \"deliverables_pos\" = ?2 \
-             ORDER BY \"pos\" DESC LIMIT 1) FROM \"convoy_deliverables\" WHERE \"owner\" = ?1 AND \"pos\" = ?2"
+            "SELECT (SELECT \"pos\" FROM \"convoy_deliverables_evidence\" WHERE \"convoy\" = ?1 AND \"deliverables_pos\" = ?2 \
+             ORDER BY \"pos\" DESC LIMIT 1) FROM \"convoy_deliverables\" WHERE \"convoy\" = ?1 AND \"pos\" = ?2"
         );
         assert!(root.last_position.is_empty() && evidence.fields.is_empty());
     }

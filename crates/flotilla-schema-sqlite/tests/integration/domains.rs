@@ -168,6 +168,24 @@ fn a_pre_domain_dictionary_is_refused_at_open() {
     assert!(matches!(Store::open(conn, "local", registry()), Err(StoreError::LegacyDictionarySchema)));
 }
 
+// Behaviour (#3627 look-over ruling 3): a kind table written before its parent key was named
+// after its root table (`owner`) is refused at open, rather than read as empty: SQLite takes the
+// unknown double-quoted `"domain_pair"` in a load's WHERE clause for a string literal.
+#[test]
+fn a_kind_table_with_other_columns_is_refused_at_open() {
+    let conn = Connection::open_in_memory().expect("connection");
+    conn.execute_batch(
+        "CREATE TABLE domain_pair_watchers (owner INTEGER NOT NULL, value INTEGER NOT NULL, PRIMARY KEY (owner, value)) STRICT, WITHOUT ROWID;",
+    )
+    .expect("pre-rename table");
+    let refused = Store::open(conn, "local", registry());
+    assert!(
+        matches!(&refused, Err(StoreError::KindTableDrift { table, found, .. }) if table == "domain_pair_watchers" && found[0] == "owner"),
+        "{:?}",
+        refused.err()
+    );
+}
+
 // Behaviour (review #5): the standalone audit works with a read-only connection and leaves the
 // database unchanged. The same production function is used by the operator example.
 #[test]

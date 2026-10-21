@@ -101,16 +101,18 @@ fn equal_interned_strings_share_one_row_per_domain() {
     let distinct: i64 = conn
         .query_row(
             "SELECT count(DISTINCT m.sender) + count(DISTINCT r.service) \
-             FROM referral m JOIN referral_references r ON r.owner = m.id",
+             FROM referral m JOIN referral_references r ON r.referral = m.id",
             [],
             |row| row.get(0),
         )
         .expect("count");
     assert_eq!(distinct, 2, "each column shares its domain row across resources");
     let same: i64 = conn
-        .query_row("SELECT count(*) FROM referral m JOIN referral_references r ON r.owner = m.id WHERE m.sender = r.service", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT count(*) FROM referral m JOIN referral_references r ON r.referral = m.id WHERE m.sender = r.service",
+            [],
+            |row| row.get(0),
+        )
         .expect("count");
     assert_eq!(same, 0, "agent and service domains have different ids");
 }

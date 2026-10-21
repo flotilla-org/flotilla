@@ -1,6 +1,8 @@
 //! The shared tables every kind's tables reference.
 
-use crate::{quote_ident, render_ddl_with, render_views, DdlMode, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD};
+use std::collections::BTreeSet;
+
+use crate::{quote_ident, render_ddl_with, render_views, DdlMode, StoreError, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD};
 use flotilla_schema::KindRegistry;
 use rusqlite::{Connection, OptionalExtension};
 
@@ -245,6 +247,27 @@ pub(crate) fn sync_views(conn: &Connection, kinds: &KindRegistry) -> rusqlite::R
 /// Startup-only metadata guard: fail clearly before a pre-domain dictionary reaches a writer.
 pub(crate) fn has_string_domain(conn: &Connection) -> rusqlite::Result<bool> {
     conn.query_row("SELECT EXISTS (SELECT 1 FROM pragma_table_info('strings') WHERE name = 'domain')", [], |row| row.get(0))
+}
+
+/// Refuses a kind table whose columns differ from its kind's: the backend's own columns (`id` and
+/// `version` on the root, the parent key below it), and the key and data columns. Order is not
+/// compared: statements name their columns, and an additive upgrade (`ADD COLUMN`) appends.
+pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Result<(), StoreError> {
+    let mut statement = conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
+    for set in kinds.iter() {
+        for table in &set.tables {
+            let mut expected: Vec<String> = match table.parent {
+                None => vec!["id".into(), "version".into()],
+                Some(_) => vec![set.parent_key_column().to_owned()],
+            };
+            expected.extend(table.key.iter().chain(&table.columns).map(|column| column.name.clone()));
+            let found = statement.query_map([&table.name], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+            if found.iter().collect::<BTreeSet<_>>() != expected.iter().collect::<BTreeSet<_>>() {
+                return Err(StoreError::KindTableDrift { table: table.name.clone(), expected, found });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Shared progress views use the same sync-on-open policy as kind views.
