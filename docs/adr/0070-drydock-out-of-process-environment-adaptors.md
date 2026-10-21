@@ -312,3 +312,45 @@ These are named as later work, not ruled out:
 - shared host endpoints, which would need guest-to-host streams that carry the vessel's identity.
 
 The last three need coordination between controllers when they are designed.
+
+## Amendment (2026-10-21, daemon homes and provider-only configuration; drydock#41)
+
+The owner clarified the process boundary after trying the standalone CLI against
+Daytona. This supersedes the earlier unconditional statement that flotillad
+embeds drydock and the earlier host-oriented CLI/configuration examples.
+
+- **The long-lived drydock has two possible homes.** A standalone `drydockd`
+  wraps the crate; flotillad can be the daemon instead. Whether flotillad embeds
+  the crate or delegates to the standalone daemon is decided later. Its caller
+  uses a trait matching the provider API so either implementation fits. Several
+  independent drydocks per flotillad are not designed now.
+- **The CLI is a daemon client.** It finds the companion daemon beside itself
+  and starts it on demand, following flotilla/flotillad. Managed host supervision,
+  polling, status caching and credential refresh continue between commands.
+- **The daemon serves the provider API**, `/v1/providers/{provider}/…`, and
+  routes providers to their language hosts. When flotillad is that daemon, it
+  serves the same API; the CLI does not change. Host configuration and credential
+  refresh remain daemon-to-host operations on authenticated connections.
+- **User configuration names providers only.** TOML provider tables choose a
+  module and contain opaque `settings`, a sibling `credential` reference, and
+  optional drydock-read defaults for image, size and egress. Users declare no
+  hosts or module registry. Drydock asks hosts which modules they can load and
+  chooses the process layout and provider placement. External hosts remain a
+  daemon option. `hello` reports loadable modules as well as loaded ones.
+
+The standalone config follows rigging's XDG policy at
+`~/.config/drydock/drydock.toml`. Its Unix socket intentionally lives at
+`run/drydock.sock` under the config directory, following flotillad's current
+layout; designing a separate runtime directory is deferred. Admission checks
+kernel peer credentials. Commands use the provider and its opaque `id`; labels
+remain client environment IDs, not operator handles.
+
+The daemon crate's build owns the tools-digest selection point. Until
+[drydock#53](https://github.com/flotilla-org/drydock/issues/53) supplies the tools
+image, it selects the interim identity accepted by today's modules: Daytona's
+operator-baked agent and configured `agent_command`. This amendment adds no
+agent/tools build dependency. Bare `ubuntu:24.04` launch acceptance belongs to
+[drydock#54](https://github.com/flotilla-org/drydock/issues/54). Standalone launch
+prepares implicitly, merges per-provider defaults with flags, generates a vessel
+label and SSH key, and defaults to Open egress (Advisory with today's modules).
+The low-level provider protocol retains deny-all as its default.
