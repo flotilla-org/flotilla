@@ -27,6 +27,19 @@ fn context() -> ResolutionContext {
     }
 }
 
+// Keep cleanup fast without accidentally matching a future `sleep 10` or
+// silently retaining production delays when the watchdog text changes.
+#[cfg(unix)]
+fn fast_docker_cleanup_wrapper(wrapper: &str) -> String {
+    let mut wrapper = wrapper.to_owned();
+    for seconds in [5, 1] {
+        let original = format!("        sleep {seconds}\n");
+        assert_eq!(wrapper.matches(&original).count(), 1, "expected one cleanup watchdog sleep: {original:?}");
+        wrapper = wrapper.replace(&original, "        sleep 0.05\n");
+    }
+    wrapper
+}
+
 fn command(action: &ResolvedAction) -> &[Arg] {
     let ResolvedAction::Command(args) = action;
     args
@@ -279,7 +292,7 @@ fn docker_attach_cleanup_is_bounded_when_transport_hangs() {
     resolver.resolve_wrap(&environment, &mut context).expect("known environment");
     let [ResolvedAction::Command(args)] = context.actions.as_slice() else { panic!("expected one supervised command") };
     let Arg::Quoted(wrapper) = &args[2] else { panic!("wrapper must be a quoted shell program") };
-    let wrapper = wrapper.replace("sleep 5", "sleep 0.05").replace("sleep 1", "sleep 0.05");
+    let wrapper = fast_docker_cleanup_wrapper(wrapper);
 
     let temp = tempfile::tempdir().expect("fake Docker directory");
     let docker = temp.path().join("docker");
@@ -417,6 +430,7 @@ fn resolved_ssh_connections_preserve_lookup_and_multiplex(tc: hegel::TestCase) {
         assert_eq!(args.contains(&Arg::Literal("ControlMaster=auto".into())), multiplex);
     }
 }
+
 // An empty command enters the image's login shell (or /bin/sh if SHELL is
 // absent/empty) at the requested directory. Explicit commands retain their
 // arguments, directory and exit status instead of entering a login shell.
@@ -492,7 +506,7 @@ exec "$@"
         let resolved = resolver.resolve(&plan, &mut context).expect("resolve shell hop");
         let mut child = Command::new("sh");
         // Shorten only the cleanup watchdog, as in the other wrapper tests.
-        let rendered = flatten(command(&resolved.0[0]), 0).replace("sleep 5", "sleep 0.05").replace("sleep 1", "sleep 0.05");
+        let rendered = fast_docker_cleanup_wrapper(&flatten(command(&resolved.0[0]), 0));
         child.args(["-c", &rendered]).env("PATH", &path).env_remove("SHELL");
         if let Some(value) = shell_env {
             child.env("SHELL", value);
