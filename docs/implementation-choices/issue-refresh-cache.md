@@ -20,9 +20,11 @@ page windows; it lives until demand or the source disappears.
 Unregistering on an error discards the expensive provider cache and converts a
 retry into a full query. Keeping the registration but requesting a full reload
 has the same network amplification. Retaining the cursor and caching the failed
-observation shares the retry across filtered windows. Consecutive failures
-increase the existing source polling interval exponentially, capped by the
-viewed/governed interval; success resets the failure counter. GitHub budget reset
+observation shares the retry across filtered windows. Consecutive changed-since
+failures increase the existing source polling interval exponentially, capped by the
+viewed/governed interval; success resets the failure counter. Page-query failures
+do not increment this counter; an unsuccessful initial load still needs its first page and retries at the per-query refresh
+cadence, retaining the registered provider. GitHub budget reset
 suspension remains stronger than this interval. Unrelated sources keep polling.
 
 The assumption is that a refresh error does not prove source removal. The
