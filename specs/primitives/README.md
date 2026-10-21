@@ -39,11 +39,17 @@ Every variable still receives an assignment, and world variables stay separate.
 The step blocks contain no assignment lists or machine rules. Imported variants use bare names in
 `match` patterns (constructors in expressions remain qualified).
 
-Convoy admission accepts `{project, promises, duties, quota, priority}` (#3587
-spec ruling). Admission needs an obligation: at least one promise or one
+Convoy admission accepts `{project, promises, duties, seats, quota, priority}`
+(#3587 spec ruling). Admission needs an obligation: at least one promise or one
 convoy-lifetime duty (`NoObligations`). Each admitted promise keeps its opaque
-kind/target data, its source (template, dispatch or crew) and its owner seat;
-seats are compared only for equality, and seat relations are the caller's.
+kind/target data, its source (template, dispatch or crew) and its owner seat.
+Seats (proposal for the layer 4 ruling) are records of the convoy, each with
+the seat it was created under and an opaque `supervisedBy`; every owner, and
+every parent, must be a seat (`UnknownSeat`). Fan-out adds a seat under an
+existing one (`AddSeat`, refused `SeatExists` for a name ever used), and
+`Resupervise` re-points a seat's supervisor; both are authorised by the
+caller, as `Abandon` is. Authority classes are worked out by the caller from
+these relations.
 Admission fixes the project, the duties and the priority; promises are work
 state, since the crew's `Declare` adds one while the convoy is Open (refused
 for an id ever used, retracted ids included), and the quota in force is work
@@ -64,7 +70,7 @@ crew-declared promise its owner's alone before any submission and its owner's
 supervisor's after, and an operator may retract any promise. A verdict keep
 follows the same rule, except that an owner never keeps its own promise.
 `Reassign` (by the owner, its supervisor or an operator) moves a Pending or
-Submitted promise and its submissions to another seat. A settled promise
+Submitted promise and its submissions to another known seat. A settled promise
 refuses every promise edge (`PromiseSettled`), and `Kept` is final.
 
 Duties sit beside promises: an owner seat, a scope and opaque terms, never

@@ -28,7 +28,7 @@ module convoy_deliver {
       C::admitRequest(1, { project: "project", projectKnown: true,
         promises: promises.mapBy(_ => { promise: definition, source: source, owner: "a" }),
         duties: if (lifetimeDuty) Map(0 -> { owner: "a", scope: C::Lifetime, terms: "terms" }) else Map(),
-        quota: Map(0 -> 1, 1 -> 1), priority: 1 }),
+        seats: Map("a" -> { parent: C::Root, supervisedBy: "op" }), quota: Map(0 -> 1, 1 -> 1), priority: 1 }),
       keepWorld,
     }
   }
@@ -47,6 +47,9 @@ module convoy_deliver {
       { nondet authority = authorities.oneOf() all { C::retract(1, p, seat, authority, reason), keepWorld } },
       { nondet authority = authorities.oneOf() all { C::reassign(1, p, "b", seat, authority), keepWorld } },
       all { C::retireDuty(1, 0, auth), keepWorld },
+      // Fan-out of "b" under a seat that may be unknown, and its supervision re-pointed.
+      { nondet parent = Set("a", "z").oneOf() all { C::addSeat(1, "b", parent, "a", auth), keepWorld } },
+      all { C::resupervise(1, "b", "op", auth), keepWorld },
       all { C::deliver(1), keepWorld },
       all { C::abandon(1, auth, reason), keepWorld },
       all { C::readmit(1, Map(0 -> 2, 1 -> 1), auth), keepWorld },
@@ -77,7 +80,13 @@ module convoy_deliver {
       })
     | _ => true
   })
-  val safety = everyConvoyObliged and deliveredSettled and settledPromisesFinal and submittedHasSubmission and ownerRetractsOnlyUnsubmitted
+  // Every promise and duty owner is a seat, and every seat's parent is a seat.
+  val ownersAreSeats = everyState(s => C::work(s).promises.keys().forall(p => C::work(s).seats.keys().contains(C::work(s).promises.get(p).owner))
+    and C::work(s).spec.duties.keys().forall(d => C::work(s).seats.keys().contains(C::work(s).spec.duties.get(d).owner)))
+  val seatTreeClosed = everyState(s => C::work(s).seats.keys().forall(seat => match C::work(s).seats.get(seat).parent {
+    | Root => true | Under(q) => C::work(s).seats.keys().contains(q)
+  }))
+  val safety = ownersAreSeats and seatTreeClosed and everyConvoyObliged and deliveredSettled and settledPromisesFinal and submittedHasSubmission and ownerRetractsOnlyUnsubmitted
   // No inductive invariant: an explicit universe of every owned-promise shape
   // is beyond Apalache in a crew's memory, and the fast tier exhausts this
   // scenario's complete finite graph, which covers every depth at its bounds.

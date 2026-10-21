@@ -1,0 +1,10 @@
+--- a/machines/convoy.qnt
++++ b/machines/convoy.qnt
+@@ -159,7 +159,6 @@
+           else Moved(Open({ ...w, retired: w.retired.union(Set(a.duty)) }))
+       | AddSeat(a) => if (not(a.authorised)) Refused(Unauthorised)
+           else if (w.seats.keys().contains(a.seat)) Refused(SeatExists)
+-          else if (not(w.seats.keys().contains(a.parent))) Refused(UnknownSeat)
+           else Moved(Open({ ...w, seats: w.seats.put(a.seat, { parent: Under(a.parent), supervisedBy: a.supervisedBy }) }))
+       // Re-pointing to the current supervisor is an accepted no-op edge.
+       | Resupervise(a) => if (not(a.authorised)) Refused(Unauthorised)
