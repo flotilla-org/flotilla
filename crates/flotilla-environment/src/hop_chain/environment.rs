@@ -45,8 +45,9 @@ fi
 docker "$@"
 "#;
 
-pub(super) const DOCKER_ATTACH_INNER_WRAPPER: &str =
-    r#"umask 077; set -C; exec 3>"$1" || exit 1; printf '%s\n' "$$" >&3; exec 3>&-; shift; exec "$@""#;
+pub(super) const DOCKER_ATTACH_INNER_WRAPPER: &str = r#"umask 077; set -C; exec 3>"$1" || exit 1; printf '%s\n' "$$" >&3; exec 3>&-; shift
+if [ "$#" -eq 0 ]; then exec "${SHELL:-/bin/sh}" -l; fi
+exec "$@""#;
 
 /// Resolves a `Hop::EnterEnvironment` into environment-specific actions on the context.
 ///
