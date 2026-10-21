@@ -222,8 +222,8 @@ pub struct Duty {
 /// The promise kinds admission used, frozen into the convoy so a charter
 /// edited mid-flight never changes a running convoy's rules (#3587 kinds
 /// ruling). Each kind composes the code-owned condition vocabulary into its
-/// durable, ready and kept rules; the vocabulary and the stock kinds are
-/// layer 5's, which may reshape this document without a schema change.
+/// durable, ready and kept rules; [`crate::kinds::Catalog::freeze`] builds it
+/// from the stock and charter definitions.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromiseKinds {
     pub kinds: BTreeMap<String, PromiseKind>,
@@ -932,8 +932,8 @@ fn may_reassign(promise: &Promise, by: &SeatName, authority: Authority) -> bool 
     }
 }
 
-// The kind is opaque here: whether it is one of the frozen promise kinds is
-// the promise kinds' check (#3587 layer 5).
+// The kind is opaque here, as in the spec: the write path declares only a
+// kind the convoy froze (`crate::kinds`).
 fn gate_declare(h: &mut Handle<'_, Convoy>, declare: &Declare) -> Result<(), ConvoyRefusal> {
     if h.spec().promise(declare.promise).is_some() {
         return Err(ConvoyRefusal::PromiseExists);

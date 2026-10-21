@@ -21,6 +21,11 @@
 //!   submissions naming the change request's address, through `by_address`, joined to their
 //!   promise and to the convoy's root row to keep Open convoys; then the same lookup with the index
 //!   dropped, for comparison.
+//!
+//! Promise kinds (#3587 layer 5): each admission resolves the stock kinds with a charter that
+//! tightens `pr` and freezes the kind it used; the frozen document is content-addressed, so the
+//! store keeps one object for all 10,000 convoys. Per event, the `pr` kind's ready and kept rules
+//! are judged over in-memory observations.
 
 use std::{
     env, fs,
@@ -34,6 +39,7 @@ use flotilla_engine_store::{convoy_registry, StoreLog};
 use flotilla_schema::{Address, Frozen, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
+    kinds::{stock, Catalog, KindDefinition, Observation, Observations, Rule, Template},
     machines::convoy::{
         AdmittedPromise, Convoy, ConvoyRequest, ConvoySpec, Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority, PromiseId,
         PromiseKinds, PromiseSource, Seat, SeatName, Submit, Terms, VesselClass,
@@ -84,6 +90,37 @@ fn seat(role: &str) -> SeatName {
     SeatName::new(role, "")
 }
 
+/// The stock kinds under a charter that also requires an approving review before `pr` is kept.
+fn catalog() -> Catalog {
+    let tightened = KindDefinition {
+        name: "pr".into(),
+        extends: Some("pr".into()),
+        kept: vec!["$cr .review == approved".parse::<Template>().expect("template")],
+        ..KindDefinition::default()
+    };
+    Catalog::resolve(&stock(), &[tightened]).expect("kinds resolve")
+}
+
+fn frozen_kinds() -> Frozen<PromiseKinds> {
+    catalog().freeze(["pr"]).expect("freeze")
+}
+
+/// A merged, approved, passing change request.
+struct Merged;
+
+impl Observations for Merged {
+    fn observe(&self, observation: Observation, _: &Address) -> Option<String> {
+        let value = match observation {
+            Observation::ChangeRequestState => "merged",
+            Observation::ChangeRequestChecks => "pass",
+            Observation::ChangeRequestReview => "approved",
+            Observation::ChangeRequestMergeable => "true",
+            _ => return None,
+        };
+        Some(value.to_owned())
+    }
+}
+
 fn request(n: usize) -> ConvoyRequest {
     let promise =
         || AdmittedPromise { kind: "pr".into(), target: address("target"), source: PromiseSource::Template, owner: seat("coder") };
@@ -97,7 +134,7 @@ fn request(n: usize) -> ConvoyRequest {
         ],
         quota: [(VesselClass::new("standard"), 2), (VesselClass::new("large"), 1)].into(),
         priority: Priority(1),
-        kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
+        kinds: frozen_kinds(),
     }
 }
 
@@ -250,7 +287,28 @@ fn convoy_load() {
         CONVOYS / PROJECTS
     );
 
+    let started = Instant::now();
+    for _ in 0..CONVOYS {
+        std::hint::black_box(frozen_kinds());
+    }
+    let freeze_micros = started.elapsed().as_secs_f64() * 1e6 / CONVOYS as f64;
+    eprintln!("{:>34}: {freeze_micros:>8.1} µs/admission (stock and charter kinds resolved, pr frozen)", "kinds resolve and freeze");
+    let pr = catalog().get("pr").expect("pr").clone();
+    let started = Instant::now();
+    for n in 0..CONVOYS {
+        let address = change(n, 0);
+        assert_eq!(pr.holds(Rule::Kept, &address, "abc", &Merged), Some(true));
+        assert_eq!(pr.holds(Rule::Ready, &address, "abc", &Merged), Some(false));
+    }
+    let judge_micros = started.elapsed().as_secs_f64() * 1e6 / CONVOYS as f64;
+    eprintln!("{:>34}: {judge_micros:>8.1} µs/event (pr kept and ready rules)", "kinds judged");
+
     let read = Connection::open(&local_db.0).expect("read connection");
+    let (objects, bytes): (i64, i64) = read
+        .query_row("SELECT count(*), coalesce(sum(length(bytes)), 0) FROM objects", [], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("objects");
+    assert_eq!(objects, 1, "every convoy shares the one frozen kinds document");
+    eprintln!("{:>34}: {objects} object, {bytes} bytes for {CONVOYS} convoys", "frozen kinds stored");
     let projects: Vec<String> = (0..PROJECTS).map(|n| project(n).as_str().to_owned()).collect();
     report("open_by_project", &measure(&read, OPEN_BY_PROJECT, &projects));
     // Mostly replicas, as the events arrive: every tenth change request is a local convoy's.
