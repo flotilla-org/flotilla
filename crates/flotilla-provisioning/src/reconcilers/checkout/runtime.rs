@@ -194,10 +194,11 @@ impl CheckoutControllerRuntime {
                 let registration = if runner.path_exists(&Path::new(target_path).join(".git")).await? {
                     let vcs = controller_vcs(&self.vcs, &self.runner, target_path)?;
                     if let Err(error) = vcs.checkout_registration(target_path, CheckoutRegistration::Release).await {
-                        if vcs.orphaned_worktree(target_path).await? {
-                            return Ok(CheckoutRemovalOutcome::PreservedOrphanedCheckout { path: target_path.to_string() });
-                        }
-                        return Err(error);
+                        return match vcs.orphaned_worktree(target_path).await {
+                            Ok(true) => Ok(CheckoutRemovalOutcome::PreservedOrphanedCheckout { path: target_path.to_string() }),
+                            Ok(false) => Err(error),
+                            Err(probe_error) => Err(format!("{error}; orphaned worktree probe failed: {probe_error}")),
+                        };
                     }
                     Some(vcs)
                 } else {

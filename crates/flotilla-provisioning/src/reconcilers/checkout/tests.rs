@@ -1144,6 +1144,31 @@ async fn pruned_worktree_registration_preserves_checkout_without_retry_error() {
     runtime.create_worktree(source.path().to_str().expect("source"), "convoy/work", Some("main"), path).await.expect("create");
     fs::remove_dir_all(source.path().join(".git/worktrees/orphan")).expect("prune admin directory");
     fs::write(target.join("untracked"), "recover me").expect("untracked work");
+    // Runner boundary: fail the orphan probe after Release has failed, so both
+    // errors must remain available to the operator and the directory stays safe.
+    struct FailOrphanProbeRunner;
+    #[async_trait]
+    impl CommandRunner for FailOrphanProbeRunner {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            ProcessCommandRunner.run(cmd, args, cwd, label).await
+        }
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            if cmd == "cat" {
+                return Err("orphan probe unavailable".into());
+            }
+            ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+        }
+        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+            ProcessCommandRunner.exists(cmd, args).await
+        }
+    }
+    let failing =
+        CheckoutControllerRuntime { vcs: None, runner: Arc::new(FailOrphanProbeRunner), change_requests: None, forges: Vec::new() };
+    let error =
+        failing.remove_checkout(&CheckoutRemoval::OrphanedWorktree { target_path: path.into() }).await.expect_err("both probes fail");
+    assert!(error.contains("resolve shared Git directory"), "original Release failure is retained: {error}");
+    assert!(error.contains("orphan probe unavailable"), "probe failure is retained: {error}");
+    assert!(target.exists(), "probe failure cannot allow removal");
     let removals = [
         CheckoutRemoval::Worktree {
             clone_path: source.path().to_str().expect("source").into(),

@@ -1042,6 +1042,8 @@ impl Vcs for FlotillaVcs {
         let entry = entry.to_str().ok_or_else(|| "git entry is not UTF-8".to_string())?;
         let output = self.runner.run_output("cat", &["--", entry], Path::new("/"), &command_channel_label("cat", &["--", entry])).await?;
         if !output.success() {
+            // A directory, unreadable pointer or transient failure is not proof
+            // of an orphan. Preserve the caller's existing refusal/retry policy.
             return Ok(false);
         }
         let Some(pointer) = output.stdout.trim().strip_prefix("gitdir: ") else { return Ok(false) };
