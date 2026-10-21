@@ -141,6 +141,29 @@ impl GitHubChangeRequest {
         self
     }
 
+    async fn poll_revision(
+        &self,
+        number: u64,
+        crew_logins: &flotilla_change_request::CrewGithubLoginsByRequest,
+    ) -> Result<String, flotilla_forge_github::github::GhApiFailure> {
+        let endpoint = format!("repos/{}/pulls/{number}", self.repo_slug);
+        let response = self.api.get_classified_response(&endpoint, execution_root(), &gh_api_channel_label("GET", &endpoint)).await?;
+        let value: serde_json::Value = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
+        let mut checks = Vec::new();
+        if let Some(sha) = value["head"]["sha"].as_str() {
+            for suffix in [format!("commits/{sha}/status"), format!("commits/{sha}/check-runs?per_page=100")] {
+                let endpoint = format!("repos/{}/{suffix}", self.repo_slug);
+                let response =
+                    self.api.get_classified_response(&endpoint, execution_root(), &gh_api_channel_label("GET", &endpoint)).await?;
+                checks.push((response.etag, response.body));
+            }
+        }
+        let revision =
+            serde_json::to_string(&(response.etag, &value["updated_at"], &value["head"]["sha"], checks, crew_logins.get(&number)))
+                .map_err(|e| e.to_string())?;
+        Ok(revision)
+    }
+
     async fn poll_pull_requests(&self) -> Result<Vec<serde_json::Value>, String> {
         let poll = self.poll.as_ref().ok_or("durable PR observer is not configured")?;
         let mut cache = poll.state.lock().await;
@@ -201,6 +224,7 @@ impl GitHubChangeRequest {
         for number in numbers {
             let request = &repository[format!("pr{number}")];
             if request.is_null() {
+                statuses.insert(*number, Err(format!("GitHub pull request {number} not found").into()));
                 continue;
             }
             if let Some(error) = &cooldown {
@@ -397,22 +421,21 @@ impl flotilla_change_request::ChangeRequestTracker for GitHubChangeRequest {
         let mut statuses = HashMap::new();
         for number in numbers {
             let id = number.to_string();
-            let endpoint = format!("repos/{}/pulls/{number}", self.repo_slug);
-            let response =
-                self.api.get_classified_with_headers(&endpoint, execution_root(), &gh_api_channel_label("GET", &endpoint)).await?;
-            let value: serde_json::Value = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
-            let mut checks = Vec::new();
-            if let Some(sha) = value["head"]["sha"].as_str() {
-                for suffix in [format!("commits/{sha}/status"), format!("commits/{sha}/check-runs?per_page=100")] {
-                    let endpoint = format!("repos/{}/{suffix}", self.repo_slug);
-                    let response =
-                        self.api.get_classified_with_headers(&endpoint, execution_root(), &gh_api_channel_label("GET", &endpoint)).await?;
-                    checks.push((response.etag, response.body));
+            let revision = match self.poll_revision(*number, crew_logins).await {
+                Ok(revision) => revision,
+                Err(failure) => {
+                    // Authentication, throttling and failures without an HTTP
+                    // response apply to the whole scope. Other HTTP failures
+                    // belong to this request, including its status/check reads.
+                    let local = failure.response.as_ref().is_some_and(|response| !matches!(response.status, 401 | 403 | 429))
+                        && !matches!(failure.error, ObservationError::RateLimited { .. });
+                    if !local {
+                        return Err(failure.error);
+                    }
+                    statuses.insert(*number, Err(failure.error));
+                    continue;
                 }
-            }
-            let revision =
-                serde_json::to_string(&(response.etag, &value["updated_at"], &value["head"]["sha"], checks, crew_logins.get(number)))
-                    .map_err(|e| e.to_string())?;
+            };
             if next.pulls.revisions.get(&id) == Some(&revision) {
                 if let Some(detail) = next.pulls.details.get(&id) {
                     let mut validated: flotilla_resources::ChangeRequestStatus =
@@ -1184,6 +1207,7 @@ mod tests {
         assert_eq!(error.retry_at(), None, "no fabricated deadline for a cache, completion or Landing wait");
     }
 
+    // #3633: a null NOT_FOUND node still has an outcome alongside healthy PRs.
     #[tokio::test]
     async fn missing_bound_request_does_not_hide_other_observations() {
         let response = serde_json::json!({
@@ -1193,13 +1217,79 @@ mod tests {
             }}},
             "errors": [{"type": "NOT_FOUND", "path": ["repository", "pr1"], "message": "Could not resolve pull request"}]
         });
-        let runner = Arc::new(MockRunner::new(vec![Ok(format!("HTTP/2 200 OK\r\n\r\n{response}"))]));
+        let runner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
+            stdout: format!("HTTP/2 200 OK\r\n\r\n{response}"),
+            stderr: "gh: Could not resolve pull request".into(),
+            exit_code: Some(1),
+        })]));
         let api = Arc::new(GhApiClient::new(runner.clone()));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), api, runner);
         let statuses = provider.observe_bound(&[1, 2], &Default::default()).await.expect("partial GraphQL result");
-        assert!(!statuses.contains_key(&1));
+        assert!(statuses[&1].as_ref().unwrap_err().to_string().contains("not found"));
         assert!(statuses.contains_key(&2));
     }
+    // #3633: each failed REST read affects only its PR; scope failures abort.
+    // Subprocess boundary: gh emits HTTP status/headers and partial GraphQL data.
+    #[tokio::test]
+    async fn polling_batch_keeps_independent_outcomes() {
+        for failed_read in 0..3 {
+            for status in [0, 404, 500, 401, 403, 429] {
+                let ok = |body: &str| {
+                    Ok(CommandOutput { stdout: format!("HTTP/2 200 OK\r\n\r\n{body}"), stderr: String::new(), exit_code: Some(0) })
+                };
+                let mut outputs = Vec::new();
+                for _ in 0..failed_read {
+                    outputs.push(ok(r#"{"head":{"sha":"abc"}}"#));
+                }
+                if status == 0 {
+                    outputs.push(Err("transport unavailable".into()));
+                } else {
+                    outputs.push(Ok(CommandOutput {
+                        stdout: format!("HTTP/2 {status} Error\r\n\r\n{{\"message\":\"read failed\"}}"),
+                        stderr: format!("gh: HTTP {status}"),
+                        exit_code: Some(1),
+                    }));
+                }
+                let local = matches!(status, 404 | 500);
+                if local {
+                    outputs.push(ok("{}"));
+                    outputs.push(ok(r#"{"data":{"repository":{"pr2":{"title":"survivor","state":"OPEN"}}}}"#));
+                }
+                let runner = Arc::new(MockRunner::with_outputs(outputs));
+                let directory = tempfile::tempdir().unwrap();
+                let provider = GitHubChangeRequest::new(
+                    "github".into(),
+                    "team/one".into(),
+                    Arc::new(GhApiClient::new(runner.clone())),
+                    runner.clone(),
+                )
+                .with_poll_directory(directory.path().into());
+                let result = provider.observe_bound(&[1, 2], &Default::default()).await;
+                if local {
+                    let statuses = result.expect("independent outcomes");
+                    assert!(statuses[&1].is_err());
+                    assert_eq!(statuses[&2].as_ref().unwrap().title.value.as_deref(), Some("survivor"));
+                } else {
+                    assert!(result.is_err(), "scope failure {status} must fail batch");
+                }
+                let calls = runner.calls();
+                let endpoints =
+                    ["repos/team/one/pulls/1", "repos/team/one/commits/abc/status", "repos/team/one/commits/abc/check-runs?per_page=100"];
+                for (call, endpoint) in calls.iter().zip(endpoints).take(failed_read + 1) {
+                    assert!(call.1.contains(&endpoint.to_string()), "unexpected REST read: {call:?}");
+                    assert!(call.1.contains(&"--include".to_string()));
+                }
+                if local {
+                    assert!(calls[failed_read + 1].1.contains(&"repos/team/one/pulls/2".to_string()));
+                    let query = calls.last().unwrap().1.join(" ");
+                    assert!(query.contains("pr2: pullRequest(number:2)"));
+                    assert!(!query.contains("pr1: pullRequest(number:1)"));
+                }
+                assert_eq!(runner.remaining(), 0);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn bound_details_survive_restart_and_refresh_when_checks_change() {
         fn rest(etag: &str, body: serde_json::Value) -> String {
