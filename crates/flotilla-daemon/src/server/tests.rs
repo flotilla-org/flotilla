@@ -6650,3 +6650,115 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
         assert!(primitives.sessions().get("missing").is_none());
     }
 }
+
+async fn activity_failure_test_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>, Arc<flotilla_core::primitives::MessagePrimitives>) {
+    let (tmp, daemon) = empty_daemon().await;
+    let service = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(
+            &tmp.path().join("activity.sqlite"),
+            "home",
+            flotilla_engine_store::registry().unwrap(),
+        )
+        .unwrap(),
+    );
+    let primitives = Arc::new(
+        flotilla_core::primitives::MessagePrimitives::open(
+            "home",
+            service,
+            daemon.resource_backend(),
+            Arc::new(flotilla_resources::SystemClock),
+        )
+        .unwrap(),
+    );
+    daemon.install_message_primitives(Arc::clone(&primitives)).unwrap();
+    daemon
+        .resource_backend()
+        .using::<TerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder().name("agent".to_string()).build(),
+            &TerminalSessionSpec {
+                env_ref: "host-direct".into(),
+                role: "coder".into(),
+                source: TerminalSessionSource::Tool { command: "agent".into() },
+                cwd: "/repo".into(),
+                env: Default::default(),
+                pool: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
+    (tmp, daemon, primitives)
+}
+
+// Activity-store errors must leave the pre-existing hook attention path working.
+// Delete the SQLite row behind the live home to exercise a real failed edge write.
+#[tokio::test]
+async fn agent_activity_store_failure_preserves_legacy_attention() {
+    use flotilla_schema::{Kind, Origin, Timestamp};
+    use flotilla_state_machines::{
+        machines::agent_session::{Activity, AgentSession},
+        Resource,
+    };
+    let (_tmp, daemon, primitives) = activity_failure_test_daemon().await;
+    primitives.sessions().ensure("agent", Timestamp(0)).unwrap();
+    primitives
+        .service()
+        .with_store(|store| {
+            let mut write = store.write()?;
+            let id = write.resolve(Resource::<AgentSession>::CODE, "agent", "home")?.unwrap();
+            let loaded = write.load::<Resource<AgentSession>>(id)?.unwrap();
+            write.delete::<Resource<AgentSession>>(loaded.stamp(), &Origin::new("test", Timestamp(1)))?;
+            write.commit()
+        })
+        .unwrap();
+    assert!(
+        primitives.sessions().observe("agent", Activity::Working, "UserPromptSubmit".into(), Timestamp(2)).is_err(),
+        "the store write really fails"
+    );
+    for harness in [AgentHarness::ClaudeCode, AgentHarness::Codex] {
+        let event = AgentHookEvent::builder()
+            .attachable_id(AttachableId::new("candidate"))
+            .native_codex_hook(harness == AgentHarness::Codex)
+            .harness(harness)
+            .event_type(AgentEventType::Active)
+            .hook_event("UserPromptSubmit".to_string())
+            .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: "agent".into() })
+            .build();
+        let response = dispatch_request_with_state(&daemon, daemon.agent_state_store(), 1, Request::AgentHook { event }).await;
+        assert!(matches!(ok_response(response, 1), Response::AgentHook));
+        let terminal = daemon.resource_backend().using::<TerminalSession>("flotilla").get("agent").await.unwrap();
+        assert_eq!(terminal.status.unwrap().attention.unwrap().state, TerminalAttentionState::Working);
+        assert!(
+            primitives.sessions().get("agent").unwrap().state().observation().is_none(),
+            "failed activity writes leave the cached value unchanged"
+        );
+    }
+}
+
+// Duplicate observations bypass terminal reads and the blocking writer entirely.
+// A missing terminal would fail the observer if it did any backend lookup.
+#[tokio::test]
+async fn agent_activity_duplicates_skip_terminal_reads() {
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::machines::agent_session::Activity;
+    let (_tmp, daemon, primitives) = activity_failure_test_daemon().await;
+    primitives.sessions().observe("agent", Activity::Working, "UserPromptSubmit".into(), Timestamp(1)).unwrap();
+    let before = primitives.sessions().get("agent").unwrap();
+    let empty_backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut event = AgentHookEvent::builder()
+        .attachable_id(AttachableId::new("candidate"))
+        .harness(AgentHarness::ClaudeCode)
+        .event_type(AgentEventType::ToolActive)
+        .hook_event("PreToolUse".to_string())
+        .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: "agent".into() })
+        .build();
+    super::request_dispatch::record_hook_activity(&empty_backend, &primitives, &event).await.unwrap();
+    assert_eq!(primitives.sessions().get("agent").unwrap(), before);
+    event.event_type = AgentEventType::Idle;
+    assert!(
+        super::request_dispatch::record_hook_activity(&empty_backend, &primitives, &event).await.is_err(),
+        "changed activity still validates the terminal"
+    );
+    assert_eq!(primitives.sessions().get("agent").unwrap(), before);
+    drop(daemon);
+}

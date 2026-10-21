@@ -216,6 +216,8 @@ pub enum Activity {
 
 /// Records a hook's activity only when it changes. Cause is the native event
 /// name, never tool arguments, call identifiers or transcript contents.
+/// Since and cause identify the first event in the current activity run:
+/// later hooks with that activity are refused and preserve both fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Observe {
     pub activity: Activity,

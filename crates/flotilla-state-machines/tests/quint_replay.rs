@@ -71,6 +71,10 @@
 //! The scenarios' negative picks (`auth`, `seen` or `matches` false, an empty
 //! reason) are never taken steps, so they are probed too: Rust must refuse them.
 
+#[path = "common/agent_session.rs"]
+mod session_value;
+use session_value::session_value;
+
 use flotilla_quint_testkit::message::MessageSubject;
 use flotilla_quint_testkit::{
     itf,
@@ -88,9 +92,7 @@ use std::{
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
-        agent_session::{
-            AgentSession, AgentSessionEdge, AgentSessionState, Attach, Channel, Detach, End, EndReason, MemoryAgentSessionWorld, Receive,
-        },
+        agent_session::{AgentSession, AgentSessionEdge, Attach, Detach, End, EndReason, MemoryAgentSessionWorld, Receive},
         consumer::ConsumerKind,
         convoy::{
             self, Convoy, ConvoyEdge, ConvoyId, ConvoyRequest, ConvoyState, MemoryConvoyWorld, Priority, Promise, PromiseId, PromiseState,
@@ -427,34 +429,6 @@ fn lifecycle_end_refuses<K: LifecycleKind>(
 
 // ---------------------------------------------------------------------------
 // AgentSession (spec `machines/agent_session.qnt`)
-
-/// Lifecycle labels with their current observed activity, as in the spec.
-fn session_value(state: &AgentSessionState) -> Value {
-    use flotilla_state_machines::machines::agent_session::Activity;
-    let observation = state.observation().map_or_else(|| variant("Unobserved", serde_json::json!({"#tup":[]})), |o| {
-        variant("Observed", serde_json::json!({
-            "activity": variant(match o.activity { Activity::Working => "Working", Activity::Idle => "Idle", Activity::Interrupted => "Interrupted" }, serde_json::json!({"#tup":[]})),
-            "since": serde_json::json!({"#bigint": (o.activity_since.0 / 60_000_000).to_string()}),
-            "cause": o.activity_cause,
-        }))
-    });
-    match state {
-        AgentSessionState::Live { channel, .. } => variant(
-            "Live",
-            serde_json::json!({
-                "channel": variant(match channel { Channel::Detached => "Detached", Channel::Attached => "Attached" }, serde_json::json!({"#tup":[]})),
-                "observation": observation,
-            }),
-        ),
-        AgentSessionState::Ended { reason, .. } => variant(
-            "Ended",
-            serde_json::json!({
-                "reason": variant(match reason { EndReason::Completed => "Completed", EndReason::Lost => "Lost" }, serde_json::json!({"#tup":[]})),
-                "observation": observation,
-            }),
-        ),
-    }
-}
 
 /// Every Ended session refuses attach, detach, either end and a receipt
 /// with `AlreadyEnded`, even with every observation present, and stays unchanged.

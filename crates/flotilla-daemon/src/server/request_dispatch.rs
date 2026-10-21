@@ -619,27 +619,10 @@ pub(super) async fn handle_agent_hook(
 
     let Some(terminal) = event.terminal.as_ref() else { return Ok(()) };
     if let Some(primitives) = primitives {
-        use flotilla_state_machines::machines::agent_session::Activity;
-        let activity = match event.event_type {
-            AgentEventType::Active | AgentEventType::ToolActive => Some(Activity::Working),
-            AgentEventType::Idle => Some(Activity::Idle),
-            AgentEventType::Interrupted => Some(Activity::Interrupted),
-            _ => None,
-        };
-        if let (Some(activity), Some(cause)) = (activity, event.hook_event.as_ref()) {
-            // Resolve the transport-bound terminal by key before recording its hook.
-            backend
-                .using::<flotilla_resources::TerminalSession>(&terminal.namespace)
-                .get(&terminal.session_name)
-                .await
-                .map_err(|error| error.to_string())?;
-            let sessions = std::sync::Arc::clone(primitives.sessions());
-            let name = terminal.session_name.clone();
-            let cause = cause.clone();
-            let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
-            tokio::task::spawn_blocking(move || sessions.observe(&name, activity, cause, now))
-                .await
-                .map_err(|error| error.to_string())??;
+        if let Err(error) = record_hook_activity(backend, &primitives, &event).await {
+            // Activity is an additional observer. Its store/join errors must not
+            // suppress the established agent registry and terminal attention path.
+            tracing::warn!(session = %terminal.session_name, %error, "failed to record agent session activity");
         }
     }
     let state = match event.event_type {
@@ -681,5 +664,39 @@ pub(super) async fn handle_agent_hook(
     )
     .await
     .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Records change-only activity, keeping duplicate hooks off the store and
+/// blocking pool. The machine's gate remains authoritative across races.
+pub(super) async fn record_hook_activity(
+    backend: &flotilla_store::ResourceBackend,
+    primitives: &flotilla_core::primitives::MessagePrimitives,
+    event: &AgentHookEvent,
+) -> Result<(), String> {
+    use flotilla_protocol::AgentEventType;
+    use flotilla_state_machines::machines::agent_session::Activity;
+    let activity = match event.event_type {
+        AgentEventType::Active | AgentEventType::ToolActive => Activity::Working,
+        AgentEventType::Idle => Activity::Idle,
+        AgentEventType::Interrupted => Activity::Interrupted,
+        _ => return Ok(()),
+    };
+    let (Some(terminal), Some(cause)) = (event.terminal.as_ref(), event.hook_event.as_ref()) else { return Ok(()) };
+    if !primitives.sessions().needs_observation(&terminal.session_name, activity)? {
+        return Ok(());
+    }
+    // A hook token can outlive its terminal, so first observations still validate
+    // that identity instead of creating orphan records for stale tokens.
+    backend
+        .using::<flotilla_resources::TerminalSession>(&terminal.namespace)
+        .get(&terminal.session_name)
+        .await
+        .map_err(|error| error.to_string())?;
+    let sessions = std::sync::Arc::clone(primitives.sessions());
+    let name = terminal.session_name.clone();
+    let cause = cause.clone();
+    let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
+    tokio::task::spawn_blocking(move || sessions.observe(&name, activity, cause, now)).await.map_err(|error| error.to_string())??;
     Ok(())
 }

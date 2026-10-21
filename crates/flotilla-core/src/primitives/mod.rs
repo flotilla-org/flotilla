@@ -139,6 +139,19 @@ impl Sessions {
         home.apply(name, End { reason, observed }, &world, now).map(|_| ()).map_err(|error| format!("AgentSession `{name}`: {error:?}"))
     }
 
+    /// A keyed, in-memory hint for avoiding duplicate hook I/O. Observe rechecks
+    /// under the writer lock, since another hook can win after this read.
+    pub fn needs_observation(
+        &self,
+        name: &str,
+        activity: flotilla_state_machines::machines::agent_session::Activity,
+    ) -> Result<bool, String> {
+        let home = self.home.lock().map_err(|_| "session home lock poisoned".to_string())?;
+        Ok(home.get(name).is_none_or(|session| {
+            session.state().end_reason().is_none() && session.state().observation().is_none_or(|old| old.activity != activity)
+        }))
+    }
+
     /// Records only a real hook activity change; repeated and late hooks write nothing.
     pub fn observe(
         &self,
@@ -151,7 +164,10 @@ impl Sessions {
             machines::agent_session::{AgentSessionRefusal, Observe},
             WriteError,
         };
-        let mut home = self.home.lock().expect("session home");
+        let mut home = self.home.lock().map_err(|_| "session home lock poisoned".to_string())?;
+        // A hook may precede the delivery adapter's first consumer registration.
+        // Materialize the same minimal record here, named by the validated terminal;
+        // the terminal and delivery adapter still own its lifecycle, not the hook.
         if home.get(name).is_none() {
             home.create(name, (), &MemoryAgentSessionWorld::default(), now).map_err(|error| format!("AgentSession `{name}`: {error:?}"))?;
         }

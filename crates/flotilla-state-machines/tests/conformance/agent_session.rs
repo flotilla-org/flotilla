@@ -14,16 +14,16 @@
 
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
-    machines::agent_session::{
-        AgentSession, AgentSessionRefusal, AgentSessionState, Attach, Channel, Detach, End, EndReason, MemoryAgentSessionWorld, Receive,
-    },
+    machines::agent_session::{AgentSession, AgentSessionRefusal, Attach, Detach, End, EndReason, MemoryAgentSessionWorld, Receive},
     Home, Ref, Transport, WriteError,
 };
 use serde_json::Value;
 
+use crate::session_value::session_value;
+
 use crate::{
     graph::{self, refusal, tick, Conformance, Report, Step},
-    itf::{boolean, number, payload, tag, text, variant},
+    itf::{boolean, number, payload, tag, text},
 };
 
 const NAME: &str = "s";
@@ -117,31 +117,4 @@ fn agent_session_follows_the_full_graph() {
     let mut report = Report::new("agent_session");
     graph::check::<SessionConformance>(&graph::load(SessionConformance::MACHINE), &mut report);
     report.finish();
-}
-
-fn session_value(state: &AgentSessionState) -> Value {
-    use flotilla_state_machines::machines::agent_session::Activity;
-    let observation = state.observation().map_or_else(|| variant("Unobserved", serde_json::json!({"#tup":[]})), |o| {
-        variant("Observed", serde_json::json!({
-            "activity": variant(match o.activity { Activity::Working => "Working", Activity::Idle => "Idle", Activity::Interrupted => "Interrupted" }, serde_json::json!({"#tup":[]})),
-            "since": serde_json::json!({"#bigint": (o.activity_since.0 / 60_000_000).to_string()}),
-            "cause": o.activity_cause,
-        }))
-    });
-    match state {
-        AgentSessionState::Live { channel, .. } => variant(
-            "Live",
-            serde_json::json!({
-                "channel": variant(match channel { Channel::Detached => "Detached", Channel::Attached => "Attached" }, serde_json::json!({"#tup":[]})),
-                "observation": observation,
-            }),
-        ),
-        AgentSessionState::Ended { reason, .. } => variant(
-            "Ended",
-            serde_json::json!({
-                "reason": variant(match reason { EndReason::Completed => "Completed", EndReason::Lost => "Lost" }, serde_json::json!({"#tup":[]})),
-                "observation": observation,
-            }),
-        ),
-    }
 }
