@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -96,7 +96,7 @@
+@@ -107,7 +107,7 @@
      | Operator => true
      | ConvoySupervisor => p.source == Template
      | Dispatcher => p.source == Dispatch

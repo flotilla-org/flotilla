@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -166,7 +166,7 @@
+@@ -177,7 +177,7 @@
            else if (not(w.seats.keys().contains(a.seat))) Refused(UnknownSeat)
            else Moved(Open({ ...w, seats: w.seats.put(a.seat, { ...w.seats.get(a.seat), supervisedBy: a.supervisedBy }) }))
        | Deliver => val outstanding = w.promises.keys().filter(p => open(w.promises.get(p)))

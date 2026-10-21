@@ -157,7 +157,7 @@ pub enum Progress {
 #[store(index(name = "by_address", eq(address)))]
 pub struct Submission {
     pub address: Address,
-    /// Opaque and non-empty: compared, never interpreted.
+    /// Opaque: compared, never interpreted.
     pub revision: String,
     #[store(flatten)]
     pub by: SeatName,
@@ -361,8 +361,12 @@ pub struct ConvoyRequest {
     pub kinds: Frozen<PromiseKinds>,
 }
 
-/// The authority class a caller works out from seat relations; the machine
-/// checks it against the promise's source (#3587 spec ruling 5).
+/// The authority class a caller works out from seat relations, as the spec's
+/// `authority`; the machine checks it against the promise's source (#3587
+/// spec ruling 5), and the owner class against the promise's owner seat. It
+/// is the caller's claim, carried in the edge's payload: seat relations stay
+/// outside the machine (spec ruling), so nothing here resolves a class, and a
+/// supervisor need not be a seat of this convoy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Authority {
     Operator,
@@ -418,7 +422,9 @@ pub struct Retract {
     pub reason: String,
 }
 
-/// Handoff: a Pending or Submitted promise moves to another seat with its submissions.
+/// Handoff: a Pending or Submitted promise moves to another seat with its
+/// submissions. `to` must be a seat; `by` is the deciding seat, or the role of
+/// a decider outside the convoy (an operator).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reassign {
     pub promise: PromiseId,
@@ -610,6 +616,8 @@ pub enum ConvoyRefusal {
     DutyHolds(BTreeSet<DutyId>),
     UnknownSeat,
     SeatExists,
+    /// Admission's seats are not a tree: a seat is above itself.
+    SeatCycle,
 }
 
 impl From<Ended<ConvoyLabel>> for ConvoyRefusal {
@@ -828,6 +836,9 @@ impl Machine for Convoy {
         if !closed {
             return Err(ConvoyRefusal::UnknownSeat);
         }
+        if !acyclic(&request.seats) {
+            return Err(ConvoyRefusal::SeatCycle);
+        }
         let now = admission.now();
         let mut spec = ConvoySpec {
             project: request.project,
@@ -838,7 +849,7 @@ impl Machine for Convoy {
             promises: Records::new(),
         };
         for seat in request.seats {
-            spec.seats.append(0, seat).map_err(|_| ConvoyRefusal::UnknownSeat)?;
+            spec.seats.append(0, seat).expect("a request holds fewer than 2^32 seats");
         }
         for (id, promise) in request.promises {
             let row = Promise {
@@ -850,10 +861,26 @@ impl Machine for Convoy {
                 progress: State::new(Progress::Pending, now),
                 submissions: Records::new(),
             };
-            spec.promises.append(0, row).map_err(|_| ConvoyRefusal::UnknownPromise)?;
+            spec.promises.append(0, row).expect("a request holds fewer than 2^32 promises");
         }
         Ok((spec, ConvoyState::Open { quota: request.quota, retired: BTreeSet::new() }))
     }
+}
+
+/// No seat is above itself: following parents from any seat ends at the root
+/// within as many steps as there are seats. Parents are known seats here.
+fn acyclic(seats: &[Seat]) -> bool {
+    let parent: BTreeMap<SeatName, Option<&SeatName>> = seats.iter().map(|seat| (seat.name(), seat.parent.as_ref())).collect();
+    seats.iter().all(|seat| {
+        let mut at = seat.parent.as_ref();
+        for _ in 0..seats.len() {
+            match at {
+                None => return true,
+                Some(name) => at = parent.get(name).copied().flatten(),
+            }
+        }
+        at.is_none()
+    })
 }
 
 fn authorised(h: &mut Handle<'_, Convoy>, authority: &Ref<Authorisation>) -> bool {
@@ -905,6 +932,8 @@ fn may_reassign(promise: &Promise, by: &SeatName, authority: Authority) -> bool 
     }
 }
 
+// The kind is opaque here: whether it is one of the frozen promise kinds is
+// the promise kinds' check (#3587 layer 5).
 fn gate_declare(h: &mut Handle<'_, Convoy>, declare: &Declare) -> Result<(), ConvoyRefusal> {
     if h.spec().promise(declare.promise).is_some() {
         return Err(ConvoyRefusal::PromiseExists);
@@ -938,6 +967,8 @@ fn gate_keep(h: &mut Handle<'_, Convoy>, keep: &Keep) -> Result<(), ConvoyRefusa
     match keep {
         Keep::Observed { promise, submission } => {
             let promise = open_promise(h, *promise)?;
+            // Saturating is exact: record positions are u32, so no promise
+            // holds more submissions than u32::MAX.
             let current = u32::try_from(promise.submissions.len()).unwrap_or(u32::MAX);
             if promise.progress.value != Progress::Submitted || *submission != current {
                 return Err(ConvoyRefusal::StaleEvidence);

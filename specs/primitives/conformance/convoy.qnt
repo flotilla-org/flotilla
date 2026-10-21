@@ -17,7 +17,7 @@
 // that move (AddSeat of "c", Resupervise of "b") are probed only in a convoy
 // admitted for them, marked by an extra seat "y", where Declare is not
 // probed; their refusals are probed always, once each. One request names an
-// owner that is not a seat.
+// owner that is not a seat, and one admits seats in a cycle.
 module convoy_conformance {
   import convoy(IDS = Set()) as C from "../machines/convoy"
   type Probe = Admitted({ request: C::ConvoyRequest, result: C::Next })
@@ -36,7 +36,9 @@ module convoy_conformance {
     request(admitted(C::Template), Map(), true), request(admitted(C::Template), Map(), false), request(admitted(C::Dispatch), Map(), true),
     request(admitted(C::Template), lifetime, true), request(admitted(C::Template), whileOpen, true),
     { ...request(admitted(C::Template), Map(), true), seats: Map("b" -> { parent: C::Root, supervisedBy: "op" }) },
+    { ...request(admitted(C::Template), Map(), true), seats: Map("a" -> { parent: C::Under("b"), supervisedBy: "op" }, "b" -> { parent: C::Under("a"), supervisedBy: "op" }) },
     { ...request(Map(), lifetime, true), seats: seats.put("y", { parent: C::Root, supervisedBy: "op" }) })
+  // The convoy admitted for the moving seat edges: its extra seat "y" marks it.
   pure def seatProbe(w: C::Work): bool = w.seats.keys().contains("y")
   // Quotas: an increase, a decrease and a changed class domain. Negative counts
   // are omitted: Rust quota counts are unsigned, so InvalidQuota is unrepresentable.

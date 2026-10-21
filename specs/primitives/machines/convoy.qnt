@@ -67,10 +67,20 @@ module convoy {
     | Readmit({ quota: VesselClass -> int, authorised: bool })
   type Refusal = NoObligations | UnknownProject | InvalidQuota | NotOpen | UnknownPromise | PromiseSettled
     | PromisesOutstanding(Set[PromiseId]) | Unauthorised | QuotaNotIncrease | PromiseExists | NotOwner | NotDurable
-    | NotSubmitted | StaleEvidence | UnknownDuty | DutyHolds(Set[DutyId]) | UnknownSeat | SeatExists
+    | NotSubmitted | StaleEvidence | UnknownDuty | DutyHolds(Set[DutyId]) | UnknownSeat | SeatExists | SeatCycle
   type Next = Moved(State) | Refused(Refusal)
   pure def validQuota(q: VesselClass -> int): bool = q.keys().forall(c => q.get(c) >= 0)
   pure def lifetime(d: Duty): bool = match d.scope { | Lifetime => true | WhileOpen(_) => false }
+  // The seats a seat was created under, transitively: its parent, its
+  // parent's parent and so on, as far as the seats go.
+  pure def above(seats: Seat -> SeatRecord, seat: Seat): Set[Seat] = {
+    pure def parents(s: Set[Seat]): Set[Seat] = s.map(q => match seats.get(q).parent { | Root => Set() | Under(p) => Set(p) })
+      .flatten().filter(p => seats.keys().contains(p))
+    seats.keys().fold(parents(Set(seat)), (found, _) => found.union(parents(found)))
+  }
+  // No seat is above itself: admission's seats form a tree. AddSeat keeps it
+  // one, since a new seat's parent already exists.
+  pure def acyclic(seats: Seat -> SeatRecord): bool = seats.keys().forall(s => not(above(seats, s).contains(s)))
   // Every owner admission names, and every parent, is one of the admitted seats.
   pure def seatsClosed(r: ConvoyRequest): bool =
     r.promises.keys().forall(p => r.seats.keys().contains(r.promises.get(p).owner))
@@ -81,6 +91,7 @@ module convoy {
     else if (not(r.projectKnown)) Refused(UnknownProject)
     else if (not(validQuota(r.quota))) Refused(InvalidQuota)
     else if (not(seatsClosed(r))) Refused(UnknownSeat)
+    else if (not(acyclic(r.seats))) Refused(SeatCycle)
     else Moved(Open({ spec: { project: r.project, duties: r.duties, priority: r.priority }, seats: r.seats,
       promises: r.promises.keys().mapBy(p => { promise: r.promises.get(p).promise, source: r.promises.get(p).source,
         owner: r.promises.get(p).owner, state: Pending, submissions: [] }),

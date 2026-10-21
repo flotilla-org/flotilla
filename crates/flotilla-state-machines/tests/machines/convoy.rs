@@ -210,6 +210,21 @@ fn admission_refuses_an_owner_that_is_no_seat() {
     }
 }
 
+// Admission's seats form a tree: a seat that is its own parent, or two seats under each other,
+// are refused, where a chain of parents is admitted in any order.
+#[test]
+fn admission_refuses_a_seat_cycle() {
+    let mut home = Home::<Convoy>::new("home").expect("valid declaration");
+    let cycle = |seats: Vec<Seat>| ConvoyRequest { seats, ..request(&[(0, PromiseSource::Template)]) };
+    let own = cycle(vec![seat_row("coder", Some("coder"))]);
+    let pair = cycle(vec![seat_row("lead", Some("coder")), seat_row("coder", Some("lead"))]);
+    for (name, bad) in [("a", own), ("b", pair)] {
+        assert_eq!(home.create(name, bad, &world(), Timestamp(0)).err(), Some(WriteError::Refused(ConvoyRefusal::SeatCycle)), "{name}");
+    }
+    let chain = cycle(vec![seat_row("coder", Some("lead")), seat_row("reviewer", Some("coder")), seat_row("lead", None)]);
+    home.create("c", chain, &world(), Timestamp(0)).expect("a chain in any order");
+}
+
 // The crew declares a promise owned by a seat; an id ever used is refused,
 // retracted ones included, and so is an owner that is no seat.
 #[test]

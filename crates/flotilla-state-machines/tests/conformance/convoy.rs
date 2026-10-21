@@ -199,6 +199,7 @@ fn refusal_of(refusal: ConvoyRefusal) -> Value {
         ConvoyRefusal::UnknownDuty => "UnknownDuty",
         ConvoyRefusal::UnknownSeat => "UnknownSeat",
         ConvoyRefusal::SeatExists => "SeatExists",
+        ConvoyRefusal::SeatCycle => "SeatCycle",
     };
     bare(name)
 }

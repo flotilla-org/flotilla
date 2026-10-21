@@ -44,8 +44,10 @@ Convoy admission accepts `{project, promises, duties, seats, quota, priority}`
 convoy-lifetime duty (`NoObligations`). Each admitted promise keeps its opaque
 kind/target data, its source (template, dispatch or crew) and its owner seat.
 Seats (proposal for the layer 4 ruling) are records of the convoy, each with
-the seat it was created under and an opaque `supervisedBy`; every owner, and
-every parent, must be a seat (`UnknownSeat`). Fan-out adds a seat under an
+the seat it was created under and an opaque `supervisedBy`, which may name a
+seat, the convoy's supervisor role or an operator and is never checked
+against the seats; every owner, and every parent, must be a seat
+(`UnknownSeat`), and admission's seats must form a tree (`SeatCycle`). Fan-out adds a seat under an
 existing one (`AddSeat`, refused `SeatExists` for a name ever used), and
 `Resupervise` re-points a seat's supervisor; both are authorised by the
 caller, as `Abandon` is. Authority classes are worked out by the caller from
