@@ -641,7 +641,8 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
                 message: None,
             },
             cwd: session_cwd.display().to_string(),
-            env: BTreeMap::new(),
+            // A declared environment claim never makes the daemon host's own session contained.
+            env: BTreeMap::from([("FLOTILLA_ENVIRONMENT_ID".to_string(), "declared-claim".to_string())]),
             pool: "fake-terminals".to_string(),
         };
         let session_name = "terminal-demo-work-coder";
@@ -668,5 +669,14 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
             }
         }
         assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["type"], "command");
+        // #3655: the daemon host's own host-direct session stays uncontained:
+        // it names no flotilla environment, keeps the host user's harness home
+        // and configuration (unwritten), keeps attribution, and takes no image
+        // harness environment.
+        for name in ["FLOTILLA_ENVIRONMENT_ID", "CLAUDE_CONFIG_DIR", "DISABLE_AUTOUPDATER", "LANG"] {
+            assert_eq!(value(name), None, "{name}");
+        }
+        assert!(settings.get("attribution").is_none());
+        assert!(!home.join(".claude.json").exists(), "host-direct launch wrote the host user's Claude state");
     }
 }

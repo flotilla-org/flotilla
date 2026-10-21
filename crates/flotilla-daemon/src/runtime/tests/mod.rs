@@ -131,6 +131,7 @@ use recovery_scenario::*;
 use terminal_support::*;
 
 mod adopted_checkouts;
+mod agentless_harness;
 mod convoy_lifecycle;
 mod credential_delivery;
 mod discovery;

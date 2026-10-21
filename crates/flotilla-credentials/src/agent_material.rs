@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -92,6 +92,16 @@ trait AgentMaterialAdapter: Send + Sync {
             };
         }
         Ok(Some(config_home.join("skills")))
+    }
+
+    /// Directory name of this harness's home under a host environment's
+    /// flotilla-owned agent home.
+    fn host_home_name(&self) -> &'static str;
+
+    /// Make the host's own login usable from a freshly selected flotilla home
+    /// without writing the host user's harness configuration.
+    async fn adopt_ambient_login(&self, _home: &Path, _runner: &dyn CommandRunner) -> Result<(), String> {
+        Ok(())
     }
 
     fn requires_skills_for_prepare(&self, environment: &BTreeMap<String, String>) -> bool {
@@ -308,6 +318,69 @@ done"#,
                 result.push((variable.into(), home.to_string_lossy().into_owned()));
             }
             Ok(result)
+        })
+    }
+
+    /// #3655: a session on an agentless host takes the contained harness path.
+    /// The host has no image and no mounts, so each required harness's config
+    /// home is selected under the host runner's writable base: a delivered
+    /// credential home already there (the Claude OAuth or Codex key delivery)
+    /// is kept, and anything else, including a home pointing at the host
+    /// user's own configuration, is replaced by
+    /// `<base>/agent-homes/<environment>/<harness>`. Per-crew homes then follow
+    /// [`Self::crew_environment`], as they do for Docker vessels. The adapter
+    /// seeds onboarding and workspace trust into the selected home; the host
+    /// user's `~/.claude`, `~/.claude.json` and `~/.codex` are never selected.
+    pub fn host_harness_environment<'a>(
+        &'a self,
+        environment_ref: &'a str,
+        role: &'a str,
+        required_adapters: &'a BTreeSet<String>,
+        environment: &'a [(String, String)],
+        runner: &'a dyn CommandRunner,
+    ) -> BoxFuture<'a, Result<Vec<(String, String)>, String>> {
+        Box::pin(async move {
+            if !matches!(Path::new(environment_ref).components().collect::<Vec<_>>().as_slice(), [std::path::Component::Normal(_)]) {
+                return Err(format!("invalid agent home environment {environment_ref:?}"));
+            }
+            let config_base = runner
+                .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
+                .await
+                .map_err(|error| format!("resolve host agent home base: {error}"))?;
+            let mut result = environment.to_vec();
+            for adapter in required_adapters.iter().filter_map(|id| self.adapters.get(id.as_str())) {
+                let variable = adapter.config_home_variable();
+                let delivered = result
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key == variable)
+                    .map(|(_, value)| PathBuf::from(value))
+                    // `starts_with` compares components lexically, so a `..`
+                    // could climb out of the base while appearing inside it.
+                    .filter(|home| {
+                        home.is_absolute()
+                            && home.starts_with(&config_base)
+                            && home.components().all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+                    });
+                let home = match delivered {
+                    Some(home) => home,
+                    None => config_base.join("agent-homes").join(environment_ref).join(adapter.host_home_name()),
+                };
+                let home_text = home.to_string_lossy().into_owned();
+                runner
+                    .run("mkdir", &["-p", &home_text], Path::new("/"), &ChannelLabel::Default)
+                    .await
+                    .map_err(|error| format!("create {} home {home_text}: {error}", adapter.id()))?;
+                // Owner-only even when an earlier generation created the home.
+                runner
+                    .run("chmod", &["700", &home_text], Path::new("/"), &ChannelLabel::Default)
+                    .await
+                    .map_err(|error| format!("protect {} home {home_text}: {error}", adapter.id()))?;
+                adapter.adopt_ambient_login(&home, runner).await?;
+                result.retain(|(key, _)| key != variable);
+                result.push((variable.into(), home_text));
+            }
+            self.crew_environment(role, required_adapters, &result, runner).await
         })
     }
 
@@ -1023,6 +1096,34 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
         config_home.starts_with(Path::new(CONTAINER_CODEX_HOME))
     }
 
+    fn host_home_name(&self) -> &'static str {
+        "codex"
+    }
+
+    /// The host keeps one Codex login: link its `auth.json` rather than copy
+    /// it, so a refresh rotates the single-use refresh token in one place
+    /// (#1906). Only the credential is shared; `config.toml` stays the home's
+    /// own. A delivered credential already in the home is left alone.
+    async fn adopt_ambient_login(&self, home: &Path, runner: &dyn CommandRunner) -> Result<(), String> {
+        runner
+            .run(
+                "sh",
+                &[
+                    "-c",
+                    r#"set -eu
+ambient="${CODEX_HOME:-$HOME/.codex}/auth.json"
+if [ ! -e "$1/auth.json" ] && [ ! -L "$1/auth.json" ] && [ -f "$ambient" ]; then ln -s "$ambient" "$1/auth.json"; fi"#,
+                    "flotilla-codex-ambient-login",
+                    &home.to_string_lossy(),
+                ],
+                Path::new("/"),
+                &ChannelLabel::Default,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("link host Codex login into {}: {error}", home.display()))
+    }
+
     fn externally_managed_home_opts_out_of_skills(&self) -> bool {
         true
     }
@@ -1074,6 +1175,10 @@ impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
 
     fn is_managed_config_home(&self, config_home: &Path, config_base: &Path) -> bool {
         config_home.starts_with(config_base)
+    }
+
+    fn host_home_name(&self) -> &'static str {
+        "claude"
     }
 
     fn externally_managed_home_opts_out_of_skills(&self) -> bool {
@@ -1538,6 +1643,105 @@ esac
         let calls = runner.calls.lock().expect("recorded calls");
         assert_eq!(&calls[0].1[3..], &["flotilla-stage-skills", "./-", "/skills", "false", "/cache"]);
         assert!(runner.inputs.lock().expect("recorded input").is_empty());
+    }
+
+    /// The host behind an agentless SSH runner, recording each command; its
+    /// writable config base is `/host/state/flotilla`.
+    #[derive(Default)]
+    struct HostHomeRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for HostHomeRunner {
+        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            self.calls.lock().expect("calls").push(std::iter::once(cmd).chain(args.iter().copied()).map(str::to_string).collect());
+            Ok(String::new())
+        }
+
+        async fn run_output(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            Err(format!("unexpected host command {cmd}"))
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+
+        async fn writable_config_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
+            Ok(PathBuf::from("/host/state/flotilla"))
+        }
+    }
+
+    // #3655: an agentless session's harness homes live under the host runner's
+    // writable base. A delivered credential home there is kept (and gains the
+    // per-crew home); a home outside it, such as the host user's own config,
+    // one escaping it through `..`, or none at all is replaced by the
+    // environment's flotilla-owned home, and
+    // only Codex adopts the host login. Cases: delivered, host-pointing,
+    // escaping and absent homes for both harnesses.
+    #[tokio::test]
+    async fn host_harness_homes_are_flotilla_owned_under_the_runner_base() {
+        let registry = test_registry(Arc::new(TestEnvVars::new([("HOME", "/controller-home")])));
+        let required = BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string(), CODEX_ADAPTER_ID.to_string()]);
+        for (claude, codex, expected_claude, expected_codex) in [
+            (
+                Some("/host/state/flotilla/credentials/claude-max/claude"),
+                Some("/host/state/flotilla/credentials/codex-key/codex"),
+                "/host/state/flotilla/credentials/claude-max/claude/crews/coder",
+                "/host/state/flotilla/credentials/codex-key/codex",
+            ),
+            (
+                Some("/home/crew/.claude"),
+                Some("/home/crew/.codex"),
+                "/host/state/flotilla/agent-homes/host-direct-b3/claude/crews/coder",
+                "/host/state/flotilla/agent-homes/host-direct-b3/codex",
+            ),
+            (
+                Some("/host/state/flotilla/../../../home/crew/.claude"),
+                Some("/host/state/flotilla/credentials/../../../home/crew/.codex"),
+                "/host/state/flotilla/agent-homes/host-direct-b3/claude/crews/coder",
+                "/host/state/flotilla/agent-homes/host-direct-b3/codex",
+            ),
+            (
+                None,
+                None,
+                "/host/state/flotilla/agent-homes/host-direct-b3/claude/crews/coder",
+                "/host/state/flotilla/agent-homes/host-direct-b3/codex",
+            ),
+        ] {
+            let runner = HostHomeRunner::default();
+            let mut environment = vec![("KEEP".to_string(), "kept".to_string())];
+            environment.extend(claude.map(|home| ("CLAUDE_CONFIG_DIR".to_string(), home.to_string())));
+            environment.extend(codex.map(|home| ("CODEX_HOME".to_string(), home.to_string())));
+
+            let prepared =
+                registry.host_harness_environment("host-direct-b3", "coder", &required, &environment, &runner).await.expect("host homes");
+
+            let value = |name: &str| {
+                let values = prepared.iter().filter(|(key, _)| key == name).map(|(_, value)| value.as_str()).collect::<Vec<_>>();
+                assert_eq!(values.len(), 1, "{name} selected once: {prepared:?}");
+                values[0].to_string()
+            };
+            assert_eq!(value("CLAUDE_CONFIG_DIR"), expected_claude);
+            assert_eq!(value("CODEX_HOME"), expected_codex);
+            assert_eq!(value("KEEP"), "kept");
+            let calls = runner.calls.lock().expect("calls");
+            let claude_home =
+                Path::new(expected_claude).parent().and_then(Path::parent).expect("claude home").to_string_lossy().into_owned();
+            for home in [&claude_home, &expected_codex.to_string()] {
+                assert!(calls.iter().any(|call| call == &["mkdir", "-p", home]), "{home} created: {calls:?}");
+                assert!(calls.iter().any(|call| call == &["chmod", "700", home]), "{home} owner-only: {calls:?}");
+            }
+            let adoptions =
+                calls.iter().filter(|call| call.get(3).map(String::as_str) == Some("flotilla-codex-ambient-login")).collect::<Vec<_>>();
+            assert!(matches!(adoptions.as_slice(), [call] if call[4] == expected_codex), "{adoptions:?}");
+        }
+
+        let error = registry
+            .host_harness_environment("../escape", "coder", &required, &[], &HostHomeRunner::default())
+            .await
+            .expect_err("an environment name must be one path component");
+        assert!(error.contains("invalid agent home environment"), "{error}");
     }
 
     #[tokio::test]
