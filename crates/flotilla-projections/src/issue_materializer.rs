@@ -85,6 +85,8 @@ pub struct IssueMaterializer {
 }
 
 #[derive(Default)]
+// Cache lifetime follows demand/source membership, not refresh success.
+// See docs/implementation-choices/issue-refresh-cache.md.
 struct SharedIssueRefresh {
     sources: StdMutex<HashMap<IssueSource, Arc<SourceRefresh>>>,
     health: IssuePollingHealth,
@@ -148,6 +150,7 @@ struct SourceRefresh {
 #[derive(Default)]
 struct SourceActivity {
     quiet_polls: u32,
+    failed_polls: u32,
     sampled_at: Option<tokio::time::Instant>,
     demand: Option<SourceDemand>,
 }
@@ -183,7 +186,7 @@ impl SourceRefresh {
             activity.quiet_polls = 0;
         }
         activity.demand = Some(demand);
-        base.saturating_mul(1 << activity.quiet_polls.min(4)).min(cap)
+        base.saturating_mul(1 << activity.quiet_polls.max(activity.failed_polls).min(4)).min(cap)
     }
 
     fn note_activity(&self, active: bool) {
@@ -318,16 +321,15 @@ impl SharedIssueRefresh {
         });
     }
 
-    fn unregister_source(&self, source: &IssueSource, query: &QueryId) {
+    fn retain_sources(&self, query: &QueryId, bindings: &[ResolvedIssueSourceBinding]) {
         let mut sources = self.sources.lock().expect("shared issue sources lock poisoned");
-        if let Some(entry) = sources.get(source) {
+        sources.retain(|source, entry| {
             let mut cursors = entry.cursors.lock().expect("shared issue cursors lock poisoned");
-            cursors.remove(query);
-            if cursors.is_empty() {
-                drop(cursors);
-                sources.remove(source);
+            if !bindings.iter().any(|binding| &binding.source == source) {
+                cursors.remove(query);
             }
-        }
+            !cursors.is_empty()
+        });
     }
 
     fn advance(&self, source: &IssueSource, query: &QueryId, cursor: &str) {
@@ -391,16 +393,18 @@ impl SharedIssueRefresh {
         let oldest = entry.cursors.lock().expect("shared issue cursors lock poisoned").values().min().copied().unwrap_or(since_time);
         let next_cursor = Utc::now();
         let result = provider.list_changed_since(source, &oldest.to_rfc3339(), PAGE_SIZE).await;
-        // Errors reset quiet backoff for prompt recovery; forge reset-time
-        // health backoff still suppresses requests when quota is exhausted.
-        entry.note_activity(
-            result.as_ref().map_or(true, |changes| !changes.updated.is_empty() || !changes.closed.is_empty() || changes.has_more),
-        );
-        // A new observation invalidates pages once; all query reloads caused by
-        // that observation then share the replacement pages.
-        entry.pages.lock().await.clear();
-        if let Err(message) = &result {
-            self.health.note(message);
+        match &result {
+            Ok(changes) => {
+                entry.activity.lock().expect("source activity lock poisoned").failed_polls = 0;
+                entry.note_activity(!changes.updated.is_empty() || !changes.closed.is_empty() || changes.has_more);
+                // Only a successful observation invalidates shared pages.
+                entry.pages.lock().await.clear();
+            }
+            Err(message) => {
+                let mut activity = entry.activity.lock().expect("source activity lock poisoned");
+                activity.failed_polls = activity.failed_polls.saturating_add(1);
+                self.health.note(message);
+            }
         }
         *last = Some(
             SourceRefreshResult::builder()
@@ -605,13 +609,13 @@ async fn load_window(
             return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions, suspended_until: None };
         }
         Err(message) => {
-            shared_refresh.unregister(query);
             let conditions = vec![unavailable(None, message)];
             publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_sink).await;
             return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions, suspended_until: None };
         }
     };
 
+    shared_refresh.retain_sources(query, &bindings);
     let loaded = stream::iter(bindings.into_iter().map(|binding| {
         let source = binding.source;
         let mut params = base_params.clone();
@@ -656,7 +660,6 @@ async fn load_window(
     let mut windows = Vec::new();
     let mut conditions = Vec::new();
     let mut suspension = None;
-    let mut failed_sources = Vec::new();
     for result in loaded {
         match result {
             Ok((window, source_rows)) => {
@@ -665,20 +668,12 @@ async fn load_window(
                 windows.push(window);
             }
             Err(condition) => {
-                if let ResultSetCondition::IssueSourceUnavailable { source, message } = &condition {
-                    if let Some(source) = source {
-                        failed_sources.push(source.clone());
-                    }
+                if let ResultSetCondition::IssueSourceUnavailable { message, .. } = &condition {
                     shared_refresh.health.note(message);
                     suspension = suspended_until(query, message);
                 }
                 conditions.push(condition);
             }
-        }
-    }
-    for source in failed_sources {
-        if !windows.iter().any(|window: &IssueSourceWindow| window.source == source) {
-            shared_refresh.unregister_source(&source, query);
         }
     }
     let rows = rows.into_values().collect::<Vec<_>>();
@@ -844,13 +839,11 @@ async fn refresh_window(
                 shared_refresh.advance(&source.source, query, &source.refresh_cursor);
             }
             Err(message) => {
-                shared_refresh.unregister_source(&source.source, query);
                 shared_refresh.health.note(&message);
                 if let Some(deadline) = suspended_until(query, &message) {
                     window.suspended_until = Some(deadline);
                 }
                 conditions.push(unavailable(Some(source.source.clone()), message));
-                window.needs_full_reload = true;
             }
         }
     }
@@ -967,6 +960,7 @@ mod tests {
     struct ScriptedProvider {
         pages: Mutex<VecDeque<IssueResultPage>>,
         changes: Mutex<VecDeque<IssueChangeset>>,
+        errors: Mutex<VecDeque<String>>,
         seen_since: Mutex<Vec<String>>,
         seen_queries: Mutex<Vec<IssueQuery>>,
     }
@@ -976,6 +970,7 @@ mod tests {
             Self {
                 pages: Mutex::new(pages.into()),
                 changes: Mutex::new(changes.into()),
+                errors: Mutex::new(VecDeque::new()),
                 seen_since: Mutex::new(Vec::new()),
                 seen_queries: Mutex::new(Vec::new()),
             }
@@ -1037,6 +1032,9 @@ mod tests {
         async fn list_changed_since(&self, source: &IssueSource, since: &str, _count: usize) -> Result<IssueChangeset, String> {
             assert!(!since.is_empty());
             self.seen_since.lock().await.push(since.to_string());
+            if let Some(error) = self.errors.lock().await.pop_front() {
+                return Err(error);
+            }
             let mut changes =
                 self.changes.lock().await.pop_front().unwrap_or(IssueChangeset { updated: vec![], closed: vec![], has_more: false });
             for issue in &mut changes.updated {
@@ -1929,6 +1927,41 @@ mod tests {
         let DaemonEvent::ResultDelta(delta) = next_event(&mut events).await else { panic!("fetch-more must emit a delta") };
         assert!(delta.changes.as_issues().expect("issue changes").is_empty());
         assert!(!delta.state.and_then(|state| state.demand).expect("demand metadata").has_more);
+    }
+
+    // A transient refresh failure must preserve the provider, page cache and
+    // incremental cursor; recovery retries changed-since rather than querying again.
+    #[tokio::test(start_paused = true)]
+    async fn transient_refresh_preserves_cache_and_retries_incrementally() {
+        let state = AggregatorProjectionState::new();
+        let query = project_query("transient");
+        let source = IssueSource { service: "fake".into(), scope: "transient".into() };
+        let provider = Arc::new(ScriptedProvider::new(vec![page(&["OLD"], false)], vec![]));
+        let resolver = FixedResolver { sources: vec![source.clone()], provider: provider.clone() };
+        subscribe(&state, &query);
+        let shared = SharedIssueRefresh::default();
+        let (tx, _) = broadcast::channel(64);
+        let sink: Arc<dyn EventSink> = Arc::new(BroadcastEventSink::new(tx));
+        let mut window = load_window(&query, generation(&state, &query), &resolver, &shared, &state, &sink).await;
+        let cursor = window.sources[0].refresh_cursor.clone();
+        provider.errors.lock().await.push_back("temporary network error".into());
+        refresh_window(&query, generation(&state, &query), &resolver, &shared, &mut window, &state, &sink).await;
+        assert!(shared.sources.lock().expect("sources").contains_key(&source), "provider must remain registered");
+        assert!(!window.needs_full_reload, "error must not trigger a full reload");
+        assert_eq!(window.sources[0].refresh_cursor, cursor);
+        let entry = shared.sources.lock().expect("sources")[&source].clone();
+        assert_eq!(entry.pages.lock().await.len(), 1, "failed observation must retain cached pages");
+        assert_eq!(window.conditions.len(), 1);
+        tokio::time::advance(REFRESH_INTERVAL).await;
+        refresh_window(&query, generation(&state, &query), &resolver, &shared, &mut window, &state, &sink).await;
+        assert_eq!(provider.seen_since.lock().await.len(), 1, "retry must back off beyond the normal interval");
+        tokio::time::advance(REFRESH_INTERVAL).await;
+        refresh_window(&query, generation(&state, &query), &resolver, &shared, &mut window, &state, &sink).await;
+        assert_eq!(provider.seen_queries.lock().await.len(), 1, "recovery must not reload the initial page");
+        assert_eq!(provider.seen_since.lock().await.as_slice(), &[cursor.clone(), cursor]);
+        assert!(window.conditions.is_empty(), "successful retry clears the error");
+        shared.unregister(&query);
+        assert!(shared.sources.lock().expect("sources").is_empty(), "removing demand releases the cache");
     }
 
     #[tokio::test]
