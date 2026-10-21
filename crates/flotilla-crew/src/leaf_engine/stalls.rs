@@ -617,6 +617,19 @@ impl ReconcilerWake {
                                 status.crew_work[vessel][role].message.clone().unwrap_or_else(|| "crew stalled".into()),
                                 StallEvidenceSource::Crew,
                             ))
+                        } else if status.phase == ConvoyPhase::Landing
+                            && status.work.get(vessel).is_some_and(|work| work.phase == flotilla_resources::WorkPhase::Complete)
+                            && session.is_none_or(|session| {
+                                session.metadata.deletion_timestamp.is_some()
+                                    || session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Stopped)
+                            })
+                        {
+                            // A cached actor row can outlive completed work and
+                            // its teardown. This actor has no remaining work;
+                            // other makers (especially failed controllers) still judge.
+                            self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
+                            obligation.quiet_since = None;
+                            Ok(())
                         } else if launching {
                             // Pending launch is not a dead session or an ended turn. Keep
                             // both clocks clear so launch latency cannot age evidence.
