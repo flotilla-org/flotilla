@@ -426,8 +426,7 @@ impl InteractiveWidget for Screen {
                 let address = ctx.views.active_address().cloned().expect("table page has a parsed address");
                 let filter = ctx.views.active_table_state().filter.clone();
                 let source_search = ctx.views.active_table_state().source_search.as_deref();
-                let rows = crate::app::table_rows(ctx.model, ctx.namespaces, ctx.query_tables, source_search);
-                match crate::table_view::project(&address, &rows).map(|view| view.filtered(&filter)) {
+                match ctx.query_tables.project_table(&address, ctx.model, ctx.namespaces, source_search, &filter) {
                     Ok(view) => {
                         let breadcrumbs = if ctx.views.active().has_history() {
                             Vec::new()

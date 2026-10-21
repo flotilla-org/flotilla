@@ -59,14 +59,7 @@ pub struct ProjectPageWidget {
 }
 
 impl ProjectPageWidget {
-    fn filtered_panels(
-        address: &ViewAddress,
-        rows: &table_view::TableRows<'_>,
-        state: &ProjectTableState,
-    ) -> Result<Vec<ProjectPanel>, String> {
-        table_view::project_panels(address, rows).map(|panels| Self::apply_filters(panels, state))
-    }
-
+    #[cfg(test)]
     fn apply_filters(panels: Vec<ProjectPanel>, state: &ProjectTableState) -> Vec<ProjectPanel> {
         panels
             .into_iter()
@@ -83,18 +76,17 @@ impl ProjectPageWidget {
         namespaces: &NamespaceMap,
         query_tables: &QueryTableCache,
         state: &ProjectTableState,
-    ) -> Result<Vec<ProjectPanel>, String> {
-        let rows = crate::app::table_rows(model, namespaces, query_tables, state.issue_source_search());
-        Self::filtered_panels(address, &rows, state)
+    ) -> Result<std::rc::Rc<Vec<ProjectPanel>>, String> {
+        query_tables.project_panels(address, model, namespaces, state)
     }
 
-    fn panels(ctx: &WidgetContext<'_>) -> Result<Vec<ProjectPanel>, String> {
+    fn panels(ctx: &WidgetContext<'_>) -> Result<std::rc::Rc<Vec<ProjectPanel>>, String> {
         let address = ctx.views.active_address().ok_or_else(|| "active view has no valid address".to_string())?;
         let state = ctx.views.active_project_table_state();
         Self::project_panels(address, ctx.model, ctx.namespaces, ctx.query_tables, state)
     }
 
-    fn render_panels(ctx: &RenderContext<'_>) -> Result<Vec<ProjectPanel>, String> {
+    fn render_panels(ctx: &RenderContext<'_>) -> Result<std::rc::Rc<Vec<ProjectPanel>>, String> {
         let address = ctx.views.active_address().ok_or_else(|| "active view has no valid address".to_string())?;
         let state = ctx.views.active_project_table_state();
         Self::project_panels(address, ctx.model, ctx.namespaces, ctx.query_tables, state)

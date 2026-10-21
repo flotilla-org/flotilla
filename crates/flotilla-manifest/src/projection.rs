@@ -55,6 +55,8 @@ pub struct CatalogInput<'a> {
     pub project_repositories: &'a [ProjectRepositoriesRow],
 }
 
+mod fragments;
+pub use fragments::CatalogFragments;
 mod subjects;
 pub use subjects::change_request_facts;
 use subjects::{project_role_attempts, project_subjects};
@@ -387,10 +389,23 @@ pub fn project_catalog_without_warnings(input: &CatalogInput<'_>, mint: &dyn Rec
 
 /// Liveness is a projection input: supervised connections have no expiry.
 pub fn project_catalog_with_ttl(input: &CatalogInput<'_>, mint: &dyn RecipeMint, ttl_ms: Option<u64>) -> Catalog {
+    let headers = input.awareness.into_iter().flatten().map(|node| (node.id.clone(), node.entries.len())).collect();
+    project_catalog_fragment(input, mint, ttl_ms, &headers)
+}
+
+/// Project an indexed fragment. Awareness headers are separate keys from their
+/// entries; each header carries its original visible count for truncation text.
+/// All rows joined by convoy, standing role or subject identity must be supplied.
+pub fn project_catalog_fragment(
+    input: &CatalogInput<'_>,
+    mint: &dyn RecipeMint,
+    ttl_ms: Option<u64>,
+    headers: &BTreeMap<String, usize>,
+) -> Catalog {
     let mut catalog = Catalog { ttl_ms, ..Catalog::default() };
     if let Some(nodes) = input.awareness {
         for node in nodes {
-            project_awareness_node(&mut catalog, node, input.convoys, mint);
+            project_awareness_node(&mut catalog, node, input.convoys, mint, headers.get(&node.id).copied());
         }
         project_readiness(&mut catalog, input.convoys);
         mark_superseded_convoys(&mut catalog, input.convoys);
@@ -619,10 +634,16 @@ fn mark_superseded_convoys(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
     }
 }
 
-fn project_awareness_node(catalog: &mut Catalog, node: &AwarenessNode, convoys: &[ConvoyRow], mint: &dyn RecipeMint) {
+fn project_awareness_node(
+    catalog: &mut Catalog,
+    node: &AwarenessNode,
+    convoys: &[ConvoyRow],
+    mint: &dyn RecipeMint,
+    visible: Option<usize>,
+) {
     let parent = awareness_parent_facts(node, convoys);
-    if let Some((entity, mut facts)) = awareness_node_entity(node, convoys) {
-        facts.extend(status_and_counts(node.state, &node.counts, node.entries.len()));
+    if let Some((entity, mut facts)) = visible.and_then(|_| awareness_node_entity(node, convoys)) {
+        facts.extend(status_and_counts(node.state, &node.counts, visible.expect("header count")));
         if let Some(recipe) = awareness_project_recipe(node, mint) {
             catalog.assert_entity(entity.clone(), action_facts(&recipe, "workspace"), None);
         }
