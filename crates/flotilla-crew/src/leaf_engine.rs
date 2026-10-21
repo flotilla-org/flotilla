@@ -118,6 +118,8 @@ struct LeafSubscriptionTableInner {
     controller_queues: Mutex<HashMap<String, flotilla_store::controller::WorkQueueSender>>,
     turn_delivery: Mutex<Arc<dyn TurnDeliveryActuator>>,
     episode_limit: u32,
+    /// Turn-delivery failures awaiting their convoy's single status write (#3455).
+    pending_failures: std::sync::Mutex<HashMap<(String, String), turn_delivery::PendingFailures>>,
     decisions: crate::decision_log::DecisionLog,
     supervisor_context: Mutex<HashMap<(String, String), String>>,
     #[cfg(test)]
@@ -219,6 +221,7 @@ impl LeafSubscriptionTable {
                 controller_queues: Mutex::new(HashMap::new()),
                 turn_delivery: Mutex::new(Arc::new(UnavailableTurnDeliveryActuator)),
                 episode_limit,
+                pending_failures: Default::default(),
                 decisions: Default::default(),
                 supervisor_context: Default::default(),
                 #[cfg(test)]
