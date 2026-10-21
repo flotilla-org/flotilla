@@ -49,7 +49,9 @@ row changes.
   fragments and diffing only touched targets. Shared project facts use an ordered
   lookup for their remaining contributor, not a scan of all sibling convoys.
   Namespace discovery likewise queues newly encountered namespaces instead of
-  scanning every convoy on every event. Alias/forge resolution is cached per
+  scanning every convoy on every event. Namespaces leave the pending queue only
+  after watch setup succeeds; a failure preserves the current and unstarted
+  namespaces, and session teardown cancels any partial watches. Alias/forge resolution is cached per
   live source and evicted when its last input leaves the graph.
 
 For independent rows, one changed key costs one row projection plus ordered
