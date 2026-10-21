@@ -18,4 +18,4 @@ If this PR changes a resource kind's serialized shape, list every out-of-repo so
 
 ## CI coverage
 
-Platform-specific code gets cfg-gated tests in its own crate; platform jobs pick them up through their fixed crate scope. Do not add lines to `ci/platform-tests/selectors.txt` (being retired, #2909). Add a new CI job only for a new runner type or OS; otherwise use an existing job on the same runner.
+Platform-specific code gets cfg-gated tests in its own crate; platform jobs pick them up through their fixed crate scope (the explicit list of crates each platform job tests; see [#2909](https://github.com/flotilla-org/flotilla/issues/2909)). Do not add lines to `ci/platform-tests/selectors.txt` (being retired, #2909). Add a new CI job only for a new runner type or OS; otherwise use an existing job on the same runner.
