@@ -343,6 +343,25 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         raised_at: "2026-10-07T12:00:00Z".into(),
     });
     assert!(format_convoy_explanation_human(&held).contains("checks-settled held since=2026-10-07T12:00:00Z: episode limit"));
+    // #3009: an unresolvable receiver is shown beside its Message.
+    let mut unresolved = explanation.clone();
+    unresolved.messages.push(flotilla_protocol::query::CrewMessageView {
+        current_receiver: None,
+        receiver_error: Some("project role has multiple holder declarations".into()),
+        name: "ambiguous".into(),
+        sender: "system:turn-rules".into(),
+        receiver: "flotilla/coder".into(),
+        relation: "system".into(),
+        phase: "accepted".into(),
+        since: "2026-10-07T12:00:00Z".into(),
+        reason: None,
+        subject: None,
+        expectation: serde_json::json!({"kind": "none"}),
+        crew_id: None,
+        session: None,
+    });
+    assert!(format_convoy_explanation_human(&unresolved)
+        .contains("  - ambiguous system:turn-rules -> flotilla/coder (system) accepted since 2026-10-07T12:00:00Z\n    receiver_error=project role has multiple holder declarations"));
     let mut artifact_only = explanation;
     artifact_only.decision_ledgers = vec![artifact_only.decision_ledgers[1].clone()];
     artifact_only.decision_ledgers[0].comment_url = None;

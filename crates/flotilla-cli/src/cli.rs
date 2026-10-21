@@ -1239,6 +1239,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 message.since,
                 message.reason.as_ref().map_or_else(String::new, |reason| format!(": {reason}"))
             );
+            if let Some(error) = &message.receiver_error {
+                let _ = writeln!(output, "    receiver_error={error}");
+            }
         }
     }
 

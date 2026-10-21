@@ -2146,7 +2146,12 @@ pub async fn message_views(
     let mut views = Vec::new();
     for source in records {
         let message = source.object;
-        let holder = receivers.resolve(&message.spec.receiver)?;
+        // A diagnostic view shows an unresolvable receiver beside the Message
+        // instead of failing the whole read; delivery keeps refusing it (#3009).
+        let (holder, receiver_error) = match receivers.resolve(&message.spec.receiver) {
+            Ok(holder) => (holder, None),
+            Err(error) => (None, Some(error)),
+        };
         let current_receiver = holder.and_then(|holder| {
             let terminal = holder.object;
             let convoy = terminal.metadata.labels.get(flotilla_resources::CONVOY_LABEL)?;
@@ -2156,7 +2161,12 @@ pub async fn message_views(
         if let Some(convoy) = convoy {
             let direct = message.spec.receiver.split('/').collect::<Vec<_>>();
             let is_direct = matches!(direct.as_slice(), [_, name, _, _] if *name == convoy.metadata.name);
+            // An unresolvable receiver has no holder to confirm the convoy, so
+            // keep it on the evidence `may_address_convoy` already required: a
+            // four-part address naming this convoy, or a role declaration or
+            // terminal claim pointing at it. Hiding it would hide the ambiguity.
             if !is_direct
+                && receiver_error.is_none()
                 && !current_receiver.as_deref().is_some_and(|receiver| receiver.split('/').nth(1) == Some(convoy.metadata.name.as_str()))
             {
                 continue;
@@ -2166,6 +2176,7 @@ pub async fn message_views(
         let receiver = status.resolved_receiver.as_ref();
         views.push(flotilla_protocol::query::CrewMessageView {
             current_receiver,
+            receiver_error,
             name: message.metadata.name,
             sender: message.spec.sender,
             receiver: message.spec.receiver,
