@@ -273,14 +273,14 @@ pub fn parse_gh_observation_value_with_crew_identity(
             || head_at.is_some_and(|head_at| {
                 comments.iter().copied().any(|item| {
                     unaddressed(item)
-                        && substantive_feedback(item)
+                        && substantive_feedback(item, review_bot_login)
                         && item["createdAt"]
                             .as_str()
                             .or_else(|| item["submittedAt"].as_str())
                             .is_some_and(|created_at| created_at > head_at)
                 }) || reviews.into_iter().flatten().any(|review| {
                     unaddressed(review)
-                        && substantive_feedback(review)
+                        && substantive_feedback(review, review_bot_login)
                         && (review["state"] == "COMMENTED"
                             || review["author"]["login"]
                                 .as_str()
@@ -346,9 +346,31 @@ fn actionable_author(item: &serde_json::Value, pr_author: Option<&str>, review_b
     !is_bot || (item["author"]["__typename"] == "Bot" && login == review_bot_login)
 }
 
-fn substantive_feedback(item: &serde_json::Value) -> bool {
-    let body = item["body"].as_str().unwrap_or_default().trim().trim_end_matches(['!', '.', '?']).trim_end();
-    !body.is_empty() && !matches!(body.to_ascii_lowercase().as_str(), "thanks" | "thank you" | "lgtm" | "+1" | "approved")
+fn substantive_feedback(item: &serde_json::Value, review_bot_login: &str) -> bool {
+    let raw = item["body"].as_str().unwrap_or_default();
+    let body = raw.trim().trim_end_matches(['!', '.', '?']).trim_end();
+    !body.is_empty()
+        && !matches!(body.to_ascii_lowercase().as_str(), "thanks" | "thank you" | "lgtm" | "+1" | "approved")
+        // A review wake is for findings the crew still has to act on (#3083).
+        && !(item["author"]["login"].as_str() == Some(review_bot_login) && bot_reports_no_findings(raw))
+}
+
+/// Openings with which the review bot reports nothing new to act on.
+const NO_FINDINGS_OPENINGS: [&str; 5] = ["no new issues", "no new findings", "found no issues", "no issues found", "no findings"];
+
+/// True when a review-bot comment reports no findings for the crew. Its
+/// `<!-- review-findings: N -->` marker is authoritative; without one, the
+/// bot's opening lines (after any heading) must say it found nothing new.
+fn bot_reports_no_findings(body: &str) -> bool {
+    let marked = body
+        .split("<!--")
+        .skip(1)
+        .find_map(|part| part.split_once("-->")?.0.trim().strip_prefix("review-findings:")?.trim().parse::<u64>().ok());
+    if let Some(findings) = marked {
+        return findings == 0;
+    }
+    let opening = body.lines().map(str::trim).filter(|line| !line.is_empty()).take(3).collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+    NO_FINDINGS_OPENINGS.iter().any(|phrase| opening.contains(phrase))
 }
 
 fn github_comment_id(comment: &serde_json::Value) -> Option<u64> {
@@ -526,6 +548,45 @@ mod tests {
             "body": "Please fix the race"
         }));
         assert!(review_actionable(request));
+    }
+
+    // #3083 (option A): a review wake is for findings the crew still has to act
+    // on. A bot re-review at a new head that reports no new findings is not
+    // actionable; one with a new, unanswered finding still is; a human comment
+    // with the same words is unaffected; the bot's findings marker is authoritative.
+    #[test]
+    fn bot_rereview_without_new_findings_does_not_wake_crew() {
+        let observe = |body: &str, login: &str, typename: &str| {
+            review_actionable(serde_json::json!({
+                "reviewDecision": null, "author": {"login": "author"},
+                "headRefOid": "new-head",
+                "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z"}}]},
+                "comments": {"nodes": [
+                    // The previous round at the old head, answered by the crew before it pushed.
+                    {"databaseId": 1, "createdAt": "2026-09-30T09:00:00Z", "author": {"login": "claude", "__typename": "Bot"},
+                     "body": "**Review**\n\n1. The retry loop never ends."},
+                    {"databaseId": 2, "createdAt": "2026-09-30T11:00:00Z", "author": {"login": login, "__typename": typename},
+                     "body": body}
+                ]}
+            }))
+        };
+        for quiet in [
+            "**Re-review (static)**\n\nI found no new issues. The earlier points are resolved in abc123.",
+            "**Static review**\n\nNo new issues found. I checked the earlier review threads against the current head.",
+            "Looks settled; see the threads above.\n\n<!-- review-findings: 0 -->",
+        ] {
+            assert!(!observe(quiet, "claude", "Bot"), "{quiet}");
+        }
+        for finding in [
+            "**Re-review**\n\n1. `retry_at` can overflow when attempts exceed 63.",
+            "**Review: episode limit**\n\nNo correctness bugs found.\n\n**Things to consider**\n\n1. `episodes` is now unbounded.",
+            "No new issues found in the parser.\n\n1. The new cap drops queued episodes.\n\n<!-- review-findings: 1 -->",
+        ] {
+            assert!(observe(finding, "claude", "Bot"), "{finding}");
+        }
+        // A human's words are judged as before; only the configured review bot reports findings this way.
+        assert!(observe("No new issues found, but please rename `run` before merging.", "reviewer", "User"));
+        assert!(observe("<!-- review-findings: 0 -->\nPlease rename `run`.", "reviewer", "User"));
     }
 
     #[test]

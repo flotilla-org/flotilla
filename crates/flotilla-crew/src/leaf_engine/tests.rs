@@ -1384,7 +1384,10 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
         let conflict = table.rows().await.into_iter().find(|row| is_conflict_probe(&row.leaves[0])).expect("active conflict subscription");
         let LeafWatcher::TurnDelivery { source, rule, .. } = &conflict.watcher else { unreachable!() };
         table.deliver_turn(conflict.id, "checks-wake", source, rule, &conflict.leaves[0]).await.expect("active conflict turn");
-        assert!(actuator.requests.lock().expect("requests").last().expect("conflict request").brief.starts_with(rule.brief.trim()));
+        let brief = actuator.requests.lock().expect("requests").last().expect("conflict request").brief.clone();
+        assert!(brief.starts_with(rule.brief.trim()));
+        // #3083: turn briefs carry no settlement-claim pressure.
+        assert!(!brief.contains("settlement claim"), "{brief}");
     }
     for row in table.rows().await {
         table.finish(row.id).await;
