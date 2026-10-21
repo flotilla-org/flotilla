@@ -11,6 +11,7 @@
 //! one implementation.
 
 pub mod convert;
+pub mod convoys;
 pub mod import;
 pub mod ports;
 pub mod roles;
@@ -214,6 +215,7 @@ pub struct MessagePrimitives {
     service: Arc<Service>,
     inbox: SqliteInbox,
     sessions: Arc<Sessions>,
+    convoys: Arc<convoys::Convoys>,
     world: Arc<GateWorld>,
     backend: ResourceBackend,
     system: Arc<Mutex<Option<Address>>>,
@@ -277,11 +279,13 @@ impl MessagePrimitives {
         for session in names {
             sessions.home.lock().expect("session home").restore(session).map_err(|error| format!("{error:?}"))?;
         }
+        let convoys = Arc::new(convoys::Convoys::open(home, &service)?);
         Ok(Self {
             home: home.to_owned(),
             service,
             inbox,
             sessions,
+            convoys,
             world,
             system,
             consumers: Mutex::new(BTreeSet::new()),
@@ -305,6 +309,10 @@ impl MessagePrimitives {
     }
     pub fn sessions(&self) -> &Arc<Sessions> {
         &self.sessions
+    }
+    /// This home's Convoy records (#3587 layer 6).
+    pub fn convoys(&self) -> &Arc<convoys::Convoys> {
+        &self.convoys
     }
     pub fn world(&self) -> &Arc<GateWorld> {
         &self.world

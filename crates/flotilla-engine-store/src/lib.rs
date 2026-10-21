@@ -40,6 +40,7 @@ pub fn machine_registry() -> Result<MachineRegistry, RegistryError> {
     }
     register!(Message);
     register!(AgentSession);
+    register!(convoy::Convoy);
     Ok(MachineRegistry { kinds, diagrams })
 }
 pub fn registry() -> Result<KindRegistry, RegistryError> {
@@ -48,8 +49,9 @@ pub fn registry() -> Result<KindRegistry, RegistryError> {
 
 /// The kinds the Convoy stack moves (#3587): Convoy, with its seats,
 /// promises, submissions and duties as its records, and AwaitingReply. Both
-/// codes are the production registry's. Nothing opens a store with these
-/// yet; the write path (layer 6) moves them into [`machine_registry`].
+/// codes are the production registry's. The write path (layer 6) moved
+/// Convoy into [`machine_registry`]; AwaitingReply follows with the send path
+/// (layer 7). The benchmark opens a store with both.
 pub fn convoy_registry() -> Result<KindRegistry, RegistryError> {
     let mut kinds = KindRegistry::new();
     kinds.register::<Resource<convoy::Convoy>>()?;

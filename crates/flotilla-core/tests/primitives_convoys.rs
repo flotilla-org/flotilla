@@ -1,0 +1,75 @@
+//! Convoy on the engine behind the `[primitives]` switch (#3587 layer 6):
+//! this home's Convoy writer over the decided store.
+
+use std::sync::Arc;
+
+use flotilla_core::primitives::convoys::Convoys;
+use flotilla_schema::{Address, Timestamp};
+use flotilla_schema_sqlite::stream::Service;
+use flotilla_state_machines::{
+    kinds::{stock, Catalog},
+    machines::convoy::{
+        AdmittedPromise, ConvoyRefusal, ConvoyRequest, Priority, Progress, PromiseId, PromiseSource, Seat, SeatName, Submit, VesselClass,
+    },
+    Ref, Version,
+};
+
+fn address(text: &str) -> Address {
+    Address::project(text).expect("address")
+}
+
+fn request() -> ConvoyRequest {
+    ConvoyRequest {
+        project: address("fleet"),
+        promises: [(
+            PromiseId(0),
+            AdmittedPromise {
+                kind: "pr".into(),
+                target: address("target"),
+                source: PromiseSource::Template,
+                owner: SeatName::new("coder", ""),
+            },
+        )]
+        .into(),
+        duties: Default::default(),
+        seats: vec![Seat { role: "coder".into(), seat: String::new(), parent: None, supervised_by: address("supervisor") }],
+        quota: [(VesselClass::new("standard"), 1)].into(),
+        priority: Priority(1),
+        kinds: Catalog::resolve(&stock(), &[]).expect("stock").freeze(["pr"]).expect("freeze"),
+    }
+}
+
+fn service(dir: &tempfile::TempDir) -> Arc<Service> {
+    Arc::new(
+        Service::open(&dir.path().join("decided.sqlite"), "home-a", flotilla_engine_store::registry().expect("registry")).expect("store"),
+    )
+}
+
+// Behaviour: a Convoy admitted and edged at this home is in the decided store, and a reopened
+// home restores it at the version its log gave, so the next edge continues from there.
+#[test]
+fn a_convoy_survives_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let convoys = Convoys::open("home-a", &service(&dir)).expect("open");
+        let refused = convoys.admit("c", request(), Timestamp(1)).expect_err("the project must exist");
+        assert_eq!(refused.refusal(), Some(&ConvoyRefusal::UnknownProject));
+        convoys.world(|world| world.projects.put(&Ref::new(address("fleet").as_str()), ()));
+        assert!(convoys.admit("c", request(), Timestamp(1)).expect("admitted"));
+        assert!(!convoys.admit("c", request(), Timestamp(1)).expect("existing"), "a second admission is the first");
+        convoys.world(|world| world.durable.put(&Ref::new(address("change").as_str()), true));
+        let submit = Submit {
+            promise: PromiseId(0),
+            by: SeatName::new("coder", ""),
+            address: address("change"),
+            revision: "abc".into(),
+            durable: Ref::new(address("change").as_str()),
+        };
+        assert_eq!(convoys.apply("c", submit, Timestamp(2)).expect("submitted"), Version(2));
+    }
+    let convoys = Convoys::open("home-a", &service(&dir)).expect("reopen");
+    let convoy = convoys.get("c").expect("restored");
+    assert_eq!(convoy.version(), Version(2));
+    let (_, promise) = convoy.spec().promise(PromiseId(0)).expect("promise");
+    assert_eq!(promise.progress.value, Progress::Submitted);
+}
