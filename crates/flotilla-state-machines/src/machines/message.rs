@@ -104,9 +104,10 @@ pub enum MessageBody {
 /// The typed request bodies. Admission's convoy request is the first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestBody {
-    /// A convoy request to the admission role (ADR 0064 "Admission and capacity").
+    /// A convoy request to the admission role (ADR 0064 "Admission and capacity"),
+    /// boxed for its size: the stored body is the request itself.
     #[serde(rename = "cv")]
-    Convoy(ConvoyRequest),
+    Convoy(Box<ConvoyRequest>),
 }
 
 /// A thing the message refers to, at a revision (ADR 0066 §4). At most one

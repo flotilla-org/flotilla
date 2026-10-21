@@ -2,4 +2,5 @@
 
 mod declaration;
 mod latch;
+mod records;
 mod writer;

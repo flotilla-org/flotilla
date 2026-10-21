@@ -133,7 +133,7 @@ fn resources_survive_the_codec() {
             Address::project("sender").expect("sender"),
             Address::project("i").expect("inbox"),
             Relation::Supervisor,
-            Frozen::new(MessageBody::Request(RequestBody::Convoy(request))).expect("a request body freezes"),
+            Frozen::new(MessageBody::Request(RequestBody::Convoy(Box::new(request)))).expect("a request body freezes"),
         )
     };
     let world =

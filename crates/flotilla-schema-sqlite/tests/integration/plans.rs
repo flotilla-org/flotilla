@@ -92,7 +92,13 @@ fn the_enumeration_covers_every_kind_and_index() {
         "message set receiver",
         "message set state state",
         "message label state",
-        "convoy_resolution upsert",
+        "convoy_retired insert",
+        "convoy_promises last position",
+        "convoy_promises_submissions last position",
+        "convoy_promises set progress",
+        "convoy_promises set owner",
+        "convoy_seats last position",
+        "convoy_seats set supervised_by",
         "convoy_quota insert",
         "convoy_quota delete",
         "convoy label state",
@@ -141,7 +147,7 @@ fn the_enumeration_covers_every_kind_and_index() {
     assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 10);
     assert!(!labels.iter().any(|label| label.contains("_edges")), "no kind has an edge-log table");
     assert!(
-        !labels.iter().any(|label| label.starts_with("convoy_promises ") && label.ends_with(" last position")),
+        !labels.iter().any(|label| label.starts_with("convoy_duties ") && label.ends_with(" last position")),
         "spec collections take no positions from edges"
     );
     assert!(

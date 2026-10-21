@@ -4,13 +4,16 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
-| `agent_session` | root | 9 | – | – | – |
 | `awaiting_reply` | root | 12 | – | – | `open_by_sender` (sender), `open_by_subject` (subject), `by_message` (message), `deadline` (deadline) |
-| `agent_session` | root | 6 | – | – | – |
-| `convoy` | root | 7 | – | `convoy_promises` (child), `convoy_resolution` (state data), `convoy_quota` (state data) | `open_by_project` (project) |
-| `convoy_promises` | child | 4 | – | – | – |
-| `convoy_resolution` | state data | 3 | – | – | – |
+| `agent_session` | root | 9 | – | – | – |
+| `convoy` | root | 8 | – | `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_quota` (state data), `convoy_retired` (state data) | `open_by_project` (project) |
+| `convoy_duties` | child | 6 | 1: `scope` 1 | `convoy_duties_scope_promises` (child) | – |
+| `convoy_duties_scope_promises` | child | 3 | – | – | – |
+| `convoy_seats` | records | 8 | – | – | – |
+| `convoy_promises` | records | 11 | – | `convoy_promises_submissions` (records) | – |
+| `convoy_promises_submissions` | records | 8 | – | – | `by_address` (address) |
 | `convoy_quota` | state data | 3 | – | – | – |
+| `convoy_retired` | state data | 2 | – | – | – |
 | `dossier` | root | 7 | – | `dossier_inputs` (child), `dossier_deliverables` (records) | – |
 | `dossier_inputs` | child | 5 | 3: `tag` 3 | `dossier_inputs_items` (child) | – |
 | `dossier_inputs_items` | child | 4 | – | – | – |
@@ -37,10 +40,9 @@ Tables wider than 30 columns:
 - none
 
 States with data (one label column, then data shared by name across the labels):
-- `agent_session`.`state`: label `state` and `state_since`; data columns `channel`, `activity`, `activity_since`, `activity_cause`, `reason`; data tables –
 - `awaiting_reply`.`state`: label `state` and `state_since`; data columns `reason`; data tables –
-- `agent_session`.`state`: label `state` and `state_since`; data columns `channel`, `reason`; data tables –
-- `convoy`.`state`: label `state` and `state_since`; data columns `reason`; data tables `convoy_resolution`, `convoy_quota`
+- `agent_session`.`state`: label `state` and `state_since`; data columns `channel`, `activity`, `activity_since`, `activity_cause`, `reason`; data tables –
+- `convoy`.`state`: label `state` and `state_since`; data columns `reason`; data tables `convoy_quota`, `convoy_retired`
 - `ensure`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `bound`; data tables `ensure_recorded`, `ensure_created`
 - `message`.`state`: label `state` and `state_since`; data columns `receiver_kind`, `receiver_id`, `receiver_host`, `reason`, `reason_by`, `reason_authority`, `watermark`; data tables –
 - `ticket`.`state`: label `state` and `state_since`; data columns `priority`, `owner`, `hold_by`, `hold_until`, `reason`, `closed_by`, `signature_who`, `signature_at`; data tables `ticket_assignees`, `ticket_notes`
@@ -56,8 +58,21 @@ Interned column domains:
 | `awaiting_reply` | `subject` | `ad` |
 | `awaiting_reply` | `kind` | `ak` |
 | `convoy` | `project` | `ad` |
+| `convoy_duties` | `owner_role` | `rl` |
+| `convoy_duties` | `owner_seat` | `st` |
+| `convoy_seats` | `role` | `rl` |
+| `convoy_seats` | `seat` | `st` |
+| `convoy_seats` | `parent_role` | `rl` |
+| `convoy_seats` | `parent_seat` | `st` |
+| `convoy_seats` | `supervised_by` | `ad` |
 | `convoy_promises` | `kind` | `pk` |
 | `convoy_promises` | `target` | `ad` |
+| `convoy_promises` | `owner_role` | `rl` |
+| `convoy_promises` | `owner_seat` | `st` |
+| `convoy_promises_submissions` | `address` | `ad` |
+| `convoy_promises_submissions` | `by_role` | `rl` |
+| `convoy_promises_submissions` | `by_seat` | `st` |
+| `convoy_quota` | `key` | `vc` |
 | `dossier_deliverables` | `label` | `lb` |
 | `dossier_deliverables` | `source_step` | `st` |
 | `dossier_deliverables_evidence` | `verdict_by` | `wr` |
@@ -85,3 +100,4 @@ Interned column domains:
 | `terminal_session` | `role` | `rl` |
 | `terminal_session` | `pool` | `pl` |
 | `terminal_session` | `source_selector` | `sl` |
+| `vessel` | `class` | `vc` |

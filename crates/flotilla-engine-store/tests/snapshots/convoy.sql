@@ -188,6 +188,7 @@ CREATE TABLE "convoy_retired" (
   FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "convoy_open_by_project" ON "convoy" ("project") WHERE "state" IN ('op');
+CREATE INDEX "convoy_promises_submissions_by_address" ON "convoy_promises_submissions" ("address");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'state', 'ab', 'Abandoned'),
   ('cv', 'state', 'de', 'Delivered'),

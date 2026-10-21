@@ -18,7 +18,7 @@ use hegel::{generators as gs, TestCase};
 
 use super::{
     engine::{self, resource},
-    reference,
+    name, reference,
     terminal::{candidates, state_value},
     timestamp, Fixture, Pick,
 };
@@ -42,7 +42,7 @@ fn shape(tc: &TestCase, pick: Pick) -> BTreeMap<Dimension, u32> {
 pub fn spec(tc: &TestCase, pick: Pick) -> VesselSpec {
     VesselSpec {
         convoy: reference(tc),
-        class: VesselClass(tc.draw(gs::integers::<u32>())),
+        class: VesselClass::new(name(tc)),
         shape: shape(tc, pick.nth(2)),
         priority: Priority(tc.draw(gs::integers::<u32>())),
         host: Host(tc.draw(gs::integers::<u32>().max_value(3))),

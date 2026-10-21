@@ -146,7 +146,15 @@ pub enum Progress {
 /// pushed ref at a commit, a stored object at its digest, a posted artifact),
 /// at its revision (ADR 0066), and the seat that submitted it. Its position
 /// among the promise's submissions is what observed evidence names.
+///
+/// Indexed by address (#3627 look-over ruling 5): each observation of a
+/// change request (merged, closed unmerged) finds the promises that submitted
+/// it, so the lookup runs once per event. The index cannot be partial on Open
+/// convoys: SQLite's partial-index predicate reads only the indexed table's
+/// columns, and the convoy's label is on its root row. A lookup joins the root
+/// to keep Open convoys.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
+#[store(index(name = "by_address", eq(address)))]
 pub struct Submission {
     pub address: Address,
     /// Opaque and non-empty: compared, never interpreted.

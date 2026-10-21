@@ -10,7 +10,7 @@ use std::{
 use flotilla_schema::{Address, Timestamp};
 use flotilla_state_machines::{
     machines::{
-        convoy::{ConvoyRequest, Promise, PromiseId, VesselClass},
+        convoy::{AdmittedPromise, ConvoyRequest, Duty, DutyId, DutyScope, PromiseId, Seat, SeatName, VesselClass},
         message::*,
     },
     Resource, Transport,
@@ -99,12 +99,30 @@ pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&BTreeMap<Rec
         + match body.value() {
             MessageBody::Text(text) => text.capacity(),
             MessageBody::Request(RequestBody::Convoy(request)) => {
-                let ConvoyRequest { project, promises, quota, priority: _ } = request;
+                let ConvoyRequest { project, promises, duties, seats, quota, priority: _, kinds } = request.as_ref();
                 let nodes = |len: usize, slot: usize| if len == 0 { 0 } else { len.saturating_mul(2).max(11) * slot + (len / 5 + 1) * 96 };
-                heap_address(project)
+                let seat = |seat: &SeatName| seat.role.capacity() + seat.seat.capacity();
+                let scope = |duty: &Duty| match &duty.scope {
+                    DutyScope::Lifetime => 0,
+                    DutyScope::WhileOpen { promises } => nodes(promises.len(), size_of::<PromiseId>()),
+                };
+                size_of::<ConvoyRequest>()
+                    + heap_address(project)
                     + nodes(quota.len(), size_of::<(VesselClass, u32)>())
-                    + nodes(promises.len(), size_of::<(PromiseId, Promise)>())
-                    + promises.values().map(|p| p.kind.capacity() + heap_address(&p.target)).sum::<usize>()
+                    + quota.keys().map(|class| class.0.capacity()).sum::<usize>()
+                    + nodes(promises.len(), size_of::<(PromiseId, AdmittedPromise)>())
+                    + promises.values().map(|p| p.kind.capacity() + heap_address(&p.target) + seat(&p.owner)).sum::<usize>()
+                    + nodes(duties.len(), size_of::<(DutyId, Duty)>())
+                    + duties.values().map(|d| seat(&d.owner) + scope(d) + d.terms.note.as_ref().map_or(0, String::capacity)).sum::<usize>()
+                    + seats.capacity() * size_of::<Seat>()
+                    + seats
+                        .iter()
+                        .map(|s| s.role.capacity() + s.seat.capacity() + s.parent.as_ref().map_or(0, seat) + heap_address(&s.supervised_by))
+                        .sum::<usize>()
+                    // The frozen kinds keep their bytes and their value; a decoded
+                    // document's heap is bounded by eight times its CBOR.
+                    + kinds.bytes().len() * 9
+                    + 64
             }
         };
     bytes += references.capacity() * size_of::<MessageReference>();

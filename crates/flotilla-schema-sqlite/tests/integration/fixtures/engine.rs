@@ -2,7 +2,10 @@
 //! engine applied, through `Home`, to that resource.
 
 use flotilla_schema::{Cbor, Edge, Identity, Kind, KindSpec, Labelled, State, StateData, Timestamp};
-use flotilla_state_machines::{machines::message::Message, EdgePayload, Home, Label, Machine, Resource, Version};
+use flotilla_state_machines::{
+    machines::message::Message, EdgeEventOf, EdgePayload, Home, InputRead, Label, Log, LogError, Machine, Resource, StoredState,
+    StoredWrite, Version,
+};
 use hegel::TestCase;
 
 use super::{name, Pick, LOCAL};
@@ -34,6 +37,7 @@ where
     M: Machine,
     M::Spec: KindSpec<State = M::State> + Clone,
     M::State: StateData + Labelled<Label = Label<M>>,
+    M::Write: StoredWrite<Resource<M>>,
     EdgePayload<M::Edge>: Cbor,
 {
     if candidates.is_empty() {
@@ -45,9 +49,46 @@ where
     candidates.into_iter().find_map(|(edge, world, now)| step(resource, &writer, edge, &*world, now))
 }
 
+/// A log that keeps the stored edge persisting the last edge it took, with its records writes.
+struct Capture<M: Machine> {
+    edge: Option<Edge<Resource<M>>>,
+}
+
+impl<M> Log<M> for Capture<M>
+where
+    M: Machine,
+    M::Spec: KindSpec<State = M::State>,
+    M::State: StateData + Labelled<Label = Label<M>>,
+    M::Write: StoredWrite<Resource<M>>,
+    EdgePayload<M::Edge>: Cbor,
+{
+    fn create(&mut self, _: &str, _: Timestamp, _: &Resource<M>, _: &[InputRead]) -> Result<Version, LogError> {
+        Ok(Version(1))
+    }
+
+    fn edge(&mut self, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
+        self.edge_with_writes(previous, next, event, &[])
+    }
+
+    fn edge_with_writes(
+        &mut self,
+        previous: &StoredState<M>,
+        next: &Resource<M>,
+        event: &EdgeEventOf<M>,
+        writes: &[M::Write],
+    ) -> Result<Version, LogError> {
+        // Every master an engine edge names in these fixtures is a message at this home.
+        let master = |name: &str| Identity { kind: Resource::<Message>::CODE, name: name.to_owned(), home: LOCAL.to_owned() };
+        let edge = next.stored_edge_about(previous, event, master).expect("an applied edge is storable");
+        let edge = writes.iter().try_fold(edge, |edge, write| write.store(edge)).expect("a records write is storable");
+        self.edge = Some(edge);
+        Ok(Version(next.version().0 + 1))
+    }
+}
+
 /// `edge` applied at `now` by a home writing as `writer` and holding only `resource` (as
-/// [`NAME`]), as the stored edge persisting it and the resource it leads to; `None` when the
-/// engine refuses it.
+/// [`NAME`]), as the stored edge persisting it (its records writes included) and the resource it
+/// leads to; `None` when the engine refuses it.
 pub fn step<M>(
     resource: &Resource<M>,
     writer: &str,
@@ -59,17 +100,15 @@ where
     M: Machine,
     M::Spec: KindSpec<State = M::State> + Clone,
     M::State: StateData + Labelled<Label = Label<M>>,
+    M::Write: StoredWrite<Resource<M>>,
     EdgePayload<M::Edge>: Cbor,
 {
-    let mut home = Home::<M>::new(writer).expect("the machine's declaration validates");
-    let previous = resource.stored_state().clone();
+    let mut home = Home::<M, Capture<M>>::with_log(writer, Capture { edge: None }).expect("the machine's declaration validates");
     let version = resource.version().0;
     home.restore(resource.clone().with_identity(NAME, version)).unwrap_or_else(|_| panic!("an empty home takes the resource"));
-    let event = home.apply(NAME, edge, world, now).ok()?;
+    home.apply(NAME, edge, world, now).ok()?;
     let next = home.get(NAME).expect("restored").clone();
-    // Every master an engine edge names in these fixtures is a message at this home.
-    let master = |name: &str| Identity { kind: Resource::<Message>::CODE, name: name.to_owned(), home: LOCAL.to_owned() };
-    let edge = next.stored_edge_about(&previous, &event, master).expect("an applied edge is storable");
+    let edge = home.log_mut().edge.take().expect("the log took the edge");
     Some((edge, next))
 }
 

@@ -150,12 +150,20 @@ fn calibrate() {
             let mut value = spec();
             value.body = if body_len == usize::MAX {
                 use flotilla_state_machines::machines::convoy::*;
-                flotilla_schema::Frozen::new(MessageBody::Request(RequestBody::Convoy(ConvoyRequest {
+                let owner = SeatName::new("coder", "");
+                flotilla_schema::Frozen::new(MessageBody::Request(RequestBody::Convoy(Box::new(ConvoyRequest {
                     project: address("project:test"),
-                    promises: [(PromiseId(0), Promise { kind: "opaque".into(), target: inbox() })].into(),
-                    quota: [(VesselClass(0), 2)].into(),
+                    promises: [(
+                        PromiseId(0),
+                        AdmittedPromise { kind: "opaque".into(), target: inbox(), source: PromiseSource::Template, owner: owner.clone() },
+                    )]
+                    .into(),
+                    duties: [(DutyId(0), Duty { owner, scope: DutyScope::Lifetime, terms: Terms::default() })].into(),
+                    seats: vec![Seat { role: "coder".into(), seat: String::new(), parent: None, supervised_by: inbox() }],
+                    quota: [(VesselClass::new("standard"), 2)].into(),
                     priority: Priority(1),
-                })))
+                    kinds: flotilla_schema::Frozen::new(PromiseKinds::default()).unwrap(),
+                }))))
                 .unwrap()
             } else {
                 MessageBody::text("x".repeat(body_len)).unwrap()

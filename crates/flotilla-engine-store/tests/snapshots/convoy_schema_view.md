@@ -10,7 +10,7 @@ Kind tables only; the shared tables are in `convoy.sql`.
 | `convoy_duties_scope_promises` | child | 3 | – | – | – |
 | `convoy_seats` | records | 8 | – | – | – |
 | `convoy_promises` | records | 11 | – | `convoy_promises_submissions` (records) | – |
-| `convoy_promises_submissions` | records | 8 | – | – | – |
+| `convoy_promises_submissions` | records | 8 | – | – | `by_address` (address) |
 | `convoy_quota` | state data | 3 | – | – | – |
 | `convoy_retired` | state data | 2 | – | – | – |
 

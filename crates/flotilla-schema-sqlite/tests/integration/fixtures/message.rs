@@ -5,7 +5,7 @@ use flotilla_schema::{Address, Edge, Frozen, State, Timestamp};
 use flotilla_state_machines::{
     machines::{
         consumer::ConsumerKind,
-        convoy::{ConvoyRequest, Priority, Promise, PromiseId, VesselClass},
+        convoy::{AdmittedPromise, ConvoyRequest, Priority, PromiseId, PromiseKinds, PromiseSource, SeatName, VesselClass},
         message::{
             Deliver, DropMessage, DropReason, Expectation, MemoryMessageWorld, Message, MessageBody, MessageReference, MessageSpec,
             MessageState, MessageWorld, Receiver, Relation, RequestBody, Settle, Settlement, Supersedes,
@@ -40,12 +40,24 @@ pub fn agent(id: &str, host: &str) -> Receiver {
 pub fn body(tc: &TestCase, pick: Pick) -> Frozen<MessageBody> {
     let body = match pick.variant(tc, 2, |index| index) {
         0 => MessageBody::Text(text(tc)),
-        _ => MessageBody::Request(RequestBody::Convoy(ConvoyRequest {
+        _ => MessageBody::Request(RequestBody::Convoy(Box::new(ConvoyRequest {
             project: address(tc),
-            promises: [(PromiseId(0), Promise { kind: name(tc), target: address(tc) })].into(),
-            quota: [(VesselClass(1), 2)].into(),
+            promises: [(
+                PromiseId(0),
+                AdmittedPromise {
+                    kind: name(tc),
+                    target: address(tc),
+                    source: PromiseSource::Template,
+                    owner: SeatName::new(name(tc), ""),
+                },
+            )]
+            .into(),
+            duties: Default::default(),
+            seats: Vec::new(),
+            quota: [(VesselClass::new(name(tc)), 2)].into(),
             priority: Priority(3),
-        })),
+            kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
+        }))),
     };
     Frozen::new(body).expect("a fixture body freezes")
 }
