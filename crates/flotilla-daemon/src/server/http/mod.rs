@@ -210,7 +210,7 @@ async fn login(
     Extension(caller): Extension<CallerAuth>,
     RawQuery(query): RawQuery,
 ) -> Response {
-    if matches!(caller, CallerAuth::Socket(_) | CallerAuth::Environment { .. } | CallerAuth::Hook(_, _)) {
+    if matches!(caller, CallerAuth::Socket(_) | CallerAuth::Environment { .. } | CallerAuth::Hook { .. }) {
         return auth::refusal(StatusCode::NOT_FOUND, "browser login is served on the HTTP listener");
     }
     let code =
