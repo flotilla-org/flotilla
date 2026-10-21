@@ -4,7 +4,7 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
-| `agent_session` | root | 6 | – | – | – |
+| `agent_session` | root | 9 | – | – | – |
 | `convoy` | root | 7 | – | `convoy_promises` (child), `convoy_resolution` (state data), `convoy_quota` (state data) | `open_by_project` (project) |
 | `convoy_promises` | child | 4 | – | – | – |
 | `convoy_resolution` | state data | 3 | – | – | – |
@@ -35,7 +35,7 @@ Tables wider than 30 columns:
 - none
 
 States with data (one label column, then data shared by name across the labels):
-- `agent_session`.`state`: label `state` and `state_since`; data columns `channel`, `reason`; data tables –
+- `agent_session`.`state`: label `state` and `state_since`; data columns `channel`, `activity`, `activity_since`, `activity_cause`, `reason`; data tables –
 - `convoy`.`state`: label `state` and `state_since`; data columns `reason`; data tables `convoy_resolution`, `convoy_quota`
 - `ensure`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `bound`; data tables `ensure_recorded`, `ensure_created`
 - `message`.`state`: label `state` and `state_since`; data columns `receiver_kind`, `receiver_id`, `receiver_host`, `reason`, `reason_by`, `reason_authority`, `watermark`; data tables –

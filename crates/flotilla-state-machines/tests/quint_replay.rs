@@ -71,6 +71,10 @@
 //! The scenarios' negative picks (`auth`, `seen` or `matches` false, an empty
 //! reason) are never taken steps, so they are probed too: Rust must refuse them.
 
+#[path = "common/agent_session.rs"]
+mod session_value;
+use session_value::session_value;
+
 use flotilla_quint_testkit::message::MessageSubject;
 use flotilla_quint_testkit::{
     itf,
@@ -88,9 +92,7 @@ use std::{
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
-        agent_session::{
-            AgentSession, AgentSessionEdge, AgentSessionState, Attach, Channel, Detach, End, EndReason, MemoryAgentSessionWorld, Receive,
-        },
+        agent_session::{AgentSession, AgentSessionEdge, Attach, Detach, End, EndReason, MemoryAgentSessionWorld, Receive},
         consumer::ConsumerKind,
         convoy::{
             self, Convoy, ConvoyEdge, ConvoyId, ConvoyRequest, ConvoyState, MemoryConvoyWorld, Priority, Promise, PromiseId, PromiseState,
@@ -427,27 +429,6 @@ fn lifecycle_end_refuses<K: LifecycleKind>(
 
 // ---------------------------------------------------------------------------
 // AgentSession (spec `machines/agent_session.qnt`)
-
-/// The spec's `Live(Channel) | Ended(EndReason)`.
-fn session_value(state: &AgentSessionState) -> Value {
-    match state {
-        AgentSessionState::Live { channel } => variant(
-            "Live",
-            constant(match channel {
-                Channel::Detached => "Detached",
-                Channel::Attached => "Attached",
-            }),
-        ),
-        AgentSessionState::Ended { reason } => variant("Ended", constant(end_reason_name(*reason))),
-    }
-}
-
-fn end_reason_name(reason: EndReason) -> &'static str {
-    match reason {
-        EndReason::Completed => "Completed",
-        EndReason::Lost => "Lost",
-    }
-}
 
 /// Every Ended session refuses attach, detach, either end and a receipt
 /// with `AlreadyEnded`, even with every observation present, and stays unchanged.

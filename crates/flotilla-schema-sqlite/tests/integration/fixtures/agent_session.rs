@@ -4,8 +4,8 @@
 use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::agent_session::{
-        AgentSession, AgentSessionSpec, AgentSessionState, AgentSessionWorld, Attach, Channel, Detach, End, EndReason,
-        MemoryAgentSessionWorld, Receive,
+        Activity, ActivityObservation, AgentSession, AgentSessionSpec, AgentSessionState, AgentSessionWorld, Attach, Channel, Detach, End,
+        EndReason, MemoryAgentSessionWorld, Observe, Receive,
     },
     Ref, Resource, Transport,
 };
@@ -17,16 +17,25 @@ use super::{
     name, timestamp, Fixture, Pick,
 };
 
-/// Covering indexes: the label is digit 0 (base 2), and the channel or end reason digit 1.
-pub const COVERING: usize = 16;
+/// Covering indexes span lifecycle, channel/end reason and absent/all three activities.
+pub const COVERING: usize = 64;
 
 pub fn state_value(tc: &TestCase, pick: Pick) -> AgentSessionState {
-    match (pick.digit(tc, 2, 1), pick.digit(tc, 2, 2)) {
-        (0, 0) => AgentSessionState::Live { channel: Channel::Detached },
-        (0, _) => AgentSessionState::Live { channel: Channel::Attached },
-        (_, 0) => AgentSessionState::Ended { reason: EndReason::Completed },
-        _ => AgentSessionState::Ended { reason: EndReason::Lost },
-    }
+    let state = match (pick.digit(tc, 2, 1), pick.digit(tc, 2, 2)) {
+        (0, 0) => AgentSessionState::live(Channel::Detached),
+        (0, _) => AgentSessionState::live(Channel::Attached),
+        (_, 0) => AgentSessionState::ended(EndReason::Completed),
+        _ => AgentSessionState::ended(EndReason::Lost),
+    };
+    let observation = match pick.digit(tc, 4, 4) {
+        0 => None,
+        digit => Some(ActivityObservation {
+            activity: [Activity::Working, Activity::Idle, Activity::Interrupted][digit - 1],
+            activity_since: timestamp(tc),
+            activity_cause: name(tc),
+        }),
+    };
+    state.with_observation(observation)
 }
 
 /// A receipt for a drawn message, by each transport in turn.
@@ -35,12 +44,12 @@ pub fn receive(tc: &TestCase, pick: Pick) -> Receive {
 }
 
 pub fn generate(tc: &TestCase, pick: Pick) -> Resource<AgentSession> {
-    resource(AgentSessionSpec {}, State::new(state_value(tc, pick), timestamp(tc)))
+    resource(AgentSessionSpec::default(), State::new(state_value(tc, pick), timestamp(tc)))
 }
 
 /// A live, detached session with no history.
 pub fn sample() -> Resource<AgentSession> {
-    resource(AgentSessionSpec {}, State::new(AgentSessionState::Live { channel: Channel::Detached }, Timestamp(0)))
+    resource(AgentSessionSpec::default(), State::new(AgentSessionState::live(Channel::Detached), Timestamp(0)))
 }
 
 fn boxed(world: MemoryAgentSessionWorld) -> Box<dyn AgentSessionWorld> {
@@ -64,6 +73,9 @@ pub fn candidates(tc: &TestCase, pick: Pick) -> Vec<Candidate<AgentSession>> {
         let mut world = MemoryAgentSessionWorld::default();
         world.ends.put(&observed, reason);
         candidates.push((End { reason, observed }.into(), boxed(world), now));
+    }
+    for activity in [Activity::Working, Activity::Idle, Activity::Interrupted] {
+        candidates.push((Observe { activity, cause: name(tc) }.into(), boxed(MemoryAgentSessionWorld::default()), now));
     }
     candidates.push((receive(tc, pick).into(), boxed(MemoryAgentSessionWorld::default()), now));
     candidates

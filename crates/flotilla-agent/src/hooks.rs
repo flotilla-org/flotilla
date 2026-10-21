@@ -163,6 +163,27 @@ impl HarnessHookParser for ClaudeCodeParser {
                     native_codex_hook: false,
                 })
             }
+            "post-tool-use-failure" => {
+                #[derive(Deserialize)]
+                struct Failure {
+                    #[serde(flatten)]
+                    common: ClaudeCommonPayload,
+                    // Only explicit abort evidence means Interrupted. Older or
+                    // ordinary failure payloads must remain informational.
+                    #[serde(default)]
+                    is_interrupt: bool,
+                }
+                let parsed: Failure =
+                    serde_json::from_slice(payload).map_err(|e| format!("failed to parse PostToolUseFailure payload: {e}"))?;
+                Ok(ParsedHookEvent {
+                    event_type: if parsed.is_interrupt { AgentEventType::Interrupted } else { AgentEventType::NoChange },
+                    session_id: parsed.common.session_id,
+                    model: None,
+                    cwd: parsed.common.cwd,
+                    transcript_path: None,
+                    native_codex_hook: false,
+                })
+            }
             "stop" => {
                 let parsed: ClaudeCommonPayload =
                     serde_json::from_slice(payload).map_err(|e| format!("failed to parse Stop payload: {e}"))?;
@@ -215,6 +236,7 @@ const CLAUDE_CODE_HOOK_SUBSCRIPTIONS: &[ClaudeCodeHookSubscription] = &[
     ClaudeCodeHookSubscription { hook: "UserPromptSubmit", matcher: "", event: "user-prompt-submit" },
     ClaudeCodeHookSubscription { hook: "PreToolUse", matcher: "", event: "pre-tool-use" },
     ClaudeCodeHookSubscription { hook: "PostToolUse", matcher: "", event: "post-tool-use" },
+    ClaudeCodeHookSubscription { hook: "PostToolUseFailure", matcher: "", event: "post-tool-use-failure" },
     ClaudeCodeHookSubscription { hook: "Stop", matcher: "", event: "stop" },
     ClaudeCodeHookSubscription { hook: "Notification", matcher: "permission_prompt", event: "notification" },
     ClaudeCodeHookSubscription { hook: "Notification", matcher: "elicitation_dialog", event: "notification" },
@@ -332,6 +354,7 @@ const CODEX_HOOK_SUBSCRIPTIONS: &[(&str, &str, AgentEventType)] = &[
     ("PreToolUse", "pre-tool-use", AgentEventType::ToolActive),
     ("PostToolUse", "post-tool-use", AgentEventType::ToolActive),
     ("Stop", "stop", AgentEventType::Idle),
+    ("Interrupt", "interrupt", AgentEventType::Interrupted),
 ];
 
 /// Invocation overrides keep hooks wired even when an old crew home has notify.
@@ -477,6 +500,20 @@ pub fn update_codex_hooks(document: &mut toml_edit::DocumentMut, install: bool, 
     Ok(())
 }
 
+/// The native hook name for the configured command/HTTP event argument.
+/// Configuration and cause attribution share the subscription tables.
+pub fn hook_event_name(harness: &AgentHarness, event: &str) -> Option<&'static str> {
+    match harness {
+        AgentHarness::ClaudeCode => CLAUDE_CODE_HOOK_SUBSCRIPTIONS.iter().find(|s| s.event == event).map(|s| s.hook),
+        AgentHarness::Codex => CODEX_HOOK_SUBSCRIPTIONS
+            .iter()
+            .find(|(_, e, _)| *e == event)
+            .map(|(native, _, _)| *native)
+            .or_else(|| (event == "notify").then_some("agent-turn-complete")),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::AttachableId;
@@ -602,7 +639,7 @@ mod tests {
         let settings = claude_code_hook_settings();
         let hooks = settings["hooks"].as_object().expect("hooks object");
 
-        assert_eq!(hooks.len(), 7);
+        assert_eq!(hooks.len(), 8);
         for subscription in CLAUDE_CODE_HOOK_SUBSCRIPTIONS {
             let entry = hooks[subscription.hook]
                 .as_array()
@@ -628,7 +665,7 @@ mod tests {
         let settings =
             claude_code_hook_settings_over(ClaudeCodeHookTransport::Http { base_url: "http://127.0.0.1:7878/v1/hooks/claude-code/" });
         let hooks = settings["hooks"].as_object().expect("hooks object");
-        assert_eq!(hooks.len(), 7);
+        assert_eq!(hooks.len(), 8);
         for subscription in CLAUDE_CODE_HOOK_SUBSCRIPTIONS {
             let entry = hooks[subscription.hook]
                 .as_array()
@@ -667,6 +704,21 @@ mod tests {
         for environment in [vec![url.clone()], vec![token.clone()], vec![url, pair(CLAUDE_CODE_HOOK_TOKEN_ENV, "")], Vec::new()] {
             assert_eq!(ClaudeCodeHookTransport::from_environment(&environment), ClaudeCodeHookTransport::Command, "{environment:?}");
         }
+    }
+
+    // Claude reports abort evidence separately from ordinary tool failures.
+    // Generate both flags and absence: a failed command alone is not an interrupt.
+    #[hegel::test]
+    fn claude_failure_observes_only_explicit_interrupts(tc: hegel::TestCase) {
+        let interrupted = tc.draw(hegel::generators::booleans());
+        let mut payload = serde_json::json!({"session_id":"s", "error":"failure", "is_interrupt": interrupted});
+        let parsed = ClaudeCodeParser.parse_event("post-tool-use-failure", &serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(parsed.event_type, if interrupted { AgentEventType::Interrupted } else { AgentEventType::NoChange });
+        payload.as_object_mut().unwrap().remove("is_interrupt");
+        assert_eq!(
+            ClaudeCodeParser.parse_event("post-tool-use-failure", &serde_json::to_vec(&payload).unwrap()).unwrap().event_type,
+            AgentEventType::NoChange
+        );
     }
 
     // Real command input shapes from openai/codex rust-v0.160.0 schema.rs:

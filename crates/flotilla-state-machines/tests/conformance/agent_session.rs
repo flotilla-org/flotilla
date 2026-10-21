@@ -8,21 +8,22 @@
 //! - `Receive{message, transport}`: the receive edge for message `m<message>`
 //!   by that transport (`turn`, `notify` or `mute`); it reads nothing.
 //!
-//! State mapping, one to one: `Live { channel }` is `Live(channel)` and
-//! `Ended { reason }` is `Ended(reason)`, with the same constructor names.
+//! Observe maps the native cause and model time to the current observation.
+//! Live and Ended retain the same lifecycle labels, carrying that observation
+//! as data alongside their channel or reason.
 
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
-    machines::agent_session::{
-        AgentSession, AgentSessionRefusal, AgentSessionState, Attach, Channel, Detach, End, EndReason, MemoryAgentSessionWorld, Receive,
-    },
+    machines::agent_session::{AgentSession, AgentSessionRefusal, Attach, Detach, End, EndReason, MemoryAgentSessionWorld, Receive},
     Home, Ref, Transport, WriteError,
 };
 use serde_json::Value;
 
+use crate::session_value::session_value;
+
 use crate::{
-    graph::{self, bare, refusal, tick, Conformance, Report, Step},
-    itf::{boolean, number, payload, tag, text, variant},
+    graph::{self, refusal, tick, Conformance, Report, Step},
+    itf::{boolean, number, payload, tag, text},
 };
 
 const NAME: &str = "s";
@@ -32,6 +33,7 @@ fn outcome<T>(result: Result<T, WriteError<AgentSession>>) -> Step {
         Ok(_) => Step::Accepted,
         Err(WriteError::Refused(AgentSessionRefusal::AlreadyEnded)) => refusal("AlreadyEnded"),
         Err(WriteError::Refused(AgentSessionRefusal::WrongChannel)) => refusal("WrongChannel"),
+        Err(WriteError::Refused(AgentSessionRefusal::UnchangedActivity)) => refusal("UnchangedActivity"),
         Err(WriteError::Refused(AgentSessionRefusal::MissingEvidence)) => refusal("MissingEvidence"),
         Err(other) => refusal(&format!("{other:?}")),
     }
@@ -73,6 +75,16 @@ impl Conformance for SessionConformance {
                 }
                 outcome(home.apply(NAME, End { reason, observed: Ref::new(NAME) }, &world, at))
             }
+            "Observe" => {
+                use flotilla_state_machines::machines::agent_session::{Activity, Observe};
+                let activity = match tag(&o["activity"]) {
+                    "Working" => Activity::Working,
+                    "Idle" => Activity::Idle,
+                    "Interrupted" => Activity::Interrupted,
+                    other => panic!("activity {other}"),
+                };
+                outcome(home.apply(NAME, Observe { activity, cause: text(&o["cause"]).into() }, &world, tick(number(&o["at"]))))
+            }
             "Receive" => {
                 let transport = match text(&o["transport"]) {
                     "turn" => Transport::Turn,
@@ -88,22 +100,7 @@ impl Conformance for SessionConformance {
     }
 
     fn encode(home: &Home<AgentSession>) -> Value {
-        match home.get(NAME).expect("exists").state() {
-            AgentSessionState::Live { channel } => variant(
-                "Live",
-                bare(match channel {
-                    Channel::Detached => "Detached",
-                    Channel::Attached => "Attached",
-                }),
-            ),
-            AgentSessionState::Ended { reason } => variant(
-                "Ended",
-                bare(match reason {
-                    EndReason::Completed => "Completed",
-                    EndReason::Lost => "Lost",
-                }),
-            ),
-        }
+        session_value(home.get(NAME).expect("exists").state())
     }
 
     fn version(home: &Home<AgentSession>) -> u64 {

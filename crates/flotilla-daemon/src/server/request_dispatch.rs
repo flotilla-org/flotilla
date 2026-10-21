@@ -483,7 +483,15 @@ impl<'a> RequestDispatcher<'a> {
         let Request::AgentHook { event } = request else {
             return Message::error_response(id, "AgentHook request selected the wrong handler");
         };
-        match handle_agent_hook(&self.daemon.resource_backend(), self.agent_state_store, self.hook_identity_policy, event).await {
+        match handle_agent_hook(
+            &self.daemon.resource_backend(),
+            self.agent_state_store,
+            self.hook_identity_policy,
+            self.daemon.message_primitives(),
+            event,
+        )
+        .await
+        {
             Ok(()) => Message::ok_response(id, Response::AgentHook),
             Err(e) => {
                 warn!(err = %e, "failed to process agent hook event");
@@ -523,6 +531,7 @@ pub(super) async fn handle_agent_hook(
     backend: &flotilla_store::ResourceBackend,
     agent_state_store: &SharedAgentStateStore,
     hook_identity_policy: HookIdentityPolicy,
+    primitives: Option<std::sync::Arc<flotilla_core::primitives::MessagePrimitives>>,
     mut event: AgentHookEvent,
 ) -> Result<(), String> {
     use flotilla_protocol::AgentEventType;
@@ -609,11 +618,19 @@ pub(super) async fn handle_agent_hook(
     }
 
     let Some(terminal) = event.terminal.as_ref() else { return Ok(()) };
+    if let Some(primitives) = primitives {
+        if let Err(error) = record_hook_activity(backend, &primitives, &event).await {
+            // Activity is an additional observer. Its store/join errors must not
+            // suppress the established agent registry and terminal attention path.
+            tracing::warn!(session = %terminal.session_name, %error, "failed to record agent session activity");
+        }
+    }
     let state = match event.event_type {
         AgentEventType::Active | AgentEventType::ToolActive => flotilla_resources::TerminalAttentionState::Working,
         AgentEventType::Idle | AgentEventType::Started => flotilla_resources::TerminalAttentionState::Idle,
         AgentEventType::WaitingForPermission => flotilla_resources::TerminalAttentionState::NeedsInput,
-        AgentEventType::Ended | AgentEventType::NoChange => return Ok(()),
+        // Interrupted changes only the gated AgentSession observation; preserve legacy terminal attention.
+        AgentEventType::Ended | AgentEventType::NoChange | AgentEventType::Interrupted => return Ok(()),
     };
     if !event.native_codex_hook {
         return crate::agent_attention::observe_hook_attention(
@@ -648,5 +665,39 @@ pub(super) async fn handle_agent_hook(
     )
     .await
     .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Records change-only activity, keeping duplicate hooks off the store and
+/// blocking pool. The machine's gate remains authoritative across races.
+pub(super) async fn record_hook_activity(
+    backend: &flotilla_store::ResourceBackend,
+    primitives: &flotilla_core::primitives::MessagePrimitives,
+    event: &AgentHookEvent,
+) -> Result<(), String> {
+    use flotilla_protocol::AgentEventType;
+    use flotilla_state_machines::machines::agent_session::Activity;
+    let activity = match event.event_type {
+        AgentEventType::Active | AgentEventType::ToolActive => Activity::Working,
+        AgentEventType::Idle => Activity::Idle,
+        AgentEventType::Interrupted => Activity::Interrupted,
+        _ => return Ok(()),
+    };
+    let (Some(terminal), Some(cause)) = (event.terminal.as_ref(), event.hook_event.as_ref()) else { return Ok(()) };
+    if !primitives.sessions().needs_observation(&terminal.session_name, activity)? {
+        return Ok(());
+    }
+    // A hook token can outlive its terminal, so first observations still validate
+    // that identity instead of creating orphan records for stale tokens.
+    backend
+        .using::<flotilla_resources::TerminalSession>(&terminal.namespace)
+        .get(&terminal.session_name)
+        .await
+        .map_err(|error| error.to_string())?;
+    let sessions = std::sync::Arc::clone(primitives.sessions());
+    let name = terminal.session_name.clone();
+    let cause = cause.clone();
+    let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
+    tokio::task::spawn_blocking(move || sessions.observe(&name, activity, cause, now)).await.map_err(|error| error.to_string())??;
     Ok(())
 }

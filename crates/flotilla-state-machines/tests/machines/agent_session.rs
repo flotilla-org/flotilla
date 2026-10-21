@@ -3,8 +3,8 @@
 use flotilla_schema::{Code, CodeEnum, Timestamp};
 use flotilla_state_machines::{
     machines::agent_session::{
-        AgentSession, AgentSessionEdgeKind, AgentSessionLabel, AgentSessionRefusal, AgentSessionState, Attach, Channel, ChannelPresence,
-        Detach, End, EndReason, MemoryAgentSessionWorld, Receive, SessionEnd,
+        Activity, ActivityObservation, AgentSession, AgentSessionEdgeKind, AgentSessionLabel, AgentSessionRefusal, AgentSessionState,
+        Attach, Channel, ChannelPresence, Detach, End, EndReason, MemoryAgentSessionWorld, Observe, Receive, SessionEnd,
     },
     Coded, Diagram, Home, InputRead, Machine, Ref, Transport, Version, WriteError,
 };
@@ -56,7 +56,7 @@ fn state(home: &Home<AgentSession>) -> &AgentSessionState {
 }
 
 fn live(channel: Channel) -> AgentSessionState {
-    AgentSessionState::Live { channel }
+    AgentSessionState::live(channel)
 }
 
 // The declaration obeys the engine's rules.
@@ -71,7 +71,7 @@ fn codes_and_names_are_pinned() {
     let labels: Vec<_> = AgentSessionLabel::ALL.iter().map(|s| (s.name(), s.code())).collect();
     assert_eq!(labels, [("Live", Code::new("li")), ("Ended", Code::new("en"))]);
     let edges: Vec<_> = AgentSessionEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
-    let codes = [("attach", "at"), ("detach", "de"), ("end", "en"), ("receive", "rv")];
+    let codes = [("attach", "at"), ("detach", "de"), ("end", "en"), ("receive", "rv"), ("observe", "ob")];
     assert_eq!(edges, codes.map(|(name, code)| (name, Code::new(code))));
 }
 
@@ -81,7 +81,7 @@ fn codes_and_names_are_pinned() {
 #[test]
 fn mermaid_is_pinned() {
     let head = "---\ntitle: AgentSession\n---\nstateDiagram-v2\n  direction LR\n  [*] --> Live\n";
-    let channel = "  Live --> Live: attach [channel]\n  Live --> Live: detach [channel]\n  Live --> Live: receive\n";
+    let channel = "  Live --> Live: attach [channel]\n  Live --> Live: detach [channel]\n  Live --> Live: receive\n  Live --> Live: observe [activity, activity_since, activity_cause]\n";
     let rest = "  Live --> Ended: end [reason]\n  Ended --> [*]\n  note right of Ended: the session has ended\n";
     let definition = AgentSession::definition();
     assert_eq!(definition.mermaid(Diagram::Full), format!("{head}{channel}{rest}"));
@@ -126,7 +126,7 @@ fn end_needs_an_observed_end_with_that_reason() {
         assert_eq!(h.apply("s", end(reason), &ended_with(Some(other)), at(1)).err(), refused(AgentSessionRefusal::MissingEvidence));
         let event = h.apply("s", end(reason), &ended_with(Some(reason)), at(2)).expect("ended");
         assert_eq!(event.payload.reads, [InputRead { kind: "session_end".into(), name: "s".into(), version: Some(Version(1)) }]);
-        assert_eq!(*state(&h), AgentSessionState::Ended { reason });
+        assert_eq!(*state(&h), AgentSessionState::ended(reason));
     }
 }
 
@@ -165,5 +165,46 @@ fn an_ended_session_refuses_everything_with_already_ended() {
     assert_eq!(h.apply("s", detach(), &channel(Some(false)), at(3)).err(), already);
     assert_eq!(h.apply("s", end(EndReason::Lost), &ended_with(Some(EndReason::Lost)), at(3)).err(), already);
     assert_eq!(h.apply("s", receipt, &channel(None), at(3)).err(), already);
-    assert_eq!(*state(&h), AgentSessionState::Ended { reason: EndReason::Lost });
+    assert_eq!(*state(&h), AgentSessionState::ended(EndReason::Lost));
+}
+
+// Owner ruling #3625: only changes write the observation and the home log;
+// all lifecycle edges preserve it, and an ended session refuses Observe.
+// Generate all three activities, repeated causes, both channel states and both ends.
+#[hegel::test]
+fn activity_observations_change_only_on_a_real_change(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let mut h = home();
+    assert_eq!(state(&h).observation(), None);
+    let world = MemoryAgentSessionWorld::default();
+    for tick in 1..=tc.draw(gs::integers::<i64>().min_value(4).max_value(30)) {
+        let activity =
+            [Activity::Working, Activity::Idle, Activity::Interrupted][tc.draw(gs::integers::<usize>().min_value(0).max_value(2))];
+        let cause = format!("event-{}", tc.draw(gs::integers::<u8>().min_value(0).max_value(3)));
+        let before = h.get("s").unwrap().clone();
+        let result = h.apply("s", Observe { activity, cause: cause.clone() }, &world, at(tick));
+        if before.state().observation().is_some_and(|old| old.activity == activity) {
+            assert_eq!(result.err(), refused(AgentSessionRefusal::UnchangedActivity));
+            assert_eq!(h.get("s").unwrap(), &before);
+        } else {
+            result.expect("activity changed");
+            assert_eq!(state(&h).observation(), Some(ActivityObservation { activity, activity_since: at(tick), activity_cause: cause }));
+            assert!(h.get("s").unwrap().version() > before.version());
+        }
+        assert_eq!(h.get("s").unwrap().since(), at(0));
+    }
+    let observation = state(&h).observation();
+    h.apply("s", attach(), &channel(Some(true)), at(40)).unwrap();
+    assert_eq!(state(&h).observation(), observation);
+    h.apply("s", detach(), &channel(Some(false)), at(41)).unwrap();
+    assert_eq!(state(&h).observation(), observation);
+    let reason = if tc.draw(gs::booleans()) { EndReason::Lost } else { EndReason::Completed };
+    h.apply("s", end(reason), &ended_with(Some(reason)), at(42)).unwrap();
+    assert_eq!(state(&h).observation(), observation);
+    let before = h.get("s").unwrap().clone();
+    assert_eq!(
+        h.apply("s", Observe { activity: Activity::Working, cause: "late".into() }, &world, at(43)).err(),
+        refused(AgentSessionRefusal::AlreadyEnded)
+    );
+    assert_eq!(h.get("s").unwrap(), &before);
 }

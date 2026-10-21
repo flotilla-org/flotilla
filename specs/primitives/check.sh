@@ -14,7 +14,7 @@ jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
 mkdir -p build
 quint test tests/stream_properties.qnt --backend typescript
 run=$(mktemp -d "$PWD/build/fast.XXXXXX")
-for scenario in convoy_deliver ensure_bind inbox_delivery message_race controller_delivery machine_edges admission_placement; do
+for scenario in agent_activity convoy_deliver ensure_bind inbox_delivery message_race controller_delivery machine_edges admission_placement; do
   # Assignment coverage is mandatory even for branches unreachable at depth one.
   # Simulation/typecheck alone can silently lose an unassigned world variable.
   quint verify "scenarios/$scenario.qnt" --invariant safety --max-steps 1 > "$run/$scenario.frames.log" 2>&1
@@ -25,8 +25,11 @@ for scenario in convoy_deliver ensure_bind inbox_delivery message_race controlle
     -workers "${TLC_WORKERS:-4}" -metadir "$run/$scenario.states" \
     -config "$run/$scenario.cfg" "$run/$scenario.tla" > "$run/$scenario.tlc.log" 2>&1
   grep -q 'Model checking completed. No error has been found' "$run/$scenario.tlc.log"
+  # Activity has full-graph conformance; the shared replay runner handles the existing compositions.
+  if [ "$scenario" != agent_activity ]; then
   quint run "scenarios/$scenario.qnt" --backend typescript --mbt --invariant safety --seed 3220 \
     --max-samples 128 --n-traces 128 --max-steps 80 --out-itf "$run/$scenario-{seq}.itf.json" > "$run/$scenario.replay.log"
+  fi
 done
 # Full-graph conformance: TLC dumps every reachable state of each machine's
 # harness, and the engine must accept, reach and refuse exactly as the spec does.

@@ -284,3 +284,5 @@ There is no double-write path and no long-lived branch.
 - **Peer merge goes away.** The Plane-A peer-merge layer (`crates/flotilla-daemon/src/peer/`) stays bugfix-only and is deleted by this work, because whole-home log replication supersedes it.
 - **CLAUDE.md changes at the cut-over roll.** Its "Development Phase" rules (serde aliases and defaults, the JSON golden corpus) change to the schema-snapshot form in the same roll.
 - **Interactions are model-checked in Quint.** The exploratory specs (#3214) found the races ruled above. Minimal per-machine specs, replayed as traces against the engine (#3220), gate the implementation, which is split into PR stacks (#3215).
+
+ADR 0064 AgentSession records current activity (Working, Idle, Interrupted, with since and cause) through a self edge in Live that changes only on a real change. Its history is the home log. Call-level agent detail is session-log data, never replicated store data.

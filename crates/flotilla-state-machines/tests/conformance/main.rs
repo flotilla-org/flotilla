@@ -31,3 +31,6 @@ mod ensure;
 mod lifecycle;
 mod message;
 mod vessel;
+
+#[path = "../common/agent_session.rs"]
+mod session_value;

@@ -35,9 +35,11 @@ pub(crate) async fn run_hook(cli: &Cli, harness: &str, event_type: &str, argumen
     let attachable_id = flotilla_agent::attachable::terminal_hook_id(explicit_id.as_deref(), terminal.as_ref());
 
     // 5. Build the event.
+    let cause = agents::hooks::hook_event_name(&harness_enum, event_type).map(str::to_owned);
     let event = AgentHookEvent::builder()
         .attachable_id(attachable_id)
         .harness(harness_enum)
+        .maybe_hook_event(cause)
         .event_type(parsed.event_type)
         .maybe_session_id(parsed.session_id)
         .maybe_model(parsed.model)

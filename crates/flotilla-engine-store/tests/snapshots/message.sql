@@ -43,6 +43,9 @@ CREATE TABLE "agent_session" (
   "state" TEXT NOT NULL CHECK ("state" IN ('en', 'li')),
   "state_since" INTEGER NOT NULL,
   "channel" TEXT CHECK ("channel" IN ('at', 'de')),
+  "activity" TEXT CHECK ("activity" IN ('id', 'in', 'wo')),
+  "activity_since" INTEGER,
+  "activity_cause" TEXT,
   "reason" TEXT CHECK ("reason" IN ('co', 'lo')),
   CHECK (CASE WHEN "state" = 'li'
       THEN "channel" IS NOT NULL
@@ -58,11 +61,15 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('as', 'state', 'li', 'Live'),
   ('as', 'channel', 'at', 'Attached'),
   ('as', 'channel', 'de', 'Detached'),
+  ('as', 'activity', 'id', 'Idle'),
+  ('as', 'activity', 'in', 'Interrupted'),
+  ('as', 'activity', 'wo', 'Working'),
   ('as', 'reason', 'co', 'Completed'),
   ('as', 'reason', 'lo', 'Lost'),
   ('as', 'log:edge', 'at', 'Attach'),
   ('as', 'log:edge', 'de', 'Detach'),
   ('as', 'log:edge', 'en', 'End'),
+  ('as', 'log:edge', 'ob', 'Observe'),
   ('as', 'log:edge', 'rv', 'Receive'),
   ('as', 'log:label', 'en', 'Ended'),
   ('as', 'log:label', 'li', 'Live');
@@ -72,6 +79,9 @@ CREATE VIEW "agent_session_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'state' AND "code" = "agent_session"."state") AS "state",
   "agent_session"."state_since",
   (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'channel' AND "code" = "agent_session"."channel") AS "channel",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'activity' AND "code" = "agent_session"."activity") AS "activity",
+  "agent_session"."activity_since",
+  "agent_session"."activity_cause",
   (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'reason' AND "code" = "agent_session"."reason") AS "reason"
 FROM "agent_session";
 CREATE TABLE "message" (

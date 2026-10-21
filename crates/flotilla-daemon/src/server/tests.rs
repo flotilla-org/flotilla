@@ -6531,3 +6531,260 @@ fn bound_caller_surface_cannot_replace_principal() {
         assert_eq!(surface.principal_ref, if bound { caller.principal_ref.clone() } else { declared });
     }
 }
+
+// #3625 and owner ruling: native hook sequences on both transports expose a
+// keyed current observation; repeated Working hooks preserve cause, time and version.
+// Exercise both harnesses, both transports and the disabled primitives switch.
+#[tokio::test]
+async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport() {
+    use super::http::{CallerAuth, HttpRouter, ListenerOrigin, LoginStore};
+    use axum::{body::Body, Extension};
+    use flotilla_state_machines::machines::agent_session::Activity;
+    use tower::ServiceExt;
+    for enabled in [false, true] {
+        let (tmp, daemon) = empty_daemon().await;
+        let service = Arc::new(
+            flotilla_schema_sqlite::stream::Service::open(
+                &tmp.path().join("activity.sqlite"),
+                "home",
+                flotilla_engine_store::registry().unwrap(),
+            )
+            .unwrap(),
+        );
+        let primitives = Arc::new(
+            flotilla_core::primitives::MessagePrimitives::open(
+                "home",
+                Arc::clone(&service),
+                daemon.resource_backend(),
+                Arc::new(flotilla_resources::SystemClock),
+            )
+            .unwrap(),
+        );
+        if enabled {
+            daemon.install_message_primitives(Arc::clone(&primitives)).unwrap();
+        }
+        primitives.sessions().ensure("other-session", flotilla_schema::Timestamp(0)).unwrap();
+        let other = primitives.sessions().get("other-session").unwrap();
+        for harness_name in ["claude-code", "codex"] {
+            for http in [false, true] {
+                let name = format!("{harness_name}-{http}");
+                let terminal = flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() };
+                let terminals = daemon.resource_backend().using::<TerminalSession>("flotilla");
+                terminals
+                    .create(
+                        &InputMeta::builder().name(name.clone()).build(),
+                        &TerminalSessionSpec {
+                            env_ref: "host-direct".into(),
+                            role: "coder".into(),
+                            source: TerminalSessionSource::Tool { command: harness_name.into() },
+                            cwd: "/repo".into(),
+                            env: Default::default(),
+                            pool: "test".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let router = HttpRouter::for_daemon(
+                    Arc::clone(&daemon),
+                    Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))),
+                    ListenerOrigin::default(),
+                )
+                .into_router()
+                .layer(Extension(CallerAuth::Hook(terminal.clone())));
+                let (harness, parser) = flotilla_agent::parser_for_harness(harness_name).unwrap();
+                let interrupt =
+                    if harness_name == "codex" { ("interrupt", "Interrupt") } else { ("post-tool-use-failure", "PostToolUseFailure") };
+                let mut previous = None;
+                for (argument, native, activity) in [
+                    ("user-prompt-submit", "UserPromptSubmit", Activity::Working),
+                    ("pre-tool-use", "PreToolUse", Activity::Working),
+                    ("stop", "Stop", Activity::Idle),
+                    (interrupt.0, interrupt.1, Activity::Interrupted),
+                ] {
+                    let payload = serde_json::json!({ "session_id":"native-1", "cwd":"/repo", "hook_event_name":native,
+                        "is_interrupt":true, "stop_hook_active":false, "prompt":"work", "tool_name":"Bash",
+                        "tool_input":{"command":"secret-call-detail"}, "tool_use_id":"call-detail" });
+                    if http {
+                        let response = router
+                            .clone()
+                            .oneshot(
+                                axum::http::Request::builder()
+                                    .method("POST")
+                                    .uri(format!("/v1/hooks/{harness_name}/{argument}"))
+                                    .header("content-type", "application/json")
+                                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(response.status(), axum::http::StatusCode::OK);
+                    } else {
+                        let parsed = parser.parse_event(argument, &serde_json::to_vec(&payload).unwrap()).unwrap();
+                        let response = dispatch_request_with_state(
+                            &daemon,
+                            daemon.agent_state_store(),
+                            1,
+                            Request::AgentHook {
+                                event: AgentHookEvent::builder()
+                                    .attachable_id(AttachableId::new("candidate"))
+                                    .harness(harness.clone())
+                                    .event_type(parsed.event_type)
+                                    .hook_event(native.to_string())
+                                    .maybe_session_id(parsed.session_id)
+                                    .native_codex_hook(parsed.native_codex_hook)
+                                    .terminal(terminal.clone())
+                                    .build(),
+                            },
+                        )
+                        .await;
+                        assert!(matches!(ok_response(response, 1), Response::AgentHook));
+                    }
+                    // A single name lookup returns this session, and another session stays unchanged.
+                    assert_eq!(primitives.sessions().get("other-session").unwrap(), other);
+                    let current = primitives.sessions().get(&name);
+                    if !enabled {
+                        assert!(current.is_none());
+                        continue;
+                    }
+                    let current = current.unwrap();
+                    let observation = current.state().observation().unwrap();
+                    assert_eq!(observation.activity, activity);
+                    if argument == "pre-tool-use" {
+                        assert_eq!(Some(current.clone()), previous, "same activity writes nothing, including cause and time");
+                        assert_eq!(observation.activity_cause, "UserPromptSubmit");
+                    } else {
+                        assert_eq!(observation.activity_cause, native);
+                    }
+                    previous = Some(current);
+                }
+            }
+        }
+        // Reopening from the actual store preserves current activity and its cause.
+        let reopened = flotilla_core::primitives::MessagePrimitives::open(
+            "home",
+            service,
+            daemon.resource_backend(),
+            Arc::new(flotilla_resources::SystemClock),
+        )
+        .unwrap();
+        for harness in ["claude-code", "codex"] {
+            for http in [false, true] {
+                let name = format!("{harness}-{http}");
+                assert_eq!(reopened.sessions().get(&name), primitives.sessions().get(&name));
+            }
+        }
+        assert!(primitives.sessions().get("missing").is_none());
+    }
+}
+
+async fn activity_failure_test_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>, Arc<flotilla_core::primitives::MessagePrimitives>) {
+    let (tmp, daemon) = empty_daemon().await;
+    let service = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(
+            &tmp.path().join("activity.sqlite"),
+            "home",
+            flotilla_engine_store::registry().unwrap(),
+        )
+        .unwrap(),
+    );
+    let primitives = Arc::new(
+        flotilla_core::primitives::MessagePrimitives::open(
+            "home",
+            service,
+            daemon.resource_backend(),
+            Arc::new(flotilla_resources::SystemClock),
+        )
+        .unwrap(),
+    );
+    daemon.install_message_primitives(Arc::clone(&primitives)).unwrap();
+    daemon
+        .resource_backend()
+        .using::<TerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder().name("agent".to_string()).build(),
+            &TerminalSessionSpec {
+                env_ref: "host-direct".into(),
+                role: "coder".into(),
+                source: TerminalSessionSource::Tool { command: "agent".into() },
+                cwd: "/repo".into(),
+                env: Default::default(),
+                pool: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
+    (tmp, daemon, primitives)
+}
+
+// Activity-store errors must leave the pre-existing hook attention path working.
+// Delete the SQLite row behind the live home to exercise a real failed edge write.
+#[tokio::test]
+async fn agent_activity_store_failure_preserves_legacy_attention() {
+    use flotilla_schema::{Kind, Origin, Timestamp};
+    use flotilla_state_machines::{
+        machines::agent_session::{Activity, AgentSession},
+        Resource,
+    };
+    let (_tmp, daemon, primitives) = activity_failure_test_daemon().await;
+    primitives.sessions().ensure("agent", Timestamp(0)).unwrap();
+    primitives
+        .service()
+        .with_store(|store| {
+            let mut write = store.write()?;
+            let id = write.resolve(Resource::<AgentSession>::CODE, "agent", "home")?.unwrap();
+            let loaded = write.load::<Resource<AgentSession>>(id)?.unwrap();
+            write.delete::<Resource<AgentSession>>(loaded.stamp(), &Origin::new("test", Timestamp(1)))?;
+            write.commit()
+        })
+        .unwrap();
+    assert!(
+        primitives.sessions().observe("agent", Activity::Working, "UserPromptSubmit".into(), Timestamp(2)).is_err(),
+        "the store write really fails"
+    );
+    for harness in [AgentHarness::ClaudeCode, AgentHarness::Codex] {
+        let event = AgentHookEvent::builder()
+            .attachable_id(AttachableId::new("candidate"))
+            .native_codex_hook(harness == AgentHarness::Codex)
+            .harness(harness)
+            .event_type(AgentEventType::Active)
+            .hook_event("UserPromptSubmit".to_string())
+            .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: "agent".into() })
+            .build();
+        let response = dispatch_request_with_state(&daemon, daemon.agent_state_store(), 1, Request::AgentHook { event }).await;
+        assert!(matches!(ok_response(response, 1), Response::AgentHook));
+        let terminal = daemon.resource_backend().using::<TerminalSession>("flotilla").get("agent").await.unwrap();
+        assert_eq!(terminal.status.unwrap().attention.unwrap().state, TerminalAttentionState::Working);
+        assert!(
+            primitives.sessions().get("agent").unwrap().state().observation().is_none(),
+            "failed activity writes leave the cached value unchanged"
+        );
+    }
+}
+
+// Duplicate observations bypass terminal reads and the blocking writer entirely.
+// A missing terminal would fail the observer if it did any backend lookup.
+#[tokio::test]
+async fn agent_activity_duplicates_skip_terminal_reads() {
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::machines::agent_session::Activity;
+    let (_tmp, daemon, primitives) = activity_failure_test_daemon().await;
+    primitives.sessions().observe("agent", Activity::Working, "UserPromptSubmit".into(), Timestamp(1)).unwrap();
+    let before = primitives.sessions().get("agent").unwrap();
+    let empty_backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut event = AgentHookEvent::builder()
+        .attachable_id(AttachableId::new("candidate"))
+        .harness(AgentHarness::ClaudeCode)
+        .event_type(AgentEventType::ToolActive)
+        .hook_event("PreToolUse".to_string())
+        .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: "agent".into() })
+        .build();
+    super::request_dispatch::record_hook_activity(&empty_backend, &primitives, &event).await.unwrap();
+    assert_eq!(primitives.sessions().get("agent").unwrap(), before);
+    event.event_type = AgentEventType::Idle;
+    assert!(
+        super::request_dispatch::record_hook_activity(&empty_backend, &primitives, &event).await.is_err(),
+        "changed activity still validates the terminal"
+    );
+    assert_eq!(primitives.sessions().get("agent").unwrap(), before);
+    drop(daemon);
+}
