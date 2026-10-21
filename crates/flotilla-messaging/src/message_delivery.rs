@@ -982,11 +982,14 @@ impl MessageInbox {
         let description = HeldMessageBatch::collect([message]).first().map(|batch| batch.describe(&self.namespace));
         match demands.get(&meta.name).await {
             Ok(existing) => {
-                // Keep the gate's description current as the held reason changes.
-                let current = existing.metadata.annotations.get(DELIVERY_HOLD_REASON_ANNOTATION);
-                if let Some(description) = description.filter(|description| current != Some(description)) {
+                // Keep the gate's description current as the held reason changes,
+                // and never leave one that no longer describes a held batch.
+                if existing.metadata.annotations.get(DELIVERY_HOLD_REASON_ANNOTATION) != description.as_ref() {
                     let mut meta = InputMeta::from(&existing.metadata);
-                    meta.annotations.insert(DELIVERY_HOLD_REASON_ANNOTATION.into(), description);
+                    match description {
+                        Some(description) => meta.annotations.insert(DELIVERY_HOLD_REASON_ANNOTATION.into(), description),
+                        None => meta.annotations.remove(DELIVERY_HOLD_REASON_ANNOTATION),
+                    };
                     demands.update(&meta, &existing.metadata.resource_version, &existing.spec).await?;
                 }
                 return Ok(());

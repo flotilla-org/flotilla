@@ -347,6 +347,11 @@ impl TurnHolds {
 /// out, after a person has already spoken. Superseding drops it instead, with
 /// the successor recorded as `Dropped(Superseded { by })`. A held turn from
 /// anyone other than flotilla stays held: only an operator closes it.
+///
+/// Holds here are per message, unlike the live store's per-batch hold: a
+/// typed turn that mixed system and other messages holds each member, and an
+/// engine hold ends by retyping, not by an operator closing it. Dropping the
+/// system members leaves the others to be retyped exactly as before.
 pub fn held_turns_superseded<'a>(
     due: &'a [(String, flotilla_resources::MessageSpec)],
     held: &'a [(String, flotilla_resources::MessageSpec)],
