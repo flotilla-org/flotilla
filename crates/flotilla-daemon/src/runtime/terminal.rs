@@ -98,11 +98,13 @@ pub(super) async fn observe_terminal_screen(
     };
     let mut output_digest = None;
     let mut state = None;
+    let mut obstruction = None;
     if let Some(adapter) = adapter {
         match pool.capture_screen(session_id).await {
             Ok(Some(screen)) => {
                 output_digest = adapter.screen_output_digest(&screen);
                 state = adapter.classify_screen_attention(&screen);
+                obstruction = adapter.classify_screen_obstruction(&screen);
             }
             Ok(None) => {}
             Err(error) => tracing::debug!(%session_id, %error, "could not capture terminal screen for attention observation"),
@@ -116,6 +118,7 @@ pub(super) async fn observe_terminal_screen(
     });
     Ok(Some(TerminalObservation {
         output_digest,
+        obstruction,
         attention: state.map(|state| flotilla_resources::TerminalAttention { state, as_of: now, source: TerminalAttentionSource::Screen }),
         occupancy,
     }))

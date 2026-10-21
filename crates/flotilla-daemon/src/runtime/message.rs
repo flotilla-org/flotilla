@@ -225,7 +225,11 @@ impl AgentTransport for TerminalControllerRuntime {
                 }),
             evidence,
             output_digest: status.last_output_digest.clone(),
-            waiting_reason: Some("waiting for a fresh idle holder observation".into()),
+            // #3460: name an idle agent that cannot take a turn, and its recovery.
+            waiting_reason: Some(match status.idle_obstruction() {
+                Some(obstruction) => format!("waiting on the holder: {}", obstruction.describe(session)),
+                None => "waiting for a fresh idle holder observation".into(),
+            }),
         })
     }
     async fn release_closed(&self) {

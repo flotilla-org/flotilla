@@ -1550,6 +1550,13 @@ impl ReadProjections<'_> {
             .cloned()
             .map(|source| ExplainedCrewDelivery {
                 terminal_condition: source.object.status.as_ref().and_then(crate::terminal_health::condition),
+                obstruction: source.object.status.as_ref().and_then(|status| {
+                    let session = status.session_id.as_deref().unwrap_or(&source.object.metadata.name);
+                    status
+                        .idle_obstruction()
+                        .filter(|_| status.phase == flotilla_resources::TerminalSessionPhase::Running)
+                        .map(|obstruction| obstruction.describe(session))
+                }),
                 session: source.object.metadata.name,
                 role: source.object.spec.role,
                 // ADR 0028's delivery ladder has not landed yet. Keep the

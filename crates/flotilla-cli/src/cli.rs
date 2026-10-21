@@ -1246,6 +1246,12 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 let _ = writeln!(output, "    receiver_error={error}");
             }
         }
+        // #3460: why waiting Messages cannot reach an idle-looking crew.
+        for delivery in &explanation.crew_deliveries {
+            if let Some(obstruction) = &delivery.obstruction {
+                let _ = writeln!(output, "  delivery to {} is blocked: {obstruction}", delivery.role);
+            }
+        }
     }
 
     if !explanation.queued_turns.is_empty() {
@@ -1288,6 +1294,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             );
             if let Some(condition) = &delivery.terminal_condition {
                 let _ = writeln!(output, "    {condition}");
+            }
+            if let Some(obstruction) = &delivery.obstruction {
+                let _ = writeln!(output, "    blocked: {obstruction}");
             }
             for brief in &delivery.pending_briefs {
                 let _ = writeln!(output, "    pending brief: {brief}");

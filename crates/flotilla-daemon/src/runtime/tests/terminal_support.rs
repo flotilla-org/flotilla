@@ -168,6 +168,7 @@ pub(super) async fn refresh_message_test_attention(runtime: &TerminalControllerR
         &sessions,
         name,
         &flotilla_resources::TerminalSessionStatusPatch::Observe {
+            obstruction: None,
             attention: observation.attention,
             occupancy: observation.occupancy,
             output_digest: observation.output_digest,
@@ -256,6 +257,7 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool, refusals:
             &sessions,
             "agent",
             &flotilla_resources::TerminalSessionStatusPatch::Observe {
+                obstruction: None,
                 attention: observation.attention,
                 occupancy: observation.occupancy,
                 output_digest: observation.output_digest,

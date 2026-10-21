@@ -2690,7 +2690,15 @@ impl Aggregator {
             })
             .collect::<BTreeSet<_>>();
         let terminal_condition = (!terminal_conditions.is_empty()).then(|| terminal_conditions.into_iter().collect::<Vec<_>>().join("; "));
-        let surface_state = if credential_attention.is_some() || completion_pending.is_some() {
+        // #3460: an idle agent that cannot take a turn needs an operator, and says why.
+        let obstruction = matching_sessions()
+            .filter_map(|session| {
+                let status = session.object.status.as_ref().filter(|status| status.phase == TerminalSessionPhase::Running)?;
+                let name = status.session_id.as_deref().unwrap_or(&session.object.metadata.name);
+                Some(format!("{}: {}", session.object.spec.role, status.idle_obstruction()?.describe(name)))
+            })
+            .min();
+        let surface_state = if credential_attention.is_some() || completion_pending.is_some() || obstruction.is_some() {
             SurfaceState::NeedsYou
         } else if let Some(stalled) = stalled.filter(|stalled| {
             matches!(&stalled.maker, Some(flotilla_resources::LeafMaker::Actor { vessel, .. }) if vessel == &definition.name)
@@ -2755,6 +2763,7 @@ impl Aggregator {
                             .filter(|state| state.phase == ResourceWorkPhase::Interrupted)
                             .and_then(|state| state.message.clone())
                             .or_else(|| completion_pending.map(|pending| format!("completion pending: {}", pending.last_error)))
+                            .or_else(|| obstruction.clone())
                             .or_else(|| terminal_condition.clone())
                             .or_else(|| state.and_then(|state| state.message.clone()))
                     })
@@ -3211,6 +3220,44 @@ mod tests {
         let convoy = &result_set.rows.as_convoys().expect("convoy rows")[0];
         assert!(!convoy.surface_state.needs_attention());
         assert!(!convoy.vessels[0].surface_state.needs_attention());
+    }
+
+    // #3460: an idle crew whose composer holds a stray reply is not "working":
+    // the vessel and convoy need an operator, and the vessel names the
+    // condition and the exact recovery command.
+    #[tokio::test]
+    async fn idle_crew_with_composer_text_names_itself_in_attention() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        state
+            .replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: QueryId::Convoys { scope: None }, since: None }]);
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+        let mut session = session_object("terminal-convoy-a-implement").await;
+        session.metadata.labels =
+            BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        let status = session.status.as_mut().expect("running status");
+        status.attention = Some(TerminalAttention {
+            state: TerminalAttentionState::Unobservable,
+            as_of: Utc::now(),
+            source: TerminalAttentionSource::Screen,
+        });
+        status.screen_obstruction =
+            Some(flotilla_resources::ScreenObstruction::ComposerText { text: "6;24;9t".into(), terminal_reply: true });
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
+        let result_set = state.result_set().await;
+        let convoy = &result_set.rows.as_convoys().expect("convoy rows")[0];
+        assert_eq!(convoy.surface_state, SurfaceState::NeedsYou);
+        assert_eq!(convoy.vessels[0].surface_state, SurfaceState::NeedsYou);
+        let message = convoy.vessels[0].message.as_deref().expect("vessel names the condition");
+        assert!(message.starts_with("observer: idle, composer holds unsent text `6;24;9t`"), "{message}");
+        assert!(message.contains("`cleat send-keys terminal-convoy-a-implement C-u`"), "{message}");
+
+        // Once the composer is clear the crew reads as working again.
+        session.status.as_mut().expect("status").screen_obstruction = None;
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session)).await;
+        let result_set = state.result_set().await;
+        assert_eq!(result_set.rows.as_convoys().expect("convoy rows")[0].vessels[0].surface_state, SurfaceState::Working);
     }
 
     // #3455: a held message batch for a crew names itself at the top of the

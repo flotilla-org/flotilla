@@ -737,6 +737,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     launch_command: Some("bash".to_string()),
                     delivered_message_id: None,
                     attention: None,
+                    screen_obstruction: None,
                     occupancy: Default::default(),
                     completion_pending: None,
                     degraded: None,

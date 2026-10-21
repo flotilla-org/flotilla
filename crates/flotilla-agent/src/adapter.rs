@@ -644,6 +644,12 @@ pub trait AgentAdapter: Send + Sync {
     fn classify_screen_attention(&self, _screen: &str) -> Option<TerminalAttentionState> {
         None
     }
+    /// Why a screen that reads `Unobservable` shows an agent that is idle but
+    /// cannot take a turn, so attention can name it (#3460). Never changes the
+    /// attention state: delivery still refuses.
+    fn classify_screen_obstruction(&self, _screen: &str) -> Option<flotilla_resources::ScreenObstruction> {
+        None
+    }
     /// Optional meaningful-output fingerprint, excluding harness animation.
     fn screen_output_digest(&self, _screen: &str) -> Option<String> {
         None
@@ -814,6 +820,15 @@ impl AgentAdapter for CliAgentAdapter {
         }
     }
 
+    fn classify_screen_obstruction(&self, screen: &str) -> Option<flotilla_resources::ScreenObstruction> {
+        match &self.flavor {
+            AdapterFlavor::ClaudeCode { .. } => None,
+            AdapterFlavor::Codex { .. } => {
+                (self.classify_screen_attention(screen) == Some(TerminalAttentionState::Unobservable)).then(|| codex_obstruction(screen))?
+            }
+        }
+    }
+
     fn screen_output_digest(&self, screen: &str) -> Option<String> {
         use sha2::{Digest, Sha256};
         match self.flavor {
@@ -976,6 +991,32 @@ fn codex_composer_visible(screen: &str) -> bool {
         tracing::debug!(codex_version = "rust-v0.160.0", "unrecognised Codex composer text; delivery remains blocked");
     }
     idle
+}
+
+/// Names why an `Unobservable` Codex screen cannot take a turn (#3460). A
+/// scrolled-back transcript ("↓ Back to bottom") comes first: its composer
+/// may not be the last prompt row. Otherwise the live composer's draft text,
+/// except a selection row, is named with whether it looks like a stray
+/// terminal reply.
+fn codex_obstruction(screen: &str) -> Option<flotilla_resources::ScreenObstruction> {
+    let lines = screen.lines().map(str::trim).collect::<Vec<_>>();
+    if lines.iter().any(|line| line.contains("Back to bottom")) {
+        return Some(flotilla_resources::ScreenObstruction::ScrolledBack);
+    }
+    if lines.iter().any(|line| line.starts_with("Select ") || line.starts_with("Choose ")) {
+        return None;
+    }
+    let text = lines.iter().rev().find_map(|line| line.strip_prefix('›')).map(str::trim)?;
+    if text.is_empty() || text.starts_with(|character: char| character.is_ascii_digit() && text.contains(". ")) {
+        return None;
+    }
+    if CODEX_COMPOSER_PLACEHOLDERS.contains(&text) {
+        return None;
+    }
+    Some(flotilla_resources::ScreenObstruction::ComposerText {
+        text: text.chars().take(80).collect(),
+        terminal_reply: flotilla_resources::looks_like_terminal_reply(text),
+    })
 }
 
 fn codex_footer_chrome(line: &str) -> bool {
@@ -2764,6 +2805,42 @@ mod tests {
         assert_eq!(codex.classify_screen_attention(wrapped), Some(TerminalAttentionState::Idle), "{wrapped}");
         let host_draft = format!("› i think{host_footer}");
         assert_ne!(codex.classify_screen_attention(&host_draft), Some(TerminalAttentionState::Idle), "{host_draft}");
+    }
+
+    // #3460: an idle Codex that cannot take a turn stays Unobservable, so
+    // delivery still refuses, but the screen names why: a stray terminal
+    // reply or a person's draft in the composer, or a scrolled-back view.
+    // Idle, working and selection screens name nothing.
+    #[test]
+    fn codex_names_why_an_idle_screen_cannot_take_a_turn() {
+        use flotilla_resources::ScreenObstruction;
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+        let stray = include_str!("fixtures/codex-3460/stray-cell-size-reply.txt");
+        assert_eq!(codex.classify_screen_attention(stray), Some(TerminalAttentionState::Unobservable));
+        assert_eq!(
+            codex.classify_screen_obstruction(stray),
+            Some(ScreenObstruction::ComposerText { text: "6;24;9t".into(), terminal_reply: true })
+        );
+        let draft = stray.replace("› 6;24;9t", "› please also check the docs");
+        assert_eq!(
+            codex.classify_screen_obstruction(&draft),
+            Some(ScreenObstruction::ComposerText { text: "please also check the docs".into(), terminal_reply: false })
+        );
+        let hidden = include_str!("fixtures/codex-3460/scrolled-back-composer-hidden.txt");
+        assert_eq!(codex.classify_screen_attention(hidden), Some(TerminalAttentionState::Unobservable));
+        assert_eq!(codex.classify_screen_obstruction(hidden), Some(ScreenObstruction::ScrolledBack));
+        for screen in [
+            stray.replace("› 6;24;9t", "› Ask Codex to do anything"),
+            include_str!("fixtures/codex-2927/scrolled-back.txt").to_string(),
+            include_str!("fixtures/codex-2927/working-after-release.txt").to_string(),
+            "Select reasoning effort\n› 1. High\n  2. Low".to_string(),
+            "Do you trust the contents of this directory?\n› 1. Yes, continue\n  2. No, quit\n\nPress enter to continue".to_string(),
+        ] {
+            assert_eq!(codex.classify_screen_obstruction(&screen), None, "{screen}");
+        }
+        let claude = registry.get("claude-code").expect("claude adapter");
+        assert_eq!(claude.classify_screen_obstruction(stray), None);
     }
 
     // #2927: scrolling an attached transcript must not hide the idle composer

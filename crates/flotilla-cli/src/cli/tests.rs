@@ -357,6 +357,39 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     assert!(format_convoy_explanation_human(&held_batch).starts_with(
         "Convoy: flotilla/ledger\nPhase: Landing\nHELD DELIVERY: message batch `message-0` is held for flotilla/ledger/work/coder\n"
     ));
+    // #3460: an idle crew that cannot take a turn is named next to the
+    // waiting Messages and under its crew delivery.
+    let mut obstructed = explanation.clone();
+    obstructed.messages.push(flotilla_protocol::query::CrewMessageView {
+        current_receiver: Some("flotilla/ledger/work/coder".into()),
+        receiver_error: None,
+        name: "resume".into(),
+        sender: "principal:operator".into(),
+        receiver: "flotilla/ledger/work/coder".into(),
+        relation: "supervisor".into(),
+        phase: "deliverable".into(),
+        since: "2026-10-18T12:29:00Z".into(),
+        reason: Some("waiting on the holder: idle, composer holds unsent text `6;24;9t`".into()),
+        subject: None,
+        expectation: serde_json::json!({"kind": "none"}),
+        crew_id: None,
+        session: None,
+    });
+    obstructed.crew_deliveries.push(flotilla_protocol::commands::ExplainedCrewDelivery {
+        terminal_condition: None,
+        obstruction: Some("idle, composer holds unsent text `6;24;9t`; clear it with `cleat send-keys crew-session C-u`".into()),
+        session: "terminal-ledger-work-coder".into(),
+        role: "coder".into(),
+        last_delivery_rung: None,
+        delivered_message_id: None,
+        sender: None,
+        pending_briefs: Vec::new(),
+    });
+    let output = format_convoy_explanation_human(&obstructed);
+    assert!(output.contains(
+        "deliverable since 2026-10-18T12:29:00Z: waiting on the holder: idle, composer holds unsent text `6;24;9t`\n  delivery to coder is blocked: idle, composer holds unsent text `6;24;9t`; clear it with `cleat send-keys crew-session C-u`\n"
+    ), "{output}");
+    assert!(output.contains("    blocked: idle, composer holds unsent text `6;24;9t`"), "{output}");
     // #3009: an unresolvable receiver is shown beside its Message.
     let mut unresolved = explanation.clone();
     unresolved.messages.push(flotilla_protocol::query::CrewMessageView {
