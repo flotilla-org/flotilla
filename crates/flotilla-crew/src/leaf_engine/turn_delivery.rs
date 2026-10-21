@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -54,7 +55,7 @@ pub(super) struct PendingFailures {
 }
 
 /// Pending failures per `(namespace, convoy)`.
-pub(super) type PendingFailureMap = std::sync::Mutex<HashMap<(String, String), PendingFailures>>;
+pub(super) type PendingFailureMap = Mutex<HashMap<(String, String), PendingFailures>>;
 
 /// Every pending failure of one convoy, applied in one status write. Attempts
 /// and backoff derive from the status each optimistic retry reads; `changed`
@@ -62,7 +63,7 @@ pub(super) type PendingFailureMap = std::sync::Mutex<HashMap<(String, String), P
 struct FailTurnDeliveries {
     failures: BTreeMap<String, DeliveryError>,
     now: DateTime<Utc>,
-    changed: std::sync::Mutex<Vec<String>>,
+    changed: Mutex<Vec<String>>,
 }
 
 impl FailTurnDeliveries {
@@ -178,7 +179,10 @@ impl LeafSubscriptionTable {
             entry.writing = true;
         }
         // A failed write returns its batch to the pending set and frees the slot;
-        // the next failure for this convoy writes it again with its own.
+        // the next failure for this convoy writes it again with its own. Until
+        // then a follower's failure is only in memory, with no durable backoff:
+        // its turn row stays armed and level-triggered, so the next observation
+        // or convoy event re-fires the delivery, which fails again and records.
         let mut writer = FailureWriter::new(&self.inner.pending_failures, key);
         let convoys = self.inner.backend.clone().using::<Convoy>(namespace);
         while let Some(failures) = writer.next_batch() {
