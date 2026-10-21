@@ -597,6 +597,10 @@ mod tests {
             "**Re-review (static)**\n\nI found no new issues. The earlier points are resolved in abc123.",
             "**Static review**\n\nNo new issues found. I checked the earlier review threads against the current head.",
             "Looks settled; see the threads above.\n\n<!-- review-findings: 0 -->",
+            // Pinned: a quiet opening followed by a bare list reads as quiet. Real
+            // re-reviews list resolved items this way; the marker (#3702) is what
+            // distinguishes a bare list of new findings.
+            "**Static review**\n\nNo new issues found.\n\n- Episode history is capped at 32.\n- The `@` assumption is documented.",
         ] {
             assert!(!observe(quiet, "claude", "Bot"), "{quiet}");
         }
@@ -616,6 +620,21 @@ mod tests {
         // A human's words are judged as before; only the configured review bot reports findings this way.
         assert!(observe("No new issues found, but please rename `run` before merging.", "reviewer", "User"));
         assert!(observe("<!-- review-findings: 0 -->\nPlease rename `run`.", "reviewer", "User"));
+    }
+
+    // #3083 review: a formal changes-requested review from the bot stays
+    // actionable whatever its body says; only comment-style reviews are judged
+    // by the no-findings reading.
+    #[test]
+    fn bot_changes_requested_review_stays_actionable_despite_quiet_body() {
+        let request = serde_json::json!({
+            "reviewDecision": "CHANGES_REQUESTED", "author": {"login": "author"},
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z"}}]},
+            "reviews": {"nodes": [{"fullDatabaseId": "9", "submittedAt": "2026-09-30T11:00:00Z",
+                "author": {"login": "claude", "__typename": "Bot"}, "state": "CHANGES_REQUESTED",
+                "body": "No new issues found.\n\n<!-- review-findings: 0 -->"}]}
+        });
+        assert!(review_actionable(request));
     }
 
     #[test]
