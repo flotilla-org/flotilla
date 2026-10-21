@@ -1680,6 +1680,96 @@ mod tests {
         assert_eq!(delivered[0].session.as_deref(), Some("session"));
         assert!(delivered[0].reason.is_none());
     }
+
+    // #3009: one unresolvable receiver does not fail the whole read. Invalid
+    // adoption claims and ambiguous holders read as `receiver_error` beside the
+    // valid and missing candidates; delivery remains strict and refuses them.
+    #[tokio::test]
+    async fn message_views_show_receiver_errors_beside_valid_candidates() {
+        use flotilla_messaging::MessageInbox;
+        use flotilla_resources::{
+            MessageRelation, MessageSpec, RoleDefinition, Selector, TerminalBrief, TerminalCrewContext, TerminalSessionStatus,
+            ROLE_ADDRESS_ANNOTATION,
+        };
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let adoptable = RoleDefinition { adoptable: Some(true), ..Default::default() };
+        backend
+            .definitions::<Project>("flotilla")
+            .create(
+                &InputMeta::builder().name("root".into()).build(),
+                &ProjectSpec::builder()
+                    .display_name("root".into())
+                    .role_definitions(BTreeMap::from([
+                        ("attended".into(), adoptable.clone()),
+                        ("pair".into(), adoptable),
+                        ("plain".into(), RoleDefinition::default()),
+                    ]))
+                    .build(),
+            )
+            .await
+            .expect("project");
+        let terminals = backend.using::<ResourceTerminalSession>("flotilla");
+        for (name, claim) in [("held", "root/attended"), ("pair-one", "root/pair"), ("pair-two", "root/pair"), ("plain", "root/plain")] {
+            let spec = TerminalSessionSpec::builder()
+                .env_ref("host-direct".into())
+                .role("guide".into())
+                .cwd("/workspace".into())
+                .pool("cleat".into())
+                .source(TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("coding"),
+                    brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), artifact_digest: None, copies: Vec::new() },
+                    context: Box::new(TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "attending".into(),
+                        vessel_ref: "attending-work".into(),
+                    }),
+                    message: None,
+                })
+                .build();
+            let meta = InputMeta::builder()
+                .name(name.into())
+                .labels(BTreeMap::from([(CONVOY_LABEL.into(), "attending".into()), (VESSEL_LABEL.into(), "work".into())]))
+                .annotations(BTreeMap::from([(ROLE_ADDRESS_ANNOTATION.into(), claim.into())]))
+                .build();
+            let created = terminals.create(&meta, &spec).await.expect("claimed terminal");
+            terminals
+                .update_status(
+                    name,
+                    &created.metadata.resource_version,
+                    &TerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() },
+                )
+                .await
+                .expect("running claim");
+        }
+        let inbox = MessageInbox::new(backend.clone(), "flotilla");
+        for (name, receiver) in [
+            ("a-valid", "root/attended"),
+            ("b-missing", "root/convoy/work/coder"),
+            ("c-invalid", "root/plain"),
+            ("d-ambiguous", "root/pair"),
+        ] {
+            let intent = MessageSpec::builder()
+                .sender("flotilla/test".into())
+                .receiver(receiver.into())
+                .relation(MessageRelation::System)
+                .body("brief".into())
+                .build();
+            inbox.accept(&InputMeta::builder().name(name.into()).build(), &intent, Utc::now()).await.expect("admit");
+        }
+        let views = super::crew_message_views(&backend, "flotilla").await.expect("diagnostic view survives receiver errors");
+        let view = |name: &str| views.iter().find(|view| view.name == name).unwrap_or_else(|| panic!("{name} shown"));
+        assert_eq!(views.len(), 4);
+        assert_eq!(view("a-valid").current_receiver.as_deref(), Some("root/attending/work/guide"));
+        assert!(view("a-valid").receiver_error.is_none());
+        assert!(view("b-missing").current_receiver.is_none());
+        assert!(view("b-missing").receiver_error.is_none());
+        assert!(view("c-invalid").current_receiver.is_none());
+        assert!(view("c-invalid").receiver_error.as_deref().is_some_and(|error| error.contains("not adoptable")), "{views:?}");
+        assert!(view("d-ambiguous").current_receiver.is_none());
+        assert!(view("d-ambiguous").receiver_error.as_deref().is_some_and(|error| error.contains("multiple")), "{views:?}");
+        // Delivery itself stays strict: the ambiguous address still refuses.
+        assert!(flotilla_messaging::resolve_message_receiver(&backend, "flotilla", "root/pair").await.is_err());
+    }
 }
 
 #[cfg(test)]

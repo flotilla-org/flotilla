@@ -129,6 +129,10 @@ pub struct CrewListResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrewMessageView {
     pub current_receiver: Option<String>,
+    /// Why the receiver did not resolve (an invalid adoption claim or ambiguous
+    /// holders); `current_receiver` is then absent. Delivery still refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_error: Option<String>,
     pub name: String,
     pub sender: String,
     pub receiver: String,
