@@ -1113,12 +1113,21 @@ pub(crate) mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingRunner(Mutex<Vec<(String, Vec<String>)>>);
+    // Boundary double: records process argv and stdin separately.
+    struct RecordingRunner {
+        calls: Mutex<Vec<(String, Vec<String>)>>,
+        inputs: Mutex<Vec<Vec<u8>>>,
+    }
 
     #[async_trait]
     impl CommandRunner for RecordingRunner {
+        async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+            self.inputs.lock().expect("recording input lock").push(input.to_vec());
+            self.run(cmd, args, cwd, label).await
+        }
+
         async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-            self.0
+            self.calls
                 .lock()
                 .expect("recording runner lock should be healthy")
                 .push((cmd.to_string(), args.iter().map(|arg| (*arg).to_string()).collect()));
@@ -1152,7 +1161,11 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl CommandRunner for PromisorRunner {
-        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            self.run_with_input(cmd, args, cwd, label, &[]).await
+        }
+
+        async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
             let container_manifest = format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}");
             let source_manifest = self.skills_source.join(SKILL_BUNDLE_MANIFEST).to_string_lossy().into_owned();
             let args = args
@@ -1167,18 +1180,14 @@ pub(crate) mod tests {
                     }
                 })
                 .collect::<Vec<_>>();
-            let output = Command::new(cmd)
-                .args(&args)
-                .current_dir(cwd)
-                .env("PATH", &self.path)
-                .env("FLOTILLA_TEST_FETCH_LOG", self.config_base.parent().expect("config parent").join("fetches"))
-                .output()
-                .map_err(|error| format!("run {cmd}: {error}"))?;
-            if output.status.success() {
-                String::from_utf8(output.stdout).map_err(|error| format!("decode {cmd} stdout: {error}"))
-            } else {
-                Err(String::from_utf8_lossy(&output.stderr).into_owned())
-            }
+            let mut env_args = vec![
+                format!("PATH={}", self.path),
+                format!("FLOTILLA_TEST_FETCH_LOG={}", self.config_base.parent().expect("config parent").join("fetches").display()),
+                cmd.to_string(),
+            ];
+            env_args.extend(args);
+            let refs = env_args.iter().map(String::as_str).collect::<Vec<_>>();
+            flotilla_provider_runtime::ProcessCommandRunner.run_with_input("env", &refs, cwd, label, input).await
         }
 
         async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
@@ -1519,6 +1528,18 @@ esac
         );
     }
 
+    // Glue: a literal dash pathname must reach the shell as a pathname rather
+    // than its stdin sentinel; normalization must not change other arguments.
+    #[tokio::test]
+    async fn skill_manifest_dash_path_is_not_stdin() {
+        let runner = RecordingRunner::default();
+        let args = ["flotilla-stage-skills", "-", "/skills", "false", "/cache"].map(str::to_string);
+        stage_git_skill_sources(&runner, &args).await.expect("stage pathname");
+        let calls = runner.calls.lock().expect("recorded calls");
+        assert_eq!(&calls[0].1[3..], &["flotilla-stage-skills", "./-", "/skills", "false", "/cache"]);
+        assert!(runner.inputs.lock().expect("recorded input").is_empty());
+    }
+
     #[tokio::test]
     async fn pinned_skills_are_staged_to_the_seam_resolved_claude_config() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1542,11 +1563,13 @@ esac
             .await
             .expect("stage pinned skills");
 
-        let calls = runner.0.lock().expect("recording runner lock should be healthy");
+        let calls = runner.calls.lock().expect("recording runner lock should be healthy");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "sh");
-        let manifest = calls[0].1.iter().find_map(|arg| arg.strip_prefix("json:")).expect("resolved source manifest");
-        let manifest: SkillBundleManifest = serde_json::from_str(manifest).expect("manifest");
+        assert_eq!(calls[0].1[4], "-", "inline manifest is consumed through stdin");
+        assert!(!calls[0].1.iter().any(|arg| arg.starts_with("json:")));
+        let inputs = runner.inputs.lock().expect("recorded stdin");
+        let manifest: SkillBundleManifest = serde_json::from_slice(&inputs[0]).expect("manifest");
         assert_eq!(manifest.sources[0].revision, "1".repeat(40));
         assert!(calls[0].1.contains(&"/tmp/flotilla-config/credentials/claude-max/claude/skills".to_string()));
         assert!(calls[0].1.contains(&"https://github.com/flotilla-org/mattpocock-skills.git".to_string()));
@@ -2085,7 +2108,7 @@ esac
 
         registry.stage_test_skills("crew-codex", &required, &environment, &BTreeMap::new(), &runner).await.expect("stage pinned skills");
 
-        let calls = runner.0.lock().expect("recording runner lock should be healthy");
+        let calls = runner.calls.lock().expect("recording runner lock should be healthy");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "sh");
         assert!(calls[0].1.contains(&format!("{CONTAINER_CODEX_HOME}/skills")));
@@ -2113,7 +2136,7 @@ esac
             .await
             .expect("stage pinned skills for both adapters");
 
-        let calls = runner.0.lock().expect("recording runner lock should be healthy");
+        let calls = runner.calls.lock().expect("recording runner lock should be healthy");
         assert_eq!(calls.len(), 2);
         let destinations =
             calls.iter().map(|(_, args)| args.get(5).expect("staging call must include its destination").as_str()).collect::<BTreeSet<_>>();
@@ -2146,7 +2169,7 @@ esac
             .expect("skip external Codex home");
 
         assert_eq!(
-            runner.0.lock().expect("recording runner lock should be healthy").as_slice(),
+            runner.calls.lock().expect("recording runner lock should be healthy").as_slice(),
             &[("rm".to_string(), vec!["-f".to_string(), "--".to_string(), "/tmp/unused-skill-token".to_string()])]
         );
     }
