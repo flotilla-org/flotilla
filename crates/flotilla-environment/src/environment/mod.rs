@@ -406,6 +406,7 @@ pub fn legacy_environment_spec(spec: &flotilla_protocol::EnvironmentSpec) -> Res
         return Err("waiting on build: declare an ImageBuild and pin its resulting digest".into());
     };
     Ok(flotilla_resources::EnvironmentSpec {
+        provider_address: None,
         host_direct: None,
         docker: Some(flotilla_resources::DockerEnvironmentSpec {
             host_ref: String::new(),

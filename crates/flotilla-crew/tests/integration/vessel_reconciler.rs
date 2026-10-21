@@ -3240,6 +3240,7 @@ async fn create_labeled_environment(backend: &ResourceBackend, namespace: &str, 
         .create(
             &labeled_meta(name, [(VESSEL_REF_LABEL.to_string(), workspace_name.to_string())]),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec {
                     host_ref: HOST_REF.to_string(),
                     repo_default_dir: "/Users/alice/dev/flotilla-repos".to_string(),

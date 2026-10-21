@@ -71,7 +71,7 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
             environments.push(environment);
         }
     }
-    use flotilla_environment::environment::{EnvironmentInput, ENVIRONMENT_PROVIDER_INSTANCE_LABEL};
+    use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
     // This adoption path still consumes stored Docker status. Its input filter
     // must stay narrower than the profile's per_vessel capability test. Retire
     // the legacy-input bridge and these recovery filters together at #3108.
@@ -94,13 +94,15 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     let mut inventories = HashMap::new();
     let mut reconciliations = Vec::new();
     for environment in environments {
-        let instance = environment.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned();
+        let instance = state
+            .provider_address(
+                &environment.metadata.name,
+                &environment.spec,
+                environment.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
+            )
+            .await?;
         if !inventories.contains_key(&instance) {
-            let (_, provider) = state
-                .local_registry
-                .environment_providers
-                .select_legacy_input(EnvironmentInput::Docker, instance.as_deref())
-                .ok_or("environment provider unavailable or ambiguous during adoption")?;
+            let provider = state.environment_providers.get(&instance)?;
             let handles = provider
                 .list()
                 .await?

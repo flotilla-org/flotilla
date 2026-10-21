@@ -3,8 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits};
 use flotilla_resources::{
-    Checkout, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentStatusPatch, Host, ImageBuildPhase,
-    ImageDelivery, ResourceError, ResourceObject,
+    Checkout, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentStatusPatch, Host, ImageBuildPhase, ImageDelivery,
+    ResourceError, ResourceObject,
 };
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler},
@@ -12,21 +12,15 @@ use flotilla_store::{
 };
 
 #[async_trait]
-pub trait DockerEnvironmentRuntime: Send + Sync {
-    /// Adopt or provision through the selected environment provider.
+pub trait EnvironmentRuntime: Send + Sync {
+    /// Adopt or provision through the provider addressed by the full spec.
     async fn provision_environment(
         &self,
         name: &str,
         spec: &flotilla_resources::EnvironmentSpec,
-    ) -> Result<EnvironmentProvisioning, String> {
-        if let Some(docker) = &spec.docker {
-            return self.provision(name, docker).await.map(EnvironmentProvisioning::Docker);
-        }
-        Err("host-direct provider unavailable".into())
-    }
-    async fn provision(&self, name: &str, spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String>;
-    async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String>;
-    /// Recover a Docker backing whose identity was never committed to status.
+    ) -> Result<EnvironmentProvisioning, String>;
+    async fn destroy(&self, environment_ref: &str, backing_id: &str) -> Result<(), String>;
+    /// Recover a provider backing whose identity was never committed to status.
     async fn destroy_unrecorded(&self, environment_ref: &str) -> Result<(), String> {
         self.cleanup(environment_ref).await
     }
@@ -35,17 +29,8 @@ pub trait DockerEnvironmentRuntime: Send + Sync {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DockerProvisioning {
-    pub configured_limits: Option<ConfiguredResourceLimits>,
-    pub container_id: String,
-    pub image_ref: String,
-    pub local_image_id: String,
-    pub registry_digest: Option<String>,
-}
-
 pub struct EnvironmentReconciler<R> {
-    docker: Arc<R>,
+    runtime: Arc<R>,
     hosts: TypedResolver<Host>,
     backend: ResourceBackend,
     namespace: String,
@@ -54,9 +39,9 @@ pub struct EnvironmentReconciler<R> {
 }
 
 impl<R> EnvironmentReconciler<R> {
-    pub fn new(docker: Arc<R>, backend: ResourceBackend, namespace: &str) -> Self {
+    pub fn new(runtime: Arc<R>, backend: ResourceBackend, namespace: &str) -> Self {
         Self {
-            docker,
+            runtime,
             hosts: backend.using::<Host>(namespace),
             backend,
             namespace: namespace.into(),
@@ -81,13 +66,7 @@ impl<R> EnvironmentReconciler<R> {
         };
         // Unscoped environments predate placement projection; their local
         // authoritative store remains their actuator.
-        let Some(host_ref) = environment
-            .spec
-            .host_direct
-            .as_ref()
-            .map(|spec| spec.host_ref.as_str())
-            .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
-        else {
+        let Some(host_ref) = environment.spec.host_ref() else {
             return Ok(true);
         };
         let hosts = self.hosts.list().await?;
@@ -99,9 +78,14 @@ impl<R> EnvironmentReconciler<R> {
     }
 }
 
-pub enum EnvironmentProvisioning {
-    HostDirect,
-    Docker(DockerProvisioning),
+/// Provider facts mapped to the preceding-generation stored status shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvironmentProvisioning {
+    pub configured_limits: Option<ConfiguredResourceLimits>,
+    pub backing_id: Option<String>,
+    pub image_ref: Option<String>,
+    pub local_image_id: Option<String>,
+    pub registry_digest: Option<String>,
 }
 
 pub enum EnvironmentPrepared {
@@ -114,7 +98,7 @@ pub enum EnvironmentPrepared {
 
 impl<R> Reconciler for EnvironmentReconciler<R>
 where
-    R: DockerEnvironmentRuntime + 'static,
+    R: EnvironmentRuntime + 'static,
 {
     type Resource = Environment;
     type Prepared = EnvironmentPrepared;
@@ -172,10 +156,10 @@ where
                         };
                     }
                     match self
-                        .docker
+                        .runtime
                         .provision_environment(
                             &obj.metadata.name,
-                            &flotilla_resources::EnvironmentSpec { host_direct: None, docker: Some(spec) },
+                            &flotilla_resources::EnvironmentSpec { docker: Some(spec), ..obj.spec.clone() },
                         )
                         .await
                     {
@@ -184,7 +168,7 @@ where
                         Err(message) => Ok(EnvironmentPrepared::Failed(message)),
                     }
                 } else {
-                    match self.docker.provision_environment(&obj.metadata.name, &obj.spec).await {
+                    match self.runtime.provision_environment(&obj.metadata.name, &obj.spec).await {
                         Ok(provisioning) => Ok(EnvironmentPrepared::Ready(provisioning)),
                         Err(message) => Ok(EnvironmentPrepared::Failed(message)),
                     }
@@ -205,18 +189,11 @@ where
         }
         let patch = match obj.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending) {
             EnvironmentPhase::Pending | EnvironmentPhase::Provisioning => match prepared {
-                EnvironmentPrepared::Ready(EnvironmentProvisioning::HostDirect) => Some(EnvironmentStatusPatch::MarkReady {
-                    configured_limits: None,
-                    docker_container_id: None,
-                    image_ref: None,
-                    local_image_id: None,
-                    registry_digest: None,
-                }),
-                EnvironmentPrepared::Ready(EnvironmentProvisioning::Docker(provisioning)) => Some(EnvironmentStatusPatch::MarkReady {
+                EnvironmentPrepared::Ready(provisioning) => Some(EnvironmentStatusPatch::MarkReady {
                     configured_limits: provisioning.configured_limits.clone(),
-                    docker_container_id: Some(provisioning.container_id.clone()),
-                    image_ref: Some(provisioning.image_ref.clone()),
-                    local_image_id: Some(provisioning.local_image_id.clone()),
+                    docker_container_id: provisioning.backing_id.clone(),
+                    image_ref: provisioning.image_ref.clone(),
+                    local_image_id: provisioning.local_image_id.clone(),
                     registry_digest: provisioning.registry_digest.clone(),
                 }),
                 EnvironmentPrepared::Failed(message) => Some(EnvironmentStatusPatch::MarkFailed { message: message.clone() }),
@@ -241,11 +218,11 @@ where
             return Err(ResourceError::FinalizerPending);
         }
         if let Some(container_id) = obj.status.as_ref().and_then(|status| status.docker_container_id.as_deref()) {
-            self.docker.destroy(&obj.metadata.name, container_id).await.map_err(ResourceError::other)?;
-        } else if obj.spec.docker.is_some() {
-            self.docker.destroy_unrecorded(&obj.metadata.name).await.map_err(ResourceError::other)?;
+            self.runtime.destroy(&obj.metadata.name, container_id).await.map_err(ResourceError::other)?;
+        } else if obj.spec.provider_address.is_some() || obj.spec.docker.is_some() {
+            self.runtime.destroy_unrecorded(&obj.metadata.name).await.map_err(ResourceError::other)?;
         } else {
-            self.docker.cleanup(&obj.metadata.name).await.map_err(ResourceError::other)?;
+            self.runtime.cleanup(&obj.metadata.name).await.map_err(ResourceError::other)?;
         }
         Ok(())
     }

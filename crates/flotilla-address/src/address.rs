@@ -130,6 +130,9 @@ impl Address {
         if !kind.may_follow(parent) {
             return Err(Error::Shape { kind, parent });
         }
+        if kind == Kind::Account && parent == Some(Kind::Usage) && normalise_usage(&value) != value {
+            return Err(Error::InvalidValue { kind, value, reason: "usage accounts are trimmed and lowercase" });
+        }
         validate_value(kind, &value)?;
         if kind == Kind::Repo && self.segments[0].value == GITHUB_FORGE_ID {
             validate_repository(ForgeKind::Github, &value)?;
@@ -227,7 +230,7 @@ fn validate_value(kind: Kind, value: &str) -> Result<(), Error> {
     }
     match kind {
         Kind::Forge => validate_forge_id(value),
-        Kind::Usage | Kind::Account if normalise_usage(value) != value => invalid("usage providers and accounts are trimmed and lowercase"),
+        Kind::Usage if normalise_usage(value) != value => invalid("usage providers and accounts are trimmed and lowercase"),
         Kind::ChangeRequest | Kind::Issue => {
             let canonical = value.bytes().all(|byte| byte.is_ascii_digit()) && (value == "0" || !value.starts_with('0'));
             if canonical && value.parse::<u64>().is_ok() {

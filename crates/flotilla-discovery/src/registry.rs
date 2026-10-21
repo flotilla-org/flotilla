@@ -15,6 +15,67 @@ use flotilla_issue_tracker::{provider_for_source, IssueProvider};
 
 use flotilla_vcs::providers::CloneProvisioner;
 
+/// Configured providers keyed by their qualified place and instance, never kind.
+#[derive(Default)]
+pub struct EnvironmentProviderRegistry {
+    entries: std::collections::BTreeMap<flotilla_address::Address, Arc<dyn EnvironmentProvider>>,
+}
+
+impl EnvironmentProviderRegistry {
+    pub fn insert(&mut self, address: flotilla_address::Address, provider: Arc<dyn EnvironmentProvider>) -> Result<(), String> {
+        flotilla_resources::validate_environment_provider_address(&address)?;
+        if self.entries.contains_key(&address) {
+            return Err(format!("duplicate environment provider address {address}"));
+        }
+        self.entries.insert(address, provider);
+        Ok(())
+    }
+
+    pub fn get(&self, address: &flotilla_address::Address) -> Result<Arc<dyn EnvironmentProvider>, String> {
+        self.entries.get(address).cloned().ok_or_else(|| format!("environment provider unavailable at {address}"))
+    }
+
+    pub fn register_place(
+        &mut self,
+        place: &flotilla_address::Address,
+        providers: &ProviderSet<dyn EnvironmentProvider>,
+    ) -> Result<(), String> {
+        let entries = providers
+            .inner
+            .iter()
+            .map(|(name, (_, provider))| {
+                let address = place.child(flotilla_address::Kind::Provider, name).map_err(|error| error.to_string())?;
+                flotilla_resources::validate_environment_provider_address(&address)?;
+                if self.entries.contains_key(&address) {
+                    return Err(format!("duplicate environment provider address {address}"));
+                }
+                Ok((address, Arc::clone(provider)))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        self.entries.extend(entries);
+        Ok(())
+    }
+
+    /// Old records may omit the instance or carry its historical label.
+    /// Resolve only within the named place and require one compatible match.
+    pub fn resolve_legacy(&self, host: &str, kind: EnvironmentInput, instance: Option<&str>) -> Result<flotilla_address::Address, String> {
+        let candidates = self
+            .entries
+            .iter()
+            .filter(|(address, provider)| {
+                address.get(flotilla_address::Kind::Host) == Some(host)
+                    && instance.is_none_or(|instance| address.name() == instance)
+                    && provider.legacy_input() == Some(kind)
+            })
+            .map(|(address, _)| address.clone())
+            .collect::<Vec<_>>();
+        match candidates.as_slice() {
+            [address] => Ok(address.clone()),
+            _ => Err(format!("environment provider unavailable or ambiguous on host {host} (instance {instance:?}, input {kind:?})")),
+        }
+    }
+}
+
 /// Common accessors shared by all descriptor types.
 ///
 /// Descriptor fields used by typed provider sets.
@@ -433,5 +494,102 @@ mod advertisement_tests {
             assert_eq!(entry.kind.as_ref().unwrap().class, EnvironmentClass::Dummy);
             assert_eq!(entry.capabilities, provider.capabilities());
         }
+    }
+}
+
+#[cfg(test)]
+mod address_registry_tests {
+    use super::*;
+    use flotilla_address::{Address, Kind};
+    use flotilla_environment::environment::host_direct::HostDirectEnvironmentProvider;
+    use hegel::generators as gs;
+
+    // Registration is one startup operation: a collision must not leave an
+    // earlier, non-conflicting instance installed from the rejected batch.
+    #[test]
+    fn register_place_is_atomic_on_collision() {
+        let mut registry = EnvironmentProviderRegistry::default();
+        let place = Address::root(Kind::Host, "home").expect("place");
+        let provider: Arc<dyn EnvironmentProvider> = Arc::new(HostDirectEnvironmentProvider::new(
+            Arc::new(flotilla_replay_testkit::testing::MockRunner::new(vec![])),
+            Default::default(),
+        ));
+        let occupied = place.child(Kind::Provider, "occupied").expect("address");
+        registry.insert(occupied.clone(), provider.clone()).expect("existing instance");
+        let mut providers = ProviderSet::new();
+        for name in ["new", "occupied"] {
+            providers.insert(name, ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, name), provider.clone());
+        }
+        assert!(registry.register_place(&place, &providers).is_err());
+        assert!(registry.get(&place.child(Kind::Provider, "new").expect("address")).is_err());
+        assert!(Arc::ptr_eq(&registry.get(&occupied).expect("original retained"), &provider));
+    }
+
+    // ADR 0058: equal instance names at distinct places are independent;
+    // account and SSH-host entries use the same resolution as local entries.
+    #[hegel::test]
+    fn qualified_provider_registry_isolates_places(tc: hegel::TestCase) {
+        let instance = tc.draw(gs::text().alphabet("aZ09 /:%é").min_size(1).max_size(16));
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+        // Subprocess boundary only: selection never executes this runner.
+        let runner = Arc::new(flotilla_replay_testkit::testing::MockRunner::new(vec![]));
+        let mut registry = EnvironmentProviderRegistry::default();
+        let mut expected = Vec::new();
+        for index in 0..count {
+            let kind = if index % 2 == 0 { Kind::Host } else { Kind::Account };
+            let address =
+                Address::root(kind, &format!("place-{index}")).and_then(|place| place.child(Kind::Provider, &instance)).expect("address");
+            let provider: Arc<dyn EnvironmentProvider> = Arc::new(HostDirectEnvironmentProvider::new(runner.clone(), Default::default()));
+            registry.insert(address.clone(), provider.clone()).expect("unique entry");
+            assert!(registry.insert(address.clone(), provider.clone()).is_err(), "duplicates must not silently replace a provider");
+            expected.push((address, provider));
+        }
+        for (address, provider) in expected {
+            assert!(Arc::ptr_eq(&registry.get(&address).expect("registered provider"), &provider));
+            if address.get(Kind::Host).is_some() {
+                assert_eq!(
+                    registry
+                        .resolve_legacy(address.get(Kind::Host).unwrap(), EnvironmentInput::HostDirect, Some(&instance))
+                        .expect("legacy"),
+                    address
+                );
+            }
+        }
+        let missing = Address::root(Kind::Host, "absent").and_then(|place| place.child(Kind::Provider, &instance)).expect("address");
+        assert!(registry.get(&missing).is_err());
+        assert!(registry.resolve_legacy("absent", EnvironmentInput::HostDirect, None).is_err());
+        assert!(registry
+            .insert(Address::project("invalid").unwrap(), Arc::new(HostDirectEnvironmentProvider::new(runner, Default::default())))
+            .is_err());
+    }
+}
+
+#[cfg(test)]
+mod legacy_address_tests {
+    use super::*;
+    use flotilla_address::{Address, Kind};
+    use flotilla_environment::environment::{docker::DockerEnvironmentProvider, host_direct::HostDirectEnvironmentProvider};
+    use hegel::generators as gs;
+
+    // Legacy records resolve only a unique compatible provider at their own
+    // place; labels never select a provider accepting the wrong stored input.
+    #[hegel::test]
+    fn legacy_provider_addresses_fail_closed_on_ambiguity(tc: hegel::TestCase) {
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        // Process boundary; resolving an address must not run a command.
+        let runner = Arc::new(flotilla_replay_testkit::testing::MockRunner::new(vec![]));
+        let mut registry = EnvironmentProviderRegistry::default();
+        for index in 0..count {
+            let address =
+                Address::root(Kind::Host, "home").and_then(|place| place.child(Kind::Provider, &format!("docker-{index}"))).unwrap();
+            registry.insert(address, Arc::new(DockerEnvironmentProvider::new(runner.clone()))).unwrap();
+        }
+        registry
+            .insert("host:home/provider:direct".parse().unwrap(), Arc::new(HostDirectEnvironmentProvider::new(runner, Default::default())))
+            .unwrap();
+        assert_eq!(registry.resolve_legacy("home", EnvironmentInput::Docker, None).is_ok(), count == 1);
+        assert_eq!(registry.resolve_legacy("home", EnvironmentInput::Docker, Some("docker-0")).is_ok(), count > 0);
+        assert!(registry.resolve_legacy("home", EnvironmentInput::Docker, Some("direct")).is_err());
+        assert!(registry.resolve_legacy("away", EnvironmentInput::Docker, Some("docker-0")).is_err());
     }
 }

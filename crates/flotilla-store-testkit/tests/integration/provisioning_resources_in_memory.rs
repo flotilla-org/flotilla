@@ -117,6 +117,7 @@ async fn environment_and_checkout_specs_serialize_through_in_memory_backend() {
     let checkouts = backend.using::<Checkout>("flotilla");
 
     let env_spec = EnvironmentSpec {
+        provider_address: None,
         host_direct: None,
         docker: Some(DockerEnvironmentSpec {
             image_build_ref: None,

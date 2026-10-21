@@ -653,6 +653,19 @@ impl Reconciler for VesselReconciler {
                         actuations.push(Actuation::CreateEnvironment {
                             meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
                             spec: EnvironmentSpec {
+                                provider_address: Some(
+                                    flotilla_address::Address::root(flotilla_address::Kind::Host, host_ref)
+                                        .and_then(|place| {
+                                            place.child(
+                                                flotilla_address::Kind::Provider,
+                                                environment_provider_labels(&placement_policy)
+                                                    .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
+                                                    .map(String::as_str)
+                                                    .unwrap_or("docker"),
+                                            )
+                                        })
+                                        .map_err(|error| ResourceError::other(error.to_string()))?,
+                                ),
                                 host_direct: None,
                                 docker: Some(DockerEnvironmentSpec {
                                     image_build_ref,
@@ -1125,6 +1138,19 @@ impl Reconciler for VesselReconciler {
                         actuations.push(Actuation::CreateEnvironment {
                             meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
                             spec: EnvironmentSpec {
+                                provider_address: Some(
+                                    flotilla_address::Address::root(flotilla_address::Kind::Host, host_ref)
+                                        .and_then(|place| {
+                                            place.child(
+                                                flotilla_address::Kind::Provider,
+                                                environment_provider_labels(&placement_policy)
+                                                    .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
+                                                    .map(String::as_str)
+                                                    .unwrap_or("docker"),
+                                            )
+                                        })
+                                        .map_err(|error| ResourceError::other(error.to_string()))?,
+                                ),
                                 host_direct: None,
                                 docker: Some(DockerEnvironmentSpec {
                                     image_build_ref,

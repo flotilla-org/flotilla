@@ -674,7 +674,10 @@ mod tests {
         let environment = backend
             .clone()
             .using::<Environment>("fleet")
-            .create(&InputMeta::builder().name("environment".into()).build(), &EnvironmentSpec { host_direct: None, docker: Some(docker) })
+            .create(
+                &InputMeta::builder().name("environment".into()).build(),
+                &EnvironmentSpec { host_direct: None, docker: Some(docker), ..Default::default() },
+            )
             .await
             .expect("environment");
         let environment_index = inventory.len();
@@ -903,6 +906,7 @@ mod tests {
                         serde_json::from_value::<DockerEnvironmentSpec>(serde_json::json!({"host_ref":"host-b", "image":"frozen-tag"}))
                             .expect("docker"),
                     ),
+                    ..Default::default()
                 },
             )
             .await
@@ -1130,6 +1134,7 @@ mod tests {
                         serde_json::from_value(serde_json::json!({"host_ref":"host-b", "image":"", "image_build_ref": name}))
                             .expect("docker"),
                     ),
+                    ..Default::default()
                 },
             )
             .await

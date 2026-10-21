@@ -16,7 +16,7 @@ const GITHUB_RECORD_SERVICE: &str = "github.com";
 /// - issue: `issue-<hex service>-<hex owner/repo>-<number>`;
 /// - artifact slot: `artifact-<sha256 of convoy, role, kind and subject>`;
 /// - usage account: `usage-<sha256 prefix of provider and account>`;
-/// - project and convoy: their name.
+/// - project, convoy and host: their name.
 ///
 /// These are the names records already carry, so this is a read and write
 /// boundary, not a stored-shape change. A convoy's Project does not take part
@@ -49,10 +49,17 @@ pub fn record_name(address: &Address) -> Option<String> {
             let digest = format!("{:x}", hash.finalize());
             Some(format!("usage-{}", &digest[..54]))
         }
-        Kind::Project | Kind::Convoy => Some(address.name().to_string()),
-        Kind::Vessel | Kind::Role | Kind::Message | Kind::Forge | Kind::Repo | Kind::Comment | Kind::Commit | Kind::Ref | Kind::Usage => {
-            None
-        }
+        Kind::Project | Kind::Convoy | Kind::Host => Some(address.name().to_string()),
+        Kind::Provider
+        | Kind::Vessel
+        | Kind::Role
+        | Kind::Message
+        | Kind::Forge
+        | Kind::Repo
+        | Kind::Comment
+        | Kind::Commit
+        | Kind::Ref
+        | Kind::Usage => None,
     }
 }
 
@@ -111,6 +118,10 @@ mod tests {
         assert_eq!(record_name(&in_project), Some(legacy_artifact_name()), "the project does not change the record");
         let standing = Address::project("flotilla").and_then(|p| p.child(Kind::Role, "gui")).and_then(|r| r.artifact("k", "s")).expect("a");
         assert_eq!(record_name(&standing), None, "standing-role artifacts have no record yet");
+        // A host place names its existing Host record by canonical host key.
+        let host = Address::root(Kind::Host, "host-a").expect("host address");
+        assert_eq!(record_name(&host).as_deref(), Some("host-a"));
+        assert_eq!(record_name(&host.child(Kind::Provider, "docker").expect("provider")), None);
         let usage = Address::usage("Claude", " Team@Example.com ").expect("usage");
         assert_eq!(record_name(&usage), Some(legacy_usage_name("claude", "team@example.com")));
     }

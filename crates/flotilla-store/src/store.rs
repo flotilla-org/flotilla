@@ -15,7 +15,7 @@ use flotilla_resources::{
 use futures::StreamExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct SerializedResource;
@@ -831,7 +831,9 @@ pub trait StoreExt: Store {
         meta: &InputMeta,
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
-        let spec = transcode_request(self.blocking_request_encoding(), spec.clone()).await?;
+        let spec =
+            transcode_request(self.blocking_request_encoding(), T::canonicalize_spec(&meta.labels, Cow::Borrowed(spec))?.into_owned())
+                .await?;
         typed_object(self.create_raw(ResourceKind::of::<T>(), namespace, meta, &spec).await?)
     }
     async fn create_definition_typed<T: Resource>(
@@ -841,7 +843,9 @@ pub trait StoreExt: Store {
         spec: &T::Spec,
         merge: MergeMetadata,
     ) -> Result<ResourceObject<T>, ResourceError> {
-        let spec = transcode_request(self.blocking_request_encoding(), spec.clone()).await?;
+        let spec =
+            transcode_request(self.blocking_request_encoding(), T::canonicalize_spec(&meta.labels, Cow::Borrowed(spec))?.into_owned())
+                .await?;
         typed_object(self.create_definition_raw(ResourceKind::of::<T>(), namespace, meta, &spec, merge).await?)
     }
     async fn update_typed<T: Resource>(
@@ -851,7 +855,9 @@ pub trait StoreExt: Store {
         resource_version: &str,
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
-        let spec = transcode_request(self.blocking_request_encoding(), spec.clone()).await?;
+        let spec =
+            transcode_request(self.blocking_request_encoding(), T::canonicalize_spec(&meta.labels, Cow::Borrowed(spec))?.into_owned())
+                .await?;
         typed_object(self.update_raw(ResourceKind::of::<T>(), namespace, meta, resource_version, &spec).await?)
     }
     async fn update_definition_typed<T: Resource>(
@@ -862,7 +868,9 @@ pub trait StoreExt: Store {
         spec: &T::Spec,
         merge: MergeMetadata,
     ) -> Result<ResourceObject<T>, ResourceError> {
-        let spec = transcode_request(self.blocking_request_encoding(), spec.clone()).await?;
+        let spec =
+            transcode_request(self.blocking_request_encoding(), T::canonicalize_spec(&meta.labels, Cow::Borrowed(spec))?.into_owned())
+                .await?;
         typed_object(self.update_definition_raw(ResourceKind::of::<T>(), namespace, meta, resource_version, &spec, merge).await?)
     }
     async fn update_status_typed<T: Resource>(

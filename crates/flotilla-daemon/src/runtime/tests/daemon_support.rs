@@ -141,6 +141,7 @@ pub(super) async fn create_credential_test_session(backend: &ResourceBackend, na
 
 pub(super) fn manual_profile(host_id: &str, docker_available: bool) -> LocalProvisioningProfile {
     LocalProvisioningProfile {
+        host_direct_provider: "host-direct".into(),
         environment_providers: flotilla_discovery_testkit::environment::ready_placement_advertisements()
             .into_iter()
             .filter(|provider| {

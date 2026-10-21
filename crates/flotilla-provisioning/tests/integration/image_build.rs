@@ -21,7 +21,7 @@ use flotilla_environment::environment::{
 use flotilla_protocol::{EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo};
 use flotilla_provisioning::reconcilers::{
     image_build::{attribute_recipe_failure, image_build_retry_backoff, registry_build_cache},
-    DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ImageBuildMaterials, ImageBuildReconciler,
+    EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime, ImageBuildMaterials, ImageBuildReconciler,
 };
 use flotilla_resources::{
     image_identity, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentSpec, FleetDesignation,
@@ -707,14 +707,20 @@ struct Docker {
     provisioned: Mutex<Vec<(String, DockerImagePullPolicy)>>,
 }
 #[async_trait]
-impl DockerEnvironmentRuntime for Docker {
-    async fn provision(&self, _name: &str, spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+impl EnvironmentRuntime for Docker {
+    async fn provision_environment(
+        &self,
+        _name: &str,
+        spec: &flotilla_resources::EnvironmentSpec,
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+        let spec = spec.docker.as_ref().expect("Docker scenario input");
+
         self.provisioned.lock().expect("provisioned").push((spec.image.clone(), spec.pull_policy));
-        Ok(DockerProvisioning {
+        Ok(EnvironmentProvisioning {
             configured_limits: None,
-            container_id: "container".into(),
-            image_ref: spec.image.clone(),
-            local_image_id: digest('d'),
+            backing_id: Some("container".into()),
+            image_ref: Some(spec.image.clone()),
+            local_image_id: Some(digest('d')),
             registry_digest: spec.image.split_once('@').map(|(_, digest)| digest.to_string()),
         })
     }
@@ -741,6 +747,7 @@ async fn environment_becomes_ready_with_the_built_digest(#[case] delivery: Image
         .create(
             &InputMeta::builder().name("env".into()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: Some(name.clone()),

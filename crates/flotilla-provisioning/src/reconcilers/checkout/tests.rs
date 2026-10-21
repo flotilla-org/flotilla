@@ -281,6 +281,7 @@ async fn empty_convoy_sweep_respects_namespaces_and_hosts() {
             .create(
                 &empty_meta(name),
                 &EnvironmentSpec {
+                    provider_address: None,
                     host_direct: Some(HostDirectEnvironmentSpec {
                         host_ref: host.into(),
                         repo_default_dir: root.to_str().expect("test fixture operation succeeds").into(),
@@ -319,6 +320,7 @@ async fn empty_convoy_sweep_fails_closed_on_listing_errors() {
             .create(
                 &empty_meta("host-direct"),
                 &EnvironmentSpec {
+                    provider_address: None,
                     host_direct: Some(HostDirectEnvironmentSpec {
                         host_ref: "local".into(),
                         repo_default_dir: root.to_str().expect("root path").into(),

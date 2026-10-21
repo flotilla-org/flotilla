@@ -141,10 +141,15 @@ pub(super) async fn ensure_host_direct_environment_exists(
         Err(err) => return Err(format!("check environment {name}: {err}")),
     }
 
+    let address = flotilla_address::Address::root(flotilla_address::Kind::Host, &profile.host_id)
+        .and_then(|place| place.child(flotilla_address::Kind::Provider, &profile.host_direct_provider))
+        .map_err(|error| error.to_string())?;
+
     environments
         .create(
             &empty_meta(&name),
             &EnvironmentSpec {
+                provider_address: Some(address),
                 host_direct: Some(HostDirectEnvironmentSpec {
                     host_ref: profile.host_id.clone(),
                     repo_default_dir: profile.repo_default_dir.clone(),

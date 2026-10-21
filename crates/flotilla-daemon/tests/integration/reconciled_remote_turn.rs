@@ -180,6 +180,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .create(
             &meta("host-direct-placement-host"),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec {
                     host_ref: "placement-host".to_string(),
                     repo_default_dir: "/workspace".to_string(),

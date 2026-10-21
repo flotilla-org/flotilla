@@ -150,8 +150,9 @@ pub use dispatch_hold::{
 };
 pub use dispatch_observation::{DispatchObservation, DispatchObservationSpec, DISPATCH_RECONCILER_PROVENANCE};
 pub use environment::{
-    host_direct_environment_name, DockerEnvironmentSpec, Environment, EnvironmentMemoryPolicy, EnvironmentMount, EnvironmentMountMode,
-    EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, HOST_DIRECT_NAME_PREFIX,
+    host_direct_environment_name, validate_environment_provider_address, DockerEnvironmentSpec, Environment, EnvironmentMemoryPolicy,
+    EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch,
+    HostDirectEnvironmentSpec, HOST_DIRECT_NAME_PREFIX,
 };
 pub use error::{FinalizerWaitReason, ResourceError};
 pub use event::{Event, EventRegarding, EventSpec, ObjectEvent, DEFAULT_EVENT_TTL_SECONDS};

@@ -4,18 +4,22 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_provisioning::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler};
+use flotilla_provisioning::reconcilers::{EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime};
 use flotilla_resources::{
     DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, Host,
     HostDirectEnvironmentSpec, HostSpec, InputMeta, ResourceError, StatusPatch,
 };
 use flotilla_store::{controller::Reconciler, ResourceBackend};
 
-struct FailingDockerRuntime;
+struct FailingEnvironmentRuntime;
 
 #[async_trait]
-impl DockerEnvironmentRuntime for FailingDockerRuntime {
-    async fn provision(&self, _name: &str, _spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+impl EnvironmentRuntime for FailingEnvironmentRuntime {
+    async fn provision_environment(
+        &self,
+        _name: &str,
+        _spec: &flotilla_resources::EnvironmentSpec,
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
         Err("central Codex credential is not provisioned on this host".to_string())
     }
 
@@ -34,8 +38,13 @@ struct RecordingDockerRuntime {
 }
 
 #[async_trait]
-impl DockerEnvironmentRuntime for RecordingDockerRuntime {
-    async fn provision(&self, _name: &str, _spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+impl EnvironmentRuntime for RecordingDockerRuntime {
+    async fn provision_environment(
+        &self,
+        _name: &str,
+        spec: &flotilla_resources::EnvironmentSpec,
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+        let _spec = spec.docker.as_ref().expect("Docker scenario input");
         unreachable!("finalizer test does not provision")
     }
 
@@ -57,6 +66,7 @@ async fn a_provisioning_failure_marks_the_environment_failed() {
         .create(
             &InputMeta::builder().name("env-waiting".to_string()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: None,
@@ -73,7 +83,7 @@ async fn a_provisioning_failure_marks_the_environment_failed() {
         )
         .await
         .expect("create environment");
-    let reconciler = EnvironmentReconciler::new(Arc::new(FailingDockerRuntime), backend.clone(), "flotilla");
+    let reconciler = EnvironmentReconciler::new(Arc::new(FailingEnvironmentRuntime), backend.clone(), "flotilla");
 
     let deps = reconciler.prepare(&environment).await.expect("attempt provisioning");
     let outcome = reconciler.reconcile(&environment, &deps, chrono::Utc::now());
@@ -92,11 +102,11 @@ async fn finalizer_error_surfaces_as_failed_environment_status() {
         .using::<Environment>("flotilla")
         .create(
             &InputMeta::builder().name("env-corrupt-metadata".to_string()).build(),
-            &EnvironmentSpec { host_direct: None, docker: None },
+            &EnvironmentSpec { provider_address: None, host_direct: None, docker: None },
         )
         .await
         .expect("create environment");
-    let reconciler = EnvironmentReconciler::new(Arc::new(FailingDockerRuntime), backend.clone(), "flotilla");
+    let reconciler = EnvironmentReconciler::new(Arc::new(FailingEnvironmentRuntime), backend.clone(), "flotilla");
     let error = ResourceError::other("failed to parse provisioned mount metadata: corrupt label");
 
     let patch = reconciler
@@ -117,6 +127,7 @@ async fn failed_environment_without_a_container_still_runs_terminal_cleanup() {
         .create(
             &InputMeta::builder().name("env-failed".to_string()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: None,
@@ -156,8 +167,13 @@ async fn failed_environment_without_a_container_still_runs_terminal_cleanup() {
 struct ForeignEnvironmentRuntime;
 
 #[async_trait]
-impl DockerEnvironmentRuntime for ForeignEnvironmentRuntime {
-    async fn provision(&self, _name: &str, _spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+impl EnvironmentRuntime for ForeignEnvironmentRuntime {
+    async fn provision_environment(
+        &self,
+        _name: &str,
+        spec: &flotilla_resources::EnvironmentSpec,
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+        let _spec = spec.docker.as_ref().expect("Docker scenario input");
         panic!("a non-actuator must not provision a foreign environment")
     }
 
@@ -188,6 +204,7 @@ async fn foreign_environment_is_not_actuated_or_finalized() {
         .create(
             &InputMeta::builder().name("env-udder".to_string()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: None,
@@ -208,6 +225,7 @@ async fn foreign_environment_is_not_actuated_or_finalized() {
         .create(
             &InputMeta::builder().name("direct-udder".to_string()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "udder".to_string(), repo_default_dir: "/worktrees".to_string() }),
                 docker: None,
             },
@@ -232,6 +250,7 @@ async fn orphaned_environment_can_finalize_after_its_host_disappears() {
         .create(
             &InputMeta::builder().name("env-orphaned".to_string()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: None,
@@ -266,13 +285,14 @@ async fn host_direct_provider_failure_prevents_readiness() {
         .create(
             &InputMeta::builder().name("direct-adoption".into()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/".into() }),
                 docker: None,
             },
         )
         .await
         .expect("create direct environment");
-    let reconciler = EnvironmentReconciler::new(Arc::new(FailingDockerRuntime), backend, "flotilla");
+    let reconciler = EnvironmentReconciler::new(Arc::new(FailingEnvironmentRuntime), backend, "flotilla");
     let prepared = reconciler.prepare(&environment).await.expect("prepare direct adoption");
     let result = reconciler.reconcile(&environment, &prepared, chrono::Utc::now());
     assert!(matches!(result.patch, Some(EnvironmentStatusPatch::MarkFailed { .. })));
@@ -289,6 +309,7 @@ async fn lost_environment_is_not_reprovisioned() {
         .create(
             &InputMeta::builder().name("lost-environment".into()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     host_ref: "host-a".into(),
@@ -336,14 +357,20 @@ struct ProvisioningDockerRuntime {
 }
 
 #[async_trait]
-impl DockerEnvironmentRuntime for ProvisioningDockerRuntime {
-    async fn provision(&self, _name: &str, spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+impl EnvironmentRuntime for ProvisioningDockerRuntime {
+    async fn provision_environment(
+        &self,
+        _name: &str,
+        spec: &flotilla_resources::EnvironmentSpec,
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+        let spec = spec.docker.as_ref().expect("Docker scenario input");
+
         self.provisioned.lock().expect("provision log").push((spec.image.clone(), spec.pull_policy));
-        Ok(DockerProvisioning {
+        Ok(EnvironmentProvisioning {
             configured_limits: None,
-            container_id: "container".into(),
-            image_ref: spec.image.clone(),
-            local_image_id: format!("sha256:{}", "9".repeat(64)),
+            backing_id: Some("container".into()),
+            image_ref: Some(spec.image.clone()),
+            local_image_id: Some(format!("sha256:{}", "9".repeat(64))),
             registry_digest: None,
         })
     }
@@ -396,6 +423,7 @@ async fn composed_environment_waits_for_its_build_then_provisions_the_digest(#[c
         .create(
             &InputMeta::builder().name("env-composed".to_string()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: Some(name.clone()),
@@ -482,6 +510,7 @@ async fn retired_build_reference_fails_the_environment() {
         .create(
             &InputMeta::builder().name("env-old".to_string()).build(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: Some("image-build-old-stage".into()),
@@ -522,6 +551,7 @@ async fn environment_cleanup_waits_for_referencing_checkout_finalizers() {
             .create(
                 &InputMeta::builder().name("env-cleanup".into()).build(),
                 &EnvironmentSpec {
+                    provider_address: None,
                     host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".into(), repo_default_dir: "/workspace".into() }),
                     docker: None,
                 },
@@ -563,4 +593,57 @@ async fn environment_cleanup_waits_for_referencing_checkout_finalizers() {
         reconciler.run_finalizer(&environment).await.expect("no checkout still needs the environment");
         assert_eq!(*runtime.cleaned.lock().expect("cleanup log"), ["env-cleanup"]);
     }
+}
+
+// Provider process boundary: this provider accepts no legacy Docker/host-direct
+// input, and returns only an opaque backing identity.
+struct NeutralRuntime {
+    destroyed: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl EnvironmentRuntime for NeutralRuntime {
+    async fn provision_environment(
+        &self,
+        _: &str,
+        spec: &EnvironmentSpec,
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+        assert!(spec.docker.is_none() && spec.host_direct.is_none());
+        assert!(spec.provider_address.is_some());
+        Ok(flotilla_provisioning::reconcilers::EnvironmentProvisioning {
+            backing_id: Some("opaque-provider-backing".into()),
+            ..Default::default()
+        })
+    }
+    async fn destroy(&self, _: &str, backing: &str) -> Result<(), String> {
+        self.destroyed.lock().unwrap().push(backing.into());
+        Ok(())
+    }
+}
+
+// ADR 0058: reconciliation and teardown use provider facts and opaque backing
+// IDs even when the provider has neither of the preceding-generation inputs.
+#[tokio::test]
+async fn neutral_provider_provisions_and_destroys_opaque_backing() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let runtime = Arc::new(NeutralRuntime { destroyed: Mutex::new(Vec::new()) });
+    let reconciler = EnvironmentReconciler::new(runtime.clone(), backend.clone(), "flotilla");
+    let mut environment = backend
+        .using::<Environment>("flotilla")
+        .create(
+            &InputMeta::builder().name("neutral-provider".to_string()).build(),
+            &EnvironmentSpec { provider_address: Some("account:cloud/provider:sandbox".parse().unwrap()), host_direct: None, docker: None },
+        )
+        .await
+        .unwrap();
+    let prepared = reconciler.prepare(&environment).await.unwrap();
+    let outcome = reconciler.reconcile(&environment, &prepared, chrono::Utc::now());
+    let mut status = EnvironmentStatus::default();
+    outcome.patch.expect("ready patch").apply(&mut status);
+    assert_eq!(status.phase, EnvironmentPhase::Ready);
+    assert_eq!(status.docker_container_id.as_deref(), Some("opaque-provider-backing"));
+    assert!(status.image_ref.is_none());
+    environment.status = Some(status);
+    reconciler.run_finalizer(&environment).await.unwrap();
+    assert_eq!(*runtime.destroyed.lock().unwrap(), ["opaque-provider-backing"]);
 }

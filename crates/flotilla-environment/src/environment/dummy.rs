@@ -487,6 +487,7 @@ mod tests {
 
     fn docker_spec(image: &str) -> EnvironmentSpec {
         EnvironmentSpec {
+            provider_address: None,
             host_direct: None,
             docker: Some(DockerEnvironmentSpec {
                 host_ref: "host".into(),

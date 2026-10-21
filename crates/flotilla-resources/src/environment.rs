@@ -1,9 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use flotilla_protocol::ConfiguredResourceLimits;
 use serde::{Deserialize, Serialize};
 
-use crate::{placement_policy::DockerImagePullPolicy, resource::define_resource, status_patch::StatusPatch, ControllerRetry};
+use crate::{
+    placement_policy::DockerImagePullPolicy, resource::define_resource, status_patch::StatusPatch, ControllerRetry, ResourceError,
+};
 
 define_resource!(
     Environment,
@@ -12,7 +17,14 @@ define_resource!(
     EnvironmentStatus,
     EnvironmentStatusPatch,
     replication = crate::ReplicationClass::None,
-    queryable = &["metadata.name", "spec.host_direct.host_ref", "status.runtime_observation.container_id"]
+    canonicalize_spec = canonicalize_environment_spec,
+    queryable = &[
+        "metadata.name",
+        "spec.provider_address",
+        "spec.host_direct",
+        "spec.host_direct.host_ref",
+        "status.runtime_observation.container_id"
+    ]
 );
 
 /// Shared namespace for host-direct Environments and seeded PlacementPolicies.
@@ -24,16 +36,118 @@ pub fn host_direct_environment_name(host_ref: &str) -> String {
     format!("{HOST_DIRECT_NAME_PREFIX}{host_ref}")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct EnvironmentSpec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_address: Option<flotilla_address::Address>,
     pub host_direct: Option<HostDirectEnvironmentSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker: Option<DockerEnvironmentSpec>,
+}
+
+// A preceding-generation Environment can bind a non-default instance in its
+// metadata. Resolve it while that context is present, before Serialize could
+// select a built-in default. Explicit addresses always remain authoritative.
+fn canonicalize_environment_spec<'a>(
+    labels: &BTreeMap<String, String>,
+    mut spec: Cow<'a, EnvironmentSpec>,
+) -> Result<Cow<'a, EnvironmentSpec>, ResourceError> {
+    if spec.provider_address.is_none() {
+        if let Some(instance) = labels.get("flotilla.work/environment-provider-instance") {
+            let address = spec.resolved_provider_address(Some(instance)).map_err(ResourceError::invalid)?;
+            spec.to_mut().provider_address = address;
+        }
+    }
+    Ok(spec)
+}
+
+/// Only host/account places followed by one provider instance name are valid.
+pub fn validate_environment_provider_address(address: &flotilla_address::Address) -> Result<(), String> {
+    use flotilla_address::Kind;
+    let segments = address.segments();
+    if segments.len() == 2 && matches!(segments[0].kind(), Kind::Host | Kind::Account) && segments[1].kind() == Kind::Provider {
+        Ok(())
+    } else {
+        Err(format!("expected host:<host>/provider:<instance> or account:<account>/provider:<instance>, got {address}"))
+    }
+}
+
+impl EnvironmentSpec {
+    pub fn host_ref(&self) -> Option<&str> {
+        if let Some(address) = &self.provider_address {
+            return address.get(flotilla_address::Kind::Host);
+        }
+        self.host_direct
+            .as_ref()
+            .map(|spec| spec.host_ref.as_str())
+            .or_else(|| self.docker.as_ref().map(|spec| spec.host_ref.as_str()))
+            .filter(|host| !host.is_empty())
+    }
+
+    pub fn resolved_provider_address(&self, instance: Option<&str>) -> Result<Option<flotilla_address::Address>, String> {
+        if let Some(address) = &self.provider_address {
+            validate_environment_provider_address(address)?;
+            return Ok(Some(address.clone()));
+        }
+        let Some(host) = self.host_ref() else { return Ok(None) };
+        let default_instance = if self.host_direct.is_some() { "host-direct" } else { "docker" };
+        flotilla_address::Address::root(flotilla_address::Kind::Host, host)
+            .and_then(|place| place.child(flotilla_address::Kind::Provider, instance.unwrap_or(default_instance)))
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+}
+
+// Canonical writes are centralized here so every resource author, including
+// manifest ingestion, writes the new address and never legacy host fields.
+// Resource::canonicalize_spec first resolves legacy instance labels while the
+// metadata context is available.
+impl Serialize for EnvironmentSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Stored<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            provider_address: Option<flotilla_address::Address>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            host_direct: &'a Option<HostDirectEnvironmentSpec>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            docker: &'a Option<DockerEnvironmentSpec>,
+        }
+        let provider_address = self.resolved_provider_address(None).map_err(serde::ser::Error::custom)?;
+        Stored { provider_address, host_direct: &self.host_direct, docker: &self.docker }.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EnvironmentSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stored {
+            #[serde(default)]
+            provider_address: Option<flotilla_address::Address>,
+            #[serde(default)]
+            host_direct: Option<HostDirectEnvironmentSpec>,
+            #[serde(default)]
+            docker: Option<DockerEnvironmentSpec>,
+        }
+        let mut stored = Stored::deserialize(deserializer)?;
+        if let Some(address) = &stored.provider_address {
+            validate_environment_provider_address(address).map_err(serde::de::Error::custom)?;
+            // Keep transitional in-memory consumers consistent with the explicit
+            // address. These compatibility fields are never serialized.
+            let host = address.get(flotilla_address::Kind::Host).unwrap_or_default();
+            if let Some(spec) = &mut stored.host_direct {
+                spec.host_ref = host.into();
+            }
+            if let Some(spec) = &mut stored.docker {
+                spec.host_ref = host.into();
+            }
+        }
+        Ok(Self { provider_address: stored.provider_address, host_direct: stored.host_direct, docker: stored.docker })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostDirectEnvironmentSpec {
+    /// ADR 0047: decode legacy host placement for one roll after #3521.
+    #[serde(default, skip_serializing)]
     pub host_ref: String,
     pub repo_default_dir: String,
 }
@@ -43,6 +157,8 @@ pub struct HostDirectEnvironmentSpec {
 // this type's lenient decoding; ADR 0047: no shim to remove, but keep this
 // type lenient until one roll after ADR 0062 images land.
 pub struct DockerEnvironmentSpec {
+    /// ADR 0047: decode legacy host placement for one roll after #3521.
+    #[serde(default, skip_serializing)]
     pub host_ref: String,
     pub image: String,
     /// The per-identity ImageBuild that realises `image`.
@@ -381,6 +497,75 @@ mod observation_tests {
             if last.is_some() {
                 assert_eq!(evidence.memory_observed_at.as_deref(), Some("sample time"));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod provider_address_tests {
+    use super::*;
+    use flotilla_address::{Address, Kind};
+    use hegel::generators as gs;
+
+    // ADR 0058: the explicit address owns provider selection even if legacy
+    // host fields disagree. New writes contain only that address and inputs.
+    #[hegel::test]
+    fn explicit_provider_address_owns_placement(tc: hegel::TestCase) {
+        // Both place classes, arbitrary escaped/case-sensitive identifiers,
+        // both legacy input shapes, and conflicting legacy host identities.
+        let place = tc.draw(gs::text().alphabet("aZ09 /:%é").min_size(1).max_size(24));
+        let instance = tc.draw(gs::text().alphabet("aZ09 /:%é").min_size(1).max_size(24));
+        let account = tc.draw(gs::booleans());
+        let direct = tc.draw(gs::booleans());
+        let address = Address::root(if account { Kind::Account } else { Kind::Host }, &place)
+            .and_then(|place| place.child(Kind::Provider, &instance))
+            .expect("qualified address");
+        let mut value = serde_json::json!({"provider_address": address.to_string()});
+        value[if direct { "host_direct" } else { "docker" }] = if direct {
+            serde_json::json!({"host_ref":"obsolete-host", "repo_default_dir":"/workspace"})
+        } else {
+            serde_json::json!({"host_ref":"obsolete-host", "image":"image"})
+        };
+        let spec: EnvironmentSpec = serde_json::from_value(value).expect("decode explicit address");
+        assert_eq!(spec.resolved_provider_address(Some("obsolete-instance")).expect("resolve"), Some(address.clone()));
+        assert_eq!(spec.host_ref(), (!account).then_some(place.as_str()));
+        let encoded = serde_json::to_value(&spec).expect("encode");
+        assert_eq!(encoded["provider_address"], address.to_string());
+        assert!(encoded[if direct { "host_direct" } else { "docker" }].get("host_ref").is_none());
+        let decoded: EnvironmentSpec = serde_json::from_value(encoded).expect("read new shape");
+        assert_eq!(decoded, spec);
+    }
+
+    // ADR 0047: preceding-generation host fields still decode, and the next
+    // write retires them in favour of an address without losing the place.
+    #[hegel::test]
+    fn legacy_host_inputs_write_only_provider_address(tc: hegel::TestCase) {
+        let host = tc.draw(gs::text().alphabet("aZ09 /:%é").min_size(1).max_size(24));
+        let direct = tc.draw(gs::booleans());
+        let value = if direct {
+            serde_json::json!({"host_direct":{"host_ref":host,"repo_default_dir":"/work"}})
+        } else {
+            serde_json::json!({"docker":{"host_ref":host,"image":"image"}})
+        };
+        let spec: EnvironmentSpec = serde_json::from_value(value).expect("legacy input");
+        let encoded = serde_json::to_value(&spec).expect("canonical write");
+        let address: Address = serde_json::from_value(encoded["provider_address"].clone()).expect("address written");
+        assert_eq!(address.get(Kind::Host), Some(host.as_str()));
+        assert_eq!(address.name(), if direct { "host-direct" } else { "docker" });
+        assert!(encoded[if direct { "host_direct" } else { "docker" }].get("host_ref").is_none());
+    }
+
+    // Invalid explicit addresses must never be replaced by the legacy host.
+    #[test]
+    fn invalid_explicit_provider_address_fails_closed() {
+        for address in ["", "host:h", "host:h/provider:", "project:p", "usage:p/account:a/provider:i", "host:h/provider:i/provider:j"] {
+            assert!(
+                serde_json::from_value::<EnvironmentSpec>(serde_json::json!({
+                    "provider_address": address, "host_direct":{"host_ref":"fallback", "repo_default_dir":"/work"}
+                }))
+                .is_err(),
+                "invalid explicit address {address:?}"
+            );
         }
     }
 }

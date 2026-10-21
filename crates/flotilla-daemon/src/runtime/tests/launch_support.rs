@@ -38,6 +38,7 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
             .create(
                 &empty_meta(env_id.as_str()),
                 &EnvironmentSpec {
+                    provider_address: None,
                     host_direct: None,
                     docker: Some(flotilla_resources::DockerEnvironmentSpec {
                         image_build_ref: None,

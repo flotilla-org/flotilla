@@ -18,7 +18,7 @@ use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_protocol::ConfiguredResourceLimits;
 use flotilla_provisioning::reconcilers::{
     checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler,
-    CloneRuntime, DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, PreparedCheckout,
+    CloneRuntime, EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime, PreparedCheckout,
 };
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone,
@@ -42,18 +42,24 @@ struct FakeDockerRuntime {
 }
 
 #[async_trait]
-impl DockerEnvironmentRuntime for FakeDockerRuntime {
-    async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
-        Ok(DockerProvisioning {
+impl EnvironmentRuntime for FakeDockerRuntime {
+    async fn provision_environment(
+        &self,
+        name: &str,
+        spec: &flotilla_resources::EnvironmentSpec,
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+        let spec = spec.docker.as_ref().expect("Docker scenario input");
+
+        Ok(EnvironmentProvisioning {
             configured_limits: Some(ConfiguredResourceLimits {
                 cpus: Some(4),
                 cpu_shares: None,
                 build_jobs: Some(4),
                 linker_threads: Some(4),
             }),
-            container_id: format!("container-{name}"),
-            image_ref: spec.image.clone(),
-            local_image_id: "sha256:test-image".to_string(),
+            backing_id: Some(format!("container-{name}")),
+            image_ref: Some(spec.image.clone()),
+            local_image_id: Some("sha256:test-image".to_string()),
             registry_digest: None,
         })
     }
@@ -557,6 +563,7 @@ async fn environment_controller_marks_docker_environment_ready() {
         .create(
             &controller_meta().name("docker-env").call(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: None,
@@ -776,6 +783,7 @@ async fn vessel_controller_finalizer_deletes_vessel_owned_children_but_preserves
                 .labels([(VESSEL_REF_LABEL.to_string(), "workspace-delete".to_string())].into_iter().collect())
                 .call(),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec {
                     host_ref: "01HXYZ".to_string(),
                     repo_default_dir: "/Users/alice/dev/flotilla-repos".to_string(),

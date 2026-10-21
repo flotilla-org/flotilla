@@ -152,6 +152,7 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
         .create(
             &empty_meta_with_labels("quartermaster-work", BTreeMap::from([(CONVOY_LABEL.to_string(), "quartermaster".to_string())])),
             &flotilla_resources::EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
                     image_build_ref: None,
@@ -224,7 +225,7 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
 #[tokio::test]
 async fn fresh_daemon_readopts_running_environment_from_shared_store_and_backing() {
     for (instance, extra_provider, succeeds) in
-        [(None, false, true), (Some("docker"), true, true), (Some("absent"), false, false), (None, true, false)]
+        [(None, false, true), (Some("docker"), true, true), (Some("absent"), false, false), (None, true, true)]
     {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
@@ -257,6 +258,11 @@ async fn fresh_daemon_readopts_running_environment_from_shared_store_and_backing
                 .metadata
                 .labels
                 .insert(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.into());
+            environment.spec.provider_address = Some(
+                flotilla_address::Address::root(flotilla_address::Kind::Host, environment.spec.host_ref().expect("host"))
+                    .and_then(|place| place.child(flotilla_address::Kind::Provider, instance))
+                    .expect("address"),
+            );
             api.update(&InputMeta::from(&environment.metadata), &environment.metadata.resource_version, &environment.spec)
                 .await
                 .expect("bind instance");
@@ -295,7 +301,7 @@ async fn fresh_daemon_readopts_running_environment_from_shared_store_and_backing
 
         let result = reconcile_provisioned_environments(&state, NAMESPACE).await;
         if !succeeds {
-            assert!(result.expect_err("missing or ambiguous instance must not adopt").contains("unavailable or ambiguous"));
+            assert!(result.expect_err("missing or ambiguous instance must not adopt").contains("unavailable"));
             assert!(restarted.environment_registry_for_environment(&env_id).is_none());
             continue;
         }
@@ -409,6 +415,7 @@ async fn failed_environment_readoption_does_not_block_a_live_sibling() {
         .create(
             &empty_meta(orphaned_id.as_str()),
             &EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
                     image_build_ref: None,

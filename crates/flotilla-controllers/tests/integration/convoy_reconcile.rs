@@ -30,7 +30,7 @@ use flotilla_store::{
 
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
-use flotilla_provisioning::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler};
+use flotilla_provisioning::reconcilers::{EnvironmentReconciler, EnvironmentRuntime};
 use flotilla_store_testkit::fixtures as common;
 
 use crate::common::cr_name;
@@ -2864,8 +2864,12 @@ async fn running_task_with_failed_workspace_marks_task_failed() {
 // The container runtime boundary injects the same failure returned by skill staging.
 struct FailedSkillStaging;
 #[async_trait]
-impl DockerEnvironmentRuntime for FailedSkillStaging {
-    async fn provision(&self, _: &str, _: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+impl EnvironmentRuntime for FailedSkillStaging {
+    async fn provision_environment(
+        &self,
+        _: &str,
+        _spec: &flotilla_resources::EnvironmentSpec,
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
         Err("skill staging: pinned source unavailable".into())
     }
     async fn destroy(&self, _: &str, _: &str) -> Result<(), String> {
@@ -2881,6 +2885,7 @@ async fn skill_failure_vessel(convoy: &flotilla_resources::ResourceObject<Convoy
         .create(
             &InputMeta::builder().name("failed-skills".into()).build(),
             &flotilla_resources::EnvironmentSpec {
+                provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
                     host_ref: "host".into(),

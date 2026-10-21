@@ -86,6 +86,7 @@ fn providers() -> Vec<(Arc<dyn EnvironmentProvider>, flotilla_resources::Environ
         (
             Arc::new(host_direct::HostDirectEnvironmentProvider::new(Arc::new(DockerEngine::default()), Default::default())),
             flotilla_resources::EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/".into() }),
                 docker: None,
             },

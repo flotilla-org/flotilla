@@ -54,6 +54,7 @@ async fn request(
         url::form_urlencoded::parse(query.as_deref().unwrap_or_default().as_bytes()).into_owned().collect();
     let kind = match path["plural"].as_str() {
         "convoys" => ResourceKind::of::<Convoy>(),
+        "environments" => ResourceKind::of::<Environment>(),
         "demands" => ResourceKind::of::<Demand>(),
         "regards" => ResourceKind::of::<Regard>(),
         other => panic!("unexpected fixture resource {other}"),
@@ -854,4 +855,48 @@ async fn relay_deletions_are_sorted_and_disjoint_from_live_rows(#[case] adapter:
         let ResourceProvenance::Replica { origin_root, .. } = row.provenance else { panic!("replica provenance") };
         assert!(!identities.contains(&(origin_root.to_string(), row.object.metadata.name)), "live identities cannot also be fenced");
     }
+}
+
+// ADR 0047/0058: old records can bind their instance only in metadata. Every
+// typed read/write adapter must preserve that binding and converge after one
+// canonical write; equality of canonical specs must not cause update loops.
+#[rstest::rstest]
+#[case("memory")]
+#[case("sqlite")]
+#[case("http")]
+#[tokio::test]
+async fn legacy_environment_instance_survives_read_write_and_noop(#[case] adapter: &str, #[values(false, true)] direct: bool) {
+    if cfg!(feature = "skip-no-sandbox-tests") && adapter == "http" {
+        return;
+    }
+    let (backend, _server) = backend(adapter).await;
+    let meta = InputMeta::builder()
+        .name("legacy-environment".into())
+        .labels(BTreeMap::from([("flotilla.work/environment-provider-instance".into(), "custom-instance".into())]))
+        .build();
+    let legacy = if direct {
+        json!({"host_direct":{"host_ref":"home", "repo_default_dir":"/work"}})
+    } else {
+        json!({"docker":{"host_ref":"home", "image":"image"}})
+    };
+    // Raw seed models the preceding generation's stored bytes, not a new author.
+    backend.store().create_raw(ResourceKind::of::<Environment>(), "flotilla", &meta, &legacy).await.expect("old stored record");
+    let api = backend.using::<Environment>("flotilla");
+    let read = api.get(&meta.name).await.expect("typed legacy read");
+    let expected = "host:home/provider:custom-instance";
+    assert_eq!(read.spec.provider_address.as_ref().expect("metadata binding resolved").as_str(), expected);
+    let unresolved: EnvironmentSpec = serde_json::from_value(legacy.clone()).expect("old standalone spec");
+    assert!(read.matches_update(&meta, &unresolved).expect("canonical no-op comparison"));
+    let updated = api.update(&meta, &read.metadata.resource_version, &unresolved).await.expect("legacy write");
+    let raw = backend.store().get_raw(ResourceKind::of::<Environment>(), "flotilla", &meta.name).await.expect("canonical stored bytes");
+    assert_eq!(raw.spec["provider_address"], expected);
+    assert!(raw.spec[if direct { "host_direct" } else { "docker" }].get("host_ref").is_none());
+    let unchanged = api.update(&meta, &updated.metadata.resource_version, &unresolved).await.expect("repeat unresolved write");
+    assert_eq!(unchanged.metadata.resource_version, updated.metadata.resource_version, "canonical updates converge after one write");
+    let old_document = json!({"kind":"Environment", "metadata":{"labels":meta.labels}, "spec":legacy});
+    let current_document = json!({"kind":"Environment", "metadata":{"labels":meta.labels}, "spec":raw.spec});
+    assert_eq!(
+        flotilla_store::resource_document_spec_hash(&old_document).expect("old hash"),
+        flotilla_store::resource_document_spec_hash(&current_document).expect("current hash")
+    );
 }

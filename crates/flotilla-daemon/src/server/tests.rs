@@ -2301,6 +2301,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
         .create(
             &InputMeta::builder().name(environment_name.clone()).build(),
             &flotilla_resources::EnvironmentSpec {
+                provider_address: None,
                 host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
                     host_ref: remote_host_id.clone(),
                     repo_default_dir: "/workspace".to_string(),
