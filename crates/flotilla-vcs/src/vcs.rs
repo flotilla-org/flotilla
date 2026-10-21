@@ -669,6 +669,8 @@ impl FlotillaVcs {
         let preserve = |reason| Some(CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason });
         let current = match backend.current_branch().await {
             Err(error) => {
+                // Probe before the generic "not a git repository" fallback:
+                // a dangling gitdir pointer can produce that same error.
                 if self.orphaned_worktree_after_failure(target, &error).await? {
                     return Ok(preserve(CheckoutPreservationReason::OrphanedCheckout));
                 }
