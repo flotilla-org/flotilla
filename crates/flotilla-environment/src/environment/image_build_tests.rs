@@ -538,6 +538,10 @@ async fn transient_fetch_failures_survive_buildkit_summary_and_redaction() {
     let cases = [
         ("#8 1.2 E: Failed to fetch https://snapshot.ubuntu.com/pkg.deb 503 Service Unavailable", ImageBuildFailureClass::Infrastructure),
         ("#8 1.2 E: Failed to fetch https://snapshot.ubuntu.com/pkg.deb Connection timed out", ImageBuildFailureClass::Infrastructure),
+        ("#8 1.2 E: Failed to fetch https://snapshot.ubuntu.com:443/pkg.deb Could not connect to snapshot.ubuntu.com:443 (185.1.2.3), connection timed out [IP: 185.1.2.3 443]", ImageBuildFailureClass::Infrastructure),
+        ("#8 1.2 E: Failed to fetch https://mirror-404.example.com/foo_404.deb Connection timed out [IP: 1.2.3.4 443]", ImageBuildFailureClass::Infrastructure),
+        ("#8 1.2 curl: (22) The requested URL returned error: 600", ImageBuildFailureClass::Recipe),
+        ("#8 1.2 curl: (22) Unknown HTTP error", ImageBuildFailureClass::Recipe),
         ("#8 1.2 W: Failed to fetch https://snapshot.ubuntu.com/index 503 Service Unavailable", ImageBuildFailureClass::Infrastructure),
         ("#8 1.2 curl: (22) The requested URL returned error: 429", ImageBuildFailureClass::Infrastructure),
         ("#8 1.2 curl: (22) The requested URL returned error: 502", ImageBuildFailureClass::Infrastructure),
@@ -569,6 +573,16 @@ async fn transient_fetch_failures_survive_buildkit_summary_and_redaction() {
     }
 }
 
+// An apt timeout remains transient regardless of ports or HTTP-looking
+// digits in its URL and diagnostic. These are not HTTP response statuses.
+#[hegel::test]
+fn apt_timeout_ports_do_not_become_http_status(tc: hegel::TestCase) {
+    let port = tc.draw(gs::integers::<u16>().min_value(1).max_value(u16::MAX));
+    let digits = tc.draw(gs::integers::<u16>().min_value(400).max_value(599));
+    let output = format!("#8 1.2 E: Failed to fetch https://mirror-{digits}.example.com/foo_{digits}.deb Could not connect to mirror:{port} (1.2.3.4), connection timed out [IP: 1.2.3.4 {port}]\nERROR: process did not complete successfully: exit code: 100");
+    assert_eq!(super::docker_image::classify_build_failure(Some(1), &output), ImageBuildFailureClass::Infrastructure);
+}
+
 // HTTP 429 and every 5xx are transient for apt/curl, independent of BuildKit's
 // progress prefix and repeated diagnostics. Other 4xx remain recipe errors.
 #[hegel::test]
@@ -582,7 +596,11 @@ fn fetch_http_status_controls_retry_class(tc: hegel::TestCase) {
     } else {
         format!("E: Failed to fetch https://example.org/pkg.deb {status} response")
     };
-    let output = format!("{progress}{diagnostic}\n{progress}{diagnostic}\nERROR: process did not complete successfully: exit code: 100");
+    // Ports and IP annotations must never become HTTP status evidence.
+    let port = tc.draw(gs::integers::<u16>().min_value(1).max_value(u16::MAX));
+    let output = format!(
+        "{progress}{diagnostic} [IP: 1.2.3.4 {port}]\n{progress}{diagnostic}\nERROR: process did not complete successfully: exit code: 100"
+    );
     let expected =
         if status == 429 || (500..600).contains(&status) { ImageBuildFailureClass::Infrastructure } else { ImageBuildFailureClass::Recipe };
     assert_eq!(super::docker_image::classify_build_failure(Some(1), &output), expected, "{output}");

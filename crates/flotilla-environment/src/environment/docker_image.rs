@@ -654,21 +654,24 @@ fn transient_fetch_failure(line: &str) -> bool {
             Some(diagnostic.trim_start())
         })
         .unwrap_or(line);
-    let apt = line.starts_with("e: failed to fetch ") || line.starts_with("w: failed to fetch ");
-    let curl_http = line.starts_with("curl: (22)");
-    if apt || curl_http {
-        let status = line
-            .split_whitespace()
-            .find_map(|word| word.trim_matches(|c: char| !c.is_ascii_digit()).parse::<u16>().ok().filter(|code| (400..600).contains(code)));
-        // Missing packages and authorization errors remain recipe failures.
-        // An apt fetch failure without an HTTP status can be DNS/TLS/timeout.
-        return status.map_or(apt, |code| code == 429 || code >= 500);
+    if let Some(fetch) = line.strip_prefix("e: failed to fetch ").or_else(|| line.strip_prefix("w: failed to fetch ")) {
+        // apt prints URL, then response code and reason. Numbers in the URL,
+        // connection diagnostic or [IP: address port] annotation are not codes.
+        let status = fetch.split_whitespace().nth(1).and_then(|word| word.parse::<u16>().ok());
+        // Without a response code an apt fetch can have failed in DNS/TLS or
+        // timed out. Explicit non-retryable statuses remain recipe failures.
+        return status.is_none_or(|code| code == 429 || (500..600).contains(&code));
+    }
+    if let Some(error) = line.strip_prefix("curl: (22) ") {
+        let status = error.split_once("returned error:").and_then(|(_, code)| code.split_whitespace().next()?.parse::<u16>().ok());
+        // curl (22) without a recognized retryable HTTP status stays Recipe.
+        return status.is_some_and(|code| code == 429 || (500..600).contains(&code));
     }
     line.starts_with("curl: (7)") || line.starts_with("curl: (28)")
 }
 
 pub fn classify_build_failure(exit_code: Option<i32>, reason: &str) -> ImageBuildFailureClass {
-    if reason.to_ascii_lowercase().lines().any(transient_fetch_failure) {
+    if reason.lines().any(|line| transient_fetch_failure(&line.to_ascii_lowercase())) {
         return ImageBuildFailureClass::Infrastructure;
     }
     let reason = failure_summary(reason, exit_code).to_ascii_lowercase();
