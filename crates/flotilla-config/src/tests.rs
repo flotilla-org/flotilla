@@ -739,3 +739,21 @@ fn primitives_switch_defaults_off_and_requires_the_dummy_fleet() {
     assert_eq!(on.primitives(), Ok(Some(&PrimitivesConfig::default())));
     assert!(toml::from_str::<DaemonConfig>("[primitives]\nconvoy = true\n").is_err(), "only Message moves for now");
 }
+
+// Unknown [http] keys must fail through the file-loading API and name the key.
+// No [http] field has been retired; the existing default/listen tests cover N→N+1.
+#[hegel::test]
+fn http_listener_unknown_fields_fail_to_load(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    // Misspellings, unrelated keys, and short/long names, with or without a valid listen.
+    let length = tc.draw(gs::integers::<usize>().min_value(1).max_value(64));
+    let typo = tc.draw(gs::booleans());
+    let valid_listen = tc.draw(gs::booleans());
+    let key = if typo { "listn".to_string() } else { "x".repeat(length) };
+    let listen = if valid_listen { "listen = \"127.0.0.1:7878\"\n" } else { "" };
+    let dir = tempdir().expect("config directory");
+    std::fs::write(dir.path().join("daemon.toml"), format!("[http]\n{listen}{key} = \"127.0.0.1:7878\"\n")).expect("write config");
+    let error = ConfigStore::with_base(dir.path()).load_daemon_config().expect_err("unknown key");
+    assert!(error.contains("unknown field"), "{error}");
+    assert!(error.contains(&key), "{error}");
+}
