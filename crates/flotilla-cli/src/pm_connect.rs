@@ -198,6 +198,19 @@ impl Default for ConnectorState {
     }
 }
 
+// Full snapshots replace membership; keyed updaters skip unchanged values.
+// Retaining wire order also preserves last-row-wins for duplicate snapshot keys.
+fn snapshot_updates<K: Eq + std::hash::Hash + Clone, R: Clone>(
+    held: &HashMap<K, R>,
+    rows: &[R],
+    key: impl Fn(&R) -> K,
+) -> Vec<(K, Option<R>)> {
+    let retained: HashSet<_> = rows.iter().map(&key).collect();
+    let mut updates: Vec<_> = held.keys().filter(|key| !retained.contains(*key)).map(|key| (key.clone(), None)).collect();
+    updates.extend(rows.iter().map(|row| (key(row), Some(row.clone()))));
+    updates
+}
+
 impl ConnectorState {
     /// Apply a resource list/watch envelope, including replicated records.
     pub fn apply_resource_records(&mut self, envelope: &flotilla_protocol::ResourceReadEnvelope) -> Result<(), String> {
@@ -234,57 +247,32 @@ impl ConnectorState {
         }
         match &set.rows {
             Rows::Convoys { scope: None, rows } => {
-                let retained: HashSet<_> = rows.iter().map(|row| &row.resource).collect();
-                let removed: Vec<_> = self.convoys.keys().filter(|key| !retained.contains(key)).cloned().collect();
-                for key in removed {
-                    self.update_convoy(key, None);
-                }
-                for row in rows {
-                    self.update_convoy(row.resource.clone(), Some(row.clone()));
+                for (key, row) in snapshot_updates(&self.convoys, rows, |row| row.resource.clone()) {
+                    self.update_convoy(key, row);
                 }
             }
             Rows::Convoys { scope: Some(_), .. } => return Applied::Ignored,
             Rows::Independents { scope: None, rows } => {
-                let retained: HashSet<_> = rows.iter().map(|row| &row.resource).collect();
-                let removed: Vec<_> = self.independents.keys().filter(|key| !retained.contains(key)).cloned().collect();
-                for key in removed {
-                    self.update_independent(key, None);
-                }
-                for row in rows {
-                    self.update_independent(row.resource.clone(), Some(row.clone()));
+                for (key, row) in snapshot_updates(&self.independents, rows, |row| row.resource.clone()) {
+                    self.update_independent(key, row);
                 }
             }
             Rows::Independents { scope: Some(_), .. } => return Applied::Ignored,
             Rows::StandingRoles { scope: None, rows } => {
-                let retained: HashSet<_> = rows.iter().map(|row| &row.resource).collect();
-                let removed: Vec<_> = self.standing_roles.keys().filter(|key| !retained.contains(key)).cloned().collect();
-                for key in removed {
-                    self.update_role(key, None);
-                }
-                for row in rows {
-                    self.update_role(row.resource.clone(), Some(row.clone()));
+                for (key, row) in snapshot_updates(&self.standing_roles, rows, |row| row.resource.clone()) {
+                    self.update_role(key, row);
                 }
             }
             Rows::StandingRoles { scope: Some(_), .. } => return Applied::Ignored,
             Rows::ProjectRepositories { scope: None, rows } => {
-                let retained: HashSet<_> = rows.iter().map(|row| &row.resource).collect();
-                let removed: Vec<_> = self.project_repositories.keys().filter(|key| !retained.contains(key)).cloned().collect();
-                for key in removed {
-                    self.update_membership(key, None);
-                }
-                for row in rows {
-                    self.update_membership(row.resource.clone(), Some(row.clone()));
+                for (key, row) in snapshot_updates(&self.project_repositories, rows, |row| row.resource.clone()) {
+                    self.update_membership(key, row);
                 }
             }
             Rows::ProjectRepositories { scope: Some(_), .. } => return Applied::Ignored,
             Rows::Awareness { rows, .. } => {
-                let retained: HashSet<_> = rows.iter().map(|row| &row.id).collect();
-                let removed: Vec<_> = self.awareness.keys().filter(|key| !retained.contains(key)).cloned().collect();
-                for key in removed {
-                    self.update_awareness(key, None);
-                }
-                for row in rows {
-                    self.update_awareness(row.id.clone(), Some(row.clone()));
+                for (key, row) in snapshot_updates(&self.awareness, rows, |row| row.id.clone()) {
+                    self.update_awareness(key, row);
                 }
             }
             Rows::DispatchReady { .. } | Rows::Issues { .. } | Rows::Checkouts { .. } => {
@@ -402,13 +390,7 @@ impl ConnectorState {
             self.pending_namespaces.insert(key.namespace.clone());
         }
         let node = projection::Node::Convoy(key.clone());
-        self.projection.change(
-            node.clone(),
-            row.as_ref().map(|row| {
-                let _ = row;
-                projection::convoy_links(row)
-            }),
-        );
+        self.projection.change(node.clone(), row.as_ref().map(projection::convoy_links));
         self.projection.expire_at(
             node.clone(),
             row.as_ref()
@@ -432,13 +414,7 @@ impl ConnectorState {
             return;
         }
         let node = projection::Node::Independent(key.clone());
-        self.projection.change(
-            node.clone(),
-            row.as_ref().map(|row| {
-                let _ = row;
-                Vec::new()
-            }),
-        );
+        self.projection.change(node.clone(), row.as_ref().map(|_| Vec::new()));
         match row {
             Some(row) => {
                 self.independents.insert(key, row);
@@ -459,10 +435,7 @@ impl ConnectorState {
         let node = projection::Node::Role(key.clone());
         self.projection.change(
             node.clone(),
-            row.as_ref().map(|row| {
-                let _ = row;
-                vec![projection::Dependency::Role(row.resource.namespace.clone(), row.resource.name.clone())]
-            }),
+            row.as_ref().map(|row| vec![projection::Dependency::Role(row.resource.namespace.clone(), row.resource.name.clone())]),
         );
         match row {
             Some(row) => {
@@ -482,13 +455,7 @@ impl ConnectorState {
             self.pending_namespaces.insert(key.namespace.clone());
         }
         let node = projection::Node::Membership(key.clone());
-        self.projection.change(
-            node.clone(),
-            row.as_ref().map(|row| {
-                let _ = row;
-                Vec::new()
-            }),
-        );
+        self.projection.change(node.clone(), row.as_ref().map(|_| Vec::new()));
         match row {
             Some(row) => {
                 self.project_repositories.insert(key, row);

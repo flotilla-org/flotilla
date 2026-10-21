@@ -179,6 +179,11 @@ impl Records {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn cached_source_count(&self) -> usize {
+        self.source_configuration.len()
+    }
+
     pub(super) fn forget_source(&mut self, source: &IssueSource) {
         self.source_configuration.remove(source);
     }

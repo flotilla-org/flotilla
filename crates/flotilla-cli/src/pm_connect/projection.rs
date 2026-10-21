@@ -40,6 +40,13 @@ impl Node {
         }
     }
 }
+// Exhaustive destructuring makes adding any ResourceRef field a compile error
+// here, so node ordering cannot silently omit a new identity component.
+fn resource_order(resource: &ResourceRef) -> (&str, &str, &str, &str, Option<&str>, Option<&str>) {
+    let ResourceRef { api_version, kind, namespace, name, host, subresource } = resource;
+    (api_version, kind, namespace, name, host.as_ref().map(|host| host.as_str()), subresource.as_deref())
+}
+
 impl Ord for Node {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         let rank = self.rank().cmp(&other.rank());
@@ -50,20 +57,12 @@ impl Ord for Node {
             (Self::Convoy(a), Self::Convoy(b))
             | (Self::Independent(a), Self::Independent(b))
             | (Self::Role(a), Self::Role(b))
-            | (Self::Membership(a), Self::Membership(b)) => {
-                (&a.api_version, &a.kind, &a.namespace, &a.name, a.host.as_ref().map(|host| host.as_str()), &a.subresource).cmp(&(
-                    &b.api_version,
-                    &b.kind,
-                    &b.namespace,
-                    &b.name,
-                    b.host.as_ref().map(|host| host.as_str()),
-                    &b.subresource,
-                ))
-            }
+            | (Self::Membership(a), Self::Membership(b)) => resource_order(a).cmp(&resource_order(b)),
             (Self::Record(a), Self::Record(b)) => a.cmp(b),
             (Self::Entry(a, b), Self::Entry(c, d)) => (a, b).cmp(&(c, d)),
             (Self::Header(a), Self::Header(b)) => a.cmp(b),
-            _ => std::cmp::Ordering::Equal,
+            (Self::Configuration, Self::Configuration) => std::cmp::Ordering::Equal,
+            _ => unreachable!("different node variants must have distinct ranks"),
         }
     }
 }
@@ -420,4 +419,45 @@ pub(super) fn convoy_links(row: &flotilla_protocol::result_set::ConvoyRow) -> Ve
     }
     links.extend(row.subjects.iter().map(|entry| Dependency::Subject(entry.subject.clone())));
     links
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Node ordering is a map identity: comparison may be equal only for exactly
+    // equal variants and every ResourceRef identity field participates.
+    #[test]
+    fn ordering_preserves_all_node_identity_fields() {
+        let base = ResourceRef::new("v1", "Convoy", "dev", "name");
+        let mut refs = vec![base.clone()];
+        for field in 0..6 {
+            let mut row = base.clone();
+            match field {
+                0 => row.api_version = "v2".into(),
+                1 => row.kind = "Other".into(),
+                2 => row.namespace = "other".into(),
+                3 => row.name = "other".into(),
+                4 => row.host = Some(flotilla_protocol::HostName::new("host")),
+                5 => row.subresource = Some("child".into()),
+                _ => unreachable!(),
+            }
+            refs.push(row);
+        }
+        let mut nodes = vec![
+            Node::Configuration,
+            Node::Record(("issues".into(), "dev".into(), "issue".into(), "root".into())),
+            Node::Entry("parent".into(), "entry".into()),
+            Node::Header("header".into()),
+        ];
+        for row in refs {
+            nodes.extend([Node::Convoy(row.clone()), Node::Independent(row.clone()), Node::Role(row.clone()), Node::Membership(row)]);
+        }
+        for left in &nodes {
+            for right in &nodes {
+                assert_eq!(left.cmp(right).is_eq(), left == right);
+                assert_eq!(left.cmp(right), right.cmp(left).reverse());
+            }
+        }
+    }
 }
