@@ -121,4 +121,4 @@ Later features are each filed when a consumer needs them:
 - **Attach, "the vessel's cleat server":** cleat is optional. Without it a shell comes from the kind natively or from the fallback runner.
 - **Egress, "TLS interception happens only for hosts where the proxy swaps credentials":** already replaced by ADR 0044's P4a, which decrypts all HTTPS under enforced egress.
 
-Everything else stands: the control API's trust rule, the hello as readiness, exec with no terminal, egress capture and the tested isolation invariant.
+Everything else stands: the control API's trust rule, the hello as readiness, exec with no terminal, and egress capture. The tested isolation invariant stands and grows: it also checks that the host end of each guest-to-host forward serves one vessel only.
