@@ -263,6 +263,8 @@ impl ForgeDefaultBranchResolver for GhForgeDefaultBranchResolver {
         let lookup = {
             let mut cache = self.cache.lock().expect("default branch cache lock");
             let now = tokio::time::Instant::now();
+            // A concurrent Arc drop can only retain an idle entry for one extra
+            // pruning pass. Removing the map's Arc never invalidates a caller's Arc.
             if cache.last_prune.is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(60)) {
                 cache.entries.retain(|_, entry| {
                     Arc::strong_count(entry) > 1
@@ -281,7 +283,7 @@ impl ForgeDefaultBranchResolver for GhForgeDefaultBranchResolver {
         }
         lookup.success = None;
         if let Some(retry_at) = lookup.retry_at.filter(|at| *at > Utc::now()) {
-            return Err(format!("github rate limited (budget=REST core, identity=host gh login, retry_at={retry_at})"));
+            return Err(format!("github rate limited (budget=REST core, identity=host gh login, retry_at={})", retry_at.to_rfc3339()));
         }
         lookup.retry_at = None;
         let endpoint = format!("repos/{}", forge.repository);
@@ -301,6 +303,8 @@ impl ForgeDefaultBranchResolver for GhForgeDefaultBranchResolver {
         if branch.is_empty() {
             return Ok(None);
         }
+        // Owner-ruled TTL: branch changes can lag six hours; a repository rename
+        // with a new service/repository key is a cache miss immediately.
         lookup.success = Some((tokio::time::Instant::now() + std::time::Duration::from_secs(6 * 60 * 60), branch.to_string()));
         Ok(Some(branch.to_string()))
     }
@@ -581,6 +585,7 @@ mod chained_default_branch_tests {
     struct DefaultBranchRunner {
         calls: std::sync::atomic::AtomicUsize,
         failures: std::sync::atomic::AtomicUsize,
+        error: Option<String>,
     }
     #[async_trait]
     impl CommandRunner for DefaultBranchRunner {
@@ -609,7 +614,7 @@ mod chained_default_branch_tests {
                 .try_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |left| left.checked_sub(1))
                 .is_ok()
             {
-                Err("temporary forge failure".into())
+                Err(self.error.clone().unwrap_or_else(|| "temporary forge failure".into()))
             } else {
                 Ok("main\n".into())
             }
@@ -619,7 +624,7 @@ mod chained_default_branch_tests {
         failures: usize,
     ) -> (Arc<DefaultBranchRunner>, flotilla_provisioning::reconcilers::RepositoryReconciler, ResourceObject<flotilla_resources::Repository>)
     {
-        let runner = Arc::new(DefaultBranchRunner { calls: Default::default(), failures: failures.into() });
+        let runner = Arc::new(DefaultBranchRunner { calls: Default::default(), failures: failures.into(), error: None });
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let spec = flotilla_resources::RepositorySpec::remote("https://github.com/org/repo.git").expect("spec");
         let repository = backend
@@ -663,6 +668,38 @@ mod chained_default_branch_tests {
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         reconciler.prepare(&repository).await.expect("refreshed");
         assert_eq!(runner.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // Pin both public producers: the host budget runner's reset_at refusal and
+    // the HTTP classifier's retry_at error must suppress the next prepare.
+    #[tokio::test]
+    async fn default_branch_honours_cooldowns_from_github_error_producers() {
+        use flotilla_forge_github::{
+            forge_budget::{BudgetedRunner, ForgeBudgets},
+            github::{rate_limit_error_from_response, rate_limit_reset},
+        };
+        use std::sync::atomic::Ordering;
+        let raw = "HTTP/2 429 Too Many Requests\r\nRetry-After: 600\r\n\r\n{\"message\":\"secondary rate limit\"}";
+        let producer = BudgetedRunner {
+            inner: Arc::new(DefaultBranchRunner { calls: 0.into(), failures: 1.into(), error: Some(raw.into()) }),
+            budgets: ForgeBudgets::default(),
+        };
+        let args = ["api", "repos/org/repo", "--jq", ".default_branch"];
+        producer.run("gh", &args, Path::new("/"), &ChannelLabel::Default).await.expect_err("learn cooldown");
+        let reset_error = producer.run("gh", &args, Path::new("/"), &ChannelLabel::Default).await.expect_err("budget producer");
+        let retry_error = rate_limit_error_from_response(raw, "REST core").expect("HTTP producer");
+        assert!(reset_error.contains("reset_at="));
+        assert!(retry_error.contains("retry_at="));
+        for error in [reset_error, retry_error] {
+            let expected_retry = rate_limit_reset(&error).expect("producer retry date");
+            let runner = Arc::new(DefaultBranchRunner { calls: 0.into(), failures: 2.into(), error: Some(error) });
+            let resolver = GhForgeDefaultBranchResolver::new(runner.clone());
+            let forge = ForgeIdentity { service_url: "https://github.com".into(), repository: "org/repo".into() };
+            resolver.default_branch(&forge).await.expect_err("first limit");
+            let cooldown = resolver.default_branch(&forge).await.expect_err("cooldown");
+            assert_eq!(rate_limit_reset(&cooldown), Some(expected_retry));
+            assert_eq!(runner.calls.load(Ordering::SeqCst), 1, "cooldown must avoid another command");
+        }
     }
 
     struct Answer(Result<Option<&'static str>, &'static str>);

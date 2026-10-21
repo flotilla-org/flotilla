@@ -171,15 +171,29 @@ impl BudgetAttempt<'_> {
     }
     fn emit(&self, identity: &str, budget: &str, raw: &str, outcome: &str) {
         let response = parse_gh_api_response(raw);
-        let document: serde_json::Value = serde_json::from_str(if response.status == 0 { raw } else { &response.body }).unwrap_or_default();
+        // REST/CLI bodies may be large; only GraphQL exposes a cost in JSON.
+        let graphql_cost = (budget == "GraphQL")
+            .then(|| {
+                serde_json::from_str::<serde_json::Value>(if response.status == 0 { raw } else { &response.body })
+                    .ok()
+                    .and_then(|document| document["data"]["rateLimit"]["cost"].as_u64())
+            })
+            .flatten();
         let charged_cost = match budget {
             "REST" => Some(u64::from(response.status != 304)),
-            "GraphQL" => document["data"]["rateLimit"]["cost"].as_u64(),
+            "GraphQL" => graphql_cost,
             _ => None,
+        };
+        let cost_basis = match (budget, response.status, charged_cost) {
+            ("REST", 0, _) => "attempt_estimate",
+            ("REST", 304, _) => "not_modified",
+            ("REST", _, _) => "http_response_estimate",
+            ("GraphQL", _, Some(_)) => "reported",
+            _ => "unreported",
         };
         tracing::info!(target: "flotilla::forge_call", caller = self.caller, identity, budget,
             command_kind = %self.command_kind, status = %if response.status == 0 { outcome.to_string() } else { response.status.to_string() },
-            charged_cost = %charged_cost.map(|cost| cost.to_string()).unwrap_or_else(|| "unknown".into()), not_modified = response.status == 304, "forge call");
+            charged_cost = %charged_cost.map(|cost| cost.to_string()).unwrap_or_else(|| "unknown".into()), cost_basis, not_modified = response.status == 304, "forge call");
     }
     fn finish(mut self, raw: &str, outcome: &str) {
         let key = self.key.take();
@@ -426,81 +440,6 @@ mod tests {
         assert_eq!(row.calls, 1);
         assert_eq!(row.unreported_calls, 1);
         assert_eq!(row.reported_cost, 0);
-    }
-
-    #[derive(Clone)]
-    struct LogWriter(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for LogWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("logs").extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    // Process boundary fake: return headers and costs without contacting GitHub.
-    struct TraceRunner;
-    #[async_trait]
-    impl CommandRunner for TraceRunner {
-        async fn run_output(
-            &self,
-            cmd: &str,
-            args: &[&str],
-            cwd: &Path,
-            label: &ChannelLabel,
-        ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
-            self.run(cmd, args, cwd, label).await.map(|stdout| flotilla_provider_runtime::CommandOutput {
-                stdout,
-                stderr: String::new(),
-                exit_code: Some(0),
-            })
-        }
-        async fn exists(&self, _: &str, _: &[&str]) -> bool {
-            true
-        }
-        async fn run(&self, _: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
-            Ok(if args.contains(&"graphql") {
-                "HTTP/2 200 OK\r\n\r\n{\"data\":{\"rateLimit\":{\"cost\":3}}}"
-            } else {
-                "HTTP/2 304 Not Modified\r\n\r\n"
-            }
-            .into())
-        }
-    }
-    // #3710: each subprocess attempt emits exactly one structured event and
-    // captures its named caller, with an explicit fallback outside a span.
-    #[test]
-    fn every_call_traces_caller_and_unspanned_calls_are_unattributed() {
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let writer = LogWriter(logs.clone());
-        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(move || writer.clone()).finish();
-        tracing::subscriber::with_default(subscriber, || {
-            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-            runtime.block_on(async {
-                let runner = BudgetedRunner { inner: Arc::new(TraceRunner), budgets: ForgeBudgets::default() };
-                {
-                    let span = tracing::info_span!("test_forge_caller");
-                    let _entered = span.enter();
-                    runner.run("gh", &["api", "graphql", "secret-token"], Path::new("/"), &ChannelLabel::Default).await.expect("call");
-                }
-                runner.run("gh", &["api", "repos/org/repo"], Path::new("/"), &ChannelLabel::Default).await.expect("call");
-            });
-        });
-        let logs = String::from_utf8(logs.lock().expect("logs").clone()).expect("UTF-8");
-        assert_eq!(logs.matches("forge call").count(), 2, "{logs}");
-        for field in [
-            "caller=\"test_forge_caller\"",
-            "caller=\"unattributed\"",
-            "identity=\"host gh login\"",
-            "budget=\"GraphQL\"",
-            "charged_cost=3",
-            "charged_cost=0",
-            "not_modified=true",
-        ] {
-            assert!(logs.contains(field), "missing {field}: {logs}");
-        }
-        assert!(!logs.contains("secret-token"));
     }
 
     // REST diagnostics conservatively count attempts, including HTTP failures

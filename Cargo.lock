@@ -2045,6 +2045,7 @@ dependencies = [
  "flotilla-engine-store",
  "flotilla-environment",
  "flotilla-executor",
+ "flotilla-forge-github",
  "flotilla-inbox",
  "flotilla-issue-tracker",
  "flotilla-load-driver",
@@ -2406,11 +2407,14 @@ dependencies = [
 name = "flotilla-forge-forgejo"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "dirs",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
  "flotilla-build-features-http",
+ "flotilla-build-features-logging",
  "flotilla-build-features-os",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
@@ -2419,12 +2423,14 @@ dependencies = [
  "flotilla-paths",
  "flotilla-provider-runtime",
  "flotilla-resources",
+ "http",
  "reqwest 0.13.2",
  "rigging-tls",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "urlencoding",
 ]
 

@@ -12,8 +12,9 @@ use flotilla_resources::{
     ResourceObject,
 };
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
-use flotilla_vcs::checkout_integration::inspect_checkout_integration;
-use flotilla_vcs::checkout_integration::{inspect_convoy_checkout_integration, ChangeRequestIntegrationInput};
+use flotilla_vcs::checkout_integration::{
+    inspect_checkout_integration, inspect_convoy_checkout_integration, ChangeRequestIntegrationInput,
+};
 use flotilla_vcs::vcs as core_vcs;
 use flotilla_vcs::vcs::CheckoutRegistration;
 use flotilla_vcs::vcs::Vcs;

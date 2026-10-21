@@ -316,10 +316,7 @@ impl crate::ports::CheckoutIntegrationInspector for FreshDeleteInspection {
         })
     }
 }
-// #3710: each manual Active-convoy delete forces one fresh checkout inspection,
-// including a second request inside the normal evidence freshness horizon.
-#[tokio::test]
-async fn manual_active_convoy_delete_inspects_checkout_once_per_request() {
+async fn active_delete_fixture() -> (Arc<CrewService>, ResourceBackend, tempfile::TempDir) {
     let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let mut convoy = convoys.get("crew").await.expect("convoy");
@@ -356,11 +353,65 @@ async fn manual_active_convoy_delete_inspects_checkout_once_per_request() {
         )
         .await
         .expect("stale checkout");
-    assert!(crew.teardown("flotilla", "crew", false).await.expect_err("stale").contains("stale"));
+    (crew, backend, _config)
+}
+
+// Process/VCS boundary stand-in: a transient failure must not publish fallback evidence.
+struct FailedDeleteInspection;
+#[async_trait::async_trait]
+impl crate::ports::CheckoutIntegrationInspector for FailedDeleteInspection {
+    async fn inspect(
+        &self,
+        _: &ResourceObject<ResourceConvoy>,
+        _: &ResourceObject<ResourceCheckout>,
+    ) -> Result<CheckoutIntegrationStatus, String> {
+        Err("VCS temporarily unavailable".into())
+    }
+}
+// An Active checkout requires a wired inspector; transient inspection failure
+// refuses deletion and leaves its prior observation untouched.
+#[tokio::test]
+async fn active_teardown_refuses_unset_or_failing_inspector() {
+    for configured in [false, true] {
+        let (crew, backend, _config) = active_delete_fixture().await;
+        if configured {
+            crew.set_checkout_inspector(Arc::new(FailedDeleteInspection));
+        }
+        let error = crew.teardown("flotilla", "crew", false).await.expect_err("inspection is required");
+        assert!(
+            error.contains(if configured {
+                "fresh inspection failed for checkout checkout: VCS temporarily unavailable"
+            } else {
+                "inspector not configured"
+            }),
+            "{error}"
+        );
+        let checkout = backend.using::<ResourceCheckout>("flotilla").get("checkout").await.expect("checkout preserved");
+        assert_eq!(checkout.status.expect("status").integration, CheckoutIntegrationStatus::default());
+        assert!(checkout.metadata.deletion_timestamp.is_none());
+    }
+}
+
+// #3710: each manual Active-convoy delete forces one fresh checkout inspection,
+// including a second request inside the normal evidence freshness horizon.
+#[tokio::test]
+async fn manual_active_convoy_delete_inspects_checkout_once_per_request() {
+    let (crew, backend, _config) = active_delete_fixture().await;
+    assert!(crew.teardown("flotilla", "crew", false).await.expect_err("missing inspector").contains("inspector not configured"));
     let inspector = Arc::new(FreshDeleteInspection(0.into()));
     crew.set_checkout_inspector(inspector.clone());
     crew.teardown("flotilla", "crew", false).await.expect("fresh delete evidence");
     crew.teardown("flotilla", "crew", false).await.expect("second explicit inspection");
     assert_eq!(inspector.0.load(std::sync::atomic::Ordering::SeqCst), 2);
-    assert!(checkouts.get("checkout").await.expect("checkout").status.expect("status").integration.landed.observed_at.is_some());
+    assert!(backend
+        .using::<ResourceCheckout>("flotilla")
+        .get("checkout")
+        .await
+        .expect("checkout")
+        .status
+        .expect("status")
+        .integration
+        .landed
+        .observed_at
+        .is_some());
 }
