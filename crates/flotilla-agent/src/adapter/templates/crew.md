@@ -41,7 +41,9 @@ Use `flotilla artifact put --kind <kind> --about <subject> --summary key=value <
 - **Alternative:** the alternative you considered
 - **If asking were free:** what you would have asked
 
-Optionally append a `### Friction` section after all numbered decisions to record environment friction: misleading tools, missing commands, slow or flaky checks, and brief silences or conflicts. This is input for retrospectives and session-log analysis; omit it when there is nothing to report. See `docs/agents/decision-ledger.md` for the ledger template and guidance.
+Optionally append a `### Friction` section after all numbered decisions to record environment friction: misleading tools, missing commands, slow or flaky checks, and brief silences or conflicts. This is input for retrospectives and session-log analysis; omit it when there is nothing to report. The ledger template and guidance are included below.
+
+{{ decision_ledger_guidance }}
 
 For repository assignments, take the final shepherd snapshot before submitting this artifact. If checks are still pending when you reach settlement, report the PR state and yield at the turn boundary; flotilla wakes you when checks settle, and you then take the clean final snapshot. Only after the final shepherd snapshot is clean (checks settled green, every review item answered, and no conflict), submit the ledger. For other assignments, submit it when the work is finished. Run `flotilla artifact put --kind decision-ledger <path>`; the daemon reads and validates the ledger artifact. Keep the file outside the repository. The ledger artifact keeps its promise. If new review feedback or failing checks arrive before your promises settle, return to shepherding and take a new clean final snapshot before resubmitting the ledger. Your part ends when every promise is kept or retracted.{% endif %}
 
