@@ -180,7 +180,11 @@ date>`, and layers that bundle independently versioned tools (`display-x11`,
   stock image has no CA bundle and the snapshot service is HTTPS-only, so the
   first `apt-get update` and the `ca-certificates` install skip TLS peer
   verification. apt still verifies the snapshot's signed `InRelease` and every
-  package hash; all later apt calls verify TLS.
+  package hash; all later apt calls verify TLS. Before bootstrap, the base
+  configures three apt retries and 30-second HTTP/HTTPS connection and read
+  timeouts, inherited by every layer. Transient apt/curl fetch diagnostics in
+  failed build steps use the build controller's infrastructure retry path;
+  package lookup errors and non-retryable HTTP 4xx remain recipe failures.
 - **rust**: rustup and the default toolchain (rustfmt, clippy,
   llvm-tools-preview and the `wasm32-unknown-unknown` target) live read-only
   under `/opt/flotilla/toolchains/rust`. Only the proxies are on `PATH`;

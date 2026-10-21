@@ -343,6 +343,22 @@ fn read_layer(directory: &Path) -> ImageLayerSpec {
     parse_layer_directory_with_executables(&files, &executable, ImageLayerSource::Stdlib, None).expect("stdlib layer parses")
 }
 
+// Glue: inherited apt policy is written before even the CA bootstrap fetch,
+// and the base's runtime probe checks the effective apt configuration.
+#[test]
+fn stdlib_base_bounds_apt_fetches_before_bootstrap() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stdlib/image-layers");
+    let base = read_layer(&root.join("base-ubuntu-24.04"));
+    let generated = generate_build(std::slice::from_ref(&base), "amd64").expect("base generates");
+    let first_fetch = generated.dockerfile.find("    apt-get ").expect("bootstrap apt");
+    for setting in ["Acquire::Retries", "Acquire::http::Timeout", "Acquire::https::Timeout"] {
+        let value = if setting == "Acquire::Retries" { "3" } else { "30" };
+        let declaration = format!("{setting} \"{value}\";");
+        assert!(generated.dockerfile.find(&declaration).expect("inherited apt policy") < first_fetch);
+        assert!(base.probe.contains(&format!("{setting}={value}")));
+    }
+}
+
 // The shipped stdlib layers (`stdlib/image-layers/` at the workspace root,
 // the same directories the daemon embeds) compose into one Dockerfile per
 // architecture: the

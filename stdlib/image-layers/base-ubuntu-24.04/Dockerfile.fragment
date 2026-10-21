@@ -14,7 +14,14 @@ ARG DEBIAN_FRONTEND=noninteractive
 # signature against the image's ubuntu-archive-keyring and every package
 # against the signed hashes, exactly as it does over the archive's plain-HTTP
 # default. Every later apt call, here and in other layers, verifies TLS.
+# Timeout bounds both connection establishment and stalled reads; retries
+# absorb brief archive outages. Write this before the CA bootstrap as well.
 RUN set -eu; \
+    printf '%s\n' \
+        'Acquire::Retries "3";' \
+        'Acquire::http::Timeout "30";' \
+        'Acquire::https::Timeout "30";' \
+        > /etc/apt/apt.conf.d/80flotilla-network; \
     rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*; \
     printf '%s\n' \
         'Types: deb' \
