@@ -238,8 +238,16 @@ impl ChangeRequestRefresher {
     /// Release only explicit unlink assertions. Missing convoys retain history.
     async fn release_unlinked_history(&self, namespace: &str) -> Result<(), String> {
         let records = self.inner.backend.using::<ChangeRequest>(namespace);
+        let inventory = records.list().await.map_err(|error| error.to_string())?;
+        if inventory.items.iter().all(|record| record.spec.subject_of.is_empty()) {
+            return Ok(());
+        }
         let forges = self.forges(namespace).await?;
-        for record in records.list().await.map_err(|error| error.to_string())?.items {
+        let convoys = self.inner.backend.including_replicas::<Convoy>(namespace).list().await.map_err(|e| e.to_string())?;
+        for record in inventory.items {
+            if record.spec.subject_of.is_empty() {
+                continue;
+            }
             let subject = match record.spec.address(&forges).and_then(|address| ChangeRequestKey::new(namespace, address)) {
                 Ok(subject) => subject,
                 Err(error) => {
@@ -250,9 +258,6 @@ impl ChangeRequestRefresher {
             let lock = self.subject_lock(&subject).await;
             let _guard = lock.lock().await;
             loop {
-                // Read under the same lock as history capture so a stale capture
-                // cannot reintroduce a link after its unlink has been processed.
-                let convoys = self.inner.backend.including_replicas::<Convoy>(namespace).list().await.map_err(|e| e.to_string())?;
                 let current = match records.get(&record.metadata.name).await {
                     Ok(current) => current,
                     Err(ResourceError::NotFound { .. }) => break,
@@ -273,14 +278,24 @@ impl ChangeRequestRefresher {
                     })
                 });
                 if spec == current.spec {
-                    self.collect_unheld_subject(&subject).await?;
+                    break;
+                }
+                let demanded = self.inner.active.lock().await.get(&subject).is_some_and(|refresh| !refresh.demands.is_empty());
+                if !demanded && spec.subject_of.is_empty() {
+                    // Delete before dropping the final history entry. A failed
+                    // deletion leaves that entry available for the next retry.
+                    let held_elsewhere = self.subject_held_elsewhere(&subject, &current.metadata.name).await?;
+                    records.delete(&current.metadata.name).await.map_err(|e| e.to_string())?;
+                    if !held_elsewhere {
+                        if let Some(refresh) = self.inner.active.lock().await.remove(&subject) {
+                            refresh.task.abort();
+                        }
+                        self.inner.observation_errors.lock().await.remove(&subject);
+                    }
                     break;
                 }
                 match records.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await {
-                    Ok(_) => {
-                        self.collect_unheld_subject(&subject).await?;
-                        break;
-                    }
+                    Ok(_) => break,
                     Err(ResourceError::Conflict { .. }) => continue,
                     Err(error) => return Err(error.to_string()),
                 }
@@ -289,24 +304,14 @@ impl ChangeRequestRefresher {
         Ok(())
     }
 
-    // Caller holds the subject lock. Recheck every local spelling before deleting
-    // so an alias's history can still hold the subject; failed deletion retries on
-    // the next reconciliation even though the unlink update already succeeded.
-    async fn collect_unheld_subject(&self, subject: &ChangeRequestKey) -> Result<(), String> {
-        let demanded = self.inner.active.lock().await.get(subject).is_some_and(|refresh| !refresh.demands.is_empty());
-        if demanded {
-            return Ok(());
-        }
+    // Check aliases before deletion so a read failure leaves retryable history.
+    // Unrelated history-less records are never deleted by unlink reconciliation.
+    async fn subject_held_elsewhere(&self, subject: &ChangeRequestKey, name: &str) -> Result<bool, String> {
         let records = self.inner.backend.using::<ChangeRequest>(subject.namespace()).list().await.map_err(|e| e.to_string())?;
-        if records.items.iter().any(|record| spec_names(&record.spec, subject) && !record.spec.subject_of.is_empty()) {
-            return Ok(());
-        }
-        self.collect_local_subject(subject).await.map_err(|e| e.to_string())?;
-        if let Some(refresh) = self.inner.active.lock().await.remove(subject) {
-            refresh.task.abort();
-        }
-        self.inner.observation_errors.lock().await.remove(subject);
-        Ok(())
+        Ok(records
+            .items
+            .iter()
+            .any(|record| record.metadata.name != name && spec_names(&record.spec, subject) && !record.spec.subject_of.is_empty()))
     }
 
     async fn subject_lock(&self, subject: &ChangeRequestKey) -> Arc<Mutex<()>> {
@@ -628,6 +633,7 @@ impl ChangeRequestRefresher {
     /// Capture links at admission, before a convoy can disappear. History is in
     /// the spec so ordinary forge status refreshes cannot erase it, and it follows
     /// the record's existing observation replication class.
+    // Tests can capture history without already holding demand admission's lock.
     #[cfg(test)]
     async fn record_convoy_history(&self, subject: &ChangeRequestKey) -> Result<(), String> {
         let lock = self.subject_lock(subject).await;
@@ -839,6 +845,7 @@ impl ChangeRequestRefresher {
                                 Ok(()) => {
                                     self.inner.active.lock().await.remove(&subject);
                                     self.inner.observation_errors.lock().await.remove(&subject);
+                                    // Returning ends this refresh task; it must not abort itself.
                                     return;
                                 }
                                 Err(error) => tracing::warn!(%error, "collect nonexistent retained change request failed"),
@@ -1535,6 +1542,102 @@ mod tests {
                 refresh.task.abort();
             }
         });
+    }
+
+    // An explicit-unlink pass must leave unrelated observations alone, regardless
+    // of their authority. Startup GC is a separate policy for history-less rows.
+    #[tokio::test]
+    async fn unlink_reconciliation_keeps_unrelated_historyless_records() {
+        for authority in ["node", "peer"] {
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let refresher = ChangeRequestRefresher::new(
+                "fleet".into(),
+                backend.clone(),
+                "node".into(),
+                Arc::new(UnavailableSource),
+                ChangeRequestRefreshCadence::default(),
+            );
+            let records = backend.using::<ChangeRequest>("ops");
+            records
+                .create(
+                    &InputMeta::builder().name("unrelated".into()).build(),
+                    &ChangeRequestSpec::builder()
+                        .service("github.com".into())
+                        .scope("org/repo".into())
+                        .number(42)
+                        .observing_authority(authority.into())
+                        .build(),
+                )
+                .await
+                .unwrap();
+            refresher.reconcile_convoy_demands("ops", &mut HashMap::new()).await.unwrap();
+            assert_eq!(records.get("unrelated").await.unwrap().spec.observing_authority, authority);
+        }
+    }
+
+    // Network boundary: pause a missing-PR response so a new demand can be
+    // admitted before collection. The demand must keep its record and diagnostics.
+    struct PausedMissingSource {
+        started: Notify,
+        proceed: Notify,
+    }
+    #[async_trait::async_trait]
+    impl ChangeRequestObservationSource for PausedMissingSource {
+        async fn observe(&self, _: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
+            self.started.notify_one();
+            self.proceed.notified().await;
+            Err(ObservationError::NotFound("missing".into()))
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn demand_arriving_during_missing_collection_preserves_observation() {
+        for collection_first in [false, true] {
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let source = Arc::new(PausedMissingSource { started: Notify::new(), proceed: Notify::new() });
+            let refresher = ChangeRequestRefresher::new(
+                "fleet".into(),
+                backend.clone(),
+                "node".into(),
+                source.clone(),
+                ChangeRequestRefreshCadence::default(),
+            );
+            let subject = ChangeRequestKey::new(
+                "ops",
+                flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).unwrap(),
+            )
+            .unwrap();
+            refresher.ensure_record(&subject, &subject.record_name()).await.unwrap();
+            refresher.start_retained(subject.clone()).await;
+            source.started.notified().await;
+            let demand = uuid::Uuid::new_v4();
+            if collection_first {
+                let lock = refresher.subject_lock(&subject).await;
+                let guard = lock.lock().await;
+                source.proceed.notify_one();
+                // The missing response queues cleanup on the subject lock.
+                for _ in 0..30 {
+                    tokio::task::yield_now().await;
+                }
+                let resumed = refresher.clone();
+                let demanded = subject.clone();
+                let admission = tokio::spawn(async move { resumed.demand(demand, demanded, None).await });
+                tokio::task::yield_now().await;
+                drop(guard);
+                admission.await.unwrap().unwrap();
+                // Cleanup ran first; admission must recreate and re-arm demand.
+                source.started.notified().await;
+            } else {
+                refresher.demand(demand, subject.clone(), None).await.unwrap();
+            }
+            source.proceed.notify_one();
+            for _ in 0..30 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(refresher.active_demands().await, 1);
+            assert!(backend.using::<ChangeRequest>("ops").get(&subject.record_name()).await.is_ok());
+            assert!(matches!(refresher.observation_error(&subject).await, Some(ObservationError::NotFound(_))));
+            refresher.release(demand).await;
+        }
     }
 
     // HTTP boundary: an invalid endpoint deterministically refuses backend I/O,

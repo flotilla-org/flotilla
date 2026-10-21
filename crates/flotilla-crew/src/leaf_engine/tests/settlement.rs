@@ -323,3 +323,94 @@ async fn stalled_merged_unclaimed_crew_resumes_with_open_promises() {
         }
     }
 }
+
+// #3651 operator recovery: an old retracted submission and refusal do not
+// restore settlement demand after explicit unlink, including after restart.
+// Another convoy's live subject still demands the very same PR.
+#[hegel::test]
+fn retracted_unlinked_submission_does_not_recreate_observation(tc: hegel::TestCase) {
+    use flotilla_resources::promises::{Promise, PromiseKind, PromiseSource, PromiseState, Submission};
+    use flotilla_resources::{ChangeRequestSpec, ChangeRequestSubjectHistory, SubjectDiscoverySource};
+    let other_holder = tc.draw(hegel::generators::booleans());
+    let reconciliations = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime");
+    runtime.block_on(async {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let convoys = backend.using::<Convoy>("flotilla");
+        let address = flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/rigging", 70, &[]).unwrap();
+        let subject = flotilla_resources::address::subject_for(&address).unwrap();
+        let created = convoys.create(&InputMeta::builder().name("mistaken-submission".into()).build(),
+            &ConvoySpec::builder().workflow_ref("single-agent".into()).role("coder".into()).build()).await.unwrap();
+        let workflow = flotilla_resources::single_agent_workflow_spec();
+        let mut status = ConvoyStatus {
+            phase: ConvoyPhase::Landing,
+            workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None, stall_nudges: workflow.stall_nudges, supervision: workflow.supervision,
+                exit: workflow.exit, turn_delivery: workflow.turn_delivery, vessels: workflow.vessels,
+            }),
+            crew_work: BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(),
+                CrewWorkState::builder().phase(CrewWorkPhase::Stalled).build())]))]),
+            ..Default::default()
+        };
+        // Previous-generation data allowed a submitted promise to be retracted.
+        // Retain its audit history rather than erasing the mistaken reference.
+        status.promises.insert("work".into(), BTreeMap::from([("coder".into(), vec![Promise {
+            id: "mistaken-pr".into(), vessel: "work".into(), role: "coder".into(), source: PromiseSource::Crew,
+            kind: PromiseKind::Pr, state: PromiseState::Retracted, retraction_reason: Some("incorrect PR number".into()),
+            submissions: vec![Submission { reference: "cr/github.com/flotilla-org/rigging/70".into(), metadata: BTreeMap::new(),
+                submitted_at: Utc::now(), verdict: None }],
+        }]) ]));
+        status.discover_subject(subject.clone(), flotilla_protocol::Relationship::Produces, SubjectDiscoverySource::Claim, Utc::now());
+        status.unlink_subject(&subject);
+        // Decode the old refusal shape, which the current writer no longer emits.
+        let mut stored = serde_json::to_value(&status).unwrap();
+        stored["crew_work"]["work"]["coder"]["completion_refusal"] = serde_json::json!({
+            "expectation": "cr/github.com/flotilla-org/rigging/70", "consecutive_count": 2,
+            "causes": [{"kind": "missing_change_request_observation", "service": "github.com", "scope": "flotilla-org/rigging", "number": 70}]
+        });
+        let restored: ConvoyStatus = serde_json::from_value(stored).unwrap();
+        assert!(restored.crew_work["work"]["coder"].completion_refusal.is_some());
+        let convoy = convoys.update_status(&created.metadata.name, &created.metadata.resource_version, &restored).await.unwrap();
+        assert!(flotilla_resources::expected_change_request_leaves(&convoy, &[]).unwrap().is_empty());
+        assert!(!flotilla_resources::promises::needs_observation(&restored, PromiseKind::Pr));
+        assert!(flotilla_resources::promises::pending(&restored, "work", "coder").is_empty());
+
+        let mut history = vec![ChangeRequestSubjectHistory::builder().namespace("flotilla".into()).convoy(created.metadata.name.clone())
+            .origin("fleet".into()).relationship(flotilla_protocol::Relationship::Produces).role("coder".into()).last_seen(Utc::now()).build()];
+        if other_holder {
+            let other = convoys.create(&InputMeta::builder().name("other-holder".into()).build(), &created.spec).await.unwrap();
+            let mut status = ConvoyStatus { phase: ConvoyPhase::Landing, workflow_snapshot: restored.workflow_snapshot.clone(), ..Default::default() };
+            status.discover_subject(subject.clone(), flotilla_protocol::Relationship::Produces, SubjectDiscoverySource::Operator, Utc::now());
+            convoys.update_status(&other.metadata.name, &other.metadata.resource_version, &status).await.unwrap();
+            let mut entry = history[0].clone(); entry.convoy = other.metadata.name; history.push(entry);
+        }
+        let name = cr_name("github.com", "flotilla-org/rigging", 70);
+        let requests = backend.using::<ChangeRequest>("flotilla");
+        requests.create(&InputMeta::builder().name(name.clone()).build(), &ChangeRequestSpec::builder()
+            .service("github.com".into()).scope("flotilla-org/rigging".into()).number(70).observing_authority("authority".into())
+            .subject_of(history).build()).await.unwrap();
+        let wake = supervision_wake(&backend);
+        let refresher = &wake.subscriptions.inner.change_requests;
+        refresher.garbage_collect_orphans().await.unwrap();
+        for _ in 0..reconciliations {
+            let mut snapshot = convoys.list().await.unwrap().items.into_iter().map(|c| (c.metadata.name.clone(), c)).collect::<HashMap<_, _>>();
+            // Exercise the old decoded refusal: the current writer omits it.
+            snapshot.get_mut("mistaken-submission").unwrap().status = Some(restored.clone());
+            wake.sync_rows("flotilla", &snapshot).await.unwrap();
+            for row in wake.subscriptions.rows().await {
+                if matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy } if convoy == "mistaken-submission") {
+                    assert!(!row.leaves.iter().any(|leaf| matches!(leaf.address, LeafAddress::ChangeRequest { number: 70, .. })));
+                }
+            }
+            assert_eq!(refresher.active_demands().await > 0, other_holder);
+            tokio::time::advance(Duration::from_secs(16 * 60)).await;
+            assert_eq!(requests.get(&name).await.is_ok(), other_holder, "unheld record must stay absent after polling");
+            if other_holder {
+                let record = requests.get(&name).await.unwrap();
+                assert_eq!(record.spec.subject_of.len(), 1);
+                assert_eq!(record.spec.subject_of[0].convoy, "other-holder");
+            }
+        }
+        for row in wake.subscriptions.rows().await { wake.subscriptions.finish(row.id).await; }
+    });
+}

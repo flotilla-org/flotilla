@@ -12,6 +12,8 @@ The catalog marks an observed open or draft request `flotilla.orphaned = true` w
 
 ChangeRequest records are authored by daemon observers. There are no known out-of-repository manifest authors of this resource shape; existing external API authors can omit the new history field.
 
-Explicit forge absence collects an undemanded retained request and stops its refresh task. Only a pull-endpoint 404 or a matching GraphQL `NOT_FOUND` path establishes absence; authentication, rate limiting, transport failures, and missing check/review endpoints do not. Active demand retains its diagnostic and retry behavior.
+Explicit forge absence collects an undemanded retained request and stops its refresh task. Only a pull-endpoint 404 followed by a successful repository pull listing, or a matching GraphQL `NOT_FOUND` path within an accessible repository, establishes absence; authentication, rate limiting, transport failures, and missing check/review endpoints do not. Active demand retains its diagnostic and retry behavior.
 
 Convoy demand reconciliation and startup collection release history entries for explicit `status.unlinked_subjects` assertions. Other convoy holders remain, and a missing convoy still preserves history. Once no history or active demand holds the subject, local records are collected. This processes explicit unlink assertions without deriving all history from live links (#3646).
+
+Retracted promise submissions remain audit history and contribute no observation demand. The previous-generation completion refusal decoded after #3586 also contributes no leaf or demand. Recovery coverage combines both with explicit unlink and startup cleanup, ensuring the removed record stays absent; a separate convoy's live subject still demands the same PR.

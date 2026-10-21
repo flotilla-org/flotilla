@@ -11,16 +11,21 @@ pub(crate) async fn execute(
 ) -> Result<serde_json::Value, ObservationError> {
     let request = forge.repository_request(repo, reqwest::Method::GET, path, query, None)?;
     let response = http_execute!(forge.http, request)?;
-    check_response(&forge.config.service_url, response.status(), response.headers(), response.body()).map_err(|error| {
-        // Absence is meaningful only on the requested pull, not review/check reads.
-        if response.status() == reqwest::StatusCode::NOT_FOUND
-            && path.strip_prefix("pulls/").is_some_and(|number| number.parse::<u64>().is_ok())
-        {
-            ObservationError::NotFound(error.to_string())
-        } else {
-            error
-        }
-    })?;
+    check_response(&forge.config.service_url, response.status(), response.headers(), response.body())?;
+    serde_json::from_slice(response.body()).map_err(|error| ObservationError::Failed(error.to_string()))
+}
+
+/// Only a pull read may establish PR absence, after confirming repository access.
+pub(crate) async fn execute_pull(forge: &ForgejoClient, repo: &str, number: u64) -> Result<serde_json::Value, ObservationError> {
+    let request = forge.repository_request(repo, reqwest::Method::GET, &format!("pulls/{number}"), &[], None)?;
+    let response = http_execute!(forge.http, request)?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        // A successful repository pull listing confirms both repository access
+        // and pull-read permission, including private repositories.
+        execute(forge, repo, "pulls", &[("state", "all".into()), ("limit", "1".into()), ("page", "1".into())]).await?;
+        return Err(ObservationError::NotFound(format!("Forgejo pull request {number} not found (404)")));
+    }
+    check_response(&forge.config.service_url, response.status(), response.headers(), response.body())?;
     serde_json::from_slice(response.body()).map_err(|error| ObservationError::Failed(error.to_string()))
 }
 
