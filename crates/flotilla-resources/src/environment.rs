@@ -22,6 +22,8 @@ define_resource!(
         "metadata.name",
         "spec.provider_address",
         "spec.host_direct",
+        // ADR 0047: remove this legacy query field one roll after nothing
+        // writes host_ref, or at #3108, whichever is first.
         "spec.host_direct.host_ref",
         "status.runtime_observation.container_id"
     ]
@@ -131,7 +133,9 @@ impl<'de> Deserialize<'de> for EnvironmentSpec {
         if let Some(address) = &stored.provider_address {
             validate_environment_provider_address(address).map_err(serde::de::Error::custom)?;
             // Keep transitional in-memory consumers consistent with the explicit
-            // address. These compatibility fields are never serialized.
+            // address. These compatibility fields are never serialized. Remove
+            // this copy one roll after nothing writes host_ref, or at #3108,
+            // whichever is first.
             let host = address.get(flotilla_address::Kind::Host).unwrap_or_default();
             if let Some(spec) = &mut stored.host_direct {
                 spec.host_ref = host.into();
@@ -146,7 +150,8 @@ impl<'de> Deserialize<'de> for EnvironmentSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostDirectEnvironmentSpec {
-    /// ADR 0047: decode legacy host placement for one roll after #3521.
+    /// ADR 0047: remove one roll after nothing writes host_ref, or at
+    /// #3108, whichever is first.
     #[serde(default, skip_serializing)]
     pub host_ref: String,
     pub repo_default_dir: String,
@@ -157,7 +162,8 @@ pub struct HostDirectEnvironmentSpec {
 // this type's lenient decoding; ADR 0047: no shim to remove, but keep this
 // type lenient until one roll after ADR 0062 images land.
 pub struct DockerEnvironmentSpec {
-    /// ADR 0047: decode legacy host placement for one roll after #3521.
+    /// ADR 0047: remove one roll after nothing writes host_ref, or at
+    /// #3108, whichever is first.
     #[serde(default, skip_serializing)]
     pub host_ref: String,
     pub image: String,
@@ -225,6 +231,9 @@ pub struct EnvironmentStatus {
     #[serde(default)]
     pub ready: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Opaque provider backing ID for any Environment, including host-direct
+    /// and account providers. The historical field name is retained for stored
+    /// compatibility; consumers must not infer Docker from its presence.
     pub docker_container_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,

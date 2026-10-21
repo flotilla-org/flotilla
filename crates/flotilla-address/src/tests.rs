@@ -36,7 +36,7 @@ fn segment_value(tc: &hegel::TestCase, kind: Kind) -> String {
         }
         // Usage values are trimmed and lowercase; the leading letter keeps
         // them non-empty once trimmed.
-        Kind::Usage | Kind::Account => format!("u{}", value(tc, 0).to_lowercase()).trim_end().to_string(),
+        Kind::Usage => format!("u{}", value(tc, 0).to_lowercase()).trim_end().to_string(),
         _ => value(tc, 1),
     }
 }
@@ -71,7 +71,13 @@ fn address(tc: &hegel::TestCase) -> Address {
         address = if kind == Kind::Artifact {
             address.artifact(&value(tc, 1), &value(tc, 1)).expect("artifact")
         } else {
-            address.child(kind, &segment_value(tc, kind)).expect("child")
+            let value = segment_value(tc, kind);
+            let value = if kind == Kind::Account && address.kind() == Kind::Usage {
+                format!("u{}", value.to_lowercase()).trim_end().to_string()
+            } else {
+                value
+            };
+            address.child(kind, &value).expect("child")
         };
     }
     if address.kind() == Kind::Artifact {
@@ -563,4 +569,24 @@ mod shape {
         assert!("message:x".parse::<Address>().is_err());
         assert!(message.child(Kind::Message, "y").is_err());
     }
+}
+
+// The shared grammar is segment-based: a provider may follow either account
+// context. Environment placement separately requires a root host/account.
+#[test]
+fn usage_account_may_have_a_provider_child() {
+    let address: Address = "usage:x/account:y/provider:z".parse().expect("shared grammar");
+    assert_eq!(address.to_string(), "usage:x/account:y/provider:z");
+    assert_eq!(address, Address::usage("x", "y").expect("usage").child(Kind::Provider, "z").expect("child"));
+}
+
+// Root account identities preserve mixed case and escaped characters, unlike
+// usage accounts. Generate a guaranteed uppercase prefix plus arbitrary values.
+#[hegel::test]
+fn root_account_case_is_preserved(tc: hegel::TestCase) {
+    let name = format!("MiXeD{}", value(&tc, 0));
+    let address = Address::root(Kind::Account, &name).expect("account");
+    let decoded: Address = address.to_string().parse().expect("round trip");
+    assert_eq!(decoded.get(Kind::Account), Some(name.as_str()));
+    assert_eq!(decoded, address);
 }

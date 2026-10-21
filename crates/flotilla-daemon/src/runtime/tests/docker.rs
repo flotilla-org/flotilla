@@ -247,8 +247,9 @@ async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_r
             .expect("create registry credential");
         let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None), prepared_auth: Mutex::new(None) });
         let mut local_registry = ProviderRegistry::new();
+        // Unlabelled legacy Docker input resolves the built-in instance exactly.
         local_registry.environment_providers.insert(
-            "sandbox",
+            "docker",
             flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "sandbox"),
             Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
         );
@@ -410,8 +411,9 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
         }
         let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None), prepared_auth: Mutex::new(None) });
         let mut local_registry = ProviderRegistry::new();
+        // Unlabelled legacy Docker input resolves the built-in instance exactly.
         local_registry.environment_providers.insert(
-            "sandbox",
+            "docker",
             flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "sandbox"),
             Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
         );

@@ -381,3 +381,32 @@ async fn agentless_host_without_a_platform_cli_is_refused_at_placement() {
     assert!(cli_available);
     assert!(matches!(conditions.as_slice(), [condition] if condition.reason == "PlatformUnknown" && !condition.blocks_readiness()));
 }
+
+// Unlabelled legacy records derive the approved built-in identity. A compatible
+// dummy instance must never steal their binding, even when it is the only one.
+#[tokio::test]
+async fn legacy_runtime_resolution_matches_canonical_writes_with_only_dummy_registered() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"legacy-resolution\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(temp.path()));
+    let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+    let host = daemon.local_host_id().expect("local host").to_string();
+    let mut registry = ProviderRegistry::new();
+    registry.environment_providers.insert(
+        "dummy",
+        ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "dummy"),
+        Arc::new(flotilla_environment::environment::dummy::DummyEnvironmentProvider::new(Default::default())),
+    );
+    let state = ControllerRuntimeState::new(daemon, config, Arc::new(registry), None, host.clone(), format!("host-direct-{host}"));
+    for (input, instance) in [
+        (json!({"host_direct":{"host_ref":host, "repo_default_dir":"/work"}}), "host-direct"),
+        (json!({"docker":{"host_ref":host, "image":"image"}}), "docker"),
+    ] {
+        let spec: EnvironmentSpec = serde_json::from_value(input).expect("legacy spec");
+        let address = state.provider_address("legacy", &spec, None).await.expect("derived address");
+        assert_eq!(address.to_string(), format!("host:{host}/provider:{instance}"));
+        assert!(state.environment_providers.get(&address).is_err(), "absence must fail closed instead of choosing dummy");
+        let written: EnvironmentSpec = serde_json::from_value(serde_json::to_value(&spec).expect("write")).expect("read");
+        assert_eq!(written.provider_address, Some(address));
+    }
+}

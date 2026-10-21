@@ -307,9 +307,9 @@ Do not invoke `git` directly through `CommandRunner` methods or `run!`, or throu
 
 ### Environment runtime boundary
 
-The environment reconciler and its unchanged `DockerEnvironmentRuntime` port live in `flotilla-provisioning`.
+The environment reconciler and its kind-neutral `EnvironmentRuntime` port live in `flotilla-provisioning`.
 
-Use `EnvironmentProvider`, its instance-owned `LocalImageCache`, and its `ImageBuildService` capability for environment and image operations. Pre-provisioning tool detection uses `EnvironmentProvider::detect`; read-only image-reference validation uses the owning cache's `inspect_reference` and `registry_available` methods. These observations never pull images or admit mutable tags for provisioning. Select providers by `EnvironmentKind` or a configured instance name, never by a literal runtime name. Direct OCI distribution reads use `RegistryClient`. Candidate validation's read-only registry fallback stays behind the provider cache and uses the host tool's configured credentials. Resource specifications and runtime-neutral traits remain usable by consumers.
+Use `EnvironmentProvider`, its instance-owned `LocalImageCache`, and its `ImageBuildService` capability for environment and image operations. Pre-provisioning tool detection uses `EnvironmentProvider::detect`; read-only image-reference validation uses the owning cache's `inspect_reference` and `registry_available` methods. These observations never pull images or admit mutable tags for provisioning. Resolve an Environment’s provider address (`host:<host>/provider:<instance>` or `account:<account>/provider:<instance>`) through the shared registry. For preceding-generation records without an address, derive the built-in `host-direct` or `docker` instance from the stored input, honoring an explicit historical instance label; never select an arbitrary compatible provider. Direct OCI distribution reads use `RegistryClient`. Candidate validation's read-only registry fallback stays behind the provider cache and uses the host tool's configured credentials. Resource specifications and runtime-neutral traits remain usable by consumers.
 
 The ast-grep operation boundary check in the existing format job rejects literal invocations of `docker`, `podman`, `buildah`, `skopeo`, and `ctr` outside these exact implementation files:
 

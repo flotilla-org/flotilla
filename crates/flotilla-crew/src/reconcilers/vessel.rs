@@ -661,6 +661,8 @@ impl Reconciler for VesselReconciler {
                                                 environment_provider_labels(&placement_policy)
                                                     .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
                                                     .map(String::as_str)
+                                                    // Unlabelled contained placement uses the same exact
+                                                    // built-in identity as legacy read/write derivation.
                                                     .unwrap_or("docker"),
                                             )
                                         })
@@ -1146,6 +1148,8 @@ impl Reconciler for VesselReconciler {
                                                 environment_provider_labels(&placement_policy)
                                                     .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
                                                     .map(String::as_str)
+                                                    // Unlabelled contained placement uses the same exact
+                                                    // built-in identity as legacy read/write derivation.
                                                     .unwrap_or("docker"),
                                             )
                                         })

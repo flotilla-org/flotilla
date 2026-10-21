@@ -1604,6 +1604,8 @@ fn host_direct_environment_query(local_host: &str) -> Result<StoreQuery, String>
                 ..Default::default()
             },
             StoreQuery {
+                // ADR 0047: remove this legacy branch one roll after nothing
+                // writes host_ref, or at #3108, whichever is first.
                 fields: BTreeMap::from([("spec.host_direct.host_ref".into(), local_host.into())]),
                 missing_fields: BTreeSet::from(["spec.provider_address".into()]),
                 ..Default::default()

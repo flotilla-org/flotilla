@@ -66,13 +66,7 @@ impl RepositoryReconciler {
             .get(environment_ref)
             .await
             .map_err(|error| format!("cannot resolve host for environment {environment_ref}: {error}"))?;
-        environment
-            .spec
-            .host_direct
-            .as_ref()
-            .map(|spec| spec.host_ref.clone())
-            .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.clone()))
-            .ok_or_else(|| format!("environment {environment_ref} has no host association"))
+        environment.spec.host_ref().map(str::to_owned).ok_or_else(|| format!("environment {environment_ref} has no host association"))
     }
 }
 

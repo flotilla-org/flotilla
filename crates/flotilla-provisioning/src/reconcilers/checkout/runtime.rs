@@ -328,8 +328,8 @@ pub async fn sweep_host_empty_convoy_directories(backend: &ResourceBackend, host
     let mut roots = BTreeSet::new();
     for namespace in backend.local_namespaces::<Environment>().await.map_err(|error| error.to_string())? {
         for environment in backend.using::<Environment>(&namespace).list().await.map_err(|error| error.to_string())?.items {
-            if let Some(direct) = environment.spec.host_direct {
-                if direct.host_ref == host {
+            if environment.spec.host_ref() == Some(host) {
+                if let Some(direct) = environment.spec.host_direct {
                     roots.insert(direct.repo_default_dir);
                 }
             }

@@ -85,16 +85,9 @@ impl ControllerRuntimeState {
         spec: &flotilla_resources::EnvironmentSpec,
         instance: Option<&str>,
     ) -> Result<flotilla_address::Address, String> {
-        use flotilla_environment::environment::EnvironmentInput;
-        let mut address = if let Some(address) = &spec.provider_address {
-            flotilla_resources::validate_environment_provider_address(address)?;
-            address.clone()
-        } else {
-            let host = spec.host_ref().ok_or_else(|| format!("environment {name} has no provider address or legacy host"))?;
-            let local = CanonicalHostId::resolved(&self.local_host_ref);
-            let host = canonical_runtime_host_id(&self.daemon, &self.namespace, &local, host).await?;
-            self.environment_providers.resolve_legacy(host.as_str(), EnvironmentInput::of(spec)?, instance)?
-        };
+        let mut address = spec
+            .resolved_provider_address(instance)?
+            .ok_or_else(|| format!("environment {name} has no provider address or legacy host"))?;
         // A legacy host_ref may be a display alias. Metadata-aware decoding can
         // already qualify its instance; retain the same Host authority lookup
         // for the place without ever substituting another provider instance.
