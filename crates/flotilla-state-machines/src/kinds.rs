@@ -181,7 +181,9 @@ impl PromiseKind {
     /// Whether `rule` holds for a submission of `address` at `revision`: every
     /// condition holds, `None` while any is unobserved and none fails. An
     /// empty durable or ready rule holds; an empty kept rule never does, so
-    /// only a verdict keeps that kind.
+    /// only a verdict keeps that kind. A frozen condition a later generation's
+    /// vocabulary no longer admits reads as unobserved: the rule stays `None`,
+    /// never silently false, and the caller reports it ([`Catalog::retired`]).
     pub fn holds(&self, rule: Rule, address: &Address, revision: &str, observations: &impl Observations) -> Option<bool> {
         let conditions = self.rule(rule);
         if rule == Rule::Kept && conditions.is_empty() {
@@ -189,8 +191,10 @@ impl PromiseKind {
         }
         let mut known = true;
         for template in conditions {
-            // Frozen kinds were resolved against the vocabulary, so every term is found.
-            let Ok(term) = term(template) else { return Some(false) };
+            let Ok(term) = term(template) else {
+                known = false;
+                continue;
+            };
             let literal = match term.literal {
                 Literal::OneOf(_) => template.literal.as_str(),
                 Literal::Revision => revision,
@@ -294,16 +298,60 @@ pub enum KindError {
         template: String,
         error: TermError,
     },
-    /// Conditions over more than one subject variable.
-    MixedSubjects(String),
+    /// Conditions over more than one subject variable: `extension` is the
+    /// definition whose conditions brought in a second subject.
+    MixedSubjects {
+        kind: String,
+        extension: String,
+        subjects: Vec<String>,
+    },
     /// An admission used a kind the catalog does not hold.
     UnknownKind(String),
     Encode(String),
 }
 
+impl fmt::Display for TermError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            TermError::Arguments => "the submission variable takes no arguments",
+            TermError::Unobserved => "no observation stands behind this variable and path",
+            TermError::Operator => "the vocabulary does not admit this operator here",
+            TermError::Literal => "the vocabulary does not admit this literal here",
+        })
+    }
+}
+
+impl fmt::Display for Rule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Rule::Durable => "durable",
+            Rule::Ready => "ready",
+            Rule::Kept => "kept",
+        })
+    }
+}
+
 impl fmt::Display for KindError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self, f)
+        match self {
+            KindError::InvalidName(name) => write!(f, "promise kind `{name}`: a kind name is a lowercase word ([a-z][a-z0-9-]*)"),
+            KindError::Duplicate(name) => write!(f, "promise kind `{name}` is declared twice"),
+            KindError::StockRedeclared(name) => {
+                write!(f, "promise kind `{name}` is a stock kind: tighten it with `extends: {name}`, which only adds conditions")
+            }
+            KindError::UnknownBase { kind, extends } => write!(f, "promise kind `{kind}` extends `{extends}`, which is not a known kind"),
+            KindError::Cycle(name) => write!(f, "promise kind `{name}` extends itself through its bases"),
+            KindError::Unobserved { kind, rule, template, error } => {
+                write!(f, "promise kind `{kind}`, {rule} rule: `{template}`: {error}")
+            }
+            KindError::MixedSubjects { kind, extension, subjects } => write!(
+                f,
+                "promise kind `{kind}`: `{extension}` adds conditions over a second submission variable ({})",
+                subjects.iter().map(|subject| format!("${subject}")).collect::<Vec<_>>().join(", ")
+            ),
+            KindError::UnknownKind(name) => write!(f, "promise kind `{name}` is not in the charter's catalog"),
+            KindError::Encode(error) => write!(f, "the frozen promise kinds do not encode: {error}"),
+        }
     }
 }
 
@@ -325,22 +373,15 @@ impl Catalog {
         let declared = layer(declared)?;
         let mut kinds = BTreeMap::new();
         for (name, definition) in &stock {
-            let kind = compose(name, definition, &stock, &BTreeMap::new(), &mut BTreeSet::new())?;
+            let kind = compose(name, definition, &stock, &BTreeMap::new(), &mut BTreeSet::new()).map_err(|error| top(error, name))?;
             kinds.insert(name.clone(), kind);
         }
         for (name, definition) in &declared {
             if stock.contains_key(name) && definition.extends.as_deref() != Some(name.as_str()) {
                 return Err(KindError::StockRedeclared(name.clone()));
             }
-            let kind = compose(name, definition, &stock, &declared, &mut BTreeSet::new())?;
+            let kind = compose(name, definition, &stock, &declared, &mut BTreeSet::new()).map_err(|error| top(error, name))?;
             kinds.insert(name.clone(), kind);
-        }
-        for (name, kind) in &kinds {
-            let subjects: BTreeSet<&str> =
-                Rule::ALL.iter().flat_map(|rule| kind.rule(*rule)).map(|template| template.subject.name()).collect();
-            if subjects.len() > 1 {
-                return Err(KindError::MixedSubjects(name.clone()));
-            }
         }
         Ok(Self { kinds })
     }
@@ -351,6 +392,25 @@ impl Catalog {
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.kinds.keys().map(String::as_str)
+    }
+
+    /// The conditions of frozen `kinds` that this generation's vocabulary no
+    /// longer admits, by kind and rule: each reads as unobserved in
+    /// [`PromiseKind::holds`], so the caller reports them rather than wait
+    /// silently.
+    pub fn retired(kinds: &PromiseKinds) -> Vec<(String, Rule, Template)> {
+        kinds
+            .kinds
+            .iter()
+            .flat_map(|(name, kind)| {
+                Rule::ALL.into_iter().flat_map(move |rule| {
+                    kind.rule(rule)
+                        .iter()
+                        .filter(|template| term(template).is_err())
+                        .map(move |template| (name.clone(), rule, template.clone()))
+                })
+            })
+            .collect()
     }
 
     /// The kinds `used` names, frozen for a convoy's admission.
@@ -387,9 +447,19 @@ fn layer(definitions: &[KindDefinition]) -> Result<BTreeMap<String, KindDefiniti
     Ok(layer)
 }
 
+/// A kind's name on a mixed-subject refusal raised while composing one of its bases.
+fn top(error: KindError, name: &str) -> KindError {
+    match error {
+        KindError::MixedSubjects { extension, subjects, .. } => KindError::MixedSubjects { kind: name.to_owned(), extension, subjects },
+        error => error,
+    }
+}
+
 /// A definition's rules: its base's, then its own. A charter kind's base is
 /// the charter kind of that name, unless it extends itself, which is the
-/// stock kind's.
+/// stock kind's. A definition names one base, so its bases form a chain, never
+/// a diamond: `visiting` holds that chain for one top-level kind (each
+/// resolution starts a fresh set), and meeting a name again is a cycle.
 fn compose(
     name: &str,
     definition: &KindDefinition,
@@ -420,6 +490,14 @@ fn compose(
                 kind.rule_mut(rule).push(template.clone());
             }
         }
+    }
+    let subjects: BTreeSet<&str> = Rule::ALL.iter().flat_map(|rule| kind.rule(*rule)).map(|template| template.subject.name()).collect();
+    if subjects.len() > 1 {
+        return Err(KindError::MixedSubjects {
+            kind: name.to_owned(),
+            extension: name.to_owned(),
+            subjects: subjects.into_iter().map(str::to_owned).collect(),
+        });
     }
     Ok(kind)
 }

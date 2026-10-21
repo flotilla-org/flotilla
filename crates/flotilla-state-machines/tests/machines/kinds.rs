@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use flotilla_address::{Address, Template};
 use flotilla_state_machines::{
     kinds::{self, stock, Catalog, KindDefinition, KindError, Observation, Observations, Rule, TermError, VOCABULARY},
-    machines::convoy::PromiseKinds,
+    machines::convoy::{PromiseKind, PromiseKinds},
 };
 
 fn template(text: &str) -> Template {
@@ -142,7 +142,11 @@ fn malformed_charters_are_refused() {
     );
     assert_eq!(catalog(&[definition("own", Some("own"), &[])]), Err(KindError::UnknownBase { kind: "own".into(), extends: "own".into() }));
     assert!(matches!(catalog(&[definition("a", Some("b"), &[]), definition("b", Some("a"), &[])]), Err(KindError::Cycle(_))));
-    assert_eq!(catalog(&[definition("mixed", Some("pr"), &["$artifact .exists == true"])]), Err(KindError::MixedSubjects("mixed".into())));
+    assert_eq!(
+        catalog(&[definition("mixed", Some("pr"), &["$artifact .exists == true"]), definition("above", Some("mixed"), &[])]),
+        Err(KindError::MixedSubjects { kind: "above".into(), extension: "mixed".into(), subjects: vec!["artifact".into(), "cr".into()] }),
+        "the refusal names the extension that brought in the second subject"
+    );
     assert_eq!(catalog(&[definition("a", None, &[]), definition("a", None, &[])]), Err(KindError::Duplicate("a".into())));
     assert_eq!(catalog(&[definition("Bad", None, &[])]), Err(KindError::InvalidName("Bad".into())));
 }
@@ -167,4 +171,43 @@ fn definitions_round_trip_as_data() {
     }
     let text = r#"{"name":"pr","extends":"pr","kept":["$cr .review == approved"]}"#;
     assert_eq!(serde_json::from_str::<KindDefinition>(text).expect("decodes"), definition("pr", Some("pr"), &["$cr .review == approved"]));
+}
+
+// A charter kind built on another charter kind that extends a stock kind: the chain switches from
+// the charter's definitions to the stock ones exactly once, at the stock base.
+#[test]
+fn a_two_step_charter_chain_reaches_the_stock_base() {
+    let catalog = catalog(&[
+        definition("reviewed", Some("pr"), &["$cr .review == approved"]),
+        definition("released", Some("reviewed"), &["$cr .checks == pass"]),
+    ])
+    .expect("resolves");
+    assert_eq!(
+        catalog.get("released").expect("released").kept,
+        [template("$cr .state == merged"), template("$cr .review == approved"), template("$cr .checks == pass")]
+    );
+    assert_eq!(catalog.get("pr").expect("pr").kept, [template("$cr .state == merged")], "the stock pr is untouched");
+}
+
+// A frozen condition the vocabulary no longer admits reads as unobserved, never as false, and
+// the catalog lists it so the caller can report it.
+#[test]
+fn a_retired_condition_reads_as_unobserved() {
+    let kind = PromiseKind { kept: vec![template("$cr .state == merged"), template("$cr .title == done")], ..PromiseKind::default() };
+    let merged = Seen::default().with(Observation::ChangeRequestState, "merged");
+    assert_eq!(kind.holds(Rule::Kept, &address(), "abc", &merged), None);
+    let closed = Seen::default().with(Observation::ChangeRequestState, "closed");
+    assert_eq!(kind.holds(Rule::Kept, &address(), "abc", &closed), Some(false), "a failing condition still decides");
+    let kinds = PromiseKinds { kinds: [("old".to_owned(), kind)].into() };
+    assert_eq!(Catalog::retired(&kinds), [("old".to_owned(), Rule::Kept, template("$cr .title == done"))]);
+}
+
+// Refusals read as sentences naming the kind, the rule and the condition.
+#[test]
+fn refusals_name_what_is_wrong() {
+    let error = catalog(&[definition("odd", None, &["$cr .title == done"])]).expect_err("refused");
+    assert_eq!(
+        error.to_string(),
+        "promise kind `odd`, kept rule: `$cr .title == done`: no observation stands behind this variable and path"
+    );
 }
