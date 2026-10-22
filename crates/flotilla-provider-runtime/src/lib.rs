@@ -1,4 +1,5 @@
 //! Flotilla process policy and helper scripts over Rigging's shared runtime.
+pub mod blocking_probe;
 pub mod observation_error;
 pub mod weak_registry;
 pub use observation_error::ObservationError;

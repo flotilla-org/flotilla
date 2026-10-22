@@ -683,3 +683,86 @@ async fn fleet_health_does_not_materialize_convoy_inventory() {
         }
     }
 }
+
+// Independent in-process daemon harnesses must not compete for the production
+// process-wide eight-call admission budget. Hold nine real checks in-flight
+// until every injected measurement has started, then release them together.
+#[tokio::test]
+async fn parallel_daemons_have_independent_free_space_probe_capacity() {
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    struct HeldSpaceProbe {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl flotilla_provider_runtime::available_space::AvailableSpaceProbe for HeldSpaceProbe {
+        fn measure(&self, _path: &std::path::Path) -> Option<u64> {
+            self.entered.send(()).unwrap();
+            let (lock, ready) = &*self.gate;
+            let released = lock.lock().unwrap();
+            // Bound cleanup even if a regression prevents all callers entering.
+            let _guard = ready.wait_timeout_while(released, Duration::from_secs(10), |released| !*released).unwrap();
+            Some(100 * 1024 * 1024 * 1024)
+        }
+    }
+
+    let (entered, mut started) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let mut daemons = Vec::new();
+    let mut dirs = Vec::new();
+    for index in 0..9 {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("daemon.toml"), format!("machine_id = \"probe-host-{index}\"\n")).unwrap();
+        let mut discovery = if index % 2 == 0 {
+            fake_discovery(false)
+        } else {
+            flotilla_discovery_testkit::fake_discovery_with_provider_set(Default::default())
+        };
+        discovery.available_space_probe = Arc::new(HeldSpaceProbe { entered: entered.clone(), gate: Arc::clone(&gate) });
+        daemons.push(Arc::new(
+            InProcessDaemon::new_with_resource_backend(
+                Vec::new(),
+                Arc::new(ConfigStore::with_base(temp.path())),
+                discovery,
+                HostName::new(format!("host-{index}")),
+                ResourceBackend::new(InMemoryBackend::default()),
+                Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+            )
+            .await,
+        ));
+        dirs.push(temp);
+    }
+    // Cover both admission routes and both shared harness constructors.
+    for report_only in [false, true] {
+        *gate.0.lock().unwrap() = false;
+        let mut checks = tokio::task::JoinSet::new();
+        for daemon in &daemons {
+            let daemon = Arc::clone(daemon);
+            checks.spawn(async move {
+                if report_only {
+                    daemon.admission.free_space_bytes().await.map(|bytes| {
+                        assert_eq!(bytes, Some(100 * 1024 * 1024 * 1024));
+                    })
+                } else {
+                    daemon.admission.check_local_free_space_floor().await
+                }
+            });
+        }
+        let all_started = tokio::time::timeout(Duration::from_secs(4), async {
+            for _ in 0..9 {
+                started.recv().await.unwrap();
+            }
+        })
+        .await;
+        let (lock, ready) = &*gate;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        let mut results = Vec::new();
+        while let Some(result) = checks.join_next().await {
+            results.push(result.unwrap());
+        }
+        assert!(all_started.is_ok(), "all nine independent probes must start (report_only={report_only}): {results:?}");
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+    }
+}

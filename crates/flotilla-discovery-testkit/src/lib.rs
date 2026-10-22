@@ -398,6 +398,7 @@ fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> floti
         .runner(runner)
         .env(std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")])))
         .available_space_probe(fixed_available_space_probe())
+        .admission_probe(flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated())
         .host_detectors(std::sync::Arc::new(vec![Box::new(flotilla_discovery_api::detectors::CommandDetector::new(
             "git",
             &["--version"],
@@ -1282,6 +1283,7 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
         .runner(runner)
         .env(Arc::new(TestEnvVars::default()))
         .available_space_probe(fixed_available_space_probe())
+        .admission_probe(flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated())
         .host_detectors(std::sync::Arc::new(vec![]))
         .repo_detectors(vec![])
         .factories(FactoryRegistry {
