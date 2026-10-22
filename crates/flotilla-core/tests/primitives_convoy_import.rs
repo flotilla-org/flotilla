@@ -121,6 +121,22 @@ fn imported(outcome: Result<ImportOutcome, ConvoyImportRefusal>) -> ImportedConv
     }
 }
 
+// Behaviour (#3721 look-over ruling): only the import qualifies a label by its seat. Old ids that
+// repeat across crews import as `@<seat>/<id>`, and each still maps back to the id its crew used.
+#[test]
+fn repeated_old_ids_import_seat_qualified() {
+    let mut old = convoy("c", ConvoyPhase::Active, vec![agent("coder", true), agent("reviewer", false)]);
+    for role in ["coder", "reviewer"] {
+        operate(&mut old, role, PromiseOperation::Declare { id: "notes".into(), kind: PromiseKind::Pr, source: PromiseSource::Crew });
+        operate(&mut old, role, submit("notes", PromiseKind::Pr, PR));
+    }
+    let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
+    let promises: Vec<_> = convoy.resource.spec().promises.iter().map(|row| row.record.clone()).collect();
+    let labels: Vec<_> = promises.iter().map(|promise| promise.label.as_str()).collect();
+    assert_eq!(labels, vec!["template/pr", "@coder/notes", "@reviewer/notes"]);
+    assert!(promises.iter().skip(1).all(|promise| flotilla_core::primitives::convoy_map::old_id(promise) == "notes"));
+}
+
 // Behaviour: a convoy with history imports one to one: each promise keeps its progress and
 // submissions under its seat and label, a rejected submission stays, a crew's Done is dropped,
 // Landing becomes Open, the claim history rides along, and the machine reaches the same record.

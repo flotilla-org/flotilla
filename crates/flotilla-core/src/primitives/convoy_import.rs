@@ -170,7 +170,7 @@ pub fn import_convoy(
     let mut promises = Records::new();
     for (index, (vessel, role, old)) in declared.iter().enumerate() {
         let owner = crews.seat(vessel, role);
-        let label = map::label_for(&owner, &old.id, |id| counts.get(id).is_some_and(|count| *count > 1));
+        let label = map::imported_label(&owner, &old.id, counts.get(old.id.as_str()).is_some_and(|count| *count > 1));
         let mut submissions = Records::new();
         for submitted in &old.submissions {
             let (address, revision) = map::submission(&name, role, old.kind, submitted, forges)
