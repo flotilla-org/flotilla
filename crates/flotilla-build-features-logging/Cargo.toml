@@ -11,7 +11,7 @@ publish = false
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
-once_cell = { version = "1", features = ["std"] }
+once_cell = { version = "1", features = ["std", "critical-section", "portable-atomic"] }
 regex-automata = { version = "0.4", default-features = false, features = ["alloc", "dfa-build", "dfa-onepass", "dfa-search", "hybrid", "meta", "nfa-backtrack", "nfa-pikevm", "nfa-thompson", "perf-inline", "perf-literal", "perf-literal-multisubstring", "perf-literal-substring", "std", "syntax", "unicode", "unicode-age", "unicode-bool", "unicode-case", "unicode-gencat", "unicode-perl", "unicode-script", "unicode-segment", "unicode-word-boundary"] }
 regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["derive"] }

@@ -66,6 +66,7 @@ async fn a_provisioning_failure_marks_the_environment_failed() {
         .create(
             &InputMeta::builder().name("env-waiting".to_string()).build(),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
@@ -102,7 +103,7 @@ async fn finalizer_error_surfaces_as_failed_environment_status() {
         .using::<Environment>("flotilla")
         .create(
             &InputMeta::builder().name("env-corrupt-metadata".to_string()).build(),
-            &EnvironmentSpec { provider_address: None, host_direct: None, docker: None },
+            &EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: None },
         )
         .await
         .expect("create environment");
@@ -127,6 +128,7 @@ async fn failed_environment_without_a_container_still_runs_terminal_cleanup() {
         .create(
             &InputMeta::builder().name("env-failed".to_string()).build(),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
@@ -204,6 +206,7 @@ async fn foreign_environment_is_not_actuated_or_finalized() {
         .create(
             &InputMeta::builder().name("env-udder".to_string()).build(),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
@@ -225,6 +228,7 @@ async fn foreign_environment_is_not_actuated_or_finalized() {
         .create(
             &InputMeta::builder().name("direct-udder".to_string()).build(),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "udder".to_string(), repo_default_dir: "/worktrees".to_string() }),
                 docker: None,
@@ -250,6 +254,7 @@ async fn orphaned_environment_can_finalize_after_its_host_disappears() {
         .create(
             &InputMeta::builder().name("env-orphaned".to_string()).build(),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
@@ -285,6 +290,7 @@ async fn host_direct_provider_failure_prevents_readiness() {
         .create(
             &InputMeta::builder().name("direct-adoption".into()).build(),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/".into() }),
                 docker: None,
@@ -309,6 +315,7 @@ async fn lost_environment_is_not_reprovisioned() {
         .create(
             &InputMeta::builder().name("lost-environment".into()).build(),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
@@ -367,6 +374,8 @@ impl EnvironmentRuntime for ProvisioningDockerRuntime {
 
         self.provisioned.lock().expect("provision log").push((spec.image.clone(), spec.pull_policy));
         Ok(EnvironmentProvisioning {
+            provider_descriptor: None,
+            survivors: None,
             configured_limits: None,
             backing_id: Some("container".into()),
             image_ref: Some(spec.image.clone()),
@@ -423,6 +432,7 @@ async fn composed_environment_waits_for_its_build_then_provisions_the_digest(#[c
         .create(
             &InputMeta::builder().name("env-composed".to_string()).build(),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
@@ -510,6 +520,7 @@ async fn retired_build_reference_fails_the_environment() {
         .create(
             &InputMeta::builder().name("env-old".to_string()).build(),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
@@ -551,6 +562,7 @@ async fn environment_cleanup_waits_for_referencing_checkout_finalizers() {
             .create(
                 &InputMeta::builder().name("env-cleanup".into()).build(),
                 &EnvironmentSpec {
+                    cloud_sandbox: None,
                     provider_address: None,
                     host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".into(), repo_default_dir: "/workspace".into() }),
                     docker: None,
@@ -632,7 +644,12 @@ async fn neutral_provider_provisions_and_destroys_opaque_backing() {
         .using::<Environment>("flotilla")
         .create(
             &InputMeta::builder().name("neutral-provider".to_string()).build(),
-            &EnvironmentSpec { provider_address: Some("account:cloud/provider:sandbox".parse().unwrap()), host_direct: None, docker: None },
+            &EnvironmentSpec {
+                cloud_sandbox: None,
+                provider_address: Some("account:cloud/provider:sandbox".parse().unwrap()),
+                host_direct: None,
+                docker: None,
+            },
         )
         .await
         .unwrap();
@@ -646,4 +663,77 @@ async fn neutral_provider_provisions_and_destroys_opaque_backing() {
     environment.status = Some(status);
     reconciler.run_finalizer(&environment).await.unwrap();
     assert_eq!(*runtime.destroyed.lock().unwrap(), ["opaque-provider-backing"]);
+}
+
+struct CloudRuntime {
+    destroyed: Mutex<Vec<String>>,
+}
+#[async_trait]
+impl EnvironmentRuntime for CloudRuntime {
+    async fn provision_environment(&self, _: &str, spec: &EnvironmentSpec) -> Result<EnvironmentProvisioning, String> {
+        assert!(spec.cloud_sandbox.is_some() && spec.docker.is_none() && spec.host_direct.is_none());
+        Ok(EnvironmentProvisioning {
+            backing_id: Some("opaque-cloud-backing".into()),
+            image_ref: Some(spec.cloud_sandbox.as_ref().unwrap().image.clone()),
+            provider_descriptor: Some(Box::new(flotilla_resources::EnvironmentProviderDescriptor {
+                instance: "daytona".into(),
+                kind: flotilla_protocol::provider::ProviderKind::new(
+                    flotilla_protocol::provider::EnvironmentClass::CloudSandbox,
+                    "daytona",
+                ),
+                image_digest: spec.cloud_sandbox.as_ref().unwrap().image.clone(),
+                host_version: "1".into(),
+                module_version: "1".into(),
+                capabilities: Default::default(),
+            })),
+            survivors: Some(flotilla_resources::EnvironmentSurvivors {
+                host_checkpoint: Some("controller-checkpoint".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+    async fn destroy(&self, _: &str, backing: &str) -> Result<(), String> {
+        self.destroyed.lock().unwrap().push(backing.into());
+        Ok(())
+    }
+}
+// #3620: cloud provisioning stores the opaque backing, descriptor and survivor
+// references without populating legacy Docker identity. Finalization uses that
+// same opaque identity through the reconciler's kind-neutral runtime port.
+#[tokio::test]
+async fn cloud_ready_and_finalization_use_generic_backing() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let environments = backend.using::<Environment>("flotilla");
+    let environment = environments
+        .create(
+            &InputMeta::builder().name("cloud-environment".to_string()).build(),
+            &EnvironmentSpec {
+                provider_address: Some("account:daytona/provider:daytona".parse().unwrap()),
+                cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                    image: "image@sha256:digest".into(),
+                    size: flotilla_resources::CloudSandboxSize { cpus: 2, memory_bytes: 1024, disk_bytes: 1024 },
+                    lifetime_cap_seconds: None,
+                    env: Default::default(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let runtime = Arc::new(CloudRuntime { destroyed: Default::default() });
+    let reconciler = EnvironmentReconciler::new(runtime.clone(), backend.clone(), "flotilla");
+    let prepared = reconciler.prepare(&environment).await.unwrap();
+    let outcome = reconciler.reconcile(&environment, &prepared, chrono::Utc::now());
+    let mut status = EnvironmentStatus::default();
+    outcome.patch.unwrap().apply(&mut status);
+    assert!(status.ready && status.phase == EnvironmentPhase::Ready);
+    assert_eq!(status.backing_id.as_deref(), Some("opaque-cloud-backing"));
+    assert!(status.docker_container_id.is_none());
+    assert_eq!(status.provider_descriptor.as_ref().unwrap().instance, "daytona");
+    assert_eq!(status.survivors.as_ref().unwrap().host_checkpoint.as_deref(), Some("controller-checkpoint"));
+    environments.update_status(&environment.metadata.name, &environment.metadata.resource_version, &status).await.unwrap();
+    let ready = environments.get(&environment.metadata.name).await.unwrap();
+    reconciler.run_finalizer(&ready).await.unwrap();
+    assert_eq!(*runtime.destroyed.lock().unwrap(), vec!["opaque-cloud-backing"]);
 }

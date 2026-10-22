@@ -4322,7 +4322,8 @@ mod tests {
                     kind,
                     "flotilla",
                     &InputMeta::builder().name(name.into()).build(),
-                    &serde_json::to_value(EnvironmentSpec { provider_address: None, host_direct: None, docker: None }).unwrap(),
+                    &serde_json::to_value(EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: None })
+                        .unwrap(),
                 )
                 .await
                 .unwrap();
@@ -4797,7 +4798,7 @@ mod tests {
             .create_typed::<Environment>(
                 "flotilla",
                 &InputMeta::builder().name("contended".to_string()).build(),
-                &EnvironmentSpec { provider_address: None, host_direct: None, docker: None },
+                &EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: None },
             )
             .await
             .expect("create live resource");

@@ -12,6 +12,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
+libc = { workspace = true }
 hegeltest = { workspace = true }
 
 [lints]

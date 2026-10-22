@@ -538,6 +538,7 @@ async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
         .create(
             &empty_meta("contained-restarted"),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: Some("host:host-test/provider:docker".parse().expect("provider address")),
                 host_direct: None,
                 docker: None,
@@ -615,6 +616,7 @@ async fn docker_orphan_cleanup_without_persisted_status_reaps_backing() {
         .create(
             &empty_meta("env-lost-status"),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {

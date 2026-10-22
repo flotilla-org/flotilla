@@ -592,6 +592,7 @@ pub(super) async fn create_ready_docker_environment(
         .create(
             &empty_meta(name),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {

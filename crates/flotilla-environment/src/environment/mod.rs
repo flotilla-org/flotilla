@@ -1,3 +1,5 @@
+#[cfg(unix)]
+pub mod drydock;
 mod seam;
 pub use seam::*;
 pub mod docker;
@@ -371,6 +373,12 @@ pub trait ProvisionedEnvironment: Send + Sync {
         ProviderReadiness::default()
     }
 
+    fn survivors(&self) -> Option<flotilla_resources::EnvironmentSurvivors> {
+        None
+    }
+    fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
+        None
+    }
     fn id(&self) -> &EnvironmentId;
     fn image(&self) -> &ImageId;
     /// Immutable content digest of the image actually backing this environment.
@@ -406,6 +414,7 @@ pub fn legacy_environment_spec(spec: &flotilla_protocol::EnvironmentSpec) -> Res
         return Err("waiting on build: declare an ImageBuild and pin its resulting digest".into());
     };
     Ok(flotilla_resources::EnvironmentSpec {
+        cloud_sandbox: None,
         provider_address: None,
         host_direct: None,
         docker: Some(flotilla_resources::DockerEnvironmentSpec {

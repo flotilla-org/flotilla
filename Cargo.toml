@@ -86,11 +86,18 @@ license = "Apache-2.0 OR MIT"
 # When adding dependencies anywhere in the workspace, update the external-crate
 # allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
-rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "0e17afbd10eab95614a2033159d2dabde30e5eea" }
-rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "0e17afbd10eab95614a2033159d2dabde30e5eea" }
-rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "0e17afbd10eab95614a2033159d2dabde30e5eea" }
-rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "0e17afbd10eab95614a2033159d2dabde30e5eea" }
-rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "0e17afbd10eab95614a2033159d2dabde30e5eea" }
+drydock = { git = "https://github.com/flotilla-org/drydock", rev = "4a0e4b24811e9f85c9750ce2d9a744895e66322f" }
+drydock-protocol = { git = "https://github.com/flotilla-org/drydock", rev = "4a0e4b24811e9f85c9750ce2d9a744895e66322f" }
+drydock-agent = { git = "https://github.com/flotilla-org/drydock", rev = "4a0e4b24811e9f85c9750ce2d9a744895e66322f" }
+drydock-transport = { git = "https://github.com/flotilla-org/drydock", rev = "4a0e4b24811e9f85c9750ce2d9a744895e66322f" }
+drydock-host = { git = "https://github.com/flotilla-org/drydock", rev = "4a0e4b24811e9f85c9750ce2d9a744895e66322f" }
+rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "8c5fef84c6ce9c01ea56fb680a83986c1f14941d" }
+rigging-ssh = { git = "https://github.com/flotilla-org/rigging", rev = "8c5fef84c6ce9c01ea56fb680a83986c1f14941d" }
+rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "8c5fef84c6ce9c01ea56fb680a83986c1f14941d" }
+rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "8c5fef84c6ce9c01ea56fb680a83986c1f14941d" }
+rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "8c5fef84c6ce9c01ea56fb680a83986c1f14941d" }
+rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "8c5fef84c6ce9c01ea56fb680a83986c1f14941d" }
+rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "8c5fef84c6ce9c01ea56fb680a83986c1f14941d" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_yml = "0.0.12"
 tokio-util = "0.7"
@@ -101,7 +108,7 @@ sha2 = "0.10"
 http = "1"
 bytes = "1"
 uuid = "1"
-libc = "0.2"
+libc = { version = "0.2", features = ["extra_traits"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -157,7 +164,7 @@ flotilla-vessel-agent = { path = "crates/flotilla-vessel-agent" }
 ratatui = { version = "0.30", optional = true }
 tokio = { workspace = true }
 color-eyre = { workspace = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "string"] }
 bon = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }

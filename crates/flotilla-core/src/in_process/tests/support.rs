@@ -457,6 +457,7 @@ pub(in crate::in_process) async fn create_test_environment(daemon: &InProcessDae
         .create(
             &test_meta(name),
             &ResourceEnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.to_string(), repo_default_dir: "/tmp".to_string() }),
                 docker: None,

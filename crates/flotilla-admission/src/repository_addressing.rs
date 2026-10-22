@@ -353,6 +353,7 @@ mod tests {
         let observed = backend();
         let key = repository(&durable, "widgets", "acme/widgets").await;
         let environment = EnvironmentSpec {
+            cloud_sandbox: None,
             provider_address: None,
             host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/work".into() }),
             docker: None,

@@ -180,19 +180,23 @@ impl DockerControllerRuntime {
                     environment.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned(),
                 ),
                 Err(ResourceError::NotFound { .. }) => {
-                    (EnvironmentSpec { provider_address: None, host_direct: None, docker: Some(spec.clone()) }, None)
+                    (EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) }, None)
                 }
                 Err(error) => return Err(error.to_string()),
             };
-        environment_spec.docker = Some(spec.clone());
+        if environment_spec.cloud_sandbox.is_none() {
+            environment_spec.docker = Some(spec.clone());
+        }
         let provider = self.provider_for_spec(name, &environment_spec, instance.as_deref()).await?;
-        let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new() };
+        let jobs = environment_spec.cloud_sandbox.as_ref().map(|cloud| cloud.size.cpus as usize);
+        let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new_with(jobs) };
         let mut tools = if provider.receives_host_tools() {
             self.state.environment_tools.prepare(DOCKER_PROVIDER_KIND, name, &context).await?
         } else {
             Vec::new()
         };
         if provider.receives_host_tools() {
+            let cloud = environment_spec.cloud_sandbox.is_some();
             let sockets = self
                 .state
                 .environment_sockets
@@ -209,7 +213,7 @@ impl DockerControllerRuntime {
                     }
                 }
                 for asset in &mut tool.assets {
-                    if asset.kind == EnvironmentToolAssetKind::UnixSocket {
+                    if !cloud && asset.kind == EnvironmentToolAssetKind::UnixSocket {
                         // Mount a dedicated directory containing only this socket.
                         // Keeping the directory stable permits socket replacement on restart.
                         asset.host_path = flotilla_protocol::DaemonHostPath::new(
@@ -363,7 +367,19 @@ impl DockerControllerRuntime {
         let mut provisioned_mounts = Vec::with_capacity(spec.mounts.len() + material_deliveries.len());
         provisioned_mounts.extend(spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount));
         for delivery in &material_deliveries {
-            provisioned_mounts.push(delivery.mount.clone());
+            if environment_spec.cloud_sandbox.is_some() {
+                tools.push(flotilla_environment::environment::EnvironmentTool::new("agent-material", "/").with_asset(
+                    flotilla_environment::environment::EnvironmentToolAsset::new(
+                        delivery.mount.host_path.as_path(),
+                        delivery.mount.environment_path.as_path(),
+                        EnvironmentToolAssetKind::Directory,
+                        flotilla_environment::environment::EnvironmentToolAssetAccess::ReadOnly,
+                        "frozen initial agent material",
+                    ),
+                ));
+            } else {
+                provisioned_mounts.push(delivery.mount.clone());
+            }
         }
         let jobs = context.rust_build_jobs().await?;
         let opts = CreateOpts {
@@ -620,6 +636,18 @@ impl DockerControllerRuntime {
                 .await);
             }
         };
+        if environment_spec.cloud_sandbox.is_some() {
+            if let Err(error) = verify_cloud_image_needs(spec, &handle, &bag).await {
+                return Err(discard_failed_environment(
+                    &handle,
+                    self.state.credential_store.as_deref(),
+                    self.state.agent_material.as_deref(),
+                    name,
+                    error,
+                )
+                .await);
+            }
+        }
         if let Err(error) = verify_declared_agent_adapters(spec, &registry) {
             return Err(discard_failed_environment(
                 &handle,
@@ -646,9 +674,13 @@ impl DockerControllerRuntime {
             .await);
         }
         let handle_registry_digest = handle.registry_digest().map(str::to_owned);
+        let provider_descriptor = handle.provider_descriptor().map(Box::new);
+        let survivors = handle.survivors();
         self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { handle });
         Ok(EnvironmentProvisioning {
             backing_id: Some(container_id),
+            provider_descriptor,
+            survivors,
             image_ref: Some(image_ref),
             local_image_id: Some(local_image_id),
             registry_digest: handle_registry_digest,
@@ -670,6 +702,32 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         spec: &EnvironmentSpec,
     ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
         use flotilla_provisioning::reconcilers::EnvironmentProvisioning;
+        if let Some(cloud) = &spec.cloud_sandbox {
+            let carrier = flotilla_resources::DockerEnvironmentSpec {
+                host_ref: self.state.local_host_ref.clone(),
+                image: cloud.image.clone(),
+                image_build_ref: None,
+                declared_agent_adapters: cloud
+                    .env
+                    .get("FLOTILLA_REQUIRED_AGENT_ADAPTERS")
+                    .map(|s| serde_json::from_str(s))
+                    .transpose()
+                    .map_err(|_| "invalid required adapter declaration")?
+                    .unwrap_or_default(),
+                required_agent_adapters: cloud
+                    .env
+                    .get("FLOTILLA_REQUIRED_AGENT_ADAPTERS")
+                    .map(|s| serde_json::from_str(s))
+                    .transpose()
+                    .map_err(|_| "invalid required adapter declaration")?
+                    .unwrap_or_default(),
+                pull_policy: Default::default(),
+                memory_policy: Default::default(),
+                mounts: vec![],
+                env: cloud.env.clone(),
+            };
+            return self.provision_docker(name, &carrier).await;
+        }
         if let Some(docker) = &spec.docker {
             return self.provision_docker(name, docker).await;
         }
@@ -792,6 +850,63 @@ impl EnvironmentRuntime for DockerControllerRuntime {
             return Err(cleanup_errors.join("; "));
         }
         Ok(())
+    }
+}
+
+struct GuestProbeEnvironment<'a>(&'a EnvironmentBag);
+impl flotilla_provider_runtime::EnvVars for GuestProbeEnvironment<'_> {
+    fn get(&self, key: &str) -> Option<String> {
+        if key == "FLOTILLA_PROBE_MODELS" {
+            Some(String::new())
+        } else {
+            self.0.find_env_var(key).map(str::to_owned)
+        }
+    }
+}
+async fn verify_cloud_image_needs(
+    spec: &flotilla_resources::DockerEnvironmentSpec,
+    handle: &EnvironmentHandle,
+    bag: &EnvironmentBag,
+) -> Result<(), String> {
+    let needs: BTreeSet<flotilla_resources::CapabilityNeed> = spec
+        .env
+        .get("FLOTILLA_CLOUD_IMAGE_NEEDS")
+        .map(|value| serde_json::from_str(value))
+        .transpose()
+        .map_err(|_| "invalid cloud image probe needs")?
+        .unwrap_or_default();
+    if needs.is_empty() {
+        return Ok(());
+    }
+    // This helper adopts an already-running command endpoint only for detection;
+    // it never provisions or selects a runtime for the sandbox.
+    let detector = flotilla_environment::environment::command_provider(
+        flotilla_environment::environment::EnvironmentInput::HostDirect,
+        handle.runner(),
+    );
+    let kind = flotilla_resources::FulfilmentKindSpec {
+        host_ref: String::new(),
+        pool: "cleat".into(),
+        cost_class: Default::default(),
+        grants: Default::default(),
+        realisation: flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { image: spec.image.clone() },
+    };
+    let facts = crate::fulfilment_probe::probe_kind(
+        &kind,
+        crate::fulfilment_probe::DetectionTarget { image: None, provider: detector.as_ref() },
+        true,
+        &*handle.runner(),
+        &GuestProbeEnvironment(bag),
+        Path::new("/tmp/flotilla/probe"),
+        &mut Default::default(),
+    )
+    .await?;
+    let missing =
+        needs.iter().filter(|need| !need.covered_by(&Default::default(), Some(&facts))).map(ToString::to_string).collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("cloud image does not satisfy {}", missing.join(", ")))
     }
 }
 

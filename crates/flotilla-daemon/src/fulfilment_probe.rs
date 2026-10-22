@@ -233,7 +233,9 @@ pub(crate) async fn probe_kind(
                 // Docker receives neither the host credential file nor host
                 // auth environment. The inspected image ID identifies its
                 // bundled credential and execution environment.
-                FulfilmentRealisation::DockerPerVessel { .. } => "image-contained".to_string(),
+                FulfilmentRealisation::DockerPerVessel { .. } | FulfilmentRealisation::CloudSandboxPerVessel { .. } => {
+                    "image-contained".to_string()
+                }
             };
             for model in declared_models(env) {
                 let key = format!(
@@ -311,6 +313,7 @@ mod tests {
         let kind = match spec.realisation {
             FulfilmentRealisation::HostDirect => EnvironmentInput::HostDirect,
             FulfilmentRealisation::DockerPerVessel { .. } => EnvironmentInput::Docker,
+            FulfilmentRealisation::CloudSandboxPerVessel { .. } => return Err("cloud probes require the provisioned environment".into()),
         };
         let provider = command_provider(kind, runner.clone());
         super::probe_kind(

@@ -1093,3 +1093,82 @@ const OWNED_BUILDER_NAME: &str = "flotilla-images";
 mod test_git_repo;
 #[cfg(test)]
 mod tests;
+
+/// Optional provider-only Drydock configuration. Supervision remains at the
+/// composition root; the adapter sees only ProviderApi and host readiness.
+#[cfg(unix)]
+async fn compose_drydock(
+    config: &ConfigStore,
+    registry: &mut ProviderRegistry,
+    env: &dyn flotilla_provider_runtime::EnvVars,
+) -> Result<(), String> {
+    use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
+    use flotilla_environment::environment::{drydock::DrydockEnvironmentProvider, EnvironmentProvider};
+    let path = config.base_path().as_path().join("drydock.toml");
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read drydock provider configuration: {error}")),
+    };
+    let configuration = drydock::config::Config::parse(&text)?;
+    if configuration.provider.is_empty() {
+        return Ok(());
+    }
+    let mut providers = Vec::new();
+    let mut credentials = std::collections::BTreeMap::new();
+    let mut modules = std::collections::BTreeMap::new();
+    for (name, provider) in &configuration.provider {
+        modules.insert(
+            provider.module.clone(),
+            drydock_protocol::ModuleConfiguration { name: provider.module.clone(), entrypoint: provider.module.clone() },
+        );
+        credentials.insert(name.clone(), provider.credential.reference(env)?);
+        providers.push(drydock_protocol::ProviderConfiguration {
+            name: name.clone(),
+            module: provider.module.clone(),
+            settings: provider.settings.clone(),
+            credential: drydock_protocol::CredentialMode::Direct { credential_reference: name.clone() },
+        });
+    }
+    let binary = drydock::local::companion("drydock-host", "DRYDOCK_HOST_BIN").unwrap_or_else(|_| PathBuf::from("drydock-host"));
+    let supervisor = drydock::Supervisor::new(
+        config.state_dir().as_path().join("drydock-hosts"),
+        Arc::new(drydock::credentials::BuiltinCredentials::default()),
+    );
+    let host = Arc::new(
+        supervisor
+            .start(drydock::HostSpec {
+                name: "rust".into(),
+                connection: drydock::HostConnection::Managed {
+                    command: vec![binary.to_string_lossy().into_owned()],
+                    runtime: None,
+                    proxy_environment: Default::default(),
+                },
+                configuration: drydock_protocol::HostConfiguration { modules: modules.into_values().collect(), providers },
+                credentials,
+            })
+            .await
+            .map_err(|error| error.to_string())?,
+    );
+    for (name, provider) in configuration.provider {
+        if registry.environment_providers.contains_key(&name) {
+            return Err(format!("duplicate environment provider instance {name}"));
+        }
+        let adapter: Arc<dyn EnvironmentProvider> = Arc::new(
+            DrydockEnvironmentProvider::new(
+                Arc::new(host.client.clone()),
+                name.clone(),
+                provider.module,
+                config.state_dir().as_path().join("drydock-keys"),
+            )
+            .with_host(host.clone()),
+        );
+        adapter.detect_readiness().await;
+        registry.environment_providers.insert(
+            name.clone(),
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, &name),
+            adapter,
+        );
+    }
+    Ok(())
+}

@@ -376,7 +376,10 @@ pub(super) async fn probe_local_provider_registry(
         .next()
         .map(ExecutionEnvironmentPath::new)
         .unwrap_or_else(|| ExecutionEnvironmentPath::new("/"));
-    Ok(Arc::new(daemon.discovery_runtime().factories.probe_all(&local_bag, config, &probe_root, runner).await))
+    let mut registry = daemon.discovery_runtime().factories.probe_all(&local_bag, config, &probe_root, runner).await;
+    #[cfg(unix)]
+    super::compose_drydock(config, &mut registry, daemon.discovery_runtime().env.as_ref()).await?;
+    Ok(Arc::new(registry))
 }
 
 pub(super) async fn build_local_profile(
@@ -508,10 +511,12 @@ pub(super) async fn observe_fulfilment_facts(
                 continue;
             }
             FulfilmentRealisation::HostDirect => None,
+            FulfilmentRealisation::CloudSandboxPerVessel { .. } => continue,
         };
         let provider_kind = match kind.spec.realisation {
             FulfilmentRealisation::HostDirect => EnvironmentInput::HostDirect,
             FulfilmentRealisation::DockerPerVessel { .. } => EnvironmentInput::Docker,
+            FulfilmentRealisation::CloudSandboxPerVessel { .. } => continue,
         };
         let Some((_, provider)) = probe.providers.environment_providers.for_legacy_input(provider_kind) else {
             debug!(kind = %kind.metadata.name, ?provider_kind, "cannot observe fulfilment facts without an unambiguous environment provider");

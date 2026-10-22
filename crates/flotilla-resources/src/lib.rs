@@ -150,8 +150,9 @@ pub use dispatch_hold::{
 };
 pub use dispatch_observation::{DispatchObservation, DispatchObservationSpec, DISPATCH_RECONCILER_PROVENANCE};
 pub use environment::{
-    host_direct_environment_name, validate_environment_provider_address, DockerEnvironmentSpec, Environment, EnvironmentMemoryPolicy,
-    EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch,
+    host_direct_environment_name, validate_environment_provider_address, CloudSandboxEnvironmentSpec, CloudSandboxSize,
+    DockerEnvironmentSpec, Environment, EnvironmentMemoryPolicy, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
+    EnvironmentProviderDescriptor, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, EnvironmentSurvivors,
     HostDirectEnvironmentSpec, HOST_DIRECT_NAME_PREFIX,
 };
 pub use error::{FinalizerWaitReason, ResourceError};
@@ -185,9 +186,9 @@ pub use manifest_root::{
     ResolutionAction, ResolutionOutcome,
 };
 pub use placement_policy::{
-    DockerCheckoutStrategy, DockerImagePullPolicy, DockerImageSource, DockerPerVesselPlacementPolicySpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, PlacementPolicy, PlacementPolicySpec, ProviderRequirements,
-    DOCKER_POLICY_NAME_PREFIX,
+    CloudSandboxCheckout, CloudSandboxPerVesselPlacementPolicySpec, DockerCheckoutStrategy, DockerImagePullPolicy, DockerImageSource,
+    DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, PlacementPolicy,
+    PlacementPolicySpec, ProviderRequirements, DOCKER_POLICY_NAME_PREFIX,
 };
 pub use platform::Platform;
 pub use prepared_snapshot::{content_hash, is_prepared_snapshot, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND};

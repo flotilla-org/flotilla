@@ -82,6 +82,8 @@ impl<R> EnvironmentReconciler<R> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvironmentProvisioning {
     pub configured_limits: Option<ConfiguredResourceLimits>,
+    pub provider_descriptor: Option<Box<flotilla_resources::EnvironmentProviderDescriptor>>,
+    pub survivors: Option<flotilla_resources::EnvironmentSurvivors>,
     pub backing_id: Option<String>,
     pub image_ref: Option<String>,
     pub local_image_id: Option<String>,
@@ -91,7 +93,7 @@ pub struct EnvironmentProvisioning {
 pub enum EnvironmentPrepared {
     Foreign,
     None,
-    Ready(EnvironmentProvisioning),
+    Ready(Box<EnvironmentProvisioning>),
     Failed(String),
     Waiting(String),
 }
@@ -163,13 +165,13 @@ where
                         )
                         .await
                     {
-                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(provisioning)),
+                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
                         Err(message) if message.starts_with("waiting on build:") => Ok(EnvironmentPrepared::Waiting(message)),
                         Err(message) => Ok(EnvironmentPrepared::Failed(message)),
                     }
                 } else {
                     match self.runtime.provision_environment(&obj.metadata.name, &obj.spec).await {
-                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(provisioning)),
+                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
                         Err(message) => Ok(EnvironmentPrepared::Failed(message)),
                     }
                 }
@@ -189,6 +191,21 @@ where
         }
         let patch = match obj.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending) {
             EnvironmentPhase::Pending | EnvironmentPhase::Provisioning => match prepared {
+                EnvironmentPrepared::Ready(provisioning) if obj.spec.cloud_sandbox.is_some() => {
+                    match (&provisioning.backing_id, &provisioning.image_ref, &provisioning.provider_descriptor, &provisioning.survivors) {
+                        (Some(backing_id), Some(image_ref), Some(provider_descriptor), Some(survivors)) => {
+                            Some(EnvironmentStatusPatch::MarkCloudReady {
+                                backing_id: backing_id.clone(),
+                                image_ref: image_ref.clone(),
+                                provider_descriptor: provider_descriptor.clone(),
+                                survivors: survivors.clone(),
+                            })
+                        }
+                        _ => Some(EnvironmentStatusPatch::MarkFailed {
+                            message: "cloud provider omitted backing, image, descriptor or survivors".into(),
+                        }),
+                    }
+                }
                 EnvironmentPrepared::Ready(provisioning) => Some(EnvironmentStatusPatch::MarkReady {
                     configured_limits: provisioning.configured_limits.clone(),
                     docker_container_id: provisioning.backing_id.clone(),
@@ -217,7 +234,9 @@ where
         if !self.backend.query_declared::<Checkout>(&self.namespace, &query).await?.items.is_empty() {
             return Err(ResourceError::FinalizerPending);
         }
-        if let Some(container_id) = obj.status.as_ref().and_then(|status| status.docker_container_id.as_deref()) {
+        if let Some(container_id) =
+            obj.status.as_ref().and_then(|status| status.backing_id.as_deref().or(status.docker_container_id.as_deref()))
+        {
             self.runtime.destroy(&obj.metadata.name, container_id).await.map_err(ResourceError::other)?;
         } else if obj.spec.provider_address.is_some() || obj.spec.docker.is_some() {
             self.runtime.destroy_unrecorded(&obj.metadata.name).await.map_err(ResourceError::other)?;

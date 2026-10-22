@@ -9,6 +9,7 @@ async fn credential_refresh_retry_waits_until_deadline_without_rewriting_status(
         .create(
             &empty_meta("refresh-work"),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
                 docker: None,

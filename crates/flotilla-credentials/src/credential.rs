@@ -2965,6 +2965,7 @@ mod tests {
                 .create(
                     &InputMeta::builder().name("env".into()).build(),
                     &EnvironmentSpec {
+                        cloud_sandbox: None,
                         provider_address: None,
                         host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/workspace".into() }),
                         docker: None,

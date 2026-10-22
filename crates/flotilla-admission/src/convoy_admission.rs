@@ -1780,7 +1780,7 @@ impl AdmissionReadContext<'_> {
             .including_replicas::<PlacementPolicy>(namespace)
             .get(&placement.policy_name)
             .await
-            .is_ok_and(|source| placement_host_ref(&source.object).is_some());
+            .is_ok_and(|source| placement_host_ref(&source.object).is_some() || source.object.spec.cloud_sandbox_per_vessel.is_some());
         if !has_replica && !is_host_targeted_placement {
             return Ok(());
         }
@@ -2641,7 +2641,11 @@ impl AdmissionReadContext<'_> {
                 }
                 _ => None,
             };
-            let image_covers = |need: &CapabilityNeed| composed.is_some() && need.is_image_need();
+            // Remote image testimony is checked inside the actual sandbox before
+            // crew launch. Host privileges and other grants are never deferred.
+            let cloud_probe = matches!(kind.spec.realisation, flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { .. });
+            let image_covers =
+                |need: &CapabilityNeed| composed.is_some() && need.is_image_need() || cloud_probe && need.requires_guest_probe();
             let structurally_missing = needs
                 .iter()
                 .filter(|need| {
@@ -2663,6 +2667,7 @@ impl AdmissionReadContext<'_> {
             if purpose == PlacementPurpose::Admission
                 && facts.is_none()
                 && composed.is_none()
+                && !cloud_probe
                 && needs
                     .iter()
                     .any(|need| matches!(need, CapabilityNeed::GuiSession | CapabilityNeed::Toolchain(_) | CapabilityNeed::Harness { .. }))
@@ -2731,7 +2736,13 @@ impl AdmissionReadContext<'_> {
                         rejected.push(refusal("fulfilment kind and placement policy disagree on image composition".into()));
                         continue;
                     }
-                    let realization_matches = policy_host_ref.is_some() && policy_host == canonical_kind_host;
+                    let realization_matches =
+                        if matches!(kind.spec.realisation, flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { .. }) {
+                            policy.spec.cloud_sandbox_per_vessel.is_some()
+                                && Some(placement_target_host(&self.backend, namespace, policy).await?.reference) == canonical_kind_host
+                        } else {
+                            policy_host_ref.is_some() && policy_host == canonical_kind_host
+                        };
                     if !realization_matches {
                         rejected.push(refusal("fulfilment kind and placement policy disagree on host or realisation".into()));
                         continue;
@@ -4346,6 +4357,11 @@ pub async fn validate_workflow_agent_adapters(
     allow_unready: bool,
 ) -> Result<(), String> {
     let required_adapters = required_workflow_agent_adapters(workflow)?;
+    // Cloud images are verified through interior discovery before crew launch.
+    // The controller cannot run an image-local probe for a remote sandbox.
+    if placement.is_some_and(|p| p.spec.cloud_sandbox_per_vessel.is_some()) {
+        return Ok(());
+    }
     // A composed image derives its harness layers from these same roles.
     if placement
         .and_then(|policy| policy.spec.docker_per_vessel.as_ref())
@@ -4989,7 +5005,7 @@ async fn image_placement_cost(
         IMAGE_DIGESTS_CAPABILITY,
     };
     let image = match realisation {
-        FulfilmentRealisation::HostDirect => return Ok(ImageAcquisitionCost::Held),
+        FulfilmentRealisation::HostDirect | FulfilmentRealisation::CloudSandboxPerVessel { .. } => return Ok(ImageAcquisitionCost::Held),
         FulfilmentRealisation::DockerPerVessel { image } => image,
     };
     let held = host

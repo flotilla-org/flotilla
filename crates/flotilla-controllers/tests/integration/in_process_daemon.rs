@@ -9312,6 +9312,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         .create(
             &InputMeta::builder().name("idle-environment".to_string()).build(),
             &flotilla_resources::EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
                     host_ref: local_host_ref,
