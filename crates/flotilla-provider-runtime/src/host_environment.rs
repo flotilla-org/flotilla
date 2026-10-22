@@ -115,7 +115,11 @@ impl HostEnvironment {
     }
 
     /// Shell assignments that establish the composed environment for one
-    /// command run on the host, expanding `~` there against its `$HOME`.
+    /// command run on the host, expanding `~` there against its `$HOME`. The
+    /// controller-side expansions use the `HOME` discovered by running `env`
+    /// through this same prelude over SSH, so both name the same login home.
+    /// Variable names are written unquoted: [`Self::new`] admits only valid
+    /// shell identifiers, and it is the only constructor with supplies.
     pub fn shell_prelude(&self) -> String {
         let path = self
             .supplies
