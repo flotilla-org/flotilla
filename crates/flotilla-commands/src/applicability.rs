@@ -69,6 +69,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::LinkIssuesToChangeRequest { .. }
         | CommandAction::ArchiveSession { .. }
         | CommandAction::ConvoyWorkForceComplete { .. }
+        | CommandAction::ConvoyPromiseVerdict { .. }
         | CommandAction::ConvoyDelete { .. }
         | CommandAction::ConvoyLink { .. }
         | CommandAction::ConvoyUnlink { .. }

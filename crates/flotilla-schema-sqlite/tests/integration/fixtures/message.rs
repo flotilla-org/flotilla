@@ -45,6 +45,7 @@ pub fn body(tc: &TestCase, pick: Pick) -> Frozen<MessageBody> {
             promises: [(
                 PromiseId(0),
                 AdmittedPromise {
+                    label: name(tc),
                     kind: name(tc),
                     target: address(tc),
                     source: PromiseSource::Template,

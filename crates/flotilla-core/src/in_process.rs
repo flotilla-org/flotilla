@@ -711,6 +711,9 @@ pub struct InProcessDaemon {
     message_path: crate::primitives::MessagePath,
     /// The same path, as crew code reaches it: through its EngineMessages port.
     crew_message_path: flotilla_crew::ports::MessagePath,
+    /// The `[primitives]` Convoy path (#3587 layer 6), as crew code and the
+    /// convoy reconciler reach it.
+    convoy_engine_path: flotilla_resources::convoy::engine::EngineConvoyPath,
     message_receivers: projection_ports::MessageReceivers,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
     /// Unique identity for this daemon instance, generated at startup.
@@ -1170,6 +1173,7 @@ impl InProcessDaemon {
         let message_inboxes = Arc::new(Mutex::new(HashMap::new()));
         let message_path = crate::primitives::MessagePath::default();
         let crew_message_path = flotilla_crew::ports::MessagePath::default();
+        let convoy_engine_path = flotilla_resources::convoy::engine::EngineConvoyPath::default();
         let leaf_subscriptions =
             LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher)
                 .with_clock(Arc::clone(&clock))
@@ -1205,6 +1209,7 @@ impl InProcessDaemon {
             CrewService::builder()
                 .message_inboxes(Arc::clone(&message_inboxes))
                 .message_path(Arc::clone(&crew_message_path))
+                .convoy_engine(Arc::clone(&convoy_engine_path))
                 .capability_cards(flotilla_crew::crew_capabilities::CapabilityCardTracker::with_message_path(Arc::clone(
                     &crew_message_path,
                 )))
@@ -1276,6 +1281,7 @@ impl InProcessDaemon {
             message_receivers: projection_ports::MessageReceivers(Arc::clone(&message_path)),
             message_path,
             crew_message_path,
+            convoy_engine_path,
             brief_artifact_writer: Arc::clone(&brief_artifact_writer),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
@@ -2085,8 +2091,15 @@ impl InProcessDaemon {
     /// after its decided store. Absent, every Message stays in the old store.
     pub fn install_message_primitives(&self, primitives: Arc<crate::primitives::MessagePrimitives>) -> Result<(), String> {
         self.message_path.set(Arc::clone(&primitives)).map_err(|_| "the Message path is already installed".to_owned())?;
+        let convoys: Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> = primitives.convoy_engine().clone();
+        self.convoy_engine_path.set(convoys).map_err(|_| "the Convoy path is already installed".to_owned())?;
         let engine: Arc<dyn flotilla_crew::ports::EngineMessages> = primitives;
         self.crew_message_path.set(engine).map_err(|_| "the crew's Message path is already installed".to_owned())
+    }
+
+    /// The `[primitives]` Convoy path: empty until the switch's primitives are installed.
+    pub fn convoy_engine_path(&self) -> flotilla_resources::convoy::engine::EngineConvoyPath {
+        Arc::clone(&self.convoy_engine_path)
     }
 
     /// The `[primitives]` Message path, when the switch is on.
@@ -2498,7 +2511,8 @@ impl InProcessDaemon {
             flotilla_protocol::CommandAction::CrewSupervise { namespace, convoy, .. } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), convoy.as_str())
             }
-            flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, .. } => {
+            flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, .. }
+            | flotilla_protocol::CommandAction::ConvoyPromiseVerdict { convoy, .. } => {
                 (self.provisioning_namespace().await, convoy.as_str())
             }
             flotilla_protocol::CommandAction::CrewPromise { context, .. }
@@ -5285,7 +5299,10 @@ impl InProcessDaemon {
                 return boxed_action!(crew.execute_action_convoy_abandon(id, &command, &caller, &dispatching_principal_ref))
             }
             CommandAction::ConvoyWorkForceComplete { .. } => {
-                return boxed_action!(crew.execute_action_convoy_work_force_complete(id, &command))
+                return boxed_action!(crew.execute_action_convoy_work_force_complete(id, &command, &dispatching_principal_ref))
+            }
+            CommandAction::ConvoyPromiseVerdict { .. } => {
+                return boxed_action!(crew.execute_action_convoy_promise_verdict(id, &command, &dispatching_principal_ref))
             }
             CommandAction::ConvoyStart { .. } => {
                 return boxed_action!(admission.execute_action_convoy_start(id, &command, &dispatching_principal_ref))

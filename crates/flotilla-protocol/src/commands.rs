@@ -932,6 +932,15 @@ pub enum CommandAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// An operator keeps (or retracts) one promise by its label, with a
+    /// reason: the engine's verdict edge (#3587 layer 6). Refused while
+    /// `[primitives]` is off or the engine does not hold the convoy.
+    ConvoyPromiseVerdict {
+        convoy: String,
+        promise: String,
+        keep: bool,
+        reason: String,
+    },
     ConvoyDelete {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
@@ -1300,6 +1309,8 @@ impl Command {
             CommandAction::ArchiveSession { .. } => "Archiving session...",
             CommandAction::GenerateBranchName { .. } => "Generating branch name...",
             CommandAction::ConvoyWorkForceComplete { .. } => "Force-completing work...",
+            CommandAction::ConvoyPromiseVerdict { keep: true, .. } => "Keeping promise by verdict...",
+            CommandAction::ConvoyPromiseVerdict { keep: false, .. } => "Retracting promise by verdict...",
             CommandAction::ConvoyDelete { .. } => "Deleting convoy...",
             CommandAction::ConvoyLink { .. } => "Linking convoy subject...",
             CommandAction::ConvoyUnlink { .. } => "Unlinking convoy subject...",
@@ -1759,6 +1770,14 @@ mod tests {
                     convoy: "convoy-a".into(),
                     work: "implement".into(),
                     message: Some("done".into()),
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::ConvoyPromiseVerdict {
+                    convoy: "convoy-a".into(),
+                    promise: "template/pr".into(),
+                    keep: true,
+                    reason: "merged by hand".into(),
                 })
                 .build(),
             Command::builder()

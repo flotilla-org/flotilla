@@ -166,10 +166,15 @@ pub struct Submission {
 /// One promise of the convoy: what is promised (an opaque kind and the
 /// target's address, which need not exist yet), where it came from, the seat
 /// that owns it, its progress and its submissions. `id` is the spec's promise
-/// id; a `Reassign` changes only `owner`.
+/// id; a `Reassign` changes only `owner`. `label` is the name crews and views
+/// use (`template/pr`, `l2-quint`): per-convoy instance data like a seat name,
+/// unique within the convoy (#3587 layer 6 labels ruling).
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
+#[store(index(name = "by_label", eq(label), unique))]
 pub struct Promise {
     pub id: PromiseId,
+    #[store(intern = "pl")]
+    pub label: String,
     #[store(intern = "pk")]
     pub kind: String,
     pub target: Address,
@@ -334,6 +339,7 @@ impl ConvoySpec {
 /// the seat that owns it. It starts Pending with no submissions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmittedPromise {
+    pub label: String,
     pub kind: String,
     pub target: Address,
     pub source: PromiseSource,
@@ -380,6 +386,7 @@ pub enum Authority {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Declare {
     pub promise: PromiseId,
+    pub label: String,
     pub kind: String,
     pub target: Address,
     pub owner: SeatName,
@@ -854,6 +861,7 @@ impl Machine for Convoy {
         for (id, promise) in request.promises {
             let row = Promise {
                 id,
+                label: promise.label,
                 kind: promise.kind,
                 target: promise.target,
                 source: promise.source,
@@ -1078,6 +1086,7 @@ fn gate_readmit(h: &mut Handle<'_, Convoy>, readmit: &Readmit) -> Result<(), Con
 fn declare(h: &mut Handle<'_, Convoy>, state: ConvoyState, declare: &Declare) -> ConvoyState {
     let row = Promise {
         id: declare.promise,
+        label: declare.label.clone(),
         kind: declare.kind.clone(),
         target: declare.target.clone(),
         source: PromiseSource::Crew,

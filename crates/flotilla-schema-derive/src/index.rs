@@ -5,6 +5,7 @@
 //! ```text
 //! index(name = "open_by_inbox", eq(inbox), order(accepted_seq), when(state in [Pending, Awaiting]))
 //! index(name = "deadline", order(deadline), when(state in [Pending, Awaiting], deadline is_some))
+//! index(name = "by_label", eq(label), unique)     // on a part: no two rows of one owner share `label`
 //! ```
 //!
 //! `eq` and `order` name top-level single-column fields: unattributed fields whose type (inside
@@ -38,6 +39,7 @@ struct IndexAttr {
     eq: Vec<Ident>,
     order: Vec<Ident>,
     when: Vec<Condition>,
+    unique: bool,
 }
 
 enum Condition {
@@ -63,13 +65,26 @@ pub(crate) struct Indexes<'f, 'a> {
 }
 
 impl<'f, 'a> Indexes<'f, 'a> {
-    pub(crate) fn parse(bodies: &[TokenStream], fields: &'f [Field<'a>], holder_state: Option<&'f Type>) -> syn::Result<Indexes<'f, 'a>> {
+    /// `part`: the struct is a part, whose rows sit in nested tables, so a `unique` index is
+    /// unique within the row's owner.
+    pub(crate) fn parse(
+        bodies: &[TokenStream],
+        fields: &'f [Field<'a>],
+        holder_state: Option<&'f Type>,
+        part: bool,
+    ) -> syn::Result<Indexes<'f, 'a>> {
         let mut indexes = Vec::new();
         let mut names = BTreeSet::new();
         for body in bodies {
             let index = parse_body.parse2(body.clone())?;
             if !names.insert(index.name.value()) {
                 return Err(refuse(&index.name, format_args!("index `{}` is declared twice", index.name.value())));
+            }
+            if index.unique && (!part || index.eq.is_empty() || !index.order.is_empty() || !index.when.is_empty()) {
+                return Err(refuse(
+                    &index.name,
+                    "a unique index belongs on a part struct, unique within the row's owner, with `eq` fields only and no `order` or `when`",
+                ));
             }
             let key = check(&index, fields, holder_state.is_some())?;
             indexes.push((index, key));
@@ -82,6 +97,7 @@ impl<'f, 'a> Indexes<'f, 'a> {
         let schema = schema();
         let indexes = self.indexes.iter().map(|(index, (eq, order))| {
             let name = &index.name;
+            let unique = index.unique;
             let eq = eq.iter().map(|column| &column.field.name);
             let order = order.iter().map(|column| &column.field.name);
             let predicate = index.when.iter().map(|condition| match condition {
@@ -124,6 +140,7 @@ impl<'f, 'a> Indexes<'f, 'a> {
                     eq: ::std::vec![#(::std::string::String::from(#eq)),*],
                     order: ::std::vec![#(::std::string::String::from(#order)),*],
                     predicate: ::std::vec![#(#predicate),*],
+                    unique: #unique,
                 });
             }
         });
@@ -199,6 +216,7 @@ fn parse_body(input: ParseStream<'_>) -> syn::Result<IndexAttr> {
     let mut eq: Option<Vec<Ident>> = None;
     let mut order: Option<Vec<Ident>> = None;
     let mut when: Option<Vec<Condition>> = None;
+    let mut unique = false;
     let span = input.span();
     while !input.is_empty() {
         let key = Ident::parse_any(input)?;
@@ -236,14 +254,21 @@ fn parse_body(input: ParseStream<'_>) -> syn::Result<IndexAttr> {
                     return Err(twice());
                 }
             }
-            other => return Err(refuse(&key, format_args!("unknown index argument `{other}`; an index takes name, eq, order and when"))),
+            "unique" => {
+                if std::mem::replace(&mut unique, true) {
+                    return Err(twice());
+                }
+            }
+            other => {
+                return Err(refuse(&key, format_args!("unknown index argument `{other}`; an index takes name, eq, order, when and unique")))
+            }
         }
         if !input.is_empty() {
             input.parse::<Token![,]>()?;
         }
     }
     let name = name.ok_or_else(|| refuse_at(span, "an index needs `name = \"...\"`"))?;
-    Ok(IndexAttr { name, eq: eq.unwrap_or_default(), order: order.unwrap_or_default(), when: when.unwrap_or_default() })
+    Ok(IndexAttr { name, eq: eq.unwrap_or_default(), order: order.unwrap_or_default(), when: when.unwrap_or_default(), unique })
 }
 
 fn parse_condition(input: ParseStream<'_>) -> syn::Result<Condition> {

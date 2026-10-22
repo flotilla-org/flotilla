@@ -10,7 +10,7 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 | `convoy_duties` | child | 6 | 1: `scope` 1 | `convoy_duties_scope_promises` (child) | – |
 | `convoy_duties_scope_promises` | child | 3 | – | – | – |
 | `convoy_seats` | records | 8 | – | – | – |
-| `convoy_promises` | records | 11 | – | `convoy_promises_submissions` (records) | – |
+| `convoy_promises` | records | 12 | – | `convoy_promises_submissions` (records) | `by_label` (unique convoy, label) |
 | `convoy_promises_submissions` | records | 8 | – | – | `by_address` (address) |
 | `convoy_quota` | state data | 3 | – | – | – |
 | `convoy_retired` | state data | 2 | – | – | – |
@@ -65,6 +65,7 @@ Interned column domains:
 | `convoy_seats` | `parent_role` | `rl` |
 | `convoy_seats` | `parent_seat` | `st` |
 | `convoy_seats` | `supervised_by` | `ad` |
+| `convoy_promises` | `label` | `pl` |
 | `convoy_promises` | `kind` | `pk` |
 | `convoy_promises` | `target` | `ad` |
 | `convoy_promises` | `owner_role` | `rl` |

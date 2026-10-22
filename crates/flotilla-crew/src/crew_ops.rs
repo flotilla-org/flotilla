@@ -104,6 +104,10 @@ pub struct CrewService {
     /// The `[primitives]` switch's Message path; empty while it is off.
     #[builder(default)]
     pub(crate) message_path: crate::ports::MessagePath,
+    /// The `[primitives]` switch's Convoy path (#3587 layer 6): with it set,
+    /// the engine decides each convoy it holds; empty while the switch is off.
+    #[builder(default)]
+    pub(crate) convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
     #[builder(default)]
     resource_intent_publisher: std::sync::RwLock<Option<Weak<dyn ResourceIntentPublisher>>>,
     leaf_subscriptions: LeafSubscriptionTable,
@@ -1090,6 +1094,13 @@ impl CrewService {
                 PromiseOperation::Retract { id, reason }
             }
         };
+        if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
+            // The engine decides (#3587 layer 6): its refusal is the answer, and
+            // the old status follows by the one-way copy.
+            return engine
+                .promise(&convoy, &context.vessel, &context.caller_role, &operation, flotilla_resources::convoy::engine::Actor::Crew)
+                .await;
+        }
         let updated = apply_resource_status_patch(
             &convoys,
             name,
@@ -1175,6 +1186,19 @@ impl CrewService {
                     self.clock.now(),
                 )
             }) {
+                if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
+                    engine
+                        .promise(
+                            &convoy,
+                            &context.vessel,
+                            &context.caller_role,
+                            &operation,
+                            flotilla_resources::convoy::engine::Actor::Crew,
+                        )
+                        .await?;
+                    convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+                    continue;
+                }
                 convoy = apply_resource_status_patch(
                     &convoys,
                     convoy_name,
@@ -1206,6 +1230,16 @@ impl CrewService {
             return Ok(CommandValue::CrewCompletionAdvisory { pending });
         }
         let principal = principal.ok_or_else(|| "`--force` requires an operator principal".to_string())?;
+        if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
+            // `--force` is an operator's attributed verdict on the crew's open
+            // promises (#3574 decision 8); the engine refuses what it may not keep.
+            let scope = flotilla_resources::convoy::engine::VerdictScope {
+                vessel: context.vessel.clone(),
+                role: Some(context.caller_role.clone()),
+            };
+            let reason = message.clone().unwrap_or_else(|| "operator forced completion".to_string());
+            engine.keep_by_verdict(&convoy, &scope, &principal.name, &reason).await?;
+        }
         apply_resource_status_patch(
             &convoys,
             convoy_name,
@@ -1838,8 +1872,12 @@ impl CrewService {
         // retrying the command is safe because archiving is best-effort.
         let archives = self.archive_convoy_checkouts_best_effort(namespace, name).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let expected_phase =
-            convoys.get(name).await.map_err(|err| err.to_string())?.status.map_or(ConvoyPhase::Pending, |status| status.phase);
+        let current = convoys.get(name).await.map_err(|err| err.to_string())?;
+        if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &current) {
+            let principal = principal_ref.map_or("unattributed", |principal| principal.name.as_str());
+            engine.abandon(&current, principal, reason).await?;
+        }
+        let expected_phase = current.status.map_or(ConvoyPhase::Pending, |status| status.phase);
         let authority = match principal_ref {
             Some(principal) if principal.name == PrincipalRef::IMPLICIT_NAME => WorkCompletionAuthority::HumanOverride,
             Some(principal) => WorkCompletionAuthority::Principal(principal.clone()),
@@ -2094,6 +2132,10 @@ impl CrewService {
         };
         let environment_ref = target_session.as_ref().or(anchor.as_ref()).expect("target or anchor session").spec.env_ref.clone();
         let previous_status = convoy.status.clone().ok_or_else(|| format!("convoy `{}` has no status", context.convoy))?;
+        if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
+            // Handoff is the engine's `Reassign` of the sender's open promises (#3574 decision 3).
+            engine.reassign(&convoy, &context.vessel, &context.caller_role, target).await?;
+        }
         let reopened = apply_resource_status_patch(
             &convoys,
             &context.convoy,

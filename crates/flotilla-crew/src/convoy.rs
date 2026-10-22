@@ -4,9 +4,16 @@
 //! operations is [`ConvoyTeardownRuntime`], the reclaim gate that the daemon
 //! implements over the crew service's teardown verification. Redesigning that
 //! boundary is #3519.
+//!
+//! Behind `[primitives]` it also reaches the engine Convoy through the
+//! old-shaped [`EngineConvoys`] port (#3587 layer 6): a freshly bootstrapped
+//! convoy is admitted on the engine, its observations become engine edges
+//! instead of old promise patches, landing's settlement fires `Deliver`
+//! first, and each pass retries the one-way copy into the old status.
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Relationship, Subject};
 use flotilla_resources::address::record_name;
+use flotilla_resources::convoy::engine::{deciding, Actor, Admission, EngineConvoyPath};
 use flotilla_resources::convoy::reconcile::*;
 use flotilla_resources::*;
 use flotilla_store::{
@@ -38,6 +45,8 @@ pub struct ConvoyReconciler {
     clock: Arc<dyn Clock>,
     prepared_snapshot_gc: Option<PreparedSnapshotGarbageCollector>,
     teardown_runtime: Option<Arc<dyn ConvoyTeardownRuntime>>,
+    /// The `[primitives]` switch's Convoy path; empty while it is off.
+    engine: EngineConvoyPath,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +62,9 @@ pub struct ConvoyPrepared {
     settlement_attention: Option<ConvoyAttention>,
     reclaim_eligible: bool,
     capacity_wait: Option<String>,
+    /// The engine refused this convoy's admission: the refusal, as the
+    /// convoy's failure message.
+    engine_refusal: Option<String>,
 }
 
 impl ConvoyReconciler {
@@ -73,7 +85,14 @@ impl ConvoyReconciler {
             clock: Arc::new(SystemClock),
             prepared_snapshot_gc: None,
             teardown_runtime: None,
+            engine: EngineConvoyPath::default(),
         }
+    }
+
+    /// The `[primitives]` switch's Convoy path, set at startup when it is on.
+    pub fn with_engine(mut self, engine: EngineConvoyPath) -> Self {
+        self.engine = engine;
+        self
     }
 
     pub fn with_artifacts(mut self, artifacts: ReplicaReadResolver<Artifact>) -> Self {
@@ -175,6 +194,30 @@ async fn federated_children<T: Resource + std::clone::Clone>(
     convoy: &ResourceObject<Convoy>,
 ) -> Result<BTreeMap<String, ResourceObject<T>>, ResourceError> {
     Ok(select_convoy_children(convoy, &resolver.list().await?.items))
+}
+
+impl ConvoyReconciler {
+    /// Admits a freshly bootstrapped convoy on the engine when the switch is
+    /// on; returns the engine's refusal, if it refused. A convoy the engine
+    /// skips stays on the old path.
+    async fn admit_on_engine(&self, obj: &ResourceObject<Convoy>) -> Option<String> {
+        let engine = self.engine.get()?;
+        if obj.status.as_ref().is_none_or(|status| status.phase.is_terminal()) || engine.holds(obj) {
+            return None;
+        }
+        match engine.admit(obj).await {
+            Ok(Admission::Held) => None,
+            Ok(Admission::Skipped(reason)) => {
+                tracing::debug!(convoy = %obj.metadata.name, ?reason, "convoy stays on the old path");
+                None
+            }
+            Ok(Admission::Refused(refusal)) => Some(refusal),
+            Err(error) => {
+                tracing::warn!(convoy = %obj.metadata.name, %error, "engine admission failed; retrying on the next pass");
+                None
+            }
+        }
+    }
 }
 
 impl Reconciler for ConvoyReconciler {
@@ -326,7 +369,15 @@ impl Reconciler for ConvoyReconciler {
             }
             _ => BTreeMap::new(),
         };
-        let promise_patch = obj.status.as_ref().filter(|status| !status.phase.is_terminal()).and_then(|status| {
+        let engine_refusal = self.admit_on_engine(obj).await;
+        let engine = deciding(&self.engine, obj);
+        if let Some(engine) = engine {
+            // Retry any copy an earlier write could not make.
+            if let Err(error) = engine.copy_back(obj).await {
+                tracing::warn!(convoy = %obj.metadata.name, %error, "copying the engine's promises into the old status failed");
+            }
+        }
+        let observation = obj.status.as_ref().filter(|status| !status.phase.is_terminal()).and_then(|status| {
             flotilla_resources::convoy::promises::next_observation(
                 status,
                 &obj.metadata.name,
@@ -336,7 +387,23 @@ impl Reconciler for ConvoyReconciler {
                 self.clock.now(),
                 self.change_request_stale_after,
             )
-            .or_else(|| flotilla_resources::promises::next_completion(status, self.clock.now()))
+        });
+        let observation = match (engine, observation) {
+            // The engine decides: an observation is its edge, and the old
+            // status follows by the copy, so no old promise patch is written.
+            (Some(engine), Some(ConvoyStatusPatch::ObservePromise { vessel, role, operation })) => {
+                if let Err(error) = engine.promise(obj, &vessel, &role, &operation, Actor::Observer).await {
+                    tracing::info!(convoy = %obj.metadata.name, %vessel, %role, %error, "the engine refused an observed promise edge");
+                }
+                None
+            }
+            (_, observation) => observation,
+        };
+        let promise_patch = observation.or_else(|| {
+            obj.status
+                .as_ref()
+                .filter(|status| !status.phase.is_terminal())
+                .and_then(|status| flotilla_resources::promises::next_completion(status, self.clock.now()))
         });
         let settlement = if is_landing {
             Some(evaluate_landing_settlement_with_disposition(
@@ -352,7 +419,14 @@ impl Reconciler for ConvoyReconciler {
         } else {
             None
         };
-        let exit_disposition = settlement.as_ref().and_then(|settlement| settlement.disposition.clone());
+        let mut exit_disposition = settlement.as_ref().and_then(|settlement| settlement.disposition.clone());
+        if let (Some(engine), Some(_)) = (engine, exit_disposition.as_ref()) {
+            // Landing settles only once the engine has delivered the convoy.
+            if let Err(error) = engine.deliver(obj).await {
+                tracing::info!(convoy = %obj.metadata.name, %error, "the engine refused delivery; landing holds");
+                exit_disposition = None;
+            }
+        }
         let settlement_attention = settlement.as_ref().and_then(|settlement| {
             settlement.evaluation.unmet.iter().find_map(|unmet| match unmet {
                 UnmetSettlementExpectation::ObservedDigestMismatch { reference, claimed, observed } => Some(
@@ -408,6 +482,7 @@ impl Reconciler for ConvoyReconciler {
             settlement_attention,
             reclaim_eligible,
             capacity_wait,
+            engine_refusal,
         })
     }
 
@@ -477,6 +552,25 @@ impl Reconciler for ConvoyReconciler {
         if !missing.is_empty() {
             return ControllerReconcileOutcome {
                 patch: Some(ConvoyStatusPatch::DiscoverSubjects { subjects: missing, source: SubjectDiscoverySource::Branch, at: now }),
+                actuations: Vec::new(),
+                events: Vec::new(),
+                requeue_after: None,
+            };
+        }
+        if let Some(refusal) = &prepared.engine_refusal {
+            // With `[primitives]` on the engine decides admission: a refused
+            // convoy is not admitted, so it fails with the refusal named.
+            return ControllerReconcileOutcome {
+                patch: Some(controller_patches::fail_convoy(
+                    obj.status
+                        .as_ref()
+                        .map(|status| {
+                            status.work.iter().filter(|(_, work)| !work.phase.is_terminal()).map(|(name, _)| (name.clone(), now)).collect()
+                        })
+                        .unwrap_or_default(),
+                    now,
+                    Some(format!("the engine refused this convoy's admission: {refusal}")),
+                )),
                 actuations: Vec::new(),
                 events: Vec::new(),
                 requeue_after: None,

@@ -3,6 +3,7 @@
 // Controllers' fixtures stay with the crew and provisioning tests that also use them.
 #[path = "../../../flotilla-controllers/tests/common/mod.rs"]
 mod common;
+mod convoy_engine_path;
 mod convoy_in_memory;
 mod placement_tiebreak_capacity_wait;
 mod review_bundle;
