@@ -137,7 +137,7 @@ impl<K: LifecycleKind, L: Log<Lifecycle<K>>> LifecycleHome<K, L> {
 
     /// The home, for a restore or a read of its log.
     pub fn with_home<T>(&self, read: impl FnOnce(&mut Home<Lifecycle<K>, L>) -> T) -> T {
-        read(&mut self.home.lock().expect("lifecycle home"))
+        read(&mut self.home.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 }
 
@@ -170,17 +170,17 @@ where
     }
 
     fn get(&self, name: &str) -> Option<Resource<Lifecycle<K>>> {
-        self.home.lock().expect("lifecycle home").get(name).cloned()
+        self.home.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).cloned()
     }
 
     fn request(&self, name: &str, request: K::Request, at: Timestamp) -> Result<Resource<Lifecycle<K>>, EngineError> {
-        let mut home = self.home.lock().expect("lifecycle home");
+        let mut home = self.home.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         home.create(name, request, &MemoryLifecycleWorld::default(), at)?;
         Ok(home.get(name).cloned().expect("created"))
     }
 
     fn step(&self, name: &str, step: &Step, at: Timestamp) -> Result<Resource<Lifecycle<K>>, EngineError> {
-        let mut home = self.home.lock().expect("lifecycle home");
+        let mut home = self.home.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let world = evidence(name, step);
         match step {
             Step::Attempted(outcome) => {
@@ -350,9 +350,17 @@ where
             return Ok(Prepared::Decided(Mutex::new(Some(ReconcileOutcome::new(B::copy(obj, &resource))))));
         }
         let prepared = self.inner.prepare(obj).await?;
+        // The old reconciler's pure reconcile runs here, at the moment the engine records its
+        // steps, so the engine decides on what it reported. The loop's own `now`, a moment later,
+        // is not used: no decision here schedules from it.
         let now = Utc::now();
         let mut outcome = self.inner.reconcile(obj, &prepared, now);
-        let decision = decide::<B>(lifecycles.as_ref(), obj, outcome.patch.take(), now);
+        // Each step is one short SQLite transaction; it runs off the async workers.
+        let owned = ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status: obj.status.clone() };
+        let (lifecycles, patch) = (Arc::clone(lifecycles), outcome.patch.take());
+        let decision = tokio::task::spawn_blocking(move || decide::<B>(lifecycles.as_ref(), &owned, patch, now))
+            .await
+            .map_err(|error| ResourceError::other(format!("engine decision: {error}")))?;
         outcome.patch = decision.patch;
         if decision.ended {
             outcome.requeue_after = None;
@@ -368,21 +376,26 @@ where
     ) -> ReconcileOutcome<Self::Resource> {
         match prepared {
             Prepared::Old(prepared) => self.inner.reconcile(obj, prepared, now),
-            Prepared::Decided(outcome) => outcome.lock().expect("decided outcome").take().unwrap_or_else(|| ReconcileOutcome::new(None)),
+            Prepared::Decided(outcome) => {
+                outcome.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take().unwrap_or_else(|| ReconcileOutcome::new(None))
+            }
         }
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         self.inner.run_finalizer(obj).await?;
         let Some(lifecycles) = &self.lifecycles else { return Ok(()) };
-        let name = &obj.metadata.name;
-        if lifecycles.get(name).is_some_and(|resource| !ended(&resource)) {
-            // The teardown completed: the engine releases it, whatever it held.
-            if let Err(error) = lifecycles.step(name, &Step::Released, at(Utc::now())) {
-                tracing::warn!(resource = %name, kind = <B::Kind as LifecycleKind>::NAME, %error, "engine release failed");
+        let (lifecycles, name) = (Arc::clone(lifecycles), obj.metadata.name.clone());
+        tokio::task::spawn_blocking(move || {
+            if lifecycles.get(&name).is_some_and(|resource| !ended(&resource)) {
+                // The teardown completed: the engine releases it, whatever it held.
+                if let Err(error) = lifecycles.step(&name, &Step::Released, at(Utc::now())) {
+                    tracing::warn!(resource = %name, kind = <B::Kind as LifecycleKind>::NAME, %error, "engine release failed");
+                }
             }
-        }
-        Ok(())
+        })
+        .await
+        .map_err(|error| ResourceError::other(format!("engine release: {error}")))
     }
 
     fn finalizer_name(&self) -> Option<&'static str> {

@@ -464,3 +464,21 @@ async fn image_build_failures_follow_the_build_policy() {
     assert_eq!(decide::<ImageBuildBinding>(home.as_ref(), &obj, Some(built.clone()), Utc::now()).patch, Some(built));
     assert_eq!(home.get("image-a").expect("held").state(), &LifecycleState::Realised { identity: "sha256:beef".into() });
 }
+
+// Behaviour (#3729 review): when the controller's old-status write fails after the engine took a
+// step, the next reconcile's report is a new try made by the old reconciler's prepare, so the
+// engine counts it once more; the copy then brings the old status level with the engine.
+#[tokio::test]
+async fn a_lost_status_write_leaves_the_engine_counting_each_try_once() {
+    let home = lifecycles::<CloneBinding>();
+    let retrying = || Some(CloneStatusPatch::MarkRetrying { message: "network unreachable".into() });
+    let engine = Engine::<_, CloneBinding>::new(Scripted::<OldClone>::new([retrying(), retrying()]), Some(home.clone()));
+    let obj = clone_object(Some(ClonePhase::Pending));
+    // Two reconciles whose patches are never written: the old status stays Pending.
+    for tries in 1..=2u32 {
+        let prepared = engine.prepare(&obj).await.expect("prepare");
+        assert_eq!(engine.reconcile(&obj, &prepared, Utc::now()).patch, retrying());
+        assert!(matches!(home.get("clone-a").expect("held").state(), LifecycleState::Requested { failures, .. } if *failures == tries));
+    }
+    assert_eq!(engine.inner().prepared.load(Ordering::SeqCst), 2, "each count is a try the old reconciler made");
+}
