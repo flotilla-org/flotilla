@@ -190,3 +190,51 @@ async fn a_fresh_sweep_index_seeds_open_messages_from_a_scan() {
     restarted.refresh(&primitives).expect("tail");
     assert_eq!(restarted.open().count(), 3);
 }
+
+// Behaviour (#3587 layer 7): a crew's stall to its supervisor records the sender's half at this
+// home, about the crew's seat; the seat is stalled until the supervisor's reply lands in the crew's
+// own inbox, which answers the record. A record written after its reply landed is answered at once.
+#[tokio::test]
+async fn a_stall_is_open_until_the_supervisors_reply_lands() {
+    use flotilla_state_machines::machines::{awaiting_reply::AwaitingReplyLabel, message::MessageRef};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let primitives = primitives(&dir).await;
+    let seat: flotilla_address::Address = "project:flotilla/convoy:demo/role:coder".parse().expect("seat");
+    let supervisor = "fleet/governor";
+    let send = |id: &str| {
+        let mut stall = intent(CREW, supervisor);
+        stall.relation = MessageRelation::Supervisor;
+        stall.expectation = flotilla_resources::MessageExpectation::Reply;
+        (flotilla_resources::message_record_name(supervisor, CREW, id), stall)
+    };
+    let (name, stall) = send("stall-1");
+    primitives.admit(NAMESPACE, &name, &stall).await.expect("stall sent");
+    assert!(primitives.await_reply(NAMESPACE, &name, &stall, "home-a", "stall", Some(CREW)).await.expect("recorded"));
+    assert!(primitives.awaiting().stalled(&seat).expect("read"), "the seat is stalled");
+    let awaited = MessageRef::new(format!("project:fleet/role:governor/message:{name}"), "home-a");
+    assert_eq!(primitives.awaiting().get(&awaited).expect("record").spec().recipient.as_str(), "project:fleet/role:governor");
+
+    let resume = |id: &str, original: &str| {
+        let mut reply = intent("fleet/governor", CREW);
+        reply.relation = MessageRelation::Supervisor;
+        reply.in_reply_to = Some(original.to_owned());
+        (flotilla_resources::message_record_name(CREW, supervisor, id), reply)
+    };
+    let (reply_name, reply) = resume("resume-1", &name);
+    primitives.admit(NAMESPACE, &reply_name, &reply).await.expect("reply");
+    assert_eq!(primitives.awaiting().get(&awaited).expect("record").label(), AwaitingReplyLabel::Answered);
+    assert!(!primitives.awaiting().stalled(&seat).expect("read"), "answered");
+
+    // The reply first, then the record: answered as it is written.
+    let (late, stall) = send("stall-2");
+    primitives.admit(NAMESPACE, &late, &stall).await.expect("stall sent");
+    let (reply_name, reply) = resume("resume-2", &late);
+    primitives.admit(NAMESPACE, &reply_name, &reply).await.expect("reply");
+    primitives.await_reply(NAMESPACE, &late, &stall, "home-a", "stall", Some(CREW)).await.expect("recorded");
+    let awaited = MessageRef::new(format!("project:fleet/role:governor/message:{late}"), "home-a");
+    assert_eq!(primitives.awaiting().get(&awaited).expect("record").label(), AwaitingReplyLabel::Answered);
+    // A send expecting nothing records nothing.
+    let (plain, mut note) = send("note");
+    note.expectation = flotilla_resources::MessageExpectation::None;
+    assert!(!primitives.await_reply(NAMESPACE, &plain, &note, "home-a", "reply", None).await.expect("nothing"));
+}

@@ -81,6 +81,19 @@ pub async fn resolve_local_convoy_name(backend: &ResourceBackend, namespace: &st
     }
 }
 
+/// The sender's awaiting-reply record kind for a send (#3587 layer 7): none
+/// for a send expecting nothing, a stall for a stalled crew's supervision,
+/// else the expectation's own.
+fn awaiting_kind(expectation: &flotilla_resources::MessageExpectation, stall_of: Option<&str>) -> Option<&'static str> {
+    use flotilla_resources::MessageExpectation;
+    match (expectation, stall_of) {
+        (MessageExpectation::None, _) => None,
+        (_, Some(_)) => Some("stall"),
+        (MessageExpectation::Reply, None) => Some("reply"),
+        (MessageExpectation::Outcome { .. }, None) => Some("outcome"),
+    }
+}
+
 /// An authorized supervision decision; escalation carries its admitted recipient.
 enum SupervisorRuling {
     Resume,
@@ -2781,7 +2794,8 @@ impl CrewService {
         let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
         let (message, new_turn) = if let Some(publisher) = publisher {
             let document = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":request.namespace}, "spec":intent});
-            let reference = publisher.publish(&request.namespace, document).await?;
+            let (reference, home) = publisher.publish_admitted(&request.namespace, document).await?;
+            self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await;
             (reference, true)
         } else {
             if holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
@@ -2799,6 +2813,8 @@ impl CrewService {
                 flotilla_messaging::MessageAdmission::Accepted(object) => object,
                 flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
             };
+            let home = object.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
+            self.record_awaiting(&request.namespace, &object.metadata.name, &intent, home, request.stall_of.as_deref()).await;
             (ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, object.metadata.name), !existing)
         };
         Ok(CrewTurnAdmission { message, new_turn, rung: TurnDeliveryRung::WarmSession })
@@ -2966,7 +2982,9 @@ impl CrewService {
                     "apiVersion": "flotilla.work/v1", "kind": "Message",
                     "metadata": { "name": name, "namespace": request.namespace }, "spec": intent
                 });
-                publisher.publish(&request.namespace, document).await?
+                let (reference, home) = publisher.publish_admitted(&request.namespace, document).await?;
+                self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await;
+                reference
             } else {
                 if matches!(target.provenance, ResourceProvenance::Replica { .. })
                     || holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. }))
@@ -2981,6 +2999,8 @@ impl CrewService {
                     flotilla_messaging::MessageAdmission::Accepted(record) => record,
                     flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
                 };
+                let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
+                self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await;
                 ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.metadata.name)
             };
             Ok(message)
@@ -3283,7 +3303,10 @@ impl CrewService {
         }
         let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
         if let Some(publisher) = publisher {
-            return publisher.publish(namespace, serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":namespace}, "spec":intent})).await;
+            let document = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":namespace}, "spec":intent});
+            let (reference, home) = publisher.publish_admitted(namespace, document).await?;
+            self.record_awaiting(namespace, name, intent, home, None).await;
+            return Ok(reference);
         }
         let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, namespace, &intent.receiver)
             .await
@@ -3299,7 +3322,33 @@ impl CrewService {
             flotilla_messaging::MessageAdmission::Accepted(record) => record,
             flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
         };
+        let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
+        self.record_awaiting(namespace, &record.metadata.name, intent, home, None).await;
         Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
+    }
+
+    /// With `[primitives]` on, records the sender's half of a send expecting
+    /// a reply or an outcome, once its receiver's home admitted it at `home`
+    /// (#3587 layer 7): a stall's supervision about the stalled crew, or a
+    /// plain reply or outcome. The send has happened, so a failed record is
+    /// logged, never the send's error; nothing is recorded off the engine path.
+    async fn record_awaiting(
+        &self,
+        namespace: &str,
+        name: &str,
+        intent: &flotilla_resources::MessageSpec,
+        home: Option<String>,
+        stall_of: Option<&str>,
+    ) {
+        let Some(kind) = awaiting_kind(&intent.expectation, stall_of) else { return };
+        let Some(engine) = self.message_primitives() else { return };
+        let Some(home) = home else {
+            tracing::warn!(message = %name, "the receiver home reported no admitting home; no awaiting-reply record");
+            return;
+        };
+        if let Err(error) = engine.await_reply(namespace, name, intent, &home, kind, stall_of).await {
+            tracing::warn!(message = %name, %error, "recording the sender's awaiting reply failed");
+        }
     }
 
     async fn execute_turn_delivery_hold(&self, request: &CrewTurnIntent, act: &HoldAct, reason: &str) -> Result<(), String> {

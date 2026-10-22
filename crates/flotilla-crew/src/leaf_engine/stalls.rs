@@ -1269,6 +1269,14 @@ impl ReconcilerWake {
                                         ),
                                         revision: convoy.metadata.resource_version.clone(),
                                     }])
+                                    .maybe_stall_of(stalled_source_actor(&condition).map(|(vessel, role)| {
+                                        crew_role_address(
+                                            convoy.spec.project_ref.as_deref().unwrap_or(namespace),
+                                            &convoy.metadata.name,
+                                            vessel,
+                                            role,
+                                        )
+                                    }))
                                     .build();
                                 let admission = match self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await {
                                     Ok(admission) => admission,

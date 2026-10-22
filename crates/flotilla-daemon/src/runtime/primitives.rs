@@ -117,6 +117,12 @@ impl MessageDelivery {
         if report != SweepReport::default() {
             debug!(namespace = %self.namespace, ?report, "engine message sweep");
         }
+        // The senders' records past their deadlines with no reply present (#3587 layer 7).
+        let awaiting = Arc::clone(self.primitives.awaiting());
+        let expired = tokio::task::spawn_blocking(move || awaiting.expire_due(now)).await.map_err(|error| error.to_string())??;
+        if !expired.is_empty() {
+            debug!(namespace = %self.namespace, ?expired, "awaiting-reply records expired");
+        }
         Ok(())
     }
 

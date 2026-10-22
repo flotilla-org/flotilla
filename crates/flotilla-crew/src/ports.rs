@@ -40,6 +40,18 @@ pub trait EngineMessages: Send + Sync {
     ) -> Result<flotilla_resources::ResourceObject<flotilla_resources::Message>, flotilla_resources::ResourceError>;
     /// An operator withdraws a queued message homed here, on the convoy's authority.
     async fn withdraw(&self, namespace: &str, record: &str, convoy: &str) -> Result<(), String>;
+    /// Records the sender's half of a send expecting a reply or an outcome,
+    /// once it is admitted at `home` (#3587 layer 7): an AwaitingReply record
+    /// of `kind` at this home, the sender's, about `about` when given.
+    async fn await_reply(
+        &self,
+        namespace: &str,
+        name: &str,
+        intent: &flotilla_resources::MessageSpec,
+        home: &str,
+        kind: &str,
+        about: Option<&str>,
+    ) -> Result<bool, String>;
     /// Where charter notifications are admitted on this path.
     fn charter_notices(self: std::sync::Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices>;
 }
