@@ -7,13 +7,13 @@ cd "$(dirname "$0")/.."
 jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
 mkdir -p build
 run=$(mktemp -d "$PWD/build/mutants.XXXXXX")
-for mutant in activity_unchanged expiry_without_watermark release_only_realised duplicate_turn bind_without_drain promise_resettled quota_exceeded host_overbooked queue_bypassed lease_retained undeliverable_with_receipt hold_ignores_window hold_counts_past_success give_up_ignores_cause give_up_counts_past_success deliver_while_submitted deliver_while_duty_holds owner_retracts_submitted answer_any_message expire_over_reply reassign_to_unknown_seat seat_under_unknown_parent declare_unknown_owner admit_unknown_owner seat_name_reused; do
+for mutant in activity_unchanged expiry_without_watermark release_only_realised duplicate_turn bind_without_drain promise_resettled quota_exceeded host_overbooked queue_bypassed lease_retained undeliverable_with_receipt hold_ignores_window hold_counts_past_success give_up_ignores_cause give_up_counts_past_success deliver_while_submitted deliver_while_duty_holds owner_retracts_submitted answer_any_message expire_over_reply reassign_to_unknown_seat seat_under_unknown_parent declare_unknown_owner admit_unknown_owner seat_name_reused retire_seat_holding_work add_seat_past_cap declare_to_retired_seat promise_id_reused; do
   case "$mutant" in
     activity_unchanged) scenario=agent_activity ;;
     expiry_without_watermark) scenario=message_race ;;
     release_only_realised|hold_ignores_window|hold_counts_past_success) scenario=ensure_bind ;;
     duplicate_turn|bind_without_drain|undeliverable_with_receipt) scenario=inbox_delivery ;;
-    promise_resettled|deliver_while_submitted|deliver_while_duty_holds|owner_retracts_submitted|reassign_to_unknown_seat|seat_under_unknown_parent|declare_unknown_owner|admit_unknown_owner|seat_name_reused) scenario=convoy_deliver ;;
+    promise_resettled|deliver_while_submitted|deliver_while_duty_holds|owner_retracts_submitted|reassign_to_unknown_seat|seat_under_unknown_parent|declare_unknown_owner|admit_unknown_owner|seat_name_reused|retire_seat_holding_work|add_seat_past_cap|declare_to_retired_seat|promise_id_reused) scenario=convoy_deliver ;;
     answer_any_message|expire_over_reply) scenario=reply_exchange ;;
     give_up_ignores_cause|give_up_counts_past_success) scenario=machine_edges ;;
     *) scenario=admission_placement ;;

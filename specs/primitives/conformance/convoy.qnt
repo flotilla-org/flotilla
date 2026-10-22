@@ -19,8 +19,21 @@
 // probed; their refusals are probed always, once each. One request names an
 // owner that is not a seat, and two admit seats in a cycle: a seat under
 // itself, and two seats under each other.
+//
+// Seat growth (#3587 seat-growth ruling): the cap is four seats. One request
+// admits five, and in the seat-probe convoy AddSeat of "d" beside "c" fills
+// the cap, so the second is refused SeatsFull. The edges that move (RetireSeat
+// of "a" or "b", an authorised Rollover) are probed only in a convoy admitted
+// for them with promise 0 and a lifetime duty, marked by an extra seat "g",
+// where neither Declare nor Submit is probed: its promise settles by verdict
+// or retraction. There "a" is refused while it holds the promise or the duty,
+// the convoy is refused while the promise is open, and a retired "b" is
+// refused SeatRetired as a Reassign target. Their refusals (unauthorised, an
+// unknown seat) are probed always, once each. Declare to a retired seat,
+// AddSeat under one and Declare below the promise floor are left to
+// convoy_deliver's traces and mutants.
 module convoy_conformance {
-  import convoy(IDS = Set()) as C from "../machines/convoy"
+  import convoy(IDS = Set(), SEAT_LIMIT = 4) as C from "../machines/convoy"
   type Probe = Admitted({ request: C::ConvoyRequest, result: C::Next })
     | Stepped({ from: C::State, event: C::Event, result: C::Next })
   var slot: C::Slot
@@ -39,9 +52,13 @@ module convoy_conformance {
     { ...request(admitted(C::Template), Map(), true), seats: Map("b" -> { parent: C::Root, supervisedBy: "op" }) },
     { ...request(admitted(C::Template), Map(), true), seats: Map("a" -> { parent: C::Under("b"), supervisedBy: "op" }, "b" -> { parent: C::Under("a"), supervisedBy: "op" }) },
     { ...request(admitted(C::Template), Map(), true), seats: Map("a" -> { parent: C::Under("a"), supervisedBy: "op" }) },
-    { ...request(Map(), lifetime, true), seats: seats.put("y", { parent: C::Root, supervisedBy: "op" }) })
+    { ...request(Map(), lifetime, true), seats: seats.put("y", { parent: C::Root, supervisedBy: "op" }) },
+    { ...request(admitted(C::Template), Map(), true), seats: Set("c", "d", "e").fold(seats, (m, s) => m.put(s, { parent: C::Under("a"), supervisedBy: "a" })) },
+    { ...request(admitted(C::Template), lifetime, true), seats: seats.put("g", { parent: C::Root, supervisedBy: "op" }) })
   // The convoy admitted for the moving seat edges: its extra seat "y" marks it.
   pure def seatProbe(w: C::Work): bool = w.seats.keys().contains("y")
+  // The convoy admitted for seat growth: its extra seat "g" marks it.
+  pure def growthProbe(w: C::Work): bool = w.seats.keys().contains("g")
   // Quotas: an increase, a decrease and a changed class domain. Negative counts
   // are omitted: Rust quota counts are unsigned, so InvalidQuota is unrepresentable.
   pure val increase = Map(0 -> 2, 1 -> 1)
@@ -53,8 +70,8 @@ module convoy_conformance {
   pure def bound(r: C::PromiseRecord): int = if (r.source == C::Crew) 2 else 1
   pure def submittable(w: C::Work, p: int): bool = not(w.promises.keys().contains(p)) or w.promises.get(p).submissions.length() < bound(w.promises.get(p))
   pure def events(w: C::Work): Set[C::Event] =
-    (if (seatProbe(w)) Set() else Set("a", "z").map(o => C::Declare({ promise: 0, definition: definition, owner: o })))
-    .union(ids.filter(p => submittable(w, p)).map(p => Set("a", "b").map(by => Set(true, false).map(d =>
+    (if (seatProbe(w) or growthProbe(w)) Set() else Set("a", "z").map(o => C::Declare({ promise: 0, definition: definition, owner: o })))
+    .union(ids.filter(p => submittable(w, p) and not(growthProbe(w))).map(p => Set("a", "b").map(by => Set(true, false).map(d =>
       C::Submit({ promise: p, by: by, reference: "ref", durable: d }))).flatten()).flatten())
     .union(ids.map(p => C::Reject({ promise: p })))
     .union(Set(0, 1, 2).map(n => C::Keep(C::Observed({ promise: 0, submission: n }))))
@@ -73,7 +90,12 @@ module convoy_conformance {
       C::Resupervise({ seat: "b", supervisedBy: "s", authorised: false }),
       C::Resupervise({ seat: "z", supervisedBy: "s", authorised: true })))
     .union(if (seatProbe(w)) Set(C::AddSeat({ seat: "c", parent: "a", supervisedBy: "a", authorised: true }),
+      C::AddSeat({ seat: "d", parent: "a", supervisedBy: "a", authorised: true }),
       C::Resupervise({ seat: "b", supervisedBy: "s", authorised: true })) else Set())
+    .union(Set(C::RetireSeat({ seat: "b", authorised: false }), C::RetireSeat({ seat: "z", authorised: true }),
+      C::Rollover({ authorised: false })))
+    .union(if (growthProbe(w)) Set(C::RetireSeat({ seat: "a", authorised: true }), C::RetireSeat({ seat: "b", authorised: true }),
+      C::Rollover({ authorised: true })) else Set())
     .union(Set(C::Deliver))
     .union(Set(true, false).map(a => Set("", "decision").map(r => C::Abandon({ authorised: a, reason: r }))).flatten())
     .union((if (w.promises.keys().size() == 0) quotas.union(Set(increase)) else quotas).map(q =>

@@ -1,5 +1,5 @@
 module convoy_deliver {
-  import convoy(IDS = Set(1)) as C from "../machines/convoy"
+  import convoy(IDS = Set(1), SEAT_LIMIT = 3) as C from "../machines/convoy"
   var now: int
   action keepWorld = now' = now
   action tick = all { now < 1, now' = now + 1 }
@@ -26,11 +26,16 @@ module convoy_deliver {
     nondet lifetimeDuty = Set(false, true).oneOf()
     // An owner that may be no seat: admission refuses it.
     nondet owner = Set("a", "z").oneOf()
+    // A crowded convoy admits seats "c" and "d" too, which fills the cap:
+    // AddSeat of "b" is refused SeatsFull.
+    nondet crowded = Set(false, true).oneOf()
     all {
       C::admitRequest(1, { project: "project", projectKnown: true,
         promises: promises.mapBy(_ => { promise: definition, source: source, owner: owner }),
         duties: if (lifetimeDuty) Map(0 -> { owner: "a", scope: C::Lifetime, terms: "terms" }) else Map(),
-        seats: Map("a" -> { parent: C::Root, supervisedBy: "op" }), quota: Map(0 -> 1, 1 -> 1), priority: 1 }),
+        seats: if (crowded) Map("a" -> { parent: C::Root, supervisedBy: "op" }, "c" -> { parent: C::Under("a"), supervisedBy: "a" },
+            "d" -> { parent: C::Under("a"), supervisedBy: "a" })
+          else Map("a" -> { parent: C::Root, supervisedBy: "op" }), quota: Map(0 -> 1, 1 -> 1), priority: 1 }),
       keepWorld,
     }
   }
@@ -53,6 +58,9 @@ module convoy_deliver {
       // exists, and its supervision re-pointed.
       { nondet parent = Set("a", "b", "z").oneOf() all { C::addSeat(1, "b", parent, "a", auth), keepWorld } },
       all { C::resupervise(1, "b", "op", auth), keepWorld },
+      // A seat retires, or the convoy rolls over to its next generation.
+      all { C::retireSeat(1, seat, auth), keepWorld },
+      all { C::rollover(1, auth), keepWorld },
       all { C::deliver(1), keepWorld },
       all { C::abandon(1, auth, reason), keepWorld },
       all { C::readmit(1, Map(0 -> 2, 1 -> 1), auth), keepWorld },
@@ -91,7 +99,14 @@ module convoy_deliver {
   }))
   // No seat is above itself.
   val seatTreeAcyclic = everyState(s => C::acyclic(C::work(s).seats))
-  val safety = ownersAreSeats and seatTreeClosed and seatTreeAcyclic and everyConvoyObliged and deliveredSettled and settledPromisesFinal and submittedHasSubmission and ownerRetractsOnlyUnsubmitted
+  // A generation's seats, retired ones included, stay within the cap.
+  val seatsWithinLimit = everyState(s => C::work(s).seats.keys().size() <= C::SEAT_LIMIT)
+  // A retired seat owns no open promise and holds no duty.
+  val retiredSeatsHoldNothing = everyState(s => C::work(s).retiredSeats.forall(seat =>
+    C::work(s).seats.keys().contains(seat) and C::seatPromises(C::work(s), seat).size() == 0 and C::seatDuties(C::work(s), seat).size() == 0))
+  // Promise ids of an ended generation are never reused.
+  val promisesAboveFloor = everyState(s => C::work(s).promises.keys().forall(p => p >= C::work(s).promiseFloor))
+  val safety = seatsWithinLimit and retiredSeatsHoldNothing and promisesAboveFloor and ownersAreSeats and seatTreeClosed and seatTreeAcyclic and everyConvoyObliged and deliveredSettled and settledPromisesFinal and submittedHasSubmission and ownerRetractsOnlyUnsubmitted
   // No inductive invariant: an explicit universe of every owned-promise shape
   // is beyond Apalache in a crew's memory, and the fast tier exhausts this
   // scenario's complete finite graph, which covers every depth at its bounds.
