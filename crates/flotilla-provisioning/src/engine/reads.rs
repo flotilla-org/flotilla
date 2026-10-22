@@ -172,7 +172,10 @@ where
                 Some(event) if matches!(event.payload.edge, LifecycleEdge::Vanish(_)) => Ending::Vanished,
                 _ => Ending::Unknown,
             },
-            None => Ending::Unknown,
+            None => {
+                tracing::debug!(resource = %loaded.name, home = %loaded.home, version = loaded.version, "the entry that ended it is not held here; read as Gone");
+                Ending::Unknown
+            }
         }
     } else {
         Ending::Unknown
