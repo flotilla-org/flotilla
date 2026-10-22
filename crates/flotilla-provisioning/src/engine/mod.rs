@@ -33,6 +33,7 @@ pub mod clone;
 pub mod environment;
 pub mod image_build;
 pub mod reads;
+pub mod terminal_session;
 #[cfg(test)]
 mod tests;
 
@@ -50,7 +51,10 @@ use flotilla_state_machines::{
 };
 use flotilla_store::controller::{ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler};
 
-use crate::stored::{checkout::CheckoutKind, clone::CloneKind, environment::EnvironmentKind, image_build::ImageBuildKind};
+use crate::stored::{
+    checkout::CheckoutKind, clone::CloneKind, environment::EnvironmentKind, image_build::ImageBuildKind,
+    terminal_session::TerminalSessionKind,
+};
 
 /// The provisioning kinds' engine homes at this home, behind `[primitives]`.
 #[derive(Clone)]
@@ -59,6 +63,8 @@ pub struct ProvisioningLifecycles {
     pub image_builds: Arc<dyn Lifecycles<ImageBuildKind>>,
     pub clones: Arc<dyn Lifecycles<CloneKind>>,
     pub checkouts: Arc<dyn Lifecycles<CheckoutKind>>,
+    /// TerminalSession, each launch a resource (layer 7).
+    pub terminal_sessions: Arc<dyn Lifecycles<TerminalSessionKind>>,
 }
 
 /// One thing a reconciler observed about a resource's realisation, with the evidence the
@@ -213,6 +219,11 @@ pub trait Binding: Send + Sync + 'static {
     type Old: flotilla_resources::Resource<Status: Default>;
     type Kind: LifecycleKind;
 
+    /// Whether each launch of an old object is a resource of its own (`<name>#<n>`): an old
+    /// reconciler that restarts an ended thing in place starts a new launch, never revives the
+    /// old one (#3629 Q2). Otherwise the engine resource takes the old object's name.
+    const LAUNCHES: bool = false;
+
     /// The engine request for `obj` at `home`, or why it cannot be one.
     fn request(obj: &ResourceObject<Self::Old>, home: &str) -> Result<<Self::Kind as LifecycleKind>::Request, String>;
 
@@ -240,6 +251,39 @@ fn at(now: DateTime<Utc>) -> Timestamp {
     Timestamp::from_datetime(&now)
 }
 
+/// The engine resource `obj` writes to now, and what the engine holds under that name: the old
+/// object's own name, or for a kind with launches its latest launch (`<name>#1` before any).
+pub fn current<B: Binding>(
+    lifecycles: &dyn Lifecycles<B::Kind>,
+    obj: &ResourceObject<B::Old>,
+) -> (String, Option<Resource<Lifecycle<B::Kind>>>) {
+    let name = &obj.metadata.name;
+    if !B::LAUNCHES {
+        return (name.clone(), lifecycles.get(name));
+    }
+    let mut latest = (launch(name, 1), None);
+    for n in 1.. {
+        match lifecycles.get(&launch(name, n)) {
+            Some(resource) => latest = (launch(name, n), Some(resource)),
+            None => return latest,
+        }
+    }
+    latest
+}
+
+/// Launch `n` of old object `name`.
+pub fn launch(name: &str, n: u32) -> String {
+    format!("{name}#{n}")
+}
+
+/// The launch after `name`'s (`<old>#<n>`).
+fn next_launch(name: &str) -> String {
+    match name.rsplit_once('#').and_then(|(old, n)| Some((old, n.parse::<u32>().ok()?))) {
+        Some((old, n)) => launch(old, n + 1),
+        None => launch(name, 1),
+    }
+}
+
 /// What the engine answers to `patch`, a patch an old writer would make to `obj`: the patch it
 /// may write, which is `patch` when the engine took its steps (or holds nothing for `obj`), and
 /// otherwise the copy of the engine's state. The decision behind [`Engine`], shared with
@@ -250,10 +294,19 @@ pub fn decide<B: Binding>(
     patch: Option<Patch<B::Old>>,
     now: DateTime<Utc>,
 ) -> Decision<B::Old> {
-    let name = &obj.metadata.name;
     let kind = <B::Kind as LifecycleKind>::NAME;
     let steps = patch.as_ref().map(|patch| B::steps(obj, patch)).unwrap_or_default();
-    let mut resource = match lifecycles.get(name) {
+    let (mut current, held) = current::<B>(lifecycles, obj);
+    // A kind with launches restarted in place: the ended launch stays ended, and this is the next.
+    let held = match held {
+        Some(resource) if B::LAUNCHES && ended(&resource) && !steps.is_empty() && B::initial(obj) => {
+            current = next_launch(&current);
+            None
+        }
+        held => held,
+    };
+    let name = &current;
+    let mut resource = match held {
         Some(resource) => resource,
         None if !steps.is_empty() && B::initial(obj) => match B::request(obj, lifecycles.home()) {
             Ok(request) => match lifecycles.request(name, request, at(now)) {
@@ -346,15 +399,18 @@ where
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         let Some(lifecycles) = &self.lifecycles else { return Ok(Prepared::Old(self.inner.prepare(obj).await?)) };
-        // The read takes the home's lock, which a step may hold for its write: off the async workers too.
+        // The engine has ended it: the old reconciler does not act on it again, unless it is
+        // starting a new launch of it. The read takes the home's lock, which a step may hold for
+        // its write: off the async workers too.
+        let restarting = B::LAUNCHES && B::initial(obj);
         let owned = ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status: obj.status.clone() };
         let home = Arc::clone(lifecycles);
-        let ended_copy =
-            tokio::task::spawn_blocking(move || home.get(&owned.metadata.name).filter(ended).map(|resource| B::copy(&owned, &resource)))
-                .await
-                .map_err(|error| ResourceError::other(format!("engine read: {error}")))?;
+        let ended_copy = tokio::task::spawn_blocking(move || {
+            current::<B>(home.as_ref(), &owned).1.filter(ended).filter(|_| !restarting).map(|resource| B::copy(&owned, &resource))
+        })
+        .await
+        .map_err(|error| ResourceError::other(format!("engine read: {error}")))?;
         if let Some(copy) = ended_copy {
-            // The engine has ended it: the old reconciler does not act on it again.
             return Ok(Prepared::Decided(Mutex::new(Some(ReconcileOutcome::new(copy)))));
         }
         let prepared = self.inner.prepare(obj).await?;
@@ -393,9 +449,11 @@ where
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         self.inner.run_finalizer(obj).await?;
         let Some(lifecycles) = &self.lifecycles else { return Ok(()) };
-        let (lifecycles, name) = (Arc::clone(lifecycles), obj.metadata.name.clone());
+        let lifecycles = Arc::clone(lifecycles);
+        let owned = ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status: obj.status.clone() };
         tokio::task::spawn_blocking(move || {
-            if lifecycles.get(&name).is_some_and(|resource| !ended(&resource)) {
+            let (name, held) = current::<B>(lifecycles.as_ref(), &owned);
+            if held.is_some_and(|resource| !ended(&resource)) {
                 // The teardown completed: the engine releases it, whatever it held.
                 if let Err(error) = lifecycles.step(&name, &Step::Released, at(Utc::now())) {
                     tracing::warn!(resource = %name, kind = <B::Kind as LifecycleKind>::NAME, %error, "engine release failed");

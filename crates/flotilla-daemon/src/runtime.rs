@@ -33,7 +33,8 @@ use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
 use flotilla_provisioning::engine::{
-    checkout::CheckoutBinding, clone::CloneBinding, environment::EnvironmentBinding, image_build::ImageBuildBinding, Engine,
+    checkout::CheckoutBinding, clone::CloneBinding, environment::EnvironmentBinding, image_build::ImageBuildBinding,
+    terminal_session::TerminalSessionBinding, Engine,
 };
 use flotilla_provisioning::reconcilers::{
     CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver, RepositoryReconciler,
@@ -899,12 +900,16 @@ fn spawn_controller_loops(
                 let local_host_ref = state.local_host_ref.clone();
                 let additional_host_refs = state.agentless_host_refs();
                 let state = Arc::clone(&state);
+                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.terminal_sessions));
                 (
                     vec![],
-                    TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
-                        .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
-                        .with_additional_host_refs(additional_host_refs)
-                        .with_federated_convoys(&backend, &namespace_string),
+                    Engine::<_, TerminalSessionBinding>::new(
+                        TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
+                            .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
+                            .with_additional_host_refs(additional_host_refs)
+                            .with_federated_convoys(&backend, &namespace_string),
+                        lifecycles,
+                    ),
                 )
             }
         }),
@@ -1147,6 +1152,7 @@ async fn open_provisioning_lifecycles(
             image_builds: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             clones: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             checkouts: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            terminal_sessions: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
         })
     })
     .await

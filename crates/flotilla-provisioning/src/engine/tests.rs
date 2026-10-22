@@ -538,3 +538,101 @@ async fn a_lost_status_write_leaves_the_engine_counting_each_try_once() {
     }
     assert_eq!(engine.inner().prepared.load(Ordering::SeqCst), 2, "each count is a try the old reconciler made");
 }
+
+fn session_object(phase: flotilla_resources::TerminalSessionPhase) -> ResourceObject<flotilla_resources::TerminalSession> {
+    use flotilla_resources::{TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus};
+    ResourceObject {
+        metadata: meta("terminal-vessel-a-coder"),
+        spec: TerminalSessionSpec {
+            env_ref: "env-vessel-a".into(),
+            role: "coder".into(),
+            source: TerminalSessionSource::Tool { command: "bash".into() },
+            cwd: "/workspace".into(),
+            pool: "cleat".into(),
+            env: Default::default(),
+        },
+        status: Some(TerminalSessionStatus { phase, ..Default::default() }),
+    }
+}
+
+// Behaviour (#3629 Q2, layer 7): each launch of a terminal session is a resource of its own. The
+// first runs as `#1`; stopped, it is released; resumed in place by the old path, the next run is
+// `#2`, and `#1` stays Gone. A lost session stays Realised (unobservable is a judgement); when the
+// old path relaunches it, the lost launch is observed absent and the relaunch is `#3`.
+#[tokio::test]
+async fn each_launch_of_a_session_is_its_own_resource() {
+    use flotilla_resources::{TerminalSessionPhase, TerminalSessionStatusPatch};
+
+    use super::{launch, terminal_session::TerminalSessionBinding};
+    let running = |id: &str| TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
+        session_id: id.into(),
+        pid: None,
+        started_at: DateTime::UNIX_EPOCH,
+        crew: None,
+        launch_command: "bash".into(),
+        delivered_message_id: None,
+    };
+    let stopped = TerminalSessionStatusPatch::MarkStopped {
+        stopped_at: DateTime::UNIX_EPOCH,
+        inner_command_status: None,
+        inner_exit_code: Some(0),
+        message: None,
+    };
+    let lost = TerminalSessionStatusPatch::MarkLost { reason: "daemon generation dead".into(), lost_at: DateTime::UNIX_EPOCH };
+    let home = lifecycles::<TerminalSessionBinding>();
+    let engine = Engine::<_, TerminalSessionBinding>::new(
+        Scripted::<flotilla_resources::TerminalSession>::new([
+            Some(running("s1")),
+            Some(stopped),
+            Some(running("s2")),
+            Some(lost),
+            Some(TerminalSessionStatusPatch::MarkStarting),
+            Some(running("s3")),
+        ]),
+        Some(home.clone()),
+    );
+    let name = "terminal-vessel-a-coder";
+    let state = |n| home.get(&launch(name, n)).map(|resource| resource.state().clone());
+
+    let mut obj = session_object(TerminalSessionPhase::Starting);
+    reconcile(&engine, &mut obj).await;
+    assert_eq!(state(1), Some(LifecycleState::Realised { identity: "s1".into() }));
+    reconcile(&engine, &mut obj).await;
+    assert_eq!(state(1), Some(LifecycleState::Gone), "stopped: released");
+    assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(TerminalSessionPhase::Stopped));
+
+    // The old path resumes it in place (crew_ops' MarkStarting): the next run is a new launch.
+    TerminalSessionStatusPatch::MarkStarting.apply(obj.status.as_mut().expect("status"));
+    reconcile(&engine, &mut obj).await;
+    assert_eq!(state(1), Some(LifecycleState::Gone), "never revived");
+    assert_eq!(state(2), Some(LifecycleState::Realised { identity: "s2".into() }));
+
+    reconcile(&engine, &mut obj).await;
+    assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(TerminalSessionPhase::Lost));
+    assert_eq!(state(2), Some(LifecycleState::Realised { identity: "s2".into() }), "unobservable stays Realised");
+    reconcile(&engine, &mut obj).await;
+    assert_eq!(state(2), Some(LifecycleState::Gone), "relaunched: the lost launch observed absent");
+    reconcile(&engine, &mut obj).await;
+    assert_eq!(state(3), Some(LifecycleState::Realised { identity: "s3".into() }));
+}
+
+// Behaviour (layer 7): a launch that fails before it runs gives up at once; a later start of the
+// same old session is a new launch.
+#[tokio::test]
+async fn a_failed_launch_gives_up_and_the_next_start_is_a_new_launch() {
+    use flotilla_resources::{TerminalSessionPhase, TerminalSessionStatusPatch};
+
+    use super::{launch, terminal_session::TerminalSessionBinding};
+    let home = lifecycles::<TerminalSessionBinding>();
+    let failed = TerminalSessionStatusPatch::MarkFailed { message: "cleat refused".into(), stopped_at: None };
+    let engine = Engine::<_, TerminalSessionBinding>::new(
+        Scripted::<flotilla_resources::TerminalSession>::new([Some(failed.clone())]),
+        Some(home.clone()),
+    );
+    let mut obj = session_object(TerminalSessionPhase::Starting);
+    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(failed));
+    assert!(matches!(home.get(&launch("terminal-vessel-a-coder", 1)).expect("held").state(), LifecycleState::GaveUp { .. }));
+    // Failed is ended for the old path too: the next reconcile writes nothing.
+    assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
+}
