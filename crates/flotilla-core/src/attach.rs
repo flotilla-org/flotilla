@@ -36,6 +36,7 @@ use super::{discover_repo_for_environment, LiveConvoyRecord};
 use flotilla_discovery::{registry::ProviderRegistry, DiscoveryRuntime};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_projections::aggregator_projection::AggregatorProjectionState;
+use flotilla_provider_runtime::host_environment::HostEnvironment;
 use flotilla_resources::convoy_address::{convoy_address, RoleAddress};
 use flotilla_terminal::TerminalSessionLiveness;
 
@@ -582,26 +583,19 @@ impl<'a> AttachResolver<'a> {
             .map(|spec| spec.host_ref.as_str())
             .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
             .ok_or_else(|| format!("environment {} has no host binding", session.spec.env_ref))?;
-        if let Some(destination) =
-            self.environment_manager.managed_environments().into_iter().find(|(id, _)| id.as_str() == session.spec.env_ref).and_then(
-                |(_, state)| match state {
-                    ManagedEnvironmentKind::Direct(direct) => direct.ssh_destination,
-                    _ => None,
-                },
-            )
+        if let Some((destination, host_environment)) = self
+            .environment_manager
+            .managed_environments()
+            .into_iter()
+            .find(|(id, _)| id.as_str() == session.spec.env_ref)
+            .and_then(|(_, state)| match state {
+                ManagedEnvironmentKind::Direct(direct) => direct.ssh_destination.map(|destination| (destination, direct.host_environment)),
+                _ => None,
+            })
         {
             let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
             let attach_args = self.terminal_pool_attach_args(reads, session, &environment, &cwd, seat).await?;
-            let plan = ResolvedAttachPlan::command(vec![
-                Arg::Literal("ssh".to_string()),
-                Arg::Literal("-tt".to_string()),
-                Arg::Literal("-o".to_string()),
-                Arg::Literal("BatchMode=yes".to_string()),
-                Arg::Quoted(destination),
-                Arg::Literal("sh".to_string()),
-                Arg::Literal("-lc".to_string()),
-                Arg::NestedCommand(attach_args),
-            ]);
+            let plan = agentless_ssh_attach_plan(destination, &host_environment, attach_args);
             // The owning daemon resolves future attach requests; the target
             // has no flotillad to receive a recursive attach command.
             return Ok((plan, self.host_name.clone()));
@@ -790,6 +784,24 @@ impl<'a> AttachResolver<'a> {
 }
 
 use flotilla_projections::ports::ResolvedAttach;
+
+/// Attach to a session on an agentless SSH host: the terminal pool's attach
+/// command runs in the host's composed environment, never its login profile
+/// (#3722).
+fn agentless_ssh_attach_plan(destination: String, host_environment: &HostEnvironment, attach_args: Vec<Arg>) -> ResolvedAttachPlan {
+    let mut remote = vec![Arg::Literal(host_environment.shell_prelude())];
+    remote.extend(attach_args);
+    ResolvedAttachPlan::command(vec![
+        Arg::Literal("ssh".to_string()),
+        Arg::Literal("-tt".to_string()),
+        Arg::Literal("-o".to_string()),
+        Arg::Literal("BatchMode=yes".to_string()),
+        Arg::Quoted(destination),
+        Arg::Literal("sh".to_string()),
+        Arg::Literal("-c".to_string()),
+        Arg::NestedCommand(remote),
+    ])
+}
 fn attach_convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
     match phase {
         ResourceConvoyPhase::Pending => ConvoyPhase::Pending,
@@ -1204,6 +1216,38 @@ mod tests {
     use crate::testkits::discovery::fake_discovery;
     use flotilla_config::ConfigStore;
     use flotilla_daemon_api::daemon::DaemonHandle;
+
+    // #3722: attach to an agentless session runs its command in the host's
+    // composed environment. The plan's remote part runs here as sshd runs it,
+    // with a login profile that must not be read.
+    #[cfg(unix)]
+    #[test]
+    fn agentless_attach_composes_the_host_environment_without_its_login_profile() {
+        use flotilla_protocol::{arg::flatten, attach_plan::ResolvedAttachAction};
+        use flotilla_provider_runtime::host_environment::HostSupply;
+
+        let home = tempfile::tempdir().expect("remote home");
+        std::fs::write(home.path().join(".profile"), "echo read > \"$HOME/profile-read\"\n").expect("login profile");
+        let host =
+            HostEnvironment::new(vec![HostSupply { name: "cleat".into(), path: vec!["~/.local/opt/cleat/bin".into()], env: Vec::new() }])
+                .expect("declared supply");
+        let plan = agentless_ssh_attach_plan("crew@b1".into(), &host, vec![Arg::Literal("printf '%s' \"$PATH\"".into())]);
+        let [ResolvedAttachAction::Command(args)] = plan.0.as_slice() else { panic!("one command: {plan:?}") };
+        assert_eq!(flatten(&args[..5], 0), "ssh -tt -o BatchMode=yes 'crew@b1'");
+        // sshd hands the rest of the command line to the user's shell.
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &flatten(&args[5..], 0)])
+            .env_clear()
+            .env("HOME", home.path())
+            .output()
+            .expect("remote shell");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("utf-8"),
+            format!("{}/.local/opt/cleat/bin:/usr/local/bin:/usr/bin:/bin", home.path().display())
+        );
+        assert!(!home.path().join("profile-read").exists(), "attach read the login profile");
+    }
 
     // Attach scenarios need a daemon and providers, independent of standing-convoy admission.
     async fn attach_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir) {

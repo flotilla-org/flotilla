@@ -304,6 +304,54 @@ fn parse_agentless_ssh_host_reuses_peer_ssh_destination_fields() {
     assert_eq!(ssh_destination(&host.hostname, host.user.as_deref()), "crew@beaufort.example");
 }
 
+// #3722: the supplies format agreed with drydock#55, exactly as declared.
+#[test]
+fn parse_agentless_host_supplies_in_declaration_order() {
+    let config: HostsConfig = toml::from_str(
+        r#"
+[hosts.b1]
+hostname = "b1.example"
+user = "flotilla"
+agentless_ssh = true
+supplies = [
+  { name = "rust", path = ["~/.cargo/bin"], env = { RUSTUP_HOME = "~/.rustup", CARGO_HOME = "~/.cargo" } },
+  { name = "gh",   path = ["~/.local/opt/gh/bin"] },
+]
+"#,
+    )
+    .expect("hosts config with supplies");
+    assert_eq!(
+        config.hosts["b1"].supplies,
+        vec![
+            HostSupply {
+                name: "rust".into(),
+                path: vec!["~/.cargo/bin".into()],
+                env: BTreeMap::from([("CARGO_HOME".into(), "~/.cargo".into()), ("RUSTUP_HOME".into(), "~/.rustup".into())]),
+            },
+            HostSupply { name: "gh".into(), path: vec!["~/.local/opt/gh/bin".into()], env: BTreeMap::new() },
+        ]
+    );
+}
+
+#[test]
+fn hosts_without_supplies_parse_as_an_empty_list() {
+    let config: HostsConfig =
+        toml::from_str("[hosts.b1]\nhostname = \"b1.example\"\nagentless_ssh = true\n").expect("hosts config without supplies");
+    assert!(config.hosts["b1"].supplies.is_empty());
+    let daemon: DaemonConfig = toml::from_str("[environments.box]\nhostname = \"box.example\"\n").expect("daemon config");
+    assert!(daemon.environments["box"].supplies.is_empty());
+}
+
+// A supply holds directories and variables only; a script is refused.
+#[test]
+fn a_supply_with_anything_but_directories_and_variables_is_refused() {
+    let error = toml::from_str::<HostsConfig>(
+        "[hosts.b1]\nhostname = \"b1.example\"\nsupplies = [{ name = \"rust\", script = \"~/.cargo/env\" }]\n",
+    )
+    .expect_err("a supply script");
+    assert!(error.to_string().contains("unknown field `script`"), "{error}");
+}
+
 #[test]
 fn parse_daemon_config_identity_and_admission() {
     let toml = r#"

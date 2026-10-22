@@ -18,6 +18,7 @@ use flotilla_environment::environment::EnvironmentInput;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::EnvironmentId;
+use flotilla_provider_runtime::host_environment::HostEnvironment;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
@@ -61,6 +62,8 @@ pub(super) struct AgentlessSshProfile {
     pub(super) destination: String,
     pub(super) env_bag: EnvironmentBag,
     pub(super) runner: Arc<dyn CommandRunner>,
+    /// The host's declared supplies (#3722).
+    pub(super) host_environment: HostEnvironment,
     pub(super) fulfilment_facts: Arc<RwLock<BTreeMap<String, FulfilmentFacts>>>,
 }
 
@@ -129,6 +132,7 @@ pub(super) async fn discover_agentless_ssh_profile(
         destination,
         env_bag: direct.env_bag,
         runner: direct.runner,
+        host_environment: direct.host_environment,
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
     })
 }
