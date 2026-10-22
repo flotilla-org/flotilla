@@ -239,7 +239,8 @@ impl AwaitingReplies {
         }
         match failures.is_empty() {
             true => Ok(withdrawn),
-            false => Err(failures.join("; ")),
+            // Bounded: the first failure names the cause, the count the extent.
+            false => Err(format!("{} of the stall records were not withdrawn; the first: {}", failures.len(), failures[0])),
         }
     }
 
