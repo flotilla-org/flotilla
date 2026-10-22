@@ -16,9 +16,16 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::Stored;
+use flotilla_schema::{Stored, Timestamp};
 
-use crate::machines::convoy::{ConvoyId, Priority, Quota, VesselClass};
+use crate::{
+    machines::{
+        convoy::{ConvoyId, Priority, Quota, VesselClass},
+        lifecycle::{LifecycleEdge, LifecycleRefusal, LifecycleState, LifecycleWorld, MemoryLifecycleWorld},
+        vessel::{live_leases, Vessel as VesselMachine, VesselSpec},
+    },
+    Home, Log, Resource, WriteError,
+};
 
 /// A host that capacity is leased on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
@@ -282,5 +289,198 @@ impl Ledger {
             Some(Vessel::Leased(_)) => Err(LedgerError::NotWaiting(id.clone())),
             None => Err(LedgerError::UnknownVessel(id.clone())),
         }
+    }
+}
+
+/// Why a placement home did not take a write.
+#[derive(Debug)]
+pub enum PlacementError {
+    /// The ledger refused it: an unknown vessel or host, or a placement refusal.
+    Ledger(LedgerError),
+    /// The vessel's resource refused it, or the log did not take it.
+    Write(WriteError<VesselMachine>),
+}
+
+impl PlacementError {
+    /// The spec's refusal, when this is one: a placement refusal, or any lifecycle refusal of a
+    /// leased vessel, which `vessel.qnt` reports as `MissingEvidence`.
+    pub fn refusal(&self) -> Option<PlacementRefusal> {
+        match self {
+            PlacementError::Ledger(LedgerError::Refused(refusal)) => Some(*refusal),
+            PlacementError::Write(WriteError::Refused(_)) => Some(PlacementRefusal::MissingEvidence),
+            _ => None,
+        }
+    }
+}
+
+/// The spec's composed vessel (`machines/vessel.qnt`) at one home: `Waiting → Leased → Gone`.
+///
+/// A request waits at the [`Ledger`] and is not stored: the stored Vessel is the lease (ADR 0064).
+/// [`Placements::place`] grants the lease under the spec's refusals and creates the vessel
+/// resource, Requested, in the same step. Its lifecycle then runs on that resource (realise,
+/// release, vanish) until it is Gone, when the ledger frees the lease. A restart rebuilds the
+/// ledger's leases from the live vessels the home holds.
+pub struct Placements<L: Log<VesselMachine>> {
+    ledger: Ledger,
+    home: Home<VesselMachine, L>,
+}
+
+impl<L: Log<VesselMachine>> Placements<L> {
+    /// Placement over `hosts`, with the leases of `home`'s live vessels put back. A live vessel
+    /// whose lease no longer fits (a host shrank or is gone) is returned with the reason, and its
+    /// lease is not held: what to do with it is the caller's decision (#3438).
+    pub fn new(
+        home: Home<VesselMachine, L>,
+        hosts: impl IntoIterator<Item = (Host, Units)>,
+    ) -> Result<(Self, Vec<(VesselId, LedgerError)>), LedgerError> {
+        let mut ledger = Ledger::new();
+        for (host, capacity) in hosts {
+            ledger.add_host(host, capacity)?;
+        }
+        let mut unplaced = Vec::new();
+        for (id, lease) in live_leases(home.resources()) {
+            if let Err(error) = ledger.restore(id.clone(), lease) {
+                unplaced.push((id, error));
+            }
+        }
+        Ok((Placements { ledger, home }, unplaced))
+    }
+
+    pub fn ledger(&self) -> &Ledger {
+        &self.ledger
+    }
+
+    pub fn home(&self) -> &Home<VesselMachine, L> {
+        &self.home
+    }
+
+    /// The vessel resource `id` names, once its lease is granted.
+    pub fn get(&self, id: &VesselId) -> Option<&Resource<VesselMachine>> {
+        self.home.get(&id.0)
+    }
+
+    /// Sets a convoy's quota, as admitted or readmitted.
+    pub fn set_caps(&mut self, convoy: ConvoyId, quota: Quota) {
+        self.ledger.set_caps(convoy, quota);
+    }
+
+    /// Queues a vessel's request: Waiting, at the ledger only.
+    pub fn request(&mut self, id: VesselId, request: Request) -> Result<(), PlacementError> {
+        self.ledger.request(id, request).map_err(PlacementError::Ledger)
+    }
+
+    /// Places waiting vessel `id` on `host` (spec `Place`) and creates its resource at `now`,
+    /// Requested. A refusal, or a log that does not take the create, leaves the ledger as it was.
+    pub fn place(&mut self, id: &VesselId, host: Host, now: Timestamp) -> Result<&Resource<VesselMachine>, PlacementError> {
+        let before = self.ledger.clone();
+        let lease = self.ledger.place(id, host).map_err(PlacementError::Ledger)?.clone();
+        let world = MemoryLifecycleWorld::default();
+        if let Err(error) = self.home.create(id.0.clone(), VesselSpec::from(lease), &world, now) {
+            self.ledger = before;
+            return Err(PlacementError::Write(error));
+        }
+        self.home.get(&id.0).ok_or_else(|| PlacementError::Ledger(LedgerError::UnknownVessel(id.clone())))
+    }
+
+    /// A lifecycle edge on leased vessel `id`: realise, release or vanish (the spec's leased
+    /// events). Reaching Gone frees the lease. A vessel's attempts and give-up are no edges of
+    /// `vessel.qnt`, so they are refused as the wrong state.
+    pub fn apply(
+        &mut self,
+        id: &VesselId,
+        edge: LifecycleEdge,
+        world: &(dyn LifecycleWorld + 'static),
+        now: Timestamp,
+    ) -> Result<&Resource<VesselMachine>, PlacementError> {
+        if matches!(edge, LifecycleEdge::Attempted(_) | LifecycleEdge::GiveUp(_)) {
+            return Err(PlacementError::Write(WriteError::Refused(LifecycleRefusal::WrongState)));
+        }
+        self.home.apply(&id.0, edge, world, now).map_err(PlacementError::Write)?;
+        if self.home.get(&id.0).is_some_and(|vessel| *vessel.state() == LifecycleState::Gone) {
+            self.ledger.release(id).map_err(PlacementError::Ledger)?;
+        }
+        self.home.get(&id.0).ok_or_else(|| PlacementError::Ledger(LedgerError::UnknownVessel(id.clone())))
+    }
+}
+
+#[cfg(test)]
+mod placements_tests {
+    use super::*;
+    use crate::{
+        machines::lifecycle::{Attempted, Observed, Realise, Release},
+        Cause, CauseCategory, MemoryLog, Outcome, Ref,
+    };
+
+    const HOST: Host = Host(1);
+
+    fn request(convoy: &str, cores: u32) -> Request {
+        Request {
+            convoy: ConvoyId::new(convoy, "home"),
+            class: VesselClass::new("crew"),
+            shape: [(Dimension(0), cores)].into(),
+            priority: Priority(1),
+        }
+    }
+
+    fn placements(home: Home<VesselMachine, MemoryLog<VesselMachine>>) -> Placements<MemoryLog<VesselMachine>> {
+        let (mut placements, unplaced) = Placements::new(home, [(HOST, [(Dimension(0), 4)].into())]).expect("host");
+        assert!(unplaced.is_empty());
+        placements.set_caps(ConvoyId::new("c", "home"), [(VesselClass::new("crew"), 2)].into());
+        placements
+    }
+
+    // Behaviour (#3629 layer 6): a waiting request is not stored; a grant creates the vessel
+    // resource Requested with the lease as its spec; a refusal (no fit) creates nothing and
+    // leaves the ledger as it was; Gone frees the lease, so a second request fits again.
+    #[test]
+    fn a_grant_creates_the_vessel_and_gone_frees_its_lease() {
+        let mut placements = placements(Home::new("home").expect("declaration"));
+        let (a, b) = (VesselId::new("a"), VesselId::new("b"));
+        placements.request(a.clone(), request("c", 3)).expect("request");
+        assert!(placements.get(&a).is_none(), "a waiting request is not stored");
+        let vessel = placements.place(&a, HOST, Timestamp(1)).expect("granted");
+        assert_eq!(*vessel.state(), LifecycleState::requested());
+        assert_eq!(vessel.spec().lease(), Lease { request: request("c", 3), host: HOST });
+
+        placements.request(b.clone(), request("c", 3)).expect("request");
+        assert_eq!(placements.place(&b, HOST, Timestamp(2)).expect_err("no room").refusal(), Some(PlacementRefusal::DoesNotFit));
+        assert!(placements.get(&b).is_none());
+        assert!(matches!(placements.ledger().vessel(&b), Some(Vessel::Waiting(_))), "still waiting");
+
+        let mut world = MemoryLifecycleWorld::default();
+        world.teardowns.put(&Ref::new("a"), true);
+        placements.apply(&a, Release { teardown: Ref::new("a") }.into(), &world, Timestamp(3)).expect("released");
+        assert!(placements.ledger().vessel(&a).is_none(), "the lease is freed");
+        placements.place(&b, HOST, Timestamp(4)).expect("now it fits");
+    }
+
+    // Behaviour: a vessel takes no attempts and never gives up (`vessel.qnt` has neither edge).
+    #[test]
+    fn a_vessel_refuses_attempts() {
+        let mut placements = placements(Home::new("home").expect("declaration"));
+        let a = VesselId::new("a");
+        placements.request(a.clone(), request("c", 1)).expect("request");
+        placements.place(&a, HOST, Timestamp(1)).expect("granted");
+        let failed = Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "x"), retryable: true };
+        let world = MemoryLifecycleWorld::default();
+        let refused = placements.apply(&a, Attempted { outcome: failed }.into(), &world, Timestamp(2)).expect_err("refused");
+        assert!(matches!(refused, PlacementError::Write(WriteError::Refused(LifecycleRefusal::WrongState))));
+    }
+
+    // Behaviour: a restart rebuilds the ledger's leases from the live vessels its home holds.
+    #[test]
+    fn a_restart_rebuilds_the_leases_from_the_live_vessels() {
+        let mut placements = placements(Home::new("home").expect("declaration"));
+        let a = VesselId::new("a");
+        placements.request(a.clone(), request("c", 3)).expect("request");
+        placements.place(&a, HOST, Timestamp(1)).expect("granted");
+        let mut world = MemoryLifecycleWorld::default();
+        world.realisations.put(&Ref::new("a"), Observed { identity: "a".into() });
+        placements.apply(&a, Realise { identity: "a".into(), observed: Ref::new("a") }.into(), &world, Timestamp(2)).expect("realised");
+
+        let mut home = Home::<VesselMachine>::new("home").expect("declaration");
+        home.restore(placements.get(&a).expect("held").clone()).expect("restored");
+        let restarted = self::placements(home);
+        assert_eq!(restarted.ledger().available(HOST), Ok([(Dimension(0), 1)].into()), "the lease holds its shape again");
     }
 }
