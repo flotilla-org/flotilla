@@ -59,6 +59,17 @@ pub struct CheckoutRequest {
     pub holder: Option<Holder>,
 }
 
+impl CheckoutRequest {
+    /// The writer's admission: a worktree names its clone. The holder is not
+    /// checked: it carries no ownership (look-over ruling 4).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.source == Source::Worktree && self.clone.is_none() {
+            return Err("a worktree checkout names its clone".into());
+        }
+        Ok(())
+    }
+}
+
 /// How the checkout is made.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub enum Source {
