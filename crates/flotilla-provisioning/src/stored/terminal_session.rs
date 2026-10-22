@@ -63,8 +63,8 @@ pub struct TerminalSessionRequest {
     pub pool: String,
     pub cwd: String,
     /// Declared, non-secret launch values, replicated with the session.
-    /// Credentials are delivered at launch and never stored here; they and
-    /// adapter requirements take precedence.
+    /// Credentials are delivered at launch and never stored here. At launch,
+    /// credentials and adapter requirements override these values.
     #[store(child)]
     pub env: BTreeMap<String, String>,
     pub source: Launch,
