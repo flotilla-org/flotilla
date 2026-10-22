@@ -11,6 +11,7 @@ use flotilla_environment::environment::EnvironmentHandle;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_provisioning::engine::environment::EnvironmentBinding;
 use flotilla_resources::{
     Checkout, Environment, EnvironmentPhase, EnvironmentStatusPatch, ResourceError, ResourceObject, Vessel, VesselStatusPatch,
 };
@@ -354,16 +355,33 @@ pub(super) async fn mark_unavailable_environment(
     } else {
         format!("{message}; recover work from retained checkout(s): {}", retained_paths.join(", "))
     };
-    flotilla_store::apply_status_patch(
-        &state.daemon.resource_backend().using::<Environment>(namespace),
-        env_id.as_str(),
-        &match disposition {
-            BackingDisposition::Lost => EnvironmentStatusPatch::MarkLost { message: message.clone() },
-            BackingDisposition::Failed => EnvironmentStatusPatch::MarkFailed { message: message.clone() },
-        },
-    )
-    .await
-    .map_err(|error| format!("mark unavailable environment {env_id}: {error}"))?;
+    let environments = state.daemon.resource_backend().using::<Environment>(namespace);
+    let mut patch = Some(match disposition {
+        BackingDisposition::Lost => EnvironmentStatusPatch::MarkLost { message: message.clone() },
+        BackingDisposition::Failed => EnvironmentStatusPatch::MarkFailed { message: message.clone() },
+    });
+    // Behind `[primitives]` the engine decides first (#3629 layer 3): the old status is written
+    // only as the engine's answer.
+    if let Some(engine) = &state.provisioning {
+        match environments.get(env_id.as_str()).await {
+            Ok(environment) => {
+                patch = flotilla_provisioning::engine::decide::<EnvironmentBinding>(
+                    engine.environments.as_ref(),
+                    &environment,
+                    patch,
+                    chrono::Utc::now(),
+                )
+                .patch;
+            }
+            Err(ResourceError::NotFound { .. }) => patch = None,
+            Err(error) => return Err(format!("mark unavailable environment {env_id}: {error}")),
+        }
+    }
+    if let Some(patch) = patch {
+        flotilla_store::apply_status_patch(&environments, env_id.as_str(), &patch)
+            .await
+            .map_err(|error| format!("mark unavailable environment {env_id}: {error}"))?;
+    }
     warn!(environment = %env_id, %message, "provisioned environment backing is unavailable");
     Ok(())
 }

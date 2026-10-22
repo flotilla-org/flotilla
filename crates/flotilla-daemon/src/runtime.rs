@@ -32,6 +32,9 @@ use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
+use flotilla_provisioning::engine::{
+    checkout::CheckoutBinding, clone::CloneBinding, environment::EnvironmentBinding, image_build::ImageBuildBinding, Engine,
+};
 use flotilla_provisioning::reconcilers::{
     CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver, RepositoryReconciler,
 };
@@ -154,8 +157,10 @@ impl DaemonRuntime {
         let daemon_config = config.load_daemon_config()?;
         // ADR 0064 switch-over (#3317): `[primitives]` moves Message onto the
         // engine and its store; refused without `[dummy_fleet]`. Absent, nothing changes.
+        let mut provisioning_lifecycles = None;
         if daemon_config.primitives()?.is_some() {
             phase("open_message_primitives", open_message_primitives(&daemon, &config)).await?;
+            provisioning_lifecycles = Some(open_provisioning_lifecycles(&daemon).await?);
         }
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
@@ -486,7 +491,8 @@ impl DaemonRuntime {
                 .with_image_inventory(image_inventory)
                 .with_image_build_service(image_build_service)
                 .with_forge_default_branches(forge_default_branches)
-                .with_controller_metrics(Arc::clone(&controller_metrics)),
+                .with_controller_metrics(Arc::clone(&controller_metrics))
+                .with_provisioning_lifecycles(provisioning_lifecycles.clone()),
             );
             phase(
                 "set_operator_reconciler",
@@ -832,12 +838,16 @@ fn spawn_controller_loops(
             move |backend: ResourceBackend, namespace_string: String| {
                 let local_host_ref = state.local_host_ref.clone();
                 let additional_host_refs = state.agentless_host_refs();
+                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.environments));
                 let state = Arc::clone(&state);
                 (
                     vec![],
-                    EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, &namespace_string)
-                        .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
-                        .with_additional_host_refs(additional_host_refs),
+                    Engine::<_, EnvironmentBinding>::new(
+                        EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, &namespace_string)
+                            .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
+                            .with_additional_host_refs(additional_host_refs),
+                        lifecycles,
+                    ),
                 )
             }
         }),
@@ -846,9 +856,12 @@ fn spawn_controller_loops(
             move |backend: ResourceBackend, namespace_string: String| {
                 (
                     vec![],
-                    CloneReconciler::new(
-                        Arc::new(RoutingCloneRuntime { state: Arc::clone(&state) }),
-                        backend.using::<Repository>(&namespace_string),
+                    Engine::<_, CloneBinding>::new(
+                        CloneReconciler::new(
+                            Arc::new(RoutingCloneRuntime { state: Arc::clone(&state) }),
+                            backend.using::<Repository>(&namespace_string),
+                        ),
+                        state.provisioning.as_ref().map(|engine| Arc::clone(&engine.clones)),
                     ),
                 )
             }
@@ -861,18 +874,22 @@ fn spawn_controller_loops(
                 // initialized from this value by with_checkout_removal_concurrency.
                 // A namespace-local task cap alone cannot pace all removals.
                 let removal_concurrency = state.checkout_removal_concurrency;
+                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.checkouts));
                 (
                     CheckoutReconciler::<RoutingCheckoutRuntime>::federated_secondary_watches(&backend, &namespace_string),
-                    CheckoutReconciler::new(
-                        Arc::new(RoutingCheckoutRuntime {
-                            state,
-                            change_requests: Some(backend.including_replicas::<ChangeRequest>(&namespace_string)),
-                        }),
-                        backend.clone(),
-                        &namespace_string,
-                    )
-                    .with_background_removal_limit(removal_concurrency)
-                    .with_federated_convoys(&backend, &namespace_string),
+                    Engine::<_, CheckoutBinding>::new(
+                        CheckoutReconciler::new(
+                            Arc::new(RoutingCheckoutRuntime {
+                                state,
+                                change_requests: Some(backend.including_replicas::<ChangeRequest>(&namespace_string)),
+                            }),
+                            backend.clone(),
+                            &namespace_string,
+                        )
+                        .with_background_removal_limit(removal_concurrency)
+                        .with_federated_convoys(&backend, &namespace_string),
+                        lifecycles,
+                    ),
                 )
             }
         }),
@@ -971,17 +988,21 @@ fn spawn_controller_loops(
         let service = state.image_build_service.clone();
         let host = state.local_host_ref.clone();
         let probe_wrapper: Arc<str> = flotilla_agent::process::with_preludes("exec \"$@\"").into();
+        let image_build_lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.image_builds));
         controllers.push(controller!(flotilla_resources::ImageBuild, {
             move |backend: ResourceBackend, namespace_string: String| {
                 (
                     vec![],
-                    flotilla_provisioning::reconcilers::ImageBuildReconciler::new(
-                        service.clone(),
-                        Arc::clone(&materials),
-                        &backend,
-                        &namespace_string,
-                        &host,
-                        &probe_wrapper,
+                    Engine::<_, ImageBuildBinding>::new(
+                        flotilla_provisioning::reconcilers::ImageBuildReconciler::new(
+                            service.clone(),
+                            Arc::clone(&materials),
+                            &backend,
+                            &namespace_string,
+                            &host,
+                            &probe_wrapper,
+                        ),
+                        image_build_lifecycles.clone(),
                     ),
                 )
             }
@@ -1103,6 +1124,28 @@ async fn open_message_primitives(daemon: &Arc<InProcessDaemon>, config: &ConfigS
     .await
     .map_err(|error| error.to_string())??;
     daemon.install_message_primitives(Arc::new(primitives))
+}
+
+/// The provisioning kinds' engine homes over the decided store (#3629 layer 3), each restored
+/// with the resources this home holds.
+async fn open_provisioning_lifecycles(
+    daemon: &Arc<InProcessDaemon>,
+) -> Result<flotilla_provisioning::engine::ProvisioningLifecycles, String> {
+    use flotilla_engine_store::{open_home, StoreLog};
+    use flotilla_provisioning::engine::{LifecycleHome, ProvisioningLifecycles};
+    let store = daemon.decided_store()?.store();
+    tokio::task::spawn_blocking(move || {
+        let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
+        let log = || StoreLog::new(Arc::clone(&store));
+        Ok(ProvisioningLifecycles {
+            environments: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            image_builds: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            clones: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            checkouts: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Daemon-owned image build state: the owned builder's Buildx state, build

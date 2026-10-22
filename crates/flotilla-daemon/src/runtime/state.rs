@@ -76,6 +76,9 @@ pub(super) struct ControllerRuntimeState {
     pub(super) forge_default_branches: Option<Arc<dyn ForgeDefaultBranchResolver>>,
     /// Per-kind controller loop load metrics (#3206).
     pub(super) controller_metrics: Arc<ControllerMetricsRegistry>,
+    /// The provisioning kinds' engine homes behind `[primitives]` (#3629): the single writer
+    /// of the resources they hold. Absent with the switch off.
+    pub(super) provisioning: Option<flotilla_provisioning::engine::ProvisioningLifecycles>,
 }
 
 impl ControllerRuntimeState {
@@ -200,7 +203,16 @@ impl ControllerRuntimeState {
             checkout_removals: Semaphore::new(DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY.get()),
             forge_default_branches: None,
             controller_metrics: Arc::default(),
+            provisioning: None,
         }
+    }
+
+    pub(super) fn with_provisioning_lifecycles(
+        mut self,
+        lifecycles: Option<flotilla_provisioning::engine::ProvisioningLifecycles>,
+    ) -> Self {
+        self.provisioning = lifecycles;
+        self
     }
 
     pub(super) fn with_controller_metrics(mut self, metrics: Arc<ControllerMetricsRegistry>) -> Self {
