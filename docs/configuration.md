@@ -138,6 +138,53 @@ Flotilla never writes the login user's `~/.claude`, `~/.claude.json` or
 design: a crew that refreshes its token updates the host's one login file.
 Skills are not staged on agentless hosts yet.
 
+#### Host supplies
+
+Flotilla never reads the login user's shell profile on an agentless host
+(#3722). Every command it runs there (probes, staging, checkout, crew
+launches and attach) starts in a non-login `sh -c` with an environment flotilla
+composes itself. The host's own tools are declared, not discovered from the
+profile:
+
+```toml
+[hosts.b1]
+hostname = "b1.example"
+user = "flotilla"
+agentless_ssh = true
+supplies = [
+  { name = "rust", path = ["~/.cargo/bin"], env = { RUSTUP_HOME = "~/.rustup", CARGO_HOME = "~/.cargo" } },
+  { name = "gh",   path = ["~/.local/opt/gh/bin"] },
+]
+```
+
+A supply holds directories (`path`) and environment variables (`env`) only,
+never a script. A leading `~` means the remote user's home; path entries must
+be absolute or under `~/`. A `hosts.toml` without `supplies` declares none.
+Static SSH environments in `daemon.toml` take the same `supplies` list. The
+format is shared with drydock's vessel agent (flotilla-org/drydock#55).
+
+`PATH` is composed in this order:
+
+1. flotilla's own directories: the delivered `flotilla` CLI and the credential
+   wrappers (the `gh` wrapper, for example);
+2. tools flotilla installs from its generation (#3655, not yet shipped);
+3. declared supplies, in declaration order;
+4. the fixed system tail, `/usr/local/bin:/usr/bin:/bin`.
+
+Directories a login profile would have added are not on `PATH` unless
+declared, so everything a crew needs from the host (Git, `cleat`, the agent
+harness, `gh`, toolchains) must be in a supply or the system tail. Supply
+variables are set as declared. A supply cannot set `PATH`, `HOME`, a `FLOTILLA_`
+variable, or any variable flotilla sets for a session (such as `LANG`); that is
+a configuration error reported for the host, and the host is not registered or
+the crew is not launched.
+
+cleat still starts each session command through `$SHELL -lc`, so the profile
+runs once inside a crew session before its command. The command sets the
+composed `PATH` and supply variables again as its first step, so the harness
+sees the composed environment. Removing that profile run needs a cleat launch
+without a login shell (#3761).
+
 The admission free-space floor below is checked against the SSH host's
 `~/dev/flotilla-repos` checkout volume using its remote `df` result.
 

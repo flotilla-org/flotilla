@@ -8,6 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_provider_runtime::host_environment::HostSupply;
 use flotilla_provider_runtime::CommandOutput;
 
 use super::*;
@@ -426,17 +427,33 @@ fn session_environment_points_at_the_forward_and_cli() {
     let paths =
         ReachPaths { remote_socket: PathBuf::from("/run/user/1000/flotilla/env/x/flotilla.sock"), cli_directory: PathBuf::from("/cli") };
     let mut env = vec![("FLOTILLA_DAEMON_SOCKET".to_string(), "/main.sock".to_string()), ("KEEP".to_string(), "1".to_string())];
-    apply_reach_environment(&mut env, "host-direct-b1", &paths, Some("/usr/bin"));
+    apply_reach_environment(&mut env, "host-direct-b1", &paths);
     fn get(env: &[(String, String)], name: &str) -> Vec<String> {
         env.iter().filter(|(key, _)| key == name).map(|(_, value)| value.clone()).collect()
     }
     assert_eq!(get(&env, DAEMON_SOCKET_ENV), ["/run/user/1000/flotilla/env/x/flotilla.sock"]);
     assert_eq!(get(&env, "FLOTILLA_ENVIRONMENT_ID"), ["host-direct-b1"]);
     assert_eq!(get(&env, CONTAINED_DAEMON_REQUIRED_ENV), ["1"], "the CLI must never spawn a daemon on the host");
-    assert_eq!(get(&env, "PATH"), ["/cli:/usr/bin"]);
     assert_eq!(get(&env, "KEEP"), ["1"]);
-    apply_reach_environment(&mut env, "host-direct-b1", &paths, Some("/ignored"));
-    assert_eq!(get(&env, "PATH"), ["/cli:/usr/bin"], "an explicit session PATH is kept, and the CLI is prepended once");
+
+    // #3722: composed last, the CLI leads PATH once, then the credential
+    // wrappers already on it, the supplies and the system tail; the session
+    // command sets them again after cleat's login shell.
+    let host = HostEnvironment::new(vec![HostSupply {
+        name: "rust".into(),
+        path: vec!["~/.cargo/bin".into()],
+        env: vec![("RUSTUP_HOME".into(), "~/.rustup".into())],
+    }])
+    .expect("valid supply");
+    env.push(("PATH".to_string(), "/run/creds/github:/home/crew/.cargo/bin:/usr/local/bin:/usr/bin:/bin".to_string()));
+    let command = compose_session_environment(&mut env, "claude", "host-direct-b1", &paths, &host, "/home/crew").expect("compose");
+    let path = "/cli:/run/creds/github:/home/crew/.cargo/bin:/usr/local/bin:/usr/bin:/bin";
+    assert_eq!(get(&env, "PATH"), [path]);
+    assert_eq!(get(&env, "RUSTUP_HOME"), ["/home/crew/.rustup"]);
+    assert_eq!(command, format!("export PATH='{path}'\nexport RUSTUP_HOME='/home/crew/.rustup'\nclaude"));
+
+    let error = compose_session_environment(&mut env, "claude", "host-direct-b1", &paths, &host, "/home/crew").expect_err("collision");
+    assert_eq!(error, "host configuration error for host-direct-b1: supply `rust` sets RUSTUP_HOME, which flotilla sets");
 }
 
 // Review #3621: retiring while the forward is still opening stops the ssh

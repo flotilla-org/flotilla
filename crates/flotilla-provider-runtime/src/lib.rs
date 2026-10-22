@@ -4,6 +4,7 @@ pub mod observation_error;
 pub mod weak_registry;
 pub use observation_error::ObservationError;
 mod git_config_guard;
+pub mod host_environment;
 pub mod ssh_runner;
 pub use rigging_http_client::http_execute;
 pub use rigging_http_client::{HttpClient, ReqwestHttpClient};

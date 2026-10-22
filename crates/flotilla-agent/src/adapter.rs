@@ -1180,7 +1180,7 @@ async fn ensure_flotilla_git_exclude(
         flotilla_protocol::arg::shell_quote(&exclude_path.to_string_lossy()),
     );
     runner
-        .run("sh", &["-lc", &script], cwd, &ChannelLabel::Default)
+        .run("sh", &["-c", &script], cwd, &ChannelLabel::Default)
         .await
         .map_err(|error| format!("cannot install .flotilla/ runtime-file exclusion: {error}"))?;
     for runtime_path in runtime_paths {

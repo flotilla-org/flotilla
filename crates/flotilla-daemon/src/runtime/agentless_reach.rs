@@ -16,6 +16,7 @@ use std::{
 
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId};
+use flotilla_provider_runtime::host_environment::{export_lines, HostEnvironment};
 use flotilla_provider_runtime::{ChannelLabel, CommandProcess, CommandRunner};
 use tokio::{
     sync::{watch, Mutex},
@@ -172,28 +173,45 @@ impl From<&AgentlessSshProfile> for ReachTarget {
     }
 }
 
-/// Point a session at the forwarded socket and the delivered CLI. The CLI
-/// never spawns a daemon of its own there: a missing socket means the forward
-/// is down, which the controller reports and repairs.
-pub(crate) fn apply_reach_environment(env: &mut Vec<(String, String)>, environment: &str, paths: &ReachPaths, host_path: Option<&str>) {
-    let base_path = env
-        .iter()
-        .rev()
-        .find(|(name, _)| name == "PATH")
-        .map(|(_, value)| value.clone())
-        .or_else(|| host_path.map(str::to_string))
-        .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
-    let cli = paths.cli_directory.to_string_lossy();
-    let path = if base_path.split(':').next() == Some(cli.as_ref()) { base_path } else { format!("{cli}:{base_path}") };
-    env.retain(|(name, _)| {
-        !matches!(name.as_str(), "PATH" | "FLOTILLA_ENVIRONMENT_ID" | DAEMON_SOCKET_ENV | CONTAINED_DAEMON_REQUIRED_ENV)
-    });
+/// Point a session at the forwarded socket. The CLI never spawns a daemon of
+/// its own there: a missing socket means the forward is down, which the
+/// controller reports and repairs. [`compose_session_environment`] puts the
+/// delivered CLI on `PATH`.
+pub(crate) fn apply_reach_environment(env: &mut Vec<(String, String)>, environment: &str, paths: &ReachPaths) {
+    env.retain(|(name, _)| !matches!(name.as_str(), "FLOTILLA_ENVIRONMENT_ID" | DAEMON_SOCKET_ENV | CONTAINED_DAEMON_REQUIRED_ENV));
     env.extend([
         (DAEMON_SOCKET_ENV.to_string(), paths.remote_socket.to_string_lossy().into_owned()),
         ("FLOTILLA_ENVIRONMENT_ID".to_string(), environment.to_string()),
         (CONTAINED_DAEMON_REQUIRED_ENV.to_string(), "1".to_string()),
-        ("PATH".to_string(), path),
     ]);
+}
+
+/// #3722: the last step before an agentless session starts. `PATH` is the
+/// delivered CLI, the credential wrappers flotilla put on the session's
+/// `PATH`, the host's declared supplies and the system tail, in that order,
+/// and each supply's variables are set. A supply variable that flotilla
+/// already set for the session is a configuration error for that host.
+///
+/// cleat runs a session command through `$SHELL -lc`, so the host's login
+/// profile still runs before the command; the returned command sets the
+/// composed `PATH` and supply variables again before anything else, until
+/// cleat can launch without a login shell (#3761).
+pub(crate) fn compose_session_environment(
+    env: &mut Vec<(String, String)>,
+    command: &str,
+    environment: &str,
+    paths: &ReachPaths,
+    host: &HostEnvironment,
+    home: &str,
+) -> Result<String, String> {
+    let own = [paths.cli_directory.to_string_lossy().into_owned()];
+    host.compose_session(home, &own, env).map_err(|error| format!("host configuration error for {environment}: {error}"))?;
+    let composed = env
+        .iter()
+        .filter(|(name, _)| name == "PATH" || host.supplies().iter().any(|supply| supply.env.iter().any(|(variable, _)| variable == name)))
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(format!("{}{command}", export_lines(&composed)))
 }
 
 /// Remote locations a session on the host is given.

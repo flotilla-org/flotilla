@@ -33,7 +33,7 @@ use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, T
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::agentless_reach::{apply_reach_environment, ReachTarget};
+use super::agentless_reach::{apply_reach_environment, compose_session_environment, ReachTarget};
 use super::credentials::{agent_material_environment, RuntimeSessionCapabilities};
 use super::state::ControllerRuntimeState;
 use crate::blob_store::BlobDigest;
@@ -420,13 +420,15 @@ impl TerminalRuntime for TerminalControllerRuntime {
         // flotilla environment names it, and its harness takes the contained
         // path; the daemon host's own host-direct session does not.
         let agentless = self.state.agentless_ssh.get(&spec.env_ref);
+        let mut reach_paths = None;
         if let Some(profile) = agentless {
             // #3618: an agentless host's crews reach the daemon through the forwarded
             // environment socket, with the controller generation's CLI on PATH.
             match &self.state.agentless_reach {
                 Some(reach) => {
                     let paths = reach.prepare_session(&ReachTarget::from(profile)).await?;
-                    apply_reach_environment(&mut credential_env, &spec.env_ref, &paths, profile.env_bag.find_env_var("PATH"));
+                    apply_reach_environment(&mut credential_env, &spec.env_ref, &paths);
+                    reach_paths = Some(paths);
                 }
                 // As for contained provisioning: a crew that cannot reach the
                 // daemon must not start silently without hooks or settlement.
@@ -450,7 +452,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             // declared or delivered environment claims.
             credential_env.retain(|(key, _)| key != FLOTILLA_ENVIRONMENT_ID_ENV);
         }
-        let (command, mut env, crew) = match &spec.source {
+        let (mut command, mut env, crew) = match &spec.source {
             TerminalSessionSource::Tool { command } => (command.clone(), credential_env.clone(), None),
             TerminalSessionSource::Agent { selector, brief, context, .. } => {
                 let mut materialized_brief = brief.clone();
@@ -621,6 +623,13 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 ("FLOTILLA_LINKER_THREADS".to_string(), jobs.to_string()),
                 ("RUSTC_WORKSPACE_WRAPPER".to_string(), wrapper.display().to_string()),
             ]);
+        }
+        if let (Some(profile), Some(paths)) = (agentless, &reach_paths) {
+            // #3722: composed last, so nothing after it adds to PATH or sets a
+            // variable a supply also declares. Every agentless launch reaches
+            // here with `reach_paths` set: without a reach it returned above.
+            let home = profile.env_bag.find_env_var("HOME").ok_or_else(|| format!("agentless host {} has no HOME", spec.env_ref))?;
+            command = compose_session_environment(&mut env, &command, &spec.env_ref, paths, &profile.host_environment, home)?;
         }
         // A dead generation may retain a recording with the old ID. Launch
         // under a fresh ID so cleat cannot resolve the name ambiguously, then

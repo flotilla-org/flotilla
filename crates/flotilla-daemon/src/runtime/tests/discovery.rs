@@ -171,6 +171,7 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
             .with(EnvironmentAssertion::env_var("FLOTILLA_PROBE_MODELS", ""))
             .with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
         runner,
+        host_environment: Default::default(),
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
     };
     register_agentless_ssh_resources(&daemon.resource_backend(), NAMESPACE, &local_host_id, &profile)
@@ -358,6 +359,7 @@ async fn agentless_host_without_a_platform_cli_is_refused_at_placement() {
         destination: "crew@b1".into(),
         env_bag: EnvironmentBag::new(),
         runner: Arc::new(DiscoveryMockRunner::builder().on_run("uname", &["-s", "-m"], Ok(uname.into())).build()),
+        host_environment: Default::default(),
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
     };
     let now = chrono::Utc::now();

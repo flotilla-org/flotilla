@@ -158,6 +158,7 @@ use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_projections::fleet::FleetService;
 use flotilla_projections::host_registry::HostCounts;
 use flotilla_projections::host_registry::HostQueryDetails;
+use flotilla_provider_runtime::host_environment::{HostEnvironment, HostSupply};
 use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
@@ -416,7 +417,11 @@ async fn register_static_ssh_direct_environment(
 ) -> Result<(), String> {
     let fallback_env_id = static_ssh_environment_id(config_key);
     let destination = flotilla_config::ssh_destination(&environment.hostname, environment.user.as_deref());
-    let runner = Arc::new(SshCommandRunner::new(destination.clone(), multiplex, Arc::clone(&discovery.runner)));
+    let host_environment =
+        host_environment(&environment.supplies).map_err(|error| format!("host configuration error for {config_key}: {error}"))?;
+    let runner = Arc::new(
+        SshCommandRunner::new(destination.clone(), multiplex, Arc::clone(&discovery.runner)).with_environment(host_environment.clone()),
+    );
     tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, runner.run("true", &[], Path::new("/"), &ChannelLabel::Default))
         .await
         .map_err(|_| format!("ssh preflight timed out for {}", environment.hostname))?
@@ -439,10 +444,25 @@ async fn register_static_ssh_direct_environment(
         env_bag = env_bag.with(EnvironmentAssertion::env_var("DISPLAY_NAME", display_name));
     }
     environment_manager.register_direct_environment(env_id.clone(), runner, env_bag, host_id)?;
+    environment_manager.set_direct_environment_host_environment(&env_id, host_environment)?;
     if host_direct {
         environment_manager.set_direct_environment_ssh_destination(&env_id, destination)?;
     }
     Ok(())
+}
+
+/// #3722: a host's declared supplies, validated for its SSH runner.
+fn host_environment(supplies: &[flotilla_config::HostSupply]) -> Result<HostEnvironment, String> {
+    HostEnvironment::new(
+        supplies
+            .iter()
+            .map(|supply| HostSupply {
+                name: supply.name.clone(),
+                path: supply.path.clone(),
+                env: supply.env.iter().map(|(name, value)| (name.clone(), value.clone())).collect(),
+            })
+            .collect(),
+    )
 }
 
 async fn register_static_ssh_direct_environments(
@@ -477,6 +497,7 @@ async fn register_static_ssh_direct_environments(
                     user: remote.user.clone(),
                     display_name: Some(remote.expected_host_name.clone()),
                     flotilla_command: None,
+                    supplies: remote.supplies.clone(),
                 };
                 if let Err(err) = register_static_ssh_direct_environment(
                     environment_manager,

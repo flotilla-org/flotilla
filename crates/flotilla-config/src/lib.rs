@@ -209,6 +209,28 @@ pub struct RemoteHostConfig {
     /// This host has no flotillad. The owning daemon may use SSH to actuate
     /// host-direct placements there, but it must not enter the peer mesh.
     pub agentless_ssh: bool,
+    /// What the host supplies to commands flotilla runs there (#3722).
+    pub supplies: Vec<HostSupply>,
+}
+
+/// One tool a host supplies: directories for `PATH` and environment
+/// variables, never a script. A leading `~` means the remote user's home.
+///
+/// ```toml
+/// supplies = [
+///   { name = "rust", path = ["~/.cargo/bin"], env = { RUSTUP_HOME = "~/.rustup", CARGO_HOME = "~/.cargo" } },
+/// ]
+/// ```
+///
+/// The format is shared with drydock's vessel agent (flotilla-org/drydock#55).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostSupply {
+    pub name: String,
+    #[serde(default)]
+    pub path: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// The same login-address rule is used for daemon peers and direct SSH
@@ -238,6 +260,8 @@ struct RawRemoteHostConfig {
     ssh_multiplex: Option<bool>,
     #[serde(default)]
     agentless_ssh: bool,
+    #[serde(default)]
+    supplies: Vec<HostSupply>,
 }
 
 impl<'de> Deserialize<'de> for HostsConfig {
@@ -261,6 +285,7 @@ impl<'de> Deserialize<'de> for HostsConfig {
                         user: host.user,
                         ssh_multiplex: host.ssh_multiplex,
                         agentless_ssh: host.agentless_ssh,
+                        supplies: host.supplies,
                     },
                 )
             })
@@ -613,6 +638,9 @@ pub struct StaticEnvironmentConfig {
     pub display_name: Option<String>,
     #[serde(default)]
     pub flotilla_command: Option<String>,
+    /// What the host supplies to commands run there, as for `hosts.toml` (#3722).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supplies: Vec<HostSupply>,
 }
 
 /// Host-local observation seed. Intentionally incapable of carrying per-path
