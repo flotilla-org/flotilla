@@ -33,6 +33,9 @@ pub(super) async fn crew_message_views(
     message_views(backend, namespace, &super::projection_ports::MessageReceiverEvidence(receivers, None), None, &BTreeSet::new()).await
 }
 
+/// The `[primitives]` Convoy path, off: explanations read the stored promises.
+static NO_CONVOY_ENGINE: std::sync::LazyLock<flotilla_resources::convoy::engine::EngineConvoyPath> =
+    std::sync::LazyLock::new(Default::default);
 /// Receiver evidence with the switch off: Messages are read from the old store.
 static OLD_STORE_RECEIVERS: std::sync::LazyLock<super::projection_ports::MessageReceivers> =
     std::sync::LazyLock::new(|| super::projection_ports::MessageReceivers(Default::default()));
@@ -322,6 +325,7 @@ mod tests {
                 leaf_subscriptions: &self.subscriptions,
                 fleet: &self.fleet,
                 lifecycles: &flotilla_projections::ports::NoLifecycleReads,
+                convoy_engine: &NO_CONVOY_ENGINE,
             }
         }
 

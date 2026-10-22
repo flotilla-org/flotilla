@@ -10,10 +10,10 @@
 //! home holds. Each engine convoy has two crews, a deliverer `coder` with `template/pr` and a
 //! `reviewer` with nothing.
 //!
-//! Per-event cost, each through [`ConvoyEngine`] and so including the old-shape mapping, the
-//! engine edges under one writer lock, and the one-way copy into the old status (one keyed old
-//! read and one status patch): admission, the crew's `Submit`, the observed `Keep` and `Deliver`.
-//! A second copy of an unchanged convoy is the reconciler's retry, and costs one keyed old read.
+//! Per-event cost, each through [`ConvoyEngine`] and so including the old-shape mapping and the
+//! engine edges under one writer lock: admission, the crew's `Submit`, the observed `Keep` and
+//! `Deliver`. Per-query cost: a reader's view of one convoy's promises, one keyed engine read
+//! mapped into the old shape (#3587 layer 8).
 //!
 //! The write path never lists: each step is a keyed engine read and a keyed old read, so the
 //! old-only convoys cost it nothing; peak memory is the process's `VmHWM`.
@@ -124,7 +124,7 @@ async fn convoy_write_path_at_the_ceiling() {
     for convoy in &local {
         assert_eq!(engine.admit(convoy).await.expect("admit"), Admission::Held);
     }
-    report("admit + copy", started, local.len());
+    report("admit", started, local.len());
 
     let submit = |number: usize| PromiseOperation::Submit {
         id: "template/pr".into(),
@@ -141,7 +141,7 @@ async fn convoy_write_path_at_the_ceiling() {
     for (number, convoy) in local.iter().enumerate() {
         engine.promise(convoy, "work", "coder", &submit(number + 1), Actor::Crew).await.expect("submit");
     }
-    report("crew submit + copy", started, local.len());
+    report("crew submit", started, local.len());
 
     let merged = PromiseOperation::Verdict {
         id: "template/pr".into(),
@@ -153,18 +153,18 @@ async fn convoy_write_path_at_the_ceiling() {
     for convoy in &local {
         engine.promise(convoy, "work", "coder", &merged, Actor::Observer).await.expect("keep");
     }
-    report("observed keep + copy", started, local.len());
+    report("observed keep", started, local.len());
 
     let started = Instant::now();
     for convoy in &local {
-        assert!(!engine.copy_back(convoy).await.expect("copy"), "already copied");
+        assert!(engine.promises(convoy, None).is_some(), "held");
     }
-    report("copy retry, unchanged", started, local.len());
+    report("read the engine's promises", started, local.len());
 
     let started = Instant::now();
     for convoy in &local {
         engine.deliver(convoy).await.expect("deliver");
     }
-    report("deliver + copy", started, local.len());
+    report("deliver", started, local.len());
     println!("{:>36}: {} KiB", "peak resident (VmHWM)", peak_kib());
 }

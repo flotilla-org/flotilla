@@ -6,14 +6,16 @@
 //! boundary is #3519.
 //!
 //! Behind `[primitives]` it also reaches the engine Convoy through the
-//! old-shaped [`EngineConvoys`] port (#3587 layer 6): a freshly bootstrapped
-//! convoy is admitted on the engine, its observations become engine edges
-//! instead of old promise patches, landing's settlement fires `Deliver`
-//! first, and each pass retries the one-way copy into the old status.
+//! old-shaped [`EngineConvoys`](flotilla_resources::convoy::engine::EngineConvoys)
+//! port (#3587 layers 6 and 8): a freshly bootstrapped convoy is admitted on
+//! the engine, each pass reads the convoy with the engine's promises in place
+//! of the stored ones ([`viewed`]), its observations become engine edges
+//! instead of old promise patches, and landing's settlement fires `Deliver`
+//! first.
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Relationship, Subject};
 use flotilla_resources::address::record_name;
-use flotilla_resources::convoy::engine::{deciding, Actor, Admission, EngineConvoyPath};
+use flotilla_resources::convoy::engine::{deciding, viewed, Actor, Admission, EngineConvoyPath};
 use flotilla_resources::convoy::reconcile::*;
 use flotilla_resources::*;
 use flotilla_store::{
@@ -65,6 +67,11 @@ pub struct ConvoyPrepared {
     /// The engine refused this convoy's admission: the refusal, as the
     /// convoy's failure message.
     engine_refusal: Option<String>,
+    /// The convoy with the engine's promises, when the engine holds it.
+    viewed: Option<ResourceObject<Convoy>>,
+    /// The engine holds the convoy, yet the stored status still has the
+    /// promises bootstrap seeded: admission's hand-over did not land.
+    stale_seeds: bool,
 }
 
 impl ConvoyReconciler {
@@ -196,6 +203,49 @@ async fn federated_children<T: Resource + std::clone::Clone>(
     Ok(select_convoy_children(convoy, &resolver.list().await?.items))
 }
 
+/// Wakes the convoy reconciler for each convoy whose engine record changed
+/// (#3587 layer 8): with the engine deciding, an engine edge writes no old
+/// record, so the reconciler's own watch would not see it.
+#[derive(Clone)]
+pub struct EngineConvoyWake {
+    pub engine: EngineConvoyPath,
+}
+
+impl SecondaryWatch for EngineConvoyWake {
+    type Primary = Convoy;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: flotilla_store::ResourceBackend,
+        _namespace: String,
+        sender: flotilla_store::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            // The switch is off: there is nothing to follow.
+            let Some(engine) = self.engine.get() else { return Ok(()) };
+            let mut changes = engine.changes();
+            loop {
+                match changes.recv().await {
+                    Ok(name) => {
+                        if sender.send(name).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    // Missed names are covered by the reconciler's resync.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!(missed, "the convoy reconciler fell behind the engine's changes");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+        })
+    }
+}
+
 impl ConvoyReconciler {
     /// Admits a freshly bootstrapped convoy on the engine when the switch is
     /// on; returns the engine's refusal, if it refused. A convoy the engine
@@ -225,6 +275,12 @@ impl Reconciler for ConvoyReconciler {
     type Prepared = ConvoyPrepared;
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        let engine_refusal = self.admit_on_engine(obj).await;
+        // With the engine holding the convoy, every promise read below is the engine's.
+        let engine = deciding(&self.engine, obj);
+        let viewed = engine.is_some().then(|| viewed(&self.engine, obj, None).into_owned());
+        let stale_seeds = engine.is_some() && obj.status.as_ref().is_some_and(|status| !status.promises.is_empty());
+        let obj = viewed.as_ref().unwrap_or(obj);
         let capacity_wait = if obj.status.as_ref().is_none_or(|status| {
             status.provisioning.is_none_or(|state| state == flotilla_resources::convoy::ConvoyProvisioningState::NotStarted)
         }) {
@@ -369,14 +425,6 @@ impl Reconciler for ConvoyReconciler {
             }
             _ => BTreeMap::new(),
         };
-        let engine_refusal = self.admit_on_engine(obj).await;
-        let engine = deciding(&self.engine, obj);
-        if let Some(engine) = engine {
-            // Retry any copy an earlier write could not make.
-            if let Err(error) = engine.copy_back(obj).await {
-                tracing::warn!(convoy = %obj.metadata.name, %error, "copying the engine's promises into the old status failed");
-            }
-        }
         let observation = obj.status.as_ref().filter(|status| !status.phase.is_terminal()).and_then(|status| {
             flotilla_resources::convoy::promises::next_observation(
                 status,
@@ -389,8 +437,8 @@ impl Reconciler for ConvoyReconciler {
             )
         });
         let observation = match (engine, observation) {
-            // The engine decides: an observation is its edge, and the old
-            // status follows by the copy, so no old promise patch is written.
+            // The engine decides: an observation is its edge, and no old
+            // promise patch is written.
             (Some(engine), Some(ConvoyStatusPatch::ObservePromise { vessel, role, operation })) => {
                 if let Err(error) = engine.promise(obj, &vessel, &role, &operation, Actor::Observer).await {
                     tracing::info!(convoy = %obj.metadata.name, %vessel, %role, %error, "the engine refused an observed promise edge");
@@ -404,6 +452,13 @@ impl Reconciler for ConvoyReconciler {
                 .as_ref()
                 .filter(|status| !status.phase.is_terminal())
                 .and_then(|status| flotilla_resources::promises::next_completion(status, self.clock.now()))
+                .map(|patch| match patch {
+                    // The stored status holds no engine promises to recheck.
+                    ConvoyStatusPatch::DeriveCrewDone { vessel, role, at, .. } => {
+                        ConvoyStatusPatch::DeriveCrewDone { vessel, role, at, engine: engine.is_some() }
+                    }
+                    other => other,
+                })
         });
         let settlement = if is_landing {
             Some(evaluate_landing_settlement_with_disposition(
@@ -483,6 +538,8 @@ impl Reconciler for ConvoyReconciler {
             reclaim_eligible,
             capacity_wait,
             engine_refusal,
+            viewed: viewed.clone(),
+            stale_seeds,
         })
     }
 
@@ -492,6 +549,8 @@ impl Reconciler for ConvoyReconciler {
         prepared: &Self::Prepared,
         now: DateTime<Utc>,
     ) -> ControllerReconcileOutcome<Self::Resource> {
+        // The engine's promises in place of the stored ones, when it holds the convoy.
+        let obj = prepared.viewed.as_ref().unwrap_or(obj);
         if !obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             let prior = obj.status.as_ref().and_then(|status| status.stalled.as_ref());
             if let Some(evidence) = &prepared.capacity_wait {
@@ -571,6 +630,15 @@ impl Reconciler for ConvoyReconciler {
                     now,
                     Some(format!("the engine refused this convoy's admission: {refusal}")),
                 )),
+                actuations: Vec::new(),
+                events: Vec::new(),
+                requeue_after: None,
+            };
+        }
+        if prepared.stale_seeds {
+            // Retry the hand-over: the engine holds the promises, not the old status.
+            return ControllerReconcileOutcome {
+                patch: Some(ConvoyStatusPatch::HandPromisesToEngine),
                 actuations: Vec::new(),
                 events: Vec::new(),
                 requeue_after: None,

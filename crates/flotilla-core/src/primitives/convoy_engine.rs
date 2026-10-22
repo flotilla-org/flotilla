@@ -6,17 +6,19 @@
 //! crew and promise names through [`super::convoy_map`], records what the
 //! gates take as given (a project's existence, a reference's durability, an
 //! operator's authority) in the world, applies the edges under one writer
-//! lock, and returns the machine's refusal to the caller. Every write is
-//! followed by the one-way copy into the old status; a failed copy is
-//! logged and never changes the engine's answer, and the convoy reconciler
-//! retries it on its next pass.
+//! lock, and returns the machine's refusal to the caller. Readers see the
+//! engine's promises in the old shape through [`EngineConvoys::promises`]
+//! (#3587 layer 8): one keyed read of this home's record, or of the replica
+//! of another home's in the decided store. Nothing is written to the old
+//! status for them; each edit publishes the convoy's name instead
+//! ([`EngineConvoys::changes`]), so its followers run again.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use flotilla_resources::{
     convoy::{
-        engine::{Actor, Admission, EngineConvoys, SkipReason, VerdictScope},
+        engine::{Actor, Admission, EngineConvoys, OldPromises, SkipReason, VerdictScope},
         reconcile::is_ensured,
     },
     promises::{PromiseKind as OldKind, PromiseOperation, PromiseSource as OldSource},
@@ -45,20 +47,32 @@ pub struct ConvoyEngine {
     convoys: Arc<Convoys>,
     backend: ResourceBackend,
     clock: Arc<dyn flotilla_resources::Clock>,
+    changes: tokio::sync::broadcast::Sender<String>,
 }
+
+/// How many changed-convoy names a slow follower may fall behind by; a
+/// follower that lags further misses names, and the reconciler's resync
+/// covers them.
+const CHANGES: usize = 1024;
 
 impl ConvoyEngine {
     pub fn new(convoys: Arc<Convoys>, backend: ResourceBackend, clock: Arc<dyn flotilla_resources::Clock>) -> Self {
-        Self { convoys, backend, clock }
+        Self { convoys, backend, clock, changes: tokio::sync::broadcast::channel(CHANGES).0 }
+    }
+
+    fn changed(&self, name: &str) {
+        // No follower is no error: the reconciler may not be running yet.
+        let _ = self.changes.send(name.to_owned());
     }
 
     fn now(&self) -> Timestamp {
         Timestamp::from_datetime(&self.clock.now())
     }
 
-    /// Applies the edges `plan` works out, off the async workers, then copies
-    /// the result back whenever any edge applied, a partial edit included. A
-    /// refusal comes back as the error; the plan's other output as the value.
+    /// Applies the edges `plan` works out, off the async workers, then
+    /// publishes the change whenever any edge applied, a partial edit
+    /// included. A refusal comes back as the error; the plan's other output
+    /// as the value.
     async fn edit<T: Send + 'static>(
         &self,
         convoy: &ResourceObject<OldConvoy>,
@@ -78,16 +92,9 @@ impl ConvoyEngine {
             Err(error) => error.applied(),
         };
         if applied > 0 {
-            self.copy_back_logged(convoy).await;
+            self.changed(&convoy.metadata.name);
         }
         edited.map(|(_, output)| output).map_err(|error: EditError| error.to_string())
-    }
-
-    async fn copy_back_logged(&self, convoy: &ResourceObject<OldConvoy>) {
-        if let Err(error) = EngineConvoys::copy_back(self, convoy).await {
-            // The engine's answer stands; the reconciler's next pass retries.
-            tracing::warn!(convoy = %convoy.metadata.name, %error, "copying the engine's promises into the old status failed");
-        }
     }
 
     async fn forges(&self, namespace: &str) -> Result<Vec<ForgeSpec>, String> {
@@ -161,7 +168,14 @@ impl EngineConvoys for ConvoyEngine {
         .map_err(|error| error.to_string())?;
         match admitted {
             Ok(_) => {
-                self.copy_back_logged(convoy).await;
+                // The engine holds the promises now: drop bootstrap's seeds from the old status.
+                let convoys = self.backend.clone().using::<OldConvoy>(&convoy.metadata.namespace);
+                if let Err(error) =
+                    flotilla_store::apply_status_patch(&convoys, &convoy.metadata.name, &ConvoyStatusPatch::HandPromisesToEngine).await
+                {
+                    tracing::warn!(convoy = %convoy.metadata.name, %error, "dropping the seeded promises from the old status failed");
+                }
+                self.changed(&convoy.metadata.name);
                 Ok(Admission::Held)
             }
             Err(error) => match error.refusal() {
@@ -393,18 +407,21 @@ impl EngineConvoys for ConvoyEngine {
         .await
     }
 
-    async fn copy_back(&self, convoy: &ResourceObject<OldConvoy>) -> Result<bool, String> {
-        let Some(engine) = self.convoys.get(&convoy.metadata.name) else { return Ok(false) };
-        let convoys = self.backend.clone().using::<OldConvoy>(&convoy.metadata.namespace);
-        // Compare against the stored status, not the caller's possibly older copy.
-        let stored = convoys.get(&convoy.metadata.name).await.map_err(|error| error.to_string())?;
-        let promises = map::old_promises(&engine, &crews(&stored));
-        if stored.status.as_ref().is_some_and(|status| status.promises == promises) {
-            return Ok(false);
-        }
-        flotilla_store::apply_status_patch(&convoys, &convoy.metadata.name, &ConvoyStatusPatch::CopyEnginePromises { promises })
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(true)
+    fn changes(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.changes.subscribe()
+    }
+
+    fn promises(&self, convoy: &ResourceObject<OldConvoy>, home: Option<&str>) -> Option<OldPromises> {
+        let engine = match home.filter(|home| *home != self.convoys.home()) {
+            None => self.convoys.get(&convoy.metadata.name)?,
+            Some(home) => match self.convoys.replica(&convoy.metadata.name, home) {
+                Ok(found) => found?,
+                Err(error) => {
+                    tracing::warn!(convoy = %convoy.metadata.name, %home, %error, "the engine convoy replica did not read");
+                    return None;
+                }
+            },
+        };
+        Some(map::old_promises(&engine, &crews(convoy)))
     }
 }

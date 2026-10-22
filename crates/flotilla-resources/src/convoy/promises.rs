@@ -218,6 +218,7 @@ pub fn next_completion(status: &ConvoyStatus, now: DateTime<Utc>) -> Option<supe
                 vessel: vessel.clone(),
                 role: role.clone(),
                 at: now,
+                engine: false,
             })
         })
     })

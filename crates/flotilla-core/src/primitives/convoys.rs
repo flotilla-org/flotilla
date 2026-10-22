@@ -27,6 +27,8 @@ use flotilla_state_machines::{
 /// log took it, so the records are consistent either way; the locks are
 /// recovered rather than turning one panic into a fault on every later write.
 pub struct Convoys {
+    home_name: String,
+    service: Arc<Service>,
     home: Mutex<Home<Convoy, StoreLog>>,
     world: Mutex<MemoryConvoyWorld>,
 }
@@ -62,7 +64,29 @@ impl Convoys {
         for convoy in stored {
             convoys.restore(convoy).map_err(|error| format!("{error:?}"))?;
         }
-        Ok(Self { home: Mutex::new(convoys), world: Mutex::new(MemoryConvoyWorld::default()) })
+        Ok(Self {
+            home_name: home.to_owned(),
+            service: Arc::clone(service),
+            home: Mutex::new(convoys),
+            world: Mutex::new(MemoryConvoyWorld::default()),
+        })
+    }
+
+    /// The home these records are homed at.
+    pub fn home(&self) -> &str {
+        &self.home_name
+    }
+
+    /// Another home's Convoy as this home's decided store replicates it: one
+    /// keyed read by kind, name and home. Absence means no such replica.
+    pub fn replica(&self, name: &str, home: &str) -> Result<Option<Resource<Convoy>>, String> {
+        self.service
+            .with_store(|store| {
+                let mut read = store.read()?;
+                let Some(id) = read.resolve(<Resource<Convoy> as flotilla_schema::Kind>::CODE, name, home)? else { return Ok(None) };
+                Ok(read.load::<Resource<Convoy>>(id)?.map(|loaded| loaded.value))
+            })
+            .map_err(|error| error.to_string())
     }
 
     /// One keyed read; absence means no Convoy of that name is homed here.

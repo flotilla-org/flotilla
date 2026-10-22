@@ -222,6 +222,10 @@ pub struct Aggregator {
     #[builder(skip)]
     checkout_replicas: HashMap<(String, String, flotilla_protocol::NodeId), ReadResourceObject<Checkout>>,
     bootstrapping: bool,
+    /// The `[primitives]` Convoy path (#3587 layer 8), and the namespace its
+    /// changed convoys are named in.
+    convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
+    engine_namespace: String,
     #[builder(skip)]
     projection_delivery: ConvoyProjectionDelivery,
     #[builder(skip)]
@@ -346,6 +350,8 @@ impl Aggregator {
             readiness_clones: BTreeMap::new(),
             checkout_replicas: HashMap::new(),
             bootstrapping: false,
+            convoy_engine: Default::default(),
+            engine_namespace: String::new(),
             projection_delivery: ConvoyProjectionDelivery::Immediate,
             projection_full: false,
             convoy_inputs: ConvoyInputs::default(),
@@ -374,6 +380,13 @@ impl Aggregator {
     /// Read engine-held provisioning resources through `reads` (#3629 layer 4).
     pub fn with_lifecycle_reads(mut self, reads: Arc<dyn crate::ports::LifecycleReads>) -> Self {
         self.lifecycle_reads = reads;
+        self
+    }
+
+    /// Rows read a convoy's promises from the engine when it holds the convoy.
+    pub fn with_convoy_engine(mut self, engine: flotilla_resources::convoy::engine::EngineConvoyPath, namespace: &str) -> Self {
+        self.convoy_engine = engine;
+        self.engine_namespace = namespace.to_owned();
         self
     }
 
@@ -530,6 +543,9 @@ impl Aggregator {
         self.emit_scoped_convoy_result_sets().await;
         self.emit_awareness_result_sets().await;
 
+        // An engine edge writes no old record: follow the engine's changes to
+        // re-project the convoy's row (#3587 layer 8).
+        let mut engine_changes = self.convoy_engine.get().map(|engine| engine.changes());
         let mut change_request_sweep =
             tokio::time::interval_at(Instant::now() + CHANGE_REQUEST_SWEEP_INTERVAL, CHANGE_REQUEST_SWEEP_INTERVAL);
         change_request_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -562,7 +578,21 @@ impl Aggregator {
                 }
             };
             tokio::pin!(projection_flush);
+            let engine_change = async {
+                match engine_changes.as_mut() {
+                    Some(changes) => changes.recv().await,
+                    None => futures::future::pending().await,
+                }
+            };
             tokio::select! {
+                change = engine_change => match change {
+                    Ok(name) => self.engine_convoy_changed(&name).await,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!(missed, "aggregator lagged behind the engine's convoy changes");
+                        self.rebuild_local_projection().await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => engine_changes = None,
+                },
                 () = &mut projection_flush => {
                     self.projection_delivery = ConvoyProjectionDelivery::Coalesced { deadline: None };
                     self.flush_local_projection().await;
@@ -1178,6 +1208,21 @@ impl Aggregator {
         }
     }
 
+    /// This home's convoy `name` changed on the engine: re-project its row.
+    async fn engine_convoy_changed(&mut self, name: &str) {
+        let keys: Vec<ConvoyKey> = self
+            .convoy_keys_by_name
+            .get(&(self.engine_namespace.clone(), name.to_owned()))
+            .into_iter()
+            .flat_map(|keys| keys.iter().filter(|key| key.2.is_none()).cloned())
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        self.projection_keys.extend(keys);
+        self.schedule_local_projection().await;
+    }
+
     fn has_convoy(&self, namespace: &str, name: &str) -> bool {
         self.convoy_keys_by_name
             .get(&(namespace.to_string(), name.to_string()))
@@ -1520,7 +1565,8 @@ impl Aggregator {
         let mut local_replacement = HashMap::new();
         let mut replica_replacements: HashMap<HostName, HashMap<ResourceRef, ConvoyRow>> = HashMap::new();
         for (reference, convoy) in effective_convoys {
-            let row = self.summarize(&reference, &convoy.object);
+            let viewed = flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, &convoy);
+            let row = self.summarize(&reference, &viewed);
             match convoy.provenance {
                 ResourceProvenance::Local => {
                     local_replacement.insert(row.resource.clone(), row);
@@ -1538,7 +1584,9 @@ impl Aggregator {
             keys.iter()
                 .filter_map(|key| {
                     let reference = self.convoy_key_ref(key)?;
-                    let row = self.effective_convoy_key(key).map(|item| self.summarize(&reference, &item.object));
+                    let row = self.effective_convoy_key(key).map(|item| {
+                        self.summarize(&reference, &flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, item))
+                    });
                     Some((reference, key.2.is_some(), row))
                 })
                 .collect::<Vec<_>>()

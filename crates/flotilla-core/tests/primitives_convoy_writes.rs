@@ -24,19 +24,24 @@ const PR: &str = "cr/github.com/org/repo/5";
 struct Fixture {
     _dir: tempfile::TempDir,
     backend: ResourceBackend,
+    service: Arc<Service>,
     convoys: Arc<Convoys>,
     engine: ConvoyEngine,
 }
 
 fn fixture() -> Fixture {
+    fixture_at("home-a")
+}
+
+fn fixture_at(home: &str) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let service = Arc::new(
-        Service::open(&dir.path().join("decided.sqlite"), "home-a", flotilla_engine_store::registry().expect("registry")).expect("store"),
+        Service::open(&dir.path().join("decided.sqlite"), home, flotilla_engine_store::registry().expect("registry")).expect("store"),
     );
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let convoys = Arc::new(Convoys::open("home-a", &service).expect("convoys"));
+    let convoys = Arc::new(Convoys::open(home, &service).expect("convoys"));
     let engine = ConvoyEngine::new(Arc::clone(&convoys), backend.clone(), Arc::new(SystemClock));
-    Fixture { _dir: dir, backend, convoys, engine }
+    Fixture { _dir: dir, backend, service, convoys, engine }
 }
 
 fn crew(role: &str, deliverer: bool) -> CrewSpec {
@@ -88,8 +93,14 @@ async fn old_convoy(backend: &ResourceBackend, name: &str, status: ConvoyStatus)
     convoys.update_status(name, &created.metadata.resource_version, &status).await.expect("status")
 }
 
-async fn reread(backend: &ResourceBackend, name: &str) -> ResourceObject<Convoy> {
-    backend.clone().using::<Convoy>(NAMESPACE).get(name).await.expect("convoy")
+/// The convoy as readers see it: the stored record with the engine's promises
+/// in place (#3587 layer 8).
+async fn reread(fixture: &Fixture, name: &str) -> ResourceObject<Convoy> {
+    let stored = fixture.backend.clone().using::<Convoy>(NAMESPACE).get(name).await.expect("convoy");
+    let promises = fixture.engine.promises(&stored, None).expect("the engine holds it");
+    let mut viewed = stored;
+    viewed.status.get_or_insert_with(Default::default).promises = promises;
+    viewed
 }
 
 fn old_promise<'a>(convoy: &'a ResourceObject<Convoy>, vessel: &str, role: &str, id: &str) -> &'a promises::Promise {
@@ -117,12 +128,12 @@ fn merged(id: &str) -> PromiseOperation {
 async fn admitted(fixture: &Fixture, name: &str, status: ConvoyStatus) -> ResourceObject<Convoy> {
     let convoy = old_convoy(&fixture.backend, name, status).await;
     assert_eq!(fixture.engine.admit(&convoy).await.expect("admit"), Admission::Held);
-    reread(&fixture.backend, name).await
+    reread(fixture, name).await
 }
 
 // Behaviour: a freshly bootstrapped convoy is admitted on the engine with one seat per crew and
-// its seeded promises under their old ids as labels; the copy back reproduces the seeded old
-// promises exactly, so it writes nothing, and a second admission is the first.
+// its seeded promises under their old ids as labels; the engine's view reproduces the seeded old
+// promises exactly, and a second admission is the first.
 #[tokio::test]
 async fn a_fresh_convoy_is_admitted_with_its_seeded_promises() {
     let fixture = fixture();
@@ -133,8 +144,7 @@ async fn a_fresh_convoy_is_admitted_with_its_seeded_promises() {
     let promises: Vec<_> = engine.spec().promises.iter().map(|row| (row.record.label.clone(), row.record.owner.clone())).collect();
     assert_eq!(promises, vec![("template/coder/pr".to_owned(), SeatName::new("coder", ""))]);
     assert_eq!(engine.spec().seats.len(), 2);
-    assert_eq!(convoy.status.as_ref().expect("status").promises, seeded, "the copy reproduces the seeded promises");
-    assert!(!fixture.engine.copy_back(&convoy).await.expect("copy"), "nothing to copy");
+    assert_eq!(convoy.status.as_ref().expect("status").promises, seeded, "the engine's view reproduces the seeded promises");
     assert_eq!(fixture.engine.admit(&convoy).await.expect("again"), Admission::Held);
 }
 
@@ -148,7 +158,7 @@ async fn a_submitted_pr_is_kept_by_its_merge_and_the_convoy_delivers() {
     assert!(refused.contains("PromisesOutstanding"), "{refused}");
 
     fixture.engine.promise(&convoy, "work", "coder", &submit("template/pr", PR), Actor::Crew).await.expect("submitted");
-    let convoy = reread(&fixture.backend, "c").await;
+    let convoy = reread(&fixture, "c").await;
     let copied = old_promise(&convoy, "work", "coder", "template/pr");
     assert_eq!(copied.state, PromiseState::Submitted);
     assert_eq!(copied.submissions.len(), 1);
@@ -159,7 +169,7 @@ async fn a_submitted_pr_is_kept_by_its_merge_and_the_convoy_delivers() {
     assert_eq!(engine.spec().promises.iter().next().expect("promise").record.submissions.len(), 1);
 
     fixture.engine.promise(&convoy, "work", "coder", &merged("template/pr"), Actor::Observer).await.expect("kept");
-    let convoy = reread(&fixture.backend, "c").await;
+    let convoy = reread(&fixture, "c").await;
     assert_eq!(old_promise(&convoy, "work", "coder", "template/pr").state, PromiseState::Kept);
     fixture.engine.deliver(&convoy).await.expect("delivered");
     assert_eq!(fixture.convoys.get("c").expect("held").label(), ConvoyLabel::Delivered);
@@ -180,7 +190,7 @@ async fn refusals_come_back_to_the_caller() {
     assert!(refused.contains("StaleEvidence"), "{refused}");
     let engine = fixture.convoys.get("c").expect("held");
     assert_eq!(engine.spec().promises.iter().next().expect("promise").record.progress.value, Progress::Pending);
-    assert_eq!(old_promise(&reread(&fixture.backend, "c").await, "work", "coder", "template/pr").state, PromiseState::Open);
+    assert_eq!(old_promise(&reread(&fixture, "c").await, "work", "coder", "template/pr").state, PromiseState::Open);
 }
 
 // Behaviour: a crew-declared promise is the owner's to retract before anything is submitted, and
@@ -194,7 +204,7 @@ async fn crew_declared_promises_follow_the_crew() {
     let retract = PromiseOperation::Retract { id: "l2-quint".into(), reason: "folded into l3".into() };
     fixture.engine.promise(&convoy, "work", "coder", &retract, Actor::Crew).await.expect("retracted");
     fixture.engine.promise(&convoy, "work", "coder", &submit("extra", "cr/github.com/org/repo/9"), Actor::Crew).await.expect("implicit");
-    let convoy = reread(&fixture.backend, "c").await;
+    let convoy = reread(&fixture, "c").await;
     assert_eq!(old_promise(&convoy, "work", "coder", "l2-quint").state, PromiseState::Retracted);
     assert_eq!(old_promise(&convoy, "work", "coder", "extra").state, PromiseState::Submitted);
     // A retracted id is never reused: declaring it again is a no-op on the same promise.
@@ -215,7 +225,7 @@ async fn repeated_roles_get_seats_and_template_labels_by_seat() {
     let second = &engine.spec().promises.iter().nth(1).expect("b's promise").record;
     assert_eq!(convoy_map::old_id(second), "template/pr");
     fixture.engine.promise(&convoy, "b", "coder", &submit("template/pr", PR), Actor::Crew).await.expect("submitted");
-    let convoy = reread(&fixture.backend, "c").await;
+    let convoy = reread(&fixture, "c").await;
     assert_eq!(old_promise(&convoy, "a", "coder", "template/pr").state, PromiseState::Open);
     assert_eq!(old_promise(&convoy, "b", "coder", "template/pr").state, PromiseState::Submitted);
 }
@@ -227,7 +237,7 @@ async fn handoff_reassigns_open_promises() {
     let fixture = fixture();
     let convoy = admitted(&fixture, "c", bootstrapped(vec![("work", vec![crew("coder", true), crew("reviewer", false)])])).await;
     fixture.engine.reassign(&convoy, "work", "coder", "reviewer").await.expect("reassigned");
-    let convoy = reread(&fixture.backend, "c").await;
+    let convoy = reread(&fixture, "c").await;
     assert_eq!(old_promise(&convoy, "work", "reviewer", "template/pr").state, PromiseState::Open);
     fixture.engine.reassign(&convoy, "work", "reviewer", "fixer").await.expect("reassigned to a new seat");
     let engine = fixture.convoys.get("c").expect("held");
@@ -251,7 +261,7 @@ async fn operator_verdicts_keep_and_retract() {
     let refused = fixture.engine.verdict(&convoy, "template/coder~b/pr", false, "alice", "").await.expect_err("no reason");
     assert!(refused.contains("Unauthorised"), "{refused}");
     fixture.engine.verdict(&convoy, "template/coder~b/pr", false, "alice", "dropped").await.expect("retracted");
-    let convoy = reread(&fixture.backend, "c").await;
+    let convoy = reread(&fixture, "c").await;
     assert_eq!(old_promise(&convoy, "a", "coder", "template/pr").state, PromiseState::Kept);
     assert_eq!(old_promise(&convoy, "b", "coder", "template/pr").state, PromiseState::Retracted);
     fixture.engine.deliver(&convoy).await.expect("nothing open");
@@ -310,7 +320,7 @@ async fn a_taken_label_is_refused_at_declaration() {
     assert!(refused.contains("`script-ledger` is already declared") && refused.contains("owned by `coder`"), "{refused}");
     let own = ledger("script-ledger-reviewer", "reviewer");
     fixture.engine.promise(&convoy, "work", "reviewer", &own, Actor::Crew).await.expect("reviewer's ledger");
-    let convoy = reread(&fixture.backend, "c").await;
+    let convoy = reread(&fixture, "c").await;
     assert_eq!(old_promise(&convoy, "work", "coder", "script-ledger").state, PromiseState::Kept);
     assert_eq!(old_promise(&convoy, "work", "reviewer", "script-ledger-reviewer").state, PromiseState::Submitted);
     // The same reference again is the submission already made.
@@ -332,6 +342,56 @@ async fn an_admission_with_a_label_clash_is_refused() {
     assert!(!fixture.engine.holds(&convoy));
 }
 
+// Behaviour (#3587 layer 8): the engine decides and readers read it; no engine edge writes the
+// old status, so the stored promises stay as admission found them.
+#[tokio::test]
+async fn engine_edges_write_no_old_status() {
+    let fixture = fixture();
+    let convoy = admitted(&fixture, "c", bootstrapped(vec![("work", vec![crew("coder", true)])])).await;
+    let before = fixture.backend.clone().using::<Convoy>(NAMESPACE).get("c").await.expect("stored");
+    let mut changes = fixture.engine.changes();
+    fixture.engine.promise(&convoy, "work", "coder", &submit("template/pr", PR), Actor::Crew).await.expect("submitted");
+    let after = fixture.backend.clone().using::<Convoy>(NAMESPACE).get("c").await.expect("stored");
+    assert_eq!(before.metadata.resource_version, after.metadata.resource_version, "the old record is untouched");
+    assert_eq!(old_promise(&reread(&fixture, "c").await, "work", "coder", "template/pr").state, PromiseState::Submitted);
+    assert_eq!(changes.try_recv().expect("a change"), "c", "followers hear of the engine edge");
+}
+
+// Behaviour (#3587 layer 8): a reader at another home sees a replicated convoy's promises from
+// its home's engine record in this home's decided store, by one keyed read at that home.
+#[tokio::test]
+async fn a_replica_is_read_at_its_home() {
+    use flotilla_schema::Timestamp;
+    use flotilla_schema_sqlite::stream::Follower;
+    let home_b = fixture_at("home-b");
+    let convoy = admitted(&home_b, "c", bootstrapped(vec![("work", vec![crew("coder", true)])])).await;
+    home_b.engine.promise(&convoy, "work", "coder", &submit("template/pr", PR), Actor::Crew).await.expect("submitted");
+    let home_a = fixture_at("home-a");
+    let mut frames = Vec::new();
+    home_b
+        .service
+        .serve(None, Timestamp(1), |frame| {
+            frames.push(frame.to_vec());
+            Ok(())
+        })
+        .expect("serve");
+    home_a
+        .service
+        .with_store(|store| {
+            Follower::new(store).receive("home-b", |sink| {
+                for frame in &frames {
+                    sink(frame)?;
+                }
+                Ok(())
+            })
+        })
+        .expect("follow");
+    assert!(home_a.engine.promises(&convoy, None).is_none(), "not this home's");
+    let seen = home_a.engine.promises(&convoy, Some("home-b")).expect("the replica");
+    assert_eq!(seen["work"]["coder"][0].state, PromiseState::Submitted);
+    assert!(!home_a.engine.holds(&convoy), "a replica is read, never decided, here");
+}
+
 // Behaviour (#3721 review): an operator's promise operation carries operator authority, so it
 // may retract a template promise the crew may not, and its accepted verdict is a `Keep` verdict.
 #[tokio::test]
@@ -343,7 +403,7 @@ async fn an_operator_decides_with_its_own_authority() {
     assert!(refused.contains("Unauthorised"), "{refused}");
     let operator = Actor::Operator { principal: "alice".into() };
     fixture.engine.promise(&convoy, "work", "coder", &retract, operator).await.expect("the operator may");
-    assert_eq!(old_promise(&reread(&fixture.backend, "c").await, "work", "coder", "template/pr").state, PromiseState::Retracted);
+    assert_eq!(old_promise(&reread(&fixture, "c").await, "work", "coder", "template/pr").state, PromiseState::Retracted);
 }
 
 // Behaviour (#3721 review): a verdict names one promise. An exact label always does; a bare old
@@ -355,7 +415,7 @@ async fn an_ambiguous_verdict_is_refused_with_the_labels() {
     let refused = fixture.engine.verdict(&convoy, "template/pr", true, "alice", "merged").await.expect_err("ambiguous");
     assert!(refused.contains("`template/coder~a/pr`") && refused.contains("`template/coder~b/pr`"), "{refused}");
     fixture.engine.verdict(&convoy, "template/coder~b/pr", true, "alice", "merged").await.expect("exact");
-    let convoy = reread(&fixture.backend, "c").await;
+    let convoy = reread(&fixture, "c").await;
     assert_eq!(old_promise(&convoy, "a", "coder", "template/pr").state, PromiseState::Open);
     assert_eq!(old_promise(&convoy, "b", "coder", "template/pr").state, PromiseState::Kept);
 }

@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_resources::{
     address::{artifact_address, record_name},
-    convoy::engine::{Actor, Admission, EngineConvoyPath, EngineConvoys, SkipReason, VerdictScope},
+    convoy::engine::{Actor, Admission, EngineConvoyPath, EngineConvoys, OldPromises, SkipReason, VerdictScope},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState},
     Artifact, ArtifactSpec, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec, CrewWorkPhase,
     CrewWorkState, InputMeta, ResourceObject, StatusPatch, VesselRequirement, WorkflowSnapshot, WorkflowTemplate,
@@ -28,7 +28,7 @@ struct Recording {
     holds: bool,
     admission: Option<Admission>,
     promises: Mutex<Vec<(String, String, PromiseOperation, Actor)>>,
-    copies: Mutex<usize>,
+    views: Mutex<usize>,
 }
 
 #[async_trait]
@@ -65,9 +65,13 @@ impl EngineConvoys for Recording {
     async fn abandon(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn copy_back(&self, _: &ResourceObject<Convoy>) -> Result<bool, String> {
-        *self.copies.lock().expect("copies") += 1;
-        Ok(false)
+    fn promises(&self, convoy: &ResourceObject<Convoy>, _: Option<&str>) -> Option<OldPromises> {
+        *self.views.lock().expect("views") += 1;
+        // The engine's view: here, the stored promises as they are.
+        self.holds.then(|| convoy.status.as_ref().map(|status| status.promises.clone()).unwrap_or_default())
+    }
+    fn changes(&self) -> tokio::sync::broadcast::Receiver<String> {
+        tokio::sync::broadcast::channel(1).1
     }
 }
 
@@ -133,8 +137,8 @@ fn reconciler(backend: &ResourceBackend, engine: Arc<Recording>) -> ConvoyReconc
         .with_engine(path)
 }
 
-// Behaviour: with the engine holding the convoy, the observed ledger is the engine's Submit by
-// an observer, the reconciler writes no old promise patch, and it retries the copy back.
+// Behaviour: with the engine holding the convoy, the reconciler reads the engine's promises, the
+// observed ledger is the engine's Submit by an observer, and no old promise patch is written.
 #[tokio::test]
 async fn an_engine_held_convoy_observes_through_the_engine() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -153,7 +157,9 @@ async fn an_engine_held_convoy_observes_through_the_engine() {
         "no old promise write: {:?}",
         outcome.patch
     );
-    assert_eq!(*engine.copies.lock().expect("copies"), 1);
+    assert_eq!(*engine.views.lock().expect("views"), 1, "one keyed read of the engine's promises per pass");
+    // The stored status still holds bootstrap's seeds: the hand-over is retried.
+    assert_eq!(outcome.patch, Some(ConvoyStatusPatch::HandPromisesToEngine));
 }
 
 // Behaviour: a convoy the engine does not hold stays on the old path: the observation is the old

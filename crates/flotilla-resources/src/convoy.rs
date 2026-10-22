@@ -1784,14 +1784,10 @@ pub enum ConvoyStatusPatch {
         role: String,
         operation: promises::PromiseOperation,
     },
-    /// The engine's promises copied one way into the old status (#3587 layer
-    /// 6): with `[primitives]` on, the engine decides and this is a derived
-    /// scaffold, rebuilt whole from the engine, which layer 8 deletes. It
-    /// applies in every phase, so the copy follows a delivered or abandoned
-    /// engine convoy.
-    CopyEnginePromises {
-        promises: BTreeMap<String, BTreeMap<String, Vec<promises::Promise>>>,
-    },
+    /// The engine admitted the convoy and now holds its promises (#3587
+    /// layer 8): the declarations bootstrap seeded are dropped, so no reader
+    /// or recheck sees a stale copy. Written once, at engine admission.
+    HandPromisesToEngine,
     HoldTurnDelivery {
         source: String,
         hold: ConvoyAttention,
@@ -1950,6 +1946,10 @@ pub enum ConvoyStatusPatch {
         vessel: String,
         role: String,
         at: DateTime<Utc>,
+        /// With `[primitives]` on, the engine decided the crew's promises are
+        /// settled and the stored status holds none to check again (#3587
+        /// layer 8); otherwise apply rechecks the stored promises.
+        engine: bool,
     },
     MarkCrewCompleted {
         vessel: String,
@@ -2068,7 +2068,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     | Self::SetStalled { .. }
                     | Self::SetTeardownWait { .. }
                     | Self::ObserveQueuedTurnDeliveries { .. }
-                    | Self::CopyEnginePromises { .. }
             )
             && !matches!(self, Self::MarkConvoyAbandoned { expected_phase, .. } if *expected_phase == status.phase && status.phase != ConvoyPhase::Abandoned)
         {
@@ -2125,9 +2124,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::ObservePromise { vessel, role, operation } => {
                 promises::apply(status, vessel, role, operation);
             }
-            Self::CopyEnginePromises { promises } => {
-                status.promises = promises.clone();
-            }
+            Self::HandPromisesToEngine => status.promises.clear(),
             Self::DiscoverSubjects { subjects, source, at } => {
                 for (subject, relationship) in subjects {
                     status.discover_subject(subject.clone(), *relationship, *source, *at);
@@ -2447,12 +2444,12 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
                 clear_operator_pending_brief(status);
             }
-            Self::DeriveCrewDone { vessel, role, at } => {
+            Self::DeriveCrewDone { vessel, role, at, engine } => {
                 if status.phase.is_terminal() {
                     return;
                 }
                 let held = promises::owned(status, vessel, role);
-                if held.is_empty() || held.iter().any(|promise| !promise.state.terminal()) {
+                if !engine && (held.is_empty() || held.iter().any(|promise| !promise.state.terminal())) {
                     return;
                 }
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
