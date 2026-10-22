@@ -29,7 +29,7 @@ use flotilla_provisioning::stored::{
     self,
     checkout::{CheckoutKind, CheckoutRequest, Source},
     clone::{CloneKind, CloneRequest},
-    environment::{Backing, EnvironmentKind, EnvironmentRequest},
+    environment::{EnvironmentKind, EnvironmentRequest, Recipe},
     image_build::{Architecture, Delivery, ImageBuildKind, ImageBuildRequest, Reservation},
 };
 use flotilla_quint_testkit::{
@@ -70,7 +70,11 @@ impl Sample for EnvironmentKind {
         EnvironmentRequest {
             provider: "host:feta/provider:host-direct".parse::<Address>().expect("provider"),
             image_build: None,
-            backing: Backing::HostDirect { repo_default_dir: "/work".into() },
+            recipe: Frozen::new(
+                Recipe::of(&flotilla_resources::HostDirectEnvironmentSpec { host_ref: String::new(), repo_default_dir: "/work".into() })
+                    .expect("recipe"),
+            )
+            .expect("freeze"),
         }
     }
 }

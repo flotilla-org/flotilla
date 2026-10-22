@@ -10,7 +10,7 @@
 //! Two temp-file stores in WAL mode with `synchronous = NORMAL`: the local home and a remote one,
 //! as in the Convoy benchmark. 10,000 convoys' worth of provisioning, nine in ten homed remotely
 //! and replicated into the local store through its change stream, one in ten local. Each convoy has
-//! a Docker Environment (two mounts, three env values, two adapters) on one of 100 providers, built
+//! a Docker Environment (its recipe a frozen document with two mounts, three env values and two adapters) on one of 100 providers, built
 //! from one of 50 ImageBuilds; a Clone of one of 20 repositories; and two worktree Checkouts owned
 //! by its convoy. Every resource is Realised.
 //!
@@ -37,7 +37,7 @@ use flotilla_provisioning::stored::{
     self,
     checkout::{Checkout, CheckoutRequest, Source},
     clone::{Clone, CloneRequest},
-    environment::{Backing, Environment, EnvironmentRequest, MemoryPolicy, Mount, MountMode, PullPolicy},
+    environment::{Environment, EnvironmentRequest, Recipe},
     image_build::{Architecture, Delivery, ImageBuild, ImageBuildRequest, Reservation},
 };
 use flotilla_resources::{ImageLayerSource, ImageLayerSpec, ImageLayerTier};
@@ -109,18 +109,27 @@ fn environment(n: usize, home: &str) -> EnvironmentRequest {
     EnvironmentRequest {
         provider: provider(n),
         image_build: Some(StoredRef::new(format!("image-{}", n % BUILDS), home)),
-        backing: Backing::Docker {
-            image: format!("registry/flotilla@sha256:{}", n % BUILDS),
-            declared_adapters: BTreeSet::from(["claude-code".into(), "codex".into()]),
-            required_adapters: BTreeSet::from(["claude-code".into()]),
-            pull: PullPolicy::IfNotPresent,
-            memory: MemoryPolicy { host_memory_percent: 80, expected_concurrent_crews: 4, swap_bytes: 0 },
-            mounts: vec![
-                Mount { source_path: format!("/work/{n}"), target_path: "/workspace".into(), mode: MountMode::ReadWrite },
-                Mount { source_path: "/cache".into(), target_path: "/cache".into(), mode: MountMode::ReadOnly },
-            ],
-            env: BTreeMap::from([("A".into(), "1".into()), ("B".into(), "2".into()), ("C".into(), n.to_string())]),
-        },
+        recipe: Frozen::new(Recipe::of(&docker_recipe(n)).expect("recipe")).expect("freeze"),
+    }
+}
+
+/// Convoy `n`'s Docker recipe: the provider's own document, two mounts, three env values and two
+/// adapters.
+fn docker_recipe(n: usize) -> flotilla_resources::DockerEnvironmentSpec {
+    use flotilla_resources::{EnvironmentMount, EnvironmentMountMode};
+    flotilla_resources::DockerEnvironmentSpec {
+        host_ref: String::new(),
+        image: format!("registry/flotilla@sha256:{}", n % BUILDS),
+        image_build_ref: Some(format!("image-{}", n % BUILDS)),
+        declared_agent_adapters: BTreeSet::from(["claude-code".into(), "codex".into()]),
+        required_agent_adapters: BTreeSet::from(["claude-code".into()]),
+        pull_policy: Default::default(),
+        memory_policy: Default::default(),
+        mounts: vec![
+            EnvironmentMount { source_path: format!("/work/{n}"), target_path: "/workspace".into(), mode: EnvironmentMountMode::Rw },
+            EnvironmentMount { source_path: "/cache".into(), target_path: "/cache".into(), mode: EnvironmentMountMode::Ro },
+        ],
+        env: BTreeMap::from([("A".into(), "1".into()), ("B".into(), "2".into()), ("C".into(), n.to_string())]),
     }
 }
 
@@ -351,7 +360,9 @@ fn provisioning_load() {
     let (objects, _): (i64, i64) = read
         .query_row("SELECT count(*), coalesce(sum(length(bytes)), 0) FROM objects", [], |row| Ok((row.get(0)?, row.get(1)?)))
         .expect("objects");
-    assert_eq!(objects, 1, "every build shares the one frozen composition");
+    // One frozen composition shared by every build, and each environment's own recipe (its mount
+    // and env values name the convoy).
+    assert_eq!(objects, 1 + convoys as i64, "every build shares the one frozen composition");
     let keys = |kind: &str, name: &dyn Fn(usize) -> String| -> Vec<Vec<String>> {
         (0..convoys)
             .step_by(7)
