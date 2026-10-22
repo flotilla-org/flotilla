@@ -16,20 +16,34 @@ impl drydock_transport::Connections for Connections {
         Ok(Box::new(self.listener.accept().await?))
     }
 }
+#[derive(Clone)]
 pub(super) enum Destination {
     Unix(PathBuf),
     Tcp(String, u16),
 }
+impl Destination {
+    async fn connect(self) -> io::Result<drydock_transport::ByteStream> {
+        match self {
+            Self::Unix(path) => Ok(Box::new(tokio::net::UnixStream::connect(path).await?)),
+            Self::Tcp(host, port) => Ok(Box::new(tokio::net::TcpStream::connect((host.as_str(), port)).await?)),
+        }
+    }
+}
 pub(super) struct Connection {
     pub agent: Arc<drydock_agent::Client>,
     forwards: Forwarder,
+    lab_configured: tokio::sync::Mutex<bool>,
 }
 struct Forwarder {
     session: Arc<dyn SshSession>,
     tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    sockets: std::sync::Mutex<HashMap<PathBuf, JoinHandle<()>>>,
 }
 impl Drop for Forwarder {
     fn drop(&mut self) {
+        for task in self.sockets.get_mut().expect("forward sockets").values() {
+            task.abort();
+        }
         for task in self.tasks.get_mut().expect("forward tasks") {
             task.abort();
         }
@@ -68,11 +82,18 @@ impl Connection {
         .await
         .map_err(error)?;
         let session = sessions.lock().await.take().ok_or("SSH session missing")?;
-        Ok(Self { agent: Arc::new(agent), forwards: Forwarder { session, tasks: Default::default() } })
+        Ok(Self {
+            lab_configured: Default::default(),
+            agent: Arc::new(agent),
+            forwards: Forwarder { session, tasks: Default::default(), sockets: Default::default() },
+        })
     }
 }
 impl Forwarder {
     pub async fn forward(&self, guest: &Path, destination: Destination) -> Result<(), String> {
+        if let Some(task) = self.sockets.lock().expect("forward sockets").remove(guest) {
+            task.abort();
+        }
         let removed = self.session.exec(&format!("rm -f -- {}", runner::quote(&guest.to_string_lossy()))).await.map_err(error)?;
         if !removed.status.success() {
             return Err("remove stale guest forward socket failed".into());
@@ -84,13 +105,9 @@ impl Forwarder {
                 tokio::select! {
                     stream = listener.accept(), if streams.len() < 64 => {
                         let Ok(mut stream) = stream else { break };
-                        let destination = match &destination { Destination::Unix(path) => Destination::Unix(path.clone()), Destination::Tcp(host, port) => Destination::Tcp(host.clone(), *port) };
+                        let destination = destination.clone();
                         streams.spawn(async move {
-                            let connect = async { match destination {
-                                Destination::Unix(path) => tokio::net::UnixStream::connect(path).await.map(|s| Box::new(s) as drydock_transport::ByteStream),
-                                Destination::Tcp(host, port) => tokio::net::TcpStream::connect((host.as_str(), port)).await.map(|s| Box::new(s) as drydock_transport::ByteStream),
-                            }};
-                            if let Ok(Ok(mut target)) = tokio::time::timeout(Duration::from_secs(10), connect).await {
+                            if let Ok(Ok(mut target)) = tokio::time::timeout(Duration::from_secs(10), destination.connect()).await {
                                 let _ = tokio::io::copy_bidirectional(&mut stream, &mut target).await;
                             }
                         });
@@ -99,7 +116,7 @@ impl Forwarder {
                 }
             }
         });
-        self.tasks.lock().expect("forward tasks").push(task);
+        self.sockets.lock().expect("forward sockets").insert(guest.into(), task);
         Ok(())
     }
 }
@@ -141,12 +158,17 @@ pub(super) fn upload<'a>(
             };
             let mut exec =
                 agent.exec(drydock_agent::Exec { program: args[0].clone(), args: args[1..].to_vec(), cwd: None }).await.map_err(error)?;
+            let mut exited = false;
             while let Some(event) = exec.next().await.map_err(error)? {
                 if let drydock_agent::ExecEvent::Exit { code } = event {
+                    exited = true;
                     if code != Some(0) {
                         return Err("tool material creation failed".into());
                     }
                 }
+            }
+            if !exited {
+                return Err("tool material creation ended without exit status".into());
             }
             if metadata.is_dir() {
                 use std::os::unix::fs::PermissionsExt;
@@ -178,16 +200,24 @@ pub(super) struct SshConnector;
 #[async_trait]
 impl Connector for SshConnector {
     async fn connect(&self, api: &dyn ProviderApi, instance: &str, backing: &str, key: PathBuf) -> Result<Arc<dyn Guest>, String> {
+        // Fail immediately for a missing companion, rather than obscuring an
+        // installation error as guest boot latency.
+        let executable = ::drydock::local::companion("drydock-agent", "DRYDOCK_AGENT_BIN")?;
+        tokio::fs::metadata(executable).await.map_err(|e| format!("drydock-agent companion unavailable: {e}"))?;
+        let last_error = std::sync::Mutex::new(String::new());
         let connection = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 match Connection::open(api, instance, backing, key.clone()).await {
                     Ok(c) => return c,
-                    Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+                    Err(cause) => {
+                        *last_error.lock().expect("SSH error") = cause;
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
                 }
             }
         })
         .await
-        .map_err(|_| "SSH agent hello did not complete within 60 seconds")?;
+        .map_err(|_| format!("SSH agent hello did not complete within 60 seconds: {}", last_error.lock().expect("SSH error")))?;
         Ok(Arc::new(connection))
     }
 }
@@ -196,8 +226,16 @@ impl Guest for Connection {
     fn runner(&self) -> Arc<dyn CommandRunner> {
         Arc::new(AgentRunner(self.agent.clone()))
     }
-    async fn configure(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
+    async fn configure(&self, mut environment: BTreeMap<String, String>) -> Result<(), String> {
+        let lab_forward = environment.remove("FLOTILLA_DRYDOCK_LAB_FORWARD").is_some_and(|value| value == "1");
         self.agent.configure(drydock_agent::Configuration { environment, ..Default::default() }).await.map_err(error)?;
+        if !lab_forward {
+            return Ok(());
+        }
+        let mut lab_configured = self.lab_configured.lock().await;
+        if *lab_configured {
+            return Ok(());
+        }
         // Interim lab reach uses the very same pinned SSH connection. TLS stays
         // end-to-end to the lab service; the guest receives no reach credential.
         self.forwards
@@ -207,7 +245,7 @@ impl Guest for Connection {
         runner
             .run(
                 "sh",
-                &["-c", "command -v socat >/dev/null && printf '\n127.0.0.1 forgejo.lab.flotilla.work\n' >> /etc/hosts"],
+                &["-c", &lab_setup_script(Path::new("/etc/hosts"))],
                 Path::new("/"),
                 &flotilla_provider_runtime::ChannelLabel::Default,
             )
@@ -226,6 +264,7 @@ impl Guest for Connection {
             .lock()
             .expect("forward tasks")
             .push(tokio::spawn(async move { while let Ok(Some(_)) = events.next().await {} }));
+        *lab_configured = true;
         Ok(())
     }
     async fn deliver(&self, asset: EnvironmentToolAsset) -> Result<(), String> {
@@ -239,6 +278,11 @@ impl Guest for Connection {
             upload(&self.agent, asset.host_path.as_path(), asset.environment_path.as_path()).await
         }
     }
+}
+
+fn lab_setup_script(hosts: &Path) -> String {
+    let hosts = runner::quote(&hosts.to_string_lossy());
+    format!("command -v socat >/dev/null && (grep -q '^127.0.0.1 forgejo.lab.flotilla.work$' {hosts} || printf '\\n127.0.0.1 forgejo.lab.flotilla.work\\n' >> {hosts})")
 }
 
 #[cfg(test)]
@@ -269,6 +313,32 @@ mod tests {
             std::future::pending().await
         }
     }
+    // Lab reach is explicitly requested: a missing bridge is an actionable
+    // failure, and refreshing credentials never appends duplicate host entries.
+    #[tokio::test]
+    async fn lab_setup_requires_socat_and_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let hosts = directory.path().join("hosts");
+        tokio::fs::write(&hosts, b"127.0.0.1 localhost\n").await.unwrap();
+        let script = lab_setup_script(&hosts);
+        let missing = tokio::process::Command::new("/bin/sh").args(["-c", &script]).env("PATH", directory.path()).status().await.unwrap();
+        assert!(!missing.success());
+        let socat = directory.path().join("socat");
+        tokio::fs::write(&socat, b"#!/bin/sh\nexit 0\n").await.unwrap();
+        tokio::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o700)).await.unwrap();
+        for _ in 0..2 {
+            assert!(tokio::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", format!("{}:/usr/bin:/bin", directory.path().display()))
+                .status()
+                .await
+                .unwrap()
+                .success());
+        }
+        let content = tokio::fs::read_to_string(hosts).await.unwrap();
+        assert_eq!(content.matches("forgejo.lab.flotilla.work").count(), 1);
+    }
     // #3620: daemon and lab traffic reach the controller over the SSH recipe's
     // connection. Dropping its owner closes active streams and new accepts.
     #[tokio::test]
@@ -284,7 +354,7 @@ mod tests {
             } else {
                 Destination::Unix(host_path.clone())
             };
-            let owner = Forwarder { session: Arc::new(LocalSsh), tasks: Default::default() };
+            let owner = Forwarder { session: Arc::new(LocalSsh), tasks: Default::default(), sockets: Default::default() };
             owner.forward(&guest_path, destination).await.unwrap();
             let mut guest = tokio::net::UnixStream::connect(&guest_path).await.unwrap();
             let payload = if lab { b"lab-service" } else { b"daemon-hook" };

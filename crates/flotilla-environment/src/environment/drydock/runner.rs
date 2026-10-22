@@ -104,9 +104,17 @@ impl CommandRunner for AgentRunner {
             .await
             .map_err(error)?;
         let mut success = false;
+        let mut written = 0_u64;
         while let Some(event) = events.next().await.map_err(error)? {
             match event {
-                ExecEvent::Stdout(bytes) => output.write_all(&bytes).await.map_err(error)?,
+                ExecEvent::Stdout(bytes) => {
+                    // Bound host disk consumption from a busy or hostile guest.
+                    written += bytes.len() as u64;
+                    if written > 512 * 1024 * 1024 {
+                        return Err("guest archive exceeds 512 MiB limit".into());
+                    }
+                    output.write_all(&bytes).await.map_err(error)?;
+                }
                 ExecEvent::Exit { code } => success = code == Some(0),
                 ExecEvent::Stderr(_) => {}
             }
@@ -162,8 +170,10 @@ impl CommandRunner for AgentRunner {
 pub(super) fn quote(value: &str) -> String {
     flotilla_protocol::arg::shell_quote(value)
 }
-pub(super) fn error(_: impl std::fmt::Display) -> String {
-    "drydock guest operation failed".into()
+pub(super) fn error(cause: std::io::Error) -> String {
+    // Remote error bodies/stderr can contain credential bytes. Preserve the
+    // typed category, never the provider-controlled payload, even at debug.
+    format!("drydock guest operation failed ({:?})", cause.kind())
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ use super::*;
 use ::drydock::api::ProviderApi;
 use drydock_protocol as wire;
 use runner::{error, AgentRunner};
+use sha2::Digest;
 use std::{collections::BTreeMap, sync::RwLock, time::Duration};
 use tokio::sync::OnceCell;
 
@@ -20,7 +21,8 @@ pub struct DrydockEnvironmentProvider {
     declaration: RwLock<Option<wire::ProviderDeclaration>>,
     host: Option<Arc<::drydock::HostHandle>>,
     versions: RwLock<(String, String)>,
-    provision_lock: tokio::sync::Mutex<()>,
+    provision_locks: std::sync::Mutex<HashMap<EnvironmentId, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    observations: std::sync::OnceLock<Arc<observations::Hub>>,
     active: tokio::sync::Mutex<HashMap<EnvironmentId, std::sync::Weak<DrydockEnvironment>>>,
 }
 impl DrydockEnvironmentProvider {
@@ -35,7 +37,8 @@ impl DrydockEnvironmentProvider {
             declaration: RwLock::new(None),
             host: None,
             versions: Default::default(),
-            provision_lock: tokio::sync::Mutex::new(()),
+            provision_locks: Default::default(),
+            observations: Default::default(),
             active: Default::default(),
         }
     }
@@ -57,7 +60,7 @@ impl DrydockEnvironmentProvider {
                 });
             }
         }
-        let response = self.api.request(http::Method::GET, &["v1", "hello"], &[], None).await.map_err(|e| e.to_string())?;
+        let response = self.api.request(http::Method::GET, &["v1", "hello"], &[], None).await.map_err(api_error)?;
         let hello: wire::Hello = serde_json::from_value(response.body).map_err(|_| "invalid drydock hello")?;
         if !hello.is_compatible() {
             return Err("drydock protocol version mismatch".into());
@@ -92,7 +95,10 @@ impl DrydockEnvironmentProvider {
                     capabilities: self.capabilities(),
                 }
             },
-            watch: observations::Watch::start(self.api.clone(), self.instance.clone(), environment.id.clone()),
+            watch: self
+                .observations
+                .get_or_init(|| observations::Hub::start(self.api.clone(), self.instance.clone()))
+                .watch(environment.id.clone()),
             backing: environment.id,
             image: ImageId::new(image),
             env,
@@ -149,22 +155,30 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                 },
             )
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(api_error)?;
         Ok(PreparedEnvironment::new(&self.owner, Prepared { prepared, spec: spec.clone() }))
     }
     async fn provision(&self, id: EnvironmentId, prepared: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String> {
         let prepared = prepared.get::<Prepared>(&self.owner)?;
-        let _provision_guard = self.provision_lock.lock().await;
+        // Only retries for this label serialize through complete guest setup.
+        // Different sandboxes must not wait for another guest's SSH readiness.
+        let lock = {
+            let mut locks = self.provision_locks.lock().expect("provision locks");
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let lock = locks.get(&id).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+            locks.insert(id.clone(), Arc::downgrade(&lock));
+            lock
+        };
+        let _provision_guard = lock.lock().await;
         if !opts.provisioned_mounts.is_empty() {
             return Err("cloud sandbox does not support Shared material".into());
         }
-        let keydir = self.directory.join(id.as_str());
-        // Key paths are derived from hashed IDs, never operator supplied paths.
-        let keydir = self.directory.join(format!("{:x}", sha2::Sha256::digest(keydir.as_os_str().as_encoded_bytes())));
+        let keydir = key_dir(&self.directory, &id);
+        ::drydock::local::private_dir(&keydir)?;
         let public = if keydir.join("id_ed25519.pub").is_file() {
             tokio::fs::read_to_string(keydir.join("id_ed25519.pub")).await.map_err(error)?
         } else {
-            ::drydock::launch::keypair(&keydir).await.map_err(|e| e.to_string())?.1
+            ::drydock::launch::keypair(&keydir).await.map_err(api_error)?.1
         };
         let environment = self
             .api
@@ -179,12 +193,7 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                 },
             )
             .await
-            .map_err(|e| e.to_string())?;
-        if let Some(handle) = self.active.lock().await.get(&id).and_then(std::sync::Weak::upgrade) {
-            if handle.backing == environment.id && handle.image.as_str() == prepared.spec.image {
-                return Ok(handle);
-            }
-        }
+            .map_err(api_error)?;
         let mut env = prepared.spec.env.clone();
         env.extend(opts.tokens);
         for tool in &opts.tools {
@@ -199,6 +208,19 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                         env.insert(name.clone(), format!("{value}:{existing}"));
                     }
                 }
+            }
+        }
+        if let Some(handle) = self.active.lock().await.get(&id).and_then(std::sync::Weak::upgrade) {
+            if handle.backing == environment.id && handle.image.as_str() == prepared.spec.image {
+                let connection = handle.connect().await?;
+                for tool in opts.tools {
+                    for asset in tool.assets {
+                        connection.deliver(asset).await?;
+                    }
+                }
+                // Re-adoption must apply rotated tokens and tool environments.
+                connection.configure(env).await?;
+                return Ok(handle);
             }
         }
         let handle = self.handle(environment, prepared.spec.image.clone(), env)?;
@@ -223,9 +245,13 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
             write_checkpoint(connection.runner(), &checkpoint, &handle.capabilities.workspace_root).await?;
             let runner = connection.runner();
             let root = handle.capabilities.workspace_root.clone();
+            let watch = handle.watch.clone();
             *handle.checkpoint.lock().expect("checkpoint task") = Some(tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(30)).await;
+                    if matches!(*watch.state.read().expect("observation lock"), Some(ObservationState::Gone { .. })) {
+                        break;
+                    }
                     if write_checkpoint(runner.clone(), &checkpoint, &root).await.is_err() {
                         tracing::warn!("cloud sandbox checkpoint refresh failed");
                     }
@@ -240,11 +266,13 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                 Err(cleanup) => Err(format!("{cause}; destroy failed: {cleanup}")),
             };
         }
-        self.active.lock().await.insert(id, Arc::downgrade(&handle));
+        let mut active = self.active.lock().await;
+        active.retain(|_, handle| handle.strong_count() > 0);
+        active.insert(id, Arc::downgrade(&handle));
         Ok(handle)
     }
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
-        let items = self.api.list(&self.instance).await.map_err(|e| e.to_string())?;
+        let items = self.api.list(&self.instance).await.map_err(api_error)?;
         items
             .into_iter()
             .filter(|e| e.label.is_some())
@@ -256,16 +284,29 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
             .api
             .list(&self.instance)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(api_error)?
             .into_iter()
             .filter_map(|e| e.label.map(|label| EnvironmentBacking { environment_id: EnvironmentId::new(label), backing_id: e.id }))
             .collect())
     }
     async fn destroy(&self, backing_id: &str) -> Result<(), String> {
-        self.api.destroy(&self.instance, backing_id).await.map_err(|e| e.to_string())
+        for handle in self.active.lock().await.values().filter_map(std::sync::Weak::upgrade) {
+            if handle.backing == backing_id {
+                return handle.destroy().await;
+            }
+        }
+        let environment = self.api.inspect(&self.instance, backing_id).await.ok();
+        self.api.destroy(&self.instance, backing_id).await.map_err(api_error)?;
+        if let Some(label) = environment.and_then(|e| e.label) {
+            remove_keys(&key_dir(&self.directory, &EnvironmentId::new(label))).await?;
+        }
+        Ok(())
     }
 }
-use sha2::Digest;
+// Hash IDs instead of allowing resource names to select filesystem paths.
+fn key_dir(directory: &Path, id: &EnvironmentId) -> PathBuf {
+    directory.join(format!("{:x}", sha2::Sha256::digest(directory.join(id.as_str()).as_os_str().as_encoded_bytes())))
+}
 fn size(s: &flotilla_resources::CloudSandboxSize) -> wire::Size {
     wire::Size { cpus: f64::from(s.cpus), memory_bytes: s.memory_bytes, disk_bytes: s.disk_bytes }
 }
@@ -293,6 +334,8 @@ fn readiness(r: wire::Readiness) -> ProviderReadiness {
     }
 }
 fn capabilities(c: &wire::Capabilities) -> ProviderCapabilities {
+    // Report only operations implemented by this adapter, even if a module
+    // offers more. Tool delivery uses the native agent on every provision.
     ProviderCapabilities {
         material_modes: c
             .material_modes
@@ -349,24 +392,20 @@ impl Drop for DrydockEnvironment {
 }
 async fn write_checkpoint(runner: Arc<dyn CommandRunner>, target: &Path, root: &Path) -> Result<(), String> {
     let temporary = target.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    let result = runner
-        .run_to_file(
-            "tar",
-            &[
-                "--ignore-failed-read",
-                "-cf",
-                "-",
-                "--",
-                &root.to_string_lossy(),
-                "/root",
-                "/tmp/flotilla-config",
-                "/tmp/flotilla-codex",
-                "/var/lib/flotilla/cleat",
-            ],
-            Path::new("/"),
-            &temporary,
-        )
-        .await;
+    let paths = [
+        root.to_string_lossy().into_owned(),
+        "/root".into(),
+        "/tmp/flotilla-config".into(),
+        "/tmp/flotilla-codex".into(),
+        "/var/lib/flotilla/cleat".into(),
+    ];
+    // GNU tar uses status 1 for files changing during capture. Keep that
+    // usable archive; status >= 2 is a failed capture and never replaces it.
+    let script = format!(
+        "tar --ignore-failed-read -cf - -- {}; flotilla_tar_status=$?; test \"$flotilla_tar_status\" -le 1",
+        paths.iter().map(|p| runner::quote(p)).collect::<Vec<_>>().join(" ")
+    );
+    let result = runner.run_to_file("sh", &["-c", &script], Path::new("/"), &temporary).await;
     if let Err(error) = result {
         let _ = tokio::fs::remove_file(temporary).await;
         return Err(error);
@@ -377,9 +416,7 @@ impl DrydockEnvironment {
     async fn connect(&self) -> Result<&Arc<dyn reach::Guest>, String> {
         self.connection
             .get_or_try_init(|| async {
-                let keydir = self
-                    .directory
-                    .join(format!("{:x}", sha2::Sha256::digest(self.directory.join(self.id.as_str()).as_os_str().as_encoded_bytes())));
+                let keydir = key_dir(&self.directory, &self.id);
                 self.connector.connect(&*self.api, &self.instance, &self.backing, keydir.join("id_ed25519")).await
             })
             .await
@@ -406,9 +443,8 @@ impl ProvisionedEnvironment for DrydockEnvironment {
         self.capabilities.clone()
     }
     fn survivors(&self) -> Option<flotilla_resources::EnvironmentSurvivors> {
-        let key = format!("{:x}", sha2::Sha256::digest(self.directory.join(self.id.as_str()).as_os_str().as_encoded_bytes()));
         Some(flotilla_resources::EnvironmentSurvivors {
-            host_checkpoint: Some(self.directory.join(key).join("checkpoint.tar").to_string_lossy().into_owned()),
+            host_checkpoint: Some(key_dir(&self.directory, &self.id).join("checkpoint.tar").to_string_lossy().into_owned()),
             ..Default::default()
         })
     }
@@ -425,7 +461,7 @@ impl ProvisionedEnvironment for DrydockEnvironment {
             Err(::drydock::client::Error::Protocol(wire::ProtocolError::NotFound { .. })) => {
                 ObservationState::Gone { cause: GoneCause::MissingOnList }
             }
-            Err(e) => ObservationState::Unknown { reason: UnknownReason::ProviderApiError { message: e.to_string() } },
+            Err(e) => ObservationState::Unknown { reason: UnknownReason::ProviderApiError { message: api_error(e) } },
         };
         ProviderObservation::new(state)
     }
@@ -440,7 +476,13 @@ impl ProvisionedEnvironment for DrydockEnvironment {
         }
     }
     async fn destroy(&self) -> Result<(), String> {
-        self.api.destroy(&self.instance, &self.backing).await.map_err(|e| e.to_string())
+        self.api.destroy(&self.instance, &self.backing).await.map_err(api_error)?;
+        if let Some(task) = self.checkpoint.lock().expect("checkpoint task").take() {
+            task.abort();
+        }
+        // Keep the last complete checkpoint for recovery; it is a declared
+        // survivor, not scratch. The operator removes it after continue/abandon.
+        remove_keys(&key_dir(&self.directory, &self.id)).await
     }
 }
 
@@ -503,5 +545,25 @@ impl CommandRunner for InventoryRunner {
     }
     async fn exists(&self, _: &str, _: &[&str]) -> bool {
         false
+    }
+}
+
+async fn remove_keys(directory: &Path) -> Result<(), String> {
+    for file in ["id_ed25519", "id_ed25519.pub"] {
+        match tokio::fs::remove_file(directory.join(file)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(error(e)),
+        }
+    }
+    Ok(())
+}
+fn api_error(cause: ::drydock::client::Error) -> String {
+    use ::drydock::client::Error;
+    match cause {
+        Error::Protocol(_) => "drydock provider protocol error".into(),
+        Error::NotReady(_) => "drydock provider not ready".into(),
+        Error::ReadinessTimeout(_) => "drydock provider readiness timed out".into(),
+        other => other.to_string(),
     }
 }

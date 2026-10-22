@@ -161,7 +161,12 @@ async fn reference_lifecycle_through_environment_provider() {
         vec![EnvironmentBacking { environment_id: EnvironmentId::new("crew"), backing_id: first.backing_id().into() }]
     );
     assert!(first.survivors().unwrap().host_checkpoint.is_some());
+    let private = key_dir(&provider.directory, first.id());
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&private).unwrap().permissions().mode() & 0o777, 0o700);
     provider.destroy(first.backing_id()).await.unwrap();
+    assert!(!private.join("id_ed25519").exists());
+    assert!(private.join("checkpoint.tar").exists());
     provider.destroy(first.backing_id()).await.unwrap();
     assert!(provider.list_backings().await.unwrap().is_empty());
 }
@@ -281,4 +286,102 @@ async fn missing_host_binary_is_not_ready() {
     })
     .await
     .unwrap();
+}
+
+// Failed refreshes must neither replace the recovery floor nor leave a partial
+// archive. Credential-bearing survivors remain private and explicitly retained.
+#[tokio::test]
+async fn failed_checkpoint_retains_last_archive_and_removes_partial() {
+    struct Broken;
+    #[async_trait]
+    impl CommandRunner for Broken {
+        async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+            unreachable!()
+        }
+        async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+            unreachable!()
+        }
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            false
+        }
+        async fn run_to_file(&self, _: &str, _: &[&str], _: &Path, destination: &Path) -> Result<(), String> {
+            tokio::fs::write(destination, b"partial").await.unwrap();
+            Err("connection lost".into())
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("checkpoint.tar");
+    tokio::fs::write(&target, b"last complete").await.unwrap();
+    assert!(write_checkpoint(Arc::new(Broken), &target, Path::new("/work")).await.is_err());
+    assert_eq!(tokio::fs::read(&target).await.unwrap(), b"last complete");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+}
+
+// One slow SSH handshake must not block another label; repeated adoption must
+// refresh the existing guest's credential environment without reconnecting it.
+#[tokio::test]
+async fn independent_provisions_and_rotated_tokens() {
+    struct Guest {
+        environments: Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>,
+    }
+    #[async_trait]
+    impl reach::Guest for Guest {
+        fn runner(&self) -> Arc<dyn CommandRunner> {
+            Arc::new(ReferenceGuest)
+        }
+        async fn configure(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
+            self.environments.lock().unwrap().push(environment);
+            Ok(())
+        }
+        async fn deliver(&self, _: EnvironmentToolAsset) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    struct Connector {
+        calls: std::sync::atomic::AtomicUsize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        environments: Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>,
+    }
+    #[async_trait]
+    impl reach::Connector for Connector {
+        async fn connect(&self, _: &dyn ProviderApi, _: &str, _: &str, _: PathBuf) -> Result<Arc<dyn reach::Guest>, String> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(Arc::new(Guest { environments: self.environments.clone() }))
+        }
+    }
+    let host = HostFixture::start().await;
+    host.ready().await;
+    let mut provider = host.provider();
+    let connector = Arc::new(Connector {
+        calls: Default::default(),
+        entered: Default::default(),
+        release: Default::default(),
+        environments: Default::default(),
+    });
+    provider.connector = connector.clone();
+    let prepared = Arc::new(fixture_prepared(&host, &provider).await);
+    let provider = Arc::new(provider);
+    let task = {
+        let provider = provider.clone();
+        let prepared = prepared.clone();
+        tokio::spawn(async move { provider.provision(EnvironmentId::new("slow"), &prepared, Default::default()).await })
+    };
+    connector.entered.notified().await;
+    let fast = tokio::time::timeout(Duration::from_secs(3), provider.provision(EnvironmentId::new("fast"), &prepared, Default::default()))
+        .await
+        .unwrap()
+        .unwrap();
+    connector.release.notify_one();
+    let slow = task.await.unwrap().unwrap();
+    let opts = ProvisionOpts { tokens: vec![("TEST_TOKEN".into(), "rotated".into())], ..Default::default() };
+    let adopted = provider.provision(EnvironmentId::new("fast"), &prepared, opts).await.unwrap();
+    assert_eq!(adopted.backing_id(), fast.backing_id());
+    assert_eq!(connector.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(connector.environments.lock().unwrap().last().unwrap().get("TEST_TOKEN").map(String::as_str), Some("rotated"));
+    fast.destroy().await.unwrap();
+    slow.destroy().await.unwrap();
 }

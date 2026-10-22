@@ -37,7 +37,9 @@ a substitute tools image. Reference-module tests explicitly assert this refusal
 and use reference fixture tools for the remaining lifecycle/conformance checks.
 
 The base crew image must contain the required agent harnesses, Git, `tar`, `sh`,
-and `socat`, and support the module's SSH recipe. Interim lab forwarding binds
+and support the module's SSH recipe. Opt-in lab forwarding also requires
+`socat`. Set `FLOTILLA_DRYDOCK_LAB_FORWARD=1` in the cloud policy's `env`
+for convoys that need the lab service. Interim lab forwarding binds
 loopback port 443 and writes `/etc/hosts`, so this slice requires root in the
 vessel. Drydock appends and starts its agent; Flotilla delivers its CLI, cleat,
 initial agent material and per-crew forge/model credentials through that agent.
@@ -59,7 +61,7 @@ cloud_sandbox_per_vessel:
     memory_bytes: 4294967296
     disk_bytes: 21474836480
   checkout: clone_in_vessel
-  env: {}
+  env: { FLOTILLA_DRYDOCK_LAB_FORWARD: "1" }
 ```
 
 Admission resolves a unique controlling Host from its provider advertisements.
@@ -83,7 +85,7 @@ One pinned SSH session carries the Drydock agent transport and remote forwards:
 - The vessel CLI and hooks use its dedicated controller socket, as Docker crews
   do. The directory survives controller socket replacement.
 - `forgejo.lab.flotilla.work:443` on guest loopback bridges through that session to
-  the controller's lab service. TLS remains end to end, with no extra guest
+  the controller's lab service when explicitly enabled. TLS remains end to end, with no extra guest
   secret and no guest Tailscale.
 
 These forwards are replaced by #3485/#3486 and #3617/#3616 respectively. Egress is
@@ -100,7 +102,11 @@ The protocol currently offers no promise that Daytona storage outlives its cap,
 so survivors use a controller checkpoint. It is refreshed every 30 seconds and
 includes the checkout, agent homes and cleat state. Status stores only its
 reference. Failed refreshes retain the previous complete archive; destruction
-keeps that archive for the convoy's continue/abandon decision. Recent changes
+keeps that archive for the convoy's continue/abandon decision and removes its
+SSH keys. The archive is capped at 512 MiB, lives in a validated 0700 directory
+with 0600 permissions, and includes staged credentials. Until #3744 adds managed
+retention, the operator must remove the referenced checkpoint directory after
+recovery or abandonment. Never publish the archive. Recent changes
 between successful checkpoints can still be lost; pushed branches remain the
 recovery floor.
 
