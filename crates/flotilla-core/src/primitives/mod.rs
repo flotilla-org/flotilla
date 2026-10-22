@@ -445,7 +445,10 @@ impl MessagePrimitives {
             }
         }
         if let Some(older) = supersedes.filter(|older| older.home == self.home) {
-            self.supersede(&older.name, &id).await;
+            // A successor that awaits a reply withdraws its predecessor's record once
+            // its own is written (`await_reply`), so the sender never reads as not waiting.
+            let awaits = !matches!(intent.expectation, flotilla_resources::MessageExpectation::None);
+            self.supersede(&older.name, &id, !awaits).await;
         }
         let mut object = match self.view(namespace, name).await {
             Ok(Some(view)) => view.object,
@@ -485,10 +488,25 @@ impl MessagePrimitives {
         let roles = self.roles(namespace).await?;
         let records = self.records(namespace).await.map_err(|error| error.to_string())?;
         let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
-        let sender = conversion.inbox(&intent.sender)?;
+        let sender = match conversion.sender(&intent.sender) {
+            Ok(sender) => sender,
+            // A producer with no inbox at a home (a system producer with no
+            // fleet role, or a person until #3457) cannot receive the reply,
+            // so nothing awaits it there; recording nothing is the answer.
+            Err(_) if intent.sender.starts_with("system:") || intent.sender.starts_with("principal:") => return Ok(false),
+            Err(error) => return Err(error),
+        };
         let recipient = conversion.inbox(&intent.receiver)?;
         let message = MessageRef::new(Address::message(&recipient, name).map_err(|error| error.to_string())?.as_str(), home);
         let subject = about.map(|about| conversion.inbox(about)).transpose()?;
+        // The predecessor whose record this send's record replaces, wherever it is homed.
+        let superseded = match &intent.supersedes {
+            Some(older) => {
+                let read = self.read_message(older, Some(recipient.clone())).await?;
+                Some(MessageRef::new(read.id, read.home))
+            }
+            None => None,
+        };
         let spec = AwaitingReplySpec {
             message: message.clone(),
             sender: sender.clone(),
@@ -503,14 +521,28 @@ impl MessagePrimitives {
         let here = self.home.clone();
         let now = self.world.now();
         tokio::task::spawn_blocking(move || {
+            // What this record replaces, withdrawn only once it is written, so the
+            // seat or the sender never reads as not waiting in between. A repeat
+            // withdraws again what an earlier attempt left open.
+            let replace = |spec: &AwaitingReplySpec| -> Result<(), String> {
+                if let (true, Some(subject)) = (spec.kind == awaiting::STALL, &spec.subject) {
+                    let keep = awaiting::record_name(&spec.message);
+                    awaiting.end_stalls(std::slice::from_ref(subject), Some(&keep), "replaced by a newer stall about the seat", now)?;
+                }
+                if let Some(older) = &superseded {
+                    awaiting.withdraw(older, &spec.sender, &format!("superseded by {}", spec.message.name), now)?;
+                }
+                Ok(())
+            };
             // A repeat finds its record and stops: the reply scan ran when it was written.
             if let Some(existing) = awaiting.get(&message) {
                 return match *existing.spec() == spec {
-                    true => Ok(false),
+                    true => replace(&spec).map(|()| false),
                     false => Err(format!("AwaitingReply for `{}` is recorded as {:?}, not {spec:?}", message.name, existing.spec())),
                 };
             }
-            let recorded = awaiting.record(spec, now)?;
+            let recorded = awaiting.record(spec.clone(), now)?;
+            replace(&spec)?;
             // A reply may have landed before the record: replies are indexed by what they answer.
             let replies = service
                 .with_store(|store| {
@@ -544,6 +576,30 @@ impl MessagePrimitives {
         })
         .await
         .map_err(|error| error.to_string())?
+    }
+
+    /// Withdraws this home's open stall records about `seats`, crew role
+    /// addresses the old stall status shows not stalled (#3730 review). Each
+    /// seat's records are about its role's address, which another seat of
+    /// the same role shares; `stalled`'s keeps its records. With no open
+    /// stall here it reads nothing.
+    pub async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: Option<&str>, reason: &str) -> Result<Vec<String>, String> {
+        if seats.is_empty() || !self.awaiting.any_open_stall() {
+            return Ok(Vec::new());
+        }
+        let roles = self.roles(namespace).await?;
+        let records = self.records(namespace).await.map_err(|error| error.to_string())?;
+        let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
+        let kept = stalled.map(|seat| conversion.inbox(seat)).transpose()?;
+        let mut subjects = Vec::new();
+        for seat in seats {
+            let subject = conversion.inbox(seat)?;
+            if Some(&subject) != kept.as_ref() && !subjects.contains(&subject) {
+                subjects.push(subject);
+            }
+        }
+        let (awaiting, reason, now) = (Arc::clone(&self.awaiting), reason.to_owned(), self.world.now());
+        tokio::task::spawn_blocking(move || awaiting.end_stalls(&subjects, None, &reason, now)).await.map_err(|error| error.to_string())?
     }
 
     /// One message by its old record name, in the old shape: from this
@@ -596,8 +652,9 @@ impl MessagePrimitives {
     }
 
     /// Drops `older` as superseded by `newer`, both homed here, once its
-    /// successor is admitted. Already ended is no error.
-    pub async fn supersede(&self, older: &str, newer: &str) {
+    /// successor is admitted, and with `withdraw` its sender's record here.
+    /// Already ended is no error.
+    pub async fn supersede(&self, older: &str, newer: &str, withdraw: bool) {
         let Ok(by) = newer.parse::<Address>() else { return };
         self.world
             .update(|world| world.supersession.put(&flotilla_state_machines::Ref::new(newer), Supersedes { older: older.to_owned() }));
@@ -607,7 +664,9 @@ impl MessagePrimitives {
             return;
         }
         // Its sender's record here, if it awaited a reply, waits no longer (#3587 layer 7).
-        self.withdraw_awaiting(older, &by, &format!("superseded by {newer}")).await;
+        if withdraw {
+            self.withdraw_awaiting(older, &by, &format!("superseded by {newer}")).await;
+        }
     }
 
     /// Withdraws the awaiting record of a message dropped here, when its
@@ -861,6 +920,9 @@ impl flotilla_crew::ports::EngineMessages for MessagePrimitives {
         about: Option<&str>,
     ) -> Result<bool, String> {
         MessagePrimitives::await_reply(self, namespace, name, intent, home, kind, about).await
+    }
+    async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: Option<&str>, reason: &str) -> Result<Vec<String>, String> {
+        MessagePrimitives::end_stalls(self, namespace, seats, stalled, reason).await
     }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
         Box::new(EngineCharterNotices { primitives: self, namespace: namespace.to_owned() })

@@ -54,6 +54,11 @@ pub trait EngineMessages: Send + Sync {
         kind: &str,
         about: Option<&str>,
     ) -> Result<bool, String>;
+    /// Withdraws this home's open stall records about `seats` (crew role
+    /// addresses) once the old stall status shows them not stalled (#3730
+    /// review); a seat that shares `stalled`'s record subject keeps its
+    /// records. Returns the records withdrawn.
+    async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: Option<&str>, reason: &str) -> Result<Vec<String>, String>;
     /// Where charter notifications are admitted on this path.
     fn charter_notices(self: std::sync::Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices>;
 }

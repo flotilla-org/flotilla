@@ -284,7 +284,7 @@ impl MessageDelivery {
         let Some((successor, older)) = held_turns_superseded(due, &views) else { return Ok(()) };
         for message in older {
             tracing::info!(%message, %successor, "operator turn supersedes a held system turn");
-            self.primitives.supersede(message, successor).await;
+            self.primitives.supersede(message, successor, true).await;
             self.held.release(message);
         }
         Ok(())

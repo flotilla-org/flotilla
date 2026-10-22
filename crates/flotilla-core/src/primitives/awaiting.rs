@@ -189,6 +189,16 @@ impl AwaitingReplies {
         if home.get(&name).is_none_or(|record| record.label() != AwaitingReplyLabel::Open) {
             return Ok(false);
         }
+        Self::withdraw_open(&mut home, &name, by, reason, now).map(|_| true)
+    }
+
+    fn withdraw_open(
+        home: &mut Home<AwaitingReply, StoreLog>,
+        name: &str,
+        by: &Address,
+        reason: &str,
+        now: Timestamp,
+    ) -> Result<(), String> {
         // Only this home's sender calls this, about its own send: a sender may
         // always withdraw what it awaits, so its authority is recorded as given.
         // A decision about someone else's record would read a real grant.
@@ -196,7 +206,41 @@ impl AwaitingReplies {
         let mut world = MemoryAwaitingReplyWorld::default();
         world.authority.put(&Ref::new(authority.as_str()), true);
         let withdraw = Withdraw { by: by.clone(), reason: reason.to_owned(), authority: Ref::new(authority) };
-        Self::end(&mut home, &name, withdraw, &world, now).map(|_| true).map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))
+        Self::end(home, name, withdraw, &world, now).map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))
+    }
+
+    /// Whether any stall record homed here is open: what lets a caller skip
+    /// [`Self::end_stalls`] without reading anything.
+    pub fn any_open_stall(&self) -> bool {
+        locked(&self.home).resources().any(|record| record.spec().kind == STALL && record.label() == AwaitingReplyLabel::Open)
+    }
+
+    /// Withdraws the open stall records homed here about any of `subjects`,
+    /// but `keep` (#3730 review): a stall that has ended in the old stall
+    /// status, or one that a newer stall about the same seat replaced, waits
+    /// no longer. Each sender withdraws its own record. Returns the records
+    /// withdrawn; one that fails does not stop the others.
+    pub fn end_stalls(&self, subjects: &[Address], keep: Option<&str>, reason: &str, now: Timestamp) -> Result<Vec<String>, String> {
+        let mut home = locked(&self.home);
+        let ended: Vec<(String, Address)> = home
+            .resources()
+            .filter(|record| record.spec().kind == STALL && record.label() == AwaitingReplyLabel::Open)
+            .filter(|record| record.spec().subject.as_ref().is_some_and(|subject| subjects.contains(subject)))
+            .filter(|record| Some(record.name()) != keep)
+            .map(|record| (record.name().to_owned(), record.spec().sender.clone()))
+            .collect();
+        let mut withdrawn = Vec::new();
+        let mut failures = Vec::new();
+        for (name, sender) in ended {
+            match Self::withdraw_open(&mut home, &name, &sender, reason, now) {
+                Ok(()) => withdrawn.push(name),
+                Err(error) => failures.push(error),
+            }
+        }
+        match failures.is_empty() {
+            true => Ok(withdrawn),
+            false => Err(failures.join("; ")),
+        }
     }
 
     /// Expires every open record homed here whose deadline has passed with no
@@ -243,8 +287,9 @@ impl AwaitingReplies {
         for name in due {
             match Self::end(&mut home, &name, Expire, &world, now) {
                 Ok(_) => expired.push(name),
-                // An ended record stays as it is.
-                Err(WriteError::Refused(_)) => {}
+                // An ended record stays as it is. One that ended (and was
+                // evicted) between the index read and the lock is unknown here.
+                Err(WriteError::Refused(_) | WriteError::Unknown(_)) => {}
                 Err(error) => return Err(format!("AwaitingReply `{name}`: {error:?}")),
             }
         }

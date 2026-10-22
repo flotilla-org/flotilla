@@ -74,6 +74,15 @@ impl WorkCredentialReconciler for StagingProbe {
 }
 
 async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, tempfile::TempDir) {
+    fixture_with_message_path(phase, Default::default()).await
+}
+
+/// [`fixture`], with the `[primitives]` Message path the crew service and its
+/// leaf subscriptions share, as the composition root wires them.
+async fn fixture_with_message_path(
+    phase: CrewWorkPhase,
+    message_path: crate::ports::MessagePath,
+) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, tempfile::TempDir) {
     let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
     let config_dir = tempfile::tempdir().expect("config directory");
     let config = Arc::new(ConfigStore::with_base(config_dir.path()));
@@ -86,7 +95,8 @@ async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Ar
         Arc::new(UnusedForge),
         ChangeRequestRefreshCadence::default(),
     );
-    let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::new(RecordingEventSink::default()), refresher);
+    let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::new(RecordingEventSink::default()), refresher)
+        .with_message_path(message_path.clone());
     let probe = Arc::new(StagingProbe { backend: backend.clone(), fail: AtomicBool::new(true), calls: AtomicUsize::new(0) });
     let reconciler: Arc<dyn WorkCredentialReconciler> = probe.clone();
     let crew = Arc::new(
@@ -101,6 +111,7 @@ async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Ar
             .brief_artifact_writer(Arc::new(RwLock::new(None)))
             .checkout_vcs(Arc::new(NoCheckoutVcs))
             .local_environment_id(environment)
+            .message_path(message_path)
             .build(),
     );
     let convoys = backend.using::<ResourceConvoy>("flotilla");
@@ -203,6 +214,7 @@ fn crew_message_sender_headers_snapshot() {
     }
 }
 
+mod awaiting;
 mod capabilities;
 mod delivery;
 mod handler_contract;

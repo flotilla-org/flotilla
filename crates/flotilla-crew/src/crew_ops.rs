@@ -2775,7 +2775,8 @@ impl CrewService {
         match self.message_record(&request.namespace, &name).await {
             Ok(existing) if self.same_message_intent(&existing.object.spec, &intent) => {
                 // A repeat records what an earlier send could not (record is idempotent).
-                self.record_awaiting(&request.namespace, &name, &intent, self.admitted_home(&existing), request.stall_of.as_deref()).await;
+                self.record_awaiting(&request.namespace, &name, &intent, self.admitted_home(&existing), request.stall_of.as_deref())
+                    .await?;
                 return Ok(CrewTurnAdmission {
                     new_turn: false,
                     rung: TurnDeliveryRung::WarmSession,
@@ -2798,7 +2799,7 @@ impl CrewService {
         let (message, new_turn) = if let Some(publisher) = publisher {
             let document = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":request.namespace}, "spec":intent});
             let (reference, home) = publisher.publish_admitted(&request.namespace, document).await?;
-            self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await;
+            self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await?;
             (reference, true)
         } else {
             if holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
@@ -2817,7 +2818,7 @@ impl CrewService {
                 flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
             };
             let home = object.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
-            self.record_awaiting(&request.namespace, &object.metadata.name, &intent, home, request.stall_of.as_deref()).await;
+            self.record_awaiting(&request.namespace, &object.metadata.name, &intent, home, request.stall_of.as_deref()).await?;
             (ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, object.metadata.name), !existing)
         };
         Ok(CrewTurnAdmission { message, new_turn, rung: TurnDeliveryRung::WarmSession })
@@ -2911,7 +2912,8 @@ impl CrewService {
         match self.message_record(&request.namespace, &name).await {
             Ok(existing) if self.same_message_intent(&existing.object.spec, &intent) => {
                 // A repeat records what an earlier send could not (record is idempotent).
-                self.record_awaiting(&request.namespace, &name, &intent, self.admitted_home(&existing), request.stall_of.as_deref()).await;
+                self.record_awaiting(&request.namespace, &name, &intent, self.admitted_home(&existing), request.stall_of.as_deref())
+                    .await?;
                 return Ok(CrewTurnAdmission {
                     new_turn: false,
                     rung,
@@ -2988,7 +2990,7 @@ impl CrewService {
                     "metadata": { "name": name, "namespace": request.namespace }, "spec": intent
                 });
                 let (reference, home) = publisher.publish_admitted(&request.namespace, document).await?;
-                self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await;
+                self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await?;
                 reference
             } else {
                 if matches!(target.provenance, ResourceProvenance::Replica { .. })
@@ -3005,7 +3007,7 @@ impl CrewService {
                     flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
                 };
                 let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
-                self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await;
+                self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await?;
                 ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.metadata.name)
             };
             Ok(message)
@@ -3301,7 +3303,7 @@ impl CrewService {
         match self.message_record(namespace, name).await {
             Ok(existing) if self.same_message_intent(&existing.object.spec, intent) => {
                 // A repeat records what an earlier send could not (record is idempotent).
-                self.record_awaiting(namespace, name, intent, self.admitted_home(&existing), None).await;
+                self.record_awaiting(namespace, name, intent, self.admitted_home(&existing), None).await?;
                 return Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, &existing.object.metadata.name));
             }
             Ok(_) => return Err("message producer ID already names different intent".into()),
@@ -3312,7 +3314,7 @@ impl CrewService {
         if let Some(publisher) = publisher {
             let document = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":namespace}, "spec":intent});
             let (reference, home) = publisher.publish_admitted(namespace, document).await?;
-            self.record_awaiting(namespace, name, intent, home, None).await;
+            self.record_awaiting(namespace, name, intent, home, None).await?;
             return Ok(reference);
         }
         let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, namespace, &intent.receiver)
@@ -3330,7 +3332,7 @@ impl CrewService {
             flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
         };
         let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
-        self.record_awaiting(namespace, &record.metadata.name, intent, home, None).await;
+        self.record_awaiting(namespace, &record.metadata.name, intent, home, None).await?;
         Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
     }
 
@@ -3345,8 +3347,12 @@ impl CrewService {
     /// With `[primitives]` on, records the sender's half of a send expecting
     /// a reply or an outcome, once its receiver's home admitted it at `home`
     /// (#3587 layer 7): a stall's supervision about the stalled crew, or a
-    /// plain reply or outcome. The send has happened, so a failed record is
-    /// logged, never the send's error; nothing is recorded off the engine path.
+    /// plain reply or outcome. Nothing is recorded off the engine path.
+    ///
+    /// A send is not finished until its record is written (#3587 ruling
+    /// 6353439323): a failed record is the send's error, so its producer
+    /// repeats the send, and the repeat, finding the message admitted,
+    /// writes the record.
     async fn record_awaiting(
         &self,
         namespace: &str,
@@ -3354,17 +3360,19 @@ impl CrewService {
         intent: &flotilla_resources::MessageSpec,
         home: Option<String>,
         stall_of: Option<&str>,
-    ) {
-        let Some(kind) = awaiting_kind(&intent.expectation, stall_of) else { return };
-        let Some(engine) = self.message_primitives() else { return };
+    ) -> Result<(), String> {
+        let Some(kind) = awaiting_kind(&intent.expectation, stall_of) else { return Ok(()) };
+        let Some(engine) = self.message_primitives() else { return Ok(()) };
         let Some(home) = home else {
             // A receiver home off the engine path answers without it, on every repeat.
             tracing::debug!(message = %name, "the receiver home reported no admitting home; no awaiting-reply record");
-            return;
+            return Ok(());
         };
-        if let Err(error) = engine.await_reply(namespace, name, intent, &home, kind, stall_of).await {
-            tracing::warn!(message = %name, %error, "recording the sender's awaiting reply failed");
-        }
+        engine
+            .await_reply(namespace, name, intent, &home, kind, stall_of)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("message `{name}` is admitted, but its awaiting-reply record is not written yet: {error}"))
     }
 
     async fn execute_turn_delivery_hold(&self, request: &CrewTurnIntent, act: &HoldAct, reason: &str) -> Result<(), String> {

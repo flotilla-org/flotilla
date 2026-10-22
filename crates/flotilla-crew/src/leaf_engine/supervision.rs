@@ -243,14 +243,17 @@ impl super::LeafSubscriptionTable {
                     resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", namespace, &convoy.metadata.name),
                     revision: convoy.metadata.resource_version.clone(),
                 }])
-                .maybe_stall_of(super::stalls::stalled_source_actor(stalled).map(|(vessel, role)| {
-                    super::stalls::crew_role_address(
-                        convoy.spec.project_ref.as_deref().unwrap_or(namespace),
-                        &convoy.metadata.name,
-                        vessel,
-                        role,
-                    )
-                }))
+                // An operator-rung stall has no engine record until #3457 (#3587 ruling 6353447431).
+                .maybe_stall_of(super::stalls::stalled_source_actor(stalled).filter(|_| rung != StallRung::Operator).map(
+                    |(vessel, role)| {
+                        super::stalls::crew_role_address(
+                            convoy.spec.project_ref.as_deref().unwrap_or(namespace),
+                            &convoy.metadata.name,
+                            vessel,
+                            role,
+                        )
+                    },
+                ))
                 .build();
             let actuator = self.inner.turn_delivery.lock().await.clone();
             let admission = match actuator.deliver(&intent).await {
