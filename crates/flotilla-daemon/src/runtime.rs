@@ -1069,11 +1069,12 @@ fn spawn_controller_loops(
 }
 
 /// The decided store's kinds behind `[primitives]`: Message and AgentSession
-/// (#3317), and the provisioning lifecycle kinds (#3629), each under its
-/// production code.
+/// (#3317), the provisioning lifecycle kinds and TerminalSession, and the
+/// engine's Vessel and Ensure (#3629), each under its production code.
 pub(crate) fn decided_registry() -> Result<flotilla_schema::KindRegistry, flotilla_schema::RegistryError> {
     let mut registry = flotilla_engine_store::registry()?;
     flotilla_provisioning::stored::register(&mut registry)?;
+    flotilla_engine_store::register_crew(&mut registry)?;
     Ok(registry)
 }
 
@@ -1081,19 +1082,20 @@ pub(crate) fn decided_registry() -> Result<flotilla_schema::KindRegistry, flotil
 pub(crate) fn decided_diagrams() -> Result<std::collections::BTreeMap<String, String>, flotilla_schema::RegistryError> {
     let mut diagrams = flotilla_engine_store::machine_registry()?.diagrams;
     diagrams.extend(flotilla_provisioning::stored::diagrams());
+    diagrams.extend(flotilla_engine_store::crew_diagrams());
     Ok(diagrams)
 }
 
 #[cfg(test)]
 mod decided_kinds_tests {
-    // Behaviour (#3629 layer 2): behind `[primitives]` the decided store holds the provisioning
-    // lifecycle kinds beside Message and AgentSession, and every kind it holds has its machine's
-    // diagram for the table views.
+    // Behaviour (#3629 layers 2 and 6): behind `[primitives]` the decided store holds the
+    // provisioning lifecycle kinds and the crew kinds beside Message and AgentSession, and every
+    // kind it holds has its machine's diagram for the table views.
     #[test]
     fn the_decided_store_holds_the_provisioning_kinds_with_their_diagrams() {
         let registry = super::decided_registry().expect("no code is held twice");
         let kinds: Vec<&str> = registry.iter().map(|set| set.kind.as_str()).collect();
-        for kind in ["Message", "AgentSession", "Environment", "ImageBuild", "Clone", "Checkout"] {
+        for kind in ["Message", "AgentSession", "Environment", "ImageBuild", "Clone", "Checkout", "TerminalSession", "Vessel", "Ensure"] {
             assert!(kinds.contains(&kind), "{kind} in {kinds:?}");
         }
         let diagrams = super::decided_diagrams().expect("diagrams");
