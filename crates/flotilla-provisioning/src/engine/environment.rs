@@ -49,12 +49,17 @@ impl Binding for EnvironmentBinding {
                 recipe.validate(image_build.as_ref())?;
                 (Recipe::of(&recipe)?, image_build)
             }
-            (None, Some(host)) => (Recipe::of(&HostDirectRecipe { repo_default_dir: host.repo_default_dir.clone() })?, None),
+            (None, Some(host)) => {
+                let recipe = HostDirectRecipe { repo_default_dir: host.repo_default_dir.clone() };
+                recipe.validate()?;
+                (Recipe::of(&recipe)?, None)
+            }
             _ => return Err("an environment is backed by exactly one of docker and host_direct".into()),
         };
         let recipe = Frozen::new(recipe).map_err(|error| format!("freeze the provider's recipe: {error}"))?;
         // A crew's environment is held for its vessel, which the old environment names by label.
-        let holder = obj.metadata.labels.get(VESSEL_REF_LABEL).map(|vessel| Holder::vessel(vessel));
+        // An empty label names no vessel.
+        let holder = obj.metadata.labels.get(VESSEL_REF_LABEL).filter(|vessel| !vessel.is_empty()).map(|vessel| Holder::vessel(vessel));
         Ok(EnvironmentRequest { provider, image_build, recipe, holder })
     }
 
