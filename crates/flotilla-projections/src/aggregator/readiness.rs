@@ -1,9 +1,13 @@
 //! Current provisioning evidence for surface-agnostic convoy rows.
 
-use flotilla_protocol::result_set::{Readiness, ReadinessBlocker, ReadinessState};
+use flotilla_protocol::{
+    result_set::{Readiness, ReadinessBlocker, ReadinessState},
+    LifecycleReading,
+};
 use flotilla_resources::{CheckoutPhase, ClonePhase, CrewWorkPhase, CrewWorkState, VesselPhase};
 
 use super::*;
+use crate::ports::ProvisioningKind;
 
 impl Aggregator {
     pub(super) async fn recover_clone_readiness_watch(
@@ -117,6 +121,20 @@ impl Aggregator {
                     });
                     continue;
                 };
+                // Behind `[primitives]` the engine's reading of the checkout decides (#3629 layer 4).
+                let origin = engine_origin(&source.provenance);
+                if let Some(reading) = self.lifecycle_reads.reading(ProvisioningKind::Checkout, name, origin.as_deref()) {
+                    if let Some((state, phase, reason)) = reading_blocker(&reading, "checkout is not ready") {
+                        result.state = result.state.max(state);
+                        result.blockers.push(ReadinessBlocker {
+                            resource: ResourceRef::new(api_version(Checkout::API_PATHS), Checkout::API_PATHS.kind, &convoy.namespace, name)
+                                .on_host(host.clone()),
+                            phase,
+                            reason,
+                        });
+                    }
+                    continue;
+                }
                 let status = source.object.status.as_ref();
                 let phase = status.map(|status| status.phase).unwrap_or_default();
                 if phase == CheckoutPhase::Ready {
@@ -128,7 +146,26 @@ impl Aggregator {
                             && clone.object.metadata.name == spec.clone_ref
                             && self.read_host(&clone.provenance).as_ref() == Some(host)
                     }) {
-                        if let Some(status) = clone.object.status.as_ref().filter(|status| status.phase != ClonePhase::Ready) {
+                        let clone_ref = || {
+                            ResourceRef::new(
+                                api_version(CloneResource::API_PATHS),
+                                CloneResource::API_PATHS.kind,
+                                &convoy.namespace,
+                                &spec.clone_ref,
+                            )
+                            .on_host(host.clone())
+                        };
+                        let reading = self.lifecycle_reads.reading(
+                            ProvisioningKind::Clone,
+                            &spec.clone_ref,
+                            engine_origin(&clone.provenance).as_deref(),
+                        );
+                        if let Some(reading) = reading {
+                            if let Some((state, phase, reason)) = reading_blocker(&reading, "clone is not ready") {
+                                result.state = result.state.max(state);
+                                result.blockers.push(ReadinessBlocker { resource: clone_ref(), phase, reason });
+                            }
+                        } else if let Some(status) = clone.object.status.as_ref().filter(|status| status.phase != ClonePhase::Ready) {
                             let state = if status.phase == ClonePhase::Failed && status.failure_policy.is_some() {
                                 ReadinessState::Failed
                             } else if status.retry.is_some() || status.phase == ClonePhase::Failed {
@@ -138,13 +175,7 @@ impl Aggregator {
                             };
                             result.state = result.state.max(state);
                             result.blockers.push(ReadinessBlocker {
-                                resource: ResourceRef::new(
-                                    api_version(CloneResource::API_PATHS),
-                                    CloneResource::API_PATHS.kind,
-                                    &convoy.namespace,
-                                    &spec.clone_ref,
-                                )
-                                .on_host(host.clone()),
+                                resource: clone_ref(),
                                 phase: format!("{:?}", status.phase),
                                 reason: status.message.clone().unwrap_or_else(|| "clone is not ready".into()),
                             });
@@ -223,4 +254,25 @@ pub(super) fn apply_readiness_event<T: Resource>(
             resources.remove(&repository_source_key(&tombstone.namespace, &tombstone.name, &provenance));
         }
     }
+}
+
+/// The engine home of a resource read from `provenance`: a replica's origin root, or `None` for
+/// this home.
+fn engine_origin(provenance: &ResourceProvenance) -> Option<String> {
+    match provenance {
+        ResourceProvenance::Local => None,
+        ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+    }
+}
+
+/// The readiness an engine reading implies, as its state, phase label and reason; `None` once
+/// ready.
+fn reading_blocker(reading: &LifecycleReading, not_ready: &str) -> Option<(ReadinessState, String, String)> {
+    let state = match reading {
+        LifecycleReading::Ready { .. } => return None,
+        LifecycleReading::InProgress => ReadinessState::Provisioning,
+        LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. } => ReadinessState::Blocked,
+        LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::GaveUp { .. } => ReadinessState::Failed,
+    };
+    Some((state, reading.label().to_owned(), reading.reason().unwrap_or_else(|| not_ready.to_owned())))
 }

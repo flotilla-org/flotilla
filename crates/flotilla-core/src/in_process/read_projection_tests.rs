@@ -321,6 +321,7 @@ mod tests {
                 clock: &self.clock,
                 leaf_subscriptions: &self.subscriptions,
                 fleet: &self.fleet,
+                lifecycles: &flotilla_projections::ports::NoLifecycleReads,
             }
         }
 

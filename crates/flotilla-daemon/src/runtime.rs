@@ -1133,8 +1133,10 @@ async fn open_provisioning_lifecycles(
     daemon: &Arc<InProcessDaemon>,
 ) -> Result<flotilla_provisioning::engine::ProvisioningLifecycles, String> {
     use flotilla_engine_store::{open_home, StoreLog};
-    use flotilla_provisioning::engine::{LifecycleHome, ProvisioningLifecycles};
+    use flotilla_provisioning::engine::{reads::StoreReads, LifecycleHome, ProvisioningLifecycles};
     let store = daemon.decided_store()?.store();
+    let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
+    daemon.install_lifecycle_reads(Arc::new(EngineLifecycleReads { reads: StoreReads::new(Arc::clone(&store)), home }))?;
     tokio::task::spawn_blocking(move || {
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
         let log = || StoreLog::new(Arc::clone(&store));
@@ -1147,6 +1149,39 @@ async fn open_provisioning_lifecycles(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+/// The views' provisioning readings over the decided store (#3629 layer 4): one keyed read each,
+/// at the named home or this one.
+struct EngineLifecycleReads {
+    reads: flotilla_provisioning::engine::reads::StoreReads,
+    home: String,
+}
+
+impl flotilla_projections::ports::LifecycleReads for EngineLifecycleReads {
+    fn reading(
+        &self,
+        kind: flotilla_projections::ports::ProvisioningKind,
+        name: &str,
+        origin: Option<&str>,
+    ) -> Option<flotilla_protocol::LifecycleReading> {
+        use flotilla_projections::ports::ProvisioningKind;
+        use flotilla_provisioning::engine::reads::ProvisioningReads;
+        let home = origin.unwrap_or(&self.home);
+        let judgement = match kind {
+            ProvisioningKind::Environment => self.reads.environment(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::ImageBuild => self.reads.image_build(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::Clone => self.reads.repository_clone(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::Checkout => self.reads.checkout(name, home).map(|view| view.map(|view| view.judgement)),
+        };
+        match judgement {
+            Ok(judgement) => judgement.map(|judgement| judgement.reading()),
+            Err(error) => {
+                tracing::warn!(?kind, resource = name, %error, "engine reading failed; the view reads the old status");
+                None
+            }
+        }
+    }
 }
 
 /// Daemon-owned image build state: the owned builder's Buildx state, build

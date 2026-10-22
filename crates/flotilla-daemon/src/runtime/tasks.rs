@@ -936,6 +936,7 @@ pub(super) fn spawn_aggregator_task(
                         attach: daemon.clone(),
                         change_requests: daemon.clone(),
                         issues: daemon.clone(),
+                        lifecycles: daemon.lifecycle_reads(),
                     },
                     &namespace,
                     state,

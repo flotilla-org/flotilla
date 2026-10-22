@@ -696,6 +696,9 @@ use flotilla_projections::dispatch_board::DispatchBoardInputs;
 pub struct InProcessDaemon {
     change_stream_rounds: change_stream::Rounds,
     decided_store: std::sync::Mutex<Option<Arc<flotilla_schema_sqlite::stream::Service>>>,
+    /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4), installed with
+    /// the decided store's provisioning homes; none before, and none with the switch off.
+    lifecycle_reads: Arc<flotilla_projections::ports::LateLifecycleReads>,
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
     event_source: Arc<BroadcastEventSink>,
@@ -1311,6 +1314,7 @@ impl InProcessDaemon {
             regard_lifecycle: Arc::clone(&regard_lifecycle),
             decided_store: Default::default(),
             change_stream_rounds: Default::default(),
+            lifecycle_reads: Default::default(),
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
@@ -2106,6 +2110,16 @@ impl InProcessDaemon {
         }
         *slot = Some(service);
         Ok(())
+    }
+
+    /// Installs the engine's provisioning readings during composition (#3629 layer 4).
+    pub fn install_lifecycle_reads(&self, reads: Arc<dyn flotilla_projections::ports::LifecycleReads>) -> Result<(), String> {
+        self.lifecycle_reads.install(reads)
+    }
+
+    /// The provisioning readings the views consult: the engine's once installed, none before.
+    pub fn lifecycle_reads(&self) -> Arc<dyn flotilla_projections::ports::LifecycleReads> {
+        self.lifecycle_reads.clone()
     }
 
     /// Installs the `[primitives]` Message path during composition (#3317),
@@ -4067,6 +4081,7 @@ impl InProcessDaemon {
             environment_manager: self,
             host_name: &self.host_name,
             node_id: &self.node_id,
+            lifecycles: self.lifecycle_reads.as_ref(),
             clock: &self.clock,
             leaf_subscriptions: &self.leaf_subscription_diagnostics,
             fleet: &self.fleet,
@@ -4675,6 +4690,7 @@ impl InProcessDaemon {
             local_environment_id: &self.local_environment_id,
             host_name: &self.host_name,
             namespace: &self.provisioning_namespace,
+            lifecycle_reads: self.lifecycle_reads.as_ref(),
         }
     }
 
