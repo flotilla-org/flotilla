@@ -57,9 +57,7 @@ pub struct EnvironmentRequest {
 
 /// A provider's own recipe for an environment: a document whose shape the
 /// provider owns and validates, opaque to the shared table. The Docker
-/// provider's is its `DockerEnvironmentSpec`, memory policy included (where
-/// that policy belongs is #3734); host-direct's is its
-/// `HostDirectEnvironmentSpec`.
+/// provider's is a [`DockerRecipe`] and host-direct's a [`HostDirectRecipe`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Recipe(serde_json::Value);
@@ -73,5 +71,74 @@ impl Recipe {
     /// The recipe as its provider reads it.
     pub fn read<T: DeserializeOwned>(&self) -> Result<T, String> {
         serde_json::from_value(self.0.clone()).map_err(|error| format!("decode the provider's recipe: {error}"))
+    }
+}
+
+/// The Docker provider's recipe: the document a Docker environment's
+/// [`Recipe`] holds. Declared beside the request because the provider's own
+/// spec (`flotilla_resources::DockerEnvironmentSpec`) is the old store's,
+/// with legacy host fields and an image placeholder this shape leaves out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DockerRecipe {
+    pub image: DockerImage,
+    /// Adapters the placement policy expects discovery to find in the image.
+    pub declared_adapters: std::collections::BTreeSet<String>,
+    /// Adapters this environment's workflow will launch.
+    pub required_adapters: std::collections::BTreeSet<String>,
+    pub pull_policy: flotilla_resources::DockerImagePullPolicy,
+    /// The placement policy's memory formula, resolved against host memory at
+    /// container creation (where it belongs is #3734).
+    pub memory_policy: flotilla_resources::EnvironmentMemoryPolicy,
+    pub mounts: Vec<flotilla_resources::EnvironmentMount>,
+    /// The values the placement policy and workflow declare, and nothing
+    /// derived at launch: credential grants and skills are composed then and
+    /// passed to the provider, never stored ([`LAUNCH_DERIVED_ENV`]).
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// A Docker environment's image: pinned, or built (owner's look-over ruling
+/// 6). A built image names no reference here: its ImageBuild is the
+/// request's indexed `image_build` column, and the digest used is the build's
+/// realised identity, read at container creation and never copied in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DockerImage {
+    Pinned { reference: String },
+    Built,
+}
+
+/// The host-direct provider's recipe.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostDirectRecipe {
+    pub repo_default_dir: String,
+}
+
+/// Env entries derived at launch, which no stored recipe holds (owner's
+/// look-over ruling 5): credential names, scopes and permission maps, and
+/// the crew's skills.
+pub const LAUNCH_DERIVED_ENV: [&str; 5] = [
+    flotilla_resources::CREDENTIAL_REFS_ENV,
+    flotilla_resources::CREDENTIAL_SCOPES_ENV,
+    flotilla_resources::CREDENTIAL_PERMISSIONS_ENV,
+    "FLOTILLA_CREW_SKILLS",
+    "FLOTILLA_RESOLVED_SKILLS",
+];
+
+impl DockerRecipe {
+    /// The recipe's own rules beside the request's `image_build` column: a
+    /// built image has its build there and a pinned one has none, a pinned
+    /// reference is not empty, and the env holds nothing derived at launch.
+    pub fn validate(&self, image_build: Option<&Ref<Resource<ImageBuild>>>) -> Result<(), String> {
+        match (&self.image, image_build) {
+            (DockerImage::Built, None) => return Err("a built image names its ImageBuild in the request".into()),
+            (DockerImage::Pinned { .. }, Some(_)) => return Err("a pinned image names no ImageBuild".into()),
+            (DockerImage::Pinned { reference }, None) if reference.trim().is_empty() => {
+                return Err("a pinned image names its reference".into())
+            }
+            _ => {}
+        }
+        match LAUNCH_DERIVED_ENV.iter().find(|key| self.env.contains_key(**key)) {
+            Some(key) => Err(format!("{key} is composed at launch, never stored")),
+            None => Ok(()),
+        }
     }
 }

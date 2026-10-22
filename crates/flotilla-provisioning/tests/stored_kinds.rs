@@ -12,7 +12,7 @@ use flotilla_provisioning::stored::{
     self,
     checkout::{CheckoutKind, CheckoutRequest, Source},
     clone::{Clone, CloneKind, CloneRequest},
-    environment::{Environment, EnvironmentKind, EnvironmentRequest, Recipe},
+    environment::{DockerImage, DockerRecipe, Environment, EnvironmentKind, EnvironmentRequest, HostDirectRecipe, Recipe},
     image_build::{Architecture, Delivery, ImageBuildKind, ImageBuildRequest, Reservation},
     Holder,
 };
@@ -161,18 +161,16 @@ fn each_kind_survives_the_codec() {
             LifecycleState::GaveUp { cause: Cause::new(CauseCategory::Refused, "recipe failed") },
         ]
     };
-    let docker = flotilla_resources::DockerEnvironmentSpec {
-        host_ref: String::new(),
-        image: "image".into(),
-        image_build_ref: Some("image-feed-amd64".into()),
-        declared_agent_adapters: BTreeSet::from(["claude-code".into(), "codex".into()]),
-        required_agent_adapters: BTreeSet::from(["claude-code".into()]),
+    let docker = DockerRecipe {
+        image: DockerImage::Built,
+        declared_adapters: BTreeSet::from(["claude-code".into(), "codex".into()]),
+        required_adapters: BTreeSet::from(["claude-code".into()]),
         pull_policy: Default::default(),
         memory_policy: Default::default(),
         mounts: vec![],
         env: BTreeMap::from([("A".into(), "1".into())]),
     };
-    let host_direct = flotilla_resources::HostDirectEnvironmentSpec { host_ref: String::new(), repo_default_dir: "/work".into() };
+    let host_direct = HostDirectRecipe { repo_default_dir: "/work".into() };
     let provider = "host:feta/provider:docker".parse::<Address>().expect("provider");
     for (recipe, image_build) in [
         (Recipe::of(&host_direct).expect("recipe"), None),
@@ -187,7 +185,7 @@ fn each_kind_survives_the_codec() {
     }
     // The provider reads its own recipe back.
     let stored = Recipe::of(&docker).expect("recipe");
-    assert_eq!(stored.read::<flotilla_resources::DockerEnvironmentSpec>().expect("docker reads its recipe").image, "image");
+    assert_eq!(stored.read::<DockerRecipe>().expect("docker reads its recipe"), docker);
     let layers = Frozen::new(vec![layer()]).expect("freeze");
     for delivery in [Delivery::Registry { repository: "registry/flotilla".into() }, Delivery::Local] {
         for state in states() {
@@ -228,4 +226,61 @@ fn each_kind_survives_the_codec() {
             round_trip::<CheckoutKind>(spec, state);
         }
     }
+}
+
+// Behaviour (#3719 look-over rulings 5 and 6): a Docker recipe's image is pinned or built, never
+// both: a built image has its ImageBuild in the request's column and a pinned one has none and
+// names its reference. Nothing derived at launch (credential grants, skills) is stored.
+#[test]
+fn a_docker_recipe_holds_one_image_choice_and_nothing_derived_at_launch() {
+    let recipe = |image, env: &[(&str, &str)]| DockerRecipe {
+        image,
+        declared_adapters: BTreeSet::new(),
+        required_adapters: BTreeSet::new(),
+        pull_policy: Default::default(),
+        memory_policy: Default::default(),
+        mounts: vec![],
+        env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+    };
+    let build = Ref::new("image-feed-amd64", "feta");
+    let pinned = || DockerImage::Pinned { reference: "registry/flotilla@sha256:00".into() };
+    assert_eq!(recipe(DockerImage::Built, &[]).validate(Some(&build)), Ok(()));
+    assert_eq!(recipe(pinned(), &[("A", "1")]).validate(None), Ok(()));
+    assert!(recipe(DockerImage::Built, &[]).validate(None).expect_err("built without its build").contains("names its ImageBuild"));
+    assert!(recipe(pinned(), &[]).validate(Some(&build)).expect_err("pinned and built").contains("names no ImageBuild"));
+    assert!(recipe(DockerImage::Pinned { reference: " ".into() }, &[]).validate(None).expect_err("empty").contains("reference"));
+    for key in flotilla_provisioning::stored::environment::LAUNCH_DERIVED_ENV {
+        assert!(recipe(pinned(), &[(key, "[]")]).validate(None).expect_err(key).contains("composed at launch"), "{key}");
+    }
+}
+
+// Behaviour (#3719 review): a recipe's content hash is stable, so a frozen recipe is stored once
+// and replicas agree on its object: the canonical encoding fixes the field order, and numbers
+// round-trip exactly.
+#[test]
+fn a_recipe_hashes_stably_and_round_trips_its_numbers() {
+    let docker = DockerRecipe {
+        image: DockerImage::Pinned { reference: "registry/flotilla@sha256:00".into() },
+        declared_adapters: BTreeSet::from(["codex".into(), "claude-code".into()]),
+        required_adapters: BTreeSet::new(),
+        pull_policy: Default::default(),
+        memory_policy: flotilla_resources::EnvironmentMemoryPolicy {
+            host_memory_percent: 80,
+            expected_concurrent_crews: 4,
+            swap_bytes: u64::MAX >> 1,
+        },
+        mounts: vec![],
+        env: BTreeMap::from([("Z".into(), "1".into()), ("A".into(), "2".into())]),
+    };
+    let frozen = Frozen::new(Recipe::of(&docker).expect("recipe")).expect("freeze");
+    let again = Frozen::new(Recipe::of(&docker.clone()).expect("recipe")).expect("freeze");
+    assert_eq!(frozen.hash(), again.hash());
+    assert_eq!(
+        format!("{:?}", frozen.hash()),
+        include_str!("snapshots/docker_recipe_hash.txt").trim(),
+        "the canonical encoding of a fixed recipe; a change here re-hashes every stored recipe"
+    );
+    let read = Frozen::<Recipe>::from_stored(frozen.hash(), frozen.bytes()).expect("stored").value().read::<DockerRecipe>().expect("read");
+    assert_eq!(read, docker);
+    assert_eq!(read.memory_policy.swap_bytes, u64::MAX >> 1);
 }
