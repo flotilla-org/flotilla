@@ -483,6 +483,12 @@ fn provisioning_load() {
     );
     assert_eq!(live.fullscan_steps, 0.0);
     report("a provider's live environments", &live);
+    let holders: Vec<Vec<String>> = (0..convoys).step_by(7).map(|n| vec![format!("convoy:convoy-{n}")]).collect();
+    let held =
+        measure(&read, "SELECT c.id FROM checkout c WHERE c.holder = (SELECT id FROM strings WHERE domain = 'hl' AND s = ?1)", &holders);
+    assert!(held.rows >= 2.0, "each convoy holds its checkouts");
+    assert_eq!(held.fullscan_steps, 0.0);
+    report("a convoy's held checkouts", &held);
     let keyed = measure(&read, &format!("SELECT e.state, e.identity FROM environment e WHERE e.id = {IDENTITY}"), &environments);
     assert_eq!(keyed.rows, 1.0);
     assert_eq!(keyed.fullscan_steps, 0.0);
