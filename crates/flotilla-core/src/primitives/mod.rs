@@ -14,6 +14,7 @@ pub mod convert;
 pub mod convoy_engine;
 pub mod convoy_map;
 pub mod convoys;
+pub mod ensures;
 pub mod import;
 pub mod ports;
 pub mod roles;

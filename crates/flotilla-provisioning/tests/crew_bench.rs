@@ -33,11 +33,15 @@ use std::{
 };
 
 use flotilla_engine_store::{open_home, register_crew, StoreLog};
-use flotilla_provisioning::stored::{
-    self,
-    terminal_session::{Launch, TerminalSession, TerminalSessionRequest},
-    Holder,
+use flotilla_provisioning::{
+    engine::{decide, launch, terminal_session::TerminalSessionBinding, LifecycleHome, Lifecycles},
+    stored::{
+        self,
+        terminal_session::{Launch, TerminalSession, TerminalSessionKind, TerminalSessionRequest},
+        Holder,
+    },
 };
+use flotilla_resources::{ConvoyEnsureStatusPatch, StatusPatch, TerminalSessionStatusPatch};
 use flotilla_schema::{Address, KindRegistry, Ref as StoredRef, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
@@ -163,6 +167,50 @@ impl Crew {
 
 fn inbox(role: usize) -> Address {
     format!("project:p{role}/role:standing").parse().expect("inbox")
+}
+
+/// Convoy `n`'s crew session as the old store holds it, starting.
+fn old_session(n: usize) -> flotilla_resources::ResourceObject<flotilla_resources::TerminalSession> {
+    flotilla_resources::ResourceObject {
+        metadata: meta(&format!("terminal-vessel-{n}-coder")),
+        spec: flotilla_resources::TerminalSessionSpec {
+            env_ref: format!("env-{n}"),
+            role: "coder".into(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: "claude".into() },
+            cwd: "/workspace".into(),
+            pool: "cleat".into(),
+            env: BTreeMap::new(),
+        },
+        status: None,
+    }
+}
+
+/// Standing role `role`'s ConvoyEnsure, untouched.
+fn standing(role: usize) -> flotilla_resources::ResourceObject<flotilla_resources::ConvoyEnsure> {
+    flotilla_resources::ResourceObject {
+        metadata: meta(&format!("standing-{role}")),
+        spec: flotilla_resources::ConvoyEnsureSpec::builder()
+            .project_ref(format!("p{role}"))
+            .role("ops".into())
+            .repositories(vec![])
+            .build(),
+        status: None,
+    }
+}
+
+fn meta(name: &str) -> flotilla_resources::ObjectMeta {
+    flotilla_resources::ObjectMeta {
+        name: name.into(),
+        namespace: "flotilla".into(),
+        resource_version: "1".into(),
+        labels: BTreeMap::new(),
+        annotations: BTreeMap::new(),
+        owner_references: vec![],
+        finalizers: vec![],
+        deletion_timestamp: None,
+        creation_timestamp: chrono::DateTime::UNIX_EPOCH,
+        merge: None,
+    }
 }
 
 struct Measured {
@@ -315,6 +363,65 @@ fn crew_load() {
             .expect("attempt");
     }
     per_event("ensure attempt, one transaction", ROLES, started, "the tally and the log entry");
+
+    // The crew reconcilers' write path (#3629 layer 7): each local convoy's crew session run,
+    // stopped and resumed through the engine as TerminalSession decides it, a new launch each run.
+    let launches: Arc<dyn Lifecycles<TerminalSessionKind>> =
+        Arc::new(LifecycleHome::new("local", Home::with_log("local", StoreLog::new(local.clone())).expect("declaration")));
+    let mut objects: Vec<_> = locals.iter().map(|n| old_session(*n)).collect();
+    let started = Instant::now();
+    for (round, id) in [(0, "s1"), (1, "s2")] {
+        for obj in objects.iter_mut() {
+            let running = TerminalSessionStatusPatch::MarkRunning {
+                configured_limits: None,
+                session_id: format!("{}-{id}", obj.metadata.name),
+                pid: None,
+                started_at: chrono::DateTime::UNIX_EPOCH,
+                crew: None,
+                launch_command: "claude".into(),
+                delivered_message_id: None,
+            };
+            let decided =
+                decide::<TerminalSessionBinding>(launches.as_ref(), obj, Some(running), chrono::Utc::now()).patch.expect("running");
+            decided.apply(obj.status.get_or_insert_with(Default::default));
+            if round == 0 {
+                let stopped = TerminalSessionStatusPatch::MarkStopped {
+                    stopped_at: chrono::DateTime::UNIX_EPOCH,
+                    inner_command_status: None,
+                    inner_exit_code: Some(0),
+                    message: None,
+                };
+                let decided =
+                    decide::<TerminalSessionBinding>(launches.as_ref(), obj, Some(stopped), chrono::Utc::now()).patch.expect("stopped");
+                decided.apply(obj.status.get_or_insert_with(Default::default));
+                TerminalSessionStatusPatch::MarkStarting.apply(obj.status.get_or_insert_with(Default::default));
+            }
+        }
+    }
+    per_event(
+        "session run, stop, resumed run",
+        objects.len() * 3,
+        started,
+        "launch #1 requested and realised, released; launch #2 requested and realised",
+    );
+    assert!(objects.iter().all(|obj| launches.get(&launch(&obj.metadata.name, 2)).is_some()));
+
+    // Standing roles' Ensures decided through the engine: a convoy bound, failed, a replacement bound.
+    let ensures = flotilla_core::primitives::ensures::EngineEnsurePath::open(local.clone(), Arc::new(flotilla_resources::SystemClock))
+        .expect("ensures");
+    let started = Instant::now();
+    for role in 0..ROLES {
+        let mut obj = standing(role);
+        for patch in [
+            ConvoyEnsureStatusPatch::Running { convoy_ref: format!("standing-{role}-1"), observed_at: chrono::Utc::now() },
+            ConvoyEnsureStatusPatch::BackingOff { retry_at: chrono::Utc::now(), failure: "convoy failed".into() },
+            ConvoyEnsureStatusPatch::Running { convoy_ref: format!("standing-{role}-2"), observed_at: chrono::Utc::now() },
+        ] {
+            let decided = ensures.decide_now(&obj, patch).expect("decided").expect("taken");
+            decided.apply(obj.status.get_or_insert_with(Default::default));
+        }
+    }
+    per_event("ensure patch decided", ROLES * 3, started, "its edges (record, create, attempt, bind or unbind), one transaction each");
 
     // A restart: the vessels' home and the ledger's leases rebuilt from the store.
     let started = Instant::now();

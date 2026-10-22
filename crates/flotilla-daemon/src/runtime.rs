@@ -33,7 +33,8 @@ use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
 use flotilla_provisioning::engine::{
-    checkout::CheckoutBinding, clone::CloneBinding, environment::EnvironmentBinding, image_build::ImageBuildBinding, Engine,
+    checkout::CheckoutBinding, clone::CloneBinding, environment::EnvironmentBinding, image_build::ImageBuildBinding,
+    terminal_session::TerminalSessionBinding, Engine,
 };
 use flotilla_provisioning::reconcilers::{
     CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver, RepositoryReconciler,
@@ -425,12 +426,26 @@ impl DaemonRuntime {
 
         let controller_metrics = Arc::new(flotilla_store::load_metrics::ControllerMetricsRegistry::default());
         let mut controller_state = None;
+        // Behind `[primitives]` the engine's Ensure decides standing-convoy status (#3629 layer 7).
+        let ensure_engine = match provisioning_lifecycles {
+            Some(_) => {
+                let store = daemon.decided_store()?.store();
+                let path = tokio::task::spawn_blocking(move || {
+                    flotilla_core::primitives::ensures::EngineEnsurePath::open(store, Arc::new(SystemClock))
+                })
+                .await
+                .map_err(|error| error.to_string())??;
+                Some(Arc::new(path) as Arc<dyn flotilla_admission::convoy_ensure::EngineEnsures>)
+            }
+            None => None,
+        };
         daemon
             .install_convoy_ensure_reconciler(Arc::new(
                 EnsureReconciler::builder()
                     .teardown(daemon.convoy_teardown())
                     .resource_backend(daemon.resource_backend())
                     .clock(Arc::new(SystemClock))
+                    .maybe_engine(ensure_engine)
                     .build(),
             ))
             .await;
@@ -899,12 +914,16 @@ fn spawn_controller_loops(
                 let local_host_ref = state.local_host_ref.clone();
                 let additional_host_refs = state.agentless_host_refs();
                 let state = Arc::clone(&state);
+                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.terminal_sessions));
                 (
                     vec![],
-                    TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
-                        .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
-                        .with_additional_host_refs(additional_host_refs)
-                        .with_federated_convoys(&backend, &namespace_string),
+                    Engine::<_, TerminalSessionBinding>::new(
+                        TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
+                            .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
+                            .with_additional_host_refs(additional_host_refs)
+                            .with_federated_convoys(&backend, &namespace_string),
+                        lifecycles,
+                    ),
                 )
             }
         }),
@@ -1147,6 +1166,7 @@ async fn open_provisioning_lifecycles(
             image_builds: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             clones: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             checkouts: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            terminal_sessions: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
         })
     })
     .await
