@@ -1,0 +1,4 @@
+# Each test gets a fresh process, including process-wide allocator counters.
+# Keep default discovery and ignored-test semantics; do not filter suites.
+[profile.default]
+test-threads = "num-cpus"
