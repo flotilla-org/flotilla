@@ -71,8 +71,11 @@ impl Convoys {
     }
 
     /// Edit the world the gates read; the next admission or edge reads the
-    /// result. Projects stay (one entry per project admission named); an
-    /// edit's own inputs are cleared once it applies ([`Convoys::edit`]).
+    /// result. Projects stay (one entry per project admission named). The
+    /// `durable` and `authority` tables are scoped to one edge: put them here
+    /// for an [`Convoys::apply`] that follows, or inside an edit's plan. Any
+    /// [`Convoys::edit`] clears both when it ends, so an input put here before
+    /// an unrelated edit is gone after it.
     pub fn world<T>(&self, edit: impl FnOnce(&mut MemoryConvoyWorld) -> T) -> T {
         edit(&mut locked(&self.world))
     }
@@ -104,6 +107,10 @@ impl Convoys {
     /// rest and says how many applied before it. The durability and
     /// authority inputs the plan recorded are the edit's own and are cleared
     /// once it ends, so the world does not grow with the edits.
+    ///
+    /// `plan` must not panic, and must only read the record and record its
+    /// gate inputs: it runs under both locks, and their poisoning is
+    /// recovered on the strength of that (see [`Convoys`]).
     pub fn edit<T>(
         &self,
         name: &str,
