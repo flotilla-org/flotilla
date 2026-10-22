@@ -58,6 +58,9 @@ pub struct EnvironmentRequest {
 /// A provider's own recipe for an environment: a document whose shape the
 /// provider owns and validates, opaque to the shared table. The Docker
 /// provider's is a [`DockerRecipe`] and host-direct's a [`HostDirectRecipe`].
+/// A stored recipe is a stored document: renaming or retiring one of its
+/// fields takes the same one-generation alias or default shim as any stored
+/// shape (ADR 0047), and its content hash must stay stable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Recipe(serde_json::Value);
