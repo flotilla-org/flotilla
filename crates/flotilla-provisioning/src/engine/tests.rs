@@ -555,6 +555,26 @@ fn session_object(phase: flotilla_resources::TerminalSessionPhase) -> ResourceOb
     }
 }
 
+// Behaviour (#3720 look-over, ruling 1): a crew's session is held for its vessel, by holder
+// address, with no convoy of its own; a tool session has no holder.
+#[test]
+fn a_crew_session_is_held_for_its_vessel() {
+    use flotilla_resources::{Selector, TerminalBrief, TerminalCrewContext, TerminalSessionPhase, TerminalSessionSource};
+
+    use super::terminal_session::TerminalSessionBinding;
+    use crate::stored::Holder;
+    let tool = session_object(TerminalSessionPhase::Starting);
+    assert_eq!(TerminalSessionBinding::request(&tool, HOME).expect("request").holder, None);
+    let mut agent = tool;
+    agent.spec.source = TerminalSessionSource::Agent {
+        selector: Selector { capability: "coding".into(), adapter: None, model: None },
+        brief: TerminalBrief { path: "/w/brief.md".into(), content: "# brief".into(), artifact_digest: None, copies: vec![] },
+        context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: "convoy-a".into(), vessel_ref: "vessel-a".into() }),
+        message: None,
+    };
+    assert_eq!(TerminalSessionBinding::request(&agent, HOME).expect("request").holder, Some(Holder::vessel("vessel-a")));
+}
+
 // Behaviour (#3629 Q2, layer 7): each launch of a terminal session is a resource of its own. The
 // first runs as `#1`; stopped, it is released; resumed in place by the old path, the next run is
 // `#2`, and `#1` stays Gone. A lost session stays Realised (unobservable is a judgement); when the

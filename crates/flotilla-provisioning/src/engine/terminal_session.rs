@@ -9,13 +9,15 @@
 
 use flotilla_resources::{
     ResourceObject, TerminalSession as OldTerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 use flotilla_schema::{Frozen, Ref};
 use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Outcome, Resource};
 
 use super::{Binding, Step};
-use crate::stored::terminal_session::{Launch, TerminalSession, TerminalSessionKind, TerminalSessionRequest};
+use crate::stored::{
+    terminal_session::{Launch, TerminalSession, TerminalSessionKind, TerminalSessionRequest},
+    Holder,
+};
 
 pub struct TerminalSessionBinding;
 
@@ -39,13 +41,11 @@ impl Binding for TerminalSessionBinding {
                 Some(context.as_ref()),
             ),
         };
-        // A crew's session names its vessel (here) and its convoy, at the root a federated convoy's
-        // vessel records, or this home. Queued messages are Messages (#3317), not the request.
-        let convoy_home = obj.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map_or(home, String::as_str);
+        // A crew's session is held for its vessel; its convoy is the vessel's (#3720 look-over). A
+        // tool session has no holder. Queued messages are Messages (#3317), not the request.
         Ok(TerminalSessionRequest {
             environment: Ref::new(spec.env_ref.clone(), home),
-            vessel: context.map(|context| Ref::new(context.vessel_ref.clone(), home)),
-            convoy: context.map(|context| Ref::new(context.convoy.clone(), convoy_home)),
+            holder: context.map(|context| Holder::vessel(&context.vessel_ref)),
             role: spec.role.clone(),
             pool: spec.pool.clone(),
             cwd: spec.cwd.clone(),
