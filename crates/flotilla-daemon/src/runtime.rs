@@ -426,12 +426,26 @@ impl DaemonRuntime {
 
         let controller_metrics = Arc::new(flotilla_store::load_metrics::ControllerMetricsRegistry::default());
         let mut controller_state = None;
+        // Behind `[primitives]` the engine's Ensure decides standing-convoy status (#3629 layer 7).
+        let ensure_engine = match provisioning_lifecycles {
+            Some(_) => {
+                let store = daemon.decided_store()?.store();
+                let path = tokio::task::spawn_blocking(move || {
+                    flotilla_core::primitives::ensures::EngineEnsurePath::open(store, Arc::new(SystemClock))
+                })
+                .await
+                .map_err(|error| error.to_string())??;
+                Some(Arc::new(path) as Arc<dyn flotilla_admission::convoy_ensure::EngineEnsures>)
+            }
+            None => None,
+        };
         daemon
             .install_convoy_ensure_reconciler(Arc::new(
                 EnsureReconciler::builder()
                     .teardown(daemon.convoy_teardown())
                     .resource_backend(daemon.resource_backend())
                     .clock(Arc::new(SystemClock))
+                    .maybe_engine(ensure_engine)
                     .build(),
             ))
             .await;

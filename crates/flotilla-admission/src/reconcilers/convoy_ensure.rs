@@ -10,6 +10,7 @@ use std::{
 use crate::convoy_admission::PreparedConvoyAdmission;
 use crate::convoy_ensure::ConvoyEnsureAdmission;
 use crate::convoy_ensure::ConvoyEnsureReconciler;
+use crate::convoy_ensure::EngineEnsures;
 use crate::convoy_ensure::StandingConvoyBackingInspector;
 use crate::ports::ConvoyTeardown;
 use async_trait::async_trait;
@@ -86,6 +87,8 @@ pub struct EnsureReconciler {
     /// status reads, backing inspection, admission, and status publication.
     #[builder(skip)]
     ensure_reconciliation: Mutex<()>,
+    /// The engine's Ensure behind `[primitives]` (#3629 layer 7); absent with the switch off.
+    engine: Option<Arc<dyn EngineEnsures>>,
 }
 
 impl EnsureReconciler {
@@ -97,6 +100,7 @@ impl EnsureReconciler {
             .ensure_admission_retries(&self.ensure_admission_retries)
             .ensure_reconciliation(&self.ensure_reconciliation)
             .admission(admission)
+            .maybe_engine(self.engine.as_ref())
             .build()
     }
 }
@@ -130,6 +134,7 @@ struct EnsurePass<'a> {
     ensure_admission_retries: &'a Mutex<HashMap<(String, String), EnsureAdmissionRetry>>,
     ensure_reconciliation: &'a Mutex<()>,
     admission: &'a dyn ConvoyEnsureAdmission,
+    engine: Option<&'a Arc<dyn EngineEnsures>>,
 }
 
 #[async_trait]
@@ -1120,10 +1125,23 @@ impl EnsurePass<'_> {
     }
 
     async fn patch_convoy_ensure(&self, namespace: &str, name: &str, patch: ConvoyEnsureStatusPatch) -> Result<(), String> {
-        apply_resource_status_patch(&self.resource_backend.clone().using::<ConvoyEnsure>(namespace), name, &patch)
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        let ensures = self.resource_backend.clone().using::<ConvoyEnsure>(namespace);
+        // Behind `[primitives]` the engine decides first; the old status takes its answer.
+        let patch = match self.engine {
+            Some(engine) => {
+                let ensure = match ensures.get(name).await {
+                    Ok(ensure) => ensure,
+                    Err(ResourceError::NotFound { .. }) => return Ok(()),
+                    Err(error) => return Err(error.to_string()),
+                };
+                match engine.decide(namespace, &ensure, patch).await? {
+                    Some(patch) => patch,
+                    None => return Ok(()),
+                }
+            }
+            None => patch,
+        };
+        apply_resource_status_patch(&ensures, name, &patch).await.map(|_| ()).map_err(|error| error.to_string())
     }
 
     async fn patch_driver_ensure_status_if_local(&self, namespace: &str, name: &str, patch: ConvoyEnsureStatusPatch) -> Result<(), String> {
