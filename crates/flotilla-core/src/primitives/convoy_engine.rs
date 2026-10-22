@@ -412,6 +412,8 @@ impl EngineConvoys for ConvoyEngine {
     }
 
     fn promises(&self, convoy: &ResourceObject<OldConvoy>, home: Option<&str>) -> Result<Option<OldPromises>, String> {
+        // This home named as the convoy's home is deliberately the local read: the in-memory
+        // engine is current, and its own records are never replicas here.
         let engine = match home.filter(|home| *home != self.convoys.home()) {
             None => self.convoys.get(&convoy.metadata.name),
             Some(home) => self

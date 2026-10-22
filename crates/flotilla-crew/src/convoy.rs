@@ -229,7 +229,11 @@ impl SecondaryWatch for EngineConvoyWake {
             // daemon installs the engine path while it starts, before any
             // controller (and so this watch) is spawned (runtime.rs,
             // `open_message_primitives`), so an empty path here means off.
-            let Some(engine) = self.engine.get() else { return Ok(()) };
+            let Some(engine) = self.engine.get() else {
+                // Logged, so a startup reordering that empties the path with the switch on is visible.
+                tracing::debug!("no engine convoy path: the engine convoy wake is off");
+                return Ok(());
+            };
             let mut changes = engine.changes();
             loop {
                 match changes.recv().await {
