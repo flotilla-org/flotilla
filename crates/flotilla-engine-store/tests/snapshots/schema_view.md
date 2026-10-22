@@ -4,6 +4,7 @@ Kind tables only; the shared tables are in `message.sql`.
 
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
+| `awaiting_reply` | root | 12 | – | – | `open_by_sender` (sender), `open_by_subject` (subject), `by_message` (message), `deadline` (deadline) |
 | `agent_session` | root | 9 | – | – | – |
 | `convoy` | root | 8 | – | `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_quota` (state data), `convoy_retired` (state data) | `open_by_project` (project) |
 | `convoy_duties` | child | 6 | 1: `scope` 1 | `convoy_duties_scope_promises` (child) | – |
@@ -20,6 +21,7 @@ Tables wider than 30 columns:
 - none
 
 States with data (one label column, then data shared by name across the labels):
+- `awaiting_reply`.`state`: label `state` and `state_since`; data columns `reason`; data tables –
 - `agent_session`.`state`: label `state` and `state_since`; data columns `channel`, `activity`, `activity_since`, `activity_cause`, `reason`; data tables –
 - `convoy`.`state`: label `state` and `state_since`; data columns `reason`; data tables `convoy_quota`, `convoy_retired`
 - `message`.`state`: label `state` and `state_since`; data columns `receiver_kind`, `receiver_id`, `receiver_host`, `reason`, `reason_by`, `reason_authority`, `watermark`; data tables –
@@ -28,6 +30,10 @@ Interned column domains:
 
 | Table | Column | Domain |
 |---|---|---|
+| `awaiting_reply` | `sender` | `ad` |
+| `awaiting_reply` | `recipient` | `ad` |
+| `awaiting_reply` | `subject` | `ad` |
+| `awaiting_reply` | `kind` | `ak` |
 | `convoy` | `project` | `ad` |
 | `convoy_duties` | `owner_role` | `rl` |
 | `convoy_duties` | `owner_seat` | `st` |
