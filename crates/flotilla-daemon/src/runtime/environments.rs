@@ -373,9 +373,15 @@ pub(super) async fn mark_unavailable_environment(
                 )
                 .patch;
             }
-            Err(ResourceError::NotFound { .. }) => patch = None,
+            Err(ResourceError::NotFound { .. }) => {
+                tracing::debug!(environment = %env_id, "environment record gone; nothing to mark");
+                patch = None;
+            }
             Err(error) => return Err(format!("mark unavailable environment {env_id}: {error}")),
         }
+    }
+    if patch.is_none() {
+        tracing::debug!(environment = %env_id, "the engine already holds this environment's state; nothing to mark");
     }
     if let Some(patch) = patch {
         flotilla_store::apply_status_patch(&environments, env_id.as_str(), &patch)

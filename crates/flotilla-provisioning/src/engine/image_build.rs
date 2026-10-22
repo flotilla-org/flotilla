@@ -57,11 +57,14 @@ impl Binding for ImageBuildBinding {
 
     fn copy(obj: &ResourceObject<OldImageBuild>, resource: &Resource<ImageBuild>) -> Option<ImageBuildStatusPatch> {
         let status = obj.status.clone().unwrap_or_default();
+        // A stored time outside chrono's range cannot occur for a write made now; the epoch stands in.
         let at = resource.since().to_datetime().unwrap_or_default();
         match resource.state() {
             // Every old phase short of Built is consistent with a request still being tried:
             // a failure the engine has not given up on is retried.
             LifecycleState::Requested { .. } if status.phase != ImageBuildPhase::Built => None,
+            // Built in the old status alone (a refused realise): the engine still wants it, so the
+            // build is queued again. A resource is never realised twice, so this needs a refusal.
             LifecycleState::Requested { .. } => Some(ImageBuildStatusPatch::Retry { not_before: at }),
             LifecycleState::Realised { .. } if status.phase == ImageBuildPhase::Built => None,
             LifecycleState::Realised { identity } => Some(ImageBuildStatusPatch::Built {

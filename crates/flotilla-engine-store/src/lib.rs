@@ -124,7 +124,7 @@ where
 {
     let home = log.home().to_owned();
     let stored = {
-        let mut store = log.store().lock().expect("store reader");
+        let mut store = log.store().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut read = store.read().map_err(|error| error.to_string())?;
         let mut stored = Vec::new();
         let mut after = None;

@@ -96,7 +96,10 @@ impl Binding for EnvironmentBinding {
                 registry_digest: status.and_then(|status| status.registry_digest.clone()),
             }),
             (LifecycleState::Gone, EnvironmentPhase::Lost | EnvironmentPhase::Failed) => None,
-            (LifecycleState::Gone, _) => Some(EnvironmentStatusPatch::MarkLost { message: "the environment is gone".into() }),
+            // The old message, when it has one, says why: the copy keeps it.
+            (LifecycleState::Gone, _) => Some(EnvironmentStatusPatch::MarkLost {
+                message: status.and_then(|status| status.message.clone()).unwrap_or_else(|| "the environment is gone".into()),
+            }),
             (LifecycleState::GaveUp { .. }, EnvironmentPhase::Failed) => None,
             (LifecycleState::GaveUp { cause }, _) => Some(EnvironmentStatusPatch::MarkFailed { message: cause.detail.clone() }),
         }
