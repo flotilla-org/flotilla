@@ -254,6 +254,14 @@ fn a_docker_recipe_holds_one_image_choice_and_nothing_derived_at_launch() {
     }
 }
 
+// Behaviour (#3719 review): a host-direct recipe names the root its checkouts go under.
+#[test]
+fn a_host_direct_recipe_names_its_checkout_root() {
+    use flotilla_provisioning::stored::environment::HostDirectRecipe;
+    assert_eq!(HostDirectRecipe { repo_default_dir: "/srv/flotilla".into() }.validate(), Ok(()));
+    assert!(HostDirectRecipe { repo_default_dir: " ".into() }.validate().expect_err("empty").contains("checkout root"));
+}
+
 // Behaviour (#3719 review): a recipe's content hash is stable, so a frozen recipe is stored once
 // and replicas agree on its object: the canonical encoding fixes the field order, and numbers
 // round-trip exactly.
