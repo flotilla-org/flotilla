@@ -13,6 +13,7 @@
 pub mod awaiting;
 pub mod convert;
 pub mod convoy_engine;
+pub mod convoy_import;
 pub mod convoy_map;
 pub mod convoys;
 pub mod ensures;
