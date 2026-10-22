@@ -238,3 +238,27 @@ async fn a_stall_is_open_until_the_supervisors_reply_lands() {
     note.expectation = flotilla_resources::MessageExpectation::None;
     assert!(!primitives.await_reply(NAMESPACE, &plain, &note, "home-a", "reply", None).await.expect("nothing"));
 }
+
+// Behaviour (#3730 review): a message superseded at this home withdraws its sender's record here,
+// and the ended record is evicted from memory yet still read from the store.
+#[tokio::test]
+async fn a_superseded_send_withdraws_its_awaiting_record() {
+    use flotilla_state_machines::machines::{awaiting_reply::AwaitingReplyLabel, message::MessageRef};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let primitives = primitives(&dir).await;
+    let seat: flotilla_address::Address = "project:flotilla/convoy:demo/role:coder".parse().expect("seat");
+    let supervisor = "fleet/governor";
+    let mut stall = intent(CREW, supervisor);
+    stall.relation = MessageRelation::Supervisor;
+    stall.expectation = flotilla_resources::MessageExpectation::Reply;
+    let first = flotilla_resources::message_record_name(supervisor, CREW, "stall-1");
+    primitives.admit(NAMESPACE, &first, &stall).await.expect("first");
+    primitives.await_reply(NAMESPACE, &first, &stall, "home-a", "stall", Some(CREW)).await.expect("recorded");
+    let mut again = stall.clone();
+    again.supersedes = Some(first.clone());
+    let second = flotilla_resources::message_record_name(supervisor, CREW, "stall-2");
+    primitives.admit(NAMESPACE, &second, &again).await.expect("second, superseding the first");
+    let awaited = MessageRef::new(format!("project:fleet/role:governor/message:{first}"), "home-a");
+    assert_eq!(primitives.awaiting().get(&awaited).expect("read from the store").label(), AwaitingReplyLabel::Withdrawn);
+    assert!(!primitives.awaiting().stalled(&seat).expect("read"), "the withdrawn stall is not open");
+}

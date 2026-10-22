@@ -38,9 +38,12 @@ pub const STALL: &str = flotilla_resources::STALL_KIND;
 /// The most records one indexed read returns.
 const PAGE: u32 = 256;
 
-/// This home's AwaitingReply records. Each gate's world is built for its one
-/// edge from what the caller observed (the reply that landed, the sender's
-/// authority) and dropped after it, so nothing accumulates with traffic.
+/// This home's AwaitingReply records. Only the open ones are held in memory:
+/// a record that ends is evicted, and an ended record is read on demand from
+/// the store, so memory and restart time follow the open records, not every
+/// send ever made. Each gate's world is built for its one edge from what the
+/// caller observed (the reply that landed, the sender's authority) and
+/// dropped after it, so nothing accumulates with traffic.
 ///
 /// Poisoning: a panic while the lock is held poisons it; an applied edge
 /// leaves the home as its log took it, so the lock is recovered.
@@ -73,7 +76,9 @@ impl AwaitingReplies {
                     let page = read.scan::<Resource<AwaitingReply>>(home, after, 64)?;
                     for id in page.ids {
                         if let Some(loaded) = read.load::<Resource<AwaitingReply>>(id)? {
-                            stored.push(loaded.value);
+                            if loaded.value.label() == AwaitingReplyLabel::Open {
+                                stored.push(loaded.value);
+                            }
                         }
                     }
                     after = page.next;
@@ -96,7 +101,11 @@ impl AwaitingReplies {
     pub fn record(&self, spec: AwaitingReplySpec, now: Timestamp) -> Result<bool, String> {
         let name = record_name(&spec.message);
         let mut home = locked(&self.home);
-        if let Some(existing) = home.get(&name) {
+        let existing = match home.get(&name) {
+            Some(open) => Some(open.clone()),
+            None => self.stored(&name)?,
+        };
+        if let Some(existing) = existing {
             if *existing.spec() != spec {
                 return Err(format!("AwaitingReply `{name}` is recorded as {:?}, not {spec:?}", existing.spec()));
             }
@@ -107,9 +116,40 @@ impl AwaitingReplies {
         Ok(true)
     }
 
-    /// The record awaiting `message`, if it is homed here.
+    /// The record awaiting `message`, if it is homed here: open in memory, or
+    /// ended in the store.
     pub fn get(&self, message: &MessageRef) -> Option<Resource<AwaitingReply>> {
-        locked(&self.home).get(&record_name(message)).cloned()
+        let name = record_name(message);
+        let open = locked(&self.home).get(&name).cloned();
+        open.or_else(|| self.stored(&name).ok().flatten())
+    }
+
+    /// A record homed here as the store holds it: one keyed read.
+    fn stored(&self, name: &str) -> Result<Option<Resource<AwaitingReply>>, String> {
+        self.service
+            .with_store(|store| {
+                let mut read = store.read()?;
+                let Some(id) = read.resolve(<Resource<AwaitingReply> as flotilla_schema::Kind>::CODE, name, &self.home_name)? else {
+                    return Ok(None);
+                };
+                Ok(read.load::<Resource<AwaitingReply>>(id)?.map(|loaded| loaded.value))
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    /// Applies `edge` to the open record `name` and evicts it once it ends.
+    fn end(
+        home: &mut Home<AwaitingReply, StoreLog>,
+        name: &str,
+        edge: impl Into<flotilla_state_machines::machines::awaiting_reply::AwaitingReplyEdge>,
+        world: &MemoryAwaitingReplyWorld,
+        now: Timestamp,
+    ) -> Result<(), WriteError<AwaitingReply>> {
+        home.apply(name, edge, world, now)?;
+        if home.get(name).is_some_and(|record| record.label() != AwaitingReplyLabel::Open) {
+            home.evict(name);
+        }
+        Ok(())
     }
 
     /// A message landed in `inbox` at this home. When it replies to a message
@@ -133,15 +173,16 @@ impl AwaitingReplies {
         // The gate's evidence: this reply, landed in this inbox, answering this message.
         let mut world = MemoryAwaitingReplyWorld::default();
         world.land(reply, inbox, Some(awaited));
-        match home.apply(&name, Answer { reply: reply.clone() }, &world, now) {
+        match Self::end(&mut home, &name, Answer { reply: reply.clone() }, &world, now) {
             Ok(_) => Ok(Some(name)),
             Err(WriteError::Refused(AwaitingReplyRefusal::NotOpen)) => Ok(None),
             Err(error) => Err(format!("AwaitingReply `{name}`: {error:?}")),
         }
     }
 
-    /// The sender withdraws its record, with a reason: its send was refused,
-    /// withdrawn or superseded. An ended record is left as it is.
+    /// The sender withdraws its record, with a reason: its message was
+    /// withdrawn or superseded at this home (`MessagePrimitives::withdraw`
+    /// and `supersede`). An ended record is left as it is.
     pub fn withdraw(&self, message: &MessageRef, by: &Address, reason: &str, now: Timestamp) -> Result<bool, String> {
         let name = record_name(message);
         let mut home = locked(&self.home);
@@ -155,7 +196,7 @@ impl AwaitingReplies {
         let mut world = MemoryAwaitingReplyWorld::default();
         world.authority.put(&Ref::new(authority.as_str()), true);
         let withdraw = Withdraw { by: by.clone(), reason: reason.to_owned(), authority: Ref::new(authority) };
-        home.apply(&name, withdraw, &world, now).map(|_| true).map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))
+        Self::end(&mut home, &name, withdraw, &world, now).map(|_| true).map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))
     }
 
     /// Expires every open record homed here whose deadline has passed with no
@@ -166,8 +207,9 @@ impl AwaitingReplies {
     /// deadline is_some)`, so it holds only open records with a deadline, in
     /// deadline order. It holds every home's replicated records too (a
     /// home is the record's identity, not an indexed column); those are read
-    /// and passed over, and only this home's are expired. A reply present has
-    /// already answered its record when it landed, so it is no longer Open.
+    /// and passed over, and only this home's are expired. A reply that landed
+    /// before the sweep has answered its record, so it is no longer Open; a
+    /// reply landing after expiry finds the record Expired and answers nothing.
     pub fn expire_due(&self, now: Timestamp) -> Result<Vec<String>, String> {
         let due: Vec<String> = self
             .service
@@ -199,9 +241,9 @@ impl AwaitingReplies {
         let mut home = locked(&self.home);
         let world = MemoryAwaitingReplyWorld::default();
         for name in due {
-            match home.apply(&name, Expire, &world, now) {
+            match Self::end(&mut home, &name, Expire, &world, now) {
                 Ok(_) => expired.push(name),
-                // A reply present wins over a passed deadline; an ended record stays.
+                // An ended record stays as it is.
                 Err(WriteError::Refused(_)) => {}
                 Err(error) => return Err(format!("AwaitingReply `{name}`: {error:?}")),
             }

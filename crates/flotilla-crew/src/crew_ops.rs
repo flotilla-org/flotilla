@@ -88,6 +88,7 @@ fn awaiting_kind(expectation: &flotilla_resources::MessageExpectation, stall_of:
     use flotilla_resources::MessageExpectation;
     match (expectation, stall_of) {
         (MessageExpectation::None, _) => None,
+        // A stalled crew's supervision is a stall, whatever it expects back.
         (_, Some(_)) => Some(flotilla_resources::STALL_KIND),
         (MessageExpectation::Reply, None) => Some("reply"),
         (MessageExpectation::Outcome { .. }, None) => Some("outcome"),
@@ -3357,7 +3358,8 @@ impl CrewService {
         let Some(kind) = awaiting_kind(&intent.expectation, stall_of) else { return };
         let Some(engine) = self.message_primitives() else { return };
         let Some(home) = home else {
-            tracing::warn!(message = %name, "the receiver home reported no admitting home; no awaiting-reply record");
+            // A receiver home off the engine path answers without it, on every repeat.
+            tracing::debug!(message = %name, "the receiver home reported no admitting home; no awaiting-reply record");
             return;
         };
         if let Err(error) = engine.await_reply(namespace, name, intent, &home, kind, stall_of).await {

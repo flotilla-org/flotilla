@@ -503,6 +503,13 @@ impl MessagePrimitives {
         let here = self.home.clone();
         let now = self.world.now();
         tokio::task::spawn_blocking(move || {
+            // A repeat finds its record and stops: the reply scan ran when it was written.
+            if let Some(existing) = awaiting.get(&message) {
+                return match *existing.spec() == spec {
+                    true => Ok(false),
+                    false => Err(format!("AwaitingReply for `{}` is recorded as {:?}, not {spec:?}", message.name, existing.spec())),
+                };
+            }
             let recorded = awaiting.record(spec, now)?;
             // A reply may have landed before the record: replies are indexed by what they answer.
             let replies = service
@@ -594,9 +601,24 @@ impl MessagePrimitives {
         let Ok(by) = newer.parse::<Address>() else { return };
         self.world
             .update(|world| world.supersession.put(&flotilla_state_machines::Ref::new(newer), Supersedes { older: older.to_owned() }));
-        if let Err(error) = self.inbox.drop(older, DropReason::Superseded { by }).await {
+        if let Err(error) = self.inbox.drop(older, DropReason::Superseded { by: by.clone() }).await {
             // The sweep follows the successor in the log and retries.
             tracing::warn!(%older, %newer, %error, "superseded message did not drop yet");
+            return;
+        }
+        // Its sender's record here, if it awaited a reply, waits no longer (#3587 layer 7).
+        self.withdraw_awaiting(older, &by, &format!("superseded by {newer}")).await;
+    }
+
+    /// Withdraws the awaiting record of a message dropped here, when its
+    /// sender's record is homed here too.
+    async fn withdraw_awaiting(&self, message: &str, by: &Address, reason: &str) {
+        let awaiting = Arc::clone(&self.awaiting);
+        let (message, by, reason, now) = (MessageRef::new(message, self.home.clone()), by.clone(), reason.to_owned(), self.world.now());
+        match tokio::task::spawn_blocking(move || awaiting.withdraw(&message, &by, &reason, now)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "withdrawing the awaiting record failed"),
+            Err(error) => tracing::warn!(%error, "withdrawing the awaiting record did not run"),
         }
     }
 
@@ -613,7 +635,9 @@ impl MessagePrimitives {
         let records = self.records(namespace).await.map_err(|error| error.to_string())?;
         let authority = records.convoy_address(convoy)?;
         self.world.update(|world| world.authority.put(&flotilla_state_machines::Ref::new(authority.as_str()), true));
-        self.inbox.drop(&id, DropReason::Withdrawn { by, authority }).await.map_err(|error| error.to_string())
+        self.inbox.drop(&id, DropReason::Withdrawn { by: by.clone(), authority }).await.map_err(|error| error.to_string())?;
+        self.withdraw_awaiting(&id, &by, "withdrawn by an operator").await;
+        Ok(())
     }
 
     /// The engine id and home of the message an old record name names, in
