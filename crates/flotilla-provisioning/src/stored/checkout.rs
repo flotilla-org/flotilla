@@ -60,13 +60,9 @@ pub struct CheckoutRequest {
 }
 
 impl CheckoutRequest {
-    /// The writer's admission: exactly one owner, and a worktree names its clone.
+    /// The writer's admission: a worktree names its clone. The holder is not
+    /// checked: it carries no ownership (look-over ruling 4).
     pub fn validate(&self) -> Result<(), String> {
-        match (&self.convoy, &self.ensure) {
-            (Some(_), Some(_)) => return Err("a checkout has one owner: its convoy or its ensure, not both".into()),
-            (None, None) => return Err("a checkout names its owner: its convoy or its ensure".into()),
-            _ => {}
-        }
         if self.source == Source::Worktree && self.clone.is_none() {
             return Err("a worktree checkout names its clone".into());
         }

@@ -1,11 +1,14 @@
 //! Environment's binding: the old Environment reconciler's patches as lifecycle steps.
 
-use flotilla_resources::{Environment as OldEnvironment, EnvironmentPhase, EnvironmentStatusPatch, ResourceObject};
+use flotilla_resources::{Environment as OldEnvironment, EnvironmentPhase, EnvironmentStatusPatch, ResourceObject, VESSEL_REF_LABEL};
 use flotilla_schema::{Frozen, Ref};
 use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Outcome, Resource};
 
 use super::{Binding, Step};
-use crate::stored::environment::{Environment, EnvironmentKind, EnvironmentRequest, Recipe};
+use crate::stored::{
+    environment::{Environment, EnvironmentKind, EnvironmentRequest, Recipe},
+    Holder,
+};
 
 pub struct EnvironmentBinding;
 
@@ -24,7 +27,9 @@ impl Binding for EnvironmentBinding {
             _ => return Err("an environment is backed by exactly one of docker and host_direct".into()),
         };
         let recipe = Frozen::new(recipe).map_err(|error| format!("freeze the provider's recipe: {error}"))?;
-        Ok(EnvironmentRequest { provider, image_build, recipe })
+        // A crew's environment is held for its vessel, which the old environment names by label.
+        let holder = obj.metadata.labels.get(VESSEL_REF_LABEL).map(|vessel| Holder::vessel(vessel));
+        Ok(EnvironmentRequest { provider, image_build, recipe, holder })
     }
 
     fn initial(obj: &ResourceObject<OldEnvironment>) -> bool {
