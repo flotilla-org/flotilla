@@ -34,7 +34,7 @@ use std::{
 
 use flotilla_engine_store::{open_home, register_crew, StoreLog};
 use flotilla_provisioning::{
-    engine::{decide, launch, terminal_session::TerminalSessionBinding, LifecycleHome, Lifecycles},
+    engine::{decide, launch, reads::ProvisioningReads, terminal_session::TerminalSessionBinding, LifecycleHome, Lifecycles},
     stored::{
         self,
         terminal_session::{Launch, TerminalSession, TerminalSessionKind, TerminalSessionRequest},
@@ -405,6 +405,21 @@ fn crew_load() {
         "launch #1 requested and realised, released; launch #2 requested and realised",
     );
     assert!(objects.iter().all(|obj| launches.get(&launch(&obj.metadata.name, 2)).is_some()));
+
+    // The read ports (#3629 layer 8): a session's current launch by its record name, and a
+    // vessel's sessions (which seats it serves) through the index.
+    let reads = flotilla_provisioning::engine::reads::StoreReads::new(local.clone());
+    let started = Instant::now();
+    for obj in &objects {
+        let view = reads.terminal_session(&obj.metadata.name, "local").expect("read").expect("held");
+        assert_eq!(view.name, launch(&obj.metadata.name, 2), "the current launch");
+    }
+    eprintln!("{:>40}: {:>8.1} µs/query", "port: a session's current launch", started.elapsed().as_secs_f64() * 1e6 / objects.len() as f64);
+    let started = Instant::now();
+    for n in &locals {
+        assert!(reads.held_sessions(&Holder::vessel(&format!("vessel-{n}"))).expect("index").len() >= 2);
+    }
+    eprintln!("{:>40}: {:>8.1} µs/query", "port: a vessel's served sessions", started.elapsed().as_secs_f64() * 1e6 / locals.len() as f64);
 
     // Standing roles' Ensures decided through the engine: a convoy bound, failed, a replacement bound.
     let ensures = flotilla_core::primitives::ensures::EngineEnsurePath::open(local.clone(), Arc::new(flotilla_resources::SystemClock))

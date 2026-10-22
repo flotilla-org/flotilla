@@ -96,6 +96,7 @@ pub mod terminal_session;
 pub mod usage;
 #[doc(hidden)]
 pub mod vessel;
+pub mod vessel_seats;
 mod watch;
 #[doc(hidden)]
 pub mod workflow_template;

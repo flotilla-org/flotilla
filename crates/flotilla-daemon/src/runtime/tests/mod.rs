@@ -144,6 +144,7 @@ mod message;
 mod seed;
 mod supervisor_turns;
 mod terminal;
+mod vessel_seats;
 mod work_credentials;
 
 fn test_controller_vcs(runner: Arc<dyn CommandRunner>, checkout: &str) -> Arc<dyn flotilla_vcs::vcs::Vcs> {
