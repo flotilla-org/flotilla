@@ -10,7 +10,7 @@ use flotilla_state_machines::{
     Resource,
 };
 
-use super::{clone::Clone, environment::Environment};
+use super::{clone, environment::Environment};
 
 /// Checkouts as a lifecycle kind.
 pub struct CheckoutKind;
@@ -28,7 +28,10 @@ pub type Checkout = Lifecycle<CheckoutKind>;
 ///
 /// A Checkout is owned by its role's owner (ADR 0064): the convoy for a
 /// convoy role, the Ensure for a standing role, so exactly one of `convoy`
-/// and `ensure` is set. Realised under its path once the branch is observed
+/// and `ensure` is set, and a worktree names its `clone`. The writer's
+/// admission enforces both: the derive has no cross-field CHECK, and each
+/// reference is a top-level column, not a variant's datum, so that removing
+/// its target's identity searches its index instead of scanning. Realised under its path once the branch is observed
 /// checked out there. Integration (clean, pushed, landed, the change
 /// request) is observed on the forge and in the checkout, never stored here.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
@@ -53,7 +56,7 @@ pub struct CheckoutRequest {
     pub path: String,
     pub source: Source,
     /// A worktree's Clone; for a fresh clone, the local clone it seeds from, if any.
-    pub clone: Option<Ref<Resource<Clone>>>,
+    pub clone: Option<Ref<Resource<clone::Clone>>>,
     pub convoy: Option<Ref<Resource<Convoy>>>,
     pub ensure: Option<Ref<Resource<Ensure>>>,
 }

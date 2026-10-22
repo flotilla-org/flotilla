@@ -45,7 +45,9 @@ pub struct EnvironmentRequest {
     pub backing: Backing,
 }
 
-/// How the provider backs the environment.
+/// How the provider backs the environment. Docker's adapter, mount and env
+/// rows are child tables that hold rows only under Docker: decoding refuses
+/// a row under any other variant.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub enum Backing {
     /// The host itself.
@@ -85,6 +87,7 @@ pub enum PullPolicy {
 /// The placement-authored memory budget: a share of host memory per crew.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub struct MemoryPolicy {
+    /// 1 to 100, checked where the request is written (`EnvironmentMemoryPolicy::resolve`).
     pub host_memory_percent: u8,
     pub expected_concurrent_crews: u32,
     /// Swap per crew, in bytes.
