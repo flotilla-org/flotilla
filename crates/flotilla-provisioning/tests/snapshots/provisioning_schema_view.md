@@ -1,0 +1,31 @@
+# Provisioning store schema view
+
+Kind tables only; the shared tables are in `provisioning.sql`.
+
+| Table | Role | Columns | From enum expansion | Child tables | Indexes |
+|---|---|--:|---|---|---|
+| `checkout` | root | 22 | 2: `source` 2 | – | `by_environment` (environment), `by_clone` (clone), `by_convoy` (convoy), `by_ensure` (ensure) |
+| `clone` | root | 16 | – | – | `by_environment` (environment, repository) |
+| `environment` | root | 21 | 7: `backing` 7 | `environment_backing_declared_adapters` (child), `environment_backing_required_adapters` (child), `environment_backing_mounts` (child), `environment_backing_env` (child) | `live_by_provider` (provider), `by_image_build` (image_build) |
+| `environment_backing_declared_adapters` | child | 2 | – | – | – |
+| `environment_backing_required_adapters` | child | 2 | – | – | – |
+| `environment_backing_mounts` | child | 5 | – | – | – |
+| `environment_backing_env` | child | 3 | – | – | – |
+| `image_build` | root | 19 | 2: `delivery` 2 | – | `by_composition` (composition) |
+
+Tables wider than 30 columns:
+- none
+
+States with data (one label column, then data shared by name across the labels):
+- `checkout`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `cause_category`, `cause_detail`; data tables –
+- `clone`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `cause_category`, `cause_detail`; data tables –
+- `environment`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `cause_category`, `cause_detail`; data tables –
+- `image_build`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `cause_category`, `cause_detail`; data tables –
+
+Interned column domains:
+
+| Table | Column | Domain |
+|---|---|---|
+| `checkout` | `repository` | `rk` |
+| `clone` | `repository` | `rk` |
+| `environment` | `provider` | `ad` |

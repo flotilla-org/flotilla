@@ -161,7 +161,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-charter` | Charter inputs read through a `RevisionedTree` (Git via `Vcs`, or a local directory): `project.yaml` declarations, operational entries and their provenance annotations, charter locks and source status |
 | `flotilla-executor` | Provider-backed command handlers, step plans and resolution, remote step batches and host orchestration ports |
 | `flotilla-observation` | Provider-neutral change-request, issue and forge observation, demand servicing and observed-resource projection |
-| `flotilla-provisioning` | Environment, ImageBuild, Checkout, Clone and Repository reconcilers; orphaned-environment and image-inventory loops |
+| `flotilla-provisioning` | Environment, ImageBuild, Checkout, Clone and Repository reconcilers; orphaned-environment and image-inventory loops; the four provisioning kinds' engine lifecycle specs (`stored`, #3629) |
 | `flotilla-admission` | Convoy admission, standing-convoy reconciliation, vessel placement projection, placement planning, project operations and composed-image planning; host orchestration through owned ports |
 | `flotilla-crew` | Crew operations and actions, capability cards, the leaf engine, the decision log, charter notifications, review bundles, and the Vessel, TerminalSession and Convoy reconcilers; host collaborators through owned ports |
 | `flotilla-core` | Refresh and `InProcessDaemon` composition root; implements admission, crew and observation ports |
