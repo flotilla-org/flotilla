@@ -14,6 +14,7 @@ flotilla-paths = { path = "../flotilla-paths" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-schema = { path = "../flotilla-schema" }
+flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -26,7 +27,6 @@ serde_json = { workspace = true }
 [dev-dependencies]
 flotilla-engine-store = { path = "../flotilla-engine-store" }
 flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
-flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 futures = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }

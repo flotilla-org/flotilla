@@ -246,6 +246,9 @@ pub struct ExplainedCheckout {
     pub pushed: Option<ExplainedCondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landed: Option<ExplainedCondition>,
+    /// The engine's judgement of the checkout, when `[primitives]` is on and the engine holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<crate::LifecycleReading>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
