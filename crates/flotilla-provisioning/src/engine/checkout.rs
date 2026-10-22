@@ -1,14 +1,14 @@
 //! Checkout's binding: the old Checkout reconciler's patches as lifecycle steps.
 
-use flotilla_resources::{
-    Checkout as OldCheckout, CheckoutPhase, CheckoutSpec, CheckoutStatusPatch, ResourceObject, ACTUATOR_SOURCE_ROOT_ANNOTATION,
-    CONVOY_LABEL,
-};
+use flotilla_resources::{Checkout as OldCheckout, CheckoutPhase, CheckoutSpec, CheckoutStatusPatch, ResourceObject, CONVOY_LABEL};
 use flotilla_schema::Ref;
 use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Outcome, Resource};
 
 use super::{Binding, Step};
-use crate::stored::checkout::{Checkout, CheckoutKind, CheckoutRequest, Source};
+use crate::stored::{
+    checkout::{Checkout, CheckoutKind, CheckoutRequest, Source},
+    Holder,
+};
 
 pub struct CheckoutBinding;
 
@@ -34,12 +34,9 @@ impl Binding for CheckoutBinding {
             ),
             CheckoutSpec::Observed(_) => return Err("an observed checkout is no engine request".into()),
         };
-        // The convoy is homed where it was admitted: the root a federated convoy's checkout
-        // records, or this home.
-        let convoy = obj.metadata.labels.get(CONVOY_LABEL).map(|convoy| {
-            let convoy_home = obj.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map_or(home, String::as_str);
-            Ref::new(convoy.clone(), convoy_home)
-        });
+        // Held for its convoy, when a convoy role's: the old checkout names it by label. The
+        // holder carries no home and no ownership: the convoy finds its checkouts by it.
+        let holder = obj.metadata.labels.get(CONVOY_LABEL).map(|convoy| Holder::convoy(convoy));
         let request = CheckoutRequest {
             repository: obj.spec.repo_ref().to_string(),
             environment: local(environment, home),
@@ -48,8 +45,7 @@ impl Binding for CheckoutBinding {
             path: path.clone(),
             source,
             clone,
-            convoy,
-            ensure: None,
+            holder,
         };
         request.validate()?;
         Ok(request)

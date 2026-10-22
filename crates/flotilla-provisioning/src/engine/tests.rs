@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use flotilla_resources::{
     Checkout as OldCheckout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, CheckoutWorktreeSpec, Clone as OldClone,
     ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch, ObjectMeta, RepositoryKey, Resource as OldResource, ResourceError,
-    ResourceObject, StatusPatch, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    ResourceObject, StatusPatch, CONVOY_LABEL,
 };
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
@@ -19,7 +19,10 @@ use flotilla_state_machines::{
 use flotilla_store::controller::{ReconcileOutcome, Reconciler};
 
 use super::{checkout::CheckoutBinding, clone::CloneBinding, Binding, Engine, LifecycleHome, Lifecycles, Step};
-use crate::stored::checkout::{CheckoutRequest, Source};
+use crate::stored::{
+    checkout::{CheckoutRequest, Source},
+    Holder,
+};
 
 const HOME: &str = "home";
 
@@ -262,32 +265,29 @@ async fn the_copy_restores_the_engine_state_over_a_drifted_old_status() {
     );
 }
 
-// Behaviour: a checkout's request names its convoy at the convoy's home (the source root a
-// federated convoy's checkout records), its environment and clone at this home.
+// Behaviour (#3719 look-over ruling 4): a checkout's request names who it is held for, its
+// convoy (`convoy:<name>`), and its environment and clone at this home.
 #[test]
-fn a_checkout_request_names_its_owner_at_the_owner_home() {
-    let mut obj = worktree(Some("convoy-a"));
-    let local = CheckoutBinding::request(&obj, HOME).expect("request");
-    assert_eq!(local.convoy.as_ref().map(|convoy| (convoy.name.as_str(), convoy.home.as_str())), Some(("convoy-a", HOME)));
-    assert_eq!(local.clone.as_ref().map(|clone| clone.name.as_str()), Some("clone-a"));
-    assert_eq!(local.source, Source::Worktree);
-    obj.metadata.annotations.insert(ACTUATOR_SOURCE_ROOT_ANNOTATION.into(), "admitting-node".into());
-    let federated = CheckoutBinding::request(&obj, HOME).expect("request");
-    assert_eq!(federated.convoy.as_ref().map(|convoy| convoy.home.as_str()), Some("admitting-node"));
-    assert_eq!(federated.environment.home, HOME);
+fn a_checkout_request_names_its_holder() {
+    let request = CheckoutBinding::request(&worktree(Some("convoy-a")), HOME).expect("request");
+    assert_eq!(request.holder, Some(Holder::convoy("convoy-a")));
+    assert_eq!(request.clone.as_ref().map(|clone| clone.name.as_str()), Some("clone-a"));
+    assert_eq!(request.source, Source::Worktree);
+    assert_eq!(request.environment.home, HOME);
 }
 
-// Behaviour (#3719 review): the writer refuses a checkout with no owner. The engine holds nothing
-// for it, so it stays on the old path: its patch passes.
+// Behaviour (#3719 look-over ruling 4): a checkout held for no one is still the engine's: the
+// holder carries no ownership, so nothing refuses it.
 #[tokio::test]
-async fn a_checkout_without_an_owner_is_no_engine_request() {
-    assert!(CheckoutBinding::request(&worktree(None), HOME).expect_err("no owner").contains("owner"));
+async fn a_checkout_held_for_no_one_is_the_engines() {
+    let request = CheckoutBinding::request(&worktree(None), HOME).expect("request");
+    assert_eq!(request.holder, None);
     let home = lifecycles::<CheckoutBinding>();
     let ready = CheckoutStatusPatch::MarkReady { path: "/work/feature".into(), commit: None, branch_provenance: Default::default() };
     let engine = Engine::<_, CheckoutBinding>::new(Scripted::<OldCheckout>::new([Some(ready.clone())]), Some(home.clone()));
     let mut obj = worktree(None);
     assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(ready));
-    assert!(home.get("checkout-a").is_none());
+    assert_eq!(home.get("checkout-a").expect("held").state(), &LifecycleState::Realised { identity: "/work/feature".into() });
 }
 
 // Behaviour: steps for each kind's patches.
@@ -315,19 +315,15 @@ async fn without_lifecycles_the_old_reconciler_is_unchanged() {
     assert_eq!(outcome.requeue_after, Some(std::time::Duration::from_secs(30)));
 }
 
-// Behaviour (#3719 review): the checkout writer refuses both owners, neither, and a worktree
-// without its clone.
+// Behaviour (#3719 review, look-over ruling 4): the checkout writer refuses a worktree without its
+// clone; who it is held for, or whether it is held at all, is no check.
 #[test]
-fn the_checkout_writer_refuses_a_request_breaking_its_invariants() {
+fn the_checkout_writer_refuses_a_worktree_without_its_clone() {
     let valid = CheckoutBinding::request(&worktree(Some("convoy-a")), HOME).expect("valid");
-    let both = CheckoutRequest { ensure: Some(flotilla_schema::Ref::new("ensure-a", HOME)), ..valid.clone() };
-    assert!(both.validate().expect_err("both").contains("not both"));
-    let neither = CheckoutRequest { convoy: None, ..valid.clone() };
-    assert!(neither.validate().expect_err("neither").contains("names its owner"));
     let orphan = CheckoutRequest { clone: None, ..valid.clone() };
     assert!(orphan.validate().expect_err("no clone").contains("names its clone"));
-    let ensured = CheckoutRequest { convoy: None, ensure: Some(flotilla_schema::Ref::new("ensure-a", HOME)), ..valid };
-    assert_eq!(ensured.validate(), Ok(()));
+    assert_eq!(CheckoutRequest { holder: Some(Holder::ensure("standing")), ..valid.clone() }.validate(), Ok(()));
+    assert_eq!(CheckoutRequest { holder: None, ..valid }.validate(), Ok(()));
 }
 
 fn environment_object(docker: bool) -> ResourceObject<flotilla_resources::Environment> {
@@ -377,7 +373,10 @@ fn an_environment_is_realised_under_its_container_or_root() {
         vec![Step::Realised { identity: "c0ffee".into() }]
     );
     assert_eq!(EnvironmentBinding::steps(&environment_object(false), &ready(None)), vec![Step::Realised { identity: "/work".into() }]);
-    let request = EnvironmentBinding::request(&environment_object(true), HOME).expect("request");
+    let mut held = environment_object(true);
+    held.metadata.labels.insert(flotilla_resources::VESSEL_REF_LABEL.into(), "convoy-a-implement".into());
+    let request = EnvironmentBinding::request(&held, HOME).expect("request");
+    assert_eq!(request.holder, Some(Holder::vessel("convoy-a-implement")), "held for its vessel");
     assert_eq!(request.image_build.map(|build| (build.name, build.home)), Some(("image-00-amd64".into(), HOME.into())));
     // The Docker provider's own spec is the recipe, read back by the provider.
     let recipe = request.recipe.value().read::<flotilla_resources::DockerEnvironmentSpec>().expect("the docker recipe");
