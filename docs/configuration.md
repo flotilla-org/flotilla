@@ -340,6 +340,61 @@ host only after sync reaches a fleet store. On startup, sync recovers pending
 uploads from local blobs and per-store markers; later passes process new writes
 and cache fills without walking the full local blob directory.
 
+## OpenTelemetry traces
+
+Span export is off until `[tracing]` is present in `daemon.toml`. Restart the
+daemon after changing it:
+
+```toml
+[tracing]
+endpoint = "http://collector:4318/v1/traces"
+service_name = "flotilla-daemon" # default
+sampling = 1.0                  # probability in [0, 1], default 1
+```
+
+The endpoint is the complete OTLP/HTTP protobuf traces URL. Export uses a bounded
+background batch processor and flushes on graceful shutdown. Sampling uses the
+trace ID so every host makes the same decision for queued work; use the same
+sampling probability across the mesh. The existing logging filter also controls
+which tracing spans reach the exporter.
+
+JSON events inside spans include top-level `trace_id` and `span_id`, including
+when export is disabled or a trace is not sampled. Peer command and remote-step
+request envelopes carry W3C `traceparent` and `tracestate`. Message admission,
+waiting, delivery attempts and receipts use a trace ID derived from the stable
+message ID; retries and host changes keep that identity. Context stays in memory
+and in transient envelopes, never in stored or replicated resources.
+
+The admission root represents the logical message, with both trace and root
+span IDs derived from its stable ID. Re-admission or replay exports that same
+root identity again; collectors may coalesce those submissions and retain one
+version of its attributes/timestamps. Root duration and export count therefore
+are not admission-attempt metrics. Waiting, transport attempts and receipt spans
+have fresh span IDs and remain distinct children across hosts and restarts.
+This keeps a connected graph without storing parent context or introducing an
+unexported synthetic parent.
+
+The engine's qualified `/message:<id>` address normalizes to the same stable ID
+used by its producer. Production unkeyed IDs hash inbox, sender, the decided
+Store's home and its next admission sequence, so equal sequences on different
+homes do not collide. Waiting emits on admission/state entry, not every pending
+poll; the resource-backed path emits again only when phase or reason changes.
+
+The SDK and tracing layer run even with export off, to supply JSON correlation.
+Enabled spans allocate SDK state, and JSON formatting resolves context and
+buffers each event; disabling export removes network/batch-export work, not
+instrumentation overhead. The logging filter controls the enabled spans/events.
+No routed-command latency benchmark is claimed here.
+
+Peer ingress retains only ASCII `traceparent` and `tracestate` values of at most
+512 bytes each before relaying. Empty or invalid context creates no receive
+span; valid unsampled context still supplies IDs for logs.
+
+The `otel_trace` daemon test runs the two-home router scenario with an in-memory
+exporter and checks connected spans and their JSON log IDs. **Operator, after
+the roll:** send one message across hosts, find its trace in VictoriaTraces,
+and confirm its linked log lines in VictoriaLogs through Alloy.
+
 ## Daemon logging
 
 Each daemon writes structured JSON-lines to

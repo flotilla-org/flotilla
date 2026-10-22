@@ -797,6 +797,9 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             Some(name) => name,
             None => state.home.log_mut().next_name(&spec.inbox, &spec.sender)?,
         };
+        let span = flotilla_tracing::queued_span(&name, "admission");
+        let _entered = span.enter();
+        tracing::info!("message admission");
         let empty = state.bindings.get(&inbox).is_none_or(|value| value.open == 0);
         world.run(self.observations.as_ref(), |world| state.home.create(&name, spec, world, now).map(|_| ()))??;
         Self::open_inbox(state, &inbox, now);
@@ -814,10 +817,15 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             state.home.get(&name).ok_or_else(|| Error::Storage("committed admission missing from Home".into()))?.spec().admitted_seq;
         Self::index_pending(state, &inbox, admitted, &name);
         Self::publish(state)?;
+        // Pending is a state entry, not an event on every reader scan.
+        flotilla_tracing::queued_span(&name, "waiting").in_scope(|| tracing::info!("message pending"));
         Ok(name)
     }
 
     fn receive_locked(&self, state: &mut State<L>, consumer: &Receiver, message: &str, transport: Transport) -> Result<(), Error> {
+        let span = flotilla_tracing::queued_span(message, "receipt");
+        let _entered = span.enter();
+        tracing::info!("message receipt attempt");
         Self::load(state, message)?;
         let resource = state.home.get(message).ok_or_else(|| Error::Message(WriteError::Unknown(message.into())))?;
         match resource.state() {
@@ -1040,7 +1048,13 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
     }
     async fn deliver(&self, message: &str, edge: Deliver) -> Result<(), Error> {
         let message = message.to_owned();
-        self.access(move |backend, state| backend.apply_locked(state, &message, edge)).await
+        self.access(move |backend, state| {
+            let span = flotilla_tracing::queued_span(&message, "attempt");
+            let _entered = span.enter();
+            tracing::info!("message delivery attempt");
+            backend.apply_locked(state, &message, edge)
+        })
+        .await
     }
     async fn settle(&self, message: &str, edge: Settle) -> Result<(), Error> {
         let message = message.to_owned();
@@ -1141,5 +1155,25 @@ mod read_set_tests {
                 let _ = world.lookup(&Ref::<Condition>::new("undeclared"));
             })
             .expect("snapshot");
+    }
+}
+
+#[cfg(test)]
+mod trace_identity_tests {
+    // Production next_name supplies the decided Store's home and next sequence.
+    // Equal inbox/sender/sequence on different homes must still yield distinct
+    // stable IDs. Generate sequence boundaries and home suffixes explicitly.
+    #[hegel::test]
+    fn unkeyed_message_ids_distinguish_homes(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let sequence = tc.draw(gs::integers::<u64>());
+        let host = tc.draw(gs::integers::<u64>());
+        let inbox = "project:fleet/role:reader".parse().expect("inbox");
+        let sender = "project:fleet/role:sender".parse().expect("sender");
+        let a = super::unkeyed_name(&inbox, &sender, &format!("host-a-{host}"), sequence).expect("name");
+        let duplicate = super::unkeyed_name(&inbox, &sender, &format!("host-a-{host}"), sequence).expect("duplicate");
+        let b = super::unkeyed_name(&inbox, &sender, &format!("host-b-{host}"), sequence).expect("name");
+        assert_eq!(a, duplicate);
+        assert_ne!(a, b);
     }
 }

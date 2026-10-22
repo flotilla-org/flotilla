@@ -27,6 +27,7 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 tokio = { version = "1", features = ["io-util"] }
 
 [dev-dependencies]
+hegeltest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 serde_yml = "0.0.12"
 sha2 = { workspace = true }

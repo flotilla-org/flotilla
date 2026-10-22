@@ -1,0 +1,33 @@
+[package]
+name = "flotilla-tracing"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+hegeltest = "=0.48.1"
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+
+# Align SDK transitive selections with the native workspace.
+rand = "0.9"
+thiserror = "2"

@@ -760,3 +760,20 @@ fn http_listener_unknown_fields_fail_to_load(tc: hegel::TestCase) {
     assert!(error.contains("unknown field"), "{error}");
     assert!(error.contains(&key), "{error}");
 }
+
+// Issue #3712: previous daemon config leaves export off; opting in supplies
+// endpoint, service name and sampling without changing stored resources.
+#[test]
+fn tracing_config_is_opt_in_with_defaults() {
+    let old: DaemonConfig = toml::from_str("host_name = 'old-host'").expect("previous config");
+    assert!(old.tracing.is_none());
+    let enabled: DaemonConfig = toml::from_str("[tracing]\nendpoint = 'http://collector:4318/v1/traces'").expect("tracing config");
+    let config = enabled.tracing.expect("enabled");
+    assert_eq!(config.service_name, "flotilla-daemon");
+    assert_eq!(config.sampling, 1.0);
+    let custom: DaemonConfig =
+        toml::from_str("[tracing]\nendpoint = 'https://collector/v1/traces'\nservice_name = 'test-daemon'\nsampling = 0.25")
+            .expect("custom");
+    let config = custom.tracing.expect("enabled");
+    assert_eq!((config.service_name.as_str(), config.sampling), ("test-daemon", 0.25));
+}

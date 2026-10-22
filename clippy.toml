@@ -2,6 +2,11 @@
 # self:: and super:: are not checked by Clippy.
 absolute-paths-max-segments = 3
 absolute-paths-allowed-crates = [
+    "flotilla_tracing",
+    "opentelemetry",
+    "opentelemetry_sdk",
+    "opentelemetry_otlp",
+    "tracing_opentelemetry",
     "alloc",
     "async_trait",
     "axum",

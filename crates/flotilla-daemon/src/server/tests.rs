@@ -3200,6 +3200,7 @@ async fn dispatch_request_cancel_remote_routes_cancel_and_waits_for_reply() {
                 let sent = sent.lock().expect("lock");
                 sent.iter().find_map(|msg| match msg {
                     PeerWireMessage::Routed(RoutedPeerMessage::CommandCancelRequest {
+                        trace_context: _,
                         cancel_id,
                         requester_node_id,
                         target_node_id,
@@ -3508,6 +3509,7 @@ async fn handle_inbound_command_request_does_not_hold_peer_manager_lock_across_s
             let _ = pm
                 .handle_inbound(InboundPeerEnvelope {
                     msg: PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest {
+                        trace_context: Default::default(),
                         request_id: 7,
                         requester_node_id: NodeId::new("desktop"),
                         target_node_id: NodeId::new("relay"),
@@ -5626,7 +5628,12 @@ async fn remote_checkout_completion_is_headless() {
         loop {
             if let Some(request_id) = sent.lock().expect("lock").iter().find_map(|msg| match msg {
                 PeerWireMessage::Routed(RoutedPeerMessage::RemoteStepRequest {
-                    request_id, step_offset, steps, target_node_id, ..
+                    trace_context: _,
+                    request_id,
+                    step_offset,
+                    steps,
+                    target_node_id,
+                    ..
                 }) => {
                     assert_eq!(*target_node_id, NodeId::new("feta"));
                     assert_eq!(*step_offset, 0);

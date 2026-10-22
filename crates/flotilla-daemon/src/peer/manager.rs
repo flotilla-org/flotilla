@@ -549,7 +549,8 @@ impl PeerManager {
         ActivationResult::Accepted { generation, displaced }
     }
 
-    pub async fn handle_inbound(&mut self, env: InboundPeerEnvelope) -> HandleResult {
+    pub async fn handle_inbound(&mut self, mut env: InboundPeerEnvelope) -> HandleResult {
+        env.msg.sanitize_trace_context();
         if !self.generation_is_current(&env.connection_peer, env.connection_generation) {
             debug!(
                 peer = %env.connection_peer,
@@ -608,6 +609,7 @@ impl PeerManager {
     fn handle_routed(&mut self, connection_peer: NodeId, connection_generation: u64, msg: RoutedPeerMessage) -> HandleResult {
         match msg {
             RoutedPeerMessage::CommandRequest {
+                trace_context,
                 request_id,
                 requester_node_id,
                 target_node_id,
@@ -640,6 +642,7 @@ impl PeerManager {
                     .insert(key, ReversePathHop { next_hop: connection_peer, next_hop_generation: connection_generation, learned_at });
 
                 let forwarded = RoutedPeerMessage::CommandRequest {
+                    trace_context,
                     request_id,
                     requester_node_id,
                     target_node_id: target_node_id.clone(),
@@ -652,6 +655,7 @@ impl PeerManager {
                 HandleResult::Ignored
             }
             RoutedPeerMessage::CommandCancelRequest {
+                trace_context,
                 cancel_id,
                 requester_node_id,
                 target_node_id,
@@ -680,6 +684,7 @@ impl PeerManager {
                     .insert(key, ReversePathHop { next_hop: connection_peer, next_hop_generation: connection_generation, learned_at });
 
                 let forwarded = RoutedPeerMessage::CommandCancelRequest {
+                    trace_context,
                     cancel_id,
                     requester_node_id,
                     target_node_id: target_node_id.clone(),
@@ -809,6 +814,7 @@ impl PeerManager {
                 HandleResult::Ignored
             }
             RoutedPeerMessage::RemoteStepRequest {
+                trace_context,
                 request_id,
                 requester_node_id,
                 target_node_id,
@@ -841,6 +847,7 @@ impl PeerManager {
                     .insert(key, ReversePathHop { next_hop: connection_peer, next_hop_generation: connection_generation, learned_at });
 
                 let forwarded = RoutedPeerMessage::RemoteStepRequest {
+                    trace_context,
                     request_id,
                     requester_node_id,
                     target_node_id: target_node_id.clone(),
@@ -951,6 +958,7 @@ impl PeerManager {
                 HandleResult::Ignored
             }
             RoutedPeerMessage::RemoteStepCancelRequest {
+                trace_context,
                 cancel_id,
                 requester_node_id,
                 target_node_id,
@@ -979,6 +987,7 @@ impl PeerManager {
                     .insert(key, ReversePathHop { next_hop: connection_peer, next_hop_generation: connection_generation, learned_at });
 
                 let forwarded = RoutedPeerMessage::RemoteStepCancelRequest {
+                    trace_context,
                     cancel_id,
                     requester_node_id,
                     target_node_id: target_node_id.clone(),

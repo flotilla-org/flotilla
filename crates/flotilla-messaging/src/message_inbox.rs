@@ -1,4 +1,5 @@
 use flotilla_resources::*;
+use tracing::Instrument;
 
 use std::collections::BTreeMap;
 
@@ -93,6 +94,16 @@ impl MessageInbox {
         spec: &MessageSpec,
         now: DateTime<Utc>,
     ) -> Result<MessageAdmission, ResourceError> {
+        self.accept_locked_traced(meta, spec, now).instrument(flotilla_tracing::queued_span(&meta.name, "admission")).await
+    }
+
+    async fn accept_locked_traced(
+        &self,
+        meta: &InputMeta,
+        spec: &MessageSpec,
+        now: DateTime<Utc>,
+    ) -> Result<MessageAdmission, ResourceError> {
+        tracing::info!("message admission");
         Message::validate_spec(meta, spec)?;
         let partial = match self.messages.get(&meta.name).await {
             Ok(existing) if existing.spec.same_intent(spec) => {

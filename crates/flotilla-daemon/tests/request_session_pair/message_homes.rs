@@ -131,8 +131,7 @@ fn convoy_ref(name: &str) -> MessageReference {
 // Behaviour (#3317): the receiver's home holds the message; the other home
 // reads it from its replica, or at its home on a miss, marked remote with its
 // age; a reply to a fleet role is routed by subject.
-#[tokio::test]
-async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject() {
+pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject() {
     let topology = flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful(
         super::empty_daemon_named("home-a").await,
         super::empty_daemon_named("home-b").await,
@@ -211,6 +210,11 @@ async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject() {
     let consumer = engine_b.register("crew-b-session", Timestamp(1)).await.expect("consumer");
     let inbox_b = engine_b.inbox();
     inbox_b.bind(sent.spec().inbox.clone(), consumer.clone()).await.expect("bind");
+    use futures::StreamExt;
+    for _ in 0..8 {
+        let mut pending = inbox_b.pending(&sent.spec().inbox, &consumer, &flotilla_inbox::Rules(Vec::new())).await.expect("pending");
+        assert!(pending.next().await.expect("pending message").is_ok());
+    }
     inbox_b.receive(&consumer, sent.name(), Transport::Turn).await.expect("receipt");
     inbox_b.deliver(sent.name(), Deliver { receiver: consumer.clone(), transport: Transport::Turn }).await.expect("deliver");
     assert!(matches!(homed(&engine_b, &request).expect("sent").1.state(), MessageState::Awaiting { .. }));

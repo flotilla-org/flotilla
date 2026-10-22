@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+flotilla-tracing = { path = "../flotilla-tracing" }
 bon = { workspace = true }
 tracing = { workspace = true }
 flotilla-address = { path = "../flotilla-address" }

@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use flotilla_agent_connector::{
     Delivery, DeliveryTarget, HarnessRef, Operation, Routed, SubmissionRef, TransportId, TransportOutcome, TransportRouter,
 };
+use tracing::Instrument;
 
 use crate::{
     apply_status_patch,
@@ -448,6 +449,34 @@ impl MessageInbox {
         all: &[ResourceObject<Message>],
         now: DateTime<Utc>,
     ) -> Result<(), ResourceError> {
+        let Some(first) = pending.first() else {
+            return Ok(());
+        };
+        // A shared transport submission still belongs to every member's trace.
+        let _batch_spans: Vec<_> = pending
+            .iter()
+            .skip(1)
+            .map(|message| {
+                let span = flotilla_tracing::queued_span(&message.metadata.name, "attempt");
+                span.in_scope(|| tracing::info!("message delivery attempt"));
+                span
+            })
+            .collect();
+        self.deliver_group_traced(receivers, router, holder, pending, all, now)
+            .instrument(flotilla_tracing::queued_span(&first.metadata.name, "attempt"))
+            .await
+    }
+
+    async fn deliver_group_traced(
+        &self,
+        receivers: &MessageReceiverSnapshot,
+        router: &TransportRouter,
+        holder: &ResourceObject<TerminalSession>,
+        pending: &[ResourceObject<Message>],
+        all: &[ResourceObject<Message>],
+        now: DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        tracing::info!("message delivery attempt");
         let pending = &self.supersede_held_system_turns(receivers, pending, all, now).await?;
         if pending.is_empty() {
             return Ok(());
@@ -792,13 +821,18 @@ impl MessageInbox {
         receiver: &ResolvedMessageReceiver,
     ) -> Result<(), ResourceError> {
         for member in members {
-            apply_status_patch(
-                &self.messages,
-                &member.metadata.name,
-                &MessageStatusPatch::Delivered { receiver: receiver.clone(), at: receiver.delivered_at },
-            )
+            async {
+                tracing::info!("message received");
+                apply_status_patch(
+                    &self.messages,
+                    &member.metadata.name,
+                    &MessageStatusPatch::Delivered { receiver: receiver.clone(), at: receiver.delivered_at },
+                )
+                .await?;
+                self.clear_signal(receivers, member).await
+            }
+            .instrument(flotilla_tracing::queued_span(&member.metadata.name, "receipt"))
             .await?;
-            self.clear_signal(receivers, member).await?;
         }
         Ok(())
     }
@@ -886,8 +920,18 @@ impl MessageInbox {
     ) -> Result<(), ResourceError> {
         let current = self.messages.get(&message.metadata.name).await?;
         let mut status = status_for(&current);
+        let previous = status.clone();
         MessageStatusPatch::Wait { phase, reason: reason.into(), at: now }.apply(&mut status);
-        self.write(&current, &status).await
+        if status == previous {
+            return Ok(());
+        }
+        let trace_span = flotilla_tracing::queued_span(&message.metadata.name, "waiting");
+        async {
+            tracing::info!(%reason, "message waiting");
+            self.write(&current, &status).await
+        }
+        .instrument(trace_span)
+        .await
     }
 
     async fn write(&self, message: &ResourceObject<Message>, status: &MessageStatus) -> Result<(), ResourceError> {
@@ -1126,6 +1170,52 @@ mod framing_tests {
             admitted.status.as_ref().expect("admitted status").accepted_sequence
         );
         assert_eq!(current.status.expect("status").phase, MessagePhase::Deliverable);
+    }
+
+    #[derive(Clone, Default)]
+    struct WaitSpans(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl tracing::Subscriber for WaitSpans {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    // Review #3715: repeated waits with the same phase/reason emit one span;
+    // a changed reason emits another state entry, and preserves the audit time.
+    #[tokio::test]
+    async fn unchanged_wait_does_not_emit_more_spans() {
+        use tracing::instrument::WithSubscriber;
+        let backend = crate::ResourceBackend::new(flotilla_store_testkit::memory_backend());
+        let inbox = MessageInbox::new(backend.clone(), "project");
+        let stored = backend.using::<Message>("project");
+        let message = stored.create(&InputMeta::builder().name("waiting".into()).build(), &messages().remove(0)).await.expect("intent");
+        let spans = WaitSpans::default();
+        async {
+            let first = Utc::now();
+            for offset in 0..8 {
+                inbox
+                    .wait(&message, MessagePhase::Deliverable, "holder unavailable", first + chrono::Duration::seconds(offset))
+                    .await
+                    .expect("wait");
+                assert_eq!(spans.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+            assert_eq!(stored.get("waiting").await.expect("record").status.expect("status").since, first);
+            inbox
+                .wait(&message, MessagePhase::Deliverable, "transport unavailable", first + chrono::Duration::seconds(10))
+                .await
+                .expect("new reason");
+            assert_eq!(spans.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+        .with_subscriber(spans.clone())
+        .await;
     }
 
     fn messages() -> Vec<MessageSpec> {

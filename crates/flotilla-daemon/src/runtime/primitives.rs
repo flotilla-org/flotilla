@@ -34,7 +34,7 @@ use flotilla_state_machines::{
     Transport,
 };
 use futures::TryStreamExt;
-use tracing::{debug, warn};
+use tracing::{debug, warn, Instrument};
 
 use super::{
     state::ControllerRuntimeState,
@@ -348,20 +348,30 @@ impl MessageDelivery {
         }
         let session = holder.session_id.clone();
         let typed = text.clone();
-        let task = tokio::spawn(async move {
-            let deadline =
-                tokio::time::Instant::now() + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
-            let ready = tokio::time::timeout_at(
-                deadline,
-                wait_for_delivery_ready(&*pool, adapter.as_deref(), &session, TerminalDeliveryReadiness::TurnBoundary),
-            )
-            .await;
-            match ready {
-                Ok(Ok(true)) => submit_and_confirm(&*pool, adapter.as_deref(), &session, &typed, false).await,
-                Ok(Ok(false)) | Ok(Err(_)) => Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)),
-                Err(_) => Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)),
+        let trace_spans: Vec<_> = members.iter().map(|message| flotilla_tracing::queued_span(message, "attempt")).collect();
+        let primary_span = trace_spans.first().cloned().unwrap_or_else(tracing::Span::none);
+        let task = tokio::spawn(
+            async move {
+                // Keep every member's attempt open for the shared transport call.
+                let _trace_spans = trace_spans;
+                for span in &_trace_spans {
+                    span.in_scope(|| tracing::info!("message transport attempt"));
+                }
+                let deadline = tokio::time::Instant::now()
+                    + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
+                let ready = tokio::time::timeout_at(
+                    deadline,
+                    wait_for_delivery_ready(&*pool, adapter.as_deref(), &session, TerminalDeliveryReadiness::TurnBoundary),
+                )
+                .await;
+                match ready {
+                    Ok(Ok(true)) => submit_and_confirm(&*pool, adapter.as_deref(), &session, &typed, false).await,
+                    Ok(Ok(false)) | Ok(Err(_)) => Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)),
+                    Err(_) => Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)),
+                }
             }
-        });
+            .instrument(primary_span),
+        );
         deliveries
             .insert(holder.session_id.clone(), PendingTerminalDelivery { message_batch: Some(ENGINE_BATCH.into()), message: text, task });
         self.inflight.insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members });

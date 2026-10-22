@@ -42,6 +42,9 @@ pub enum GoodbyeReason {
 #[serde(tag = "routed_type")]
 pub enum RoutedPeerMessage {
     CommandRequest {
+        /// Transient W3C traceparent/tracestate carrier, never stored.
+        #[serde(default)]
+        trace_context: std::collections::BTreeMap<String, String>,
         request_id: u64,
         requester_node_id: NodeId,
         target_node_id: NodeId,
@@ -55,6 +58,8 @@ pub enum RoutedPeerMessage {
         session_id: Option<uuid::Uuid>,
     },
     CommandCancelRequest {
+        #[serde(default)]
+        trace_context: std::collections::BTreeMap<String, String>,
         cancel_id: u64,
         requester_node_id: NodeId,
         target_node_id: NodeId,
@@ -83,6 +88,8 @@ pub enum RoutedPeerMessage {
         error: Option<String>,
     },
     RemoteStepRequest {
+        #[serde(default)]
+        trace_context: std::collections::BTreeMap<String, String>,
         request_id: u64,
         requester_node_id: NodeId,
         target_node_id: NodeId,
@@ -116,6 +123,8 @@ pub enum RoutedPeerMessage {
         outcomes: Vec<StepOutcome>,
     },
     RemoteStepCancelRequest {
+        #[serde(default)]
+        trace_context: std::collections::BTreeMap<String, String>,
         cancel_id: u64,
         requester_node_id: NodeId,
         target_node_id: NodeId,
@@ -129,6 +138,35 @@ pub enum RoutedPeerMessage {
         remaining_hops: u8,
         error: Option<String>,
     },
+}
+
+impl PeerWireMessage {
+    /// Drop non-W3C baggage and oversized values before relaying a request.
+    /// The frame limits allocation at decode; this limits retained/forwarded data.
+    pub fn sanitize_trace_context(&mut self) {
+        let context = match self {
+            Self::Routed(
+                RoutedPeerMessage::CommandRequest { trace_context, .. }
+                | RoutedPeerMessage::RemoteStepRequest { trace_context, .. }
+                | RoutedPeerMessage::CommandCancelRequest { trace_context, .. }
+                | RoutedPeerMessage::RemoteStepCancelRequest { trace_context, .. },
+            ) => trace_context,
+            _ => return,
+        };
+        context.retain(|key, value| matches!(key.as_str(), "traceparent" | "tracestate") && value.len() <= 512 && value.is_ascii());
+    }
+
+    pub fn trace_context(&self) -> Option<&std::collections::BTreeMap<String, String>> {
+        match self {
+            Self::Routed(
+                RoutedPeerMessage::CommandRequest { trace_context, .. }
+                | RoutedPeerMessage::RemoteStepRequest { trace_context, .. }
+                | RoutedPeerMessage::CommandCancelRequest { trace_context, .. }
+                | RoutedPeerMessage::RemoteStepCancelRequest { trace_context, .. },
+            ) => Some(trace_context),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +267,10 @@ mod tests {
     #[test]
     fn routed_command_request_roundtrip() {
         let msg = RoutedPeerMessage::CommandRequest {
+            trace_context: std::collections::BTreeMap::from([
+                ("traceparent".into(), "00-11111111111111111111111111111111-2222222222222222-01".into()),
+                ("tracestate".into(), "vendor=value".into()),
+            ]),
             request_id: 42,
             requester_node_id: NodeId::new("workstation"),
             target_node_id: NodeId::new("feta"),
@@ -250,6 +292,9 @@ mod tests {
         assert_eq!(json_value["requester_node_id"], "workstation");
         assert_eq!(json_value["target_node_id"], "feta");
         let json = serde_json::to_string(&msg).expect("serialize");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("wire JSON");
+        assert_eq!(value["trace_context"]["tracestate"], "vendor=value");
+        assert!(value["trace_context"]["traceparent"].as_str().expect("traceparent").starts_with("00-"));
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
             RoutedPeerMessage::CommandRequest { request_id, requester_node_id, target_node_id, remaining_hops, caller, .. } => {
@@ -289,6 +334,7 @@ mod tests {
     #[test]
     fn routed_command_cancel_request_roundtrip() {
         let msg = RoutedPeerMessage::CommandCancelRequest {
+            trace_context: Default::default(),
             cancel_id: 7,
             requester_node_id: NodeId::new("workstation"),
             target_node_id: NodeId::new("feta"),
@@ -299,6 +345,7 @@ mod tests {
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
             RoutedPeerMessage::CommandCancelRequest {
+                trace_context: _,
                 cancel_id,
                 requester_node_id,
                 target_node_id,
@@ -381,6 +428,7 @@ mod tests {
     #[test]
     fn routed_remote_step_request_roundtrip() {
         let msg = RoutedPeerMessage::RemoteStepRequest {
+            trace_context: Default::default(),
             request_id: 43,
             requester_node_id: NodeId::new("workstation"),
             target_node_id: NodeId::new("feta"),
@@ -401,6 +449,7 @@ mod tests {
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
             RoutedPeerMessage::RemoteStepRequest {
+                trace_context: _,
                 request_id,
                 requester_node_id,
                 target_node_id,
@@ -485,6 +534,7 @@ mod tests {
     #[test]
     fn routed_remote_step_cancel_request_roundtrip() {
         let msg = RoutedPeerMessage::RemoteStepCancelRequest {
+            trace_context: Default::default(),
             cancel_id: 7,
             requester_node_id: NodeId::new("workstation"),
             target_node_id: NodeId::new("feta"),
@@ -495,6 +545,7 @@ mod tests {
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
             RoutedPeerMessage::RemoteStepCancelRequest {
+                trace_context: _,
                 cancel_id,
                 requester_node_id,
                 target_node_id,
@@ -531,6 +582,51 @@ mod tests {
                 assert_eq!(error.as_deref(), Some("remote step not found"));
             }
             other => panic!("expected RemoteStepCancelResponse, got {:?}", other),
+        }
+    }
+    // Peer ingress keeps only bounded W3C context before forwarding; generated
+    // sizes cross the empty/512-byte boundary, including arbitrary extra keys.
+    #[hegel::test]
+    fn routed_trace_context_is_bounded_at_ingress(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let size = tc.draw(gs::integers::<usize>().min_value(0).max_value(514));
+        let unicode = tc.draw(gs::booleans());
+        for size in [0, 1, 511, 512, 513, 514, size] {
+            let value = if unicode { "é".repeat(size) } else { "a".repeat(size) };
+            let context = std::collections::BTreeMap::from([
+                ("traceparent".into(), value.clone()),
+                ("tracestate".into(), value.clone()),
+                ("baggage".into(), "x".repeat(1024)),
+                ("unknown".into(), "opaque".into()),
+            ]);
+            for cancel in [false, true] {
+                let mut message = PeerWireMessage::Routed(if cancel {
+                    RoutedPeerMessage::CommandCancelRequest {
+                        trace_context: context.clone(),
+                        cancel_id: 1,
+                        requester_node_id: NodeId::new("a"),
+                        target_node_id: NodeId::new("b"),
+                        remaining_hops: 2,
+                        command_request_id: 1,
+                    }
+                } else {
+                    RoutedPeerMessage::RemoteStepCancelRequest {
+                        trace_context: context.clone(),
+                        cancel_id: 1,
+                        requester_node_id: NodeId::new("a"),
+                        target_node_id: NodeId::new("b"),
+                        remaining_hops: 2,
+                        remote_step_request_id: 1,
+                    }
+                });
+                message.sanitize_trace_context();
+                let retained = message.trace_context().expect("request context").clone();
+                assert!(!retained.contains_key("baggage") && !retained.contains_key("unknown"));
+                assert_eq!(retained.contains_key("traceparent"), value.len() <= 512 && value.is_ascii());
+                assert_eq!(retained.contains_key("tracestate"), value.len() <= 512 && value.is_ascii());
+                message.sanitize_trace_context();
+                assert_eq!(message.trace_context().expect("idempotent"), &retained);
+            }
         }
     }
 }

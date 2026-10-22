@@ -22,7 +22,7 @@ use flotilla_protocol::{
 use flotilla_resources::CrewCompletionPending;
 use tokio::sync::{oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, Instrument};
 
 use crate::{
     blob_store::TieredBlobStore,
@@ -320,6 +320,7 @@ impl RemoteCommandRouter {
         self.dispatch_execute_for_caller(command, caller).await
     }
 
+    #[tracing::instrument(skip_all)]
     async fn dispatch_remote_command(
         &self,
         command: Command,
@@ -353,6 +354,7 @@ impl RemoteCommandRouter {
         );
 
         let routed = RoutedPeerMessage::CommandRequest {
+            trace_context: flotilla_tracing::inject(),
             request_id,
             requester_node_id: self.daemon.node_id().clone(),
             target_node_id: target_node_id.clone(),
@@ -456,6 +458,7 @@ impl RemoteCommandRouter {
     /// Return the destination's acknowledgement for a remote command or query.
     /// Local queries retain surface projection; resource mutations await the same
     /// acknowledgement at both local and remote receiver homes.
+    #[tracing::instrument(skip_all)]
     async fn dispatch_and_wait(&self, mut command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
         self.resolve_crew_command_routing(&mut command.action).await?;
         let target =
@@ -512,6 +515,7 @@ impl RemoteCommandRouter {
         );
 
         let routed = RoutedPeerMessage::CommandRequest {
+            trace_context: flotilla_tracing::inject(),
             request_id,
             requester_node_id: self.daemon.node_id().clone(),
             target_node_id: target_node_id.clone(),
@@ -555,6 +559,7 @@ impl RemoteCommandRouter {
         self.dispatch_cancel_typed(command_id).await.map_err(|error| error.message)
     }
 
+    #[tracing::instrument(skip_all)]
     pub(super) async fn dispatch_cancel_typed(&self, command_id: u64) -> Result<(), flotilla_protocol::DispatcherError> {
         let remote = {
             let pending = self.pending_remote_commands.lock().await;
@@ -571,6 +576,7 @@ impl RemoteCommandRouter {
             let (tx, rx) = oneshot::channel();
             self.pending_remote_cancels.lock().await.insert(cancel_id, tx);
             let routed = RoutedPeerMessage::CommandCancelRequest {
+                trace_context: flotilla_tracing::inject(),
                 cancel_id,
                 requester_node_id: self.daemon.node_id().clone(),
                 target_node_id: target_node_id.clone(),
@@ -611,17 +617,23 @@ impl RemoteCommandRouter {
             .await
             .insert(request_id, ForwardedCommand { state: ForwardedCommandState::Launching { ready: Arc::clone(&ready) } });
         let router = self.clone();
-        tokio::spawn(async move {
-            let origin = ForwardedCommandOrigin { caller: caller.map(|caller| *caller), session_id };
-            router.execute_forwarded_command(request_id, requester_node_id, reply_via, command, origin, ready).await;
-        });
+        tokio::spawn(
+            async move {
+                let origin = ForwardedCommandOrigin { caller: caller.map(|caller| *caller), session_id };
+                router.execute_forwarded_command(request_id, requester_node_id, reply_via, command, origin, ready).await;
+            }
+            .in_current_span(),
+        );
     }
 
     pub(super) fn spawn_forwarded_cancel(&self, cancel_id: u64, requester_node_id: NodeId, reply_via: NodeId, command_request_id: u64) {
         let router = self.clone();
-        tokio::spawn(async move {
-            router.cancel_forwarded_command(cancel_id, requester_node_id, reply_via, command_request_id).await;
-        });
+        tokio::spawn(
+            async move {
+                router.cancel_forwarded_command(cancel_id, requester_node_id, reply_via, command_request_id).await;
+            }
+            .in_current_span(),
+        );
     }
 
     pub(super) async fn spawn_forwarded_remote_step_batch(
@@ -637,9 +649,12 @@ impl RemoteCommandRouter {
             .await
             .insert(request_id, ForwardedRemoteStepBatch { state: ForwardedRemoteStepBatchState::Launching { ready: Arc::clone(&ready) } });
         let router = self.clone();
-        tokio::spawn(async move {
-            router.execute_forwarded_remote_step_batch(request_id, requester_node_id, reply_via, request, ready).await;
-        });
+        tokio::spawn(
+            async move {
+                router.execute_forwarded_remote_step_batch(request_id, requester_node_id, reply_via, request, ready).await;
+            }
+            .in_current_span(),
+        );
     }
 
     pub(super) fn spawn_forwarded_remote_step_cancel(
@@ -650,9 +665,12 @@ impl RemoteCommandRouter {
         remote_step_request_id: u64,
     ) {
         let router = self.clone();
-        tokio::spawn(async move {
-            router.cancel_forwarded_remote_step_batch(cancel_id, requester_node_id, reply_via, remote_step_request_id).await;
-        });
+        tokio::spawn(
+            async move {
+                router.cancel_forwarded_remote_step_batch(cancel_id, requester_node_id, reply_via, remote_step_request_id).await;
+            }
+            .in_current_span(),
+        );
     }
 
     pub(super) async fn emit_remote_command_event(&self, request_id: u64, responder_node_id: NodeId, event: CommandPeerEvent) {
@@ -1059,6 +1077,7 @@ impl RemoteCommandRouter {
 
 #[async_trait]
 impl RemoteStepExecutor for RemoteCommandRouter {
+    #[tracing::instrument(skip_all)]
     async fn execute_batch(
         &self,
         request: RemoteStepBatchRequest,
@@ -1087,6 +1106,7 @@ impl RemoteStepExecutor for RemoteCommandRouter {
         let target_node_id = request.target_node_id.clone();
 
         let routed = RoutedPeerMessage::RemoteStepRequest {
+            trace_context: flotilla_tracing::inject(),
             request_id,
             requester_node_id: self.daemon.node_id().clone(),
             target_node_id: request.target_node_id.clone(),
@@ -1109,6 +1129,7 @@ impl RemoteStepExecutor for RemoteCommandRouter {
         }
     }
 
+    #[tracing::instrument(skip_all)]
     async fn cancel_active_batch(&self, command_id: u64) -> Result<(), String> {
         let Some(active) = self.active_remote_step_batches.lock().await.get(&command_id).cloned() else {
             return Ok(());
@@ -1124,6 +1145,7 @@ impl RemoteStepExecutor for RemoteCommandRouter {
             .await
             .insert(cancel_id, PendingRemoteStepCancel { target_node_id: active.target_node_id.clone(), completion: tx });
         let routed = RoutedPeerMessage::RemoteStepCancelRequest {
+            trace_context: flotilla_tracing::inject(),
             cancel_id,
             requester_node_id: self.daemon.node_id().clone(),
             target_node_id: active.target_node_id.clone(),

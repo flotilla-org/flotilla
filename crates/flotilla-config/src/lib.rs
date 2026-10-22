@@ -283,6 +283,9 @@ impl HostsConfig {
 /// Loaded from `~/.config/flotilla/daemon.toml`.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DaemonConfig {
+    /// OTLP tracing export; absent means no network export.
+    #[serde(default)]
+    pub tracing: Option<DaemonTracingConfig>,
     /// Compact terminal Message bodies after this many days; zero disables compaction.
     #[serde(default = "default_message_audit_retention_days")]
     pub message_audit_retention_days: u64,
@@ -328,6 +331,25 @@ pub struct DaemonConfig {
     pub http: HttpListenerConfig,
 }
 
+/// `[tracing]` enables OTLP/HTTP protobuf span export.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonTracingConfig {
+    /// Complete OTLP traces URL, for example `http://collector:4318/v1/traces`.
+    pub endpoint: String,
+    #[serde(default = "default_trace_service")]
+    pub service_name: String,
+    /// Root trace sampling probability, from zero to one inclusive.
+    #[serde(default = "default_trace_sampling")]
+    pub sampling: f64,
+}
+fn default_trace_service() -> String {
+    "flotilla-daemon".into()
+}
+fn default_trace_sampling() -> f64 {
+    1.0
+}
+
 /// The `[primitives]` section. It moves only Message for now, so it has no keys.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -360,6 +382,7 @@ pub const DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY: NonZeroUsize = NonZeroUsize::new
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            tracing: None,
             message_audit_retention_days: default_message_audit_retention_days(),
             machine_id: None,
             host_name: None,
