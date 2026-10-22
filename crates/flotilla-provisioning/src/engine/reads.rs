@@ -21,6 +21,7 @@ use crate::stored::{
     clone::{CloneKind, CloneRequest},
     environment::{EnvironmentKind, EnvironmentRequest},
     image_build::ImageBuildKind,
+    Holder,
 };
 
 /// How a provisioning resource stands now: a judgement over its stored state, never stored.
@@ -124,8 +125,11 @@ pub trait ProvisioningReads: Send + Sync {
     fn environment_clone(&self, environment: &str, home: &str, repository: &str) -> Result<Option<View<CloneKind>>, ReadError>;
     /// A provider's live environments (`environment.live_by_provider`).
     fn provider_environments(&self, provider: &Address) -> Result<Vec<View<EnvironmentKind>>, ReadError>;
-    /// A convoy's checkouts (`checkout.by_convoy`).
-    fn convoy_checkouts(&self, convoy: &str, home: &str) -> Result<Vec<View<CheckoutKind>>, ReadError>;
+    /// The checkouts held for `holder` (`checkout.by_holder`), across homes: a finishing convoy or
+    /// Ensure finds its checkouts so.
+    fn held_checkouts(&self, holder: &Holder) -> Result<Vec<View<CheckoutKind>>, ReadError>;
+    /// The environments held for `holder` (`environment.by_holder`): a vessel finds its environment so.
+    fn held_environments(&self, holder: &Holder) -> Result<Vec<View<EnvironmentKind>>, ReadError>;
 }
 
 /// The read port over one decided store.
@@ -250,8 +254,12 @@ impl ProvisioningReads for StoreReads {
         self.read(|read| indexed(read, &EnvironmentRequest::live_by_provider(provider)))
     }
 
-    fn convoy_checkouts(&self, convoy: &str, home: &str) -> Result<Vec<View<CheckoutKind>>, ReadError> {
-        self.read(|read| indexed(read, &CheckoutRequest::by_convoy(&Ref::new(convoy.to_owned(), home))))
+    fn held_checkouts(&self, holder: &Holder) -> Result<Vec<View<CheckoutKind>>, ReadError> {
+        self.read(|read| indexed(read, &CheckoutRequest::by_holder(holder)))
+    }
+
+    fn held_environments(&self, holder: &Holder) -> Result<Vec<View<EnvironmentKind>>, ReadError> {
+        self.read(|read| indexed(read, &EnvironmentRequest::by_holder(holder)))
     }
 }
 

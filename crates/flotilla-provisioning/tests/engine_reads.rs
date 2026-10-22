@@ -13,6 +13,7 @@ use flotilla_provisioning::{
         self,
         checkout::{CheckoutKind, CheckoutRequest, Source},
         clone::CloneKind,
+        Holder,
     },
 };
 use flotilla_schema::{Kind, KindRegistry, Ref, Timestamp};
@@ -36,8 +37,7 @@ fn checkout(environment: &str, convoy: &str) -> CheckoutRequest {
         path: "/w".into(),
         source: Source::Worktree,
         clone: Some(Ref::new("clone-a", HOME)),
-        convoy: Some(Ref::new(convoy.to_owned(), HOME)),
-        ensure: None,
+        holder: Some(Holder::convoy(convoy)),
     }
 }
 
@@ -82,7 +82,8 @@ fn views_are_read_by_key_and_index_and_judged_per_key() {
         names
     };
     assert_eq!(names(reads.environment_checkouts("env-1", HOME).expect("index")), ["a", "b"]);
-    assert_eq!(names(reads.convoy_checkouts("convoy-1", HOME).expect("index")), ["a", "c"]);
+    assert_eq!(names(reads.held_checkouts(&Holder::convoy("convoy-1")).expect("index")), ["a", "c"]);
+    assert!(reads.held_checkouts(&Holder::ensure("convoy-1")).expect("index").is_empty(), "the holder's kind is part of it");
     assert!(reads.environment_checkouts("env-3", HOME).expect("index").is_empty());
 }
 
@@ -153,4 +154,25 @@ fn a_replica_reads_how_a_resource_ended_only_from_an_entry_it_holds() {
         write.commit().expect("commit");
     }
     assert_eq!(StoreReads::new(seeded).checkout("a", HOME).expect("read").expect("held").judgement, Judgement::Gone);
+}
+
+// Behaviour (#3719 look-over ruling 4): a vessel finds its environment through the holder index,
+// not by a naming rule.
+#[test]
+fn a_vessel_finds_its_environment_by_its_holder() {
+    use flotilla_provisioning::stored::environment::{EnvironmentKind, EnvironmentRequest, Recipe};
+    let store = store();
+    let environments: Arc<dyn Lifecycles<EnvironmentKind>> =
+        Arc::new(LifecycleHome::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("home")));
+    let request = |holder: Option<Holder>| EnvironmentRequest {
+        provider: "host:feta/provider:docker".parse().expect("provider"),
+        image_build: None,
+        recipe: flotilla_schema::Frozen::new(Recipe::of(&serde_json::json!({ "image": "x" })).expect("recipe")).expect("freeze"),
+        holder,
+    };
+    environments.request("crew-env", request(Some(Holder::vessel("convoy-a-implement"))), Timestamp(1)).expect("requested");
+    environments.request("tools", request(None), Timestamp(1)).expect("requested");
+    let reads = StoreReads::new(store);
+    let found = reads.held_environments(&Holder::vessel("convoy-a-implement")).expect("index");
+    assert_eq!(found.iter().map(|view| view.name.as_str()).collect::<Vec<_>>(), ["crew-env"]);
 }
