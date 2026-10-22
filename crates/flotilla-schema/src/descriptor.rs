@@ -488,7 +488,9 @@ impl TableSet {
     pub fn index_key(&self, index: &Index) -> Vec<String> {
         let mut key = Vec::new();
         if index.unique {
-            if let Some(table) = self.tables.iter().find(|table| table.name == index.table) {
+            let table = self.tables.iter().find(|table| table.name == index.table);
+            debug_assert!(table.is_some(), "`validate` refuses an index on table `{}`, which this set does not hold", index.table);
+            if let Some(table) = table {
                 key.push(self.parent_key_column().to_owned());
                 key.extend(table.parent_key().iter().map(|column| column.name.clone()));
             }
