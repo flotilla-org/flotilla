@@ -10,16 +10,13 @@ use flotilla_provisioning::stored::{
     self,
     environment::Environment,
     terminal_session::{Launch, TerminalSessionKind, TerminalSessionRequest},
+    Holder,
 };
 use flotilla_resources::TerminalBrief;
 use flotilla_schema::{render_view, Decoder, Encoder, Frozen, Kind, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store};
 use flotilla_state_machines::{
-    machines::{
-        convoy::Convoy,
-        lifecycle::{Lifecycle, LifecycleState},
-        vessel::Vessel,
-    },
+    machines::lifecycle::{Lifecycle, LifecycleState},
     Resource, Version,
 };
 use schema_support::{check, plan};
@@ -43,7 +40,8 @@ fn crew_store_schema_view_matches_the_snapshot() {
 
 // Behaviour (#3392 A1, #3320 production shape): every statement for the crew kinds searches a key
 // or a declared index, and removing an identity checks each root reference through its index (a
-// vessel's convoy, a session's environment, vessel and convoy). Only plans are read.
+// vessel's convoy, a session's environment; a session's holder is no reference). Only plans are
+// read.
 #[test]
 fn crew_statements_and_identity_removal_search_by_key() {
     let store = Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", stored::crew_registry().expect("registry"))
@@ -60,7 +58,7 @@ fn crew_statements_and_identity_removal_search_by_key() {
     assert!(failures.is_empty(), "{failures:#?}");
     let sql = &statements.iter().find(|(label, _)| label == "identity_delete").expect("shared statement").1;
     let rows = plan(&conn, sql);
-    for index in ["vessel_by_convoy", "terminal_session_by_environment", "terminal_session_by_vessel", "terminal_session_by_convoy"] {
+    for index in ["vessel_by_convoy", "terminal_session_by_environment"] {
         assert!(rows.iter().any(|row| row.contains(index)), "{index}: {rows:?}");
     }
 }
@@ -77,15 +75,11 @@ fn a_terminal_session_survives_the_codec() {
         model: None,
         brief: Frozen::new(brief).expect("freeze"),
     };
-    for (source, vessel, convoy) in [
-        (Launch::Tool { command: "bash".into() }, None, None),
-        (agent, Some(Ref::<Resource<Vessel>>::new("convoy-work", "feta")), Some(Ref::<Resource<Convoy>>::new("convoy", "kiwi"))),
-    ] {
+    for (source, holder) in [(Launch::Tool { command: "bash".into() }, None), (agent, Some(Holder::vessel("convoy-work")))] {
         for state in [LifecycleState::requested(), LifecycleState::Realised { identity: "cleat-1".into() }, LifecycleState::Gone] {
             let spec = TerminalSessionRequest {
                 environment: Ref::<Resource<Environment>>::new("env", "feta"),
-                vessel: vessel.clone(),
-                convoy: convoy.clone(),
+                holder: holder.clone(),
                 role: "coder".into(),
                 pool: "cleat".into(),
                 cwd: "/workspace".into(),

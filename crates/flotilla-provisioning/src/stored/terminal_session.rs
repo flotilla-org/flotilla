@@ -10,15 +10,11 @@ use std::collections::BTreeMap;
 use flotilla_resources::TerminalBrief;
 use flotilla_schema::{Frozen, Ref, Stored};
 use flotilla_state_machines::{
-    machines::{
-        convoy::Convoy,
-        lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
-        vessel::Vessel,
-    },
+    machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
     Resource,
 };
 
-use super::environment::Environment;
+use super::{environment::Environment, Holder};
 
 /// Terminal sessions as a lifecycle kind.
 pub struct TerminalSessionKind;
@@ -34,8 +30,8 @@ pub type TerminalSession = Lifecycle<TerminalSessionKind>;
 /// What a TerminalSession launches, where. It declares the stored
 /// TerminalSession (kind code `ts`), homed at its environment's host.
 ///
-/// Realised under the terminal pool's session id once it is observed running.
-/// Its pid, endpoint, launch command, screen, attention and occupancy are
+/// Realised under the terminal pool's session id once it is observed running;
+/// that id is not indexed (nothing looks a session up by it). Its pid, endpoint, launch command, screen, attention and occupancy are
 /// observations. The old spec's queued crew messages are Messages (#3317),
 /// never part of the request, and a pending crew completion is a Message to
 /// the convoy's home.
@@ -45,17 +41,15 @@ pub type TerminalSession = Lifecycle<TerminalSessionKind>;
     code = "ts",
     state = LifecycleState,
     index(name = "by_environment", eq(environment)),
-    index(name = "by_vessel", eq(vessel), when(vessel is_some)),
-    index(name = "by_convoy", eq(convoy), when(convoy is_some))
+    index(name = "by_holder", eq(holder), when(holder is_some))
 )]
 pub struct TerminalSessionRequest {
     pub environment: Ref<Resource<Environment>>,
-    /// The vessel it runs in, for a crew's sessions.
-    pub vessel: Option<Ref<Resource<Vessel>>>,
-    /// The convoy whose crew an agent session runs: the vessel's convoy when
-    /// both are set, which the writer checks. Its own column so that a
-    /// convoy's sessions are one indexed read.
-    pub convoy: Option<Ref<Resource<Convoy>>>,
+    /// The vessel it is held for (`vessel:<name>`), for a crew's session;
+    /// none for a standalone tool session (owner's look-over of #3720,
+    /// 2026-10-22). Its convoy is the vessel's: a convoy's sessions are its
+    /// vessels by convoy, then their sessions by holder.
+    pub holder: Option<Holder>,
     #[store(intern = "rl")]
     pub role: String,
     /// The terminal pool, interned (domain `tp`).

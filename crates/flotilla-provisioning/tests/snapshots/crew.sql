@@ -142,8 +142,7 @@ CREATE TABLE "terminal_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
   "environment" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
-  "vessel" INTEGER REFERENCES "resource_identity" ("id"),
-  "convoy" INTEGER REFERENCES "resource_identity" ("id"),
+  "holder" INTEGER REFERENCES "strings" ("id"),
   "role" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "pool" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "cwd" TEXT NOT NULL,
@@ -227,9 +226,8 @@ CREATE TABLE "terminal_session_env" (
   PRIMARY KEY ("terminal_session", "key"),
   FOREIGN KEY ("terminal_session") REFERENCES "terminal_session" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX "terminal_session_by_convoy" ON "terminal_session" ("convoy") WHERE "convoy" IS NOT NULL;
 CREATE INDEX "terminal_session_by_environment" ON "terminal_session" ("environment");
-CREATE INDEX "terminal_session_by_vessel" ON "terminal_session" ("vessel") WHERE "vessel" IS NOT NULL;
+CREATE INDEX "terminal_session_by_holder" ON "terminal_session" ("holder") WHERE "holder" IS NOT NULL;
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ts', 'source', 'ag', 'Agent'),
   ('ts', 'source', 'tl', 'Tool'),
@@ -260,8 +258,7 @@ CREATE VIEW "terminal_session_view" AS SELECT
   "terminal_session"."id",
   "terminal_session"."version",
   "terminal_session"."environment",
-  "terminal_session"."vessel",
-  "terminal_session"."convoy",
+  (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."holder") AS "holder",
   (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."role") AS "role",
   (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."pool") AS "pool",
   "terminal_session"."cwd",
