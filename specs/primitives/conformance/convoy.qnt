@@ -29,11 +29,15 @@
 // or retraction. There "a" is refused while it holds the promise or the duty,
 // the convoy is refused while the promise is open, and a retired "b" is
 // refused SeatRetired as a Reassign target. Their refusals (unauthorised, an
-// unknown seat) are probed always, once each. Declare to a retired seat,
+// unknown seat) are probed always, once each. Replacement (#3587 ruling Q7)
+// is limited to one per seat: in the same convoy ReplaceSeat of "a" moves,
+// is refused ReplacementsExhausted the second time, before or after a
+// rollover, and of a retired "b" is refused SeatRetired; of the unknown "z"
+// it is probed always. Declare to a retired seat,
 // AddSeat under one and Declare below the promise floor are left to
 // convoy_deliver's traces and mutants.
 module convoy_conformance {
-  import convoy(IDS = Set(), SEAT_LIMIT = 4) as C from "../machines/convoy"
+  import convoy(IDS = Set(), SEAT_LIMIT = 4, REPLACEMENT_LIMIT = 1) as C from "../machines/convoy"
   type Probe = Admitted({ request: C::ConvoyRequest, result: C::Next })
     | Stepped({ from: C::State, event: C::Event, result: C::Next })
   var slot: C::Slot
@@ -42,19 +46,19 @@ module convoy_conformance {
   pure def admitted(source: C::Source): C::PromiseId -> C::AdmittedPromise = Map(0 -> { promise: definition, source: source, owner: "a" })
   pure val lifetime = Map(0 -> { owner: "a", scope: C::Lifetime, terms: "terms" })
   pure val whileOpen = Map(0 -> { owner: "a", scope: C::WhileOpen(Set(0)), terms: "terms" })
-  pure val seats = Map("a" -> { parent: C::Root, supervisedBy: "op" }, "b" -> { parent: C::Under("a"), supervisedBy: "a" })
+  pure val seats = Map("a" -> { parent: C::Root, supervisedBy: "op", replacements: 0 }, "b" -> { parent: C::Under("a"), supervisedBy: "a", replacements: 0 })
   pure def request(promises: C::PromiseId -> C::AdmittedPromise, duties: C::DutyId -> C::Duty, known: bool): C::ConvoyRequest =
     { project: "project", projectKnown: known, promises: promises, duties: duties, seats: seats, quota: Map(0 -> 1, 1 -> 1), priority: 1 }
   pure val requests = Set(
     request(Map(), Map(), true), request(Map(), whileOpen, true), request(Map(), lifetime, true), request(Map(), lifetime, false),
     request(admitted(C::Template), Map(), true), request(admitted(C::Template), Map(), false), request(admitted(C::Dispatch), Map(), true),
     request(admitted(C::Template), lifetime, true), request(admitted(C::Template), whileOpen, true),
-    { ...request(admitted(C::Template), Map(), true), seats: Map("b" -> { parent: C::Root, supervisedBy: "op" }) },
-    { ...request(admitted(C::Template), Map(), true), seats: Map("a" -> { parent: C::Under("b"), supervisedBy: "op" }, "b" -> { parent: C::Under("a"), supervisedBy: "op" }) },
-    { ...request(admitted(C::Template), Map(), true), seats: Map("a" -> { parent: C::Under("a"), supervisedBy: "op" }) },
-    { ...request(Map(), lifetime, true), seats: seats.put("y", { parent: C::Root, supervisedBy: "op" }) },
-    { ...request(admitted(C::Template), Map(), true), seats: Set("c", "d", "e").fold(seats, (m, s) => m.put(s, { parent: C::Under("a"), supervisedBy: "a" })) },
-    { ...request(admitted(C::Template), lifetime, true), seats: seats.put("g", { parent: C::Root, supervisedBy: "op" }) })
+    { ...request(admitted(C::Template), Map(), true), seats: Map("b" -> { parent: C::Root, supervisedBy: "op", replacements: 0 }) },
+    { ...request(admitted(C::Template), Map(), true), seats: Map("a" -> { parent: C::Under("b"), supervisedBy: "op", replacements: 0 }, "b" -> { parent: C::Under("a"), supervisedBy: "op", replacements: 0 }) },
+    { ...request(admitted(C::Template), Map(), true), seats: Map("a" -> { parent: C::Under("a"), supervisedBy: "op", replacements: 0 }) },
+    { ...request(Map(), lifetime, true), seats: seats.put("y", { parent: C::Root, supervisedBy: "op", replacements: 0 }) },
+    { ...request(admitted(C::Template), Map(), true), seats: Set("c", "d", "e").fold(seats, (m, s) => m.put(s, { parent: C::Under("a"), supervisedBy: "a", replacements: 0 })) },
+    { ...request(admitted(C::Template), lifetime, true), seats: seats.put("g", { parent: C::Root, supervisedBy: "op", replacements: 0 }) })
   // The convoy admitted for the moving seat edges: its extra seat "y" marks it.
   pure def seatProbe(w: C::Work): bool = w.seats.keys().contains("y")
   // The convoy admitted for seat growth: its extra seat "g" marks it.
@@ -93,9 +97,9 @@ module convoy_conformance {
       C::AddSeat({ seat: "d", parent: "a", supervisedBy: "a", authorised: true }),
       C::Resupervise({ seat: "b", supervisedBy: "s", authorised: true })) else Set())
     .union(Set(C::RetireSeat({ seat: "b", authorised: false }), C::RetireSeat({ seat: "z", authorised: true }),
-      C::Rollover({ authorised: false })))
+      C::Rollover({ authorised: false }), C::ReplaceSeat("z")))
     .union(if (growthProbe(w)) Set(C::RetireSeat({ seat: "a", authorised: true }), C::RetireSeat({ seat: "b", authorised: true }),
-      C::Rollover({ authorised: true })) else Set())
+      C::Rollover({ authorised: true }), C::ReplaceSeat("a"), C::ReplaceSeat("b")) else Set())
     .union(Set(C::Deliver))
     .union(Set(true, false).map(a => Set("", "decision").map(r => C::Abandon({ authorised: a, reason: r }))).flatten())
     .union((if (w.promises.keys().size() == 0) quotas.union(Set(increase)) else quotas).map(q =>

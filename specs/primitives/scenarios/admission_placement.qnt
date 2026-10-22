@@ -1,6 +1,6 @@
 module admission_placement {
   // If these bounds grow, re-check complete TLC and coverage in symbolic.sh.
-  import convoy(IDS = Set(1, 2), SEAT_LIMIT = 4) as C from "../machines/convoy"
+  import convoy(IDS = Set(1, 2), SEAT_LIMIT = 4, REPLACEMENT_LIMIT = 1) as C from "../machines/convoy"
   import vessel(IDS = Set(1, 2, 3)) as V from "../machines/vessel"
   val ids = Set(1, 2, 3)
   val hosts = Set(1, 2)
@@ -38,7 +38,7 @@ module admission_placement {
     val r = requests.get(id)
     any {
       all {
-        C::admitRequest(convoy, { project: "project", projectKnown: true, promises: Map(0 -> { promise: { kind: "opaque", target: "target" }, source: C::Template, owner: "coder" }), duties: Map(), seats: Map("coder" -> { parent: C::Root, supervisedBy: "supervisor" }), quota: Map(0 -> 1, 1 -> 1), priority: if (convoy == 1) 2 else 1 }),
+        C::admitRequest(convoy, { project: "project", projectKnown: true, promises: Map(0 -> { promise: { kind: "opaque", target: "target" }, source: C::Template, owner: "coder" }), duties: Map(), seats: Map("coder" -> { parent: C::Root, supervisedBy: "supervisor", replacements: 0 }), quota: Map(0 -> 1, 1 -> 1), priority: if (convoy == 1) 2 else 1 }),
         V::unchanged,
         keepPlaced,
       },

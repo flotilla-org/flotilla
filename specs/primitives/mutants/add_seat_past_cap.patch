@@ -1,10 +1,10 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -215,7 +215,6 @@
+@@ -224,7 +224,6 @@
            else if (w.seats.keys().contains(a.seat)) Refused(SeatExists)
            else if (not(w.seats.keys().contains(a.parent))) Refused(UnknownSeat)
            else if (retiredSeat(w, a.parent)) Refused(SeatRetired)
 -          else if (w.seats.keys().size() >= SEAT_LIMIT) Refused(SeatsFull)
-           else Moved(Open({ ...w, seats: w.seats.put(a.seat, { parent: Under(a.parent), supervisedBy: a.supervisedBy }) }))
+           else Moved(Open({ ...w, seats: w.seats.put(a.seat, { parent: Under(a.parent), supervisedBy: a.supervisedBy, replacements: 0 }) }))
        // Re-pointing to the current supervisor is an accepted no-op edge.
        | Resupervise(a) => if (not(a.authorised)) Refused(Unauthorised)

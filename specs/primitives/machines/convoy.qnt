@@ -13,7 +13,11 @@ module convoy {
   // the convoy and are never removed within a generation, so a seat name is
   // never reused in it.
   type Parent = Root | Under(Seat)
-  type SeatRecord = { parent: Parent, supervisedBy: str }
+  // replacements (#3587 ruling Q7): the replacement vessels requested for the
+  // seat. Admission takes it as given (zero for a new convoy, the stored count
+  // for an imported one), AddSeat starts it at zero, and Rollover carries it
+  // over with the seat and never resets it.
+  type SeatRecord = { parent: Parent, supervisedBy: str, replacements: int }
   type Promise = { kind: str, target: str }
   // Where a promise came from, recorded when it is created. Retraction and
   // verdict authority follow it (#3587 spec ruling 5).
@@ -75,12 +79,17 @@ module convoy {
     // generation, which its ConvoyEnsure authorises.
     | RetireSeat({ seat: Seat, authorised: bool })
     | Rollover({ authorised: bool })
+    // A replacement vessel requested for a seat (#3587 ruling Q7) raises the
+    // seat's count. Past the convoy's limit it is refused, and the caller
+    // raises the convoy's attention instead of replacing again. It is the
+    // engine's own effect, so it carries no authority.
+    | ReplaceSeat(Seat)
     | Deliver | Abandon({ authorised: bool, reason: str })
     | Readmit({ quota: VesselClass -> int, authorised: bool })
   type Refusal = NoObligations | UnknownProject | InvalidQuota | NotOpen | UnknownPromise | PromiseSettled
     | PromisesOutstanding(Set[PromiseId]) | Unauthorised | QuotaNotIncrease | PromiseExists | NotOwner | NotDurable
     | NotSubmitted | StaleEvidence | UnknownDuty | DutyHolds(Set[DutyId]) | UnknownSeat | SeatExists | SeatCycle
-    | SeatRetired | SeatsFull
+    | SeatRetired | SeatsFull | ReplacementsExhausted
   type Next = Moved(State) | Refused(Refusal)
   pure def validQuota(q: VesselClass -> int): bool = q.keys().forall(c => q.get(c) >= 0)
   pure def lifetime(d: Duty): bool = match d.scope { | Lifetime => true | WhileOpen(_) => false }
@@ -160,7 +169,8 @@ module convoy {
   pure def retiredSeat(w: Work, seat: Seat): bool = w.retiredSeats.contains(seat)
   // The next generation: the seats not retired, each under its parent while
   // that parent carries over and at the root otherwise; the standing duties;
-  // no promises, with their ids left below the floor.
+  // no promises, with their ids left below the floor. A carried seat keeps
+  // its replacement count.
   pure def nextGeneration(w: Work): Work = {
     val live = w.seats.keys().exclude(w.retiredSeats)
     val standing = holdingDuties(w)
@@ -215,7 +225,7 @@ module convoy {
           else if (not(w.seats.keys().contains(a.parent))) Refused(UnknownSeat)
           else if (retiredSeat(w, a.parent)) Refused(SeatRetired)
           else if (w.seats.keys().size() >= SEAT_LIMIT) Refused(SeatsFull)
-          else Moved(Open({ ...w, seats: w.seats.put(a.seat, { parent: Under(a.parent), supervisedBy: a.supervisedBy }) }))
+          else Moved(Open({ ...w, seats: w.seats.put(a.seat, { parent: Under(a.parent), supervisedBy: a.supervisedBy, replacements: 0 }) }))
       // Re-pointing to the current supervisor is an accepted no-op edge.
       | Resupervise(a) => if (not(a.authorised)) Refused(Unauthorised)
           else if (not(w.seats.keys().contains(a.seat))) Refused(UnknownSeat)
@@ -236,6 +246,12 @@ module convoy {
           else if (holdingDuties(w).size() == 0) Refused(NoObligations)
           else if (outstanding.size() > 0) Refused(PromisesOutstanding(outstanding))
           else Moved(Open(nextGeneration(w)))
+      // A retired seat has no vessel to replace. The count reaching the limit
+      // allows that many replacements and refuses the next.
+      | ReplaceSeat(seat) => if (not(w.seats.keys().contains(seat))) Refused(UnknownSeat)
+          else if (retiredSeat(w, seat)) Refused(SeatRetired)
+          else if (w.seats.get(seat).replacements >= REPLACEMENT_LIMIT) Refused(ReplacementsExhausted)
+          else Moved(Open({ ...w, seats: w.seats.set(seat, { ...w.seats.get(seat), replacements: w.seats.get(seat).replacements + 1 }) }))
       | Deliver => val outstanding = w.promises.keys().filter(p => open(w.promises.get(p)))
           if (outstanding.size() > 0) Refused(PromisesOutstanding(outstanding))
           else if (holdingDuties(w).size() > 0) Refused(DutyHolds(holdingDuties(w)))
@@ -250,25 +266,13 @@ module convoy {
     | _ => Refused(NotOpen)
   }
 
-  // Finality is checked through the rule interface: an operator, who may
-  // settle anything open, can neither submit, reject, keep, retract nor
-  // reassign a settled promise.
-  pure def settledFinal(s: State): bool = work(s).promises.keys().forall(p => {
-    val r = work(s).promises.get(p)
-    open(r) or Set(
-      Submit({ promise: p, by: r.owner, reference: "ref", durable: true }),
-      Reject({ promise: p }),
-      Keep(Observed({ promise: p, submission: r.submissions.length() })),
-      Keep(Verdict({ promise: p, by: "operator", authority: Operator, reason: "decision" })),
-      Retract({ promise: p, by: "operator", authority: Operator, reason: "decision" }),
-      Reassign({ promise: p, to: r.owner, by: "operator", authority: Operator })
-    ).forall(e => not(moved(step(s, e))))
-  })
   // Resource-kind store. Refused rules disable actions and append nothing.
   type Slot = Absent | Present(State)
   const IDS: Set[int]
   // The configured cap on a generation's seats, retired ones included.
   const SEAT_LIMIT: int
+  // The convoy's limit on replacements requested for any one seat.
+  const REPLACEMENT_LIMIT: int
   var convoys: int -> Slot
   pure def moved(n: Next): bool = match n { | Moved(_) => true | Refused(_) => false }
   pure def target(n: Next, old: Slot): Slot = match n { | Moved(s) => Present(s) | Refused(_) => old }
@@ -301,6 +305,7 @@ module convoy {
     fire(id, Resupervise({ seat: seat, supervisedBy: supervisedBy, authorised: auth }))
   action retireSeat(id: int, seat: Seat, auth: bool): bool = fire(id, RetireSeat({ seat: seat, authorised: auth }))
   action rollover(id: int, auth: bool): bool = fire(id, Rollover({ authorised: auth }))
+  action replaceSeat(id: int, seat: Seat): bool = fire(id, ReplaceSeat(seat))
   action deliver(id: int): bool = fire(id, Deliver)
   action abandon(id: int, auth: bool, reason: str): bool = fire(id, Abandon({ authorised: auth, reason: reason }))
   action readmit(id: int, quota: VesselClass -> int, auth: bool): bool = fire(id, Readmit({ quota: quota, authorised: auth }))
