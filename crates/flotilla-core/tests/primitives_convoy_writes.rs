@@ -279,3 +279,33 @@ async fn abandonment_ends_the_engine_convoy() {
     assert_eq!(engine.state().reason(), Some("superseded"));
     fixture.engine.abandon(&convoy, "alice", "again").await.expect("already ended");
 }
+
+// Behaviour (dummy fleet, #3587 layer 6): two crews may each declare and submit a promise of the
+// same id; each reaches its own, the second under a qualified label, even once the first is kept.
+#[tokio::test]
+async fn two_crews_submit_promises_of_one_id() {
+    let fixture = fixture();
+    let convoy = admitted(&fixture, "c", bootstrapped(vec![("work", vec![crew("coder", true), crew("reviewer", false)])])).await;
+    let ledger = |by: &str| PromiseOperation::Submit {
+        id: "script-ledger".into(),
+        kind: PromiseKind::DecisionLedger,
+        source: OldSource::Crew,
+        submission: Submission { reference: format!("{by}-ledger"), metadata: BTreeMap::new(), submitted_at: Utc::now(), verdict: None },
+    };
+    fixture.engine.promise(&convoy, "work", "coder", &ledger("coder"), Actor::Crew).await.expect("coder's ledger");
+    let kept = PromiseOperation::Verdict {
+        id: "script-ledger".into(),
+        reference: String::new(),
+        submitted_at: Utc::now(),
+        verdict: SubmissionVerdict { accepted: true, who: "artifact".into(), at: Utc::now(), why: "exists".into() },
+    };
+    fixture.engine.promise(&convoy, "work", "coder", &kept, Actor::Observer).await.expect("kept");
+    fixture.engine.promise(&convoy, "work", "reviewer", &ledger("reviewer"), Actor::Crew).await.expect("reviewer's ledger");
+    let convoy = reread(&fixture.backend, "c").await;
+    assert_eq!(old_promise(&convoy, "work", "coder", "script-ledger").state, PromiseState::Kept);
+    assert_eq!(old_promise(&convoy, "work", "reviewer", "script-ledger").state, PromiseState::Submitted);
+    let labels: Vec<_> = fixture.convoys.get("c").expect("held").spec().promises.iter().map(|row| row.record.label.clone()).collect();
+    assert!(labels.contains(&"@reviewer/script-ledger".to_owned()), "{labels:?}");
+    // The same reference again is the submission already made.
+    fixture.engine.promise(&convoy, "work", "coder", &ledger("coder"), Actor::Crew).await.expect("kept: a no-op");
+}

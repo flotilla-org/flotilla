@@ -123,17 +123,16 @@ pub fn label_for(seat: &SeatName, id: &str, taken: impl Fn(&str) -> bool) -> Str
     }
 }
 
-/// The engine promise an old crew calls `id`: its own promise of that old id
-/// or label. Labels are unique, so a full label names at most one.
+/// The engine promise an old crew calls `id`: its own promise of that label,
+/// or of that old id. A crew addresses only the promises it owns, so another
+/// crew's promise of the same id is never it: a new one of this crew's is
+/// declared under a qualified label.
 pub fn find<'a>(convoy: &'a Resource<Convoy>, seat: &SeatName, id: &str) -> Option<&'a Promise> {
-    let promises = convoy.spec().promises.iter().map(|row| &row.record);
-    let owned: Vec<&Promise> = promises.clone().filter(|promise| promise.owner == *seat).collect();
-    owned
-        .iter()
-        .copied()
-        .find(|promise| promise.label == id)
-        .or_else(|| owned.iter().copied().find(|promise| old_ids(convoy).get(&promise.id).map(String::as_str) == Some(id)))
-        .or_else(|| promises.into_iter().find(|promise| promise.label == id))
+    let owned: Vec<&Promise> = convoy.spec().promises.iter().map(|row| &row.record).filter(|promise| promise.owner == *seat).collect();
+    owned.iter().copied().find(|promise| promise.label == id).or_else(|| {
+        let ids = old_ids(convoy);
+        owned.into_iter().find(|promise| ids.get(&promise.id).map(String::as_str) == Some(id))
+    })
 }
 
 /// The id each engine promise shows in the old status: its [`old_id`], or

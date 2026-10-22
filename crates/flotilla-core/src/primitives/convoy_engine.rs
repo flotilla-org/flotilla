@@ -211,11 +211,16 @@ impl EngineConvoys for ConvoyEngine {
                     let mut edges = Vec::new();
                     let (promise, owner) = match found(&id) {
                         Some(promise) => {
-                            let current_submission = promise.submissions.iter().last().map(|row| &row.record);
-                            if current_submission.is_some_and(|last| last.address == address && last.revision == revision)
-                                && matches!(promise.progress.value, Progress::Submitted | Progress::Kept)
-                            {
-                                return Ok(Vec::new());
+                            // The same reference again is the submission already made, as on the
+                            // old path, which compared subjects: a kept or submitted promise takes
+                            // it as a no-op unless it brings a revision the current one lacks.
+                            let current = promise.submissions.iter().last().map(|row| &row.record);
+                            let same = current.is_some_and(|last| last.address == address);
+                            let newer = current.is_some_and(|last| !revision.is_empty() && last.revision != revision);
+                            match promise.progress.value {
+                                Progress::Kept if same => return Ok(Vec::new()),
+                                Progress::Submitted if same && !newer => return Ok(Vec::new()),
+                                _ => {}
                             }
                             (promise.id, promise.owner.clone())
                         }
