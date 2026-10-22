@@ -1,12 +1,11 @@
 //! Environment: where crews and tools run, realised by one provider instance.
 
-use std::collections::{BTreeMap, BTreeSet};
-
-use flotilla_schema::{Address, Ref, Stored};
+use flotilla_schema::{Address, Frozen, Ref, Stored};
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
     Resource,
 };
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use super::image_build::ImageBuild;
 
@@ -24,6 +23,11 @@ pub type Environment = Lifecycle<EnvironmentKind>;
 /// What an Environment asks its provider for. It declares the stored
 /// Environment (kind code `ev`), homed at the host whose provider realises it.
 ///
+/// Columns are for what is queried: the provider (a provider's live
+/// environments) and the ImageBuild that realises its image. Everything else
+/// is the provider's own [`Recipe`], one frozen document, so a new provider
+/// never changes this table (owner's schema look-over, 2026-10-22).
+///
 /// Realised under the provider's identity for it: a Docker container id, or
 /// the host-direct root. The image the container runs, its configured limits
 /// and its runtime samples are observations.
@@ -39,73 +43,31 @@ pub struct EnvironmentRequest {
     /// The provider instance: `host:<host>/provider:<instance>` or
     /// `account:<account>/provider:<instance>` (ADR 0058).
     pub provider: Address,
-    /// The ImageBuild that realises a Docker backing's image, when one does.
-    /// A column of its own, not part of the backing, so that it is indexed.
+    /// The ImageBuild that realises the environment's image, when one does.
+    /// A column of its own, outside the recipe, so that it is indexed.
     pub image_build: Option<Ref<Resource<ImageBuild>>>,
-    pub backing: Backing,
+    /// The provider's recipe, stored once by content hash.
+    #[store(frozen)]
+    pub recipe: Frozen<Recipe>,
 }
 
-/// How the provider backs the environment. Docker's adapter, mount and env
-/// rows are child tables that hold rows only under Docker: decoding refuses
-/// a row under any other variant.
-#[derive(Clone, Debug, PartialEq, Eq, Stored)]
-pub enum Backing {
-    /// The host itself.
-    #[store(code = "hd")]
-    HostDirect { repo_default_dir: String },
-    /// A container from `image`.
-    #[store(code = "dk")]
-    Docker {
-        image: String,
-        /// Adapters the placement policy expects discovery to find in the image.
-        #[store(child)]
-        declared_adapters: BTreeSet<String>,
-        /// Adapters this environment's workflow will launch.
-        #[store(child)]
-        required_adapters: BTreeSet<String>,
-        pull: PullPolicy,
-        #[store(flatten)]
-        memory: MemoryPolicy,
-        #[store(child)]
-        mounts: Vec<Mount>,
-        #[store(child)]
-        env: BTreeMap<String, String>,
-    },
-}
+/// A provider's own recipe for an environment: a document whose shape the
+/// provider owns and validates, opaque to the shared table. The Docker
+/// provider's is its `DockerEnvironmentSpec`, memory policy included (where
+/// that policy belongs is #3734); host-direct's is its
+/// `HostDirectEnvironmentSpec`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Recipe(serde_json::Value);
 
-/// When the provider pulls the image.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Stored)]
-pub enum PullPolicy {
-    #[store(code = "al")]
-    Always,
-    #[store(code = "ip")]
-    IfNotPresent,
-    #[store(code = "nv")]
-    Never,
-}
+impl Recipe {
+    /// The recipe a provider writes, from its own type.
+    pub fn of<T: Serialize>(recipe: &T) -> Result<Recipe, String> {
+        serde_json::to_value(recipe).map(Recipe).map_err(|error| format!("encode the provider's recipe: {error}"))
+    }
 
-/// The placement-authored memory budget: a share of host memory per crew.
-#[derive(Clone, Debug, PartialEq, Eq, Stored)]
-pub struct MemoryPolicy {
-    /// 1 to 100, checked where the request is written (`EnvironmentMemoryPolicy::resolve`).
-    pub host_memory_percent: u8,
-    pub expected_concurrent_crews: u32,
-    /// Swap per crew, in bytes.
-    pub swap_bytes: u64,
-}
-
-/// One bind mount, in order.
-#[derive(Clone, Debug, PartialEq, Eq, Stored)]
-pub struct Mount {
-    pub source_path: String,
-    pub target_path: String,
-    pub mode: MountMode,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Stored)]
-pub enum MountMode {
-    #[store(code = "ro")]
-    ReadOnly,
-    #[store(code = "rw")]
-    ReadWrite,
+    /// The recipe as its provider reads it.
+    pub fn read<T: DeserializeOwned>(&self) -> Result<T, String> {
+        serde_json::from_value(self.0.clone()).map_err(|error| format!("decode the provider's recipe: {error}"))
+    }
 }

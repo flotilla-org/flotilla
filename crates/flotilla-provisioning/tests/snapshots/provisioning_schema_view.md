@@ -6,11 +6,7 @@ Kind tables only; the shared tables are in `provisioning.sql`.
 |---|---|--:|---|---|---|
 | `checkout` | root | 22 | 2: `source` 2 | – | `by_environment` (environment), `by_clone` (clone), `by_convoy` (convoy), `by_ensure` (ensure) |
 | `clone` | root | 16 | – | – | `by_environment` (environment, repository) |
-| `environment` | root | 21 | 7: `backing` 7 | `environment_backing_declared_adapters` (child), `environment_backing_required_adapters` (child), `environment_backing_mounts` (child), `environment_backing_env` (child) | `live_by_provider` (provider), `by_image_build` (image_build) |
-| `environment_backing_declared_adapters` | child | 2 | – | – | – |
-| `environment_backing_required_adapters` | child | 2 | – | – | – |
-| `environment_backing_mounts` | child | 5 | – | – | – |
-| `environment_backing_env` | child | 3 | – | – | – |
+| `environment` | root | 15 | – | – | `live_by_provider` (provider), `by_image_build` (image_build) |
 | `image_build` | root | 19 | 2: `delivery` 2 | – | `by_composition` (composition) |
 
 Tables wider than 30 columns:

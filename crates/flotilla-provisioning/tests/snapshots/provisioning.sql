@@ -275,13 +275,7 @@ CREATE TABLE "environment" (
   "version" INTEGER NOT NULL,
   "provider" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "image_build" INTEGER REFERENCES "resource_identity" ("id"),
-  "backing" TEXT NOT NULL CHECK ("backing" IN ('dk', 'hd')),
-  "backing_repo_default_dir" TEXT,
-  "backing_image" TEXT,
-  "backing_pull" TEXT CHECK ("backing_pull" IN ('al', 'ip', 'nv')),
-  "backing_memory_host_memory_percent" INTEGER,
-  "backing_memory_expected_concurrent_crews" INTEGER,
-  "backing_memory_swap_bytes" INTEGER,
+  "recipe" BLOB NOT NULL REFERENCES "objects" ("hash"),
   "state" TEXT NOT NULL CHECK ("state" IN ('go', 'gu', 'rl', 'rq')),
   "state_since" INTEGER NOT NULL,
   "failures" INTEGER,
@@ -292,22 +286,6 @@ CREATE TABLE "environment" (
   "identity" TEXT,
   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
   "cause_detail" TEXT,
-  CHECK (CASE WHEN "backing" = 'hd'
-      THEN "backing_repo_default_dir" IS NOT NULL
-      AND "backing_image" IS NULL
-      AND "backing_pull" IS NULL
-      AND "backing_memory_host_memory_percent" IS NULL
-      AND "backing_memory_expected_concurrent_crews" IS NULL
-      AND "backing_memory_swap_bytes" IS NULL
-      END),
-  CHECK (CASE WHEN "backing" = 'dk'
-      THEN "backing_image" IS NOT NULL
-      AND "backing_pull" IS NOT NULL
-      AND "backing_memory_host_memory_percent" IS NOT NULL
-      AND "backing_memory_expected_concurrent_crews" IS NOT NULL
-      AND "backing_memory_swap_bytes" IS NOT NULL
-      AND "backing_repo_default_dir" IS NULL
-      END),
   CHECK (CASE WHEN "last_failure_at" IS NOT NULL
       THEN "last_failure_cause_category" IS NOT NULL
       AND "last_failure_cause_detail" IS NOT NULL
@@ -353,42 +331,9 @@ CREATE TABLE "environment" (
       AND "identity" IS NULL
       END)
 ) STRICT;
-CREATE TABLE "environment_backing_declared_adapters" (
-  "environment" INTEGER NOT NULL,
-  "value" TEXT NOT NULL,
-  PRIMARY KEY ("environment", "value"),
-  FOREIGN KEY ("environment") REFERENCES "environment" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE TABLE "environment_backing_required_adapters" (
-  "environment" INTEGER NOT NULL,
-  "value" TEXT NOT NULL,
-  PRIMARY KEY ("environment", "value"),
-  FOREIGN KEY ("environment") REFERENCES "environment" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE TABLE "environment_backing_mounts" (
-  "environment" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "source_path" TEXT NOT NULL,
-  "target_path" TEXT NOT NULL,
-  "mode" TEXT NOT NULL CHECK ("mode" IN ('ro', 'rw')),
-  PRIMARY KEY ("environment", "pos"),
-  FOREIGN KEY ("environment") REFERENCES "environment" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE TABLE "environment_backing_env" (
-  "environment" INTEGER NOT NULL,
-  "key" TEXT NOT NULL,
-  "value" TEXT NOT NULL,
-  PRIMARY KEY ("environment", "key"),
-  FOREIGN KEY ("environment") REFERENCES "environment" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
 CREATE INDEX "environment_by_image_build" ON "environment" ("image_build") WHERE "image_build" IS NOT NULL;
 CREATE INDEX "environment_live_by_provider" ON "environment" ("provider") WHERE "state" IN ('rq', 'rl');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
-  ('ev', 'backing', 'dk', 'Docker'),
-  ('ev', 'backing', 'hd', 'HostDirect'),
-  ('ev', 'backing_pull', 'al', 'Always'),
-  ('ev', 'backing_pull', 'ip', 'IfNotPresent'),
-  ('ev', 'backing_pull', 'nv', 'Never'),
   ('ev', 'state', 'go', 'Gone'),
   ('ev', 'state', 'gu', 'GaveUp'),
   ('ev', 'state', 'rl', 'Realised'),
@@ -403,8 +348,6 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ev', 'cause_category', 'mx', 'MissingCapability'),
   ('ev', 'cause_category', 'rf', 'Refused'),
   ('ev', 'cause_category', 'tr', 'Transient'),
-  ('ev', 'backing_mounts.mode', 'ro', 'ReadOnly'),
-  ('ev', 'backing_mounts.mode', 'rw', 'ReadWrite'),
   ('ev', 'log:edge', 'at', 'Attempted'),
   ('ev', 'log:edge', 'gu', 'GiveUp'),
   ('ev', 'log:edge', 'rl', 'Realise'),
@@ -419,13 +362,7 @@ CREATE VIEW "environment_view" AS SELECT
   "environment"."version",
   (SELECT "s" FROM "strings" WHERE "id" = "environment"."provider") AS "provider",
   "environment"."image_build",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'ev' AND "field" = 'backing' AND "code" = "environment"."backing") AS "backing",
-  "environment"."backing_repo_default_dir",
-  "environment"."backing_image",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'ev' AND "field" = 'backing_pull' AND "code" = "environment"."backing_pull") AS "backing_pull",
-  "environment"."backing_memory_host_memory_percent",
-  "environment"."backing_memory_expected_concurrent_crews",
-  "environment"."backing_memory_swap_bytes",
+  "environment"."recipe",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ev' AND "field" = 'state' AND "code" = "environment"."state") AS "state",
   "environment"."state_since",
   "environment"."failures",
@@ -437,26 +374,6 @@ CREATE VIEW "environment_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'ev' AND "field" = 'cause_category' AND "code" = "environment"."cause_category") AS "cause_category",
   "environment"."cause_detail"
 FROM "environment";
-CREATE VIEW "environment_backing_declared_adapters_view" AS SELECT
-  "environment_backing_declared_adapters"."environment",
-  "environment_backing_declared_adapters"."value"
-FROM "environment_backing_declared_adapters";
-CREATE VIEW "environment_backing_required_adapters_view" AS SELECT
-  "environment_backing_required_adapters"."environment",
-  "environment_backing_required_adapters"."value"
-FROM "environment_backing_required_adapters";
-CREATE VIEW "environment_backing_mounts_view" AS SELECT
-  "environment_backing_mounts"."environment",
-  "environment_backing_mounts"."pos",
-  "environment_backing_mounts"."source_path",
-  "environment_backing_mounts"."target_path",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'ev' AND "field" = 'backing_mounts.mode' AND "code" = "environment_backing_mounts"."mode") AS "mode"
-FROM "environment_backing_mounts";
-CREATE VIEW "environment_backing_env_view" AS SELECT
-  "environment_backing_env"."environment",
-  "environment_backing_env"."key",
-  "environment_backing_env"."value"
-FROM "environment_backing_env";
 CREATE TABLE "image_build" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

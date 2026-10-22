@@ -12,7 +12,7 @@ use flotilla_provisioning::stored::{
     self,
     checkout::{CheckoutKind, CheckoutRequest, Source},
     clone::{Clone, CloneKind, CloneRequest},
-    environment::{Backing, Environment, EnvironmentKind, EnvironmentRequest, MemoryPolicy, Mount, MountMode, PullPolicy},
+    environment::{Environment, EnvironmentKind, EnvironmentRequest, Recipe},
     image_build::{Architecture, Delivery, ImageBuildKind, ImageBuildRequest, Reservation},
 };
 use flotilla_resources::{ImageLayerSource, ImageLayerSpec, ImageLayerTier};
@@ -158,7 +158,7 @@ fn layer() -> ImageLayerSpec {
 }
 
 // Behaviour (ADR 0064 D5): each kind's resource survives the schema codec in every lifecycle
-// label, with every backing, delivery and source variant and populated child tables.
+// label, with each provider's recipe, every delivery and source variant and populated child tables.
 #[test]
 fn each_kind_survives_the_codec() {
     let states = || {
@@ -170,27 +170,32 @@ fn each_kind_survives_the_codec() {
             LifecycleState::GaveUp { cause: Cause::new(CauseCategory::Refused, "recipe failed") },
         ]
     };
-    let docker = Backing::Docker {
+    let docker = flotilla_resources::DockerEnvironmentSpec {
+        host_ref: String::new(),
         image: "image".into(),
-        declared_adapters: BTreeSet::from(["claude-code".into(), "codex".into()]),
-        required_adapters: BTreeSet::from(["claude-code".into()]),
-        pull: PullPolicy::IfNotPresent,
-        memory: MemoryPolicy { host_memory_percent: 80, expected_concurrent_crews: 4, swap_bytes: 0 },
-        mounts: vec![
-            Mount { source_path: "/a".into(), target_path: "/b".into(), mode: MountMode::ReadOnly },
-            Mount { source_path: "/c".into(), target_path: "/d".into(), mode: MountMode::ReadWrite },
-        ],
+        image_build_ref: Some("image-feed-amd64".into()),
+        declared_agent_adapters: BTreeSet::from(["claude-code".into(), "codex".into()]),
+        required_agent_adapters: BTreeSet::from(["claude-code".into()]),
+        pull_policy: Default::default(),
+        memory_policy: Default::default(),
+        mounts: vec![],
         env: BTreeMap::from([("A".into(), "1".into())]),
     };
+    let host_direct = flotilla_resources::HostDirectEnvironmentSpec { host_ref: String::new(), repo_default_dir: "/work".into() };
     let provider = "host:feta/provider:docker".parse::<Address>().expect("provider");
-    for (backing, image_build) in
-        [(Backing::HostDirect { repo_default_dir: "/work".into() }, None), (docker, Some(Ref::new("image-feed-amd64", "feta")))]
-    {
+    for (recipe, image_build) in [
+        (Recipe::of(&host_direct).expect("recipe"), None),
+        (Recipe::of(&docker).expect("recipe"), Some(Ref::new("image-feed-amd64", "feta"))),
+    ] {
+        let recipe = Frozen::new(recipe).expect("freeze");
         for state in states() {
-            let spec = EnvironmentRequest { provider: provider.clone(), image_build: image_build.clone(), backing: backing.clone() };
+            let spec = EnvironmentRequest { provider: provider.clone(), image_build: image_build.clone(), recipe: recipe.clone() };
             round_trip::<EnvironmentKind>(spec, state);
         }
     }
+    // The provider reads its own recipe back.
+    let stored = Recipe::of(&docker).expect("recipe");
+    assert_eq!(stored.read::<flotilla_resources::DockerEnvironmentSpec>().expect("docker reads its recipe").image, "image");
     let layers = Frozen::new(vec![layer()]).expect("freeze");
     for delivery in [Delivery::Registry { repository: "registry/flotilla".into() }, Delivery::Local] {
         for state in states() {
