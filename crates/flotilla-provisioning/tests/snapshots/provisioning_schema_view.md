@@ -4,9 +4,9 @@ Kind tables only; the shared tables are in `provisioning.sql`.
 
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
-| `checkout` | root | 22 | 2: `source` 2 | – | `by_environment` (environment), `by_clone` (clone), `by_convoy` (convoy), `by_ensure` (ensure) |
+| `checkout` | root | 21 | 2: `source` 2 | – | `by_environment` (environment), `by_clone` (clone), `by_holder` (holder) |
 | `clone` | root | 16 | – | – | `by_environment` (environment, repository) |
-| `environment` | root | 15 | – | – | `live_by_provider` (provider), `by_image_build` (image_build) |
+| `environment` | root | 16 | – | – | `live_by_provider` (provider), `by_image_build` (image_build), `by_holder` (holder) |
 | `image_build` | root | 19 | 2: `delivery` 2 | – | `by_composition` (composition) |
 
 Tables wider than 30 columns:
@@ -23,5 +23,7 @@ Interned column domains:
 | Table | Column | Domain |
 |---|---|---|
 | `checkout` | `repository` | `rk` |
+| `checkout` | `holder` | `hl` |
 | `clone` | `repository` | `rk` |
 | `environment` | `provider` | `ad` |
+| `environment` | `holder` | `hl` |

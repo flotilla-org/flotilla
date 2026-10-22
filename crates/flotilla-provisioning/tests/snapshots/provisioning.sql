@@ -48,8 +48,7 @@ CREATE TABLE "checkout" (
   "source" TEXT NOT NULL CHECK ("source" IN ('fc', 'wt')),
   "source_url" TEXT,
   "clone" INTEGER REFERENCES "resource_identity" ("id"),
-  "convoy" INTEGER REFERENCES "resource_identity" ("id"),
-  "ensure" INTEGER REFERENCES "resource_identity" ("id"),
+  "holder" INTEGER REFERENCES "strings" ("id"),
   "state" TEXT NOT NULL CHECK ("state" IN ('go', 'gu', 'rl', 'rq')),
   "state_since" INTEGER NOT NULL,
   "failures" INTEGER,
@@ -112,9 +111,8 @@ CREATE TABLE "checkout" (
       END)
 ) STRICT;
 CREATE INDEX "checkout_by_clone" ON "checkout" ("clone") WHERE "clone" IS NOT NULL;
-CREATE INDEX "checkout_by_convoy" ON "checkout" ("convoy") WHERE "convoy" IS NOT NULL;
-CREATE INDEX "checkout_by_ensure" ON "checkout" ("ensure") WHERE "ensure" IS NOT NULL;
 CREATE INDEX "checkout_by_environment" ON "checkout" ("environment");
+CREATE INDEX "checkout_by_holder" ON "checkout" ("holder") WHERE "holder" IS NOT NULL;
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ck', 'source', 'fc', 'FreshClone'),
   ('ck', 'source', 'wt', 'Worktree'),
@@ -152,8 +150,7 @@ CREATE VIEW "checkout_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'ck' AND "field" = 'source' AND "code" = "checkout"."source") AS "source",
   "checkout"."source_url",
   "checkout"."clone",
-  "checkout"."convoy",
-  "checkout"."ensure",
+  (SELECT "s" FROM "strings" WHERE "id" = "checkout"."holder") AS "holder",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ck' AND "field" = 'state' AND "code" = "checkout"."state") AS "state",
   "checkout"."state_since",
   "checkout"."failures",
@@ -276,6 +273,7 @@ CREATE TABLE "environment" (
   "provider" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "image_build" INTEGER REFERENCES "resource_identity" ("id"),
   "recipe" BLOB NOT NULL REFERENCES "objects" ("hash"),
+  "holder" INTEGER REFERENCES "strings" ("id"),
   "state" TEXT NOT NULL CHECK ("state" IN ('go', 'gu', 'rl', 'rq')),
   "state_since" INTEGER NOT NULL,
   "failures" INTEGER,
@@ -331,6 +329,7 @@ CREATE TABLE "environment" (
       AND "identity" IS NULL
       END)
 ) STRICT;
+CREATE INDEX "environment_by_holder" ON "environment" ("holder") WHERE "holder" IS NOT NULL;
 CREATE INDEX "environment_by_image_build" ON "environment" ("image_build") WHERE "image_build" IS NOT NULL;
 CREATE INDEX "environment_live_by_provider" ON "environment" ("provider") WHERE "state" IN ('rq', 'rl');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
@@ -363,6 +362,7 @@ CREATE VIEW "environment_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "environment"."provider") AS "provider",
   "environment"."image_build",
   "environment"."recipe",
+  (SELECT "s" FROM "strings" WHERE "id" = "environment"."holder") AS "holder",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ev' AND "field" = 'state' AND "code" = "environment"."state") AS "state",
   "environment"."state_since",
   "environment"."failures",

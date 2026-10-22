@@ -7,7 +7,7 @@ use flotilla_state_machines::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use super::image_build::ImageBuild;
+use super::{image_build::ImageBuild, Holder};
 
 /// Environments as a lifecycle kind.
 pub struct EnvironmentKind;
@@ -24,7 +24,8 @@ pub type Environment = Lifecycle<EnvironmentKind>;
 /// Environment (kind code `ev`), homed at the host whose provider realises it.
 ///
 /// Columns are for what is queried: the provider (a provider's live
-/// environments) and the ImageBuild that realises its image. Everything else
+/// environments), the ImageBuild that realises its image, and its holder (a
+/// vessel finds its environment by lookup, look-over ruling 4). Everything else
 /// is the provider's own [`Recipe`], one frozen document, so a new provider
 /// never changes this table (owner's schema look-over, 2026-10-22).
 ///
@@ -37,7 +38,8 @@ pub type Environment = Lifecycle<EnvironmentKind>;
     code = "ev",
     state = LifecycleState,
     index(name = "live_by_provider", eq(provider), when(state in [Requested, Realised])),
-    index(name = "by_image_build", eq(image_build), when(image_build is_some))
+    index(name = "by_image_build", eq(image_build), when(image_build is_some)),
+    index(name = "by_holder", eq(holder), when(holder is_some))
 )]
 pub struct EnvironmentRequest {
     /// The provider instance: `host:<host>/provider:<instance>` or
@@ -49,6 +51,8 @@ pub struct EnvironmentRequest {
     /// The provider's recipe, stored once by content hash.
     #[store(frozen)]
     pub recipe: Frozen<Recipe>,
+    /// Who it is held for: `vessel:<name>` for a crew's environment.
+    pub holder: Option<Holder>,
 }
 
 /// A provider's own recipe for an environment: a document whose shape the

@@ -31,8 +31,36 @@ pub mod clone;
 pub mod environment;
 pub mod image_build;
 
-use flotilla_schema::{KindRegistry, RegistryError};
+use flotilla_schema::{KindRegistry, RegistryError, Stored};
 use flotilla_state_machines::Resource;
+
+/// Who a resource is held for: `convoy:<name>`, `ensure:<name>` or
+/// `vessel:<name>`. Interned text in its own domain (`hl`), indexed, with no
+/// foreign key and no ownership semantics: nothing cascades from it and nothing
+/// checks that the holder exists (owner's look-over, 2026-10-22, ruling 4). It
+/// is one known field, not a label mechanism. Its text uses ADR 0066's segment
+/// form, but it is not an Address: there is no `ensure` address kind, and a
+/// vessel's address nests under its convoy.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
+#[store(intern = "hl")]
+pub struct Holder(pub String);
+
+impl Holder {
+    /// A convoy's: its checkouts.
+    pub fn convoy(name: &str) -> Holder {
+        Holder(format!("convoy:{name}"))
+    }
+
+    /// A standing role's Ensure: its checkouts.
+    pub fn ensure(name: &str) -> Holder {
+        Holder(format!("ensure:{name}"))
+    }
+
+    /// A vessel's: its environment.
+    pub fn vessel(name: &str) -> Holder {
+        Holder(format!("vessel:{name}"))
+    }
+}
 
 /// Registers the four provisioning kinds into `registry`, each under the code
 /// it holds for good: Environment `ev`, ImageBuild `ib`, Clone `cl`, Checkout `ck`.

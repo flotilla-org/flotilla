@@ -14,15 +14,13 @@ use flotilla_provisioning::stored::{
     clone::{Clone, CloneKind, CloneRequest},
     environment::{Environment, EnvironmentKind, EnvironmentRequest, Recipe},
     image_build::{Architecture, Delivery, ImageBuildKind, ImageBuildRequest, Reservation},
+    Holder,
 };
 use flotilla_resources::{ImageLayerSource, ImageLayerSpec, ImageLayerTier};
 use flotilla_schema::{render_view, Address, Decoder, Encoder, Frozen, Kind, KindCode, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store};
 use flotilla_state_machines::{
-    machines::{
-        convoy::Convoy,
-        lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
-    },
+    machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
     Cause, CauseCategory, Failure, Machine, Resource, Version,
 };
 
@@ -87,14 +85,7 @@ fn identity_removal_searches_every_reference() {
     let sql = &statements.iter().find(|(label, _)| label == "identity_delete").expect("shared statement").1;
     let rows = plan(&conn, sql);
     assert!(!rows.iter().any(|row| row.contains("SCAN")), "{rows:?}");
-    for index in [
-        "environment_by_image_build",
-        "clone_by_environment",
-        "checkout_by_environment",
-        "checkout_by_clone",
-        "checkout_by_convoy",
-        "checkout_by_ensure",
-    ] {
+    for index in ["environment_by_image_build", "clone_by_environment", "checkout_by_environment", "checkout_by_clone"] {
         assert!(rows.iter().any(|row| row.contains(index)), "{index}: {rows:?}");
     }
 }
@@ -189,7 +180,8 @@ fn each_kind_survives_the_codec() {
     ] {
         let recipe = Frozen::new(recipe).expect("freeze");
         for state in states() {
-            let spec = EnvironmentRequest { provider: provider.clone(), image_build: image_build.clone(), recipe: recipe.clone() };
+            let holder = image_build.is_some().then(|| Holder::vessel("convoy-a-implement"));
+            let spec = EnvironmentRequest { provider: provider.clone(), image_build: image_build.clone(), recipe: recipe.clone(), holder };
             round_trip::<EnvironmentKind>(spec, state);
         }
     }
@@ -218,8 +210,8 @@ fn each_kind_survives_the_codec() {
         };
         round_trip::<CloneKind>(spec, state);
     }
-    for (source, clone, convoy) in [
-        (Source::Worktree, Some(Ref::<Resource<Clone>>::new("clone", "feta")), Some(Ref::<Resource<Convoy>>::new("convoy", "kiwi"))),
+    for (source, clone, holder) in [
+        (Source::Worktree, Some(Ref::<Resource<Clone>>::new("clone", "feta")), Some(Holder::convoy("convoy"))),
         (Source::FreshClone { url: "https://example/repo".into() }, None, None),
     ] {
         for state in states() {
@@ -231,8 +223,7 @@ fn each_kind_survives_the_codec() {
                 path: "/w".into(),
                 source: source.clone(),
                 clone: clone.clone(),
-                convoy: convoy.clone(),
-                ensure: convoy.is_none().then(|| Ref::new("ensure", "kiwi")),
+                holder: holder.clone().or_else(|| Some(Holder::ensure("standing"))),
             };
             round_trip::<CheckoutKind>(spec, state);
         }

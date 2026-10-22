@@ -2,15 +2,11 @@
 
 use flotilla_schema::{Ref, Stored};
 use flotilla_state_machines::{
-    machines::{
-        convoy::Convoy,
-        ensure::Ensure,
-        lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
-    },
+    machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
     Resource,
 };
 
-use super::{clone, environment::Environment};
+use super::{clone, environment::Environment, Holder};
 
 /// Checkouts as a lifecycle kind.
 pub struct CheckoutKind;
@@ -26,12 +22,12 @@ pub type Checkout = Lifecycle<CheckoutKind>;
 /// What a Checkout checks out, from where, and for whom. It declares the
 /// stored Checkout (kind code `ck`), homed at the host it lives on.
 ///
-/// A Checkout is owned by its role's owner (ADR 0064): the convoy for a
-/// convoy role, the Ensure for a standing role, so exactly one of `convoy`
-/// and `ensure` is set, and a worktree names its `clone`. The writer's
-/// admission enforces both: the derive has no cross-field CHECK, and each
-/// reference is a top-level column, not a variant's datum, so that removing
-/// its target's identity searches its index instead of scanning.
+/// A Checkout is held for its role's owner (ADR 0064): the convoy for a
+/// convoy role, the Ensure for a standing role, recorded as its [`Holder`]
+/// with no ownership semantics (owner's look-over ruling 4). A worktree names
+/// its `clone`, which the writer checks. Each reference is a top-level column,
+/// not a variant's datum, so that removing its target's identity searches its
+/// index instead of scanning.
 ///
 /// Realised under its path once the branch is observed checked out there.
 /// Integration (clean, pushed, landed, the change request) is observed on
@@ -43,8 +39,7 @@ pub type Checkout = Lifecycle<CheckoutKind>;
     state = LifecycleState,
     index(name = "by_environment", eq(environment)),
     index(name = "by_clone", eq(clone), when(clone is_some)),
-    index(name = "by_convoy", eq(convoy), when(convoy is_some)),
-    index(name = "by_ensure", eq(ensure), when(ensure is_some))
+    index(name = "by_holder", eq(holder), when(holder is_some))
 )]
 pub struct CheckoutRequest {
     /// The Repository resource's key, interned (domain `rk`).
@@ -59,8 +54,9 @@ pub struct CheckoutRequest {
     pub source: Source,
     /// A worktree's Clone; for a fresh clone, the local clone it seeds from, if any.
     pub clone: Option<Ref<Resource<clone::Clone>>>,
-    pub convoy: Option<Ref<Resource<Convoy>>>,
-    pub ensure: Option<Ref<Resource<Ensure>>>,
+    /// Who it is held for: `convoy:<name>` or `ensure:<name>`. A finishing
+    /// holder finds its checkouts through this index and releases them.
+    pub holder: Option<Holder>,
 }
 
 /// How the checkout is made.
