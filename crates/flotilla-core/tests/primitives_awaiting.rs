@@ -84,3 +84,17 @@ fn past_due_records_expire_and_withdrawn_ones_stay() {
     assert_eq!(records.get(&stall("later", None).message).expect("later").label(), AwaitingReplyLabel::Open);
     assert_eq!(records.get(&stall("withdrawn", None).message).expect("withdrawn").label(), AwaitingReplyLabel::Withdrawn);
 }
+
+// Behaviour (#3730 review): a repeated send records nothing more; a repeat that would record
+// something else about the same message is an error naming both, never silently dropped.
+#[test]
+fn a_repeated_send_is_the_first_and_a_different_one_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let records = AwaitingReplies::open("home-a", &service(&dir)).expect("open");
+    assert!(records.record(stall("s1", None), Timestamp(1)).expect("recorded"));
+    assert!(!records.record(stall("s1", None), Timestamp(2)).expect("the same send"));
+    let mut other = stall("s1", None);
+    other.kind = "reply".into();
+    let refused = records.record(other, Timestamp(3)).expect_err("another record for the same message");
+    assert!(refused.contains("is recorded as"), "{refused}");
+}

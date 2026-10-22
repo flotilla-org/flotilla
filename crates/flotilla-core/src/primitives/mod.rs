@@ -508,22 +508,32 @@ impl MessagePrimitives {
             let replies = service
                 .with_store(|store| {
                     let mut read = store.read()?;
-                    let page = read.page(&flotilla_state_machines::machines::message::MessageSpec::by_reply(&message), None, 64)?;
                     let mut found = Vec::new();
-                    for id in page.ids {
-                        if let Some(loaded) = read.load::<Resource<Message>>(id)? {
-                            if loaded.home == here {
-                                found.push((MessageRef::new(loaded.name, loaded.home), loaded.value.spec().inbox.clone()));
+                    let mut after = None;
+                    loop {
+                        let page =
+                            read.page(&flotilla_state_machines::machines::message::MessageSpec::by_reply(&message), after.as_ref(), 64)?;
+                        for id in page.ids {
+                            if let Some(loaded) = read.load::<Resource<Message>>(id)? {
+                                if loaded.home == here {
+                                    found.push((MessageRef::new(loaded.name, loaded.home), loaded.value.spec().inbox.clone()));
+                                }
                             }
                         }
+                        after = page.next;
+                        if after.is_none() {
+                            return Ok(found);
+                        }
                     }
-                    Ok(found)
                 })
                 .map_err(|error| error.to_string())?;
-            for (reply, inbox) in replies {
-                awaiting.landed(&reply, &inbox, Some(&message), now)?;
+            // Each reply is its own evidence: one that fails does not stop the others.
+            let failures: Vec<String> =
+                replies.iter().filter_map(|(reply, inbox)| awaiting.landed(reply, inbox, Some(&message), now).err()).collect();
+            match failures.is_empty() {
+                true => Ok(recorded),
+                false => Err(format!("recorded, but answering it from earlier replies failed: {}", failures.join("; "))),
             }
-            Ok(recorded)
         })
         .await
         .map_err(|error| error.to_string())?
@@ -813,6 +823,9 @@ impl flotilla_crew::ports::EngineMessages for MessagePrimitives {
     }
     async fn withdraw(&self, namespace: &str, record: &str, convoy: &str) -> Result<(), String> {
         MessagePrimitives::withdraw(self, namespace, record, convoy).await
+    }
+    fn home(&self) -> String {
+        self.home.clone()
     }
     async fn await_reply(
         &self,

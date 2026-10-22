@@ -5,8 +5,9 @@
 //! the sender's home and named by the message it awaits. The Message itself
 //! is homed at its receiver (ADR 0055), so a send that crosses homes cannot
 //! put both in one transaction: the sender's send is the record's own write,
-//! made before the message is routed to its receiver, and a routed admission
-//! that fails withdraws the record with the refusal as its reason.
+//! made once the receiver's home has admitted the message (a refused send
+//! records nothing). A reply that landed before the record is found through
+//! the Message `by_reply` index and answers it as it is written.
 //!
 //! A record is answered when a reply to its message lands in the sender's own
 //! inbox at this home, a local input ([`AwaitingReplies::landed`]), and
@@ -15,7 +16,7 @@
 //! [`STALL`] about the stalled seat; "stalled" is the indexed read of open
 //! stall records by subject ([`AwaitingReplies::open_about`]).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use flotilla_address::Address;
 use flotilla_engine_store::StoreLog;
@@ -32,19 +33,25 @@ use flotilla_state_machines::{
 };
 
 /// The record kind of a stall: a Reply-expectation message about the seat.
-pub const STALL: &str = "stall";
+pub const STALL: &str = flotilla_resources::STALL_KIND;
 
 /// The most records one indexed read returns.
 const PAGE: u32 = 256;
 
-/// This home's AwaitingReply records and the world their gates read.
+/// This home's AwaitingReply records. Each gate's world is built for its one
+/// edge from what the caller observed (the reply that landed, the sender's
+/// authority) and dropped after it, so nothing accumulates with traffic.
 ///
-/// Lock order: a write takes `home`, then `world`.
+/// Poisoning: a panic while the lock is held poisons it; an applied edge
+/// leaves the home as its log took it, so the lock is recovered.
 pub struct AwaitingReplies {
     home_name: String,
     service: Arc<Service>,
     home: Mutex<Home<AwaitingReply, StoreLog>>,
-    world: Mutex<MemoryAwaitingReplyWorld>,
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A record's name: the message it awaits, which names it at this home.
@@ -79,30 +86,30 @@ impl AwaitingReplies {
         for record in stored {
             records.restore(record).map_err(|error| format!("{error:?}"))?;
         }
-        Ok(Self {
-            home_name: home.to_owned(),
-            service: Arc::clone(service),
-            home: Mutex::new(records),
-            world: Mutex::new(MemoryAwaitingReplyWorld::default()),
-        })
+        Ok(Self { home_name: home.to_owned(), service: Arc::clone(service), home: Mutex::new(records) })
     }
 
     /// Writes the sender's record for a send expecting a reply or an outcome;
-    /// `Ok(false)` when the record exists already (a repeated send).
+    /// `Ok(false)` when the record exists already (a repeated send). A
+    /// record's spec never changes, so a repeat that would record something
+    /// else (another kind or subject) is an error naming both.
     pub fn record(&self, spec: AwaitingReplySpec, now: Timestamp) -> Result<bool, String> {
         let name = record_name(&spec.message);
-        let mut home = self.home.lock().map_err(|_| "awaiting-reply home lock poisoned")?;
-        if home.get(&name).is_some() {
+        let mut home = locked(&self.home);
+        if let Some(existing) = home.get(&name) {
+            if *existing.spec() != spec {
+                return Err(format!("AwaitingReply `{name}` is recorded as {:?}, not {spec:?}", existing.spec()));
+            }
             return Ok(false);
         }
-        let world = self.world.lock().map_err(|_| "awaiting-reply world lock poisoned")?;
-        home.create(&name, spec, &*world, now).map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))?;
+        home.create(&name, spec, &MemoryAwaitingReplyWorld::default(), now)
+            .map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))?;
         Ok(true)
     }
 
     /// The record awaiting `message`, if it is homed here.
     pub fn get(&self, message: &MessageRef) -> Option<Resource<AwaitingReply>> {
-        self.home.lock().ok()?.get(&record_name(message)).cloned()
+        locked(&self.home).get(&record_name(message)).cloned()
     }
 
     /// A message landed in `inbox` at this home. When it replies to a message
@@ -118,14 +125,15 @@ impl AwaitingReplies {
     ) -> Result<Option<String>, String> {
         let Some(awaited) = in_reply_to else { return Ok(None) };
         let name = record_name(awaited);
-        let mut home = self.home.lock().map_err(|_| "awaiting-reply home lock poisoned")?;
-        let mut world = self.world.lock().map_err(|_| "awaiting-reply world lock poisoned")?;
-        world.land(reply, inbox, Some(awaited));
+        let mut home = locked(&self.home);
         let Some(record) = home.get(&name) else { return Ok(None) };
         if record.label() != AwaitingReplyLabel::Open || record.spec().sender != *inbox {
             return Ok(None);
         }
-        match home.apply(&name, Answer { reply: reply.clone() }, &*world, now) {
+        // The gate's evidence: this reply, landed in this inbox, answering this message.
+        let mut world = MemoryAwaitingReplyWorld::default();
+        world.land(reply, inbox, Some(awaited));
+        match home.apply(&name, Answer { reply: reply.clone() }, &world, now) {
             Ok(_) => Ok(Some(name)),
             Err(WriteError::Refused(AwaitingReplyRefusal::NotOpen)) => Ok(None),
             Err(error) => Err(format!("AwaitingReply `{name}`: {error:?}")),
@@ -136,20 +144,30 @@ impl AwaitingReplies {
     /// withdrawn or superseded. An ended record is left as it is.
     pub fn withdraw(&self, message: &MessageRef, by: &Address, reason: &str, now: Timestamp) -> Result<bool, String> {
         let name = record_name(message);
-        let mut home = self.home.lock().map_err(|_| "awaiting-reply home lock poisoned")?;
-        let mut world = self.world.lock().map_err(|_| "awaiting-reply world lock poisoned")?;
+        let mut home = locked(&self.home);
         if home.get(&name).is_none_or(|record| record.label() != AwaitingReplyLabel::Open) {
             return Ok(false);
         }
-        // The sender withdraws its own record: the authority is its send's.
+        // Only this home's sender calls this, about its own send: a sender may
+        // always withdraw what it awaits, so its authority is recorded as given.
+        // A decision about someone else's record would read a real grant.
         let authority = format!("{name}/withdraw");
+        let mut world = MemoryAwaitingReplyWorld::default();
         world.authority.put(&Ref::new(authority.as_str()), true);
         let withdraw = Withdraw { by: by.clone(), reason: reason.to_owned(), authority: Ref::new(authority) };
-        home.apply(&name, withdraw, &*world, now).map(|_| true).map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))
+        home.apply(&name, withdraw, &world, now).map(|_| true).map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))
     }
 
     /// Expires every open record homed here whose deadline has passed with no
     /// reply present: one read of the deadline index, in deadline order.
+    ///
+    /// The scan stops at the first record not yet due. That relies on the
+    /// index's declaration: `order(deadline)` with `when(state in [Open],
+    /// deadline is_some)`, so it holds only open records with a deadline, in
+    /// deadline order. It holds every home's replicated records too (a
+    /// home is the record's identity, not an indexed column); those are read
+    /// and passed over, and only this home's are expired. A reply present has
+    /// already answered its record when it landed, so it is no longer Open.
     pub fn expire_due(&self, now: Timestamp) -> Result<Vec<String>, String> {
         let due: Vec<String> = self
             .service
@@ -178,10 +196,10 @@ impl AwaitingReplies {
             })
             .map_err(|error| error.to_string())?;
         let mut expired = Vec::new();
-        let mut home = self.home.lock().map_err(|_| "awaiting-reply home lock poisoned")?;
-        let world = self.world.lock().map_err(|_| "awaiting-reply world lock poisoned")?;
+        let mut home = locked(&self.home);
+        let world = MemoryAwaitingReplyWorld::default();
         for name in due {
-            match home.apply(&name, Expire, &*world, now) {
+            match home.apply(&name, Expire, &world, now) {
                 Ok(_) => expired.push(name),
                 // A reply present wins over a passed deadline; an ended record stays.
                 Err(WriteError::Refused(_)) => {}

@@ -40,6 +40,8 @@ pub trait EngineMessages: Send + Sync {
     ) -> Result<flotilla_resources::ResourceObject<flotilla_resources::Message>, flotilla_resources::ResourceError>;
     /// An operator withdraws a queued message homed here, on the convoy's authority.
     async fn withdraw(&self, namespace: &str, record: &str, convoy: &str) -> Result<(), String>;
+    /// The home this path admits at: this daemon's.
+    fn home(&self) -> String;
     /// Records the sender's half of a send expecting a reply or an outcome,
     /// once it is admitted at `home` (#3587 layer 7): an AwaitingReply record
     /// of `kind` at this home, the sender's, about `about` when given.

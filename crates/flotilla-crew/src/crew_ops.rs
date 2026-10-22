@@ -88,7 +88,7 @@ fn awaiting_kind(expectation: &flotilla_resources::MessageExpectation, stall_of:
     use flotilla_resources::MessageExpectation;
     match (expectation, stall_of) {
         (MessageExpectation::None, _) => None,
-        (_, Some(_)) => Some("stall"),
+        (_, Some(_)) => Some(flotilla_resources::STALL_KIND),
         (MessageExpectation::Reply, None) => Some("reply"),
         (MessageExpectation::Outcome { .. }, None) => Some("outcome"),
     }
@@ -2773,6 +2773,8 @@ impl CrewService {
         );
         match self.message_record(&request.namespace, &name).await {
             Ok(existing) if self.same_message_intent(&existing.object.spec, &intent) => {
+                // A repeat records what an earlier send could not (record is idempotent).
+                self.record_awaiting(&request.namespace, &name, &intent, self.admitted_home(&existing), request.stall_of.as_deref()).await;
                 return Ok(CrewTurnAdmission {
                     new_turn: false,
                     rung: TurnDeliveryRung::WarmSession,
@@ -2907,6 +2909,8 @@ impl CrewService {
         };
         match self.message_record(&request.namespace, &name).await {
             Ok(existing) if self.same_message_intent(&existing.object.spec, &intent) => {
+                // A repeat records what an earlier send could not (record is idempotent).
+                self.record_awaiting(&request.namespace, &name, &intent, self.admitted_home(&existing), request.stall_of.as_deref()).await;
                 return Ok(CrewTurnAdmission {
                     new_turn: false,
                     rung,
@@ -2916,7 +2920,7 @@ impl CrewService {
                         .as_ref()
                         .and_then(|status| status.canonical_predecessor.clone())
                         .unwrap_or_else(|| ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &name)),
-                })
+                });
             }
             Ok(_) => return Err("message producer ID already names different intent".into()),
             Err(ResourceError::NotFound { .. }) => {}
@@ -3295,7 +3299,9 @@ impl CrewService {
     ) -> Result<ResourceRef, String> {
         match self.message_record(namespace, name).await {
             Ok(existing) if self.same_message_intent(&existing.object.spec, intent) => {
-                return Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, &existing.object.metadata.name))
+                // A repeat records what an earlier send could not (record is idempotent).
+                self.record_awaiting(namespace, name, intent, self.admitted_home(&existing), None).await;
+                return Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, &existing.object.metadata.name));
             }
             Ok(_) => return Err("message producer ID already names different intent".into()),
             Err(ResourceError::NotFound { .. }) => {}
@@ -3325,6 +3331,14 @@ impl CrewService {
         let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
         self.record_awaiting(namespace, &record.metadata.name, intent, home, None).await;
         Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
+    }
+
+    /// The home that admitted an engine message, from where it was read.
+    fn admitted_home(&self, read: &flotilla_resources::ReadResourceObject<flotilla_resources::Message>) -> Option<String> {
+        match &read.provenance {
+            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str().to_owned()),
+            ResourceProvenance::Local => self.message_primitives().map(|engine| engine.home()),
+        }
     }
 
     /// With `[primitives]` on, records the sender's half of a send expecting
