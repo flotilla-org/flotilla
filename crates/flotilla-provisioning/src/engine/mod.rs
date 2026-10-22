@@ -345,9 +345,16 @@ where
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         let Some(lifecycles) = &self.lifecycles else { return Ok(Prepared::Old(self.inner.prepare(obj).await?)) };
-        if let Some(resource) = lifecycles.get(&obj.metadata.name).filter(ended) {
+        // The read takes the home's lock, which a step may hold for its write: off the async workers too.
+        let owned = ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status: obj.status.clone() };
+        let home = Arc::clone(lifecycles);
+        let ended_copy =
+            tokio::task::spawn_blocking(move || home.get(&owned.metadata.name).filter(ended).map(|resource| B::copy(&owned, &resource)))
+                .await
+                .map_err(|error| ResourceError::other(format!("engine read: {error}")))?;
+        if let Some(copy) = ended_copy {
             // The engine has ended it: the old reconciler does not act on it again.
-            return Ok(Prepared::Decided(Mutex::new(Some(ReconcileOutcome::new(B::copy(obj, &resource))))));
+            return Ok(Prepared::Decided(Mutex::new(Some(ReconcileOutcome::new(copy)))));
         }
         let prepared = self.inner.prepare(obj).await?;
         // The old reconciler's pure reconcile runs here, at the moment the engine records its

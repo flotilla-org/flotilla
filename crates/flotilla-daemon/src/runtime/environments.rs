@@ -430,13 +430,25 @@ pub(super) async fn mark_unavailable_environment(
     if let Some(engine) = &state.provisioning {
         match environments.get(env_id.as_str()).await {
             Ok(environment) => {
-                patch = flotilla_provisioning::engine::decide::<EnvironmentBinding>(
-                    engine.environments.as_ref(),
-                    &environment,
-                    patch,
-                    chrono::Utc::now(),
-                )
-                .patch;
+                // The engine's steps are synchronous SQLite transactions; they run off the async
+                // workers, as in `Engine::prepare`.
+                let lifecycles = Arc::clone(&engine.environments);
+                patch = tokio::task::spawn_blocking(move || {
+                    flotilla_provisioning::engine::decide::<EnvironmentBinding>(
+                        lifecycles.as_ref(),
+                        &environment,
+                        patch,
+                        chrono::Utc::now(),
+                    )
+                    .patch
+                })
+                .await
+                .map_err(|error| format!("mark unavailable environment {env_id}: engine decision: {error}"))?;
+                if patch.is_none() {
+                    // A refused edge (a backing lost before it was realised) or one the engine
+                    // already took: the old status stays as it is.
+                    tracing::info!(environment = %env_id, "the engine took no edge for this backing; its old status is unchanged");
+                }
             }
             Err(ResourceError::NotFound { .. }) => {
                 tracing::debug!(environment = %env_id, "environment record gone; nothing to mark");
@@ -444,9 +456,6 @@ pub(super) async fn mark_unavailable_environment(
             }
             Err(error) => return Err(format!("mark unavailable environment {env_id}: {error}")),
         }
-    }
-    if patch.is_none() {
-        tracing::debug!(environment = %env_id, "the engine already holds this environment's state; nothing to mark");
     }
     if let Some(patch) = patch {
         flotilla_store::apply_status_patch(&environments, env_id.as_str(), &patch)
