@@ -131,7 +131,7 @@ async fn a_fresh_convoy_is_admitted_with_its_seeded_promises() {
     let convoy = admitted(&fixture, "c", status).await;
     let engine = fixture.convoys.get("c").expect("held");
     let promises: Vec<_> = engine.spec().promises.iter().map(|row| (row.record.label.clone(), row.record.owner.clone())).collect();
-    assert_eq!(promises, vec![("template/pr".to_owned(), SeatName::new("coder", ""))]);
+    assert_eq!(promises, vec![("template/coder/pr".to_owned(), SeatName::new("coder", ""))]);
     assert_eq!(engine.spec().seats.len(), 2);
     assert_eq!(convoy.status.as_ref().expect("status").promises, seeded, "the copy reproduces the seeded promises");
     assert!(!fixture.engine.copy_back(&convoy).await.expect("copy"), "nothing to copy");
@@ -202,17 +202,18 @@ async fn crew_declared_promises_follow_the_crew() {
     assert_eq!(fixture.convoys.get("c").expect("held").spec().promises.len(), 3);
 }
 
-// Behaviour: a role repeated across vessels gets one seat per vessel, and its repeated template
-// ids are qualified labels; the old status keeps the ids crews submit against, and each crew's
-// submission reaches its own promise.
+// Behaviour: a role repeated across vessels gets one seat per vessel, and each seat's template
+// promise is named by that seat; the old status keeps the ids crews submit against, and each
+// crew's submission reaches its own promise.
 #[tokio::test]
-async fn repeated_roles_get_seats_and_qualified_labels() {
+async fn repeated_roles_get_seats_and_template_labels_by_seat() {
     let fixture = fixture();
     let convoy = admitted(&fixture, "c", bootstrapped(vec![("a", vec![crew("coder", true)]), ("b", vec![crew("coder", true)])])).await;
     let engine = fixture.convoys.get("c").expect("held");
     let labels: Vec<_> = engine.spec().promises.iter().map(|row| row.record.label.clone()).collect();
-    assert_eq!(labels, vec!["@coder~a/template/pr".to_owned(), "@coder~b/template/pr".to_owned()]);
-    assert_eq!(convoy_map::old_id(&labels[1]), "template/pr");
+    assert_eq!(labels, vec!["template/coder~a/pr".to_owned(), "template/coder~b/pr".to_owned()]);
+    let second = &engine.spec().promises.iter().nth(1).expect("b's promise").record;
+    assert_eq!(convoy_map::old_id(second), "template/pr");
     fixture.engine.promise(&convoy, "b", "coder", &submit("template/pr", PR), Actor::Crew).await.expect("submitted");
     let convoy = reread(&fixture.backend, "c").await;
     assert_eq!(old_promise(&convoy, "a", "coder", "template/pr").state, PromiseState::Open);
@@ -232,7 +233,10 @@ async fn handoff_reassigns_open_promises() {
     let engine = fixture.convoys.get("c").expect("held");
     let (_, fixer) = engine.spec().seat(&SeatName::new("fixer", "work")).expect("fan-out seat");
     assert_eq!(fixer.parent, Some(SeatName::new("reviewer", "")));
-    assert_eq!(engine.spec().promises.iter().next().expect("promise").record.owner, SeatName::new("fixer", "work"));
+    let promise = &engine.spec().promises.iter().next().expect("promise").record;
+    assert_eq!(promise.owner, SeatName::new("fixer", "work"));
+    // A label names the deliverable, so reassignment never changes it.
+    assert_eq!(promise.label, "template/coder/pr");
 }
 
 // Behaviour: an operator keeps a crew's open promises by verdict (the old `--force`), or keeps or
@@ -243,10 +247,10 @@ async fn operator_verdicts_keep_and_retract() {
     let convoy = admitted(&fixture, "c", bootstrapped(vec![("a", vec![crew("coder", true)]), ("b", vec![crew("coder", true)])])).await;
     let scope = VerdictScope { vessel: "a".into(), role: Some("coder".into()) };
     let kept = fixture.engine.keep_by_verdict(&convoy, &scope, "alice", "merged by hand").await.expect("kept");
-    assert_eq!(kept, vec!["@coder~a/template/pr".to_owned()]);
-    let refused = fixture.engine.verdict(&convoy, "@coder~b/template/pr", false, "alice", "").await.expect_err("no reason");
+    assert_eq!(kept, vec!["template/coder~a/pr".to_owned()]);
+    let refused = fixture.engine.verdict(&convoy, "template/coder~b/pr", false, "alice", "").await.expect_err("no reason");
     assert!(refused.contains("Unauthorised"), "{refused}");
-    fixture.engine.verdict(&convoy, "@coder~b/template/pr", false, "alice", "dropped").await.expect("retracted");
+    fixture.engine.verdict(&convoy, "template/coder~b/pr", false, "alice", "dropped").await.expect("retracted");
     let convoy = reread(&fixture.backend, "c").await;
     assert_eq!(old_promise(&convoy, "a", "coder", "template/pr").state, PromiseState::Kept);
     assert_eq!(old_promise(&convoy, "b", "coder", "template/pr").state, PromiseState::Retracted);
@@ -280,19 +284,20 @@ async fn abandonment_ends_the_engine_convoy() {
     fixture.engine.abandon(&convoy, "alice", "again").await.expect("already ended");
 }
 
-// Behaviour (dummy fleet, #3587 layer 6): two crews may each declare and submit a promise of the
-// same id; each reaches its own, the second under a qualified label, even once the first is kept.
+// Behaviour (#3721 look-over ruling): a label names one deliverable in its convoy. A second
+// crew declaring a label already taken is refused with the owner named, never qualified; under its
+// own label it is declared, and the first crew's kept promise is untouched.
 #[tokio::test]
-async fn two_crews_submit_promises_of_one_id() {
+async fn a_taken_label_is_refused_at_declaration() {
     let fixture = fixture();
     let convoy = admitted(&fixture, "c", bootstrapped(vec![("work", vec![crew("coder", true), crew("reviewer", false)])])).await;
-    let ledger = |by: &str| PromiseOperation::Submit {
-        id: "script-ledger".into(),
+    let ledger = |id: &str, by: &str| PromiseOperation::Submit {
+        id: id.into(),
         kind: PromiseKind::DecisionLedger,
         source: OldSource::Crew,
         submission: Submission { reference: format!("{by}-ledger"), metadata: BTreeMap::new(), submitted_at: Utc::now(), verdict: None },
     };
-    fixture.engine.promise(&convoy, "work", "coder", &ledger("coder"), Actor::Crew).await.expect("coder's ledger");
+    fixture.engine.promise(&convoy, "work", "coder", &ledger("script-ledger", "coder"), Actor::Crew).await.expect("coder's ledger");
     let kept = PromiseOperation::Verdict {
         id: "script-ledger".into(),
         reference: String::new(),
@@ -300,14 +305,31 @@ async fn two_crews_submit_promises_of_one_id() {
         verdict: SubmissionVerdict { accepted: true, who: "artifact".into(), at: Utc::now(), why: "exists".into() },
     };
     fixture.engine.promise(&convoy, "work", "coder", &kept, Actor::Observer).await.expect("kept");
-    fixture.engine.promise(&convoy, "work", "reviewer", &ledger("reviewer"), Actor::Crew).await.expect("reviewer's ledger");
+    let refused =
+        fixture.engine.promise(&convoy, "work", "reviewer", &ledger("script-ledger", "reviewer"), Actor::Crew).await.expect_err("taken");
+    assert!(refused.contains("`script-ledger` is already declared") && refused.contains("owned by `coder`"), "{refused}");
+    let own = ledger("script-ledger-reviewer", "reviewer");
+    fixture.engine.promise(&convoy, "work", "reviewer", &own, Actor::Crew).await.expect("reviewer's ledger");
     let convoy = reread(&fixture.backend, "c").await;
     assert_eq!(old_promise(&convoy, "work", "coder", "script-ledger").state, PromiseState::Kept);
-    assert_eq!(old_promise(&convoy, "work", "reviewer", "script-ledger").state, PromiseState::Submitted);
-    let labels: Vec<_> = fixture.convoys.get("c").expect("held").spec().promises.iter().map(|row| row.record.label.clone()).collect();
-    assert!(labels.contains(&"@reviewer/script-ledger".to_owned()), "{labels:?}");
+    assert_eq!(old_promise(&convoy, "work", "reviewer", "script-ledger-reviewer").state, PromiseState::Submitted);
     // The same reference again is the submission already made.
-    fixture.engine.promise(&convoy, "work", "coder", &ledger("coder"), Actor::Crew).await.expect("kept: a no-op");
+    fixture.engine.promise(&convoy, "work", "coder", &ledger("script-ledger", "coder"), Actor::Crew).await.expect("kept: a no-op");
+}
+
+// Behaviour (#3721 look-over ruling): an admission whose promises share a label is refused with
+// a reason naming the label and its seats, and nothing is admitted.
+#[tokio::test]
+async fn an_admission_with_a_label_clash_is_refused() {
+    let fixture = fixture();
+    let mut status = bootstrapped(vec![("work", vec![crew("coder", true), crew("reviewer", false)])]);
+    let api = PromiseOperation::Declare { id: "api-split".into(), kind: PromiseKind::Pr, source: OldSource::Dispatch };
+    promises::apply(&mut status, "work", "coder", &api);
+    promises::apply(&mut status, "work", "reviewer", &api);
+    let convoy = old_convoy(&fixture.backend, "c", status).await;
+    let Admission::Refused(reason) = fixture.engine.admit(&convoy).await.expect("admit") else { panic!("admitted a clash") };
+    assert!(reason.contains("`api-split`") && reason.contains("coder, reviewer"), "{reason}");
+    assert!(!fixture.engine.holds(&convoy));
 }
 
 // Behaviour (#3721 review): an operator's promise operation carries operator authority, so it
@@ -331,8 +353,8 @@ async fn an_ambiguous_verdict_is_refused_with_the_labels() {
     let fixture = fixture();
     let convoy = admitted(&fixture, "c", bootstrapped(vec![("a", vec![crew("coder", true)]), ("b", vec![crew("coder", true)])])).await;
     let refused = fixture.engine.verdict(&convoy, "template/pr", true, "alice", "merged").await.expect_err("ambiguous");
-    assert!(refused.contains("`@coder~a/template/pr`") && refused.contains("`@coder~b/template/pr`"), "{refused}");
-    fixture.engine.verdict(&convoy, "@coder~b/template/pr", true, "alice", "merged").await.expect("exact");
+    assert!(refused.contains("`template/coder~a/pr`") && refused.contains("`template/coder~b/pr`"), "{refused}");
+    fixture.engine.verdict(&convoy, "template/coder~b/pr", true, "alice", "merged").await.expect("exact");
     let convoy = reread(&fixture.backend, "c").await;
     assert_eq!(old_promise(&convoy, "a", "coder", "template/pr").state, PromiseState::Open);
     assert_eq!(old_promise(&convoy, "b", "coder", "template/pr").state, PromiseState::Kept);

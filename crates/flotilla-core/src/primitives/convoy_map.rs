@@ -9,11 +9,14 @@
 //!   A crew added later (a handoff target) is always discriminated by its
 //!   vessel. The snapshot never changes, so no seat is renamed by a later
 //!   crew of the same role.
-//! - **Labels** (layer 6 labels ruling): an old promise id is its label when
-//!   no other crew of the convoy uses that id; ids that repeat (each
-//!   deliverer's `template/pr`) are qualified by their seat, `@<seat>/<id>`.
-//!   No old id starts with `@`, so [`old_id`] strips the qualifier, and the
-//!   old status keeps the ids crews already submit against.
+//! - **Labels** (#3721 look-over ruling): a label is the permanent name of
+//!   what a promise delivers, unique in its convoy and unchanged by
+//!   `Reassign`. The template declares one deliverable per seat, so a
+//!   template promise is `template/<role>[~<seat>]/<kind>`, named by the seat
+//!   it was declared for; any other declaration (a dispatch
+//!   label, a crew's own id) is labelled by its id. A label already taken is
+//!   refused, never qualified: [`clash`] at admission, the crew verbs after.
+//!   [`old_id`] gives back the id crews submit against on the old path.
 //! - **Targets**: a promise is about its convoy's work, so its target is the
 //!   convoy's address.
 //! - **Submissions**: a `pr` submission is its change request's address at
@@ -100,7 +103,54 @@ impl Crews {
     }
 }
 
-/// A seat as a label qualifier: its role, and `~<seat>` when it has one.
+/// The label a newly declared promise gets: the name of what it delivers.
+/// The template declares one deliverable of `kind` per seat of its frozen
+/// workflow, so a template promise is named by that seat, given once at
+/// declaration and kept through any `Reassign`. Any other declaration is
+/// named by its declarer, so its id is its label.
+pub fn label(seat: &SeatName, id: &str, kind: OldKind, source: OldSource) -> String {
+    match source {
+        OldSource::Template => format!("template/{}/{}", seat_key(seat), kind.as_str()),
+        OldSource::Dispatch | OldSource::Crew => id.to_owned(),
+    }
+}
+
+/// The id a crew submits an engine promise against on the old path: a
+/// template promise's `template/<kind>`, else its label.
+pub fn old_id(promise: &Promise) -> String {
+    match promise.source {
+        PromiseSource::Template => format!("template/{}", promise.kind),
+        PromiseSource::Dispatch | PromiseSource::Crew => promise.label.clone(),
+    }
+}
+
+/// Why a label cannot be declared in `convoy`: another promise holds it.
+pub fn taken(convoy: &Resource<Convoy>, label: &str) -> Option<String> {
+    convoy.spec().promises.iter().map(|row| &row.record).find(|promise| promise.label == label).map(|promise| {
+        format!(
+            "promise label `{label}` is already declared in this convoy, owned by `{}`; declare the deliverable under a distinct label",
+            seat_key(&promise.owner)
+        )
+    })
+}
+
+/// Why an admission request cannot be admitted: two of its promises share a
+/// label. Template labels are unique by seat and dispatch labels by admission,
+/// so this guards the request rather than shaping it.
+pub fn clash(request: &ConvoyRequest) -> Option<String> {
+    let mut owners: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for promise in request.promises.values() {
+        owners.entry(promise.label.as_str()).or_default().push(seat_key(&promise.owner));
+    }
+    owners.into_iter().find(|(_, seats)| seats.len() > 1).map(|(label, seats)| {
+        format!(
+            "promise label `{label}` is declared by several seats ({}); a label names one deliverable, so give each a distinct label",
+            seats.join(", ")
+        )
+    })
+}
+
+/// A seat as views show it: its role, and `~<seat>` when it has one.
 fn seat_key(seat: &SeatName) -> String {
     if seat.seat.is_empty() {
         seat.role.clone()
@@ -109,33 +159,9 @@ fn seat_key(seat: &SeatName) -> String {
     }
 }
 
-/// An old id qualified by its seat.
-pub fn qualified(seat: &SeatName, id: &str) -> String {
-    format!("@{}/{id}", seat_key(seat))
-}
-
-/// The old id a label stands for: the label, less any seat qualifier.
-pub fn old_id(label: &str) -> &str {
-    match label.strip_prefix('@').and_then(|rest| rest.split_once('/')) {
-        Some((_, id)) => id,
-        None => label,
-    }
-}
-
-/// The label a new promise of `seat` gets for old `id`: the id while no
-/// other promise of the convoy has it, else qualified by the seat.
-pub fn label_for(seat: &SeatName, id: &str, taken: impl Fn(&str) -> bool) -> String {
-    if taken(id) {
-        qualified(seat, id)
-    } else {
-        id.to_owned()
-    }
-}
-
 /// The engine promise an old crew calls `id`: its own promise of that label,
 /// or of that old id. A crew addresses only the promises it owns, so another
-/// crew's promise of the same id is never it: a new one of this crew's is
-/// declared under a qualified label.
+/// crew's promise of the same id is never it.
 pub fn find<'a>(convoy: &'a Resource<Convoy>, seat: &SeatName, id: &str) -> Option<&'a Promise> {
     let owned: Vec<&Promise> = convoy.spec().promises.iter().map(|row| &row.record).filter(|promise| promise.owner == *seat).collect();
     owned.iter().copied().find(|promise| promise.label == id).or_else(|| {
@@ -152,7 +178,7 @@ pub fn old_ids(convoy: &Resource<Convoy>) -> BTreeMap<PromiseId, String> {
     let mut ids = BTreeMap::new();
     for row in convoy.spec().promises.iter() {
         let promise = &row.record;
-        let short = old_id(&promise.label).to_owned();
+        let short = old_id(promise);
         let id = if used.insert((promise.owner.clone(), short.clone())) { short } else { promise.label.clone() };
         used.insert((promise.owner.clone(), id.clone()));
         ids.insert(promise.id, id);
@@ -267,14 +293,10 @@ pub fn request(convoy: &ResourceObject<OldConvoy>) -> Result<ConvoyRequest, Stri
     let supervised_by = supervisor(convoy)?;
     let target = address(convoy)?;
     let declared = declarations(convoy, status);
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for declaration in &declared {
-        *counts.entry(declaration.id.as_str()).or_default() += 1;
-    }
     let mut promises = BTreeMap::new();
     for (index, declaration) in declared.iter().enumerate() {
         let owner = crews.seat(&declaration.vessel, &declaration.role);
-        let label = label_for(&owner, &declaration.id, |id| counts.get(id).is_some_and(|count| *count > 1));
+        let label = label(&owner, &declaration.id, declaration.kind, declaration.source);
         let id = PromiseId(u32::try_from(index).map_err(|_| "a convoy holds fewer than 2^32 promises".to_owned())?);
         promises.insert(
             id,

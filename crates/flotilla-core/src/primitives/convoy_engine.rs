@@ -19,7 +19,7 @@ use flotilla_resources::{
         engine::{Actor, Admission, EngineConvoys, SkipReason, VerdictScope},
         reconcile::is_ensured,
     },
-    promises::PromiseOperation,
+    promises::{PromiseKind as OldKind, PromiseOperation, PromiseSource as OldSource},
     Convoy as OldConvoy, ConvoyStatusPatch, Forge, ForgeSpec, ResourceObject,
 };
 use flotilla_schema::Timestamp;
@@ -116,10 +116,6 @@ fn next_id(convoy: &Resource<Convoy>) -> PromiseId {
     PromiseId(convoy.spec().promises.iter().map(|row| row.record.id.0 + 1).max().unwrap_or(0))
 }
 
-fn taken(convoy: &Resource<Convoy>) -> impl Fn(&str) -> bool + '_ {
-    move |label| convoy.spec().promises.iter().any(|row| row.record.label == label)
-}
-
 /// The world key an edge's recorded input is read under.
 fn input(convoy: &str, what: &str) -> String {
     format!("{convoy}/{what}")
@@ -149,6 +145,9 @@ impl EngineConvoys for ConvoyEngine {
             return Ok(Admission::Skipped(SkipReason::Decided(history)));
         }
         let request = map::request(convoy)?;
+        if let Some(clash) = map::clash(&request) {
+            return Ok(Admission::Refused(clash));
+        }
         let project = request.project.clone();
         let convoys = Arc::clone(&self.convoys);
         let name = convoy.metadata.name.clone();
@@ -185,11 +184,7 @@ impl EngineConvoys for ConvoyEngine {
         let target = map::address(convoy)?;
         let submitted = match operation {
             PromiseOperation::Submit { kind, submission, .. } => {
-                let forges = if *kind == flotilla_resources::promises::PromiseKind::Pr {
-                    self.forges(&convoy.metadata.namespace).await?
-                } else {
-                    Vec::new()
-                };
+                let forges = if *kind == OldKind::Pr { self.forges(&convoy.metadata.namespace).await? } else { Vec::new() };
                 Some(map::submission(&name, role, *kind, submission, &forges)?)
             }
             _ => None,
@@ -197,12 +192,19 @@ impl EngineConvoys for ConvoyEngine {
         let operation = operation.clone();
         self.edit(convoy, move |current, world| {
             let found = |id: &str| map::find(current, &seat, id).cloned();
-            let declare = |id: &str, kind: &str| Declare {
-                promise: next_id(current),
-                label: map::label_for(&seat, id, taken(current)),
-                kind: kind.to_owned(),
-                target: target.clone(),
-                owner: seat.clone(),
+            // A new promise is named for what it delivers; a label already taken is refused.
+            let declare = |id: &str, kind: OldKind, source: OldSource| {
+                let label = map::label(&seat, id, kind, source);
+                match map::taken(current, &label) {
+                    Some(refusal) => Err(refusal),
+                    None => Ok(Declare {
+                        promise: next_id(current),
+                        label,
+                        kind: kind.as_str().to_owned(),
+                        target: target.clone(),
+                        owner: seat.clone(),
+                    }),
+                }
             };
             // An operator decides with its own authority; a crew's verbs are its seat's.
             let (decider, authority) = match &actor {
@@ -210,11 +212,11 @@ impl EngineConvoys for ConvoyEngine {
                 Actor::Crew | Actor::Observer => (seat.clone(), Authority::Owner),
             };
             let edges = match (operation, submitted) {
-                (PromiseOperation::Declare { id, kind, .. }, _) => match found(&id) {
+                (PromiseOperation::Declare { id, kind, source }, _) => match found(&id) {
                     Some(_) => Vec::new(),
-                    None => vec![declare(&id, kind.as_str()).into()],
+                    None => vec![declare(&id, kind, source)?.into()],
                 },
-                (PromiseOperation::Submit { id, kind, .. }, Some((address, revision))) => {
+                (PromiseOperation::Submit { id, kind, source, .. }, Some((address, revision))) => {
                     let mut edges = Vec::new();
                     let (promise, owner) = match found(&id) {
                         Some(promise) => {
@@ -232,7 +234,7 @@ impl EngineConvoys for ConvoyEngine {
                             (promise.id, promise.owner.clone())
                         }
                         None => {
-                            let declared = declare(&id, kind.as_str());
+                            let declared = declare(&id, kind, source)?;
                             let promise = declared.promise;
                             edges.push(declared.into());
                             (promise, seat.clone())
@@ -353,7 +355,7 @@ impl EngineConvoys for ConvoyEngine {
             // An exact label names one promise; a bare old id must name exactly one.
             let promise = match promises.iter().find(|promise| promise.label == label) {
                 Some(promise) => *promise,
-                None => match promises.iter().filter(|promise| map::old_id(&promise.label) == label).collect::<Vec<_>>().as_slice() {
+                None => match promises.iter().filter(|promise| map::old_id(promise) == label).collect::<Vec<_>>().as_slice() {
                     [promise] => **promise,
                     [] => return Err(format!("no promise labelled `{label}`")),
                     several => {
