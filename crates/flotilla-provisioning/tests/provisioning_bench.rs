@@ -33,7 +33,12 @@ use std::{
 };
 
 use flotilla_engine_store::StoreLog;
-use flotilla_provisioning::engine::{checkout::CheckoutBinding, decide, LifecycleHome, Lifecycles};
+use flotilla_provisioning::engine::{
+    checkout::CheckoutBinding,
+    decide,
+    reads::{Judgement, ProvisioningReads, StoreReads},
+    LifecycleHome, Lifecycles,
+};
 use flotilla_provisioning::stored::{
     self,
     checkout::{Checkout, CheckoutKind, CheckoutRequest, Source},
@@ -376,6 +381,37 @@ fn provisioning_load() {
     }
     per_event("reconciled Gone through the engine", objects.len(), started, "the vanish, one transaction");
 
+    // The read port (#3629 layer 4): views judged per key, as explain, readiness and attach read them.
+    let reads = StoreReads::new(local.clone());
+    let started = Instant::now();
+    let mut viewed = 0;
+    for n in (0..convoys).step_by(7) {
+        let home = if n % LOCAL_ONE_IN == 0 { "local" } else { "remote" };
+        viewed += reads.environment_checkouts(&format!("env-{n}"), home).expect("index").len();
+    }
+    assert!(viewed >= 2 * convoys.div_ceil(7));
+    eprintln!(
+        "{:>40}: {:>8.1} µs/query",
+        "port: an environment's checkout views",
+        started.elapsed().as_secs_f64() * 1e6 / convoys.div_ceil(7) as f64
+    );
+    let started = Instant::now();
+    for n in &locals {
+        let view = reads.checkout(&format!("checkout-{n}-d"), "local").expect("read").expect("held");
+        assert_eq!(view.judgement, Judgement::Lost, "told from its last log entry");
+    }
+    eprintln!("{:>40}: {:>8.1} µs/query", "port: one Gone checkout, judged", started.elapsed().as_secs_f64() * 1e6 / locals.len() as f64);
+    let started = Instant::now();
+    for n in (0..convoys).step_by(7) {
+        let home = if n % LOCAL_ONE_IN == 0 { "local" } else { "remote" };
+        assert!(matches!(reads.environment(&format!("env-{n}"), home).expect("read").expect("held").judgement, Judgement::Ready { .. }));
+    }
+    eprintln!(
+        "{:>40}: {:>8.1} µs/query",
+        "port: one environment, judged",
+        started.elapsed().as_secs_f64() * 1e6 / convoys.div_ceil(7) as f64
+    );
+
     // Typed index pages through the store, as the read ports will issue them.
     let started = Instant::now();
     let mut paged = 0;
@@ -447,6 +483,12 @@ fn provisioning_load() {
     );
     assert_eq!(live.fullscan_steps, 0.0);
     report("a provider's live environments", &live);
+    let holders: Vec<Vec<String>> = (0..convoys).step_by(7).map(|n| vec![format!("convoy:convoy-{n}")]).collect();
+    let held =
+        measure(&read, "SELECT c.id FROM checkout c WHERE c.holder = (SELECT id FROM strings WHERE domain = 'hl' AND s = ?1)", &holders);
+    assert!(held.rows >= 2.0, "each convoy holds its checkouts");
+    assert_eq!(held.fullscan_steps, 0.0);
+    report("a convoy's held checkouts", &held);
     let keyed = measure(&read, &format!("SELECT e.state, e.identity FROM environment e WHERE e.id = {IDENTITY}"), &environments);
     assert_eq!(keyed.rows, 1.0);
     assert_eq!(keyed.fullscan_steps, 0.0);

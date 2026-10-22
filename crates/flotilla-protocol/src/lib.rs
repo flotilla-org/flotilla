@@ -44,7 +44,7 @@ pub use host_summary::{
     AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 pub use leaf::{Leaf, LeafAddress, LeafFire, LeafKind, LeafOperator, WaitSubscriptionRequest};
-pub use lifecycle::LifecycleAuthority;
+pub use lifecycle::{LifecycleAuthority, LifecycleReading};
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerWireMessage, RoutedPeerMessage};
 pub use placement::{

@@ -16,13 +16,14 @@ use flotilla_environment::hop_chain::{
     resolver::HopResolver,
     Hop, HopPlan, ResolutionContext,
 };
+use flotilla_projections::ports::ProvisioningKind;
 use flotilla_protocol::{
     arg::Arg,
     commands::AttachMode,
     qualified_path::HostId,
     result_set::{CheckoutRow, Rows},
-    AttachBinding, CanonicalHostId, ConvoyPhase, EnvironmentId, FleetListRow, FleetStaleness, HostName, ResolvedAttachAction,
-    ResolvedAttachPlan,
+    AttachBinding, CanonicalHostId, ConvoyPhase, EnvironmentId, FleetListRow, FleetStaleness, HostName, LifecycleReading,
+    ResolvedAttachAction, ResolvedAttachPlan,
 };
 use flotilla_resources::{
     terminal_session_attach_target_with_stale_status, Convoy as ResourceConvoy, ConvoyPhase as ResourceConvoyPhase,
@@ -90,6 +91,8 @@ pub(super) struct AttachResolver<'a> {
     pub(super) local_environment_id: &'a EnvironmentId,
     pub(super) host_name: &'a HostName,
     pub(super) namespace: &'a std::sync::RwLock<String>,
+    /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4).
+    pub(super) lifecycle_reads: &'a dyn flotilla_projections::ports::LifecycleReads,
 }
 
 impl<'a> AttachResolver<'a> {
@@ -661,7 +664,12 @@ impl<'a> AttachResolver<'a> {
         let attach_args = self.terminal_pool_attach_args(reads, session, environment, &cwd, seat).await?;
         if environment.spec.docker.is_some() {
             let environment_id = EnvironmentId::new(session.spec.env_ref.clone());
-            let container_name = environment.status.as_ref().and_then(|status| status.docker_container_id.as_deref());
+            // Behind `[primitives]` the engine's reading names the realised container (#3629 layer 4).
+            let realised = match self.lifecycle_reads.reading(ProvisioningKind::Environment, &environment.metadata.name, None) {
+                Some(LifecycleReading::Ready { identity }) => Some(identity),
+                _ => None,
+            };
+            let container_name = realised.or_else(|| environment.status.as_ref().and_then(|status| status.docker_container_id.clone()));
             let container_name =
                 container_name.ok_or_else(|| format!("environment {} has no docker container id", session.spec.env_ref))?;
             let environment_resolver =
