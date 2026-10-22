@@ -26,7 +26,6 @@ pub(in crate::server) enum Reply {
         service: Arc<Service>,
         after: Option<u64>,
         clock: Arc<dyn flotilla_resources::Clock>,
-        once: bool,
     },
     /// One encoded point read.
     Record {
@@ -108,12 +107,7 @@ pub(in crate::server) async fn respond(
             },
             None => None,
         };
-        return Reply::ChangeStream {
-            service,
-            after,
-            clock: daemon.clock_for_scenarios(),
-            once: query.get("once").is_some_and(|value| value == "true"),
-        };
+        return Reply::ChangeStream { service, after, clock: daemon.clock_for_scenarios() };
     }
     let observed_path = path == "/observed" || path.starts_with("/observed/");
     let additional_stores = if daemon.is_some() && !observed_path { vec!["/observed"] } else { Vec::new() };

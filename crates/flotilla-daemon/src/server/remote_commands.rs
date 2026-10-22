@@ -455,11 +455,26 @@ impl RemoteCommandRouter {
         self.dispatch_and_wait(command, session_id).await
     }
 
+    /// Internal stream pulls have no surface session or delegated caller.
+    pub(super) async fn dispatch_replication_query(&self, command: Command) -> Result<CommandValue, String> {
+        if !matches!(command.action, CommandAction::QueryChangeStream { .. }) {
+            return Err("replication query requires a change-stream action".into());
+        }
+        self.dispatch_with_query_origin(command, None).await
+    }
+
     /// Return the destination's acknowledgement for a remote command or query.
     /// Local queries retain surface projection; resource mutations await the same
     /// acknowledgement at both local and remote receiver homes.
     #[tracing::instrument(skip_all)]
-    async fn dispatch_and_wait(&self, mut command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
+    async fn dispatch_and_wait(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
+        if matches!(command.action, CommandAction::QueryChangeStream { .. }) {
+            return Err("change-stream queries require peer replication transport".into());
+        }
+        self.dispatch_with_query_origin(command, Some(session_id)).await
+    }
+
+    async fn dispatch_with_query_origin(&self, mut command: Command, session_id: Option<uuid::Uuid>) -> Result<CommandValue, String> {
         self.resolve_crew_command_routing(&mut command.action).await?;
         let target =
             self.daemon.resolve_command_target(&command.action, command.node_id.as_ref()).await.map_err(|error| error.to_string())?;
@@ -476,7 +491,10 @@ impl RemoteCommandRouter {
 
         if target_node_id == *self.daemon.node_id() {
             if command.action.is_query() {
-                return self.execute_projected_query(command, session_id).await;
+                if let CommandAction::QueryChangeStream { after, session } = &command.action {
+                    return self.daemon.next_change_stream_frame(self.daemon.node_id().as_str(), *after, session.clone()).await;
+                }
+                return self.execute_projected_query(command, session_id.unwrap_or(uuid::Uuid::nil())).await;
             }
             let mut events = self.daemon.subscribe();
             let command_id = self.daemon.execute_for_caller(command, None).await?;
@@ -522,7 +540,7 @@ impl RemoteCommandRouter {
             remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
             command: Box::new(command),
             caller: None,
-            session_id: Some(session_id),
+            session_id,
         };
         if let Err(err) = self.send_routed_to(&target_node_id, routed).await {
             self.pending_remote_commands.lock().await.remove(&request_id);
@@ -911,7 +929,16 @@ impl RemoteCommandRouter {
         // result back directly without subscribing to the event stream.
         if command.action.is_query() {
             let query_session = origin.session_id.unwrap_or(uuid::Uuid::nil());
-            let result = match self.execute_projected_query(command, query_session).await {
+            let query = if let CommandAction::QueryChangeStream { after, session } = &command.action {
+                if origin.caller.is_some() || origin.session_id.is_some() {
+                    Err("change-stream queries require peer replication transport".into())
+                } else {
+                    self.daemon.next_change_stream_frame(requester_node_id.as_str(), *after, session.clone()).await
+                }
+            } else {
+                self.execute_projected_query(command, query_session).await
+            };
+            let result = match query {
                 Ok(value) => value,
                 Err(message) => CommandValue::Error { message },
             };

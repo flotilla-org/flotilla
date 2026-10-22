@@ -42,6 +42,7 @@ mod checkout_providers;
 use flotilla_executor::executor_actions;
 use flotilla_projections::projections_actions;
 
+mod change_stream;
 mod cleat_roll;
 use flotilla_crew::crew_actions;
 use flotilla_crew::crew_ops::{ConvoyResumeOutcome, CrewRoutingContext, CrewService, CrewTurnDeliveryActuator, MessageAttribution};
@@ -672,6 +673,7 @@ impl flotilla_vcs::vcs::CheckoutVcsResolver for InProcessDaemon {
 use flotilla_projections::dispatch_board::DispatchBoardInputs;
 
 pub struct InProcessDaemon {
+    change_stream_rounds: change_stream::Rounds,
     decided_store: std::sync::Mutex<Option<Arc<flotilla_schema_sqlite::stream::Service>>>,
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -1281,6 +1283,7 @@ impl InProcessDaemon {
             clock: Arc::clone(&clock),
             regard_lifecycle: Arc::clone(&regard_lifecycle),
             decided_store: Default::default(),
+            change_stream_rounds: Default::default(),
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
@@ -2089,6 +2092,14 @@ impl InProcessDaemon {
     /// The `[primitives]` Message path, when the switch is on.
     pub fn message_primitives(&self) -> Option<Arc<crate::primitives::MessagePrimitives>> {
         self.message_path.get().cloned()
+    }
+
+    /// Peer replication entry point; the router supplies the originating node from
+    /// the trusted peer transport envelope.
+    pub async fn next_change_stream_frame(&self, peer: &str, after: Option<u64>, session: Option<String>) -> Result<CommandValue, String> {
+        self.change_stream_rounds
+            .next(peer, self.decided_store()?, after, session, flotilla_schema::Timestamp::from_datetime(&self.clock.now()))
+            .await
     }
 
     /// Present only after the first kind migration installs its registered store.
@@ -5493,6 +5504,9 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
+        if matches!(command.action, CommandAction::QueryChangeStream { .. }) {
+            return Err("change-stream queries require peer replication transport".into());
+        }
         self.projections_actions().execute_query(command, session_id).await
     }
 

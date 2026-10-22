@@ -13,9 +13,9 @@ use std::{
 
 use crate::DdlMode;
 use flotilla_schema::{
-    Cause, Change, Code, ColumnDef, ColumnType, DecodeError, Decoder, Edge, EdgeParts, EdgeRow, Effect, Encoder, Event, Hash, Identity,
-    IndexQuery, Kind, KindCode, KindRegistry, Named, Origin, Row, RowEdit, RowPath, Rows, TableRole, Timestamp, Value, HOME_DOMAIN,
-    RESOURCE_NAME_DOMAIN, WRITER_DOMAIN,
+    whole_log_topic, Cause, Change, Code, ColumnDef, ColumnType, DecodeError, Decoder, Edge, EdgeParts, EdgeRow, Effect, Encoder, Event,
+    Hash, Identity, IndexQuery, Kind, KindCode, KindRegistry, Named, Origin, Row, RowEdit, RowPath, Rows, TableRole, Timestamp, Value,
+    HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
 
@@ -301,12 +301,6 @@ impl Read<'_> {
     pub fn load_snapshot(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
         self.ctx().snapshot(id)
     }
-    /// Streams one logical row at a time, including its objects, without materializing an
-    /// entire resource's append-only tables. Returns false for an identity without a body.
-    pub fn visit_snapshot(&mut self, id: ResourceId, emit: impl FnMut(Snapshot) -> Result<(), StoreError>) -> Result<bool, StoreError> {
-        self.ctx().visit_snapshot(id, emit)
-    }
-
     /// Up to `limit` logged events of resource `id` after `after`, in sequence order: the tail that
     /// follows a snapshot at version `after`, and the resource's history from 0. A limit of 0 is
     /// `ZeroLimit`; one above [`MAX_PAGE`](crate::MAX_PAGE) is lowered to it. A page also stays
@@ -415,38 +409,6 @@ pub struct Write<'s> {
 }
 
 impl Write<'_> {
-    /// Installs the next snapshot row. The home snapshot transaction encloses all chunks.
-    pub fn restore_chunk(&mut self, chunk: &Snapshot) -> Result<(), StoreError> {
-        self.guarded(|ctx| {
-            let count = ctx.sql(chunk.kind)?.tables.len();
-            if chunk.rows.tables.len() != count || chunk.rows.tables.iter().map(Vec::len).sum::<usize>() != 1 {
-                return Err(StoreError::Stream("snapshot chunk must contain exactly one row".into()));
-            }
-            if !chunk.rows.tables[0].is_empty() {
-                ctx.restore(chunk)?;
-                return Ok(());
-            }
-            let identity = Identity { kind: chunk.kind, name: chunk.name.clone(), home: chunk.home.clone() };
-            if identity.home == ctx.runtime.home {
-                return Err(StoreError::OwnHome { home: identity.home });
-            }
-            let id = ctx.resolve(&identity)?.ok_or_else(|| StoreError::Stream("snapshot child precedes root".into()))?;
-            if ctx.identity_seq(id)? != chunk.version {
-                return Err(StoreError::Stream("snapshot chunk version changed".into()));
-            }
-            let sequence = i64::try_from(chunk.version).map_err(|_| Malformed::Sequence { home_seq: chunk.version })?;
-            let mut ops = Vec::new();
-            for (table, rows) in chunk.rows.tables.iter().enumerate() {
-                for row in rows {
-                    ops.push(Op::Insert { table, key: row.key.clone(), values: row.values.clone() });
-                }
-            }
-            ctx.put_objects(&chunk.rows.objects)?;
-            ctx.check_objects(&ops, &chunk.rows.objects)?;
-            ctx.execute(chunk.kind, id, &ops, sequence, Some(sequence))?;
-            Ok(())
-        })
-    }
     pub(crate) fn stream_watermark(&mut self, home: &str) -> Result<crate::stream::Watermark, StoreError> {
         self.ctx().watermark(home)
     }
@@ -574,15 +536,6 @@ impl Write<'_> {
     /// Runs one write inside a savepoint, so a refused write leaves the transaction (and the id
     /// overlay) as it was and later writes in the same transaction still commit.
     fn guarded<R>(&mut self, op: impl FnOnce(&mut Ctx<'_>) -> Result<R, StoreError>) -> Result<R, StoreError> {
-        // These are optional ID lookup caches, not transaction state. A large streamed
-        // snapshot must not retain one cache/journal entry for every row until commit.
-        // SQLite remains the source of truth inside this transaction; marks stay pending.
-        if self.pending.journal.len() >= 4096 {
-            self.pending.strings.clear();
-            self.pending.identities.clear();
-            self.pending.ids.clear();
-            self.pending.journal.clear();
-        }
         let mark = self.pending.journal.len();
         let savepoint = self.tx.savepoint()?;
         let result = op(&mut Ctx { conn: &savepoint, runtime: &mut *self.runtime, pending: Some(&mut self.pending) });
@@ -1101,7 +1054,7 @@ impl Ctx<'_> {
         let hashes: BTreeSet<Hash> = rows.tables.iter().flatten().flat_map(|row| set_objects(None, row)).collect();
         let effect = Effect { changes, objects: carried(hashes, rows.objects)?, expunged: None };
         let header = Header {
-            topic: Code::new("all"),
+            topic: whole_log_topic(),
             cause: Cause::Create,
             writer: origin.writer,
             at: origin.at,
@@ -1181,7 +1134,7 @@ impl Ctx<'_> {
         let effect = Effect { changes, objects: carried(hashes, new_objects)?, expunged: None };
         let (sequence, version) = self.next_sequence()?;
         let header = Header {
-            topic: Code::new("all"),
+            topic: whole_log_topic(),
             cause: Cause::Edit,
             writer: origin.writer,
             at: origin.at,
@@ -1329,8 +1282,14 @@ impl Ctx<'_> {
         }
         let (sequence, version) = self.next_sequence()?;
         let cause = Cause::Edge { edge: event.edge, from: event.from, to: event.to };
-        let header =
-            Header { topic: Code::new("all"), cause, writer: event.writer, at: event.at, about: event.about, payload: Some(event.payload) };
+        let header = Header {
+            topic: whole_log_topic(),
+            cause,
+            writer: event.writer,
+            at: event.at,
+            about: event.about,
+            payload: Some(event.payload),
+        };
         let effect = Effect { changes, objects, expunged: None };
         if !self.write_local(K::CODE, current.id, header, effect, (sequence, version), Some(expected))? {
             return Err(self.stale::<K>(current));
@@ -1377,7 +1336,7 @@ impl Ctx<'_> {
         let expected = expected_version(current)?;
         let (sequence, version) = self.next_sequence()?;
         let header = Header {
-            topic: Code::new("all"),
+            topic: whole_log_topic(),
             cause: Cause::Delete,
             writer: origin.writer,
             at: origin.at,
@@ -1400,7 +1359,7 @@ impl Ctx<'_> {
         let (sequence, version) = self.next_sequence()?;
         let prev_seq = self.identity_seq(id)?;
         let header = Header {
-            topic: Code::new("all"),
+            topic: whole_log_topic(),
             cause: Cause::Expunge,
             writer: origin.writer,
             at: origin.at,
@@ -1937,32 +1896,6 @@ impl Ctx<'_> {
         let (name, home, version) = (snapshot.name.clone(), snapshot.home.clone(), snapshot.version);
         let value = snapshot.into_value::<K>()?;
         Ok(Some(Loaded { id, name, home, version, value }))
-    }
-
-    fn visit_snapshot(&mut self, id: ResourceId, mut emit: impl FnMut(Snapshot) -> Result<(), StoreError>) -> Result<bool, StoreError> {
-        let Some(identity) = self.identity_of(id)? else { return Ok(false) };
-        let version = self.identity_seq(id)?;
-        let tables = self.sql(identity.kind)?.tables.len();
-        let mut live = false;
-        let conn = self.conn;
-        for table in 0..tables {
-            let select = self.sql(identity.kind)?.tables[table].select.clone();
-            let columns = self.sql(identity.kind)?.tables[table].columns.len();
-            let mut statement = conn.prepare_cached(&select)?;
-            let mut raw = statement.query([id.0])?;
-            while let Some(row) = raw.next()? {
-                live = true;
-                let start = usize::from(table == 0);
-                let values = (start..columns + start).map(|column| row.get::<_, SqlValue>(column)).collect::<Result<Vec<_>, _>>()?;
-                let mut rows = Rows::with_tables(tables);
-                rows.tables[table].push(self.logical_row(identity.kind, table, values, &mut rows.objects)?);
-                emit(Snapshot { kind: identity.kind, name: identity.name.clone(), home: identity.home.clone(), version, rows })?;
-            }
-            if table == 0 && !live {
-                return Ok(false);
-            }
-        }
-        Ok(live)
     }
 
     /// The root row and every child row of one resource, each read by primary key.

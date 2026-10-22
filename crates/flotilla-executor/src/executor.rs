@@ -135,7 +135,8 @@ pub async fn build_plan(
     let target_display_host = provisioning_target.as_ref().map(|target| target.host().clone());
 
     match action {
-        CommandAction::QueryResourceDigest { .. }
+        CommandAction::QueryChangeStream { .. }
+        | CommandAction::QueryResourceDigest { .. }
         | CommandAction::QueryResourceList { .. }
         | CommandAction::QueryResourceGet { .. }
         | CommandAction::QueryExplainConvoy { .. }

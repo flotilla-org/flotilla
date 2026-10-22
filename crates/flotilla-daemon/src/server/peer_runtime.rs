@@ -579,7 +579,7 @@ impl PeerRuntime {
             // direct peers over forwarded sockets and routed peers over the router.
             let mut peer_replicators = PeerReplicatorSupervisors::new(
                 replication_host(&outbound_daemon).with_metrics(replication_metrics),
-                peer_sources(Arc::clone(&outbound_daemon), outbound_remote_command_router),
+                peer_sources(Arc::clone(&outbound_daemon), outbound_remote_command_router.clone()),
                 replication_options,
             );
 
@@ -590,6 +590,7 @@ impl PeerRuntime {
                 let reads = super::change_stream::DecidedHomeReads {
                     service,
                     peers: Arc::clone(&decided_peers),
+                    clients: Default::default(),
                     clock: outbound_daemon.clock_for_scenarios(),
                 };
                 if let Err(error) = primitives.install_home_reads(Arc::new(reads)) {
@@ -601,9 +602,18 @@ impl PeerRuntime {
                     PeerConnectionEvent::Connected(notice) => {
                         debug!(peer = %notice.peer, generation = notice.generation, "starting peer resource replication");
                         if decided_followers.get(&notice.peer).is_none_or(|(generation, _)| *generation < notice.generation) {
-                            if let (Ok(service), Some(socket)) = (outbound_daemon.decided_store(), notice.resource_socket_path.clone()) {
-                                decided_peers.lock().expect("decided peers").insert(notice.peer.as_str().to_owned(), socket.clone());
-                                let task = super::change_stream::follow(service, notice.peer.as_str().to_owned(), socket);
+                            if let Ok(service) = outbound_daemon.decided_store() {
+                                let home = notice.peer.as_str().to_owned();
+                                decided_peers.lock().expect("decided peers").remove(&home);
+                                if let Some(socket) = &notice.resource_socket_path {
+                                    decided_peers.lock().expect("decided peers").insert(home.clone(), socket.clone());
+                                }
+                                let task = super::change_stream::follow(
+                                    service,
+                                    home,
+                                    notice.resource_socket_path.clone(),
+                                    outbound_remote_command_router.clone(),
+                                );
                                 decided_followers
                                     .insert(notice.peer.clone(), (notice.generation, tokio_util::task::AbortOnDropHandle::new(task)));
                             }

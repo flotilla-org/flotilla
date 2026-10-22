@@ -127,6 +127,7 @@ impl InProcessDaemon {
             | A::QueryCrewList { .. }
             | A::QueryDaemonLogs { .. }
             | A::QueryExplainConvoy { .. }
+            | A::QueryChangeStream { .. }
             | A::QueryResourceDigest { .. }
             | A::QueryResourceList { .. }
             | A::QueryResourceGet { .. }

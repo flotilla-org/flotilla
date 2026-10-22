@@ -238,6 +238,9 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::ResourceWatchEvent(_) => {
             tracing::warn!("query result reached TUI handler — should be handled by CLI");
         }
+        CommandValue::ChangeStreamFrame { .. } => {
+            tracing::warn!("unexpected replication result reached UI handler");
+        }
         CommandValue::EnvironmentSpecRead { .. } => {
             tracing::warn!("unexpected environment lifecycle result reached UI handler");
         }
