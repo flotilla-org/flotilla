@@ -114,8 +114,8 @@ pub struct ImportedConvoy {
     pub resource: Resource<Convoy>,
     pub history: ClaimHistory,
     pub stall: Option<ImportedStall>,
-    /// An open stall the import could not record, and why (an operator-rung
-    /// stall has no supervision message to await).
+    /// An open stall the import did not record, and why: an operator-level
+    /// stall (no record until #3457), or one with no supervision message.
     pub unrecorded_stall: Option<String>,
 }
 
@@ -284,6 +284,10 @@ pub fn import_convoy(
 
     let (stall, unrecorded_stall) = match status.stalled.as_ref() {
         None => (None, None),
+        // Until #3457 an operator-level stall has no record (#3587 ruling 6353447431).
+        Some(stalled) if stalled.rung == flotilla_resources::StallRung::Operator => {
+            (None, Some("an operator-level stall has no stall record until #3457; the old stall status keeps it in the views".into()))
+        }
         Some(stalled) => {
             let seat = match &stalled.maker {
                 Some(flotilla_resources::LeafMaker::Actor { vessel, role }) => Some(crews.seat(vessel, role)),
@@ -304,7 +308,7 @@ pub fn import_convoy(
                     (Some(ImportedStall { spec }), None)
                 }
                 (None, _) => (None, Some("the stall names no crew (its maker is not a crew actor), so no seat awaits".into())),
-                (Some(_), None) => (None, Some("no supervision message to await (an operator-rung stall)".into())),
+                (Some(_), None) => (None, Some("no supervision message to await".into())),
             }
         }
     };

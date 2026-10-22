@@ -207,18 +207,19 @@ fn a_standing_convoy_waits_for_the_ruling_then_holds_lifetime_duties() {
 }
 
 // Behaviour: an open stall that a supervision message carries becomes the stalled seat's open
-// stall record, awaiting that message; one at the operator rung has no message, and is reported.
+// stall record, awaiting that message. One with no message, and one at the operator rung even with
+// a message (no record until #3457, ruling 6353447431), records nothing and is reported.
 #[test]
 fn an_open_stall_becomes_the_seats_stall_record() {
     let mut old = convoy("c", ConvoyPhase::Active, vec![agent("coder", true)]);
-    let stall = |message: Option<&str>| StalledCondition {
+    let stall = |message: Option<&str>, rung: StallRung| StalledCondition {
         leaves: Vec::new(),
         maker: Some(LeafMaker::Actor { vessel: "work".into(), role: "coder".into() }),
         evidence: "blocked".into(),
         source: StallEvidenceSource::Crew,
         cause: None,
         began_at: Utc::now(),
-        rung: StallRung::Bosun,
+        rung,
         supervisor: None,
         supervision_message: message.map(|name| flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", name)),
         supervision_index: Some(0),
@@ -227,7 +228,7 @@ fn an_open_stall_becomes_the_seats_stall_record() {
         proposed_disposition: None,
         nudge_history: Vec::new(),
     };
-    old.status.as_mut().expect("status").stalled = Some(stall(Some("supervision-1")));
+    old.status.as_mut().expect("status").stalled = Some(stall(Some("supervision-1"), StallRung::Bosun));
     let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
     let record = convoy.stall.as_ref().expect("a stall record").spec.clone();
     assert_eq!(record.kind, "stall");
@@ -249,10 +250,14 @@ fn an_open_stall_becomes_the_seats_stall_record() {
         .expect("present")
         .value;
     assert_eq!(*stored.spec(), record);
-    old.status.as_mut().expect("status").stalled = Some(stall(None));
+    old.status.as_mut().expect("status").stalled = Some(stall(None, StallRung::Bosun));
     let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
     assert!(convoy.stall.is_none());
-    assert!(convoy.unrecorded_stall.expect("reported").contains("operator-rung"));
+    assert!(convoy.unrecorded_stall.expect("reported").contains("no supervision message"));
+    old.status.as_mut().expect("status").stalled = Some(stall(Some("supervision-1"), StallRung::Operator));
+    let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
+    assert!(convoy.stall.is_none());
+    assert!(convoy.unrecorded_stall.expect("reported").contains("operator-level"));
 }
 
 // Behaviour: the importer writes each convoy through the creation path at its home, and the
