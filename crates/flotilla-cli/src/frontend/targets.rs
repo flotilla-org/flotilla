@@ -5,11 +5,11 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{commands::CommandValue, Command, CommandAction, EnvironmentId, HostName, RepoSelector};
 use tracing::info;
 
-use flotilla_cli::cli::args::Cli;
+use crate::cli::args::Cli;
 
-use super::daemon::connect_daemon;
+use super::connection::connect_daemon;
 
-pub(super) async fn resolve_optional_host_node(cli: &Cli, host: Option<&str>) -> Result<Option<flotilla_protocol::NodeId>> {
+pub async fn resolve_optional_host_node(cli: &Cli, host: Option<&str>) -> Result<Option<flotilla_protocol::NodeId>> {
     match host {
         Some(host) => {
             let (_environment_id, node_id) = resolve_host_target(cli, &HostName::new(host)).await?;
@@ -19,7 +19,7 @@ pub(super) async fn resolve_optional_host_node(cli: &Cli, host: Option<&str>) ->
     }
 }
 
-pub(super) async fn resolve_host_target(cli: &Cli, subject: &HostName) -> Result<(EnvironmentId, flotilla_protocol::NodeId)> {
+pub async fn resolve_host_target(cli: &Cli, subject: &HostName) -> Result<(EnvironmentId, flotilla_protocol::NodeId)> {
     let daemon = connect_daemon(cli).await?;
     let result = daemon
         .execute_query(
@@ -67,7 +67,7 @@ fn select_host_target(
     }
 }
 
-pub(super) async fn resolve_environment_target(
+pub async fn resolve_environment_target(
     cli: &Cli,
     target_environment_id: &EnvironmentId,
 ) -> Result<(flotilla_protocol::ProvisioningTarget, flotilla_protocol::NodeId)> {
@@ -153,7 +153,7 @@ fn is_path_like_selector(query: &str) -> bool {
     Path::new(query).is_absolute() || query == "." || query == ".." || query.starts_with("./") || query.starts_with("../")
 }
 
-pub(super) async fn resolve_cli_repository(daemon: &dyn DaemonHandle, selector: RepoSelector) -> Result<RepoSelector, String> {
+pub async fn resolve_cli_repository(daemon: &dyn DaemonHandle, selector: RepoSelector) -> Result<RepoSelector, String> {
     let label = selector.to_string();
     lookup_cli_repository(daemon, selector.clone()).await?.ok_or_else(|| {
         if let RepoSelector::Query(query) = &selector {
@@ -167,11 +167,11 @@ pub(super) async fn resolve_cli_repository(daemon: &dyn DaemonHandle, selector: 
     })
 }
 
-pub(super) async fn resolve_optional_cwd_repository(daemon: &dyn DaemonHandle, path: PathBuf) -> Result<Option<RepoSelector>, String> {
+pub async fn resolve_optional_cwd_repository(daemon: &dyn DaemonHandle, path: PathBuf) -> Result<Option<RepoSelector>, String> {
     lookup_cli_repository(daemon, RepoSelector::Path(path)).await
 }
 
-pub(super) async fn resolve_command_repositories(daemon: &dyn DaemonHandle, command: &mut Command) -> Result<(), String> {
+pub async fn resolve_command_repositories(daemon: &dyn DaemonHandle, command: &mut Command) -> Result<(), String> {
     let original_context = command.context_repo.clone();
     if let Some(selector) = command.context_repo.take() {
         command.context_repo = match selector {
@@ -224,7 +224,7 @@ fn provisioning_target_for_environment(host: &HostName, environment_id: &Environ
     }
 }
 
-pub(super) fn resolve_repo_from_env(cli: &Cli) -> Option<RepoSelector> {
+pub fn resolve_repo_from_env(cli: &Cli) -> Option<RepoSelector> {
     match (&cli.repo, std::env::var("FLOTILLA_REPO").ok()) {
         (Some(repo), _) => Some(RepoSelector::Query(repo.clone())),
         (None, Some(repo)) if !repo.is_empty() => Some(RepoSelector::Query(repo)),
@@ -232,14 +232,14 @@ pub(super) fn resolve_repo_from_env(cli: &Cli) -> Option<RepoSelector> {
     }
 }
 
-pub(super) fn set_context_repo(cmd: &mut Command, cli: &Cli) {
+pub fn set_context_repo(cmd: &mut Command, cli: &Cli) {
     if cmd.context_repo.is_some() {
         return;
     }
     cmd.context_repo = resolve_repo_from_env(cli).or_else(|| std::env::current_dir().ok().map(RepoSelector::Path));
 }
 
-pub(super) fn inject_repo_context(cmd: &mut Command, cli: &Cli) -> Result<()> {
+pub fn inject_repo_context(cmd: &mut Command, cli: &Cli) -> Result<()> {
     let repo_selector = resolve_repo_from_env(cli).or_else(|| std::env::current_dir().ok().map(RepoSelector::Path));
 
     match &mut cmd.action {
@@ -265,7 +265,7 @@ pub(super) fn inject_repo_context(cmd: &mut Command, cli: &Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotilla_cli::cli::args::{DomainCommand, SubCommand};
+    use crate::cli::args::{DomainCommand, SubCommand};
 
     use clap::Parser;
     use flotilla_protocol::{

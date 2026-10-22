@@ -485,13 +485,19 @@ pub(crate) fn adjacent_flotilla_binary(daemon_binary: &Path) -> Result<DaemonHos
 fn running_daemon_flotilla_binary() -> Result<DaemonHostPath, String> {
     #[cfg(target_os = "linux")]
     {
-        let daemon_binary = std::env::current_exe().map_err(|error| format!("resolve running daemon binary: {error}"))?;
-        adjacent_flotilla_binary(&daemon_binary)
+        let daemon = std::env::current_exe().map_err(|e| format!("resolve running daemon: {e}"))?;
+        let binary = daemon.parent().ok_or("daemon executable has no parent")?.join("flotilla-vessel");
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(&binary)
+            .map_err(|e| format!("cut-down vessel CLI {}: {e}; build/install flotilla-vessel with this generation", binary.display()))?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err("cut-down vessel CLI must be executable".into());
+        }
+        Ok(DaemonHostPath::new(binary))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        Err("daemon-adjacent flotilla injection requires a Linux host; generation-addressed environment binaries are not available yet"
-            .to_string())
+        Err("Docker vessel tools require a Linux host".into())
     }
 }
 

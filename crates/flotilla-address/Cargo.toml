@@ -43,3 +43,4 @@ syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "vis
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 libc = { workspace = true }
 smallvec = { version = "1", default-features = false, features = ["const_generics", "const_new"] }
+

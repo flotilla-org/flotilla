@@ -14,9 +14,9 @@ use flotilla_discovery::run_provisioned_host_detectors;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_environment::environment::CreateOpts;
 use flotilla_environment::environment::EnvironmentHandle;
-use flotilla_environment::environment::EnvironmentToolAssetKind;
 use flotilla_environment::environment::EnvironmentVariableUpdate;
 use flotilla_environment::environment::{contained_daemon_socket_path, DAEMON_SOCKET_ENV};
+use flotilla_environment::environment::{EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
@@ -367,14 +367,21 @@ impl DockerControllerRuntime {
         let mut provisioned_mounts = Vec::with_capacity(spec.mounts.len() + material_deliveries.len());
         provisioned_mounts.extend(spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount));
         for delivery in &material_deliveries {
-            if environment_spec.cloud_sandbox.is_some() {
-                tools.push(flotilla_environment::environment::EnvironmentTool::new("agent-material", "/").with_asset(
-                    flotilla_environment::environment::EnvironmentToolAsset::new(
+            if environment_spec.cloud_sandbox.is_some() || provider.receives_host_tools() {
+                let metadata = tokio::fs::symlink_metadata(delivery.mount.host_path.as_path())
+                    .await
+                    .map_err(|e| format!("agent material source: {e}"))?;
+                let kind = if metadata.is_dir() { EnvironmentToolAssetKind::Directory } else { EnvironmentToolAssetKind::File };
+                // Frozen material and the initial Pushed Codex copy travel as
+                // files after hello. Guest scratch is subsequently guest-owned;
+                // auth rotation uses the same agent runner, never a host bind.
+                tools.push(EnvironmentTool::new("agent material", delivery.mount.environment_path.as_path()).with_asset(
+                    EnvironmentToolAsset::new(
                         delivery.mount.host_path.as_path(),
                         delivery.mount.environment_path.as_path(),
-                        EnvironmentToolAssetKind::Directory,
-                        flotilla_environment::environment::EnvironmentToolAssetAccess::ReadOnly,
-                        "frozen initial agent material",
+                        kind,
+                        EnvironmentToolAssetAccess::ReadOnly,
+                        "agent material",
                     ),
                 ));
             } else {
@@ -749,17 +756,30 @@ impl EnvironmentRuntime for DockerControllerRuntime {
     }
 
     async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String> {
-        let active = self.state.provisioned_environments.lock().await.remove(container_id);
+        let active = {
+            let environments = self.state.provisioned_environments.lock().await;
+            environments
+                .get(container_id)
+                .or_else(|| environments.values().find(|active| active.handle.id().as_str() == environment_ref))
+                .map(|active| active.handle.clone())
+        };
         match active {
-            Some(active) => active.handle.destroy().await?,
+            Some(handle) => {
+                if handle.agent().is_some() {
+                    if let Some(registry) = &self.state.agent_material {
+                        registry.capture_environment_home(environment_ref, handle.runner().as_ref()).await?;
+                    }
+                }
+                handle.destroy().await?
+            }
             None => {
                 let provider = self.provider_for_environment(environment_ref).await?;
                 provider.destroy(container_id).await?;
             }
         }
         // Recovery addresses Docker by full immutable ID, while adopted handles
-        // may still be indexed by container name. Remove the requested map key above,
-        // then retire any other cached handle whose Environment ID matches.
+        // may still be indexed by container name. Retire all cached handles for
+        // the Environment only after capture and destruction have succeeded.
         self.state.provisioned_environments.lock().await.retain(|_, active| active.handle.id().as_str() != environment_ref);
         let _ = self.state.daemon.remove_provisioned_environment(&EnvironmentId::new(environment_ref));
         self.cleanup(environment_ref).await

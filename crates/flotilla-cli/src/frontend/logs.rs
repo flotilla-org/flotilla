@@ -3,24 +3,24 @@ use std::time::Duration;
 use color_eyre::Result;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
 
-use flotilla_cli::cli::args::{Cli, CliPaths};
+use crate::cli::args::{Cli, CliPaths};
 
-use super::daemon::{connect_cli_socket, connect_daemon, host_daemon_socket_required, reset_sigpipe};
+use super::connection::{connect_cli_socket, connect_daemon, host_daemon_socket_required, reset_sigpipe};
 use super::targets::resolve_optional_host_node;
 
-pub(crate) async fn run_status(cli: &Cli, format: OutputFormat) -> Result<()> {
+pub async fn run_status(cli: &Cli, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     let endpoint = cli.daemon_endpoint().map_err(|e| color_eyre::eyre::eyre!(e))?;
-    flotilla_cli::cli::run_status(&endpoint, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+    crate::cli::run_status(&endpoint, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
-pub(crate) async fn run_watch(cli: &Cli, format: OutputFormat) -> Result<()> {
+pub async fn run_watch(cli: &Cli, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     let endpoint = cli.daemon_endpoint().map_err(|e| color_eyre::eyre::eyre!(e))?;
-    flotilla_cli::cli::run_watch(&endpoint, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+    crate::cli::run_watch(&endpoint, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
-pub(crate) async fn run_wait(
+pub async fn run_wait(
     cli: &Cli,
     leaves: Vec<flotilla_protocol::Leaf>,
     namespace: String,
@@ -36,7 +36,7 @@ pub(crate) async fn run_wait(
         &socket_path,
         &config_dir,
         &state_dir,
-        host_daemon_socket_required(std::env::var_os(flotilla_environment::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
+        host_daemon_socket_required(std::env::var_os("FLOTILLA_CONTAINED_HOST_DAEMON").as_deref()),
     )
     .await
     .map_err(|error| color_eyre::eyre::eyre!(error))?;
@@ -69,28 +69,22 @@ pub(crate) async fn run_wait(
     Ok(())
 }
 
-pub(crate) async fn run_topology_command(cli: &Cli, format: OutputFormat, dot: bool) -> Result<()> {
+pub async fn run_topology_command(cli: &Cli, format: OutputFormat, dot: bool) -> Result<()> {
     reset_sigpipe();
     let format = topology_output_format(format, dot).map_err(|e| color_eyre::eyre::eyre!(e))?;
     let daemon = connect_daemon(cli).await?;
-    flotilla_cli::cli::run_topology(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+    crate::cli::run_topology(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
-fn topology_output_format(format: OutputFormat, dot: bool) -> Result<flotilla_cli::cli::TopologyOutputFormat, String> {
+fn topology_output_format(format: OutputFormat, dot: bool) -> Result<crate::cli::TopologyOutputFormat, String> {
     match (format, dot) {
         (OutputFormat::Json, true) => Err("--dot cannot be used with --json".to_string()),
-        (_, true) => Ok(flotilla_cli::cli::TopologyOutputFormat::Dot),
+        (_, true) => Ok(crate::cli::TopologyOutputFormat::Dot),
         (format, false) => Ok(format.into()),
     }
 }
 
-pub(crate) async fn run_logs(
-    cli: &Cli,
-    host: Option<&str>,
-    since: Option<Duration>,
-    level: Option<String>,
-    target: Option<String>,
-) -> Result<()> {
+pub async fn run_logs(cli: &Cli, host: Option<&str>, since: Option<Duration>, level: Option<String>, target: Option<String>) -> Result<()> {
     reset_sigpipe();
     let node_id = resolve_optional_host_node(cli, host).await?;
     let daemon = connect_daemon(cli).await?;
@@ -127,8 +121,8 @@ pub(crate) async fn run_logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::args::{SubCommand, TopologyArgs};
     use clap::Parser;
-    use flotilla_cli::cli::args::{SubCommand, TopologyArgs};
     #[test]
     fn cli_rejects_topology_dot_with_json() {
         assert!(Cli::try_parse_from(["flotilla", "topology", "--dot", "--json"]).is_err());

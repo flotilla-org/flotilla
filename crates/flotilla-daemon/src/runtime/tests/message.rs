@@ -77,9 +77,48 @@ async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_ho
             .expect("ready");
     }
 
+    // The guest process boundary records the protected files call; the registry
+    // and redelivery loop are real and must select only the managed vessel.
+    struct GuestCredentialRunner(PathBuf);
+    #[async_trait]
+    impl CommandRunner for GuestCredentialRunner {
+        async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+            unreachable!()
+        }
+        async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+            unreachable!()
+        }
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            false
+        }
+        async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+            assert_eq!(path, Path::new(flotilla_credentials::CONTAINER_CODEX_HOME).join("auth.json"));
+            assert_eq!(mode, 0o400);
+            fs::write(&self.0, content).unwrap();
+            Ok(())
+        }
+    }
+    let guest_auth = temp.path().join("guest-auth.json");
+    let id = EnvironmentId::new("work");
+    daemon
+        .register_provisioned_environment(
+            id.clone(),
+            Arc::new(TestInteriorEnvironment {
+                id,
+                image: ImageId::new("test"),
+                runner: Arc::new(GuestCredentialRunner(guest_auth.clone())),
+                env_vars: HashMap::new(),
+                destroyed: Arc::new(AtomicBool::new(false)),
+            }),
+            EnvironmentBag::new(),
+            Some(passthrough_registry()),
+        )
+        .unwrap();
+
     fs::write(&central, "{\"tokens\":{\"access_token\":\"access-token-two\"}}").expect("rotate central auth");
     redeliver_codex_credentials(&state, NAMESPACE).await.expect("redeliver the rotated credential");
 
+    assert!(fs::read_to_string(&guest_auth).unwrap().contains("access-token-two"));
     let delivered = codex_home.join("auth.json");
     assert!(
         fs::read_to_string(&delivered).expect("delivered credential").contains("access-token-two"),

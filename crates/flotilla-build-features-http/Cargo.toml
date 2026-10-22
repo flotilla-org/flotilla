@@ -25,7 +25,7 @@ libc = { workspace = true }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext", "os-poll"] }
-once_cell = { version = "1", features = ["std", "critical-section", "portable-atomic"] }
+once_cell = { version = "1", features = ["std", "critical-section", "portable-atomic", "race"] }
 percent-encoding = { version = "2" }
 rand = { version = "0.9", features = ["small_rng"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "charset", "http2", "json", "query", "rustls-no-provider", "stream", "system-proxy"] }

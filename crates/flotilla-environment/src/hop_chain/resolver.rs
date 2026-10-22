@@ -1,8 +1,7 @@
+use flotilla_protocol::EnvironmentId;
 use std::sync::Arc;
 
-use super::{
-    environment::EnvironmentHopResolver, remote::RemoteHopResolver, Hop, HopPlan, ResolutionContext, ResolvedAction, ResolvedPlan,
-};
+use super::{remote::RemoteHopResolver, Hop, HopPlan, ResolutionContext, ResolvedAction, ResolvedPlan};
 
 /// Composes per-hop resolvers into the full resolution algorithm.
 ///
@@ -50,5 +49,19 @@ impl HopResolver {
             }
         }
         Ok(ResolvedPlan(std::mem::take(&mut context.actions)))
+    }
+}
+
+pub trait EnvironmentHopResolver: Send + Sync {
+    fn resolve_wrap(&self, env_id: &EnvironmentId, context: &mut ResolutionContext) -> Result<(), String>;
+}
+
+/// No-op environment hop resolver that always errors. Used when the hop plan
+/// contains no `EnterEnvironment` hops (e.g. non-containerized workflows).
+pub struct NoopEnvironmentHopResolver;
+
+impl EnvironmentHopResolver for NoopEnvironmentHopResolver {
+    fn resolve_wrap(&self, env_id: &EnvironmentId, _context: &mut ResolutionContext) -> Result<(), String> {
+        Err(format!("no environment transport available for environment: {env_id}"))
     }
 }

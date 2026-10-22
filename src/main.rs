@@ -63,7 +63,6 @@ fn main() -> Result<()> {
 
 async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat) -> Result<()> {
     match command {
-        Some(SubCommand::VesselAgent) => flotilla_vessel_agent::run().await.map_err(color_eyre::eyre::Report::msg),
         Some(SubCommand::View(ViewArgs { address })) => {
             // Parse before touching the terminal so a bad address in a
             // recipe fails loudly at the shell (ADR 0013).

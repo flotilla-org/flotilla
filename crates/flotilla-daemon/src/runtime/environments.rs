@@ -226,6 +226,12 @@ pub(super) async fn reconcile_provisioned_environment(
         }
     }
 
+    if let Some(agent) = handle.agent() {
+        let context = super::docker::DockerToolContext { state, host_ref: &spec.host_ref, jobs: tokio::sync::OnceCell::new() };
+        let tools = state.environment_tools.prepare(crate::environment_tools::DOCKER_PROVIDER_KIND, env_id.as_str(), &context).await?;
+        agent.push_tools(&tools).await?;
+    }
+
     // Retry the socket even when the interior registry was already adopted.
     // A bind failure must not become a permanently skipped reconciliation step.
     if let Some(sockets) = &state.environment_sockets {

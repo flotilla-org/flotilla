@@ -1,5 +1,7 @@
 #[cfg(unix)]
 pub mod drydock;
+#[cfg(unix)]
+pub mod agent;
 mod seam;
 pub use seam::*;
 pub mod docker;
@@ -41,9 +43,9 @@ pub struct CreateOpts {
     pub provisioned_mounts: Vec<ProvisionedMount>,
     /// Tools that must be made available inside the environment.
     ///
-    /// Providers choose how to deliver these assets. Docker currently lowers
-    /// them to bind mounts; remote sandbox providers may upload files or expose
-    /// sockets through their own transport.
+    /// Providers choose how to deliver these assets. Docker pushes read-only
+    /// files after the agent hello; writable shared material and vessel-specific
+    /// daemon endpoints remain mounts.
     pub tools: Vec<EnvironmentTool>,
     pub image_pull_policy: ImagePullPolicy,
     pub prepared_auth: PreparedEnvironmentAuth,
@@ -137,6 +139,14 @@ pub struct EnvironmentToolAsset {
 }
 
 impl EnvironmentToolAsset {
+    /// Host endpoints remain vessel-specific mounts until the daemon-forward
+    /// contract lands (#3485). Writable shared material is not a pushed file.
+    pub fn requires_mount(&self) -> bool {
+        self.kind == EnvironmentToolAssetKind::UnixSocket
+            || self.access == EnvironmentToolAssetAccess::SharedWritable
+            || self.environment_path.as_path() == Path::new(CONTAINED_DAEMON_SOCKET_DIRECTORY)
+    }
+
     pub fn new(
         host_path: impl Into<PathBuf>,
         environment_path: impl Into<PathBuf>,
@@ -248,6 +258,14 @@ impl ProvisionedMount {
     pub fn new(host_path: impl Into<PathBuf>, environment_path: impl Into<PathBuf>, mode: ProvisionedMountMode) -> Self {
         Self { host_path: DaemonHostPath::new(host_path), environment_path: ExecutionEnvironmentPath::new(environment_path), mode }
     }
+}
+
+/// Host-facing capabilities of the one resident vessel agent.
+#[async_trait]
+pub trait VesselAgent: Send + Sync {
+    async fn ready(&self) -> Result<(), String>;
+    async fn forward_socket(&self, guest: &Path) -> Result<PathBuf, String>;
+    async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String>;
 }
 
 /// A live handle to a provisioned sandbox environment.
@@ -404,6 +422,16 @@ pub trait ProvisionedEnvironment: Send + Sync {
     /// This must not include the provisioning host's ambient environment.
     async fn env_vars(&self) -> Result<HashMap<String, String>, String>;
     fn runner(&self) -> Arc<dyn CommandRunner>;
+    fn agent(&self) -> Option<Arc<dyn VesselAgent>> {
+        None
+    }
+    fn fallback_runner(&self) -> Option<Arc<dyn CommandRunner>> {
+        None
+    }
+    fn fallback_shell_plan(&self, _cwd: &Path) -> Option<flotilla_protocol::ResolvedAttachPlan> {
+        None
+    }
+
     async fn destroy(&self) -> Result<(), String>;
 }
 

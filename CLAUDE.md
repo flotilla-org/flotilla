@@ -171,7 +171,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-daemon-api` | `DaemonHandle` and event publication interfaces, query subscription token, build identity and lifecycle lock file |
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
 | `flotilla-cli` | Shared CLI parsing/output, image-check client, PM connector and foreground terminal attachment; no dashboard renderer |
-| `flotilla-vessel-agent` | Narrow resident vessel startup, environment configuration, logging and shutdown; no store, reconcilers or providers |
+| `flotilla-vessel` (in `flotilla-cli`) | Pushed CLI for domain commands, artifacts and hooks; no daemon or TUI. Drydock owns the resident agent |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap and event loop; selected by the root default-on `tui` feature |
 | `flotilla-daemon` | Runtime supervision, socket server and the one HTTP router (ADR 0065) on every listener, replication composition and routed transport, peer networking, multi-host command routing |
 | `flotilla-address` | ADR 0066 addresses: typed `kind:value` segments, canonical encoding, forge-kind normalisation, lenient input through a Forge lookup, `record_name`, references and the condition/template grammar; no flotilla dependencies |

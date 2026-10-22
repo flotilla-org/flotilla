@@ -898,7 +898,7 @@ dependencies = [
 [[package]]
 name = "drydock"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=4a0e4b24811e9f85c9750ce2d9a744895e66322f#4a0e4b24811e9f85c9750ce2d9a744895e66322f"
+source = "git+https://github.com/flotilla-org/drydock?rev=7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3#7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -936,7 +936,7 @@ dependencies = [
 [[package]]
 name = "drydock-agent"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=4a0e4b24811e9f85c9750ce2d9a744895e66322f#4a0e4b24811e9f85c9750ce2d9a744895e66322f"
+source = "git+https://github.com/flotilla-org/drydock?rev=7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3#7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3"
 dependencies = [
  "axum",
  "bytes",
@@ -960,7 +960,7 @@ dependencies = [
 [[package]]
 name = "drydock-client"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=4a0e4b24811e9f85c9750ce2d9a744895e66322f#4a0e4b24811e9f85c9750ce2d9a744895e66322f"
+source = "git+https://github.com/flotilla-org/drydock?rev=7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3#7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -980,7 +980,7 @@ dependencies = [
 [[package]]
 name = "drydock-host"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=4a0e4b24811e9f85c9750ce2d9a744895e66322f#4a0e4b24811e9f85c9750ce2d9a744895e66322f"
+source = "git+https://github.com/flotilla-org/drydock?rev=7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3#7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1007,7 +1007,7 @@ dependencies = [
 [[package]]
 name = "drydock-protocol"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=4a0e4b24811e9f85c9750ce2d9a744895e66322f#4a0e4b24811e9f85c9750ce2d9a744895e66322f"
+source = "git+https://github.com/flotilla-org/drydock?rev=7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3#7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1021,7 +1021,7 @@ dependencies = [
 [[package]]
 name = "drydock-transport"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=4a0e4b24811e9f85c9750ce2d9a744895e66322f#4a0e4b24811e9f85c9750ce2d9a744895e66322f"
+source = "git+https://github.com/flotilla-org/drydock?rev=7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3#7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3"
 dependencies = [
  "async-trait",
  "axum",
@@ -1280,7 +1280,6 @@ dependencies = [
  "flotilla-test-support",
  "flotilla-tui",
  "flotilla-vcs",
- "flotilla-vessel-agent",
  "hegeltest",
  "libc",
  "ratatui",
@@ -1769,6 +1768,7 @@ dependencies = [
  "color-eyre",
  "comfy-table",
  "crossterm",
+ "flotilla-agent",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -1787,6 +1787,7 @@ dependencies = [
  "flotilla-core",
  "flotilla-daemon",
  "flotilla-daemon-api",
+ "flotilla-daemon-testkit",
  "flotilla-discovery-testkit",
  "flotilla-manifest",
  "flotilla-paths",
@@ -1795,13 +1796,16 @@ dependencies = [
  "flotilla-store",
  "flotilla-store-memory",
  "futures",
+ "hegeltest",
  "humantime",
  "insta",
  "libc",
  "serde",
  "serde_json",
+ "serde_yml",
  "tempfile",
  "tokio",
+ "toml_edit 0.22.27",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -3323,6 +3327,7 @@ dependencies = [
  "flotilla-cbor",
  "flotilla-schema-derive",
  "hegeltest",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -3359,6 +3364,7 @@ dependencies = [
  "flotilla-schema",
  "flotilla-state-machines",
  "hegeltest",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3374,6 +3380,7 @@ dependencies = [
  "flotilla-quint-testkit",
  "flotilla-schema",
  "hegeltest",
+ "libc",
  "serde",
  "serde_json",
  "smallvec",
@@ -3737,19 +3744,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "flotilla-vessel-agent"
-version = "0.1.0"
-dependencies = [
- "flotilla-build-features",
- "flotilla-build-features-async",
- "flotilla-build-features-logging",
- "flotilla-build-features-tracing",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

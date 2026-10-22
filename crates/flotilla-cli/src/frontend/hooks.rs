@@ -4,9 +4,9 @@ use color_eyre::Result;
 use flotilla_agent as agents;
 use flotilla_protocol::AgentHookEvent;
 
-use flotilla_cli::cli::args::{Cli, CompletionShell, HooksSubCommand};
+use crate::cli::args::{Cli, CompletionShell, HooksSubCommand};
 
-pub(crate) async fn run_hook(cli: &Cli, harness: &str, event_type: &str, argument_payload: Option<&str>) -> Result<()> {
+pub async fn run_hook(cli: &Cli, harness: &str, event_type: &str, argument_payload: Option<&str>) -> Result<()> {
     use std::io::Read;
 
     // 1. Resolve harness parser
@@ -62,7 +62,7 @@ async fn send_hook_event(socket_path: &std::path::Path, event: AgentHookEvent) -
     daemon.send_agent_hook(event).await.map_err(|error| color_eyre::eyre::eyre!("daemon error: {error}"))
 }
 
-pub(crate) async fn run_hooks_command(command: &HooksSubCommand) -> Result<()> {
+pub async fn run_hooks_command(command: &HooksSubCommand) -> Result<()> {
     match command {
         HooksSubCommand::Install { harness, user, project, local, plugin } => {
             if harness == "codex" {
@@ -120,7 +120,7 @@ pub(crate) async fn run_hooks_command(command: &HooksSubCommand) -> Result<()> {
     }
 }
 
-pub(crate) fn run_complete(line: &str, cursor_pos: usize) {
+pub fn run_complete(line: &str, cursor_pos: usize) {
     use clap::CommandFactory;
     let mut root = Cli::command();
     root.build();
@@ -134,7 +134,7 @@ pub(crate) fn run_complete(line: &str, cursor_pos: usize) {
     }
 }
 
-pub(crate) fn run_completions(shell: CompletionShell) {
+pub fn run_completions(shell: CompletionShell) {
     match shell {
         CompletionShell::Bash => {
             print!(

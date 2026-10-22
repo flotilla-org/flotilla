@@ -56,7 +56,6 @@ use flotilla_environment::environment::EnvironmentVariableUpdate;
 use flotilla_environment::environment::PreparedEnvironmentAuth;
 use flotilla_environment::environment::ProvisionedEnvironment;
 use flotilla_environment::environment::ProvisionedMount;
-use flotilla_environment::environment::ProvisionedMountMode;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_projections::aggregator_projection::AggregatorProjectionState;

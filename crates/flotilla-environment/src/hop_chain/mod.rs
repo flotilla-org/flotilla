@@ -6,7 +6,6 @@
 //! resolve the following hop.
 
 pub mod builder;
-pub mod environment;
 pub mod flatten;
 pub mod remote;
 pub mod resolver;

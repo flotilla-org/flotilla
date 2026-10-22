@@ -37,6 +37,13 @@ class BootstrapValidationTests(unittest.TestCase):
             for path in ("fleet-canary.sh", "../fleet-canary.py", "bin/fleet-canary.py"):
                 self.assertFalse(validation.allowed_payload(path, platform))
 
+    def test_linux_vessel_tools_are_optional_and_platform_scoped(self):
+        for platform in validation.PLATFORMS:
+            for path in ("bin/flotilla-vessel", "bin/drydock-agent"):
+                self.assertEqual(validation.allowed_payload(path, platform), platform.startswith("linux-"))
+                self.assertNotIn(path, validation.REQUIRED_PAYLOAD)
+        self.assertFalse(validation.allowed_payload("bin/../drydock-agent", "linux-x86_64"))
+
     # cleat's database and license are release data. Earlier generations may
     # omit them so health rollback remains valid.
     def test_terminfo_payload_accepts_release_data_without_requiring_old_generations(self):
