@@ -72,7 +72,7 @@ impl Sample for EnvironmentKind {
             provider: "host:feta/provider:host-direct".parse::<Address>().expect("provider"),
             image_build: None,
             recipe: Frozen::new(
-                Recipe::of(&flotilla_resources::HostDirectEnvironmentSpec { host_ref: String::new(), repo_default_dir: "/work".into() })
+                Recipe::of(&flotilla_provisioning::stored::environment::HostDirectRecipe { repo_default_dir: "/work".into() })
                     .expect("recipe"),
             )
             .expect("freeze"),

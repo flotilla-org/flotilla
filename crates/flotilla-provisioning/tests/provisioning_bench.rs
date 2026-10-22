@@ -117,14 +117,13 @@ fn environment(n: usize, home: &str) -> EnvironmentRequest {
 
 /// Convoy `n`'s Docker recipe: the provider's own document, two mounts, three env values and two
 /// adapters.
-fn docker_recipe(n: usize) -> flotilla_resources::DockerEnvironmentSpec {
+fn docker_recipe(n: usize) -> flotilla_provisioning::stored::environment::DockerRecipe {
     use flotilla_resources::{EnvironmentMount, EnvironmentMountMode};
-    flotilla_resources::DockerEnvironmentSpec {
-        host_ref: String::new(),
-        image: format!("registry/flotilla@sha256:{}", n % BUILDS),
-        image_build_ref: Some(format!("image-{}", n % BUILDS)),
-        declared_agent_adapters: BTreeSet::from(["claude-code".into(), "codex".into()]),
-        required_agent_adapters: BTreeSet::from(["claude-code".into()]),
+    // Built: its ImageBuild is the request's column, as each environment names one.
+    flotilla_provisioning::stored::environment::DockerRecipe {
+        image: flotilla_provisioning::stored::environment::DockerImage::Built,
+        declared_adapters: BTreeSet::from(["claude-code".into(), "codex".into()]),
+        required_adapters: BTreeSet::from(["claude-code".into()]),
         pull_policy: Default::default(),
         memory_policy: Default::default(),
         mounts: vec![
