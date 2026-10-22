@@ -31,9 +31,11 @@ pub type Checkout = Lifecycle<CheckoutKind>;
 /// and `ensure` is set, and a worktree names its `clone`. The writer's
 /// admission enforces both: the derive has no cross-field CHECK, and each
 /// reference is a top-level column, not a variant's datum, so that removing
-/// its target's identity searches its index instead of scanning. Realised under its path once the branch is observed
-/// checked out there. Integration (clean, pushed, landed, the change
-/// request) is observed on the forge and in the checkout, never stored here.
+/// its target's identity searches its index instead of scanning.
+///
+/// Realised under its path once the branch is observed checked out there.
+/// Integration (clean, pushed, landed, the change request) is observed on
+/// the forge and in the checkout, never stored here.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(
     kind = "Checkout",
