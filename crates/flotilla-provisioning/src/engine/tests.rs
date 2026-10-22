@@ -359,8 +359,8 @@ fn environment_object(docker: bool) -> ResourceObject<flotilla_resources::Enviro
     ResourceObject { metadata: meta("env-a"), spec, status: None }
 }
 
-// Behaviour: an environment is realised under its container, or the host-direct root; its
-// request names its image build at this home.
+// Behaviour: an environment is realised under its container, or the host-direct root; its recipe is
+// its provider's own spec, and its request names its image build at this home.
 #[test]
 fn an_environment_is_realised_under_its_container_or_root() {
     use super::environment::EnvironmentBinding;
@@ -379,6 +379,9 @@ fn an_environment_is_realised_under_its_container_or_root() {
     assert_eq!(EnvironmentBinding::steps(&environment_object(false), &ready(None)), vec![Step::Realised { identity: "/work".into() }]);
     let request = EnvironmentBinding::request(&environment_object(true), HOME).expect("request");
     assert_eq!(request.image_build.map(|build| (build.name, build.home)), Some(("image-00-amd64".into(), HOME.into())));
+    // The Docker provider's own spec is the recipe, read back by the provider.
+    let recipe = request.recipe.value().read::<flotilla_resources::DockerEnvironmentSpec>().expect("the docker recipe");
+    assert_eq!(Some(&recipe), environment_object(true).spec.docker.as_ref());
 }
 
 // Behaviour: a Ready environment whose backing the observer reports failed has vanished; the

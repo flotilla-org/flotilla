@@ -1,13 +1,11 @@
 //! Environment's binding: the old Environment reconciler's patches as lifecycle steps.
 
-use flotilla_resources::{
-    DockerImagePullPolicy, Environment as OldEnvironment, EnvironmentMountMode, EnvironmentPhase, EnvironmentStatusPatch, ResourceObject,
-};
-use flotilla_schema::Ref;
+use flotilla_resources::{Environment as OldEnvironment, EnvironmentPhase, EnvironmentStatusPatch, ResourceObject};
+use flotilla_schema::{Frozen, Ref};
 use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Outcome, Resource};
 
 use super::{Binding, Step};
-use crate::stored::environment::{Backing, Environment, EnvironmentKind, EnvironmentRequest, MemoryPolicy, Mount, MountMode, PullPolicy};
+use crate::stored::environment::{Environment, EnvironmentKind, EnvironmentRequest, Recipe};
 
 pub struct EnvironmentBinding;
 
@@ -18,43 +16,15 @@ impl Binding for EnvironmentBinding {
     fn request(obj: &ResourceObject<OldEnvironment>, home: &str) -> Result<EnvironmentRequest, String> {
         let spec = &obj.spec;
         let provider = spec.resolved_provider_address(None)?.ok_or("an environment names no provider or host")?;
-        let (backing, image_build) = match (&spec.docker, &spec.host_direct) {
-            (Some(docker), None) => (
-                Backing::Docker {
-                    image: docker.image.clone(),
-                    declared_adapters: docker.declared_agent_adapters.clone(),
-                    required_adapters: docker.required_agent_adapters.clone(),
-                    pull: match docker.pull_policy {
-                        DockerImagePullPolicy::Always => PullPolicy::Always,
-                        DockerImagePullPolicy::IfNotPresent => PullPolicy::IfNotPresent,
-                        DockerImagePullPolicy::Never => PullPolicy::Never,
-                    },
-                    memory: MemoryPolicy {
-                        host_memory_percent: docker.memory_policy.host_memory_percent,
-                        expected_concurrent_crews: docker.memory_policy.expected_concurrent_crews,
-                        swap_bytes: docker.memory_policy.swap_bytes,
-                    },
-                    mounts: docker
-                        .mounts
-                        .iter()
-                        .map(|mount| Mount {
-                            source_path: mount.source_path.clone(),
-                            target_path: mount.target_path.clone(),
-                            mode: match mount.mode {
-                                EnvironmentMountMode::Ro => MountMode::ReadOnly,
-                                EnvironmentMountMode::Rw => MountMode::ReadWrite,
-                            },
-                        })
-                        .collect(),
-                    env: docker.env.clone(),
-                },
-                // The build is homed at its builder; the environment names it as replicated here.
-                docker.image_build_ref.as_ref().map(|name| Ref::new(name.clone(), home)),
-            ),
-            (None, Some(host)) => (Backing::HostDirect { repo_default_dir: host.repo_default_dir.clone() }, None),
+        // The provider's own spec is its recipe; only the build it names is a column.
+        let (recipe, image_build) = match (&spec.docker, &spec.host_direct) {
+            // The build is homed at its builder; the environment names it as replicated here.
+            (Some(docker), None) => (Recipe::of(docker)?, docker.image_build_ref.as_ref().map(|name| Ref::new(name.clone(), home))),
+            (None, Some(host)) => (Recipe::of(host)?, None),
             _ => return Err("an environment is backed by exactly one of docker and host_direct".into()),
         };
-        Ok(EnvironmentRequest { provider, image_build, backing })
+        let recipe = Frozen::new(recipe).map_err(|error| format!("freeze the provider's recipe: {error}"))?;
+        Ok(EnvironmentRequest { provider, image_build, recipe })
     }
 
     fn initial(obj: &ResourceObject<OldEnvironment>) -> bool {
