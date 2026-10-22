@@ -52,7 +52,9 @@ pub struct TerminalSessionRequest {
     pub environment: Ref<Resource<Environment>>,
     /// The vessel it runs in, for a crew's sessions.
     pub vessel: Option<Ref<Resource<Vessel>>>,
-    /// The convoy whose crew an agent session runs.
+    /// The convoy whose crew an agent session runs: the vessel's convoy when
+    /// both are set, which the writer checks. Its own column so that a
+    /// convoy's sessions are one indexed read.
     pub convoy: Option<Ref<Resource<Convoy>>>,
     #[store(intern = "rl")]
     pub role: String,
@@ -60,7 +62,9 @@ pub struct TerminalSessionRequest {
     #[store(intern = "tp")]
     pub pool: String,
     pub cwd: String,
-    /// Declared launch values; credentials and adapter requirements take precedence.
+    /// Declared, non-secret launch values, replicated with the session.
+    /// Credentials are delivered at launch and never stored here; they and
+    /// adapter requirements take precedence.
     #[store(child)]
     pub env: BTreeMap<String, String>,
     pub source: Launch,

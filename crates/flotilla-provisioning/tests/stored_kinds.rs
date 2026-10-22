@@ -2,11 +2,9 @@
 //! readable view, checked in for the owner's schema look-over, the codes they hold for good, the
 //! plans of their statements, and each resource through the schema codec.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    env, fs,
-    path::Path,
-};
+use std::collections::{BTreeMap, BTreeSet};
+
+mod schema_support;
 
 use flotilla_provisioning::stored::{
     self,
@@ -23,16 +21,7 @@ use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
     Cause, CauseCategory, Failure, Machine, Resource, Version,
 };
-
-fn check(file: &str, actual: &str) {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots").join(file);
-    if env::var_os("UPDATE_DDL_SNAPSHOT").is_some_and(|value| value == "1") {
-        fs::write(&path, actual).expect("write snapshot");
-        return;
-    }
-    let snapshot = fs::read_to_string(&path).expect("read snapshot; run with UPDATE_DDL_SNAPSHOT=1 to create it");
-    assert_eq!(actual, snapshot, "{file} changed; review and rerun with UPDATE_DDL_SNAPSHOT=1");
-}
+use schema_support::{check, plan};
 
 // Behaviour (CLAUDE.md schema review): the provisioning kinds render deterministic DDL, checked in
 // so the owner's look-over and every later change show as a diff.
@@ -64,13 +53,6 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("Checkout"), Some(KindCode::new("ck")));
     assert_eq!(held("TerminalSession"), Some(KindCode::new("ts")));
     assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 5);
-}
-
-fn plan(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
-    let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap_or_else(|error| panic!("{sql}: {error}"));
-    let nulls = vec![rusqlite::types::Value::Null; statement.parameter_count()];
-    let rows = statement.query_map(rusqlite::params_from_iter(nulls), |row| row.get::<_, String>(3)).expect("plan");
-    rows.collect::<Result<_, _>>().expect("plan rows")
 }
 
 // Behaviour (#3392 A1, lane 3 ruling 1): removing an identity checks every reference to it by a
