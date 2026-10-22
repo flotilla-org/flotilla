@@ -374,7 +374,10 @@ impl<'a> AttachResolver<'a> {
                             source.object.spec.role == address.role && source.object.spec.project_ref.as_deref() == Some(&address.project)
                         })
                 }) {
-                    Err(format!("session for {reference} no longer exists on {}", host.unwrap_or(self.host_name)))
+                    Err(format!(
+                        "no session available for {reference} on {}; the crew has not started yet or its session has ended",
+                        host.unwrap_or(self.host_name)
+                    ))
                 } else {
                     Err(error)
                 }
@@ -1627,6 +1630,18 @@ mod tests {
         }
     }
 
+    // A known convoy without a terminal is still starting, not a deleted session.
+    #[tokio::test]
+    async fn unstarted_convoy_attach_never_claims_session_disappeared() {
+        let (daemon, backend, _temp) = attach_fixture().await;
+        create_identity_convoy(&backend, "convoy-starting", "coder", Some("flotilla")).await;
+        for reference in ["convoy-starting", "coder", "coder@flotilla"] {
+            let error = daemon.attach_resolver().resolve_attach(reference, None, false, AttachMode::Default, None).await.unwrap_err();
+            assert!(!error.contains("no longer exists"), "{error}");
+            assert!(error.contains("not started yet"), "{error}");
+        }
+    }
+
     #[tokio::test]
     async fn deleted_terminal_session_is_named_in_attach_error() {
         let (daemon, backend, _temp) = attach_fixture().await;
@@ -1648,8 +1663,17 @@ mod tests {
         let error = resolver.resolve_attach("terminal-gone", None, false, AttachMode::Default, None).await.expect_err("gone session");
         assert_eq!(error, format!("session terminal-gone no longer exists on {}", daemon.host_name));
         let error = resolver.resolve_attach("convoy-gone", None, false, AttachMode::Default, None).await.expect_err("gone convoy session");
-        assert_eq!(error, format!("session for convoy-gone no longer exists on {}", daemon.host_name));
+        assert_eq!(
+            error,
+            format!("no session available for convoy-gone on {}; the crew has not started yet or its session has ended", daemon.host_name)
+        );
         let error = resolver.resolve_attach("coder@flotilla", None, false, AttachMode::Default, None).await.expect_err("gone role session");
-        assert_eq!(error, format!("session for coder@flotilla no longer exists on {}", daemon.host_name));
+        assert_eq!(
+            error,
+            format!(
+                "no session available for coder@flotilla on {}; the crew has not started yet or its session has ended",
+                daemon.host_name
+            )
+        );
     }
 }

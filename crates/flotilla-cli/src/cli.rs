@@ -1521,6 +1521,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
             let api_version = response.value["apiVersion"].as_str().unwrap_or("<unknown>");
             format!("already deleted {api_version}/{}/{}/{name}", response.kind, response.namespace)
         }
+        CommandValue::ChangeStreamFrame { frame, .. } => format!("change stream frame: {} bytes", frame.len()),
         CommandValue::ResourceWatchEvent(response) => flotilla_protocol::output::json_pretty(response),
         CommandValue::EnvironmentSpecRead { .. } => "environment spec read".to_string(),
         CommandValue::IssuePage(page) => format_issue_page_human(page),

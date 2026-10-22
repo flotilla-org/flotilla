@@ -122,11 +122,16 @@ impl Observations for Merged {
 }
 
 fn request(n: usize) -> ConvoyRequest {
-    let promise =
-        || AdmittedPromise { kind: "pr".into(), target: address("target"), source: PromiseSource::Template, owner: seat("coder") };
+    let promise = |label: &str| AdmittedPromise {
+        label: label.into(),
+        kind: "pr".into(),
+        target: address("target"),
+        source: PromiseSource::Template,
+        owner: seat("coder"),
+    };
     ConvoyRequest {
         project: project(n),
-        promises: [(PromiseId(0), promise()), (PromiseId(1), promise())].into(),
+        promises: [(PromiseId(0), promise("template/pr")), (PromiseId(1), promise("l2-quint"))].into(),
         duties: [(DutyId(0), Duty { owner: seat("lead"), scope: DutyScope::Lifetime, terms: Terms::default() })].into(),
         seats: vec![
             Seat { role: "lead".into(), seat: String::new(), parent: None, supervised_by: address("supervisor") },
@@ -211,6 +216,11 @@ const PROMISE_BY_SUBMISSION: &str = "SELECT s.convoy, p.id, p.progress FROM conv
      JOIN convoy c ON c.id = s.convoy \
      JOIN convoy_promises p ON p.convoy = s.convoy AND p.pos = s.promises_pos \
      WHERE s.address = (SELECT id FROM strings WHERE domain = 'ad' AND s = ?1) AND c.state IN ('op')";
+
+/// A crew's or a view's read of one promise by its label (#3587 layer 6 labels ruling): within one
+/// convoy, through the unique `by_label` index.
+const PROMISE_BY_LABEL: &str = "SELECT p.id, p.progress FROM convoy_promises p \
+     WHERE p.convoy = CAST(?1 AS INTEGER) AND p.label = (SELECT id FROM strings WHERE domain = 'pl' AND s = 'template/pr')";
 
 // Behaviour (#3587 layer 4): the 10,000-convoy load, mostly replicas: the per-event cost of the
 // engine's records edges through the store, and the reads of a project's open convoys and of the
@@ -317,6 +327,15 @@ fn convoy_load() {
     assert_eq!(indexed.rows, 1.0, "each change request names one promise");
     assert_eq!(indexed.fullscan_steps, 0.0, "the lookup scans no table");
     report("promise by submission, by_address", &indexed);
+    let labels: i64 = read.query_row("SELECT count(*) FROM strings WHERE domain = 'pl'", [], |row| row.get(0)).expect("labels");
+    assert_eq!(labels, 2, "each label is interned once, whatever the number of convoys");
+    eprintln!("{:>34}: {labels} strings for {} promises", "promise labels interned", 2 * CONVOYS);
+    let mut ids = read.prepare("SELECT id FROM convoy WHERE id % 7 = 0").expect("prepare");
+    let convoys: Vec<String> = ids.query_map([], |row| row.get::<_, i64>(0)).expect("ids").map(|id| id.expect("id").to_string()).collect();
+    let by_label = measure(&read, PROMISE_BY_LABEL, &convoys);
+    assert_eq!(by_label.rows, 1.0, "one promise of each convoy holds the label");
+    assert_eq!(by_label.fullscan_steps, 0.0, "the lookup scans no table");
+    report("promise by label, by_label", &by_label);
     read.execute_batch("DROP INDEX convoy_promises_submissions_by_address").expect("drop");
     let scanned = measure(&read, PROMISE_BY_SUBMISSION, &changes[..changes.len().min(100)]);
     report("promise by submission, no index", &scanned);

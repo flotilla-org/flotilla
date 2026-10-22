@@ -153,7 +153,9 @@ fn request_of(request: &Value) -> ConvoyRequest {
         .iter()
         .map(|p| {
             let admitted = &p[1];
+            // The spec names promises by id; a label is per-convoy data it does not model.
             let promise = AdmittedPromise {
+                label: format!("p{}", id(&p[0])),
                 kind: text(&admitted["promise"]["kind"]).into(),
                 target: address(&admitted["promise"]["target"]),
                 source: source_of(&admitted["source"]),
@@ -313,6 +315,7 @@ impl Conformance for ConvoyConformance {
                 let definition = &o["definition"];
                 let declare = Declare {
                     promise: promise(),
+                    label: format!("p{}", promise().0),
                     kind: text(&definition["kind"]).into(),
                     target: address(&definition["target"]),
                     owner: seat(&o["owner"]),

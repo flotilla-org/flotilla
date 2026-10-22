@@ -918,6 +918,7 @@ fn spawn_controller_loops(
                 (
                     secondaries,
                     ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(&namespace_string))
+                        .with_engine(daemon.convoy_engine_path())
                         .with_hosts(backend.including_replicas::<Host>(&namespace_string))
                         .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                         .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))

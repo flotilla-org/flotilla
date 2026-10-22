@@ -33,6 +33,8 @@ pub enum ConvoyVerb {
     Explain(ConvoyExplainArgs),
     /// Manage the work aboard a convoy's vessels
     Work(ConvoyWorkNoun),
+    /// An operator's attributed verdict on one promise (with `[primitives]` on)
+    Promise(ConvoyPromiseNoun),
     /// Delete a convoy and tear down its managed resources
     Delete(ConvoyDeleteArgs),
     /// Link an issue or change request to a convoy
@@ -269,6 +271,30 @@ pub enum ConvoyWorkVerb {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+pub struct ConvoyPromiseNoun {
+    /// The promise's label within the convoy
+    pub subject: String,
+
+    #[command(subcommand)]
+    pub verb: ConvoyPromiseVerb,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum ConvoyPromiseVerb {
+    /// Keep the promise by an operator's verdict
+    Keep(ConvoyPromiseVerdictArgs),
+    /// Retract the promise by an operator's verdict
+    Retract(ConvoyPromiseVerdictArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ConvoyPromiseVerdictArgs {
+    /// Why, recorded with the verdict
+    #[arg(long)]
+    pub reason: String,
+}
+
 impl ConvoyNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         match self.verb {
@@ -317,6 +343,30 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 }),
             },
+            ConvoyVerb::Promise(promise) => {
+                let (keep, args) = match promise.verb {
+                    ConvoyPromiseVerb::Keep(args) => (true, args),
+                    ConvoyPromiseVerb::Retract(args) => (false, args),
+                };
+                if args.reason.trim().is_empty() {
+                    return Err("a promise verdict requires a non-empty --reason".to_string());
+                }
+                Ok(Resolved::NeedsContext {
+                    command: Command {
+                        node_id: None,
+                        provisioning_target: None,
+                        context_repo: None,
+                        action: CommandAction::ConvoyPromiseVerdict {
+                            convoy: self.subject.ok_or_else(|| "convoy name is required before `promise`".to_string())?,
+                            promise: promise.subject,
+                            keep,
+                            reason: args.reason,
+                        },
+                    },
+                    repo: RepoContext::None,
+                    host: HostResolution::Local,
+                })
+            }
             ConvoyVerb::Delete(ConvoyDeleteArgs { name, force }) => {
                 if self.subject.is_some() {
                     return Err("convoy delete takes its name after `delete`".to_string());
@@ -573,6 +623,13 @@ impl std::fmt::Display for ConvoyNoun {
                     }
                 }
             }
+            ConvoyVerb::Promise(promise) => {
+                write!(f, " promise {}", quote_value(&promise.subject))?;
+                match &promise.verb {
+                    ConvoyPromiseVerb::Keep(args) => write!(f, " keep --reason {}", quote_value(&args.reason))?,
+                    ConvoyPromiseVerb::Retract(args) => write!(f, " retract --reason {}", quote_value(&args.reason))?,
+                }
+            }
             ConvoyVerb::Delete(ConvoyDeleteArgs { name, force }) => {
                 write!(f, " delete {}", quote_value(name))?;
                 if *force {
@@ -827,6 +884,29 @@ mod tests {
             RepoContext::None,
             HostResolution::Local,
         );
+    }
+
+    // Behaviour (#3587 layer 6): an operator keeps or retracts one promise by its label, with a
+    // reason; an empty reason is refused before anything is sent.
+    #[test]
+    fn convoy_promise_verdicts_resolve() {
+        for (verb, keep) in [("keep", true), ("retract", false)] {
+            let resolved =
+                parse(&["convoy", "convoy-a", "promise", "template/pr", verb, "--reason", "merged by hand"]).resolve().expect("resolve");
+            crate::test_utils::assert_needs_context(
+                resolved,
+                CommandAction::ConvoyPromiseVerdict {
+                    convoy: "convoy-a".into(),
+                    promise: "template/pr".into(),
+                    keep,
+                    reason: "merged by hand".into(),
+                },
+                RepoContext::None,
+                HostResolution::Local,
+            );
+        }
+        let error = parse(&["convoy", "convoy-a", "promise", "template/pr", "keep", "--reason", " "]).resolve().expect_err("empty reason");
+        assert_eq!(error, "a promise verdict requires a non-empty --reason");
     }
 
     #[test]

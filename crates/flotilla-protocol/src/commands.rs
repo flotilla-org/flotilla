@@ -932,6 +932,15 @@ pub enum CommandAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// An operator keeps (or retracts) one promise by its label, with a
+    /// reason: the engine's verdict edge (#3587 layer 6). Refused while
+    /// `[primitives]` is off or the engine does not hold the convoy.
+    ConvoyPromiseVerdict {
+        convoy: String,
+        promise: String,
+        keep: bool,
+        reason: String,
+    },
     ConvoyDelete {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
@@ -1159,6 +1168,13 @@ pub enum CommandAction {
         namespace: Option<String>,
         name: String,
     },
+    /// Peer-only pull of a whole-home stream frame; interactive query dispatch refuses it.
+    /// `after` selects a new round's cut. With `session`, the saved cut takes precedence
+    /// and `after` is ignored. Idle consumers lose the session.
+    QueryChangeStream {
+        after: Option<u64>,
+        session: Option<String>,
+    },
     QueryResourceDigest {
         namespace: String,
         kind: String,
@@ -1260,6 +1276,7 @@ impl CommandAction {
                 | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryDaemonLogs { .. }
                 | CommandAction::QueryExplainConvoy { .. }
+                | CommandAction::QueryChangeStream { .. }
                 | CommandAction::QueryResourceDigest { .. }
                 | CommandAction::QueryResourceList { .. }
                 | CommandAction::QueryResourceGet { .. }
@@ -1292,6 +1309,8 @@ impl Command {
             CommandAction::ArchiveSession { .. } => "Archiving session...",
             CommandAction::GenerateBranchName { .. } => "Generating branch name...",
             CommandAction::ConvoyWorkForceComplete { .. } => "Force-completing work...",
+            CommandAction::ConvoyPromiseVerdict { keep: true, .. } => "Keeping promise by verdict...",
+            CommandAction::ConvoyPromiseVerdict { keep: false, .. } => "Retracting promise by verdict...",
             CommandAction::ConvoyDelete { .. } => "Deleting convoy...",
             CommandAction::ConvoyLink { .. } => "Linking convoy subject...",
             CommandAction::ConvoyUnlink { .. } => "Unlinking convoy subject...",
@@ -1341,6 +1360,7 @@ impl Command {
             CommandAction::QueryCrewList { .. } => "query crew list",
             CommandAction::QueryDaemonLogs { .. } => "query daemon logs",
             CommandAction::QueryExplainConvoy { .. } => "explain convoy",
+            CommandAction::QueryChangeStream { .. } => "read change stream",
             CommandAction::QueryResourceDigest { .. } => "query resource digest",
             CommandAction::QueryResourceList { .. } => "query resource list",
             CommandAction::QueryResourceGet { .. } => "query resource get",
@@ -1400,10 +1420,28 @@ impl AttachBinding {
     }
 }
 
+// Peer commands use JSON; base64 avoids expanding every CBOR byte to an integer.
+mod frame_bytes {
+    use super::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&URL_SAFE_NO_PAD.encode(bytes))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        URL_SAFE_NO_PAD.decode(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Result returned from command execution, or inter-step data passed between steps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandValue {
+    ChangeStreamFrame {
+        session: String,
+        #[serde(with = "frame_bytes")]
+        frame: Vec<u8>,
+    },
     LedgerCommentCreationReserved {
         granted: bool,
     },
@@ -1662,6 +1700,8 @@ mod tests {
     #[test]
     fn command_roundtrip_covers_all_variants() {
         let cases = vec![
+            Command::builder().action(CommandAction::QueryChangeStream { after: None, session: None }).build(),
+            Command::builder().action(CommandAction::QueryChangeStream { after: Some(7), session: Some("round".into()) }).build(),
             Command::builder()
                 .action(CommandAction::Refresh { repo: Some(RepoSelector::Query("flotilla".into())) })
                 .node_id(NodeId::new("feta"))
@@ -1730,6 +1770,14 @@ mod tests {
                     convoy: "convoy-a".into(),
                     work: "implement".into(),
                     message: Some("done".into()),
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::ConvoyPromiseVerdict {
+                    convoy: "convoy-a".into(),
+                    promise: "template/pr".into(),
+                    keep: true,
+                    reason: "merged by hand".into(),
                 })
                 .build(),
             Command::builder()
@@ -1891,6 +1939,7 @@ mod tests {
     #[test]
     fn command_value_roundtrip_covers_all_variants() {
         let cases = vec![
+            CommandValue::ChangeStreamFrame { session: "round".into(), frame: vec![0, 127, 128, 255] },
             CommandValue::Ok,
             CommandValue::CrewFollowUpDelivered,
             CommandValue::CrewCompletionAdvisory { pending: vec!["template/pr: waiting on PR merge".into()] },

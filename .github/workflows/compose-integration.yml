@@ -52,6 +52,11 @@ jobs:
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           shared-key: "compose-integration"
           # PR caches are branch-scoped and only churn the shared pool; main
           # pushes keep the dependency cache warm for every PR.
@@ -115,6 +120,19 @@ jobs:
       - uses: docker/setup-buildx-action@v3
         with:
           driver: docker
+      # Cache only the stable runtime layers (packages, sshd, user, scripts).
+      # The binary layers differ on every push, so caching them only crowded
+      # the repository's 10 GB cache pool and evicted the Rust caches. Main
+      # keeps the runtime cache warm; PRs read it.
+      - name: Build integration runtime layers
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: tests/integration/docker/base/Dockerfile
+          target: runtime-base
+          load: true
+          cache-from: type=gha,scope=compose-integration-runtime-base
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max,scope=compose-integration-runtime-base' || '' }}
       - name: Build integration base image
         uses: docker/build-push-action@v7
         with:
@@ -124,8 +142,6 @@ jobs:
           build-args: FLOTILLA_BIN_DIR=${{ env.FLOTILLA_BIN_DIR }}
           tags: flotilla-base
           load: true
-          cache-from: type=gha,scope=compose-integration-wedge-dev
-          cache-to: type=gha,mode=max,scope=compose-integration-wedge-dev
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -174,6 +190,19 @@ jobs:
       - uses: docker/setup-buildx-action@v3
         with:
           driver: docker
+      # Cache only the stable runtime layers (packages, sshd, user, scripts).
+      # The binary layers differ on every push, so caching them only crowded
+      # the repository's 10 GB cache pool and evicted the Rust caches. Main
+      # keeps the runtime cache warm; PRs read it.
+      - name: Build integration runtime layers
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: tests/integration/docker/base/Dockerfile
+          target: runtime-base
+          load: true
+          cache-from: type=gha,scope=compose-integration-runtime-base
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max,scope=compose-integration-runtime-base' || '' }}
       - name: Build integration base image
         uses: docker/build-push-action@v7
         with:
@@ -183,8 +212,6 @@ jobs:
           build-args: FLOTILLA_BIN_DIR=${{ env.FLOTILLA_BIN_DIR }}
           tags: flotilla-base
           load: true
-          cache-from: type=gha,scope=compose-integration-hub-spoke-dev
-          cache-to: type=gha,mode=max,scope=compose-integration-hub-spoke-dev
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

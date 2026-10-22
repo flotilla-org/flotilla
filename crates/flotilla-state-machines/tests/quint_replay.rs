@@ -667,6 +667,7 @@ fn convoy_request(state: &Value) -> ConvoyRequest {
         .map(|pair| {
             let record = &pair[1];
             let promise = convoy::AdmittedPromise {
+                label: format!("p{}", small(&pair[0])),
                 kind: text(&record["promise"]["kind"]).into(),
                 target: address(&record["promise"]["target"]),
                 source: source_of(&record["source"]),
@@ -879,6 +880,7 @@ fn convoy_deliver(trace: &Trace, tally: &mut Tally) {
             "declare" => {
                 let edge = convoy::Declare {
                     promise: PromiseId(1),
+                    label: "p1".into(),
                     kind: "opaque".into(),
                     target: itf::address_of("target"),
                     owner: picked_seat(),

@@ -4995,3 +4995,65 @@ use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject() {
     message_homes::messages_are_homed_at_the_receiver_and_replies_route_by_subject().await;
 }
+
+#[derive(flotilla_schema::Stored)]
+#[store(kind = "RouterStreamSample", code = "rq")]
+struct RouterStreamSample {
+    value: String,
+}
+
+// Pinned routing/admission rows: an interactive user or crew cannot acquire replication
+// cursors from either its local daemon or a routed home, even when a store is installed.
+#[tokio::test]
+async fn router_change_stream_admission_scenario_rows() {
+    use flotilla_schema::KindRegistry;
+    use flotilla_schema_sqlite::stream::Service;
+    for (name, remote, crew) in
+        [("local-user", false, false), ("remote-user", true, false), ("local-crew", false, true), ("remote-crew", true, true)]
+    {
+        let leader = empty_daemon_named("desk").await;
+        let follower = empty_daemon_named("home").await;
+        let files = tempfile::tempdir().unwrap();
+        let mut kinds = KindRegistry::new();
+        kinds.register::<RouterStreamSample>().unwrap();
+        for (filename, daemon) in [("desk.db", &leader), ("home.db", &follower)] {
+            daemon
+                .install_decided_store(Arc::new(
+                    Service::open(&files.path().join(filename), daemon.node_id().as_str(), kinds.clone()).unwrap(),
+                ))
+                .unwrap();
+        }
+        let principal_ref = PrincipalRef::implicit_for_namespace("flotilla");
+        let caller = CommandCaller {
+            principal_ref: principal_ref.clone(),
+            process: None,
+            crew: crew.then(|| {
+                CallerCrew::builder()
+                    .namespace("flotilla".to_string())
+                    .convoy("work".to_string())
+                    .vessel("work".to_string())
+                    .role("coder".to_string())
+                    .crew_id("test-crew".to_string())
+                    .build()
+            }),
+        };
+        let topology = spawn_in_memory_request_topology_stateful_with_caller(
+            leader,
+            follower,
+            SurfaceDeclaration { principal_ref, character: SurfaceCharacter::Focal },
+            caller,
+        )
+        .await
+        .unwrap();
+        let target = if remote { topology.follower.node_id() } else { topology.leader.node_id() };
+        let error = topology
+            .client
+            .execute_query(
+                Command::builder().node_id(target.clone()).action(CommandAction::QueryChangeStream { after: None, session: None }).build(),
+                uuid::Uuid::nil(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("peer replication transport"), "{name}: {error}");
+    }
+}

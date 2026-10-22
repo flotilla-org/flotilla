@@ -380,14 +380,21 @@ pub fn codex_hook_overrides() -> Vec<String> {
     overrides
 }
 
-// Mirrors rust-v0.160.0 hooks/engine/discovery.rs and config/fingerprint.rs.
-// Optional TOML fields disappear before canonical JSON hashing; timeout is normalized.
+// Codex 0.160.0 sources (pinned to the release tag):
+// https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/hooks/src/engine/discovery.rs
+// normalize_command_hook: SessionEnd and Interrupt default to 1s; all others 600s.
+// hook_hash fingerprints the event label and normalized matcher group, not source/index.
+// https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/config/src/hook_config.rs
+// HookHandlerConfig::Command defaults async=false and all optional fields to None.
+// Our matcher and optional fields are absent; TOML serialization omits None fields.
+// https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/config/src/fingerprint.rs
+// version_for_toml hashes canonical (sorted-key) JSON with SHA-256.
 fn codex_hook_hash(native: &str, event: &str) -> String {
     use sha2::{Digest, Sha256};
     let identity = serde_json::json!({
         "event_name": event.replace('-', "_"),
         "hooks": [{"type": "command", "command": format!("flotilla hook codex {event}"),
-            "timeout": if native == "SessionEnd" { 1 } else { 600 }, "async": false}],
+            "timeout": if matches!(native, "SessionEnd" | "Interrupt") { 1 } else { 600 }, "async": false}],
     });
     format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&identity).expect("hook identity")))
 }
@@ -795,7 +802,16 @@ mod tests {
         let recorded: serde_json::Value = serde_json::from_str(include_str!("fixtures/codex-hooks-list-0.160.0.json")).unwrap();
         let state_override = codex_hook_overrides().pop().unwrap();
         let document = state_override.parse::<toml_edit::DocumentMut>().unwrap();
-        for hook in recorded["data"][0]["hooks"].as_array().unwrap() {
+        let hooks = recorded["data"][0]["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), CODEX_HOOK_SUBSCRIPTIONS.len(), "record every subscribed event");
+        // Exhaust the subscription space: a new event must have a first-party record.
+        for (native, event, _) in CODEX_HOOK_SUBSCRIPTIONS {
+            let command = format!("flotilla hook codex {event}");
+            let hook = hooks
+                .iter()
+                .find(|hook| hook["command"].as_str() == Some(command.as_str()))
+                .unwrap_or_else(|| panic!("missing Codex trust record for {native}"));
+            assert_eq!(Some(codex_hook_hash(native, event).as_str()), hook["currentHash"].as_str(), "{native}");
             // The recording is Linux; only the synthetic source path differs
             // on Windows. Handler identities and trust hashes are portable.
             let key = hook["key"].as_str().unwrap();

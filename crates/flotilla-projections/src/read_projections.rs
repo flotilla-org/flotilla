@@ -1553,7 +1553,7 @@ impl ReadProjections<'_> {
                 obstruction: source.object.status.as_ref().and_then(|status| {
                     let session = status.session_id.as_deref().unwrap_or(&source.object.metadata.name);
                     status
-                        .idle_obstruction()
+                        .attention_obstruction()
                         .filter(|_| status.phase == flotilla_resources::TerminalSessionPhase::Running)
                         .map(|obstruction| obstruction.describe(session))
                 }),

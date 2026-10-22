@@ -144,39 +144,6 @@ fn topic_round_trip() {
     assert_eq!(b.read().expect("read").changes_since("a", 0, 1).expect("event")[0], event);
 }
 
-// Differential conformance with unchanged world/stream.qnt: watermark is the maximum applied
-// keepalive time. Enumerate its finite marks (zero, equal, increasing, decreasing), prefixes
-// and links; a disconnected transport delivers no additional prefix, independent of stored time.
-#[test]
-fn quint_watermark_prefix_conformance() {
-    for a in 0..=2 {
-        for b in 0..=2 {
-            for prefix in 0..=2 {
-                for linked in [false, true] {
-                    let mut replica = store("replica");
-                    for time in [a, b].into_iter().take(prefix) {
-                        let frame = Frame::Keepalive {
-                            home: "home".into(),
-                            watermark: Watermark { home_seq: 0, applied_through: Timestamp(time) },
-                        }
-                        .encode()
-                        .expect("frame");
-                        Follower::new(&mut replica).receive("home", |sink| sink(&frame)).expect("apply prefix");
-                    }
-                    let expected = [a, b].into_iter().take(prefix).max().unwrap_or(0);
-                    // Link state after application cannot invalidate an observed prefix. A connected
-                    // duplicate old mark also cannot lower it; disconnected links deliver nothing.
-                    if linked {
-                        let old = Frame::Keepalive { home: "home".into(), watermark: Watermark::ZERO }.encode().expect("old mark");
-                        Follower::new(&mut replica).receive("home", |sink| sink(&old)).expect("older mark");
-                    }
-                    assert_eq!(mark(&mut replica, "home").applied_through, Timestamp(expected));
-                }
-            }
-        }
-    }
-}
-
 // Generated two-store interleavings: writes during partitions hold the follower's watermark;
 // reconnecting from its committed prefix converges without resnapshotting or re-running machines.
 #[hegel::test]
@@ -201,9 +168,9 @@ fn generated_partition_resume(tc: hegel::TestCase) {
 }
 
 // Every kind's rows, nested records, frozen objects and identity references survive the same
-// streaming-row protocol. The generator selects among all fixture kinds and their full shapes.
+// per-resource protocol. The generator selects among all fixture kinds and their full shapes.
 #[hegel::test]
-fn snapshot_chunks_preserve_all_kind_shapes(tc: hegel::TestCase) {
+fn snapshot_frames_preserve_all_kind_shapes(tc: hegel::TestCase) {
     use crate::fixtures::{AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Pick, Referral, TerminalSession, Ticket, Vessel};
     fn check<K: Fixture>(tc: &hegel::TestCase) {
         let mut a = store("a");
@@ -213,7 +180,19 @@ fn snapshot_chunks_preserve_all_kind_shapes(tc: hegel::TestCase) {
         let stamp = write.insert("m", &value, &origin()).expect("insert");
         write.commit().expect("commit");
         let expected = a.read().expect("read").load_snapshot(stamp.id).expect("load");
-        sync(&mut a, &mut b, None, 3).expect("chunked snapshot");
+        let mut count = 0;
+        Follower::new(&mut b)
+            .receive("a", |sink| {
+                stream::serve(&mut a, None, Timestamp(3), |bytes| {
+                    if matches!(Frame::decode(bytes)?, Frame::Resource(_)) {
+                        count += 1;
+                    }
+                    sink(bytes)
+                })
+                .map(|_| ())
+            })
+            .expect("resource snapshot");
+        assert_eq!(count, 1, "one complete resource per frame");
         let mut read = b.read().expect("read");
         let id = read.resolve(K::CODE, "m", "a").expect("identity").expect("id");
         assert_eq!(read.load_snapshot(id).expect("snapshot"), expected);
@@ -366,4 +345,118 @@ fn watermark_is_independent_of_the_store_lock() {
     read.join().expect("gate task");
     assert_eq!(before.expect("gate must not wait for store").expect("watermark"), Watermark::ZERO);
     assert_eq!(service.watermark("a").expect("published").applied_through, Timestamp(17));
+}
+
+// WORKLOAD.md ceiling: 10,000 running convoys, 100 KiB upper-width convoy bodies.
+// This measures the whole-resource frame and restores every resource through Follower.
+#[test]
+#[ignore = "in-process ceiling measurement"]
+fn workload_ceiling_resource_frames() {
+    use crate::fixtures::{convoy, Convoy};
+    use flotilla_schema::Frozen;
+    use flotilla_state_machines::machines::convoy::{PromiseKind, PromiseKinds};
+    let started = std::time::Instant::now();
+    let mut a = store("a");
+    let mut b = store("b");
+    let base = convoy::sample();
+    let mut spec = base.spec().clone();
+    // Frozen charter document dominates a convoy at the upper workload width.
+    spec.kinds = Frozen::new(PromiseKinds { kinds: [("k".repeat(100 * 1024), PromiseKind::default())].into() }).unwrap();
+    let value = base.with_spec(spec);
+    let mut write = a.write().unwrap();
+    for index in 0..10_000 {
+        write.insert(&format!("convoy-{index}"), &value, &origin()).unwrap();
+    }
+    write.commit().unwrap();
+    let mut frames = 0;
+    let mut resources = 0;
+    let mut largest = 0;
+    Follower::new(&mut b)
+        .receive("a", |sink| {
+            stream::serve(&mut a, None, Timestamp(10), |bytes| {
+                frames += 1;
+                if matches!(Frame::decode(bytes)?, Frame::Resource(_)) {
+                    resources += 1;
+                    largest = largest.max(bytes.len());
+                }
+                sink(bytes)
+            })
+            .map(|_| ())
+        })
+        .unwrap();
+    assert_eq!(resources, 10_000);
+    assert_eq!(frames, resources + 3);
+    assert!(largest < stream::FRAMING.limits.max_message);
+    let mut ar = a.read().unwrap();
+    let mut br = b.read().unwrap();
+    for index in 0..10_000 {
+        let name = format!("convoy-{index}");
+        let aid = ar.resolve(Resource::<Convoy>::CODE, &name, "a").unwrap().unwrap();
+        let bid = br.resolve(Resource::<Convoy>::CODE, &name, "a").unwrap().unwrap();
+        assert_eq!(ar.load_snapshot(aid).unwrap(), br.load_snapshot(bid).unwrap());
+    }
+    eprintln!("ceiling: resources={resources} frames={frames} largest_frame_bytes={largest} elapsed={:?}", started.elapsed());
+}
+
+#[derive(Clone, flotilla_schema::Stored)]
+#[store(kind = "GrowingSnapshot", code = "gs")]
+struct GrowingSnapshot {
+    #[store(child)]
+    entries: std::collections::BTreeMap<u32, String>,
+}
+
+// Individual writes fit the log, but accumulated children can exceed a snapshot frame.
+// Only that resource is chunked; the follower assembles it and uses the same restore().
+#[test]
+fn oversized_resource_uses_chunks_and_restores_atomically() {
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    kinds.register::<GrowingSnapshot>().unwrap();
+    let mut a = Store::open(Connection::open_in_memory().unwrap(), "a", kinds.clone()).unwrap();
+    let mut b = Store::open(Connection::open_in_memory().unwrap(), "b", kinds).unwrap();
+    let mut write = a.write().unwrap();
+    let stamp = write.insert("large", &GrowingSnapshot { entries: Default::default() }, &origin()).unwrap();
+    write.commit().unwrap();
+    for batch in 0..32 {
+        let current = a.read().unwrap().load::<GrowingSnapshot>(stamp.id).unwrap().unwrap();
+        let mut next = current.value.clone();
+        for index in 0..32 {
+            next.entries.insert(batch * 32 + index, "x".repeat(17 * 1024));
+        }
+        let mut write = a.write().unwrap();
+        write.update(&current, &next, &origin()).unwrap();
+        write.commit().unwrap();
+    }
+    let expected = a.read().unwrap().load_snapshot(stamp.id).unwrap().unwrap();
+    assert!(Frame::Resource(expected.clone()).encode().is_err(), "measured resource exceeds one frame");
+    let failed = Follower::new(&mut b).receive("a", |sink| {
+        stream::serve(&mut a, None, Timestamp(9), |bytes| {
+            if matches!(Frame::decode(bytes)?, Frame::ResourceChunk { last: true, .. }) {
+                return Err(StoreError::Stream("disconnected".into()));
+            }
+            sink(bytes)
+        })
+        .map(|_| ())
+    });
+    assert!(failed.is_err());
+    assert_eq!(mark(&mut b, "a"), Watermark::ZERO);
+    assert!(b.read().unwrap().resolve(GrowingSnapshot::CODE, "large", "a").unwrap().is_none());
+    let mut chunks = 0;
+    let mut largest = 0;
+    Follower::new(&mut b)
+        .receive("a", |sink| {
+            stream::serve(&mut a, None, Timestamp(10), |bytes| {
+                largest = largest.max(bytes.len());
+                if matches!(Frame::decode(bytes)?, Frame::ResourceChunk { .. }) {
+                    chunks += 1;
+                }
+                sink(bytes)
+            })
+            .map(|_| ())
+        })
+        .unwrap();
+    let mut read = b.read().unwrap();
+    let id = read.resolve(GrowingSnapshot::CODE, "large", "a").unwrap().unwrap();
+    assert_eq!(read.load_snapshot(id).unwrap(), Some(expected));
+    assert_eq!(chunks, 1025);
+    eprintln!("oversized: child_payload_bytes={} chunks={chunks} largest_frame_bytes={largest}", 1024 * 17 * 1024);
 }

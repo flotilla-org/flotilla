@@ -3,6 +3,8 @@
 //! Snapshots hold a consistent read transaction; consumers install them in one transaction.
 //! A failed/disconnected sink rolls back its uncommitted snapshot. No replica runs machines.
 
+//! See the [implementation choice](https://github.com/flotilla-org/flotilla/blob/main/docs/implementation-choices/change-stream.md).
+
 use flotilla_schema::{Event, Identity, Timestamp, LOG_LIMITS};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,8 +38,13 @@ pub enum Frame {
         home: String,
         home_seq: u64,
     },
-    /// Exactly one logical row and its referenced objects; root before children.
+    /// One complete resource, including child rows and referenced objects.
     Resource(Snapshot),
+    /// Only resources exceeding a frame use row chunks, assembled before restore().
+    ResourceChunk {
+        value: Snapshot,
+        last: bool,
+    },
     Tombstone {
         identity: Identity,
         home_seq: u64,
@@ -90,7 +97,9 @@ pub fn serve(
                         break;
                     }
                     for id in &ids {
-                        if !read.visit_snapshot(*id, |snapshot| emit(Frame::Resource(snapshot), &mut send))? {
+                        if let Some(snapshot) = read.load_snapshot(*id)? {
+                            send_resource(snapshot, &mut send)?;
+                        } else {
                             let (identity, home_seq) =
                                 read.identity(*id)?.ok_or_else(|| StoreError::Stream("missing snapshot identity".into()))?;
                             emit(Frame::Tombstone { identity, home_seq }, &mut send)?;
@@ -117,6 +126,44 @@ pub fn serve(
     Ok(cursor)
 }
 
+/// Ordinary resources take one frame. Append-only resources can outgrow the wire bound;
+/// split their already-loaded logical rows without a second SQL snapshot traversal.
+fn send_resource(snapshot: Snapshot, send: &mut dyn FnMut(&[u8]) -> Result<(), StoreError>) -> Result<(), StoreError> {
+    let frame = Frame::Resource(snapshot);
+    match FRAMING.encode(&frame) {
+        Ok(bytes) => return send(&bytes),
+        Err(error) if matches!(error.kind(), flotilla_cbor::ErrorKind::MessageLimit | flotilla_cbor::ErrorKind::ElementLimit) => {}
+        Err(error) => return Err(StoreError::Stream(error.to_string())),
+    }
+    let Frame::Resource(snapshot) = frame else { unreachable!() };
+    let tables = snapshot.rows.tables.len();
+    let total: usize = snapshot.rows.tables.iter().map(Vec::len).sum();
+    let mut sent = 0;
+    for (table, rows) in snapshot.rows.tables.into_iter().enumerate() {
+        for row in rows {
+            let mut chunk = flotilla_schema::Rows::with_tables(tables);
+            for value in row.key.iter().chain(&row.values) {
+                if let flotilla_schema::Value::Object(hash) = value {
+                    if let Some(bytes) = snapshot.rows.objects.get(hash) {
+                        chunk.objects.insert(*hash, bytes.clone());
+                    }
+                }
+            }
+            chunk.tables[table].push(row);
+            sent += 1;
+            let value = Snapshot {
+                kind: snapshot.kind,
+                name: snapshot.name.clone(),
+                home: snapshot.home.clone(),
+                version: snapshot.version,
+                rows: chunk,
+            };
+            send(&Frame::ResourceChunk { value, last: sent == total }.encode()?)?;
+        }
+    }
+    Ok(())
+}
+
 /// Receiver for one home. Dropping it rolls back an incomplete snapshot. Each delivery round
 /// commits state and sequence together; only an applied keepalive moves the time watermark.
 pub struct Follower<'a> {
@@ -134,6 +181,8 @@ impl<'a> Follower<'a> {
     ) -> Result<(), StoreError> {
         let mut write = self.store.write()?;
         let mut snapshot = None;
+        let mut chunks: Option<Snapshot> = None;
+        let mut chunk_bytes = 0usize;
         let mut cursor = write.stream_watermark(home)?;
         deliver(&mut |bytes| {
             match Frame::decode(bytes)? {
@@ -142,13 +191,41 @@ impl<'a> Follower<'a> {
                     snapshot = Some(home_seq);
                     cursor.home_seq = 0;
                 }
-                Frame::Resource(value) if value.home == home && snapshot.is_some_and(|cut| value.version <= cut) => {
-                    write.restore_chunk(&value)?;
+                Frame::Resource(value) if chunks.is_none() && value.home == home && snapshot.is_some_and(|cut| value.version <= cut) => {
+                    write.restore(&value)?;
                 }
-                Frame::Tombstone { identity, home_seq } if identity.home == home && snapshot.is_some_and(|cut| home_seq <= cut) => {
+                Frame::ResourceChunk { value, last } if value.home == home && snapshot.is_some_and(|cut| value.version <= cut) => {
+                    chunk_bytes = chunk_bytes.saturating_add(bytes.len());
+                    if chunk_bytes > MAX_RESOURCE_ASSEMBLY_BYTES {
+                        return Err(StoreError::Stream("snapshot resource exceeds assembly limit".into()));
+                    }
+                    match &mut chunks {
+                        None => chunks = Some(value),
+                        Some(pending) => {
+                            if pending.kind != value.kind
+                                || pending.name != value.name
+                                || pending.version != value.version
+                                || pending.rows.tables.len() != value.rows.tables.len()
+                            {
+                                return Err(StoreError::Stream("snapshot chunks changed resource".into()));
+                            }
+                            for (rows, next) in pending.rows.tables.iter_mut().zip(value.rows.tables) {
+                                rows.extend(next);
+                            }
+                            pending.rows.objects.extend(value.rows.objects);
+                        }
+                    }
+                    if last {
+                        write.restore(&chunks.take().expect("chunk resource"))?;
+                        chunk_bytes = 0;
+                    }
+                }
+                Frame::Tombstone { identity, home_seq }
+                    if chunks.is_none() && identity.home == home && snapshot.is_some_and(|cut| home_seq <= cut) =>
+                {
                     write.restore_identity(&identity, home_seq)?;
                 }
-                Frame::End { home: from, home_seq } if from == home && snapshot == Some(home_seq) => {
+                Frame::End { home: from, home_seq } if chunks.is_none() && from == home && snapshot == Some(home_seq) => {
                     write.finish_snapshot(home, home_seq)?;
                     cursor.home_seq = home_seq;
                     write.advance_watermark(home, cursor)?;
@@ -188,8 +265,12 @@ pub struct ReadResult {
 }
 
 impl flotilla_cbor::Message for Frame {
-    const TYPES: &'static [&'static str] = &["Read", "Begin", "Resource", "Tombstone", "End", "Change", "Keepalive"];
+    const TYPES: &'static [&'static str] = &["Read", "Begin", "Resource", "ResourceChunk", "Tombstone", "End", "Change", "Keepalive"];
 }
+
+/// Bounded exceptional resource assembly, well above WORKLOAD.md's 100 KiB convoy width.
+/// A resource crossing this boundary needs retention or an incremental restore design.
+pub const MAX_RESOURCE_ASSEMBLY_BYTES: usize = 64 * 1024 * 1024;
 
 pub const PATH: &str = "/apis/flotilla.work/v1/change-stream";
 pub const RECORD_PATH: &str = "/apis/flotilla.work/v1/record";
@@ -218,6 +299,10 @@ impl Service {
     /// Gates read committed progress independently of database writers and network delivery.
     pub fn watermark(&self, home: &str) -> Result<Watermark, StoreError> {
         Ok(watermark(&self.watermarks, home))
+    }
+    /// Whether a complete round has committed, including an empty snapshot at zero.
+    pub fn has_watermark(&self, home: &str) -> bool {
+        self.watermarks.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(home)
     }
     /// This home and every home whose stream this store has applied, sorted.
     pub fn homes(&self) -> Vec<String> {
@@ -265,4 +350,53 @@ struct Source {
     path: std::path::PathBuf,
     home: String,
     kinds: flotilla_schema::KindRegistry,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flotilla_schema::{KindCode, KindRegistry, Row, Rows, Value};
+    use rusqlite::Connection;
+
+    fn snapshot(value: Value) -> Snapshot {
+        let mut rows = Rows::with_tables(1);
+        rows.tables[0].push(Row { key: Vec::new(), values: vec![value] });
+        Snapshot { kind: KindCode::new("test"), name: "resource".into(), home: "home".into(), version: 0, rows }
+    }
+
+    // Splitting rows cannot repair an invalid byte string. Refuse before sending even
+    // a valid root chunk, so only aggregate message/element size triggers chunking.
+    #[test]
+    fn non_size_encoding_error_does_not_start_chunk_delivery() {
+        let mut value = snapshot(Value::Text("root".into()));
+        value.rows.tables.push(vec![Row { key: vec![Value::Int(0)], values: vec![Value::Blob(vec![0; LOG_LIMITS.max_byte_string + 1])] }]);
+        let mut sent = 0;
+        let error = send_resource(value, &mut |_| {
+            sent += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("byte-string-limit"));
+        assert_eq!(sent, 0);
+    }
+
+    // A peer cannot grow an unfinished resource indefinitely. Crossing the byte budget
+    // rejects the whole transaction and leaves its committed watermark unchanged.
+    #[test]
+    fn unfinished_chunks_cannot_exceed_resource_assembly_budget() {
+        let mut store = Store::open(Connection::open_in_memory().unwrap(), "replica", KindRegistry::new()).unwrap();
+        let begin = Frame::Begin { home: "home".into(), home_seq: 0 }.encode().unwrap();
+        let chunk = Frame::ResourceChunk { value: snapshot(Value::Text("x".repeat(1024 * 1024))), last: false }.encode().unwrap();
+        let error = Follower::new(&mut store)
+            .receive("home", |sink| {
+                sink(&begin)?;
+                for _ in 0..128 {
+                    sink(&chunk)?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("resource exceeds assembly limit"));
+        assert_eq!(store.applied_watermark("home"), Watermark::ZERO);
+    }
 }

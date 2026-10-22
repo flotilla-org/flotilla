@@ -49,6 +49,10 @@ Convoys assumed that their vessels were co-located and fixed. Many writers could
   ADR 0064 seats: fan-out adds a seat under an existing one (`AddSeat`, names never reused) and `Resupervise` is the only edge that changes `supervised_by`; admission refuses unknown owners, unknown parents and cycles. Seat retirement is not yet modelled.
 
   ADR 0064 Convoy records: a change-request observation finds its submission through a full index on the submission address (one lookup per event); there is no partial index on open convoys.
+
+  ADR 0064 promise labels: a promise's label is stored per convoy and is the name crews and views use; kinds stay declarations.
+
+  ADR 0064 promise labels: a promise label is the permanent name of what is delivered, unique in its convoy and never reused or changed by reassignment; the owner is separate data. Seat-qualified labels exist only for imported records.
 - **A judgement** is computed and never stored. Examples are ready, stalled, landing, kept, retry count, next attempt, stale and drift. Each judgement is a declared function with declared inputs, and it returns a value and the moment it could next change. The same function gates edges and renders listings, so the two cannot disagree.
 - **No host writes another home's resource.** It sends a message to that home, or it publishes a record of its own that the home observes.
 
@@ -277,6 +281,8 @@ The following stay:
 ADR 0064 §"Switch-over" records the `[primitives]` switch and its dummy-fleet guard, the phase-to-state import table with named refusals, and old-store reads behind named ports during the transition.
 
 ADR 0064 §"Switch-over" records that Message moves over only after the change stream (#3463), so cross-host reads come from local replicas and misses are marked remote.
+
+ADR 0064 §"Switch-over": with `[primitives]` on, the engine is the single writer for each kind it holds. Any old-shape copy is a one-way, derived scaffold, deleted by the read-port layer.
 
 There is no double-write path and no long-lived branch.
 1. **Build alongside.** The new code is built on main in new crates, behind one switch in the composition root.

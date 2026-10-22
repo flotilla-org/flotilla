@@ -118,7 +118,10 @@ pub fn render_view<'a>(sets: impl IntoIterator<Item = &'a TableSet>) -> String {
                 .iter()
                 .chain(&references)
                 .filter(|index| index.table == table.name)
-                .map(|index| format!("`{}` ({})", index.name, index.columns().collect::<Vec<_>>().join(", ")))
+                .map(|index| {
+                    let unique = if index.unique { "unique " } else { "" };
+                    format!("`{}` ({unique}{})", index.name, set.index_key(index).join(", "))
+                })
                 .collect();
             let flag = if count > WIDE { " **wide**" } else { "" };
             let _ = writeln!(

@@ -161,7 +161,7 @@ pub fn crew_attention(
         TerminalAttentionState::Unobservable => match status.idle_obstruction() {
             Some(crate::ScreenObstruction::ComposerText { .. }) => flotilla_protocol::CrewAttention::IdleComposerText,
             Some(crate::ScreenObstruction::ScrolledBack) => flotilla_protocol::CrewAttention::IdleScrolledBack,
-            None => flotilla_protocol::CrewAttention::Unobservable,
+            Some(crate::ScreenObstruction::HookReview) | None => flotilla_protocol::CrewAttention::Unobservable,
         },
     })
 }

@@ -748,7 +748,7 @@ async fn complete_client_hello(session: &MessageSession) {
     assert_eq!(info.protocol_fingerprint, flotilla_protocol::PROTOCOL_FINGERPRINT);
 }
 
-async fn empty_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {
+pub(super) async fn empty_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     empty_daemon_named("local").await
 }
 
@@ -989,7 +989,7 @@ impl PeerTransport for FailingPeerTransport {
     }
 }
 
-fn empty_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc<Mutex<PeerManager>>) -> RemoteCommandRouter {
+pub(super) fn empty_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc<Mutex<PeerManager>>) -> RemoteCommandRouter {
     make_remote_command_router(
         daemon,
         peer_manager,
@@ -6853,4 +6853,160 @@ async fn tcp_http_requests_reset_daemon_idle_timeout() {
         .expect("idle exit after traffic stops")
         .expect("server task")
         .expect("server shuts down cleanly");
+}
+
+#[derive(flotilla_schema::Stored)]
+#[store(kind = "RoutedStreamSample", code = "rs")]
+struct RoutedStreamSample {
+    value: String,
+    #[store(child)]
+    tags: Vec<String>,
+}
+
+// This fake replaces only the peer wire. Commands still pass through the router and the
+// remote daemon dispatcher; neither home has a forwarded resource socket.
+struct StreamCommandWire(mpsc::Sender<PeerWireMessage>);
+#[async_trait::async_trait]
+impl PeerSender for StreamCommandWire {
+    async fn send(&self, message: PeerWireMessage) -> Result<(), String> {
+        self.0.send(message).await.map_err(|e| e.to_string())
+    }
+    async fn retire(&self, _: flotilla_protocol::GoodbyeReason) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+// A routed-only home supplies a consistent snapshot and resumed tail through the
+// production command dispatcher, spool and Follower, with no HTTP transport.
+#[tokio::test]
+async fn routed_only_change_stream_follows_snapshot_and_tail() {
+    use flotilla_schema::{Kind, KindRegistry, Origin, Timestamp};
+    use flotilla_schema_sqlite::stream::Service;
+    let (_local_dir, local) = empty_daemon().await;
+    let (_home_dir, home) = empty_daemon_named("home").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut kinds = KindRegistry::new();
+    kinds.register::<RoutedStreamSample>().unwrap();
+    let source = Arc::new(Service::open(&dir.path().join("source.db"), "home", kinds.clone()).unwrap());
+    let target = Arc::new(Service::open(&dir.path().join("target.db"), "local", kinds).unwrap());
+    home.install_decided_store(Arc::clone(&source)).unwrap();
+    let seed = |name: &str| {
+        source
+            .with_store(|store| {
+                let mut write = store.write()?;
+                write.insert(
+                    name,
+                    &RoutedStreamSample { value: name.into(), tags: vec!["child".into()] },
+                    &Origin::new("writer", Timestamp(1)),
+                )?;
+                write.commit()
+            })
+            .unwrap()
+    };
+    for index in 0..20 {
+        seed(&format!("item-{index}"));
+    }
+    let pm = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let home_pm = Arc::new(Mutex::new(PeerManager::new(NodeId::new("home"))));
+    let (tx, mut rx) = mpsc::channel(1);
+    pm.lock().await.register_sender(NodeId::new("home"), Arc::new(StreamCommandWire(tx.clone())));
+    home_pm.lock().await.register_sender(NodeId::new("local"), Arc::new(StreamCommandWire(tx)));
+    let router = empty_remote_command_router(&local, &pm);
+    let home_router = empty_remote_command_router(&home, &home_pm);
+    let responses = router.clone();
+    let remote = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            match message {
+                PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest {
+                    request_id,
+                    requester_node_id,
+                    command,
+                    target_node_id,
+                    caller,
+                    session_id,
+                    ..
+                }) => {
+                    assert_eq!(target_node_id, NodeId::new("home"));
+                    assert!(matches!(command.action, CommandAction::QueryChangeStream { .. }));
+                    assert!(caller.is_none() && session_id.is_none(), "replication has no surface origin");
+                    home_router
+                        .spawn_forwarded_command(request_id, requester_node_id, NodeId::new("local"), *command, caller, session_id)
+                        .await;
+                }
+                PeerWireMessage::Routed(RoutedPeerMessage::CommandResponse { request_id, responder_node_id, result, .. }) => {
+                    responses.complete_remote_command(request_id, responder_node_id, *result).await;
+                }
+                _ => panic!("unexpected stream wire message"),
+            }
+        }
+    });
+    super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
+    assert_eq!(target.watermark("home").unwrap().home_seq, 20);
+    seed("tail");
+    super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
+    assert_eq!(target.watermark("home").unwrap().home_seq, 21);
+    for index in 0..=20 {
+        let name = if index == 20 { "tail".into() } else { format!("item-{index}") };
+        let snapshot = |service: &Service| {
+            service
+                .with_store(|store| {
+                    let mut read = store.read()?;
+                    let id = read.resolve(RoutedStreamSample::CODE, &name, "home")?.unwrap();
+                    read.load_snapshot(id)
+                })
+                .unwrap()
+        };
+        assert_eq!(snapshot(&source), snapshot(&target));
+    }
+    remote.abort();
+}
+
+// Forwarded surface context must not acquire a whole-home replication cursor. Only the
+// peer-owned path (no caller or surface session) is admitted by the destination router.
+#[tokio::test]
+async fn routed_change_stream_origin_admission_rows() {
+    use flotilla_schema::KindRegistry;
+    use flotilla_schema_sqlite::stream::Service;
+    let (_dir, home) = empty_daemon_named("home").await;
+    let files = tempfile::tempdir().unwrap();
+    let mut kinds = KindRegistry::new();
+    kinds.register::<RoutedStreamSample>().unwrap();
+    home.install_decided_store(Arc::new(Service::open(&files.path().join("home.db"), "home", kinds).unwrap())).unwrap();
+    let pm = Arc::new(Mutex::new(PeerManager::new(NodeId::new("home"))));
+    let (tx, mut rx) = mpsc::channel(1);
+    pm.lock().await.register_sender(NodeId::new("local"), Arc::new(StreamCommandWire(tx)));
+    let router = empty_remote_command_router(&home, &pm);
+    let caller = flotilla_protocol::CommandCaller {
+        principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
+        process: None,
+        crew: None,
+    };
+    for (name, caller, session, allowed) in [
+        ("surface-session", None, Some(uuid::Uuid::new_v4()), false),
+        ("delegated-caller", Some(Box::new(caller)), None, false),
+        ("peer-replication", None, None, true),
+    ] {
+        router
+            .spawn_forwarded_command(
+                1,
+                NodeId::new("local"),
+                NodeId::new("local"),
+                Command::builder().action(CommandAction::QueryChangeStream { after: None, session: None }).build(),
+                caller,
+                session,
+            )
+            .await;
+        let response = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        let PeerWireMessage::Routed(RoutedPeerMessage::CommandResponse { result, .. }) = response else {
+            panic!("{name}: expected response");
+        };
+        match *result {
+            CommandValue::ChangeStreamFrame { .. } => assert!(allowed, "{name}"),
+            CommandValue::Error { message } => {
+                assert!(!allowed, "{name}: {message}");
+                assert!(message.contains("peer replication transport"), "{name}: {message}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
 }

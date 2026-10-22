@@ -135,7 +135,8 @@ pub async fn build_plan(
     let target_display_host = provisioning_target.as_ref().map(|target| target.host().clone());
 
     match action {
-        CommandAction::QueryResourceDigest { .. }
+        CommandAction::QueryChangeStream { .. }
+        | CommandAction::QueryResourceDigest { .. }
         | CommandAction::QueryResourceList { .. }
         | CommandAction::QueryResourceGet { .. }
         | CommandAction::QueryExplainConvoy { .. }
@@ -245,6 +246,7 @@ pub async fn build_plan(
 
         // Daemon-level commands should not reach build_plan.
         CommandAction::ConvoyWorkForceComplete { .. }
+        | CommandAction::ConvoyPromiseVerdict { .. }
         | CommandAction::ConvoyDelete { .. }
         | CommandAction::ConvoyLink { .. }
         | CommandAction::ConvoyUnlink { .. }

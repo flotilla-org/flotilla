@@ -155,7 +155,13 @@ fn calibrate() {
                     project: address("project:test"),
                     promises: [(
                         PromiseId(0),
-                        AdmittedPromise { kind: "opaque".into(), target: inbox(), source: PromiseSource::Template, owner: owner.clone() },
+                        AdmittedPromise {
+                            label: "template/pr".into(),
+                            kind: "opaque".into(),
+                            target: inbox(),
+                            source: PromiseSource::Template,
+                            owner: owner.clone(),
+                        },
                     )]
                     .into(),
                     duties: [(DutyId(0), Duty { owner, scope: DutyScope::Lifetime, terms: Terms::default() })].into(),

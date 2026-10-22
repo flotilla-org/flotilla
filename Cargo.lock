@@ -3148,6 +3148,7 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-cbor",
+ "flotilla-quint-testkit",
  "flotilla-schema",
  "flotilla-state-machines",
  "hegeltest",

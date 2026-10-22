@@ -93,6 +93,7 @@ impl InProcessDaemon {
             | A::ConvoyResume { .. }
             | A::ConvoyWithdrawPendingBrief { .. }
             | A::ConvoyWorkForceComplete { .. }
+            | A::ConvoyPromiseVerdict { .. }
             | A::CrewPromise { .. }
             | A::CrewComplete { .. }
             | A::CrewFail { .. }
@@ -127,6 +128,7 @@ impl InProcessDaemon {
             | A::QueryCrewList { .. }
             | A::QueryDaemonLogs { .. }
             | A::QueryExplainConvoy { .. }
+            | A::QueryChangeStream { .. }
             | A::QueryResourceDigest { .. }
             | A::QueryResourceList { .. }
             | A::QueryResourceGet { .. }
