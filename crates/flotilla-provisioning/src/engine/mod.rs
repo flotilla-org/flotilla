@@ -261,14 +261,24 @@ pub fn current<B: Binding>(
     if !B::LAUNCHES {
         return (name.clone(), lifecycles.get(name));
     }
-    let mut latest = (launch(name, 1), None);
-    for n in 1.. {
-        match lifecycles.get(&launch(name, n)) {
-            Some(resource) => latest = (launch(name, n), Some(resource)),
-            None => return latest,
+    // Launches are numbered from 1 without gaps, so the latest is found by doubling past it and
+    // halving back: O(log launches) reads, not one per launch.
+    let Some(first) = lifecycles.get(&launch(name, 1)) else { return (launch(name, 1), None) };
+    let (mut held, mut found) = ((1, first), 2);
+    let mut absent = loop {
+        match lifecycles.get(&launch(name, found)) {
+            Some(resource) => (held, found) = ((found, resource), found.saturating_mul(2)),
+            None => break found,
+        }
+    };
+    while absent - held.0 > 1 {
+        let mid = held.0 + (absent - held.0) / 2;
+        match lifecycles.get(&launch(name, mid)) {
+            Some(resource) => held = (mid, resource),
+            None => absent = mid,
         }
     }
-    latest
+    (launch(name, held.0), Some(held.1))
 }
 
 /// Launch `n` of old object `name`.
@@ -276,7 +286,8 @@ pub fn launch(name: &str, n: u32) -> String {
     format!("{name}#{n}")
 }
 
-/// The launch after `name`'s (`<old>#<n>`).
+/// The launch after `name`'s (`<old>#<n>`). It splits at the last `#`, so an old name that holds
+/// a `#` of its own still parses: launch keys always end in `#<n>`.
 fn next_launch(name: &str) -> String {
     match name.rsplit_once('#').and_then(|(old, n)| Some((old, n.parse::<u32>().ok()?))) {
         Some((old, n)) => launch(old, n + 1),

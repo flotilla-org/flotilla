@@ -17,10 +17,17 @@
 //! The evidence each gate reads is what the old pass observed: a convoy it found running is
 //! realised and can receive, its inbox drained (the old pass binds on that and nothing more); one
 //! it found failed or abandoned is gone. An admission refused before any convoy existed is an
-//! attempt named for the Ensure's admission, since no fulfiller was created.
+//! attempt named for the Ensure's admission, since no fulfiller was created. This evidence stands
+//! in for reads of the convoy itself until the Convoy kind is on the engine (#3587), when its
+//! world reads the engine's Convoy; the operator authority on `Resume` stands in for the hold's
+//! clearer, which the old patch does not name.
 //!
 //! The patch is written only when the engine took every edge; a refused edge writes nothing to the
-//! old status, and the next pass reports again. An Ensure the engine does not hold, written before
+//! old status, and the next pass reports again. Each edge is its own transaction, so the edges
+//! before a refused one stay taken: the next pass's edges are computed from the engine's state, so
+//! it resumes after them (a recorded or created convoy is not recorded again). The exception is a
+//! refused `Hold`: its failed attempt counted, and the next `RestartLimitReached` counts another,
+//! which is what spends the window the old pass already judged spent. An Ensure the engine does not hold, written before
 //! the switch, stays on the old path until the import (layer 9).
 
 use std::sync::{Arc, Mutex};
@@ -50,14 +57,14 @@ const OPERATOR: &str = "operator";
 
 /// The engine's Ensures at this home.
 pub struct EngineEnsurePath {
-    home: Mutex<Home<Ensure, StoreLog>>,
+    home: Arc<Mutex<Home<Ensure, StoreLog>>>,
     clock: Arc<dyn Clock>,
 }
 
 impl EngineEnsurePath {
     /// The Ensures of this home over `store`, restored from it.
     pub fn open(store: Arc<Mutex<Store>>, clock: Arc<dyn Clock>) -> Result<Self, String> {
-        Ok(Self { home: Mutex::new(open_home(StoreLog::new(store))?), clock })
+        Ok(Self { home: Arc::new(Mutex::new(open_home(StoreLog::new(store))?)), clock })
     }
 
     /// The Ensure as the engine holds it.
@@ -71,32 +78,41 @@ impl EngineEnsurePath {
         ensure: &ResourceObject<ConvoyEnsure>,
         patch: ConvoyEnsureStatusPatch,
     ) -> Result<Option<ConvoyEnsureStatusPatch>, String> {
-        let name = ensure.metadata.name.as_str();
-        let now = Timestamp::from_datetime(&self.clock.now());
-        let mut home = self.home.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if home.get(name).is_none() {
-            // Taken on only from its start: one with history is the import's (layer 9).
-            if !untouched(ensure) {
-                return Ok(Some(patch));
-            }
-            let inbox = standing_inbox(ensure)?;
-            home.create(name, EnsureSpec { inbox, policy: ENSURE_POLICY }, &MemoryEnsureWorld::default(), now)
-                .map_err(|error| format!("Ensure `{name}`: {error:?}"))?;
-        }
-        let state = home.get(name).expect("held").state().clone();
-        let inbox = home.get(name).expect("held").spec().inbox.clone();
-        for (edge, world) in edges(name, &inbox, &state, &patch) {
-            match home.apply(name, edge.clone(), &world, now) {
-                Ok(_) => {}
-                Err(WriteError::Refused(refusal)) => {
-                    tracing::info!(ensure = name, ?edge, ?refusal, "the engine did not take the Ensure's edge; the old status waits");
-                    return Ok(None);
-                }
-                Err(error) => return Err(format!("Ensure `{name}`: {error:?}")),
-            }
-        }
-        Ok(Some(patch))
+        decide(&self.home, Timestamp::from_datetime(&self.clock.now()), ensure, patch)
     }
+}
+
+/// [`EngineEnsurePath::decide_now`] at `now`, over the home it holds.
+fn decide(
+    home: &Mutex<Home<Ensure, StoreLog>>,
+    now: Timestamp,
+    ensure: &ResourceObject<ConvoyEnsure>,
+    patch: ConvoyEnsureStatusPatch,
+) -> Result<Option<ConvoyEnsureStatusPatch>, String> {
+    let name = ensure.metadata.name.as_str();
+    let mut home = home.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if home.get(name).is_none() {
+        // Taken on only from its start: one with history is the import's (layer 9).
+        if !untouched(ensure) {
+            return Ok(Some(patch));
+        }
+        let inbox = standing_inbox(ensure)?;
+        home.create(name, EnsureSpec { inbox, policy: ENSURE_POLICY }, &MemoryEnsureWorld::default(), now)
+            .map_err(|error| format!("Ensure `{name}`: {error:?}"))?;
+    }
+    let state = home.get(name).expect("held").state().clone();
+    let inbox = home.get(name).expect("held").spec().inbox.clone();
+    for (edge, world) in edges(name, &inbox, &state, &patch) {
+        match home.apply(name, edge.clone(), &world, now) {
+            Ok(_) => {}
+            Err(WriteError::Refused(refusal)) => {
+                tracing::info!(ensure = name, ?edge, ?refusal, "the engine did not take the Ensure's edge; the old status waits");
+                return Ok(None);
+            }
+            Err(error) => return Err(format!("Ensure `{name}`: {error:?}")),
+        }
+    }
+    Ok(Some(patch))
 }
 
 #[async_trait]
@@ -107,7 +123,11 @@ impl EngineEnsures for EngineEnsurePath {
         ensure: &ResourceObject<ConvoyEnsure>,
         patch: ConvoyEnsureStatusPatch,
     ) -> Result<Option<ConvoyEnsureStatusPatch>, String> {
-        self.decide_now(ensure, patch)
+        // Each edge is a synchronous SQLite transaction under the home's lock: off the async workers.
+        let (home, now, ensure) = (Arc::clone(&self.home), Timestamp::from_datetime(&self.clock.now()), ensure.clone());
+        tokio::task::spawn_blocking(move || decide(&home, now, &ensure, patch))
+            .await
+            .map_err(|error| format!("Ensure decision: {error}"))?
     }
 }
 
@@ -283,5 +303,25 @@ mod tests {
         let patch = ConvoyEnsureStatusPatch::BackingOff { retry_at: Utc::now(), failure: "x".into() };
         assert_eq!(path.decide_now(&obj, patch.clone()).expect("decided"), Some(patch));
         assert!(path.get("flotilla-governor").is_none());
+    }
+
+    // Behaviour (#3747 review): the edges before a refused one stay taken, and the next pass
+    // resumes from the engine's state. The old pass judges the window spent before the engine
+    // does: each refused `Hold` leaves its failed attempt counted, nothing is written, and the
+    // third report holds the Ensure.
+    #[test]
+    fn a_refused_edge_keeps_the_edges_before_it_and_the_next_pass_resumes() {
+        let path = path();
+        let mut obj = ensure(None);
+        let limit = ConvoyEnsureStatusPatch::RestartLimitReached { convoy_ref: "governor-1".into(), failure: "admission refused".into() };
+        for failures in 1..=2 {
+            assert_eq!(path.decide_now(&obj, limit.clone()).expect("decided"), None, "Hold refused: nothing written");
+            assert_eq!(path.get("flotilla-governor").expect("held").state().failures(), failures, "the attempt before it stays");
+            assert_eq!(label(&path), "Unfulfilled");
+        }
+        let decided = path.decide_now(&obj, limit.clone()).expect("decided");
+        assert_eq!(decided, Some(limit.clone()));
+        limit.apply(obj.status.get_or_insert_with(Default::default));
+        assert_eq!(label(&path), "Held");
     }
 }

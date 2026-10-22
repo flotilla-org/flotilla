@@ -78,8 +78,24 @@ impl Binding for TerminalSessionBinding {
             },
             // Unobservable for a while, or observed again: a judgement, no edge.
             TerminalSessionStatusPatch::MarkLost { .. } | TerminalSessionStatusPatch::MarkRevived => vec![],
-            // Deliveries, observations, attention and degradations are no lifecycle edge.
-            _ => vec![],
+            // Deliveries, observations, attention, degradations and a pending completion are no lifecycle edge. Listed,
+            // not wildcarded, so a new patch must be placed here.
+            TerminalSessionStatusPatch::HoldTurnDelivery { .. }
+            | TerminalSessionStatusPatch::ClearRetiredLaunches
+            | TerminalSessionStatusPatch::ObserveCleatEndpoint { .. }
+            | TerminalSessionStatusPatch::ObserveDaemonReach { .. }
+            | TerminalSessionStatusPatch::MarkMessageDelivered { .. }
+            | TerminalSessionStatusPatch::MarkDeliveryExpired
+            | TerminalSessionStatusPatch::MarkDeliveryNotSubmitted { .. }
+            | TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { .. }
+            | TerminalSessionStatusPatch::MarkReconcileDegraded { .. }
+            | TerminalSessionStatusPatch::ClearReconcileDegraded
+            | TerminalSessionStatusPatch::ObserveNativeCodexHook { .. }
+            | TerminalSessionStatusPatch::ObserveToolActivity { .. }
+            | TerminalSessionStatusPatch::ObserveAttention { .. }
+            | TerminalSessionStatusPatch::Observe { .. }
+            | TerminalSessionStatusPatch::MarkCompletionPending { .. }
+            | TerminalSessionStatusPatch::ClearCompletionPending => vec![],
         }
     }
 

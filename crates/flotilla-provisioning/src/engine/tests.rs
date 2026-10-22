@@ -601,6 +601,9 @@ async fn each_launch_of_a_session_is_its_own_resource() {
     reconcile(&engine, &mut obj).await;
     assert_eq!(state(1), Some(LifecycleState::Gone), "stopped: released");
     assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(TerminalSessionPhase::Stopped));
+    // Ended, and not starting again: the old reconciler is not asked, and nothing is written.
+    assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
+    assert_eq!(state(1), Some(LifecycleState::Gone));
 
     // The old path resumes it in place (crew_ops' MarkStarting): the next run is a new launch.
     TerminalSessionStatusPatch::MarkStarting.apply(obj.status.as_mut().expect("status"));
@@ -635,4 +638,23 @@ async fn a_failed_launch_gives_up_and_the_next_start_is_a_new_launch() {
     assert!(matches!(home.get(&launch("terminal-vessel-a-coder", 1)).expect("held").state(), LifecycleState::GaveUp { .. }));
     // Failed is ended for the old path too: the next reconcile writes nothing.
     assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
+}
+
+// Behaviour (#3747 review): the latest launch is found however many there are, and a launch key
+// parses at its last `#`, so an old name holding a `#` of its own is kept whole.
+#[test]
+fn the_latest_launch_is_found_and_an_old_name_may_hold_a_hash() {
+    use flotilla_resources::TerminalSessionPhase;
+
+    use super::{at, current, launch, next_launch, terminal_session::TerminalSessionBinding};
+    let home = lifecycles::<TerminalSessionBinding>();
+    let mut obj = session_object(TerminalSessionPhase::Starting);
+    obj.metadata.name = "odd#5".into();
+    let request = TerminalSessionBinding::request(&obj, HOME).expect("request");
+    assert_eq!(current::<TerminalSessionBinding>(home.as_ref(), &obj).0, "odd#5#1");
+    for n in 1..=13 {
+        home.request(&launch("odd#5", n), request.clone(), at(DateTime::UNIX_EPOCH)).expect("request");
+        assert_eq!(current::<TerminalSessionBinding>(home.as_ref(), &obj).0, launch("odd#5", n));
+    }
+    assert_eq!(next_launch("odd#5#13"), "odd#5#14");
 }
