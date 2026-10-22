@@ -464,7 +464,7 @@ impl TerminalSessionDegradedCondition {
 }
 
 /// What keeps an agent that otherwise looks idle from taking a turn (#3460).
-/// Attention stays `Unobservable` so delivery still refuses; this names why,
+/// Attention is `Unobservable` or `NeedsInput` so delivery still refuses; this names why,
 /// and the operator command that recovers it. Flotilla never clears the
 /// composer itself: text there may be a person's draft.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,25 +483,28 @@ pub enum ScreenObstruction {
     /// The transcript is scrolled back ("Back to bottom"); the live composer
     /// is not where the screen classifier can read it.
     ScrolledBack,
+    /// Codex is waiting for an operator to review hook trust.
+    HookReview,
 }
 
 impl ScreenObstruction {
-    /// The key that recovers the session, for `cleat send-keys`.
-    pub fn recovery_key(&self) -> &'static str {
+    /// The key that recovers the session, or None when an operator must review it.
+    pub fn recovery_key(&self) -> Option<&'static str> {
         match self {
-            Self::ComposerText { .. } => "C-u",
-            Self::ScrolledBack => "Escape",
+            Self::ComposerText { .. } => Some("C-u"),
+            Self::ScrolledBack => Some("Escape"),
+            Self::HookReview => None,
         }
     }
 
     /// The exact command, run inside the crew's environment.
-    pub fn recovery_command(&self, session: &str) -> String {
-        format!("cleat send-keys {session} {}", self.recovery_key())
+    pub fn recovery_command(&self, session: &str) -> Option<String> {
+        self.recovery_key().map(|key| format!("cleat send-keys {session} {key}"))
     }
 
     /// The attention label: the condition first, then how to recover it.
     pub fn describe(&self, session: &str) -> String {
-        let command = self.recovery_command(session);
+        let command = self.recovery_command(session).unwrap_or_default();
         match self {
             Self::ComposerText { reply: Some(reply), .. } => format!(
                 "idle, composer holds unsent text `{reply}` that looks like a stray terminal reply; \
@@ -514,11 +517,24 @@ impl ScreenObstruction {
             Self::ScrolledBack => {
                 format!("idle, transcript scrolled back; return it to the bottom with `{command}` inside the crew's environment")
             }
+            Self::HookReview => "needs input, Codex hook trust review; attach to the crew and review the hooks before continuing".into(),
         }
     }
 }
 
 impl TerminalSessionStatus {
+    /// The current screen obstruction that needs an operator, including input dialogs.
+    pub fn attention_obstruction(&self) -> Option<&ScreenObstruction> {
+        if self.attention.as_ref().is_some_and(|attention| {
+            attention.state == TerminalAttentionState::NeedsInput && attention.source == TerminalAttentionSource::Screen
+        }) && self.screen_obstruction == Some(ScreenObstruction::HookReview)
+        {
+            self.screen_obstruction.as_ref()
+        } else {
+            self.idle_obstruction()
+        }
+    }
+
     /// The obstruction behind the current screen-read `Unobservable`
     /// attention, if any: an idle agent that cannot take a turn (#3460).
     pub fn idle_obstruction(&self) -> Option<&ScreenObstruction> {
@@ -958,6 +974,34 @@ mod tests {
         observe(Some(None)).apply(&mut status);
         assert_eq!(status.idle_obstruction(), None, "a clear screen read clears it");
         assert_eq!(crate::read_evidence::crew_attention(Some(&status), at), Some(flotilla_protocol::CrewAttention::Unobservable));
+    }
+
+    // Hook review is visible as NeedsInput; stale obstructions are hidden after
+    // a different attention reading. The serialized variant must round-trip.
+    #[test]
+    fn hook_review_obstruction_follows_screen_attention() {
+        let at = Utc.timestamp_opt(100, 0).single().expect("time");
+        let obstruction = ScreenObstruction::HookReview;
+        assert_eq!(serde_json::from_str::<ScreenObstruction>(&serde_json::to_string(&obstruction).unwrap()).unwrap(), obstruction);
+        let mut status = TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            attention: Some(TerminalAttention {
+                state: TerminalAttentionState::NeedsInput,
+                as_of: at,
+                source: TerminalAttentionSource::Screen,
+            }),
+            screen_obstruction: Some(obstruction.clone()),
+            ..Default::default()
+        };
+        assert_eq!(status.attention_obstruction(), Some(&obstruction));
+        assert_eq!(crate::read_evidence::crew_attention(Some(&status), at), Some(flotilla_protocol::CrewAttention::NeedsInput));
+        assert!(obstruction.describe("crew-session").contains("Codex hook trust review"));
+        assert_eq!(obstruction.recovery_command("crew-session"), None, "trust requires operator review");
+        status.attention.as_mut().unwrap().source = TerminalAttentionSource::Hook;
+        assert_eq!(status.attention_obstruction(), None);
+        status.attention.as_mut().unwrap().source = TerminalAttentionSource::Screen;
+        status.attention.as_mut().unwrap().state = TerminalAttentionState::Idle;
+        assert_eq!(status.attention_obstruction(), None);
     }
 
     // #2755: observations and repeated expiry cannot erase a delivery failure,

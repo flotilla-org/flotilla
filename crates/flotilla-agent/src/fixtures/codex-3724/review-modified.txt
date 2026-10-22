@@ -1,0 +1,13 @@
+  Interrupt hooks
+  2 hooks need review before they can run.
+
+› [!] Hook 1 · modified
+
+  Event     Interrupt
+  Source    User config - /tmp/config.toml
+  Command   flotilla hook codex interrupt
+  Mode      Sync
+  Timeout   1s
+  Trust     Modified since last trusted - review required
+
+  t trust · esc back

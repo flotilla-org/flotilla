@@ -824,6 +824,9 @@ impl AgentAdapter for CliAgentAdapter {
         match &self.flavor {
             AdapterFlavor::ClaudeCode { .. } => None,
             AdapterFlavor::Codex { .. } => {
+                if codex_hook_review(screen) {
+                    return Some(flotilla_resources::ScreenObstruction::HookReview);
+                }
                 (self.classify_screen_attention(screen) == Some(TerminalAttentionState::Unobservable)).then(|| codex_obstruction(screen))?
             }
         }
@@ -1039,6 +1042,16 @@ fn codex_background_terminal_footer(line: &str) -> bool {
         && (status.starts_with("background terminal running · /ps") || status.starts_with("background terminals running · /ps"))
 }
 
+// Codex rust-v0.160.0 tui/src/startup_hooks_review.rs and
+// tui/src/bottom_pane/hooks_browser_view.rs. Match visible headings with
+// interactive footer chrome so quoted hook output does not become a prompt.
+fn codex_hook_review(screen: &str) -> bool {
+    let lines = screen.lines().map(str::trim).collect::<Vec<_>>();
+    (lines.contains(&"Hooks need review") && screen.contains("Review hooks") && screen.contains("Trust all and continue"))
+        || (lines.iter().any(|line| *line == "Hooks" || line.ends_with(" hooks"))
+            && lines.iter().any(|line| line.contains("enter review · esc close") || line.ends_with("esc back")))
+}
+
 fn codex_screen_needs_input(screen: &str) -> bool {
     let approval_prompt = [
         "Do you trust the contents of this directory?",
@@ -1051,7 +1064,7 @@ fn codex_screen_needs_input(screen: &str) -> bool {
     .iter()
     .any(|prompt| screen.contains(prompt));
     let user_question = screen.contains("Question ") && (screen.contains(" to submit answer") || screen.contains(" to submit all"));
-    approval_prompt || user_question
+    codex_hook_review(screen) || approval_prompt || user_question
 }
 
 fn codex_auth_failure(screen: &str) -> Option<&'static str> {
@@ -2739,6 +2752,30 @@ mod tests {
         assert!(parsed.get("notify").is_none());
         assert!(parsed["hooks"]["Stop"].as_array().is_some());
         assert_eq!(parsed["projects"][&canonical_workspace]["trust_level"].as_str(), Some("trusted"));
+    }
+
+    // Issue #3724: hook trust dialogs and each review screen require operator input.
+    // Recorded dialog plus upstream 0.160.0 rendered browser snapshots cover both levels.
+    #[test]
+    fn codex_hook_review_needs_input() {
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+        for screen in [
+            include_str!("fixtures/codex-3724/trust-dialog.txt"),
+            include_str!("fixtures/codex-3724/review-events.txt"),
+            include_str!("fixtures/codex-3724/review-handler.txt"),
+            include_str!("fixtures/codex-3724/review-untrusted.txt"),
+            include_str!("fixtures/codex-3724/review-modified.txt"),
+            include_str!("fixtures/codex-3724/review-managed.txt"),
+        ] {
+            assert_eq!(codex.classify_screen_attention(screen), Some(TerminalAttentionState::NeedsInput), "{screen}");
+            assert_eq!(codex.classify_screen_obstruction(screen), Some(flotilla_resources::ScreenObstruction::HookReview), "{screen}");
+        }
+        // Empty/ordinary transcript text must not look like an interactive dialog.
+        for screen in ["", "Hooks need review", "Hooks\nExample hook output", "Modified since last trusted"] {
+            assert_ne!(codex.classify_screen_attention(screen), Some(TerminalAttentionState::NeedsInput), "{screen}");
+            assert_eq!(codex.classify_screen_obstruction(screen), None, "{screen}");
+        }
     }
 
     #[test]
