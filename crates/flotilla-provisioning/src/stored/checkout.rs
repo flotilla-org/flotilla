@@ -59,6 +59,21 @@ pub struct CheckoutRequest {
     pub holder: Option<Holder>,
 }
 
+impl CheckoutRequest {
+    /// The writer's admission: exactly one owner, and a worktree names its clone.
+    pub fn validate(&self) -> Result<(), String> {
+        match (&self.convoy, &self.ensure) {
+            (Some(_), Some(_)) => return Err("a checkout has one owner: its convoy or its ensure, not both".into()),
+            (None, None) => return Err("a checkout names its owner: its convoy or its ensure".into()),
+            _ => {}
+        }
+        if self.source == Source::Worktree && self.clone.is_none() {
+            return Err("a worktree checkout names its clone".into());
+        }
+        Ok(())
+    }
+}
+
 /// How the checkout is made.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub enum Source {
