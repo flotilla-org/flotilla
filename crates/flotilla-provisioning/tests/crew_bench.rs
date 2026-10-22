@@ -20,8 +20,8 @@
 //!
 //! Per-query reads, on a read connection, each statement's VM steps and full-scan steps counted by
 //! SQLite: a convoy's vessels (`vessel.by_convoy`), a host's live vessels (`vessel.live_by_host`,
-//! the ledger's view), a vessel's sessions (`terminal_session.by_vessel`), a convoy's sessions
-//! (`terminal_session.by_convoy`) and a role's Ensure (`ensure.by_inbox`).
+//! the ledger's view), a vessel's sessions (`terminal_session.by_holder`), a convoy's sessions
+//! (its vessels by convoy, then their sessions by holder) and a role's Ensure (`ensure.by_inbox`).
 
 use std::{
     collections::BTreeMap,
@@ -36,6 +36,7 @@ use flotilla_engine_store::{open_home, register_crew, StoreLog};
 use flotilla_provisioning::stored::{
     self,
     terminal_session::{Launch, TerminalSession, TerminalSessionRequest},
+    Holder,
 };
 use flotilla_schema::{Address, KindRegistry, Ref as StoredRef, Timestamp};
 use flotilla_schema_sqlite::Store;
@@ -101,8 +102,7 @@ fn convoy(n: usize, home: &str) -> ConvoyId {
 fn session(n: usize, which: &str, home: &str) -> TerminalSessionRequest {
     TerminalSessionRequest {
         environment: StoredRef::new(format!("env-{n}"), home),
-        vessel: Some(StoredRef::new(format!("vessel-{n}"), home)),
-        convoy: Some(StoredRef::new(format!("convoy-{n}"), home)),
+        holder: Some(Holder::vessel(&format!("vessel-{n}"))),
         role: which.into(),
         pool: "cleat".into(),
         cwd: "/workspace".into(),
@@ -341,12 +341,26 @@ fn crew_load() {
     let live = measure(&read, "SELECT v.id FROM vessel v WHERE v.host = ?1 AND v.state IN ('rq', 'rl')", &host_keys);
     assert_eq!(live.fullscan_steps, 0.0);
     report("a host's live vessels", &live);
-    let vessel_keys = sample("ve", &|n| format!("vessel-{n}"));
-    let sessions = measure(&read, &format!("SELECT s.id FROM terminal_session s WHERE s.vessel = {IDENTITY}"), &vessel_keys);
+    let holder_keys: Vec<Vec<String>> = (0..convoys).step_by(7).map(|n| vec![format!("vessel:vessel-{n}")]).collect();
+    let sessions = measure(
+        &read,
+        "SELECT s.id FROM terminal_session s WHERE s.holder = (SELECT id FROM strings WHERE domain = 'hl' AND s = ?1)",
+        &holder_keys,
+    );
     assert!(sessions.rows >= 2.0);
     assert_eq!(sessions.fullscan_steps, 0.0);
     report("a vessel's sessions", &sessions);
-    let convoy_sessions = measure(&read, &format!("SELECT s.id FROM terminal_session s WHERE s.convoy = {IDENTITY}"), &convoy_keys);
+    // A session's convoy is its vessel's (#3720 look-over): the convoy's vessels, then each one's
+    // sessions by holder.
+    let convoy_sessions = measure(
+        &read,
+        &format!(
+            "SELECT s.id FROM vessel v JOIN resource_identity i ON i.id = v.id \
+             JOIN strings h ON h.domain = 'hl' AND h.s = 'vessel:' || (SELECT n.s FROM strings n WHERE n.id = i.name) \
+             JOIN terminal_session s ON s.holder = h.id WHERE v.convoy = {IDENTITY}"
+        ),
+        &convoy_keys,
+    );
     assert!(convoy_sessions.rows >= 2.0, "each convoy has its sessions");
     assert_eq!(convoy_sessions.fullscan_steps, 0.0);
     report("a convoy's sessions", &convoy_sessions);
