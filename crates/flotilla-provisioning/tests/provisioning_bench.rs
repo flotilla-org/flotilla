@@ -33,15 +33,16 @@ use std::{
 };
 
 use flotilla_engine_store::StoreLog;
+use flotilla_provisioning::engine::{checkout::CheckoutBinding, decide, LifecycleHome, Lifecycles};
 use flotilla_provisioning::stored::{
     self,
-    checkout::{Checkout, CheckoutRequest, Source},
+    checkout::{Checkout, CheckoutKind, CheckoutRequest, Source},
     clone::{Clone, CloneRequest},
     environment::{Environment, EnvironmentRequest, Recipe},
     image_build::{Architecture, Delivery, ImageBuild, ImageBuildRequest, Reservation},
     Holder,
 };
-use flotilla_resources::{ImageLayerSource, ImageLayerSpec, ImageLayerTier};
+use flotilla_resources::{CheckoutStatusPatch, ImageLayerSource, ImageLayerSpec, ImageLayerTier};
 use flotilla_schema::{Address, Frozen, KindRegistry, Ref as StoredRef, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
@@ -144,6 +145,33 @@ fn checkout(n: usize, which: &str, home: &str) -> CheckoutRequest {
         source: Source::Worktree,
         clone: Some(StoredRef::new(format!("clone-{n}"), home)),
         holder: Some(Holder::convoy(&format!("convoy-{n}"))),
+    }
+}
+
+/// Convoy `n`'s fourth checkout as the old store holds it, owned by its convoy.
+fn old_checkout(n: usize) -> flotilla_resources::ResourceObject<flotilla_resources::Checkout> {
+    flotilla_resources::ResourceObject {
+        metadata: flotilla_resources::ObjectMeta {
+            name: format!("checkout-{n}-d"),
+            namespace: "flotilla".into(),
+            resource_version: "1".into(),
+            labels: BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_owned(), format!("convoy-{n}"))]),
+            annotations: BTreeMap::new(),
+            owner_references: vec![],
+            finalizers: vec![],
+            deletion_timestamp: None,
+            creation_timestamp: chrono::DateTime::UNIX_EPOCH,
+            merge: None,
+        },
+        spec: flotilla_resources::CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+            repo_ref: flotilla_protocol::RepositoryKey(repository(n)),
+            env_ref: format!("env-{n}"),
+            r#ref: format!("convoy-{n}-d"),
+            base_ref: Some("main".into()),
+            target_path: format!("/workspace/checkout-{n}-d"),
+            clone_ref: format!("clone-{n}"),
+        }),
+        status: None,
     }
 }
 
@@ -324,6 +352,30 @@ fn provisioning_load() {
     }
     per_event("release, one transaction", names.len(), started, "the state and the log entry");
 
+    // The reconcilers' write path (#3629 layer 3): a Checkout reconciler's patches decided by the
+    // engine, as `Engine` decides them, over its own home on the local store.
+    let decided: Arc<dyn Lifecycles<CheckoutKind>> =
+        Arc::new(LifecycleHome::new("local", Home::with_log("local", StoreLog::new(local.clone())).expect("declaration")));
+    let objects: Vec<_> = locals.iter().map(|n| old_checkout(*n)).collect();
+    let started = Instant::now();
+    for obj in &objects {
+        let ready = CheckoutStatusPatch::MarkReady {
+            path: format!("/workspace/{}", obj.metadata.name),
+            commit: None,
+            branch_provenance: Default::default(),
+        };
+        assert!(decide::<CheckoutBinding>(decided.as_ref(), obj, Some(ready), chrono::Utc::now()).patch.is_some());
+    }
+    per_event("reconciled Ready through the engine", objects.len(), started, "the request and the realise, two transactions");
+    let started = Instant::now();
+    for obj in &objects {
+        let mut obj =
+            flotilla_resources::ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status: obj.status.clone() };
+        obj.status = Some(flotilla_resources::CheckoutStatus { phase: flotilla_resources::CheckoutPhase::Ready, ..Default::default() });
+        assert!(decide::<CheckoutBinding>(decided.as_ref(), &obj, Some(CheckoutStatusPatch::MarkGone), chrono::Utc::now()).ended);
+    }
+    per_event("reconciled Gone through the engine", objects.len(), started, "the vanish, one transaction");
+
     // Typed index pages through the store, as the read ports will issue them.
     let started = Instant::now();
     let mut paged = 0;
@@ -371,9 +423,9 @@ fn provisioning_load() {
     };
     let environments = keys("ev", &|n| format!("env-{n}"));
     let by_environment = measure(&read, &format!("SELECT c.id FROM checkout c WHERE c.environment = {IDENTITY}"), &environments);
-    // Two checkouts each, and a local convoy's released third one: its row stays, Gone.
+    // Two checkouts each, and a local convoy's released third and vanished fourth: their rows stay, Gone.
     let sampled = (0..convoys).step_by(7);
-    let expected = sampled.clone().map(|n| if n % LOCAL_ONE_IN == 0 { 3 } else { 2 }).sum::<usize>() as f64 / sampled.count() as f64;
+    let expected = sampled.clone().map(|n| if n % LOCAL_ONE_IN == 0 { 4 } else { 2 }).sum::<usize>() as f64 / sampled.count() as f64;
     assert_eq!(by_environment.rows, expected);
     assert_eq!(by_environment.fullscan_steps, 0.0, "the lookup scans no table");
     report("an environment's checkouts", &by_environment);
