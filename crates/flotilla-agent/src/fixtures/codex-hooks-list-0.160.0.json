@@ -116,6 +116,25 @@
           "isManaged": false,
           "currentHash": "sha256:515e6d05768e9e74443b21b535220ad47d1d5465ad1863fed2c602e3a37bfd20",
           "trustStatus": "trusted"
+        },
+        {
+          "key": "/<session-flags>/config.toml:interrupt:0:0",
+          "eventName": "interrupt",
+          "handlerType": "command",
+          "command": "flotilla hook codex interrupt",
+          "async": false,
+          "matcher": null,
+          "timeoutSec": 1,
+          "statusMessage": null,
+          "additionalContextLimit": null,
+          "sourcePath": "/<session-flags>/config.toml",
+          "source": "sessionFlags",
+          "pluginId": null,
+          "displayOrder": 6,
+          "enabled": true,
+          "isManaged": false,
+          "currentHash": "sha256:3f2c98de6753ebd398832a83f487abfce76f340a99e316dcd47b4ad85448167a",
+          "trustStatus": "trusted"
         }
       ],
       "warnings": [],

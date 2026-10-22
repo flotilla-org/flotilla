@@ -2733,7 +2733,7 @@ impl Aggregator {
             .filter_map(|session| {
                 let status = session.object.status.as_ref().filter(|status| status.phase == TerminalSessionPhase::Running)?;
                 let name = status.session_id.as_deref().unwrap_or(&session.object.metadata.name);
-                Some(format!("{}: {}", session.object.spec.role, status.idle_obstruction()?.describe(name)))
+                Some(format!("{}: {}", session.object.spec.role, status.attention_obstruction()?.describe(name)))
             })
             // Several blocked sessions on one vessel show one, chosen
             // lexicographically (role first) so the row is stable.
@@ -3291,6 +3291,18 @@ mod tests {
         let message = convoy.vessels[0].message.as_deref().expect("vessel names the condition");
         assert!(message.starts_with("observer: idle, composer holds unsent text `6;24;9t`"), "{message}");
         assert!(message.contains("`cleat send-keys terminal-convoy-a-implement C-u`"), "{message}");
+
+        // #3724: hook review also names itself, under NeedsInput rather than Unobservable.
+        let status = session.status.as_mut().expect("status");
+        status.attention.as_mut().expect("attention").state = TerminalAttentionState::NeedsInput;
+        status.screen_obstruction = Some(flotilla_resources::ScreenObstruction::HookReview);
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session.clone())).await;
+        let result_set = state.result_set().await;
+        let convoy = &result_set.rows.as_convoys().expect("convoy rows")[0];
+        assert_eq!(convoy.surface_state, SurfaceState::NeedsYou);
+        assert_eq!(convoy.vessels[0].surface_state, SurfaceState::NeedsYou);
+        assert!(convoy.vessels[0].message.as_deref().unwrap().contains("Codex hook trust review"));
+        session.status.as_mut().expect("status").attention.as_mut().expect("attention").state = TerminalAttentionState::Unobservable;
 
         // Once the composer is clear the crew reads as working again.
         session.status.as_mut().expect("status").screen_obstruction = None;
