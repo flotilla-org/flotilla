@@ -17,7 +17,7 @@ pub struct ResolvedAttach {
 }
 
 /// A provisioning kind the engine holds behind `[primitives]` (#3629).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProvisioningKind {
     Environment,
     ImageBuild,

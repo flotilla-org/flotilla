@@ -123,21 +123,10 @@ impl Aggregator {
                 };
                 // Behind `[primitives]` the engine's reading of the checkout decides (#3629 layer 4).
                 let origin = engine_origin(&source.provenance);
-                if let Some(reading) = self.lifecycle_reads.reading(ProvisioningKind::Checkout, name, origin.as_deref()) {
-                    if let Some((state, phase, reason)) = reading_blocker(&reading, "checkout is not ready") {
-                        result.state = result.state.max(state);
-                        result.blockers.push(ReadinessBlocker {
-                            resource: ResourceRef::new(api_version(Checkout::API_PATHS), Checkout::API_PATHS.kind, &convoy.namespace, name)
-                                .on_host(host.clone()),
-                            phase,
-                            reason,
-                        });
-                    }
-                    continue;
-                }
+                let engine = self.lifecycle_reads.reading(ProvisioningKind::Checkout, name, origin.as_deref());
                 let status = source.object.status.as_ref();
                 let phase = status.map(|status| status.phase).unwrap_or_default();
-                if phase == CheckoutPhase::Ready {
+                if engine.as_ref().map_or(phase == CheckoutPhase::Ready, |reading| matches!(reading, LifecycleReading::Ready { .. })) {
                     continue;
                 }
                 if let CheckoutSpec::Worktree(spec) = &source.object.spec {
@@ -182,19 +171,26 @@ impl Aggregator {
                         }
                     }
                 }
-                let state = if phase == CheckoutPhase::Failed {
-                    ReadinessState::Failed
-                } else if status.is_some_and(|status| status.clone_retry.is_some()) {
-                    ReadinessState::Blocked
-                } else {
-                    ReadinessState::Provisioning
+                let (state, phase, reason) = match engine.as_ref().and_then(|reading| reading_blocker(reading, "checkout is not ready")) {
+                    Some(blocker) => blocker,
+                    None => (
+                        if phase == CheckoutPhase::Failed {
+                            ReadinessState::Failed
+                        } else if status.is_some_and(|status| status.clone_retry.is_some()) {
+                            ReadinessState::Blocked
+                        } else {
+                            ReadinessState::Provisioning
+                        },
+                        format!("{phase:?}"),
+                        status.and_then(|status| status.message.clone()).unwrap_or_else(|| "checkout is not ready".into()),
+                    ),
                 };
                 result.state = result.state.max(state);
                 result.blockers.push(ReadinessBlocker {
                     resource: ResourceRef::new(api_version(Checkout::API_PATHS), Checkout::API_PATHS.kind, &convoy.namespace, name)
                         .on_host(host.clone()),
-                    phase: format!("{phase:?}"),
-                    reason: status.and_then(|status| status.message.clone()).unwrap_or_else(|| "checkout is not ready".into()),
+                    phase,
+                    reason,
                 });
             }
         }
@@ -272,7 +268,12 @@ fn reading_blocker(reading: &LifecycleReading, not_ready: &str) -> Option<(Readi
         LifecycleReading::Ready { .. } => return None,
         LifecycleReading::InProgress => ReadinessState::Provisioning,
         LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. } => ReadinessState::Blocked,
-        LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::GaveUp { .. } => ReadinessState::Failed,
+        // Exhausted gives up on the next reconcile; until then a retry may still be under way.
+        // An ended checkout or clone never comes back: the engine has no incarnations, so a vessel
+        // waiting on it waits on a replacement under a new name, and readiness says so.
+        LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::Gone | LifecycleReading::GaveUp { .. } => {
+            ReadinessState::Failed
+        }
     };
     Some((state, reading.label().to_owned(), reading.reason().unwrap_or_else(|| not_ready.to_owned())))
 }
