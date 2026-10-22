@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use flotilla_engine_store::StoreLog;
 use flotilla_provisioning::{
     engine::{
-        reads::{judge, Judgement, ProvisioningReads, StoreReads},
+        reads::{judge, Ending, Judgement, ProvisioningReads, StoreReads},
         LifecycleHome, Lifecycles, Step,
     },
     stored::{
@@ -15,7 +15,7 @@ use flotilla_provisioning::{
         clone::CloneKind,
     },
 };
-use flotilla_schema::{KindRegistry, Ref, Timestamp};
+use flotilla_schema::{Kind, KindRegistry, Ref, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Home, Outcome};
 
@@ -95,10 +95,62 @@ fn judgements_follow_the_stored_state_and_the_policy() {
         failures,
         last_failure: Some(Failure { at: Timestamp(0), cause: cause.clone(), retryable }),
     };
-    assert_eq!(judge::<CheckoutKind>(&LifecycleState::requested(), false), Judgement::InProgress);
-    assert!(matches!(judge::<CheckoutKind>(&failed(2, true), false), Judgement::Retrying { failures: 2, .. }));
-    assert_eq!(judge::<CheckoutKind>(&failed(3, true), false), Judgement::Exhausted { last: cause.clone() });
-    assert_eq!(judge::<CloneKind>(&failed(1, false), false), Judgement::Exhausted { last: cause.clone() });
-    assert!(matches!(judge::<CloneKind>(&failed(50, true), false), Judgement::Retrying { .. }), "a clone retries while wanted");
-    assert_eq!(judge::<CheckoutKind>(&LifecycleState::GaveUp { cause: cause.clone() }, false), Judgement::GaveUp { cause });
+    assert_eq!(judge::<CheckoutKind>(&LifecycleState::requested(), Ending::Unknown), Judgement::InProgress);
+    assert!(matches!(judge::<CheckoutKind>(&failed(2, true), Ending::Unknown), Judgement::Retrying { failures: 2, .. }));
+    assert_eq!(judge::<CheckoutKind>(&failed(3, true), Ending::Unknown), Judgement::Exhausted { last: cause.clone() });
+    assert_eq!(judge::<CloneKind>(&failed(1, false), Ending::Unknown), Judgement::Exhausted { last: cause.clone() });
+    assert!(matches!(judge::<CloneKind>(&failed(50, true), Ending::Unknown), Judgement::Retrying { .. }), "a clone retries while wanted");
+    assert_eq!(judge::<CheckoutKind>(&LifecycleState::GaveUp { cause: cause.clone() }, Ending::Unknown), Judgement::GaveUp { cause });
+}
+
+// Behaviour (#3731 review): a replica told of a release by its events reads Released, as its home
+// does; a replica seeded from a snapshot holds no entry from before it, so it reads the
+// unattributed Gone rather than guess Lost.
+#[test]
+fn a_replica_reads_how_a_resource_ended_only_from_an_entry_it_holds() {
+    let origin = store();
+    let checkouts: Arc<dyn Lifecycles<CheckoutKind>> =
+        Arc::new(LifecycleHome::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&origin))).expect("home")));
+    checkouts.request("a", checkout("env-1", "convoy-1"), Timestamp(1)).expect("requested");
+    checkouts.step("a", &Step::Realised { identity: "/w".into() }, Timestamp(2)).expect("realised");
+    checkouts.step("a", &Step::Released, Timestamp(3)).expect("released");
+
+    let replica_of = || {
+        let mut registry = KindRegistry::new();
+        stored::register(&mut registry).expect("registry");
+        Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "replica", registry).expect("store")))
+    };
+    let followed = replica_of();
+    {
+        let events = origin.lock().expect("origin").read().expect("read").changes_since(HOME, 0, 100).expect("changes");
+        let mut store = followed.lock().expect("replica");
+        let mut write = store.write().expect("write");
+        for event in &events {
+            write.apply(event).expect("applied");
+        }
+        write.commit().expect("commit");
+    }
+    assert_eq!(StoreReads::new(followed).checkout("a", HOME).expect("read").expect("held").judgement, Judgement::Released);
+
+    let seeded = replica_of();
+    {
+        let snapshot = {
+            let mut store = origin.lock().expect("origin");
+            let mut read = store.read().expect("read");
+            let id = read
+                .resolve(
+                    flotilla_state_machines::Resource::<flotilla_state_machines::machines::lifecycle::Lifecycle<CheckoutKind>>::CODE,
+                    "a",
+                    HOME,
+                )
+                .expect("resolve")
+                .expect("stored");
+            read.load_snapshot(id).expect("snapshot").expect("held")
+        };
+        let mut store = seeded.lock().expect("replica");
+        let mut write = store.write().expect("write");
+        write.restore(&snapshot).expect("restored");
+        write.commit().expect("commit");
+    }
+    assert_eq!(StoreReads::new(seeded).checkout("a", HOME).expect("read").expect("held").judgement, Judgement::Gone);
 }

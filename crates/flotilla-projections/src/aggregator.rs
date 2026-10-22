@@ -6508,38 +6508,56 @@ mod tests {
         });
     }
 
-    // Behaviour (#3629 layer 4): behind `[primitives]` the engine's reading of a checkout decides its
-    // readiness over the old status, read by key at the checkout's home (a replica's origin root);
-    // without a reading the old status still decides.
-    #[tokio::test]
-    async fn engine_readings_decide_checkout_readiness() {
-        use flotilla_protocol::{result_set::ReadinessState, LifecycleReading};
-        use flotilla_resources::{CheckoutPhase, CheckoutStatus, VesselPhase, VesselSpec, VesselStatus};
+    /// Readings scripted per resource, recording each keyed read: the kind, name and origin.
+    #[derive(Default)]
+    struct ScriptedReadings {
+        readings: std::sync::Mutex<HashMap<(crate::ports::ProvisioningKind, String), flotilla_protocol::LifecycleReading>>,
+        reads: std::sync::Mutex<Vec<(crate::ports::ProvisioningKind, String, Option<String>)>>,
+    }
 
-        use crate::ports::{LifecycleReads, ProvisioningKind};
-
-        /// One keyed read: the kind, name and origin asked for.
-        type Read = (ProvisioningKind, String, Option<String>);
-        #[derive(Default)]
-        struct Scripted(std::sync::Mutex<(Option<LifecycleReading>, Vec<Read>)>);
-        impl LifecycleReads for Scripted {
-            fn reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Option<LifecycleReading> {
-                let mut script = self.0.lock().expect("script");
-                script.1.push((kind, name.to_owned(), origin.map(str::to_owned)));
-                script.0.clone()
-            }
+    impl ScriptedReadings {
+        fn set(&self, kind: crate::ports::ProvisioningKind, name: &str, reading: Option<flotilla_protocol::LifecycleReading>) {
+            let mut readings = self.readings.lock().expect("script");
+            match reading {
+                Some(reading) => readings.insert((kind, name.to_owned()), reading),
+                None => readings.remove(&(kind, name.to_owned())),
+            };
         }
+    }
 
+    impl crate::ports::LifecycleReads for ScriptedReadings {
+        fn reading(
+            &self,
+            kind: crate::ports::ProvisioningKind,
+            name: &str,
+            origin: Option<&str>,
+        ) -> Option<flotilla_protocol::LifecycleReading> {
+            self.reads.lock().expect("reads").push((kind, name.to_owned(), origin.map(str::to_owned)));
+            self.readings.lock().expect("script").get(&(kind, name.to_owned())).cloned()
+        }
+    }
+
+    /// A convoy with a provisioning vessel on `host` (a replica's when `remote`), a checkout
+    /// `checkout-a` whose old status is Ready, and, when `clone` is set, its worktree's local clone
+    /// `ops-clone`, also Ready in the old status.
+    async fn engine_readiness_fixture(
+        remote: bool,
+        clone: bool,
+        reads: Arc<ScriptedReadings>,
+    ) -> (Aggregator, ResourceRef, ResourceObject<Convoy>) {
+        use flotilla_resources::{CheckoutPhase, CheckoutStatus, VesselPhase, VesselSpec, VesselStatus};
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Ready).call();
         let (events, _) = broadcast::channel(128);
-        let reads = Arc::new(Scripted::default());
-        let mut aggregator =
-            Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads.clone());
-        let host = HostName::new("feta");
-        let origin = flotilla_protocol::NodeId::new("remote-origin");
-        aggregator.origin_hosts.insert(origin.clone(), host.clone());
-        let provenance = ResourceProvenance::Replica { origin_root: origin, last_synced_at: Utc::now() };
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads);
+        let host = HostName::new(if remote { "feta" } else { "kiwi" });
+        let provenance = if remote {
+            let origin = flotilla_protocol::NodeId::new("remote-origin");
+            aggregator.origin_hosts.insert(origin.clone(), host.clone());
+            ResourceProvenance::Replica { origin_root: origin, last_synced_at: Utc::now() }
+        } else {
+            ResourceProvenance::Local
+        };
         convoy.status.as_mut().expect("status").work.get_mut("implement").expect("work").placement =
             Some(PlacementStatus { fields: BTreeMap::from([("host".into(), serde_json::json!(host.as_str()))]) });
         let mut vessel = backend
@@ -6562,34 +6580,120 @@ mod tests {
         );
         let mut checkout = checkout_object("checkout-a", "/work/repo", RepositoryKey("repo".into())).await;
         checkout.metadata.labels.insert(CONVOY_LABEL.into(), convoy.metadata.name.clone());
-        // The old status says Ready throughout.
         checkout.status = Some(CheckoutStatus { phase: CheckoutPhase::Ready, ..Default::default() });
+        if clone {
+            checkout.spec = CheckoutSpec::Worktree(
+                flotilla_resources::CheckoutWorktreeSpec::builder()
+                    .repo_ref(RepositoryKey("repo".into()))
+                    .env_ref("local".into())
+                    .r#ref("main".into())
+                    .target_path("/work/ops".into())
+                    .clone_ref("ops-clone".into())
+                    .build(),
+            );
+            let mut clone = backend
+                .using::<CloneResource>("flotilla")
+                .create(
+                    &InputMeta::builder().name("ops-clone".into()).build(),
+                    &flotilla_resources::CloneSpec::builder()
+                        .repo_ref(RepositoryKey("repo".into()))
+                        .url("https://forgejo.test/ops".into())
+                        .env_ref("local".into())
+                        .path("/work/ops".into())
+                        .build(),
+                )
+                .await
+                .expect("clone");
+            clone.status = Some(flotilla_resources::CloneStatus { phase: flotilla_resources::ClonePhase::Ready, ..Default::default() });
+            apply_readiness_event(
+                &mut aggregator.readiness_clones,
+                ReadWatchEvent::Added(ReadResourceObject { object: clone, provenance: provenance.clone() }),
+            );
+        }
         apply_readiness_event(
             &mut aggregator.readiness_checkouts,
             ReadWatchEvent::Added(ReadResourceObject { object: checkout, provenance }),
         );
         let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("kiwi"));
-        let blocker = |aggregator: &Aggregator| {
-            let row = aggregator.summarize(&reference, &convoy);
-            let readiness = row.readiness().clone();
-            (
-                readiness.state,
-                readiness.blockers.iter().find(|blocker| blocker.resource.name == "checkout-a").map(|blocker| blocker.reason.clone()),
-            )
-        };
+        (aggregator, reference, convoy)
+    }
 
-        assert_eq!(blocker(&aggregator).1, None, "no reading: the old status, Ready, decides");
-        reads.0.lock().expect("script").0 = Some(LifecycleReading::GaveUp { cause: "branch conflicts".into() });
-        assert_eq!(blocker(&aggregator), (ReadinessState::Failed, Some("branch conflicts".into())));
-        reads.0.lock().expect("script").0 =
-            Some(LifecycleReading::Retrying { failures: 2, next: chrono::DateTime::UNIX_EPOCH, cause: "worktree add failed".into() });
-        let (state, reason) = blocker(&aggregator);
+    /// The readiness state, and each checkout and clone blocker's resource name and reason.
+    fn readiness_blockers(
+        aggregator: &Aggregator,
+        reference: &ResourceRef,
+        convoy: &ResourceObject<Convoy>,
+    ) -> (flotilla_protocol::result_set::ReadinessState, Vec<(String, String)>) {
+        let row = aggregator.summarize(reference, convoy);
+        let readiness = row.readiness().clone();
+        let provisioning =
+            |blocker: &&flotilla_protocol::result_set::ReadinessBlocker| matches!(blocker.resource.kind.as_str(), "Checkout" | "Clone");
+        (
+            readiness.state,
+            readiness.blockers.iter().filter(provisioning).map(|blocker| (blocker.resource.name.clone(), blocker.reason.clone())).collect(),
+        )
+    }
+
+    // Behaviour (#3629 layer 4): behind `[primitives]` the engine's reading of a checkout decides its
+    // readiness over the old status, read by key at the checkout's home (a replica's origin root);
+    // without a reading the old status still decides.
+    #[tokio::test]
+    async fn engine_readings_decide_checkout_readiness() {
+        use flotilla_protocol::{result_set::ReadinessState, LifecycleReading};
+
+        use crate::ports::ProvisioningKind::Checkout as Kind;
+        let reads = Arc::new(ScriptedReadings::default());
+        let (aggregator, reference, convoy) = engine_readiness_fixture(true, false, reads.clone()).await;
+        let checkout = |reading| {
+            reads.set(Kind, "checkout-a", reading);
+            readiness_blockers(&aggregator, &reference, &convoy)
+        };
+        let blocker = |reason: &str| vec![("checkout-a".to_owned(), reason.to_owned())];
+
+        assert!(checkout(None).1.is_empty(), "no reading: the old status, Ready, decides");
+        assert_eq!(
+            checkout(Some(LifecycleReading::GaveUp { cause: "branch conflicts".into() })),
+            (ReadinessState::Failed, blocker("branch conflicts"))
+        );
+        let (state, blockers) = checkout(Some(LifecycleReading::Retrying {
+            failures: 2,
+            next: chrono::DateTime::UNIX_EPOCH,
+            cause: "worktree add failed".into(),
+        }));
         assert_eq!(state, ReadinessState::Blocked);
-        assert!(reason.expect("blocked").starts_with("worktree add failed (2 failed"));
-        reads.0.lock().expect("script").0 = Some(LifecycleReading::Ready { identity: "/work/repo".into() });
-        assert_eq!(blocker(&aggregator).1, None);
-        let calls = reads.0.lock().expect("script").1.clone();
-        assert!(calls.contains(&(ProvisioningKind::Checkout, "checkout-a".into(), Some("remote-origin".into()))), "{calls:?}");
+        assert!(blockers[0].1.starts_with("worktree add failed (2 failed"));
+        assert_eq!(checkout(Some(LifecycleReading::InProgress)), (ReadinessState::Provisioning, blocker("being realised")));
+        assert_eq!(checkout(Some(LifecycleReading::Lost)), (ReadinessState::Failed, blocker("observed absent")));
+        assert!(checkout(Some(LifecycleReading::Ready { identity: "/work/repo".into() })).1.is_empty());
+        let reads = reads.reads.lock().expect("reads").clone();
+        assert!(reads.contains(&(Kind, "checkout-a".into(), Some("remote-origin".into()))), "{reads:?}");
+    }
+
+    // Behaviour (#3629 layer 4, #3731 review): a worktree's clone is read from the engine too, at
+    // this home for a local clone; it blocks the vessel beside its checkout, whichever of the
+    // engine and the old status decides the checkout.
+    #[tokio::test]
+    async fn engine_readings_decide_clone_readiness() {
+        use flotilla_protocol::{result_set::ReadinessState, LifecycleReading};
+
+        use crate::ports::ProvisioningKind;
+        let reads = Arc::new(ScriptedReadings::default());
+        let (aggregator, reference, convoy) = engine_readiness_fixture(false, true, reads.clone()).await;
+        reads.set(ProvisioningKind::Checkout, "checkout-a", Some(LifecycleReading::InProgress));
+        reads.set(ProvisioningKind::Clone, "ops-clone", Some(LifecycleReading::GaveUp { cause: "repository not found".into() }));
+        let (state, blockers) = readiness_blockers(&aggregator, &reference, &convoy);
+        assert_eq!(state, ReadinessState::Failed);
+        assert_eq!(
+            blockers,
+            vec![("ops-clone".to_owned(), "repository not found".to_owned()), ("checkout-a".to_owned(), "being realised".to_owned())]
+        );
+        reads.set(ProvisioningKind::Clone, "ops-clone", Some(LifecycleReading::Ready { identity: "/work/ops".into() }));
+        assert_eq!(
+            readiness_blockers(&aggregator, &reference, &convoy),
+            (ReadinessState::Provisioning, vec![("checkout-a".to_owned(), "being realised".to_owned())])
+        );
+        let reads = reads.reads.lock().expect("reads").clone();
+        assert!(reads.contains(&(ProvisioningKind::Clone, "ops-clone".into(), None)), "{reads:?}");
     }
 
     // #1961: Active plus pending agent work must remain provisioning, even

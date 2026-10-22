@@ -48,6 +48,8 @@ pub enum LifecycleReading {
     Lost,
     /// Gone, torn down on purpose.
     Released,
+    /// Gone, without the entry that says how (a replica seeded from a snapshot).
+    Gone,
     /// Its attempts were spent; the last failed with `cause`.
     GaveUp { cause: String },
 }
@@ -62,6 +64,7 @@ impl LifecycleReading {
             Self::Ready { .. } => "Ready",
             Self::Lost => "Lost",
             Self::Released => "Released",
+            Self::Gone => "Gone",
             Self::GaveUp { .. } => "GaveUp",
         }
     }
@@ -75,7 +78,44 @@ impl LifecycleReading {
             Self::Ready { .. } => None,
             Self::Lost => Some("observed absent".into()),
             Self::Released => Some("released".into()),
+            Self::Gone => Some("gone".into()),
             Self::GaveUp { cause } => Some(cause.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod reading_tests {
+    use super::LifecycleReading;
+
+    // Behaviour (#3629 layer 4): the labels are the views' contract: one per judgement, stable.
+    #[test]
+    fn each_reading_has_its_stable_label() {
+        let at = chrono::DateTime::UNIX_EPOCH;
+        let readings = [
+            (LifecycleReading::InProgress, "InProgress"),
+            (LifecycleReading::Retrying { failures: 1, next: at, cause: "c".into() }, "Retrying"),
+            (LifecycleReading::Exhausted { cause: "c".into() }, "Exhausted"),
+            (LifecycleReading::Ready { identity: "i".into() }, "Ready"),
+            (LifecycleReading::Lost, "Lost"),
+            (LifecycleReading::Released, "Released"),
+            (LifecycleReading::Gone, "Gone"),
+            (LifecycleReading::GaveUp { cause: "c".into() }, "GaveUp"),
+        ];
+        for (reading, label) in readings {
+            assert_eq!(reading.label(), label);
+            assert_eq!(reading.reason().is_none(), label == "Ready", "{label}");
+            let json = serde_json::to_value(&reading).expect("encodes");
+            assert_eq!(
+                json["judgement"],
+                serde_json::json!(label.chars().fold(String::new(), |mut snake, c| {
+                    if c.is_uppercase() && !snake.is_empty() {
+                        snake.push('_');
+                    }
+                    snake.push(c.to_ascii_lowercase());
+                    snake
+                }))
+            );
         }
     }
 }

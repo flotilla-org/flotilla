@@ -38,6 +38,9 @@ pub enum Judgement {
     Lost,
     /// Gone, torn down on purpose.
     Released,
+    /// Gone, and the entry that ended it is not held here: a replica seeded from a snapshot keeps
+    /// no log entries from before it, so it cannot tell lost from released.
+    Gone,
     /// Its attempts were spent; the last failed with `cause`.
     GaveUp { cause: Cause },
 }
@@ -54,9 +57,17 @@ pub struct View<K: LifecycleKind> {
     pub judgement: Judgement,
 }
 
-/// The judgement of `state` under `K`'s policy; `released` says, for a Gone resource,
-/// whether its last edge was a release.
-pub fn judge<K: LifecycleKind>(state: &LifecycleState, released: bool) -> Judgement {
+/// How a Gone resource ended, as its last log entry says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ending {
+    Released,
+    Vanished,
+    /// The entry is not held here (a replica seeded from a snapshot), or the resource is not Gone.
+    Unknown,
+}
+
+/// The judgement of `state` under `K`'s policy; `ending` says, for a Gone resource, how it ended.
+pub fn judge<K: LifecycleKind>(state: &LifecycleState, ending: Ending) -> Judgement {
     match state {
         LifecycleState::Requested { failures: 0, .. } => Judgement::InProgress,
         // The shared retry judgement (`attempt::retry`), over the Requested tally.
@@ -74,8 +85,11 @@ pub fn judge<K: LifecycleKind>(state: &LifecycleState, released: bool) -> Judgem
         }
         LifecycleState::Requested { last_failure: None, .. } => Judgement::InProgress,
         LifecycleState::Realised { identity } => Judgement::Ready { identity: identity.clone() },
-        LifecycleState::Gone if released => Judgement::Released,
-        LifecycleState::Gone => Judgement::Lost,
+        LifecycleState::Gone => match ending {
+            Ending::Released => Judgement::Released,
+            Ending::Vanished => Judgement::Lost,
+            Ending::Unknown => Judgement::Gone,
+        },
         LifecycleState::GaveUp { cause } => Judgement::GaveUp { cause: cause.clone() },
     }
 }
@@ -115,6 +129,11 @@ pub trait ProvisioningReads: Send + Sync {
 }
 
 /// The read port over one decided store.
+///
+/// Each read takes the store's lock for one keyed load (and, for a Gone resource, its last log
+/// entry) or one index page: 3 to 30 µs at the 10,000-convoy ceiling (`provisioning_bench`), so a
+/// view that reads per checkout stays well inside a frame. A write holds the same lock for one
+/// short transaction (about 0.1 to 0.4 ms), which bounds how long a read can wait for it.
 pub struct StoreReads {
     store: Arc<Mutex<Store>>,
 }
@@ -143,17 +162,23 @@ where
 {
     let Some(loaded) = read.load::<Resource<Lifecycle<K>>>(id)? else { return Ok(None) };
     let state = loaded.value.state().clone();
-    // Lost or released: the entry that ended it, the resource's last, read by key.
-    let released = state == LifecycleState::Gone && {
+    // Lost or released: the entry that ended it, the resource's last (its version is that entry's
+    // sequence), read by key. A replica seeded from a snapshot does not hold it.
+    let ending = if state == LifecycleState::Gone {
         let last = read.changes(id, loaded.version.saturating_sub(1), 1)?;
-        last.first()
-            .map(|entry| edge_event::<Lifecycle<K>>(entry).map_err(|error| ReadError(format!("{error:?}"))))
-            .transpose()?
-            .flatten()
-            .is_some_and(|event| matches!(event.payload.edge, LifecycleEdge::Release(_)))
+        match last.first().filter(|entry| entry.home_seq == loaded.version) {
+            Some(entry) => match edge_event::<Lifecycle<K>>(entry).map_err(|error| ReadError(format!("{error:?}")))? {
+                Some(event) if matches!(event.payload.edge, LifecycleEdge::Release(_)) => Ending::Released,
+                Some(event) if matches!(event.payload.edge, LifecycleEdge::Vanish(_)) => Ending::Vanished,
+                _ => Ending::Unknown,
+            },
+            None => Ending::Unknown,
+        }
+    } else {
+        Ending::Unknown
     };
     Ok(Some(View {
-        judgement: judge::<K>(&state, released),
+        judgement: judge::<K>(&state, ending),
         name: loaded.name,
         home: loaded.home,
         request: loaded.value.spec().clone(),
@@ -233,6 +258,8 @@ impl Judgement {
         use flotilla_protocol::LifecycleReading;
         match self {
             Judgement::InProgress => LifecycleReading::InProgress,
+            // A next try is a stored failure's time plus a capped backoff, always within chrono's
+            // range, so the epoch never stands in for a real one.
             Judgement::Retrying { failures, next, last } => {
                 LifecycleReading::Retrying { failures: *failures, next: next.to_datetime().unwrap_or_default(), cause: last.detail.clone() }
             }
@@ -240,6 +267,7 @@ impl Judgement {
             Judgement::Ready { identity } => LifecycleReading::Ready { identity: identity.clone() },
             Judgement::Lost => LifecycleReading::Lost,
             Judgement::Released => LifecycleReading::Released,
+            Judgement::Gone => LifecycleReading::Gone,
             Judgement::GaveUp { cause } => LifecycleReading::GaveUp { cause: cause.detail.clone() },
         }
     }
