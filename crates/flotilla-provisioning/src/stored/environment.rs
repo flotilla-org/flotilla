@@ -115,6 +115,16 @@ pub struct HostDirectRecipe {
     pub repo_default_dir: String,
 }
 
+impl HostDirectRecipe {
+    /// The recipe's own rule: it names the root its checkouts go under.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.repo_default_dir.trim().is_empty() {
+            true => Err("a host-direct environment names its checkout root".into()),
+            false => Ok(()),
+        }
+    }
+}
+
 /// Env entries derived at launch, which no stored recipe holds (owner's
 /// look-over ruling 5): credential names, scopes and permission maps, and
 /// the crew's skills.
