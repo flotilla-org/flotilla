@@ -52,7 +52,7 @@ fn provisioning_store_schema_view_matches_the_snapshot() {
     check("provisioning_schema_view.md", &view);
 }
 
-// Behaviour (#3373 ruling 6): the four kinds register beside the engine's production kinds under
+// Behaviour (#3373 ruling 6): the kinds declared here register beside the engine's production kinds under
 // codes no engine kind holds, and those codes are pinned: they are stored with every identity.
 #[test]
 fn provisioning_kind_codes_are_pinned() {
@@ -62,7 +62,8 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("ImageBuild"), Some(KindCode::new("ib")));
     assert_eq!(held("Clone"), Some(KindCode::new("cl")));
     assert_eq!(held("Checkout"), Some(KindCode::new("ck")));
-    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 4);
+    assert_eq!(held("TerminalSession"), Some(KindCode::new("ts")));
+    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 5);
 }
 
 fn plan(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {

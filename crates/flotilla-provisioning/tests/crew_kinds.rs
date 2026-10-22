@@ -1,0 +1,116 @@
+//! The crew kinds' stored shape (#3629 Track B layer 5): Vessel and Ensure, declared by the
+//! engine, and TerminalSession. Deterministic DDL and a readable view, checked in for the owner's
+//! schema look-over, the plans of their statements, and a session through the schema codec.
+
+use std::{collections::BTreeMap, env, fs, path::Path};
+
+use flotilla_provisioning::stored::{
+    self,
+    environment::Environment,
+    terminal_session::{Launch, TerminalSessionKind, TerminalSessionRequest},
+};
+use flotilla_resources::TerminalBrief;
+use flotilla_schema::{render_view, Decoder, Encoder, Frozen, Kind, Ref, State, Timestamp};
+use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store};
+use flotilla_state_machines::{
+    machines::{
+        convoy::Convoy,
+        lifecycle::{Lifecycle, LifecycleState},
+        vessel::Vessel,
+    },
+    Resource, Version,
+};
+
+fn check(file: &str, actual: &str) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots").join(file);
+    if env::var_os("UPDATE_DDL_SNAPSHOT").is_some_and(|value| value == "1") {
+        fs::write(&path, actual).expect("write snapshot");
+        return;
+    }
+    let snapshot = fs::read_to_string(&path).expect("read snapshot; run with UPDATE_DDL_SNAPSHOT=1 to create it");
+    assert_eq!(actual, snapshot, "{file} changed; review and rerun with UPDATE_DDL_SNAPSHOT=1");
+}
+
+// Behaviour (CLAUDE.md schema review): the crew kinds render deterministic DDL, checked in so the
+// owner's look-over and every later change show as a diff.
+#[test]
+fn crew_store_ddl_matches_the_snapshot() {
+    check("crew.sql", &schema_ddl(&stored::crew_registry().expect("registry"), DdlMode::Create));
+}
+
+// Behaviour (CLAUDE.md schema review): the readable view of the crew kind tables.
+#[test]
+fn crew_store_schema_view_matches_the_snapshot() {
+    let view = format!(
+        "# Crew store schema view\n\nKind tables only; the shared tables are in `crew.sql`.\n\n{}",
+        render_view(stored::crew_registry().expect("registry").iter())
+    );
+    check("crew_schema_view.md", &view);
+}
+
+fn plan(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+    let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    let nulls = vec![rusqlite::types::Value::Null; statement.parameter_count()];
+    let rows = statement.query_map(rusqlite::params_from_iter(nulls), |row| row.get::<_, String>(3)).expect("plan");
+    rows.collect::<Result<_, _>>().expect("plan rows")
+}
+
+// Behaviour (#3392 A1, #3320 production shape): every statement for the crew kinds searches a key
+// or a declared index, and removing an identity checks each root reference through its index (a
+// vessel's convoy, a session's environment, vessel and convoy). Only plans are read.
+#[test]
+fn crew_statements_and_identity_removal_search_by_key() {
+    let store = Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", stored::crew_registry().expect("registry"))
+        .expect("open");
+    let statements = store.statements();
+    let conn = store.into_connection();
+    let mut failures = Vec::new();
+    for (label, sql) in &statements {
+        let rows = plan(&conn, sql);
+        if rows.iter().any(|row| row.contains("SCAN") || row.contains("TEMP B-TREE")) {
+            failures.push(format!("{label}: {rows:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+    let sql = &statements.iter().find(|(label, _)| label == "identity_delete").expect("shared statement").1;
+    let rows = plan(&conn, sql);
+    for index in ["vessel_by_convoy", "terminal_session_by_environment", "terminal_session_by_vessel", "terminal_session_by_convoy"] {
+        assert!(rows.iter().any(|row| row.contains(index)), "{index}: {rows:?}");
+    }
+}
+
+// Behaviour (ADR 0064 D5): a session survives the schema codec in every lifecycle label, as a tool
+// and as an agent with a frozen brief and launch values.
+#[test]
+fn a_terminal_session_survives_the_codec() {
+    let brief =
+        TerminalBrief { path: "/w/.flotilla/brief.md".into(), content: "# brief".into(), artifact_digest: None, copies: vec!["/x".into()] };
+    let agent = Launch::Agent {
+        capability: "coding".into(),
+        adapter: Some("claude-code".into()),
+        model: None,
+        brief: Frozen::new(brief).expect("freeze"),
+    };
+    for (source, vessel, convoy) in [
+        (Launch::Tool { command: "bash".into() }, None, None),
+        (agent, Some(Ref::<Resource<Vessel>>::new("convoy-work", "feta")), Some(Ref::<Resource<Convoy>>::new("convoy", "kiwi"))),
+    ] {
+        for state in [LifecycleState::requested(), LifecycleState::Realised { identity: "cleat-1".into() }, LifecycleState::Gone] {
+            let spec = TerminalSessionRequest {
+                environment: Ref::<Resource<Environment>>::new("env", "feta"),
+                vessel: vessel.clone(),
+                convoy: convoy.clone(),
+                role: "coder".into(),
+                pool: "cleat".into(),
+                cwd: "/workspace".into(),
+                env: BTreeMap::from([("A".into(), "1".into())]),
+                source: source.clone(),
+            };
+            let resource =
+                Resource::<Lifecycle<TerminalSessionKind>>::stored("s", spec, State::new(state, Timestamp::from_micros(1)), Version(2));
+            let decoded: Resource<Lifecycle<TerminalSessionKind>> =
+                Decoder::decode(Encoder::encode(&resource).expect("encodes")).expect("decodes");
+            assert_eq!(decoded.with_identity("s", 2), resource);
+        }
+    }
+}
