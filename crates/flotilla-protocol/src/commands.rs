@@ -1159,7 +1159,9 @@ pub enum CommandAction {
         namespace: Option<String>,
         name: String,
     },
-    /// Pull the next framed whole-home stream item; sessions expire on idle consumers.
+    /// Peer-only pull of a whole-home stream frame; interactive query dispatch refuses it.
+    /// `after` selects a new round's cut. With `session`, the saved cut takes precedence
+    /// and `after` is ignored. Idle consumers lose the session.
     QueryChangeStream {
         after: Option<u64>,
         session: Option<String>,

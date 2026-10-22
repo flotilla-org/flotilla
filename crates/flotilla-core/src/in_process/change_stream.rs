@@ -9,41 +9,63 @@ use flotilla_schema_sqlite::{
     StoreError,
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 
 struct Session {
+    peer: String,
     receiver: Mutex<mpsc::Receiver<Result<Vec<u8>, String>>>,
     touched: std::sync::Mutex<tokio::time::Instant>,
 }
 type Receiver = Arc<Session>;
-#[derive(Default)]
-pub(super) struct Rounds(Arc<Mutex<HashMap<String, Receiver>>>);
+pub(super) struct Rounds {
+    sessions: Arc<Mutex<HashMap<String, Receiver>>>,
+    workers: Arc<Semaphore>,
+}
+impl Default for Rounds {
+    fn default() -> Self {
+        Self { sessions: Default::default(), workers: Arc::new(Semaphore::new(MAX_ROUNDS)) }
+    }
+}
 const DEADLINE: Duration = Duration::from_secs(15);
-const MAX_ROUNDS: usize = 512;
+// The whole-home mesh currently sizes for a few hosts. Reserve the blocking pool for
+// other SQLite users; at most one active session per originating peer can pin a worker.
+const MAX_ROUNDS: usize = 16;
 
 impl Rounds {
     pub(super) async fn next(
         &self,
+        peer: &str,
         service: Arc<Service>,
         after: Option<u64>,
         session: Option<String>,
         now: Timestamp,
     ) -> Result<CommandValue, String> {
         let (session, receiver) = if let Some(session) = session {
-            let receiver = self.0.lock().await.get(&session).cloned().ok_or("change-stream session expired")?;
+            let receiver = self.sessions.lock().await.get(&session).cloned().ok_or("change-stream session expired")?;
+            if receiver.peer != peer {
+                return Err("change-stream session belongs to another peer".into());
+            }
             (session, receiver)
         } else {
             let session = uuid::Uuid::new_v4().to_string();
             let (tx, rx) = mpsc::channel(2);
-            let receiver = Arc::new(Session { receiver: Mutex::new(rx), touched: std::sync::Mutex::new(tokio::time::Instant::now()) });
-            let mut rounds = self.0.lock().await;
+            let receiver = Arc::new(Session {
+                peer: peer.to_owned(),
+                receiver: Mutex::new(rx),
+                touched: std::sync::Mutex::new(tokio::time::Instant::now()),
+            });
+            let mut rounds = self.sessions.lock().await;
             if rounds.len() >= MAX_ROUNDS {
                 return Err("too many change-stream sessions".into());
             }
+            if rounds.values().any(|session| session.peer == peer) {
+                return Err("peer already has an active change-stream session".into());
+            }
+            let permit = Arc::clone(&self.workers).try_acquire_owned().map_err(|_| "change-stream workers busy")?;
             rounds.insert(session.clone(), Arc::clone(&receiver));
             drop(rounds);
             let idle = Arc::downgrade(&receiver);
-            let sessions = Arc::clone(&self.0);
+            let sessions = Arc::clone(&self.sessions);
             let key = session.clone();
             tokio::spawn(async move {
                 loop {
@@ -65,11 +87,12 @@ impl Rounds {
                     }
                 }
             });
-            let sessions = Arc::clone(&self.0);
+            let sessions = Arc::clone(&self.sessions);
             let key = session.clone();
             tokio::spawn(async move {
                 let (frames, mut incoming) = mpsc::channel(2);
                 let worker = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
                     service.serve(after, now, |bytes| {
                         frames.blocking_send(bytes.to_vec()).map_err(|_| StoreError::Stream("routed consumer closed".into()))
                     })
@@ -92,16 +115,25 @@ impl Rounds {
         let now = tokio::time::Instant::now();
         let expired = now.duration_since(*receiver.touched.lock().expect("stream progress")) >= DEADLINE;
         if expired {
-            self.0.lock().await.remove(&session);
+            self.sessions.lock().await.remove(&session);
             return Err("change-stream session expired".into());
         }
         *receiver.touched.lock().expect("stream progress") = now;
-        let frame = tokio::time::timeout(DEADLINE, async { receiver.receiver.lock().await.recv().await })
-            .await
-            .map_err(|_| "routed frame timed out")?
-            .ok_or("routed stream closed")??;
+        let delivery = tokio::time::timeout(DEADLINE, async { receiver.receiver.lock().await.recv().await }).await;
+        let frame = match delivery {
+            Ok(Some(Ok(frame))) => frame,
+            result => {
+                self.sessions.lock().await.remove(&session);
+                return Err(match result {
+                    Ok(Some(Err(error))) => error,
+                    Ok(None) => "routed stream closed".into(),
+                    Err(_) => "routed frame timed out".into(),
+                    _ => unreachable!(),
+                });
+            }
+        };
         if matches!(Frame::decode(&frame).map_err(|e| e.to_string())?, Frame::Keepalive { .. }) {
-            self.0.lock().await.remove(&session);
+            self.sessions.lock().await.remove(&session);
         }
         Ok(CommandValue::ChangeStreamFrame { session, frame })
     }
@@ -119,34 +151,71 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = Arc::new(Service::open(&dir.path().join("home.db"), "home", KindRegistry::new()).unwrap());
         let rounds = Rounds::default();
-        let CommandValue::ChangeStreamFrame { session, .. } = rounds.next(Arc::clone(&service), None, None, Timestamp(1)).await.unwrap()
+        let CommandValue::ChangeStreamFrame { session, .. } =
+            rounds.next("peer", Arc::clone(&service), None, None, Timestamp(1)).await.unwrap()
         else {
             panic!("frame");
         };
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(10)).await;
         let CommandValue::ChangeStreamFrame { frame, .. } =
-            rounds.next(Arc::clone(&service), None, Some(session.clone()), Timestamp(1)).await.unwrap()
+            rounds.next("peer", Arc::clone(&service), None, Some(session.clone()), Timestamp(1)).await.unwrap()
         else {
             panic!("frame");
         };
         assert!(matches!(Frame::decode(&frame).unwrap(), Frame::End { .. }));
         tokio::time::advance(Duration::from_secs(10)).await;
         let CommandValue::ChangeStreamFrame { frame, .. } =
-            rounds.next(Arc::clone(&service), None, Some(session.clone()), Timestamp(1)).await.unwrap()
+            rounds.next("peer", Arc::clone(&service), None, Some(session.clone()), Timestamp(1)).await.unwrap()
         else {
             panic!("frame");
         };
         assert!(matches!(Frame::decode(&frame).unwrap(), Frame::Keepalive { .. }));
-        assert!(rounds.next(Arc::clone(&service), None, Some(session), Timestamp(1)).await.is_err());
+        assert!(rounds.next("peer", Arc::clone(&service), None, Some(session), Timestamp(1)).await.is_err());
         // Resume with a fresh wall clock while the blocking source takes its read cut.
         tokio::time::resume();
-        let CommandValue::ChangeStreamFrame { session, .. } = rounds.next(Arc::clone(&service), None, None, Timestamp(2)).await.unwrap()
+        let CommandValue::ChangeStreamFrame { session, .. } =
+            rounds.next("peer", Arc::clone(&service), None, None, Timestamp(2)).await.unwrap()
         else {
             panic!("frame");
         };
         tokio::time::pause();
         tokio::time::advance(DEADLINE + Duration::from_secs(1)).await;
-        assert!(rounds.next(service, None, Some(session), Timestamp(2)).await.is_err());
+        assert!(rounds.next("peer", service, None, Some(session), Timestamp(2)).await.is_err());
+    }
+    // One stalled originating peer can reserve one cursor, not every slot. Other peers
+    // progress independently, and an opaque session token grants no cross-peer access.
+    #[tokio::test]
+    async fn peer_limits_isolate_sessions_and_bound_global_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Arc::new(Service::open(&dir.path().join("home.db"), "home", KindRegistry::new()).unwrap());
+        let rounds = Rounds::default();
+        let CommandValue::ChangeStreamFrame { session, .. } =
+            rounds.next("first", Arc::clone(&service), None, None, Timestamp(1)).await.unwrap()
+        else {
+            panic!("frame");
+        };
+        assert!(rounds.next("first", Arc::clone(&service), None, None, Timestamp(1)).await.unwrap_err().contains("already has an active"));
+        assert!(rounds.next("other", Arc::clone(&service), None, Some(session), Timestamp(1)).await.unwrap_err().contains("another peer"));
+        for index in 1..MAX_ROUNDS {
+            assert!(rounds.next(&format!("peer-{index}"), Arc::clone(&service), None, None, Timestamp(1)).await.is_ok());
+        }
+        assert!(rounds.next("overflow", service, None, None, Timestamp(1)).await.unwrap_err().contains("too many"));
+    }
+
+    // A source failure releases its cursor as soon as it is delivered, so the same peer
+    // can retry without waiting for the idle reaper or receiving a stale session error.
+    #[tokio::test]
+    #[cfg(unix)] // The injected failure unlinks a database while its writer is open.
+    async fn delivered_source_error_releases_the_peer_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("home.db");
+        let service = Arc::new(Service::open(&path, "home", KindRegistry::new()).unwrap());
+        std::fs::remove_file(path).unwrap();
+        let rounds = Rounds::default();
+        for _ in 0..2 {
+            let error = rounds.next("peer", Arc::clone(&service), None, None, Timestamp(1)).await.unwrap_err();
+            assert!(error.contains("unable to open database file"), "{error}");
+        }
     }
 }

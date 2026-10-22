@@ -51,6 +51,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryCrewList { .. }
         | CommandAction::QueryDaemonLogs { .. }
         | CommandAction::QueryExplainConvoy { .. }
+        | CommandAction::QueryChangeStream { .. }
         | CommandAction::QueryResourceDigest { .. }
         | CommandAction::QueryResourceList { .. }
         | CommandAction::QueryResourceGet { .. }

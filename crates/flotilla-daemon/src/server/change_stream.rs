@@ -196,7 +196,7 @@ async fn routed_round(service: Arc<Service>, home: &str, router: &super::remote_
     let mut spool = tokio::fs::File::from_std(tempfile::tempfile().map_err(|e| e.to_string())?);
     loop {
         let command = Command::builder().node_id(NodeId::new(home)).action(CommandAction::QueryChangeStream { after, session }).build();
-        let value = tokio::time::timeout(IO_DEADLINE, router.dispatch_query(command, uuid::Uuid::new_v4()))
+        let value = tokio::time::timeout(IO_DEADLINE, router.dispatch_replication_query(command))
             .await
             .map_err(|_| "routed stream timed out")??;
         let CommandValue::ChangeStreamFrame { session: next, frame } = value else {
@@ -332,7 +332,10 @@ async fn install_spool(service: Arc<Service>, home: &str, mut spool: std::fs::Fi
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{empty_daemon, empty_remote_command_router};
     use super::*;
+    use crate::peer::PeerManager;
+    use flotilla_protocol::NodeId;
     use flotilla_schema::KindRegistry;
     use flotilla_schema_sqlite::stream::Watermark;
     use flotilla_test_support::TestSocketDir;
@@ -391,7 +394,12 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
             });
-            follow_connection(Arc::clone(&service), "home", &http_client(&socket).unwrap()).await.expect("follow HTTP");
+            let (_daemon_dir, daemon) = empty_daemon().await;
+            let pm = Arc::new(tokio::sync::Mutex::new(PeerManager::new(NodeId::new("local"))));
+            let router = empty_remote_command_router(&daemon, &pm);
+            follow_round(Arc::clone(&service), "home", Some(&http_client(&socket).unwrap()), &router)
+                .await
+                .expect("prefer HTTP socket to missing command route");
             peer.await.expect("stand-in");
             assert_eq!(service.with_store(|store| store.read()?.watermark("home")).expect("mark").applied_through, Timestamp(7));
         }

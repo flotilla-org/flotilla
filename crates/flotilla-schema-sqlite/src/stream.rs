@@ -130,8 +130,10 @@ pub fn serve(
 /// split their already-loaded logical rows without a second SQL snapshot traversal.
 fn send_resource(snapshot: Snapshot, send: &mut dyn FnMut(&[u8]) -> Result<(), StoreError>) -> Result<(), StoreError> {
     let frame = Frame::Resource(snapshot);
-    if let Ok(bytes) = frame.encode() {
-        return send(&bytes);
+    match FRAMING.encode(&frame) {
+        Ok(bytes) => return send(&bytes),
+        Err(error) if matches!(error.kind(), flotilla_cbor::ErrorKind::MessageLimit | flotilla_cbor::ErrorKind::ElementLimit) => {}
+        Err(error) => return Err(StoreError::Stream(error.to_string())),
     }
     let Frame::Resource(snapshot) = frame else { unreachable!() };
     let tables = snapshot.rows.tables.len();
@@ -180,6 +182,7 @@ impl<'a> Follower<'a> {
         let mut write = self.store.write()?;
         let mut snapshot = None;
         let mut chunks: Option<Snapshot> = None;
+        let mut chunk_bytes = 0usize;
         let mut cursor = write.stream_watermark(home)?;
         deliver(&mut |bytes| {
             match Frame::decode(bytes)? {
@@ -192,6 +195,10 @@ impl<'a> Follower<'a> {
                     write.restore(&value)?;
                 }
                 Frame::ResourceChunk { value, last } if value.home == home && snapshot.is_some_and(|cut| value.version <= cut) => {
+                    chunk_bytes = chunk_bytes.saturating_add(bytes.len());
+                    if chunk_bytes > MAX_RESOURCE_ASSEMBLY_BYTES {
+                        return Err(StoreError::Stream("snapshot resource exceeds assembly limit".into()));
+                    }
                     match &mut chunks {
                         None => chunks = Some(value),
                         Some(pending) => {
@@ -210,6 +217,7 @@ impl<'a> Follower<'a> {
                     }
                     if last {
                         write.restore(&chunks.take().expect("chunk resource"))?;
+                        chunk_bytes = 0;
                     }
                 }
                 Frame::Tombstone { identity, home_seq }
@@ -259,6 +267,10 @@ pub struct ReadResult {
 impl flotilla_cbor::Message for Frame {
     const TYPES: &'static [&'static str] = &["Read", "Begin", "Resource", "ResourceChunk", "Tombstone", "End", "Change", "Keepalive"];
 }
+
+/// Bounded exceptional resource assembly, well above WORKLOAD.md's 100 KiB convoy width.
+/// A resource crossing this boundary needs retention or an incremental restore design.
+pub const MAX_RESOURCE_ASSEMBLY_BYTES: usize = 64 * 1024 * 1024;
 
 pub const PATH: &str = "/apis/flotilla.work/v1/change-stream";
 pub const RECORD_PATH: &str = "/apis/flotilla.work/v1/record";
@@ -338,4 +350,53 @@ struct Source {
     path: std::path::PathBuf,
     home: String,
     kinds: flotilla_schema::KindRegistry,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flotilla_schema::{KindCode, KindRegistry, Row, Rows, Value};
+    use rusqlite::Connection;
+
+    fn snapshot(value: Value) -> Snapshot {
+        let mut rows = Rows::with_tables(1);
+        rows.tables[0].push(Row { key: Vec::new(), values: vec![value] });
+        Snapshot { kind: KindCode::new("test"), name: "resource".into(), home: "home".into(), version: 0, rows }
+    }
+
+    // Splitting rows cannot repair an invalid byte string. Refuse before sending even
+    // a valid root chunk, so only aggregate message/element size triggers chunking.
+    #[test]
+    fn non_size_encoding_error_does_not_start_chunk_delivery() {
+        let mut value = snapshot(Value::Text("root".into()));
+        value.rows.tables.push(vec![Row { key: vec![Value::Int(0)], values: vec![Value::Blob(vec![0; LOG_LIMITS.max_byte_string + 1])] }]);
+        let mut sent = 0;
+        let error = send_resource(value, &mut |_| {
+            sent += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("byte-string-limit"));
+        assert_eq!(sent, 0);
+    }
+
+    // A peer cannot grow an unfinished resource indefinitely. Crossing the byte budget
+    // rejects the whole transaction and leaves its committed watermark unchanged.
+    #[test]
+    fn unfinished_chunks_cannot_exceed_resource_assembly_budget() {
+        let mut store = Store::open(Connection::open_in_memory().unwrap(), "replica", KindRegistry::new()).unwrap();
+        let begin = Frame::Begin { home: "home".into(), home_seq: 0 }.encode().unwrap();
+        let chunk = Frame::ResourceChunk { value: snapshot(Value::Text("x".repeat(1024 * 1024))), last: false }.encode().unwrap();
+        let error = Follower::new(&mut store)
+            .receive("home", |sink| {
+                sink(&begin)?;
+                for _ in 0..128 {
+                    sink(&chunk)?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("resource exceeds assembly limit"));
+        assert_eq!(store.applied_watermark("home"), Watermark::ZERO);
+    }
 }

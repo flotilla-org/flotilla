@@ -46,7 +46,20 @@ use HTTP; homes reached through command routing use `QueryChangeStream`. A route
 retains one consistent read cut and pulls one base64-wrapped CBOR frame per request, applying
 backpressure independently of the daemon event broadcast ring. Two bounded channels each
 hold at most two frames. A producer or abandoned session expires after 15 seconds without
-consumer progress; at most 512 sessions may exist at once. Completion removes the session.
+consumer progress. At most **16 sessions/workers** may exist at once, protected by a
+semaphore permit held until the blocking worker actually exits, rather than only until its
+cursor disappears. This leaves capacity in the daemon's default blocking pool for other
+SQLite work. A single originating node may hold only one session, and another node cannot
+use its cursor. Completion and delivered errors remove the session immediately.
+Interactive query dispatch refuses `QueryChangeStream` before routing. The destination
+also refuses forwarded requests carrying a surface session or delegated caller, and the
+ordinary daemon query entry point cannot serve it. Only the internal replication dispatch
+path sends the peer-owned query with neither surface field. The destination binds the
+cursor to the originating node carried by the trusted peer envelope. This inherits the
+mesh's existing trust in connected daemons; every admitted home is allowed to replicate the
+whole log, with no per-kind ACL or topic filtering. Pinned router rows cover local/remote
+user and crew refusal, and destination-origin rows cover forwarded surface/caller refusal
+and peer admission. A routed-only snapshot/tail test goes through both production routers.
 The receiver uses the same disk spool and production Follower as HTTP. Lost responses expire
 the session and the next round resumes from committed progress. Displacement/disconnect
 cancels the matching follower task. Failed links resume from committed
@@ -183,7 +196,13 @@ child strings of 17 KiB using 32 bounded updates. Its 17 MiB of child payload ex
 16 MiB frame profile, so only that resource uses row chunks. The measured exceptional case emits **1,025 chunks**, with a **17,547-byte** largest frame.
 Both sender and receiver hold
 one complete resource in memory; exceptional chunking bounds wire frames, not total
-resource materialization. A disconnected chunk sequence rolls back atomically. If
+resource materialization. The follower also caps a resource's cumulative framed chunks at
+**64 MiB**, rolling back when that budget is crossed; decoded values have additional
+representation overhead. This is far above the root workload's 100 KiB upper convoy width
+and above the measured 17 MiB exception. A real resource reaching that budget expires this
+assembly design and requires retention or incremental restore. Only aggregate CBOR message
+or element limits trigger chunking; malformed values, byte-string and depth errors fail
+before any chunk delivery. A disconnected chunk sequence rolls back atomically. If
 append-only resources routinely reach this size, revisit resource retention and incremental
 snapshot construction rather than applying per-row framing to every resource.
 
@@ -192,3 +211,14 @@ a bounded consumer and consistent cut without a second bulk transport. At the me
 convoy ceiling this is 10,003 round trips for a fresh home; steady-state tail rounds are
 proportional to new events plus one keepalive. This remains the existing small-mesh shape,
 not a claim of viability at the root workload's 500-host ceiling.
+
+The five-second cadence is the idle delay between successful rounds, not a joining-snapshot
+latency guarantee. Per-frame pulls are deliberate for this first small-mesh transport: they
+retain bounded backpressure and the existing atomic round install without an additional
+bulk channel or retained partially spooled transaction. At 20 ms routed RTT, 10,003 requests
+add about 200 seconds before encoding and disk cost; at 100 ms, about 1,000 seconds. A failed
+request discards the partial spool and resumes from the last committed prefix, so a joining
+snapshot may restart. Batch delivery or resumable staged snapshots should replace this
+choice when WAN joining latency or frequent link failure makes that cost unacceptable.
+A whole-round timeout would also reject sufficiently large but steadily progressing homes;
+the 15-second idle deadline instead bounds a stalled consumer while permitting progress.

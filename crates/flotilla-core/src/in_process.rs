@@ -2092,6 +2092,14 @@ impl InProcessDaemon {
         self.message_path.get().cloned()
     }
 
+    /// Peer replication entry point; the router supplies the originating node from
+    /// the trusted peer transport envelope.
+    pub async fn next_change_stream_frame(&self, peer: &str, after: Option<u64>, session: Option<String>) -> Result<CommandValue, String> {
+        self.change_stream_rounds
+            .next(peer, self.decided_store()?, after, session, flotilla_schema::Timestamp::from_datetime(&self.clock.now()))
+            .await
+    }
+
     /// Present only after the first kind migration installs its registered store.
     pub fn decided_store(&self) -> Result<Arc<flotilla_schema_sqlite::stream::Service>, String> {
         self.decided_store
@@ -5424,11 +5432,8 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
-        if let CommandAction::QueryChangeStream { after, session } = &command.action {
-            return self
-                .change_stream_rounds
-                .next(self.decided_store()?, *after, session.clone(), flotilla_schema::Timestamp::from_datetime(&self.clock.now()))
-                .await;
+        if matches!(command.action, CommandAction::QueryChangeStream { .. }) {
+            return Err("change-stream queries require peer replication transport".into());
         }
         self.projections_actions().execute_query(command, session_id).await
     }
