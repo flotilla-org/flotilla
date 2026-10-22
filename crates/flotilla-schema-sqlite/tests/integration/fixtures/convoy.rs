@@ -53,6 +53,7 @@ fn promise(tc: &TestCase, pick: Pick, n: usize) -> Promise {
     use PromiseSource::*;
     Promise {
         id: PromiseId(small(tc, pick, n)),
+        label: name(tc),
         kind: name(tc),
         target: address(tc),
         source: code_enum(tc, pick, &[Template, Dispatch, Crew]),
@@ -84,12 +85,13 @@ fn duty(tc: &TestCase, pick: Pick) -> Duty {
 /// every source and progress with zero to two submissions, and duties of both scopes.
 pub fn spec(tc: &TestCase, pick: Pick) -> ConvoySpec {
     let kinds = PromiseKinds { kinds: map(tc, pick.nth(3), 1, |_, _| (name(tc), PromiseKind::default())) };
-    // Promise ids are unique within a convoy.
+    // Promise ids and labels are unique within a convoy.
     let mut promises = Records::new();
-    let mut ids = BTreeSet::new();
+    let (mut ids, mut labels) = (BTreeSet::new(), BTreeSet::new());
     for n in 0..pick.count(tc, 2) {
         let row = promise(tc, pick.nth(n), n);
-        if ids.insert(row.id) {
+        if !ids.contains(&row.id) && labels.insert(row.label.clone()) {
+            ids.insert(row.id);
             promises.append(version(tc), row).expect("room");
         }
     }
@@ -136,6 +138,7 @@ pub fn sample() -> Resource<Convoy> {
     let mut promises = Records::new();
     let promise = Promise {
         id: PromiseId(0),
+        label: "template/pr".into(),
         kind: "change".into(),
         target: "forge:github/repo:o%2Fr/cr:1".parse().expect("address"),
         source: PromiseSource::Template,
@@ -178,8 +181,12 @@ pub fn candidates(tc: &TestCase, pick: Pick, convoy: &Resource<Convoy>) -> Vec<C
     let seats: Vec<SeatName> = spec.seats.iter().map(|row| row.record.name()).collect();
     if let Some(owner) = seats.first() {
         let unused = (0..).map(PromiseId).find(|id| spec.promise(*id).is_none()).expect("an unused id");
+        let label = (0..)
+            .map(|n| format!("p{n}"))
+            .find(|label| spec.promises.iter().all(|row| row.record.label != *label))
+            .expect("an unused label");
         candidates.push((
-            Declare { promise: unused, kind: word.clone(), target: place.clone(), owner: owner.clone() }.into(),
+            Declare { promise: unused, label, kind: word.clone(), target: place.clone(), owner: owner.clone() }.into(),
             yes(&authority),
             now,
         ));

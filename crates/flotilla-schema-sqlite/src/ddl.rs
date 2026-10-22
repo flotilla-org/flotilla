@@ -64,9 +64,10 @@ pub fn render_ddl_with(set: &TableSet, mode: DdlMode) -> String {
     let mut indexes: Vec<_> = set.indexes.iter().cloned().chain(set.reference_indexes()).collect();
     indexes.sort_by_key(|index| index.object_name());
     for index in &indexes {
-        let columns: Vec<String> = index.columns().map(quote_ident).collect();
+        let columns: Vec<String> = set.index_key(index).iter().map(|column| quote_ident(column)).collect();
         let name = quote_ident(&index.object_name());
-        let _ = write!(out, "CREATE INDEX {exists}{name} ON {} ({})", quote_ident(&index.table), columns.join(", "));
+        let unique = if index.unique { "UNIQUE " } else { "" };
+        let _ = write!(out, "CREATE {unique}INDEX {exists}{name} ON {} ({})", quote_ident(&index.table), columns.join(", "));
         if let Some(predicate) = index.predicate_sql() {
             let _ = write!(out, " WHERE {predicate}");
         }
@@ -370,8 +371,16 @@ mod tests {
                 Condition::In { column: "phase".into(), codes: codes(&["dr", "op"]) },
                 Condition::NotNull { column: "phase".into() },
             ],
+            unique: false,
         });
-        layout.index(Index { name: "by_name".into(), table: "convoy".into(), eq: vec!["name".into()], order: vec![], predicate: vec![] });
+        layout.index(Index {
+            name: "by_name".into(),
+            table: "convoy".into(),
+            eq: vec!["name".into()],
+            order: vec![],
+            predicate: vec![],
+            unique: false,
+        });
         layout
     }
 
@@ -552,7 +561,7 @@ FROM "convoy_deliverables_evidence";
         // Indexes share the namespace as `<table>_<name>`.
         let mut layout = Layout::root("Edge", KindCode::new("k1"));
         layout.table("items", TableRole::Child, |layout| layout.key(|layout| layout.column("pos", ColumnType::Integer, true)));
-        layout.index(Index { name: "items".into(), table: "edge".into(), eq: vec![], order: vec![], predicate: vec![] });
+        layout.index(Index { name: "items".into(), table: "edge".into(), eq: vec![], order: vec![], predicate: vec![], unique: false });
         assert!(matches!(layout.finish().validate(), Err(DescriptorError::DuplicateName { name, .. }) if name == "edge_items"));
 
         assert!(matches!(
@@ -592,6 +601,7 @@ FROM "convoy_deliverables_evidence";
             eq: eq.iter().map(|c| (*c).to_owned()).collect(),
             order: order.iter().map(|c| (*c).to_owned()).collect(),
             predicate,
+            unique: false,
         };
         let present = || Condition::NotNull { column: "due".into() };
         assert_eq!(problem(index(&["phase"], &["seq"], vec![])), None);
@@ -616,6 +626,46 @@ FROM "convoy_deliverables_evidence";
         assert_eq!(problem(index(&["phase"], &[], in_seq)), Some(IndexProblem::Codes("seq".into())));
         let seq_present = vec![Condition::NotNull { column: "seq".into() }];
         assert_eq!(problem(index(&["phase"], &[], seq_present)), Some(IndexProblem::NotNullable("seq".into())));
+        let unique = |index: Index| Index { unique: true, ..index };
+        assert_eq!(problem(unique(events(&["at"], &[]))), None, "unique within a nested table's owner");
+        assert_eq!(problem(unique(index(&["seq"], &[], vec![]))), Some(IndexProblem::Unique), "a root row has no owner");
+        assert_eq!(problem(unique(events(&[], &["at"]))), Some(IndexProblem::Unique), "eq columns only");
+    }
+
+    // Behaviour (#3587 layer 6 labels ruling): a unique index on a nested table leads with its
+    // owner's key, the resource's row id and the parent rows' keys, so it is unique per owner.
+    #[test]
+    fn a_unique_index_is_unique_within_its_owner() {
+        let mut layout = Layout::root("Note", KindCode::new("k1"));
+        layout.table("links", TableRole::Child, |layout| {
+            layout.key(|layout| layout.column("target", ColumnType::Integer, true));
+            layout.table("marks", TableRole::Child, |layout| {
+                layout.key(|layout| layout.column("n", ColumnType::Integer, true));
+                layout.column("tag", ColumnType::Text, true);
+            });
+            layout.column("name", ColumnType::Text, true);
+        });
+        for (table, column) in [("note_links", "name"), ("note_links_marks", "tag")] {
+            layout.index(Index {
+                name: "unique".into(),
+                table: table.into(),
+                eq: vec![column.into()],
+                order: vec![],
+                predicate: vec![],
+                unique: true,
+            });
+        }
+        let set = layout.finish();
+        set.validate().expect("valid descriptor");
+        let ddl = render_ddl(&set);
+        let indexes: Vec<&str> = ddl.lines().filter(|line| line.starts_with("CREATE UNIQUE INDEX")).collect();
+        assert_eq!(
+            indexes,
+            [
+                r#"CREATE UNIQUE INDEX "note_links_marks_unique" ON "note_links_marks" ("note", "links_target", "tag");"#,
+                r#"CREATE UNIQUE INDEX "note_links_unique" ON "note_links" ("note", "name");"#,
+            ]
+        );
     }
 
     // Behaviour (#3392 lane 3 ruling 1): each reference column of a child table, key or data, gets
@@ -630,7 +680,14 @@ FROM "convoy_deliverables_evidence";
             layout.column("via", ColumnType::Ref, false);
             layout.column("by", ColumnType::Ref, true);
         });
-        layout.index(Index { name: "by_by".into(), table: "note_links".into(), eq: vec!["by".into()], order: vec![], predicate: vec![] });
+        layout.index(Index {
+            name: "by_by".into(),
+            table: "note_links".into(),
+            eq: vec!["by".into()],
+            order: vec![],
+            predicate: vec![],
+            unique: false,
+        });
         let set = layout.finish();
         set.validate().expect("valid descriptor");
         let ddl = render_ddl(&set);

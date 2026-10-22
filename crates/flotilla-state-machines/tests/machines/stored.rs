@@ -62,6 +62,7 @@ fn project() -> Address {
 
 fn promise() -> AdmittedPromise {
     AdmittedPromise {
+        label: "template/pr".into(),
         kind: "k".into(),
         target: Address::project("t").expect("target"),
         source: PromiseSource::Template,
@@ -352,6 +353,7 @@ fn convoy_and_awaiting_reply_round_trip() {
             1,
             Promise {
                 id: PromiseId(0),
+                label: "template/pr".into(),
                 kind: "pr".into(),
                 target: project(),
                 source: PromiseSource::Dispatch,
