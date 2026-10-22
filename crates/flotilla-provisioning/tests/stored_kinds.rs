@@ -292,3 +292,96 @@ fn a_recipe_hashes_stably_and_round_trips_its_numbers() {
     assert_eq!(read, docker);
     assert_eq!(read.memory_policy.swap_bytes, u64::MAX >> 1);
 }
+
+/// How many consecutive retryable failures kind `K` takes before its request may give up, within
+/// 64: the give-up is refused after each failure until it is allowed.
+fn failures_before_give_up<K: LifecycleKind>(spec: K::Request) -> Option<u32> {
+    use flotilla_state_machines::{
+        machines::lifecycle::{Attempted, GiveUp, MemoryLifecycleWorld},
+        Home, Outcome,
+    };
+    let world = MemoryLifecycleWorld::default();
+    let mut home = Home::<Lifecycle<K>>::new("home").expect("declaration");
+    home.create("r", spec, &world, Timestamp::from_micros(0)).expect("created");
+    let cause = Cause::new(CauseCategory::Transient, "unreachable");
+    for failures in 1..=64 {
+        let at = Timestamp::from_micros(i64::from(failures) * 3_600_000_000);
+        home.apply("r", Attempted { outcome: Outcome::Failed { cause: cause.clone(), retryable: true } }, &world, at).expect("attempt");
+        if home.apply("r", GiveUp { cause: cause.clone() }, &world, at).is_ok() {
+            return Some(failures);
+        }
+    }
+    None
+}
+
+fn environment_request() -> EnvironmentRequest {
+    EnvironmentRequest {
+        provider: "host:feta/provider:host-direct".parse::<Address>().expect("provider"),
+        image_build: None,
+        recipe: Frozen::new(
+            Recipe::of(&flotilla_provisioning::stored::environment::HostDirectRecipe { repo_default_dir: "/work".into() }).expect("recipe"),
+        )
+        .expect("freeze"),
+        holder: None,
+    }
+}
+
+fn image_build_request() -> ImageBuildRequest {
+    ImageBuildRequest {
+        composition: "sha256:feed".into(),
+        architecture: Architecture::Amd64,
+        layers: Frozen::new(vec![layer()]).expect("freeze"),
+        delivery: Delivery::Local,
+        reservation: Reservation { cpu: 1, disk_bytes: 1 },
+    }
+}
+
+// Behaviour (#3629 layer 2): each kind's policy keeps its old retry budget. An ImageBuild gives up
+// after five failed attempts (`IMAGE_BUILD_MAX_ATTEMPTS`) and at once on a recipe failure; a Clone
+// retries transient failures for as long as it is wanted and gives up at once on one that is not
+// retryable; Environment and Checkout take the engine's default three; and the backoff between
+// ImageBuild attempts doubles from 30 s to 30 min.
+#[test]
+fn policies_give_up_as_the_old_retries_did() {
+    use flotilla_state_machines::{
+        machines::lifecycle::{Attempted, GiveUp, MemoryLifecycleWorld},
+        Home, Outcome,
+    };
+    assert_eq!(failures_before_give_up::<ImageBuildKind>(image_build_request()), Some(flotilla_resources::IMAGE_BUILD_MAX_ATTEMPTS));
+    let clone = || CloneRequest { repository: "r".into(), url: "u".into(), environment: environment("feta"), path: "/c".into() };
+    assert_eq!(failures_before_give_up::<CloneKind>(clone()), None);
+    assert_eq!(failures_before_give_up::<EnvironmentKind>(environment_request()), Some(3));
+    let checkout = CheckoutRequest {
+        repository: "r".into(),
+        environment: environment("feta"),
+        branch: "b".into(),
+        base: None,
+        path: "/w".into(),
+        source: Source::FreshClone { url: "u".into() },
+        clone: None,
+        holder: Some(Holder::convoy("c")),
+    };
+    assert_eq!(failures_before_give_up::<CheckoutKind>(checkout), Some(3));
+
+    let world = MemoryLifecycleWorld::default();
+    let mut home = Home::<Lifecycle<ImageBuildKind>>::new("home").expect("declaration");
+    home.create("b", image_build_request(), &world, Timestamp::from_micros(0)).expect("created");
+    let recipe = Cause::new(CauseCategory::Refused, "probe failed");
+    home.apply("b", Attempted { outcome: Outcome::Failed { cause: recipe.clone(), retryable: false } }, &world, Timestamp::from_micros(1))
+        .expect("attempt");
+    home.apply("b", GiveUp { cause: recipe }, &world, Timestamp::from_micros(1)).expect("a recipe failure gives up at once");
+
+    let mut clones = Home::<Lifecycle<CloneKind>>::new("home").expect("declaration");
+    clones.create("c", clone(), &world, Timestamp::from_micros(0)).expect("created");
+    let wrong = Cause::new(CauseCategory::Misconfigured, "repository not found");
+    clones
+        .apply("c", Attempted { outcome: Outcome::Failed { cause: wrong.clone(), retryable: false } }, &world, Timestamp::from_micros(1))
+        .expect("attempt");
+    clones.apply("c", GiveUp { cause: wrong }, &world, Timestamp::from_micros(1)).expect("a clone that cannot succeed gives up at once");
+    let policy = CloneKind::policy();
+    assert_eq!((policy.backoff(1), policy.backoff(2), policy.backoff(9)), (30_000_000, 60_000_000, 120_000_000));
+
+    let policy = ImageBuildKind::policy();
+    let seconds = |failures| policy.backoff(failures) / 1_000_000;
+    assert_eq!((seconds(1), seconds(2), seconds(3), seconds(7), seconds(20)), (30, 60, 120, 1800, 1800));
+}

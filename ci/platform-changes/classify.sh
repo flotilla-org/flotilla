@@ -47,7 +47,9 @@ macos_content='^[+-].*(target_os *= *"macos"|target_vendor *= *"apple")'
 # The Quint quick tier (#3280) checks the typed machine specs, their full-graph
 # conformance and trace replay against the state-machine engine (#3319). It
 # reads only those trees, plus the compiler pin, the workflow and this classifier.
-quint_paths='^(specs/primitives/|crates/flotilla-state-machines/|crates/flotilla-inbox(-testkit)?/|crates/flotilla-quint-testkit/|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/platform-changes/)'
+# The provisioning lifecycle kinds run the lifecycle graph through their stored
+# kinds (#3629), so their declarations and that harness are Quint inputs too.
+quint_paths='^(specs/primitives/|crates/flotilla-state-machines/|crates/flotilla-provisioning/(src/stored/|tests/lifecycle_conformance\.rs)|crates/flotilla-inbox(-testkit)?/|crates/flotilla-quint-testkit/|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/platform-changes/)'
 
 # An empty content pattern decides on paths alone.
 decide() {

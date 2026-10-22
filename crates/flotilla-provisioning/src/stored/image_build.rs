@@ -1,8 +1,13 @@
 //! ImageBuild: one build of one composed image identity for one architecture (ADR 0062).
 
-use flotilla_resources::ImageLayerSpec;
+use flotilla_resources::{ImageLayerSpec, IMAGE_BUILD_MAX_ATTEMPTS};
 use flotilla_schema::{Frozen, Stored};
-use flotilla_state_machines::machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState};
+use flotilla_state_machines::{
+    machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
+    AttemptPolicy,
+};
+
+use super::SECOND;
 
 /// Image builds as a lifecycle kind.
 pub struct ImageBuildKind;
@@ -10,6 +15,12 @@ pub struct ImageBuildKind;
 impl LifecycleKind for ImageBuildKind {
     const NAME: &'static str = "ImageBuild";
     type Request = ImageBuildRequest;
+    /// The old build's: at most five attempts in all (a build never succeeds
+    /// and retries, so its failures are all consecutive), 30 s doubling to 30
+    /// minutes between them. A recipe failure is not retryable and gives up at once.
+    fn policy() -> AttemptPolicy {
+        AttemptPolicy { max_failures: IMAGE_BUILD_MAX_ATTEMPTS, base: 30 * SECOND, factor: 2, cap: 30 * 60 * SECOND }
+    }
 }
 
 /// The ImageBuild machine: the shared lifecycle over its request.

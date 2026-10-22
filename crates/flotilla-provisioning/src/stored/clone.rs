@@ -3,10 +3,10 @@
 use flotilla_schema::{Ref, Stored};
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
-    Resource,
+    AttemptPolicy, Resource,
 };
 
-use super::environment::Environment;
+use super::{environment::Environment, SECOND};
 
 /// Clones as a lifecycle kind.
 pub struct CloneKind;
@@ -14,6 +14,14 @@ pub struct CloneKind;
 impl LifecycleKind for CloneKind {
     const NAME: &'static str = "Clone";
     type Request = CloneRequest;
+    /// The old clone's: transient failures are retried for as long as the
+    /// clone is wanted, 30 s doubling to two minutes apart, and a failure that
+    /// is not retryable gives up at once. A clone's name is derived from its
+    /// repository and environment, so a given-up clone could not be requested
+    /// again under it: a long outage must not give one up.
+    fn policy() -> AttemptPolicy {
+        AttemptPolicy { max_failures: u32::MAX, base: 30 * SECOND, factor: 2, cap: 120 * SECOND }
+    }
 }
 
 /// The Clone machine: the shared lifecycle over its request.

@@ -495,9 +495,8 @@ impl TableSource {
         })
         .await?
         .ok_or_else(|| bad("not_found", "unknown table"))?;
-        let declared = flotilla_engine_store::machine_registry()
+        let declared = crate::runtime::decided_diagrams()
             .map_err(|error| Failure::from(error.to_string()))?
-            .diagrams
             .remove(&kind.0)
             .ok_or_else(|| bad("no_machine", "kind has no declared machine"))?;
         if !observed {
