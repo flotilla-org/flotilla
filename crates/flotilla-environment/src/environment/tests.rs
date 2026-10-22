@@ -1656,11 +1656,11 @@ async fn preparation_pulls_only_pinned_registry_content() {
     let calls = runner.calls();
     assert_eq!(calls.len(), 4);
     assert_eq!(calls[1].1, ["--config", "/private/operation-auth", "pull", spec.docker.as_ref().expect("docker").image.as_str()]);
-    let absent = DockerEnvironmentProvider::new(Arc::new(QueuedRunner::new([Err("not held".into()), Err("not published".into())])));
+    let absent = super::contract_tests::docker_provider(Arc::new(QueuedRunner::new([Err("not held".into()), Err("not published".into())])));
     opts.prepared_auth = test_registry_auth("/private/operation-auth");
     let error = absent.prepare(&spec, &opts).await.err().expect("pull failed");
     assert!(error.starts_with("pinned image pull failed:"));
-    let absent_after_pull = DockerEnvironmentProvider::new(Arc::new(QueuedRunner::new([
+    let absent_after_pull = super::contract_tests::docker_provider(Arc::new(QueuedRunner::new([
         Err("not held".into()),
         Ok("pulled".into()),
         Err("still absent".into()),

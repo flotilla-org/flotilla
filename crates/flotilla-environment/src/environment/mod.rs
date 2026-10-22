@@ -1,7 +1,7 @@
 #[cfg(unix)]
-pub mod drydock;
-#[cfg(unix)]
 pub mod agent;
+#[cfg(unix)]
+pub mod drydock;
 mod seam;
 pub use seam::*;
 pub mod docker;
