@@ -609,6 +609,8 @@ pub struct LiveConvoyRecord {
     pub owner_host: HostName,
 }
 
+const CONVOY_ATTACH_WAIT: Duration = Duration::from_secs(60);
+
 fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<String> {
     let role = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
     let identity = convoy.spec.project_ref.as_ref().map_or_else(|| role.clone(), |project| format!("{role}@{project}"));
@@ -3375,7 +3377,7 @@ impl InProcessDaemon {
             .watch(WatchStart::resuming_from(&listed))
             .await
             .map_err(|error| format!("watch convoy {address} while waiting to attach: {error}"))?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + CONVOY_ATTACH_WAIT;
         let mut retry = tokio::time::interval(Duration::from_millis(100));
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -3431,6 +3433,8 @@ impl InProcessDaemon {
             .await
             .map_err(|error| format!("read convoy vessels while waiting to attach: {error}"))?;
         let mut stages = Vec::new();
+        // Labels select the candidates; the spec confirms ownership before a
+        // vessel's status can describe (or fail) this convoy's start.
         for vessel in vessels.items.iter().filter(|vessel| vessel.spec.convoy_ref == convoy.metadata.name) {
             let stage = match vessel.status.as_ref() {
                 Some(status) => {
@@ -3445,19 +3449,29 @@ impl InProcessDaemon {
                         flotilla_resources::VesselPhase::Ready => "waiting for its terminal session".into(),
                         flotilla_resources::VesselPhase::Pending => "waiting for placement and its environment".into(),
                         flotilla_resources::VesselPhase::Provisioning => "provisioning its environment and checkouts".into(),
-                        phase => format!("{phase:?}; waiting for recovery"),
+                        flotilla_resources::VesselPhase::Interrupted => "interrupted; waiting for recovery".into(),
+                        flotilla_resources::VesselPhase::Lost => "lost; waiting for recovery".into(),
+                        flotilla_resources::VesselPhase::Failed => unreachable!("failed vessels return above"),
                     })
                 }
                 None => "waiting for its environment".into(),
             };
             stages.push(format!("vessel {}: {stage}", vessel.spec.vessel_name));
         }
-        let phase = convoy.status.as_ref().map(|status| status.phase).unwrap_or_default();
+        let phase = match convoy.status.as_ref().map(|status| status.phase).unwrap_or_default() {
+            flotilla_resources::ConvoyPhase::Pending => "pending",
+            flotilla_resources::ConvoyPhase::Active => "active",
+            flotilla_resources::ConvoyPhase::Interrupted => "interrupted",
+            flotilla_resources::ConvoyPhase::Landing => "landing",
+            flotilla_resources::ConvoyPhase::Landed => "landed",
+            flotilla_resources::ConvoyPhase::Failed => "failed",
+            flotilla_resources::ConvoyPhase::Abandoned => "abandoned",
+        };
         let detail = convoy.status.as_ref().and_then(|status| status.message.as_deref());
         if stages.is_empty() {
             stages.push("waiting for its vessel and environment".into());
         }
-        Ok(format!("{phase:?}{}; {}", detail.map(|detail| format!(": {detail}")).unwrap_or_default(), stages.join("; ")))
+        Ok(format!("{phase}{}; {}", detail.map(|detail| format!(": {detail}")).unwrap_or_default(), stages.join("; ")))
     }
 
     fn project_service(&self) -> ProjectService<'_> {

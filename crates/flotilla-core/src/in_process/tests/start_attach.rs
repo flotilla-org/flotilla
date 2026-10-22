@@ -8,7 +8,7 @@ use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 
 use super::support::create_identity_convoy;
-use crate::in_process::InProcessDaemon;
+use crate::in_process::{InProcessDaemon, CONVOY_ATTACH_WAIT};
 use crate::testkits::discovery::fake_discovery;
 
 async fn fixture() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir) {
@@ -36,7 +36,7 @@ async fn slow_start_attach_does_not_fail() {
     let start = tokio::time::Instant::now();
     let result = daemon.wait_for_convoy_attach("flotilla", "convoy-slow", "coder@flotilla").await;
     assert!(result.is_ok(), "healthy slow provisioning failed: {result:?}");
-    assert!(start.elapsed() >= Duration::from_secs(60));
+    assert!(start.elapsed() >= CONVOY_ATTACH_WAIT);
 
     let (_, notice) = result.unwrap();
     assert!(notice.as_deref().unwrap().contains("still starting"));
@@ -75,7 +75,8 @@ fn start_attach_lifecycle(tc: hegel::TestCase) {
     use flotilla_resources::{Host, HostSpec};
     use hegel::generators as gs;
 
-    let delay = tc.draw(gs::integers::<u64>().min_value(59).max_value(61));
+    let boundary = CONVOY_ATTACH_WAIT.as_secs();
+    let delay = tc.draw(gs::integers::<u64>().min_value(boundary - 1).max_value(boundary + 1));
     let outcome = tc.draw(gs::integers::<u8>().min_value(0).max_value(2));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
     runtime.block_on(async {
@@ -106,23 +107,23 @@ fn start_attach_lifecycle(tc: hegel::TestCase) {
             }
         };
         let (result, ()) = tokio::join!(daemon.wait_for_convoy_attach("flotilla", "convoy-slow", "coder@flotilla"), actor);
-        if delay > 60 {
+        if delay > boundary {
             // The wait successfully yields before the later terminal/failure event.
             assert!(result.as_ref().unwrap().1.as_deref().unwrap().contains("still starting"));
         } else if outcome == 0 {
             // At the exact deadline either an attach plan or the successful notice is valid.
             assert!(result.is_ok(), "{result:?}");
-            if delay < 60 {
+            if delay < boundary {
                 assert!(result.unwrap().0.is_some());
             }
         } else {
             // A failure/deletion published before the deadline must remain an error.
             // At exactly 60 seconds the timeout may legitimately be observed first.
-            if delay < 60 {
+            if delay < boundary {
                 assert!(result.is_err(), "{result:?}");
             }
         }
-        // After the event, the same public resolution/wait seams must reflect reality.
+        // After the event, the same daemon resolution/wait seams must reflect reality.
         match outcome {
             0 => assert!(daemon.resolve_attach_command_internal("convoy-slow").await.is_ok()),
             1 => assert!(daemon
@@ -170,6 +171,8 @@ async fn start_attach_stage_uses_vessel_status() {
         (VesselPhase::Provisioning, None, "environment and checkouts"),
         (VesselPhase::Provisioning, Some("waiting for checkout work".to_string()), "waiting for checkout work"),
         (VesselPhase::Ready, None, "terminal session"),
+        (VesselPhase::Interrupted, None, "interrupted; waiting for recovery"),
+        (VesselPhase::Lost, None, "lost; waiting for recovery"),
         (VesselPhase::Failed, Some("placement refused".to_string()), "placement refused"),
     ] {
         vessel = vessels
@@ -181,7 +184,7 @@ async fn start_attach_stage_uses_vessel_status() {
             assert!(stage.unwrap_err().contains(expected));
         } else {
             let stage = stage.unwrap();
-            assert!(stage.contains("Pending") && stage.contains("vessel work") && stage.contains(expected), "{stage}");
+            assert!(stage.contains("pending") && stage.contains("vessel work") && stage.contains(expected), "{stage}");
         }
     }
 }
