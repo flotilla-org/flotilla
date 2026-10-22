@@ -302,12 +302,13 @@ fn pinned_spec() -> flotilla_resources::EnvironmentSpec {
 // The subprocess double represents the Docker CLI. A held digest prepares
 // without pulling/rebuilding the base; absent local-only digests wait on ImageBuild.
 #[tokio::test]
+#[cfg(unix)]
 async fn preparation_adds_only_drydock_tools_to_existing_digest() {
     for present in [true, false] {
         let runner = Arc::new(RecordingRunner::new_ok("present"));
         let missing = Arc::new(RecordingRunner::new_err("absent"));
         let selected = if present { runner } else { missing };
-        let provider = DockerEnvironmentProvider::new(selected.clone());
+        let provider = super::contract_tests::docker_provider(selected.clone());
         assert_eq!(provider.prepare(&pinned_spec(), &Default::default()).await.is_ok(), present);
         assert_eq!(selected.calls().len(), if present { 2 } else { 1 });
         assert_eq!(selected.calls()[0].1[0..2], ["image", "inspect"]);
@@ -1617,6 +1618,7 @@ async fn list_backings_rejects_incomplete_identity() {
 // Docker provisioning consumes only its own preparation, uses the prepared
 // image without an implicit pull, and exposes the environment runner and mounts.
 #[tokio::test]
+#[cfg(unix)]
 async fn docker_provisions_prepared_digest_and_refuses_another_instance() {
     let runner = Arc::new(QueuedRunner::new([
         Ok("held".into()),
@@ -1643,12 +1645,13 @@ async fn docker_provisions_prepared_digest_and_refuses_another_instance() {
 // preparation reports pull/verification failures without classifying them as build demand.
 // The queued runner stands in for Docker's subprocess interface.
 #[tokio::test]
+#[cfg(unix)]
 async fn preparation_pulls_only_pinned_registry_content() {
     let mut spec = pinned_spec();
     spec.docker.as_mut().expect("docker").image = format!("registry.example/crew@sha256:{}", "a".repeat(64));
     let mut opts = super::PrepareOpts { legacy_baseline: false, prepared_auth: test_registry_auth("/private/operation-auth") };
     let runner = Arc::new(QueuedRunner::new([Err("not held".into()), Ok("pulled".into()), Ok("held".into())]));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = super::contract_tests::docker_provider(runner.clone());
     provider.prepare(&spec, &opts).await.expect("pull existing digest");
     let calls = runner.calls();
     assert_eq!(calls.len(), 4);
@@ -1686,6 +1689,7 @@ async fn preparation_refuses_mutable_or_malformed_image_identity() {
 // Live pre-#2731 fleet records carry a baseline tag and no ImageBuild ref.
 // A controller-admitted baseline remains launchable, but runs the resolved digest.
 #[tokio::test]
+#[cfg(unix)]
 async fn live_baseline_tag_without_image_build_provisions_a_digest() {
     let tag = "forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-10-02.d9e59d8c.dbd6e440";
     let digest = format!("sha256:{}", "b".repeat(64));
@@ -1771,4 +1775,15 @@ async fn create_rejects_nested_tool_mounts_but_accepts_adjacent_paths() {
         let result = provider.create(EnvironmentId::new("nested"), &flotilla_protocol::ImageId::new("image"), opts).await;
         assert_eq!(result.is_err(), rejected, "target {target}");
     }
+}
+
+// Unsupported platforms still exercise the provider's explicit refusal rather
+// than compiling a Unix transport fixture into the Windows test binary.
+#[cfg(not(unix))]
+#[tokio::test]
+async fn docker_agent_provisioning_reports_unsupported_host() {
+    let provider = DockerEnvironmentProvider::new(Arc::new(RecordingRunner::new_ok("")));
+    let prepared = super::PreparedEnvironment::new(&Arc::new(()), ());
+    let error = provider.provision(EnvironmentId::new("unsupported"), &prepared, Default::default()).await.err().unwrap();
+    assert!(error.contains("require a Unix host"));
 }

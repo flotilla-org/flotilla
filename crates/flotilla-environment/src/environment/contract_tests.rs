@@ -82,6 +82,7 @@ impl CommandRunner for DockerEngine {
         false
     }
 }
+#[cfg(unix)]
 pub(super) fn docker_provider(runner: Arc<dyn CommandRunner>) -> docker::DockerEnvironmentProvider {
     use super::agent::{tests::MemoryAgent, AgentConnector};
     let directory = Arc::new(tempfile::tempdir().unwrap());
@@ -106,6 +107,7 @@ fn providers() -> Vec<(Arc<dyn EnvironmentProvider>, flotilla_resources::Environ
     let image_spec =
         legacy_environment_spec(&EnvironmentSpec { image: ImageSource::Registry(DIGEST.into()), token_env_vars: vec![] }).unwrap();
     vec![
+        #[cfg(unix)]
         (Arc::new(docker_provider(Arc::new(DockerEngine::default()))), image_spec.clone()),
         (Arc::new(dummy::DummyEnvironmentProvider::new(Default::default())), image_spec),
         (
@@ -174,7 +176,7 @@ fn provider_lifecycle_contract(tc: hegel::TestCase) {
 }
 
 // Prepared values cannot cross instances, including same-implementation instances.
-// The three cases exhaust the installed adapters; the public capability data
+// The available cases exhaust the installed adapters; the public capability data
 // agrees with optional accessors and the dummy has its own descriptive class.
 #[tokio::test]
 async fn provider_instances_and_declarations() {
@@ -184,12 +186,13 @@ async fn provider_instances_and_declarations() {
         let declaration = provider.capabilities();
         assert!(!declaration.workspace_root.as_os_str().is_empty());
     }
-    assert_eq!(providers()[1].0.kind(), ProviderKind::new(EnvironmentClass::Dummy, "dummy"));
+    assert!(providers().iter().any(|(provider, _)| provider.kind() == ProviderKind::new(EnvironmentClass::Dummy, "dummy")));
 }
 
 // A provider error means Unknown, never Gone. The same handle recovers
 // when the injected process boundary becomes available again.
 #[tokio::test]
+#[cfg(unix)]
 async fn observation_recovers_after_provider_error() {
     let engine = Arc::new(DockerEngine::default());
     let provider: Arc<dyn EnvironmentProvider> = Arc::new(docker_provider(engine.clone()));
@@ -216,7 +219,9 @@ async fn observation_recovers_after_provider_error() {
 #[hegel::test]
 fn advertisement_fields_default_when_omitted(tc: hegel::TestCase) {
     use hegel::generators as gs;
-    let (provider, _) = providers().remove(tc.draw(gs::integers::<usize>().min_value(0).max_value(2)));
+    let mut available = providers();
+    let index = tc.draw(gs::integers::<usize>().min_value(0).max_value(available.len() - 1));
+    let (provider, _) = available.remove(index);
     let advertisement = ProviderAdvertisement {
         instance: "configured".into(),
         kind: Some(provider.kind()),
@@ -244,7 +249,7 @@ fn advertisement_fields_default_when_omitted(tc: hegel::TestCase) {
 // handles report requested destruction, and inventories no longer list them.
 #[tokio::test]
 async fn host_and_dummy_retirement_is_observable_and_excluded_from_inventory() {
-    for (provider, spec) in providers().into_iter().skip(1) {
+    for (provider, spec) in providers().into_iter().filter(|(provider, _)| provider.kind().implementation != "docker") {
         let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
         let id = EnvironmentId::new("env-0");
         let handle = provider.provision(id.clone(), &prepared, Default::default()).await.unwrap();
