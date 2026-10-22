@@ -65,6 +65,9 @@ impl Holder {
     }
 }
 
+/// One second, in the engine's microseconds: the unit of an `AttemptPolicy`'s delays.
+const SECOND: i64 = 1_000_000;
+
 /// Registers the four provisioning kinds into `registry`, each under the code
 /// it holds for good: Environment `ev`, ImageBuild `ib`, Clone `cl`, Checkout `ck`.
 pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {

@@ -388,17 +388,15 @@ fn provisioning_load() {
     assert_eq!(keyed.rows, 1.0);
     assert_eq!(keyed.fullscan_steps, 0.0);
     report("one environment by key", &keyed);
-    eprintln!("{:>40}: {} MiB", "peak resident memory", peak_resident_kib() / 1024);
+    match peak_resident_kib() {
+        Some(kib) => eprintln!("{:>40}: {} MiB", "peak resident memory", kib / 1024),
+        None => eprintln!("{:>40}: n/a", "peak resident memory"),
+    }
 }
 
-/// The process's peak resident set (`VmHWM`), in KiB; 0 where `/proc` has none.
-fn peak_resident_kib() -> u64 {
-    fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix("VmHWM:").and_then(|kib| kib.trim().trim_end_matches("kB").trim().parse().ok()))
-        })
-        .unwrap_or(0)
+/// The process's peak resident set (`VmHWM`), in KiB, where `/proc` reports it.
+fn peak_resident_kib() -> Option<u64> {
+    fs::read_to_string("/proc/self/status").ok().and_then(|status| {
+        status.lines().find_map(|line| line.strip_prefix("VmHWM:").and_then(|kib| kib.trim().trim_end_matches("kB").trim().parse().ok()))
+    })
 }

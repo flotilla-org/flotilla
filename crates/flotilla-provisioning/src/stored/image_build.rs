@@ -1,12 +1,13 @@
 //! ImageBuild: one build of one composed image identity for one architecture (ADR 0062).
 
-use flotilla_resources::ImageLayerSpec;
-use flotilla_resources::IMAGE_BUILD_MAX_ATTEMPTS;
+use flotilla_resources::{ImageLayerSpec, IMAGE_BUILD_MAX_ATTEMPTS};
 use flotilla_schema::{Frozen, Stored};
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
     AttemptPolicy,
 };
+
+use super::SECOND;
 
 /// Image builds as a lifecycle kind.
 pub struct ImageBuildKind;
@@ -21,8 +22,6 @@ impl LifecycleKind for ImageBuildKind {
         AttemptPolicy { max_failures: IMAGE_BUILD_MAX_ATTEMPTS, base: 30 * SECOND, factor: 2, cap: 30 * 60 * SECOND }
     }
 }
-
-const SECOND: i64 = 1_000_000;
 
 /// The ImageBuild machine: the shared lifecycle over its request.
 pub type ImageBuild = Lifecycle<ImageBuildKind>;
