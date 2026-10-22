@@ -3,6 +3,8 @@
 //! Snapshots hold a consistent read transaction; consumers install them in one transaction.
 //! A failed/disconnected sink rolls back its uncommitted snapshot. No replica runs machines.
 
+//! See the [implementation choice](https://github.com/flotilla-org/flotilla/blob/main/docs/implementation-choices/change-stream.md).
+
 use flotilla_schema::{Event, Identity, Timestamp, LOG_LIMITS};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,8 +38,13 @@ pub enum Frame {
         home: String,
         home_seq: u64,
     },
-    /// Exactly one logical row and its referenced objects; root before children.
+    /// One complete resource, including child rows and referenced objects.
     Resource(Snapshot),
+    /// Only resources exceeding a frame use row chunks, assembled before restore().
+    ResourceChunk {
+        value: Snapshot,
+        last: bool,
+    },
     Tombstone {
         identity: Identity,
         home_seq: u64,
@@ -90,7 +97,9 @@ pub fn serve(
                         break;
                     }
                     for id in &ids {
-                        if !read.visit_snapshot(*id, |snapshot| emit(Frame::Resource(snapshot), &mut send))? {
+                        if let Some(snapshot) = read.load_snapshot(*id)? {
+                            send_resource(snapshot, &mut send)?;
+                        } else {
                             let (identity, home_seq) =
                                 read.identity(*id)?.ok_or_else(|| StoreError::Stream("missing snapshot identity".into()))?;
                             emit(Frame::Tombstone { identity, home_seq }, &mut send)?;
@@ -117,6 +126,42 @@ pub fn serve(
     Ok(cursor)
 }
 
+/// Ordinary resources take one frame. Append-only resources can outgrow the wire bound;
+/// split their already-loaded logical rows without a second SQL snapshot traversal.
+fn send_resource(snapshot: Snapshot, send: &mut dyn FnMut(&[u8]) -> Result<(), StoreError>) -> Result<(), StoreError> {
+    let frame = Frame::Resource(snapshot);
+    if let Ok(bytes) = frame.encode() {
+        return send(&bytes);
+    }
+    let Frame::Resource(snapshot) = frame else { unreachable!() };
+    let tables = snapshot.rows.tables.len();
+    let total: usize = snapshot.rows.tables.iter().map(Vec::len).sum();
+    let mut sent = 0;
+    for (table, rows) in snapshot.rows.tables.into_iter().enumerate() {
+        for row in rows {
+            let mut chunk = flotilla_schema::Rows::with_tables(tables);
+            for value in row.key.iter().chain(&row.values) {
+                if let flotilla_schema::Value::Object(hash) = value {
+                    if let Some(bytes) = snapshot.rows.objects.get(hash) {
+                        chunk.objects.insert(*hash, bytes.clone());
+                    }
+                }
+            }
+            chunk.tables[table].push(row);
+            sent += 1;
+            let value = Snapshot {
+                kind: snapshot.kind,
+                name: snapshot.name.clone(),
+                home: snapshot.home.clone(),
+                version: snapshot.version,
+                rows: chunk,
+            };
+            send(&Frame::ResourceChunk { value, last: sent == total }.encode()?)?;
+        }
+    }
+    Ok(())
+}
+
 /// Receiver for one home. Dropping it rolls back an incomplete snapshot. Each delivery round
 /// commits state and sequence together; only an applied keepalive moves the time watermark.
 pub struct Follower<'a> {
@@ -134,6 +179,7 @@ impl<'a> Follower<'a> {
     ) -> Result<(), StoreError> {
         let mut write = self.store.write()?;
         let mut snapshot = None;
+        let mut chunks: Option<Snapshot> = None;
         let mut cursor = write.stream_watermark(home)?;
         deliver(&mut |bytes| {
             match Frame::decode(bytes)? {
@@ -142,13 +188,36 @@ impl<'a> Follower<'a> {
                     snapshot = Some(home_seq);
                     cursor.home_seq = 0;
                 }
-                Frame::Resource(value) if value.home == home && snapshot.is_some_and(|cut| value.version <= cut) => {
-                    write.restore_chunk(&value)?;
+                Frame::Resource(value) if chunks.is_none() && value.home == home && snapshot.is_some_and(|cut| value.version <= cut) => {
+                    write.restore(&value)?;
                 }
-                Frame::Tombstone { identity, home_seq } if identity.home == home && snapshot.is_some_and(|cut| home_seq <= cut) => {
+                Frame::ResourceChunk { value, last } if value.home == home && snapshot.is_some_and(|cut| value.version <= cut) => {
+                    match &mut chunks {
+                        None => chunks = Some(value),
+                        Some(pending) => {
+                            if pending.kind != value.kind
+                                || pending.name != value.name
+                                || pending.version != value.version
+                                || pending.rows.tables.len() != value.rows.tables.len()
+                            {
+                                return Err(StoreError::Stream("snapshot chunks changed resource".into()));
+                            }
+                            for (rows, next) in pending.rows.tables.iter_mut().zip(value.rows.tables) {
+                                rows.extend(next);
+                            }
+                            pending.rows.objects.extend(value.rows.objects);
+                        }
+                    }
+                    if last {
+                        write.restore(&chunks.take().expect("chunk resource"))?;
+                    }
+                }
+                Frame::Tombstone { identity, home_seq }
+                    if chunks.is_none() && identity.home == home && snapshot.is_some_and(|cut| home_seq <= cut) =>
+                {
                     write.restore_identity(&identity, home_seq)?;
                 }
-                Frame::End { home: from, home_seq } if from == home && snapshot == Some(home_seq) => {
+                Frame::End { home: from, home_seq } if chunks.is_none() && from == home && snapshot == Some(home_seq) => {
                     write.finish_snapshot(home, home_seq)?;
                     cursor.home_seq = home_seq;
                     write.advance_watermark(home, cursor)?;
@@ -188,7 +257,7 @@ pub struct ReadResult {
 }
 
 impl flotilla_cbor::Message for Frame {
-    const TYPES: &'static [&'static str] = &["Read", "Begin", "Resource", "Tombstone", "End", "Change", "Keepalive"];
+    const TYPES: &'static [&'static str] = &["Read", "Begin", "Resource", "ResourceChunk", "Tombstone", "End", "Change", "Keepalive"];
 }
 
 pub const PATH: &str = "/apis/flotilla.work/v1/change-stream";
@@ -218,6 +287,10 @@ impl Service {
     /// Gates read committed progress independently of database writers and network delivery.
     pub fn watermark(&self, home: &str) -> Result<Watermark, StoreError> {
         Ok(watermark(&self.watermarks, home))
+    }
+    /// Whether a complete round has committed, including an empty snapshot at zero.
+    pub fn has_watermark(&self, home: &str) -> bool {
+        self.watermarks.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(home)
     }
     /// This home and every home whose stream this store has applied, sorted.
     pub fn homes(&self) -> Vec<String> {

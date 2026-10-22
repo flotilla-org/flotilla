@@ -6854,3 +6854,91 @@ async fn tcp_http_requests_reset_daemon_idle_timeout() {
         .expect("server task")
         .expect("server shuts down cleanly");
 }
+
+#[derive(flotilla_schema::Stored)]
+#[store(kind = "RoutedStreamSample", code = "rs")]
+struct RoutedStreamSample {
+    value: String,
+    #[store(child)]
+    tags: Vec<String>,
+}
+
+// This fake replaces only the peer wire. Commands still pass through the router and the
+// remote daemon dispatcher; neither home has a forwarded resource socket.
+struct StreamCommandWire(mpsc::Sender<PeerWireMessage>);
+#[async_trait::async_trait]
+impl PeerSender for StreamCommandWire {
+    async fn send(&self, message: PeerWireMessage) -> Result<(), String> {
+        self.0.send(message).await.map_err(|e| e.to_string())
+    }
+    async fn retire(&self, _: flotilla_protocol::GoodbyeReason) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+// A routed-only home supplies a consistent snapshot and resumed tail through the
+// production command dispatcher, spool and Follower, with no HTTP transport.
+#[tokio::test]
+async fn routed_only_change_stream_follows_snapshot_and_tail() {
+    use flotilla_schema::{Kind, KindRegistry, Origin, Timestamp};
+    use flotilla_schema_sqlite::stream::Service;
+    let (_local_dir, local) = empty_daemon().await;
+    let (_home_dir, home) = empty_daemon_named("home").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut kinds = KindRegistry::new();
+    kinds.register::<RoutedStreamSample>().unwrap();
+    let source = Arc::new(Service::open(&dir.path().join("source.db"), "home", kinds.clone()).unwrap());
+    let target = Arc::new(Service::open(&dir.path().join("target.db"), "local", kinds).unwrap());
+    home.install_decided_store(Arc::clone(&source)).unwrap();
+    let seed = |name: &str| {
+        source
+            .with_store(|store| {
+                let mut write = store.write()?;
+                write.insert(
+                    name,
+                    &RoutedStreamSample { value: name.into(), tags: vec!["child".into()] },
+                    &Origin::new("writer", Timestamp(1)),
+                )?;
+                write.commit()
+            })
+            .unwrap()
+    };
+    for index in 0..20 {
+        seed(&format!("item-{index}"));
+    }
+    let pm = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let (tx, mut rx) = mpsc::channel(1);
+    pm.lock().await.register_sender(NodeId::new("home"), Arc::new(StreamCommandWire(tx)));
+    let router = empty_remote_command_router(&local, &pm);
+    let responses = router.clone();
+    let remote = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            let PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { request_id, command, target_node_id, .. }) = message else {
+                panic!("expected routed command");
+            };
+            assert_eq!(target_node_id, NodeId::new("home"));
+            assert!(matches!(command.action, CommandAction::QueryChangeStream { .. }));
+            let result = home.execute_query(*command, uuid::Uuid::new_v4()).await.unwrap();
+            responses.complete_remote_command(request_id, NodeId::new("home"), result).await;
+        }
+    });
+    super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
+    assert_eq!(target.watermark("home").unwrap().home_seq, 20);
+    seed("tail");
+    super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
+    assert_eq!(target.watermark("home").unwrap().home_seq, 21);
+    for index in 0..=20 {
+        let name = if index == 20 { "tail".into() } else { format!("item-{index}") };
+        let snapshot = |service: &Service| {
+            service
+                .with_store(|store| {
+                    let mut read = store.read()?;
+                    let id = read.resolve(RoutedStreamSample::CODE, &name, "home")?.unwrap();
+                    read.load_snapshot(id)
+                })
+                .unwrap()
+        };
+        assert_eq!(snapshot(&source), snapshot(&target));
+    }
+    remote.abort();
+}

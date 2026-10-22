@@ -293,9 +293,9 @@ async fn render(reply: Reply, change_stream_deadline: std::time::Duration) -> Re
             });
             streaming("application/json", Body::from_stream(lines))
         }
-        Reply::ChangeStream { service, after, clock, once } => streaming(
+        Reply::ChangeStream { service, after, clock } => streaming(
             super::change_stream::CONTENT_TYPE,
-            Body::from_stream(super::change_stream::body(service, after, clock, once, change_stream_deadline)),
+            Body::from_stream(super::change_stream::body(service, after, clock, change_stream_deadline)),
         ),
         Reply::Record { service, kind, name, now } => match super::change_stream::query_record(service, &kind, &name, now).await {
             Ok(bytes) => ([(header::CONTENT_TYPE, super::change_stream::CONTENT_TYPE)], bytes).into_response(),

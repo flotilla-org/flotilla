@@ -88,7 +88,7 @@ pub use edge::{
     AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeHeader, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf, LabelCheck, RecordsOf,
     RowPath, StateOf,
 };
-pub use event::{Cause, Change, Effect, Event, EventError, Named, Origin, Step, LOG_LIMITS};
+pub use event::{whole_log_topic, Cause, Change, Effect, Event, EventError, Named, Origin, Step, LOG_LIMITS};
 pub use flotilla_address::Address;
 pub use flotilla_schema_derive::{Describe, Stored};
 pub use frozen::{Freezable, Frozen};

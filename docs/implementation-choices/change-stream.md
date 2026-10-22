@@ -10,15 +10,17 @@ No resource kind's serialized shape changes; no out-of-repo resource authors nee
 The log Event adds a coarse code, defaulted for the previous stored generation. Quint is unchanged.
 
 `stream::serve` emits bounded ADR 0063 framed CBOR through an injected sink. It scans identities
-in indexed pages and reads a snapshot one logical row at a time, so long append-only histories
-are not materialized. A resource's root precedes its child rows; referenced frozen documents
-travel with the rows. The follower installs a complete snapshot and each subsequent delivery
+in indexed pages and loads each resource through the existing snapshot API. A resource,
+including all child rows and referenced frozen documents, normally occupies one frame. Only a
+resource whose encoded snapshot exceeds a frame uses `ResourceChunk` frames. Those chunks are
+split from the loaded logical rows, without a second SQL traversal, and assembled before the
+same `restore()` call. There is no separate child-row install path. The follower installs a complete snapshot and each subsequent delivery
 round transactionally. A disconnected round rolls back to its last committed prefix.
 
 The listener-independent `Service` owns the new store. The daemon exposes
 `GET /apis/flotilla.work/v1/change-stream[?after=<home_seq>]` on the existing resource HTTP API.
 Its chunked response sends a snapshot when needed, tails ordered frames, and sends idle
-keepalives. Peers request `once=true` rounds every five seconds, with a 15-second network
+keepalives. Peers request finite rounds every five seconds, with a 15-second network
 read/write deadline. There is no peer-count semaphore or encoded tail cache: each round opens
 one read-only WAL connection, reads `changes_since` pages, encodes them, and closes the
 connection. A brief writer barrier before the read cut waits for the transaction currently
@@ -33,16 +35,23 @@ snapshot in memory. Its disk cost is one round per connected home; snapshots can
 larger than tails. There is no whole-round byte cap: provision temporary disk for the largest
 home snapshot at each simultaneously active peer (see the workload note below). The network
 never waits inside `with_store`. Resident committed watermarks have a separate lock, so gates can read the old safe watermark during both network stalls and
-snapshot installation. Pending lookup overlays are periodically cleared during large
-transactions; uncommitted SQLite rows remain authoritative.
+snapshot installation. Lookup overlays follow the existing transaction lifetime; the per-row snapshot journal flush is removed.
 
 `GET /apis/flotilla.work/v1/record?kind=<code>&name=<encoded-name>` serves one home point read;
 production `read_record` routes one local miss there and marks it remote with its home-time
 age. Gates receive no remote transport capability.
 
-Peer connection generations own their follower tasks over the existing forwarded resource
-sockets; displacement/disconnect cancels the matching task. Failed links resume from committed
-progress. The old replicator is unchanged. No decided store is opened lazily: before a kind
+Peer connection generations own their follower tasks. Homes with forwarded resource sockets
+use HTTP; homes reached through command routing use `QueryChangeStream`. A routed session
+retains one consistent read cut and pulls one base64-wrapped CBOR frame per request, applying
+backpressure independently of the daemon event broadcast ring. Two bounded channels each
+hold at most two frames. A producer or abandoned session expires after 15 seconds without
+consumer progress; at most 512 sessions may exist at once. Completion removes the session.
+The receiver uses the same disk spool and production Follower as HTTP. Lost responses expire
+the session and the next round resumes from committed progress. Displacement/disconnect
+cancels the matching follower task. Failed links resume from committed
+progress. The persisted watermark row, including zero, identifies a completed baseline after
+restart. Home point reads reuse the HTTP client for each currently connected socket. The old replicator is unchanged. No decided store is opened lazily: before a kind
 migration installs its registered Service with `install_decided_store`, both routes answer
 503 and no followers start. #3317 installs the first kind before peer tasks start and verifies
 the complete production path. Tests exercise the generic mechanism before that integration.
@@ -150,10 +159,36 @@ room for later partitioning without implementing it now.
 
 Two/three-store scenarios cover snapshot/tail/resume, expunge-floor rollback and resnapshot,
 whole-home identity/body distribution, stalled and invalid watermarks, and non-default topic
-preservation. Hegel generates partition/resume sequences and snapshot row
-shapes across all nine fixture kinds, including frozen objects and nested records. WAL writer/read concurrency and snapshots crossing identity-page/cache bounds are also covered. The real
+preservation. Hegel generates partition/resume sequences and per-resource snapshot
+shapes across all fixture kinds, including frozen objects and nested records. WAL writer/read concurrency and snapshots crossing identity-page/cache bounds are also covered. The real
 Unix HTTP client is tested against a strict in-process request stand-in; duplex I/O tests the
 listener-independent response adapter. SQL tests execute the DDL with foreign keys and read
-every view. Rust conformance exercises the unchanged stream module's prefix watermark rule;
-`quint test specs/primitives/tests/stream_properties.qnt --backend typescript` checks its
-finite property directly. No Quint spec edits were needed.
+every view. The `flotilla-schema-sqlite` `quint_replay` target feeds the production Follower from the
+same generated ITF stream prefixes as the engine replay, comparing stored rows and watermark
+after every step, including disconnected apply attempts. The old Rust restatement of
+`stream_properties.qnt` is deleted. No Quint spec edits were needed.
+
+### In-process frame measurements (#3479)
+
+The ignored `workload_ceiling_resource_frames` contract run uses WORKLOAD.md's 10,000 running
+convoys and a 100 KiB frozen charter document per convoy, with the fixture's child records.
+It restores and compares every resource: **10,000 resource frames, 10,003 total frames,
+102,852 bytes largest frame, 61.03 seconds** in the dev profile. This measures convoy count
+and upper convoy width, not all resident entity kinds or 500-home mesh throughput; the
+existing topology expiry above still applies.
+
+Resource sizes are not a hard schema bound: children can accumulate across individually
+bounded writes. `oversized_resource_uses_chunks_and_restores_atomically` constructs 1,024
+child strings of 17 KiB using 32 bounded updates. Its 17 MiB of child payload exceeds the
+16 MiB frame profile, so only that resource uses row chunks. The measured exceptional case emits **1,025 chunks**, with a **17,547-byte** largest frame.
+Both sender and receiver hold
+one complete resource in memory; exceptional chunking bounds wire frames, not total
+resource materialization. A disconnected chunk sequence rolls back atomically. If
+append-only resources routinely reach this size, revisit resource retention and incremental
+snapshot construction rather than applying per-row framing to every resource.
+
+Routed delivery adds one command round trip per frame. It trades extra recovery latency for
+a bounded consumer and consistent cut without a second bulk transport. At the measured
+convoy ceiling this is 10,003 round trips for a fresh home; steady-state tail rounds are
+proportional to new events plus one keepalive. This remains the existing small-mesh shape,
+not a claim of viability at the root workload's 500-host ceiling.
