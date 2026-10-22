@@ -178,6 +178,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.filter.outputs.run == 'true'
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           shared-key: cleat-environment
           cache-workspace-crates: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -243,6 +248,11 @@ jobs:
       # and thrashed the repo's 10GB cache pool against compose's blobs.
       - uses: Swatinem/rust-cache@v2
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: "clippy"
       - run: cargo --config 'profile.dev.package."*".debug=0' clippy --workspace --all-targets --locked -- -D warnings
@@ -266,6 +276,11 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: "relay-wasm"
       - run: cargo --config 'profile.dev.package."*".debug=0' build -p flotilla-relay --target wasm32-unknown-unknown --locked
@@ -289,6 +304,11 @@ jobs:
       # and thrashed the repo's 10GB cache pool against compose's blobs.
       - uses: Swatinem/rust-cache@v2
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: "test"
       - run: cargo --config 'profile.dev.package."*".debug=0' test --workspace --locked
@@ -345,9 +365,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Set up pinned Rust
+        id: rust-pin
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           shared-key: "quint"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@v4
@@ -394,6 +420,11 @@ jobs:
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           shared-key: "windows-client"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo --config 'profile.dev.package."*".debug=0' clippy -p flotilla-client -p flotilla-manifest -p flotilla-transport --locked -- -D warnings
@@ -428,6 +459,11 @@ jobs:
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           shared-key: "macos-peer-identity"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run selected macOS tests
