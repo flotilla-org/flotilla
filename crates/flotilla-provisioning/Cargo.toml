@@ -23,12 +23,12 @@ tracing = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+flotilla-engine-store = { path = "../flotilla-engine-store" }
 
 [dev-dependencies]
-flotilla-engine-store = { path = "../flotilla-engine-store" }
+rusqlite = { version = "0.37", features = ["bundled"] }
 flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
 futures = { workspace = true }
-rusqlite = { version = "0.37", features = ["bundled"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 rstest = { workspace = true }
 reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }

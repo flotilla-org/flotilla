@@ -32,6 +32,7 @@ pub mod checkout;
 pub mod clone;
 pub mod environment;
 pub mod image_build;
+pub mod import;
 pub mod reads;
 pub mod terminal_session;
 #[cfg(test)]
