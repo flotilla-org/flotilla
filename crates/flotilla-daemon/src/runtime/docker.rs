@@ -767,7 +767,19 @@ impl EnvironmentRuntime for DockerControllerRuntime {
             Some(handle) => {
                 if handle.agent().is_some() {
                     if let Some(registry) = &self.state.agent_material {
-                        registry.capture_environment_home(environment_ref, handle.runner().as_ref()).await?;
+                        let runner = handle.runner();
+                        let capture = tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            registry.capture_environment_home(environment_ref, runner.as_ref()),
+                        )
+                        .await;
+                        match capture {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                warn!(environment = environment_ref, %error, "session capture failed; continuing environment teardown")
+                            }
+                            Err(_) => warn!(environment = environment_ref, "session capture timed out; continuing environment teardown"),
+                        }
                     }
                 }
                 handle.destroy().await?
@@ -779,7 +791,8 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         }
         // Recovery addresses Docker by full immutable ID, while adopted handles
         // may still be indexed by container name. Retire all cached handles for
-        // the Environment only after capture and destruction have succeeded.
+        // the Environment after destruction succeeds. Capture is best effort: a
+        // stopped or unreachable agent must never prevent deletion.
         self.state.provisioned_environments.lock().await.retain(|_, active| active.handle.id().as_str() != environment_ref);
         let _ = self.state.daemon.remove_provisioned_environment(&EnvironmentId::new(environment_ref));
         self.cleanup(environment_ref).await

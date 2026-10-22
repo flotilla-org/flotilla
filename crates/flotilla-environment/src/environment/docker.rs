@@ -83,6 +83,7 @@ pub struct DockerAgentSettings {
 type ConnectorFactory = dyn Fn(&Path) -> Arc<dyn AgentConnector> + Send + Sync;
 #[cfg(unix)]
 struct AgentLease {
+    directory: PathBuf,
     runner: Arc<AgentRunner>,
     supervisor: tokio::task::JoinHandle<()>,
 }
@@ -609,13 +610,16 @@ impl DockerEnvironmentProviderInner {
     }
 
     async fn destroy(&self, container_name: &str) -> Result<(), String> {
+        self.runner.run("docker", &["rm", "-f", container_name], Path::new("/"), &ChannelLabel::Default).await?;
         #[cfg(unix)]
-        if let Some(cell) = self.agents.lock().await.remove(container_name) {
+        let removed = self.agents.lock().await.remove(container_name);
+        #[cfg(unix)]
+        if let Some(cell) = removed {
             if let Some(lease) = cell.get() {
                 lease.supervisor.abort();
+                self.remove_agent_directory(&lease.directory).await;
             }
         }
-        self.runner.run("docker", &["rm", "-f", container_name], Path::new("/"), &ChannelLabel::Default).await?;
         Ok(())
     }
 }
@@ -1203,6 +1207,25 @@ impl DockerEnvironmentProvider {
 
 #[cfg(unix)]
 impl DockerEnvironmentProviderInner {
+    async fn remove_agent_directory(&self, directory: &Path) {
+        // Mounted labels can describe legacy/external paths. Remove only the
+        // hashed child owned by this provider, never an arbitrary adopted path.
+        if directory.parent() != Some(self.agent_settings.runtime_root.as_path())
+            || !directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.len() == 24 && name.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            tracing::warn!(path = %directory.display(), "retaining external agent runtime directory");
+            return;
+        }
+        if let Err(error) = tokio::fs::remove_dir_all(directory).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %directory.display(), %error, "failed to remove agent runtime directory");
+            }
+        }
+    }
+
     fn runtime_directory(&self, id: &EnvironmentId) -> Result<PathBuf, String> {
         std::fs::create_dir_all(&self.agent_settings.runtime_root).map_err(|e| e.to_string())?;
         drydock_agent::socket::private_directory(&self.agent_settings.runtime_root).map_err(|e| e.to_string())?;
@@ -1305,7 +1328,7 @@ impl DockerEnvironmentProviderInner {
                         delay = (delay * 2).min(Duration::from_secs(60));
                     }
                 });
-                Ok::<_, String>(Arc::new(AgentLease { runner: agent, supervisor }))
+                Ok::<_, String>(Arc::new(AgentLease { directory: directory.into(), runner: agent, supervisor }))
             })
             .await?;
         Ok(lease.clone())
@@ -1477,6 +1500,7 @@ mod agent_contract_tests {
         assert_eq!(memory.upgrades.load(Ordering::SeqCst), 1);
         handle.destroy().await.unwrap();
         assert!(!engine.created.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0, "destroy must remove the per-vessel runtime directory");
     }
 }
 
@@ -1503,6 +1527,26 @@ mod runtime_path_tests {
             assert!(b.join("guest/agent.sock").as_os_str().len() < 108);
         }
         assert!(!a.join("guest/host").exists());
+    }
+
+    #[tokio::test]
+    async fn teardown_removes_owned_runtime_directories_and_preserves_external_mounts() {
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let provider = DockerEnvironmentProvider::new(Arc::new(flotilla_provider_runtime::ProcessCommandRunner))
+            .with_agent_settings(DockerAgentSettings { runtime_root: root.path().into(), executable: root.path().join("agent") });
+        let owned = provider.inner.runtime_directory(&EnvironmentId::new("vessel")).unwrap();
+        let unowned = root.path().join("legacy");
+        std::fs::create_dir(&unowned).unwrap();
+        for directory in [&unowned, external.path()] {
+            std::fs::write(directory.join("sentinel"), b"preserve").unwrap();
+            provider.inner.remove_agent_directory(directory).await;
+            assert!(directory.join("sentinel").exists());
+        }
+        provider.inner.remove_agent_directory(&owned).await;
+        assert!(!owned.exists());
+        // Retried teardown is idempotent.
+        provider.inner.remove_agent_directory(&owned).await;
     }
 
     // Glue: the dead-agent diagnosis path retains an interactive tty and cwd,

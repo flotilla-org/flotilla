@@ -108,8 +108,77 @@ pub struct AgentRunner {
     state: Mutex<Connection>,
     forwards: Mutex<BTreeMap<PathBuf, ForwardListener>>,
     host_directory: PathBuf,
-    layer: Mutex<Option<String>>,
+    layer: Mutex<Option<PublishedLayer>>,
 }
+struct PublishedLayer {
+    sources: String,
+    content: String,
+}
+
+// The content digest is cached by file identity, including replacement, length,
+// mode and nanosecond change/modify times. Unchanged reconciles stat assets but
+// never read or hash their bytes. Cache no binary payloads per vessel.
+fn source_identity(entries: &[FileEntry], links: &[(PathBuf, PathBuf)]) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut identity = Sha256::new();
+    for (source, destination, mode) in entries {
+        let metadata = std::fs::symlink_metadata(source).map_err(|e| e.to_string())?;
+        for path in [source, destination] {
+            identity.update((path.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
+            identity.update(path.as_os_str().as_encoded_bytes());
+        }
+        identity.update(mode.to_le_bytes());
+        for value in [
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime() as u64,
+            metadata.mtime_nsec() as u64,
+            metadata.ctime() as u64,
+            metadata.ctime_nsec() as u64,
+        ] {
+            identity.update(value.to_le_bytes());
+        }
+    }
+    for (target, destination) in links {
+        for path in [target, destination] {
+            identity.update((path.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
+            identity.update(path.as_os_str().as_encoded_bytes());
+        }
+    }
+    Ok(format!("{:x}", identity.finalize()))
+}
+
+struct LayerSnapshot {
+    files: Vec<(PathBuf, u32, Vec<u8>)>,
+    links: Vec<(PathBuf, PathBuf)>,
+    identity: Sha256,
+    sources: String,
+}
+fn snapshot_layer(
+    entries: Vec<FileEntry>,
+    links: Vec<(PathBuf, PathBuf)>,
+    previous_sources: Option<&String>,
+    read: impl Fn(&Path) -> io::Result<Vec<u8>>,
+) -> Result<Option<LayerSnapshot>, String> {
+    let sources = source_identity(&entries, &links)?;
+    if previous_sources == Some(&sources) {
+        return Ok(None);
+    }
+    let mut identity = Sha256::new();
+    let mut snapshot = Vec::new();
+    for (source, destination, mode) in entries {
+        let bytes = read(&source).map_err(|e| e.to_string())?;
+        identity.update((destination.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
+        identity.update(destination.as_os_str().as_encoded_bytes());
+        identity.update(mode.to_le_bytes());
+        identity.update((bytes.len() as u64).to_le_bytes());
+        identity.update(&bytes);
+        snapshot.push((destination, mode, bytes));
+    }
+    Ok(Some(LayerSnapshot { files: snapshot, links, identity, sources }))
+}
+
 struct ForwardListener {
     path: PathBuf,
     task: tokio::task::JoinHandle<()>,
@@ -235,8 +304,10 @@ impl AgentRunner {
     pub async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String> {
         // Snapshot once off the async executor: identity and publication use
         // exactly the same bytes even if a mutable source changes meanwhile.
+        let mut layer = self.layer.lock().await;
+        let previous_sources = layer.as_ref().map(|layer| layer.sources.clone());
         let tools = tools.to_vec();
-        let (entries, mut links, mut identity) = tokio::task::spawn_blocking(move || {
+        let snapshot = tokio::task::spawn_blocking(move || {
             let mut entries = Vec::new();
             let mut links = Vec::new();
             for tool in tools {
@@ -248,22 +319,11 @@ impl AgentRunner {
             }
             entries.sort();
             links.sort();
-            let mut identity = Sha256::new();
-            let mut snapshot = Vec::new();
-            for (source, destination, mode) in entries {
-                let bytes = std::fs::read(source).map_err(|e| e.to_string())?;
-                identity.update((destination.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
-                identity.update(destination.as_os_str().as_encoded_bytes());
-                identity.update(mode.to_le_bytes());
-                identity.update((bytes.len() as u64).to_le_bytes());
-                identity.update(&bytes);
-                snapshot.push((destination, mode, bytes));
-            }
-            Ok::<_, String>((snapshot, links, identity))
+            snapshot_layer(entries, links, previous_sources.as_ref(), |path| std::fs::read(path))
         })
         .await
         .map_err(|e| e.to_string())??;
-        let mut layer = self.layer.lock().await;
+        let Some(LayerSnapshot { files: entries, mut links, mut identity, sources }) = snapshot else { return Ok(()) };
         for (target, destination) in &links {
             identity.update((target.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
             identity.update(target.as_os_str().as_encoded_bytes());
@@ -271,7 +331,8 @@ impl AgentRunner {
             identity.update(destination.as_os_str().as_encoded_bytes());
         }
         let identity = format!("{:x}", identity.finalize());
-        if layer.as_ref() == Some(&identity) {
+        if layer.as_ref().is_some_and(|layer| layer.content == identity) {
+            *layer = Some(PublishedLayer { sources, content: identity });
             return Ok(());
         }
         for (destination, mode, bytes) in entries {
@@ -288,7 +349,7 @@ impl AgentRunner {
             )
             .await?;
         }
-        *layer = Some(identity);
+        *layer = Some(PublishedLayer { sources, content: identity });
         Ok(())
     }
 }
