@@ -21,8 +21,9 @@
 //!   (runtime samples, configured limits, integration, degradations);
 //! - a judgement (in progress, suspect, lost, next attempt).
 //!
-//! Nothing reads, writes or queries these tables yet: they are declared for
-//! the owner's schema look-over, before the machines are wired (layer 2).
+//! Behind `[primitives]` the daemon opens its decided store with these kinds
+//! registered beside the engine's ([`register`], layer 2). Nothing writes
+//! them yet: the reconcilers write through the engine in layer 3.
 //!
 //! [`Lifecycle`]: flotilla_state_machines::machines::lifecycle::Lifecycle
 
@@ -31,8 +32,10 @@ pub mod clone;
 pub mod environment;
 pub mod image_build;
 
-use flotilla_schema::{KindRegistry, RegistryError};
-use flotilla_state_machines::Resource;
+use std::collections::BTreeMap;
+
+use flotilla_schema::{Kind, KindRegistry, RegistryError};
+use flotilla_state_machines::{Diagram, Machine, Resource};
 
 /// Registers the four provisioning kinds into `registry`, each under the code
 /// it holds for good: Environment `ev`, ImageBuild `ib`, Clone `cl`, Checkout `ck`.
@@ -42,6 +45,23 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     registry.register::<Resource<clone::Clone>>()?;
     registry.register::<Resource<checkout::Checkout>>()?;
     Ok(())
+}
+
+/// The Mermaid diagram of each kind's machine, by kind name, for the
+/// decided store's table views.
+pub fn diagrams() -> BTreeMap<String, String> {
+    fn diagram<M: Machine>() -> (String, String)
+    where
+        Resource<M>: Kind,
+    {
+        (<Resource<M> as Kind>::KIND.to_owned(), M::definition().mermaid(Diagram::Full))
+    }
+    BTreeMap::from([
+        diagram::<environment::Environment>(),
+        diagram::<image_build::ImageBuild>(),
+        diagram::<clone::Clone>(),
+        diagram::<checkout::Checkout>(),
+    ])
 }
 
 /// The provisioning kinds alone, for their DDL snapshot. No store opens with

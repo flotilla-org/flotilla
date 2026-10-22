@@ -1046,14 +1046,50 @@ fn spawn_controller_loops(
     controllers
 }
 
+/// The decided store's kinds behind `[primitives]`: Message and AgentSession
+/// (#3317), and the provisioning lifecycle kinds (#3629), each under its
+/// production code.
+pub(crate) fn decided_registry() -> Result<flotilla_schema::KindRegistry, flotilla_schema::RegistryError> {
+    let mut registry = flotilla_engine_store::registry()?;
+    flotilla_provisioning::stored::register(&mut registry)?;
+    Ok(registry)
+}
+
+/// The machine diagram of each kind in [`decided_registry`], by kind name.
+pub(crate) fn decided_diagrams() -> Result<std::collections::BTreeMap<String, String>, flotilla_schema::RegistryError> {
+    let mut diagrams = flotilla_engine_store::machine_registry()?.diagrams;
+    diagrams.extend(flotilla_provisioning::stored::diagrams());
+    Ok(diagrams)
+}
+
+#[cfg(test)]
+mod decided_kinds_tests {
+    // Behaviour (#3629 layer 2): behind `[primitives]` the decided store holds the provisioning
+    // lifecycle kinds beside Message and AgentSession, and every kind it holds has its machine's
+    // diagram for the table views.
+    #[test]
+    fn the_decided_store_holds_the_provisioning_kinds_with_their_diagrams() {
+        let registry = super::decided_registry().expect("no code is held twice");
+        let kinds: Vec<&str> = registry.iter().map(|set| set.kind.as_str()).collect();
+        for kind in ["Message", "AgentSession", "Environment", "ImageBuild", "Clone", "Checkout"] {
+            assert!(kinds.contains(&kind), "{kind} in {kinds:?}");
+        }
+        let diagrams = super::decided_diagrams().expect("diagrams");
+        assert_eq!(diagrams.len(), kinds.len());
+        for kind in kinds {
+            assert!(diagrams[kind].contains("stateDiagram"), "{kind}");
+        }
+    }
+}
+
 /// Opens the engine path behind `[primitives]` (#3317): the decided store
-/// with Message and AgentSession, homed at this daemon's node id, and the
+/// with the [`decided_registry`] kinds, homed at this daemon's node id, and the
 /// Message path over it. Installed before peer tasks start, so every peer's
 /// log is followed from the first connection.
 async fn open_message_primitives(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Result<(), String> {
     let path = config.state_dir().as_path().join("decided.sqlite");
     let home = daemon.node_id().as_str().to_owned();
-    let registry = flotilla_engine_store::registry().map_err(|error| format!("decided store registry: {error:?}"))?;
+    let registry = decided_registry().map_err(|error| format!("decided store registry: {error:?}"))?;
     let service = Arc::new(
         flotilla_schema_sqlite::stream::Service::open(&path, &home, registry)
             .map_err(|error| format!("open decided store {}: {error}", path.display()))?,

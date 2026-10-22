@@ -207,6 +207,12 @@ Harness events carry the evidence a home could observe, and the test maps each
 evidence field onto the world the gate reads. Each harness comment states its
 event domain.
 
+The provisioning lifecycle kinds (Environment, ImageBuild, Clone and Checkout,
+#3629) run the same lifecycle graph through their stored kinds:
+`crates/flotilla-provisioning/tests/lifecycle_conformance.rs` writes every edge
+through the decided store's log and reads the state back from the stored row and
+its log entries, under the spec's policy.
+
 Rust replay (`crates/flotilla-state-machines/tests/quint_replay.rs`) reads
 `mbt::actionTaken` and the `Some`/`None` picks from `mbt::nondetPicks`, and
 decodes sum values from `{tag,value}`. Race drops replay the chosen reason and

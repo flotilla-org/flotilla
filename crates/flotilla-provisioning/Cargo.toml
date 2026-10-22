@@ -23,6 +23,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 serde_json = { workspace = true }
 
 [dev-dependencies]
+flotilla-engine-store = { path = "../flotilla-engine-store" }
+flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 futures = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
