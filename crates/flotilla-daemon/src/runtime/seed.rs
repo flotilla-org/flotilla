@@ -149,6 +149,7 @@ pub(super) async fn ensure_host_direct_environment_exists(
         .create(
             &empty_meta(&name),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: Some(address),
                 host_direct: Some(HostDirectEnvironmentSpec {
                     host_ref: profile.host_id.clone(),
@@ -341,12 +342,21 @@ pub(super) async fn migrate_listed_placement_policies(
 ) -> Result<(), String> {
     let kinds = backend.clone().using::<FulfilmentKind>(namespace);
     for policy in policies {
+        let cloud_controller = if policy.spec.cloud_sandbox_per_vessel.is_some() {
+            match flotilla_admission::support::placement_target_host(backend, namespace, &policy).await {
+                Ok(host) => Some(host.reference.to_string()),
+                Err(_) => continue,
+            }
+        } else {
+            None
+        };
         let policy_host = policy
             .spec
             .host_direct
             .as_ref()
             .map(|strategy| strategy.host_ref.as_str())
-            .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|strategy| strategy.host_ref.as_str()));
+            .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|strategy| strategy.host_ref.as_str()))
+            .or(cloud_controller.as_deref());
         let Some(policy_host) = policy_host else { continue };
         let canonical = match canonical_host_id(hosts, policy_host) {
             Ok(id) => id.map(|id| id.to_string()).unwrap_or_else(|| policy_host.to_string()),
@@ -388,13 +398,16 @@ pub(super) async fn migrate_listed_placement_policies(
             }
         }
         let name = &policy.metadata.name;
-        let spec = match FulfilmentKindSpec::from_policy(&policy_spec, platform) {
+        let mut spec = match FulfilmentKindSpec::from_policy(&policy_spec, platform) {
             Ok(spec) => spec,
             Err(error) => {
                 warn!(policy = %name, %error, "skipping invalid placement policy during fulfilment migration");
                 continue;
             }
         };
+        if cloud_controller.is_some() {
+            spec.host_ref = host_ref.to_owned();
+        }
         if policy_spec != policy.spec {
             match backend
                 .clone()

@@ -2909,6 +2909,7 @@ async fn skill_failure_vessel(convoy: &flotilla_resources::ResourceObject<Convoy
         .create(
             &InputMeta::builder().name("failed-skills".into()).build(),
             &flotilla_resources::EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {

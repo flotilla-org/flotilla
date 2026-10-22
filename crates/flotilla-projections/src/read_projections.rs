@@ -397,6 +397,7 @@ impl ReadProjections<'_> {
                 realisation: match kind.spec.realisation {
                     FulfilmentRealisation::DockerPerVessel { .. } => "docker_per_vessel",
                     FulfilmentRealisation::HostDirect => "host_direct",
+                    FulfilmentRealisation::CloudSandboxPerVessel { .. } => "cloud_sandbox_per_vessel",
                 }
                 .to_string(),
                 grants,

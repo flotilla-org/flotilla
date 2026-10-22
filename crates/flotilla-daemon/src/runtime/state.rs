@@ -171,6 +171,14 @@ impl ControllerRuntimeState {
         let mut environment_providers = flotilla_discovery::registry::EnvironmentProviderRegistry::default();
         let place = flotilla_address::Address::root(flotilla_address::Kind::Host, &local_host_ref).expect("local host identity");
         environment_providers.register_place(&place, &local_registry.environment_providers).expect("unique local provider addresses");
+        let account_classes = [flotilla_protocol::provider::EnvironmentClass::CloudSandbox];
+        for (_, provider) in local_registry.environment_providers.iter().filter(|(_, p)| account_classes.contains(&p.kind().class)) {
+            let instance = local_registry.environment_providers.instance_name(provider).expect("registered instance");
+            let address = flotilla_address::Address::root(flotilla_address::Kind::Account, instance)
+                .and_then(|p| p.child(flotilla_address::Kind::Provider, instance))
+                .expect("account provider address");
+            environment_providers.insert(address, provider.clone()).expect("unique cloud provider address");
+        }
         Self {
             environment_providers,
             local_core_count: std::thread::available_parallelism,

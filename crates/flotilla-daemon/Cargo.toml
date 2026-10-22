@@ -86,6 +86,9 @@ getrandom = { version = "0.2", default-features = false, features = ["std"] }
 subtle = "2"
 
 [target.'cfg(unix)'.dependencies]
+drydock.workspace = true
+drydock-protocol.workspace = true
+
 libc = { workspace = true }
 
 [dev-dependencies]

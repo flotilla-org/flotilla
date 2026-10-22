@@ -61,6 +61,14 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     let local_host_id = CanonicalHostId::resolved(&state.local_host_ref);
     let mut environments = Vec::new();
     for environment in candidates {
+        if environment.spec.cloud_sandbox.is_some() {
+            if environment.spec.provider_address.as_ref().is_some_and(|address| state.environment_providers.get(address).is_ok())
+                && environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Ready)
+            {
+                reconcile_cloud_environment(state, namespace, &environment).await?;
+            }
+            continue;
+        }
         let Some(spec) = environment.spec.docker.as_ref() else {
             continue;
         };
@@ -252,6 +260,62 @@ pub(super) async fn reconcile_provisioned_environment(
 
 /// Persist diagnostics before marking backing lost: dependency watchers may
 /// immediately start teardown, and neither inspect nor cgroup evidence survives it.
+/// Cloud liveness uses provider facts, including cap loss. Restart adoption
+/// re-enters ordinary idempotent provisioning so forwarding and credentials are
+/// restored together; a cached image/SSH recipe never proves liveness.
+async fn reconcile_cloud_environment(
+    state: &Arc<ControllerRuntimeState>,
+    namespace: &str,
+    environment: &ResourceObject<Environment>,
+) -> Result<(), String> {
+    use flotilla_environment::environment::ObservationState;
+    use flotilla_provisioning::reconcilers::EnvironmentRuntime;
+    let runtime = super::docker::DockerControllerRuntime { state: state.clone() };
+    let provider = runtime.provider_for_environment(&environment.metadata.name).await?;
+    let id = EnvironmentId::new(&environment.metadata.name);
+    let cached =
+        state.provisioned_environments.lock().await.values().find(|active| active.handle.id() == &id).map(|active| active.handle.clone());
+    let handle = match cached.clone() {
+        Some(handle) => Some(handle),
+        None => provider.inspect(&id).await?,
+    };
+    match handle {
+        Some(handle) => match handle.observe().await.state {
+            ObservationState::Running => {
+                if cached.is_none() {
+                    runtime.provision_environment(&environment.metadata.name, &environment.spec).await?;
+                }
+                Ok(())
+            }
+            ObservationState::Gone { cause } => {
+                mark_unavailable_environment(state, namespace, &id, BackingDisposition::Lost, &format!("cloud sandbox gone: {cause:?}"))
+                    .await
+            }
+            ObservationState::Stopped { cause } => {
+                mark_unavailable_environment(
+                    state,
+                    namespace,
+                    &id,
+                    BackingDisposition::Lost,
+                    &format!("cloud sandbox stopped and resume is unavailable: {cause:?}"),
+                )
+                .await
+            }
+            ObservationState::Unknown { reason } => Err(format!("cloud sandbox observation unknown: {reason:?}")),
+        },
+        None => {
+            mark_unavailable_environment(
+                state,
+                namespace,
+                &id,
+                BackingDisposition::Lost,
+                "cloud sandbox missing from authoritative provider inventory",
+            )
+            .await
+        }
+    }
+}
+
 pub(super) async fn record_environment_observation(
     state: &ControllerRuntimeState,
     namespace: &str,
@@ -322,6 +386,7 @@ pub(super) async fn mark_unavailable_environment(
 ) -> Result<(), String> {
     let registered_container = state.daemon.environment_container_name(env_id);
     state.daemon.remove_provisioned_environment(env_id);
+    state.provisioned_environments.lock().await.retain(|_, active| active.handle.id() != env_id);
     if let Some(container_id) = registered_container {
         state.provisioned_environments.lock().await.remove(&container_id);
     }

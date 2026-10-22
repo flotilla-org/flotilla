@@ -41,6 +41,7 @@ pub struct EnvironmentSpec {
     pub provider_address: Option<flotilla_address::Address>,
     pub host_direct: Option<HostDirectEnvironmentSpec>,
     pub docker: Option<DockerEnvironmentSpec>,
+    pub cloud_sandbox: Option<CloudSandboxEnvironmentSpec>,
 }
 
 // A preceding-generation Environment can bind a non-default instance in its
@@ -110,9 +111,12 @@ impl Serialize for EnvironmentSpec {
             host_direct: &'a Option<HostDirectEnvironmentSpec>,
             #[serde(skip_serializing_if = "Option::is_none")]
             docker: &'a Option<DockerEnvironmentSpec>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cloud_sandbox: &'a Option<CloudSandboxEnvironmentSpec>,
         }
         let provider_address = self.resolved_provider_address(None).map_err(serde::ser::Error::custom)?;
-        Stored { provider_address, host_direct: &self.host_direct, docker: &self.docker }.serialize(serializer)
+        Stored { provider_address, host_direct: &self.host_direct, docker: &self.docker, cloud_sandbox: &self.cloud_sandbox }
+            .serialize(serializer)
     }
 }
 
@@ -126,6 +130,8 @@ impl<'de> Deserialize<'de> for EnvironmentSpec {
             host_direct: Option<HostDirectEnvironmentSpec>,
             #[serde(default)]
             docker: Option<DockerEnvironmentSpec>,
+            #[serde(default)]
+            cloud_sandbox: Option<CloudSandboxEnvironmentSpec>,
         }
         let mut stored = Stored::deserialize(deserializer)?;
         if let Some(address) = &stored.provider_address {
@@ -140,8 +146,53 @@ impl<'de> Deserialize<'de> for EnvironmentSpec {
                 spec.host_ref = host.into();
             }
         }
-        Ok(Self { provider_address: stored.provider_address, host_direct: stored.host_direct, docker: stored.docker })
+        Ok(Self {
+            provider_address: stored.provider_address,
+            host_direct: stored.host_direct,
+            docker: stored.docker,
+            cloud_sandbox: stored.cloud_sandbox,
+        })
     }
+}
+
+/// Additive cloud input approved on #3620 (2026-10-22). No credentials or reach recipes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSandboxEnvironmentSpec {
+    pub image: String,
+    pub size: CloudSandboxSize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime_cap_seconds: Option<u64>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSandboxSize {
+    pub cpus: u32,
+    pub memory_bytes: u64,
+    pub disk_bytes: u64,
+}
+
+/// Immutable provider facts recorded when a cloud backing is provisioned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentProviderDescriptor {
+    pub instance: String,
+    pub kind: flotilla_protocol::provider::ProviderKind,
+    pub image_digest: String,
+    pub host_version: String,
+    pub module_version: String,
+    pub capabilities: flotilla_protocol::provider::ProviderCapabilities,
+}
+
+/// Durable references only; recovery owns their retention and deletion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentSurvivors {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_storage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushed_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +265,12 @@ pub enum EnvironmentPhase {
 // this type's lenient decoding (ADR 0047); `DockerEnvironmentSpec.image_build_ref`
 // names the single per-identity build.
 pub struct EnvironmentStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_descriptor: Option<EnvironmentProviderDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub survivors: Option<EnvironmentSurvivors>,
     /// Configured limits, not usage. Remove the decoder default one fleet roll
     /// after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,6 +301,12 @@ pub struct EnvironmentStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentStatusPatch {
+    MarkCloudReady {
+        backing_id: String,
+        image_ref: String,
+        provider_descriptor: Box<EnvironmentProviderDescriptor>,
+        survivors: EnvironmentSurvivors,
+    },
     ObserveRuntime {
         observation: flotilla_protocol::EnvironmentRuntimeObservation,
     },
@@ -274,6 +337,17 @@ pub enum EnvironmentStatusPatch {
 impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
     fn apply(&self, status: &mut EnvironmentStatus) {
         match self {
+            Self::MarkCloudReady { backing_id, image_ref, provider_descriptor, survivors } => {
+                status.phase = EnvironmentPhase::Ready;
+                status.ready = true;
+                status.backing_id = Some(backing_id.clone());
+                status.image_ref = Some(image_ref.clone());
+                status.local_image_id = image_ref.rsplit_once('@').map(|(_, digest)| digest.to_owned());
+                status.registry_digest = Some(image_ref.clone());
+                status.provider_descriptor = Some((**provider_descriptor).clone());
+                status.survivors = Some(survivors.clone());
+                status.message = None;
+            }
             Self::ObserveRuntime { observation } => {
                 if let Some(inspected) = &observation.configured_limits {
                     let limits = status.configured_limits.get_or_insert_with(Default::default);
@@ -567,5 +641,41 @@ mod provider_address_tests {
                 "invalid explicit address {address:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cloud_schema_tests {
+    use super::*;
+    use hegel::generators as gs;
+    // #3620's approved additive schema round-trips arbitrary positive sizes,
+    // optional caps and environment values without inventing legacy Docker data.
+    #[hegel::test]
+    fn cloud_input_roundtrips_without_legacy_fields(tc: hegel::TestCase) {
+        let cpus = tc.draw(gs::integers::<u32>().min_value(1));
+        let memory_bytes = tc.draw(gs::integers::<u64>().min_value(1));
+        let disk_bytes = tc.draw(gs::integers::<u64>().min_value(1));
+        let lifetime_cap_seconds = tc.draw(gs::booleans()).then(|| tc.draw(gs::integers::<u64>().min_value(1)));
+        let value = tc.draw(gs::text().max_size(30));
+        let spec = EnvironmentSpec {
+            provider_address: Some("account:test/provider:daytona".parse().unwrap()),
+            cloud_sandbox: Some(CloudSandboxEnvironmentSpec {
+                image: "registry/image@sha256:digest".into(),
+                size: CloudSandboxSize { cpus, memory_bytes, disk_bytes },
+                lifetime_cap_seconds,
+                env: BTreeMap::from([("VALUE".into(), value)]),
+            }),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&spec).unwrap();
+        assert!(encoded.get("docker").is_none());
+        assert!(encoded.get("host_direct").is_none());
+        assert_eq!(serde_json::from_value::<EnvironmentSpec>(encoded).unwrap(), spec);
+        let old: EnvironmentSpec = serde_json::from_value(serde_json::json!({"docker":{"image":"previous-image"}})).unwrap();
+        assert!(old.cloud_sandbox.is_none());
+        let old_status: EnvironmentStatus =
+            serde_json::from_value(serde_json::json!({"phase":"Ready","docker_container_id":"previous-backing"})).unwrap();
+        assert_eq!(old_status.docker_container_id.as_deref(), Some("previous-backing"));
+        assert!(old_status.backing_id.is_none() && old_status.provider_descriptor.is_none() && old_status.survivors.is_none());
     }
 }

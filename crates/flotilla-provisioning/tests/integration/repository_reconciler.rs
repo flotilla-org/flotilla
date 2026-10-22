@@ -41,6 +41,7 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
         .create(
             &meta("env-host-a"),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".to_string(), repo_default_dir: "/repos".to_string() }),
                 docker: None,

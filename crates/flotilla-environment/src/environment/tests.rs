@@ -301,6 +301,7 @@ async fn host_adoption_is_idempotent_and_preparation_is_instance_scoped() {
     let provider = HostDirectEnvironmentProvider::new(runner.clone(), Default::default());
     let other = HostDirectEnvironmentProvider::new(runner.clone(), Default::default());
     let spec = flotilla_resources::EnvironmentSpec {
+        cloud_sandbox: None,
         provider_address: None,
         host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/".into() }),
         docker: None,

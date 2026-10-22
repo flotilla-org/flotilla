@@ -22,14 +22,14 @@ pub fn match_provider<'a>(
     if spec.provider_requirements.is_some() && requirements.instance.is_none() && requirements.class.is_none() {
         return Err(format!("{host}: provider requirements need an instance or class"));
     }
-    let checkout = match (&spec.host_direct, &spec.docker_per_vessel) {
-        (Some(_), None) => {
+    let checkout = match (&spec.host_direct, &spec.docker_per_vessel, &spec.cloud_sandbox_per_vessel) {
+        (Some(_), None, None) => {
             if requirements.instance.is_none() && requirements.class.is_none() {
                 requirements.class = Some(EnvironmentClass::HostDirect);
             }
             Some(CheckoutStrategy::HostWorktree)
         }
-        (None, Some(docker)) => {
+        (None, Some(docker), None) => {
             if requirements.instance.is_none() && requirements.class.is_none() {
                 requirements.class = Some(EnvironmentClass::Container);
             }
@@ -39,6 +39,12 @@ pub fn match_provider<'a>(
                 DockerCheckoutStrategy::FreshCloneInContainer { .. } => CheckoutStrategy::CloneInVessel,
             })
         }
+        (None, None, Some(_)) => {
+            if requirements.instance.is_none() && requirements.class.is_none() {
+                requirements.class = Some(EnvironmentClass::CloudSandbox);
+            }
+            Some(CheckoutStrategy::CloneInVessel)
+        }
         _ => return Err(format!("{host}: placement must define exactly one execution strategy")),
     };
     // Class fixes input shape (ADR 0058); capabilities still determine behavior.
@@ -46,7 +52,11 @@ pub fn match_provider<'a>(
     // Express this input-shape constraint as data; no class dispatch chooses
     // provider operations. The matcher only tests membership in that constraint.
     let host_adoption_classes = [EnvironmentClass::HostDirect];
-    let incompatible_class = |class| host_adoption_classes.contains(&class) != spec.host_direct.is_some();
+    let cloud_input_classes = [EnvironmentClass::CloudSandbox];
+    let incompatible_class = |class| {
+        host_adoption_classes.contains(&class) != spec.host_direct.is_some()
+            || cloud_input_classes.contains(&class) != spec.cloud_sandbox_per_vessel.is_some()
+    };
     let strategy = if spec.host_direct.is_some() { "host-direct" } else { "per-vessel" };
     let shape_hint = "use host_direct for host adoption or docker_per_vessel for per-vessel provisioning";
     if let Some(class) = requirements.class.filter(|class| incompatible_class(*class)) {
@@ -151,6 +161,15 @@ mod tests {
                 checkout: flotilla_resources::HostDirectPlacementPolicyCheckout::Worktree,
             });
         }
+        if class == EnvironmentClass::CloudSandbox {
+            spec.docker_per_vessel = None;
+            spec.cloud_sandbox_per_vessel = Some(flotilla_resources::CloudSandboxPerVesselPlacementPolicySpec {
+                image: "image@sha256:digest".into(),
+                size: flotilla_resources::CloudSandboxSize { cpus: 1, memory_bytes: 1024, disk_bytes: 1024 },
+                checkout: flotilla_resources::CloudSandboxCheckout::CloneInVessel,
+                env: Default::default(),
+            });
+        }
         spec.provider_requirements = Some(ProviderRequirements { class: Some(class), ..Default::default() });
         spec
     }
@@ -160,6 +179,7 @@ mod tests {
             kind: Some(ProviderKind::new(class, "open-implementation-name")),
             readiness: ProviderReadiness::Ready,
             capabilities: ProviderCapabilities {
+                workspace_root: "/workspace".into(),
                 material_modes: vec![MaterialMode::Frozen, MaterialMode::Pushed, MaterialMode::Shared],
                 checkout_strategies: vec![CheckoutStrategy::HostWorktree, CheckoutStrategy::HostClone, CheckoutStrategy::CloneInVessel],
                 egress_enforcement: EgressEnforcement::Enforced,

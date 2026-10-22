@@ -152,6 +152,7 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
         .create(
             &empty_meta_with_labels("quartermaster-work", BTreeMap::from([(CONVOY_LABEL.to_string(), "quartermaster".to_string())])),
             &flotilla_resources::EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
@@ -415,6 +416,7 @@ async fn failed_environment_readoption_does_not_block_a_live_sibling() {
         .create(
             &empty_meta(orphaned_id.as_str()),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {

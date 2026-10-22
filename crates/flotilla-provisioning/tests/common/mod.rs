@@ -242,6 +242,7 @@ pub async fn create_ready_host_direct_environment(
         .create(
             &meta(&name),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec {
                     host_ref: host_ref.to_string(),
@@ -257,6 +258,9 @@ pub async fn create_ready_host_direct_environment(
             &name,
             &created.metadata.resource_version,
             &EnvironmentStatus {
+                backing_id: None,
+                provider_descriptor: None,
+                survivors: None,
                 configured_limits: None,
                 runtime_observation: None,
                 phase: EnvironmentPhase::Ready,
@@ -284,7 +288,7 @@ pub async fn create_ready_docker_environment(
     let environments = backend.clone().using::<Environment>(namespace);
     let image_ref = docker.image.clone();
     let created = environments
-        .create(&meta(name), &EnvironmentSpec { provider_address: None, host_direct: None, docker: Some(docker) })
+        .create(&meta(name), &EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(docker) })
         .await
         .expect("docker env create should succeed");
     environments
@@ -292,6 +296,9 @@ pub async fn create_ready_docker_environment(
             name,
             &created.metadata.resource_version,
             &EnvironmentStatus {
+                backing_id: None,
+                provider_descriptor: None,
+                survivors: None,
                 configured_limits: None,
                 runtime_observation: None,
                 phase: EnvironmentPhase::Ready,

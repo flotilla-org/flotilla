@@ -166,6 +166,36 @@ pub async fn placement_target_host(
     namespace: &str,
     policy: &ResourceObject<PlacementPolicy>,
 ) -> Result<PlacementTargetHost, String> {
+    if policy.spec.cloud_sandbox_per_vessel.is_some() {
+        let hosts = backend.including_replicas::<flotilla_resources::Host>(namespace).list().await.map_err(|e| e.to_string())?;
+        let instance = policy.spec.provider_requirements.as_ref().and_then(|r| r.instance.as_deref()).or_else(|| {
+            policy.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str)
+        });
+        let observed_hosts = hosts.items.iter().map(|h| h.object.metadata.name.as_str()).collect::<Vec<_>>().join(", ");
+        let mut controllers = Vec::new();
+        let account_classes = [flotilla_protocol::provider::EnvironmentClass::CloudSandbox];
+        for record in hosts.items {
+            let host = record.object;
+            let declarations: Vec<flotilla_protocol::provider::ProviderAdvertisement> = host
+                .status
+                .as_ref()
+                .and_then(|s| s.capabilities.get(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY))
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            if declarations
+                .iter()
+                .any(|p| p.kind.as_ref().is_some_and(|k| account_classes.contains(&k.class)) && instance.is_none_or(|i| p.instance == i))
+            {
+                controllers.push(host.metadata.name);
+            }
+        }
+        controllers.sort();
+        controllers.dedup();
+        let [controller] = controllers.as_slice() else {
+            return Err(format!("cloud provider controller is missing or ambiguous (observed hosts: {observed_hosts})"));
+        };
+        return canonical_placement_host_ref(backend, namespace, controller).await?.ok_or("cloud controller host is missing".into());
+    }
     let host_ref = placement_host_ref(policy).ok_or_else(|| format!("placement `{}` has no target host", policy.metadata.name))?;
     canonical_placement_host_ref(backend, namespace, host_ref)
         .await
@@ -297,6 +327,16 @@ pub async fn resolve_placement_provider(
     // cache and provisioning consumers that already use the identity label.
     policy.spec.provider_requirements.get_or_insert_with(Default::default).instance = Some(selected.instance.clone());
     policy.metadata.labels.insert(ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), selected.instance.clone());
+    if policy.spec.cloud_sandbox_per_vessel.is_some() {
+        // Cloud roots name the POSIX guest, independent of the admitting host OS.
+        if !selected.capabilities.workspace_root.to_string_lossy().starts_with('/') {
+            return Err("cloud provider workspace root must be absolute".into());
+        }
+        policy
+            .metadata
+            .labels
+            .insert("flotilla.work/provider-workspace-root".into(), selected.capabilities.workspace_root.to_string_lossy().into_owned());
+    }
     Ok(())
 }
 

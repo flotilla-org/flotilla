@@ -717,6 +717,8 @@ impl EnvironmentRuntime for Docker {
 
         self.provisioned.lock().expect("provisioned").push((spec.image.clone(), spec.pull_policy));
         Ok(EnvironmentProvisioning {
+            provider_descriptor: None,
+            survivors: None,
             configured_limits: None,
             backing_id: Some("container".into()),
             image_ref: Some(spec.image.clone()),
@@ -747,6 +749,7 @@ async fn environment_becomes_ready_with_the_built_digest(#[case] delivery: Image
         .create(
             &InputMeta::builder().name("env".into()).build(),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {

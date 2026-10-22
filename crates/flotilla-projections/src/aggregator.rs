@@ -4837,6 +4837,7 @@ mod tests {
             .create(
                 &InputMeta::builder().name(name.to_string()).build(),
                 &EnvironmentSpec {
+                    cloud_sandbox: None,
                     provider_address: None,
                     host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".to_string(), repo_default_dir: "/repo".to_string() }),
                     docker: None,
