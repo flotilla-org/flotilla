@@ -2,7 +2,8 @@
 //! (#3629 layer 2).
 //!
 //! The engine's own conformance checks the shared lifecycle over an in-memory log and a request of
-//! `()`. Here each kind (Environment, ImageBuild, Clone, Checkout) runs the same full graph with its
+//! `()`. Here each kind (Environment, ImageBuild, Clone, Checkout, and TerminalSession from layer 6)
+//! runs the same full graph with its
 //! real request, through [`StoreLog`] over an SQLite store holding its stored kind. Every accepted
 //! edge is one `apply_edge` in its own transaction, and the encoded state is read back from the
 //! store: the resource's row loaded and decoded, and its history from its log entries, decoded
@@ -31,6 +32,7 @@ use flotilla_provisioning::stored::{
     clone::{CloneKind, CloneRequest},
     environment::{EnvironmentKind, EnvironmentRequest, Recipe},
     image_build::{Architecture, Delivery, ImageBuildKind, ImageBuildRequest, Reservation},
+    terminal_session::{Launch, TerminalSessionKind, TerminalSessionRequest},
     Holder,
 };
 use flotilla_quint_testkit::{
@@ -124,6 +126,20 @@ impl Sample for CheckoutKind {
             source: Source::Worktree,
             clone: Some(StoredRef::new("clone", HOME)),
             holder: Some(Holder::convoy("convoy")),
+        }
+    }
+}
+
+impl Sample for TerminalSessionKind {
+    fn request() -> TerminalSessionRequest {
+        TerminalSessionRequest {
+            environment: StoredRef::new("env", HOME),
+            holder: Some(Holder::vessel("vessel")),
+            role: "coder".into(),
+            pool: "cleat".into(),
+            cwd: "/workspace".into(),
+            env: [("A".to_owned(), "1".to_owned())].into(),
+            source: Launch::Tool { command: "bash".into() },
         }
     }
 }
@@ -316,6 +332,13 @@ fn checkout_follows_the_full_graph_through_the_store() {
     check::<CheckoutKind>();
 }
 
+// TerminalSession (Track B, #3629 layer 6) shares the lifecycle.
+#[test]
+#[ignore = "export graphs with specs/primitives/check.sh"]
+fn terminal_session_follows_the_full_graph_through_the_store() {
+    check::<TerminalSessionKind>();
+}
+
 /// One path through the adaptor, with the spec's results written out: two retryable failures
 /// exhaust the spec's policy, a give-up with another cause is refused and writes nothing, and the
 /// matching give-up ends the request; a second resource is realised and then released.
@@ -356,4 +379,5 @@ fn each_kind_walks_the_lifecycle_through_the_store() {
     walk::<ImageBuildKind>();
     walk::<CloneKind>();
     walk::<CheckoutKind>();
+    walk::<TerminalSessionKind>();
 }

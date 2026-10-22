@@ -14,8 +14,9 @@ use flotilla_state_machines::{
         agent_session::AgentSession,
         awaiting_reply::AwaitingReply,
         consumer::Consumer,
-        convoy,
+        convoy, ensure,
         message::{Message, ReceiptLog},
+        vessel,
     },
     EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, StoredWrite, Version,
 };
@@ -57,6 +58,23 @@ pub fn convoy_registry() -> Result<KindRegistry, RegistryError> {
     kinds.register::<Resource<convoy::Convoy>>()?;
     kinds.register::<Resource<AwaitingReply>>()?;
     Ok(kinds)
+}
+
+/// Registers the engine's crew kinds the `[primitives]` switch moves (#3629 layer 6): Vessel,
+/// the placement lease, and Ensure, each under its production code.
+pub fn register_crew(kinds: &mut KindRegistry) -> Result<(), RegistryError> {
+    kinds.register::<Resource<vessel::Vessel>>()?;
+    kinds.register::<Resource<ensure::Ensure>>()?;
+    Ok(())
+}
+
+/// The machine diagram of each kind [`register_crew`] registers, by kind name.
+pub fn crew_diagrams() -> std::collections::BTreeMap<String, String> {
+    [
+        (Resource::<vessel::Vessel>::KIND.to_owned(), vessel::Vessel::definition().mermaid(flotilla_state_machines::Diagram::Full)),
+        (Resource::<ensure::Ensure>::KIND.to_owned(), ensure::Ensure::definition().mermaid(flotilla_state_machines::Diagram::Full)),
+    ]
+    .into()
 }
 
 fn refused(error: impl std::error::Error + Send + Sync + 'static) -> LogError {
