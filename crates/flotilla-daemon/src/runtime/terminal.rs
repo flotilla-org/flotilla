@@ -626,7 +626,8 @@ impl TerminalRuntime for TerminalControllerRuntime {
         }
         if let (Some(profile), Some(paths)) = (agentless, &reach_paths) {
             // #3722: composed last, so nothing after it adds to PATH or sets a
-            // variable a supply also declares.
+            // variable a supply also declares. Every agentless launch reaches
+            // here with `reach_paths` set: without a reach it returned above.
             let home = profile.env_bag.find_env_var("HOME").ok_or_else(|| format!("agentless host {} has no HOME", spec.env_ref))?;
             command = compose_session_environment(&mut env, &command, &spec.env_ref, paths, &profile.host_environment, home)?;
         }

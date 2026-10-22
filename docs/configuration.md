@@ -174,7 +174,7 @@ format is shared with drydock's vessel agent (flotilla-org/drydock#55).
 Directories a login profile would have added are not on `PATH` unless
 declared, so everything a crew needs from the host (Git, `cleat`, the agent
 harness, `gh`, toolchains) must be in a supply or the system tail. Supply
-variables are set as declared. A supply cannot set `PATH`, a `FLOTILLA_`
+variables are set as declared. A supply cannot set `PATH`, `HOME`, a `FLOTILLA_`
 variable, or any variable flotilla sets for a session (such as `LANG`); that is
 a configuration error reported for the host, and the host is not registered or
 the crew is not launched.

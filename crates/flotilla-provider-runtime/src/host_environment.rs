@@ -54,7 +54,8 @@ impl HostEnvironment {
             }
             for (name, _) in &supply.env {
                 validate_env_key(name).map_err(|error| format!("supply `{}`: {error}", supply.name))?;
-                if name == "PATH" || name.starts_with(FLOTILLA_VARIABLE_PREFIX) {
+                // `~` expands against `HOME`, so a supply cannot redefine it.
+                if matches!(name.as_str(), "PATH" | "HOME") || name.starts_with(FLOTILLA_VARIABLE_PREFIX) {
                     return Err(supply_collision(&supply.name, name));
                 }
                 if !variables.insert(name.as_str()) {
@@ -136,7 +137,9 @@ impl HostEnvironment {
 
 /// Shell lines that set `variables` again, for a command whose shell may have
 /// read a login profile after its environment was handed over (cleat runs a
-/// session command through `$SHELL -lc`).
+/// session command through `$SHELL -lc`). They are POSIX `export` lines, as the
+/// session command they prefix already is (`flotilla_agent::process`); a csh
+/// login shell cannot run either.
 pub fn export_lines(variables: &[(String, String)]) -> String {
     variables.iter().map(|(name, value)| format!("export {name}={}\n", shell_quote(value))).collect()
 }
@@ -227,6 +230,7 @@ mod tests {
             env: env.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect(),
         };
         assert_eq!(refused(supply(&[], &[("PATH", "/x")])), "supply `tool` sets PATH, which flotilla sets");
+        assert_eq!(refused(supply(&[], &[("HOME", "/x")])), "supply `tool` sets HOME, which flotilla sets");
         assert_eq!(
             refused(supply(&[], &[("FLOTILLA_DAEMON_SOCKET", "/x")])),
             "supply `tool` sets FLOTILLA_DAEMON_SOCKET, which flotilla sets"
