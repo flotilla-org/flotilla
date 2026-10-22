@@ -34,6 +34,7 @@ check "transport change runs both" merge_group false "crates/flotilla-transport/
 check "caller change runs macOS" pull_request false "crates/flotilla-daemon/src/server/caller.rs" "" "windows=false macos=true quint=false "
 # The compiler pin and its assertion are shared platform-job inputs.
 check "provisioning stored kinds run Quint" pull_request false "crates/flotilla-provisioning/src/stored/clone.rs" "" "windows=false macos=false quint=true "
+check "crew kinds through the store run Quint" pull_request false "crates/flotilla-engine-store/tests/crew_conformance.rs" "" "windows=false macos=false quint=true "
 check "provisioning reconcilers do not run Quint" pull_request false "crates/flotilla-provisioning/src/reconcilers/clone.rs" "" "windows=false macos=false quint=false "
 check "compiler pin runs every job" pull_request false "rust-toolchain.toml" "" "windows=true macos=true quint=true "
 check "selector changes run both" pull_request false "ci/platform-tests/selectors.txt" "" "windows=true macos=true quint=false "

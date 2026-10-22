@@ -211,7 +211,12 @@ The provisioning lifecycle kinds (Environment, ImageBuild, Clone and Checkout,
 #3629) run the same lifecycle graph through their stored kinds:
 `crates/flotilla-provisioning/tests/lifecycle_conformance.rs` writes every edge
 through the decided store's log and reads the state back from the stored row and
-its log entries, under the spec's policy.
+its log entries, under the spec's policy. TerminalSession (#3629 layer 6) runs
+the same graph there. `crates/flotilla-engine-store/tests/crew_conformance.rs`
+runs `vessel.qnt` against the production placement composition
+(`placement::Placements`) and `ensure.qnt` against the Ensure, both through the
+decided store, with the adaptors the engine's own conformance uses
+(`flotilla-quint-testkit`'s `vessel` and `ensure`).
 
 Rust replay (`crates/flotilla-state-machines/tests/quint_replay.rs`) reads
 `mbt::actionTaken` and the `Some`/`None` picks from `mbt::nondetPicks`, and

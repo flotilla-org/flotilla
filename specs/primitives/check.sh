@@ -43,6 +43,9 @@ QUINT_GRAPH_DIR="$run/graphs" cargo test -p flotilla-provisioning --locked \
   --test lifecycle_conformance -- --ignored --nocapture 2>&1 | tee "$run/provisioning.log"
 QUINT_TRACE_DIR="$run" cargo test -p flotilla-schema-sqlite --locked \
   --test quint_replay -- --ignored --nocapture 2>&1 | tee "$run/follower.log"
+# The crew kinds (#3629): the placement composition and Ensure through the decided store.
+QUINT_GRAPH_DIR="$run/graphs" cargo test -p flotilla-engine-store --locked \
+  --test crew_conformance -- --ignored --nocapture 2>&1 | tee "$run/crew.log"
 # Backends share the trace mapping but replay only the Message race; full-graph
 # conformance remains with the engine above.
 QUINT_TRACE_DIR="$run" cargo test -p flotilla-inbox --locked \

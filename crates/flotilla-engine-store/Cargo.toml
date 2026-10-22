@@ -11,6 +11,8 @@ flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 
 [dev-dependencies]
+flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
+serde_json = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
 
 [lints]
