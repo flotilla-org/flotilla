@@ -15,6 +15,7 @@ use crate::{
     SettlementClaimEvidence, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
 };
 
+pub mod engine;
 pub mod promises;
 #[doc(hidden)]
 pub mod reconcile;
@@ -1783,6 +1784,14 @@ pub enum ConvoyStatusPatch {
         role: String,
         operation: promises::PromiseOperation,
     },
+    /// The engine's promises copied one way into the old status (#3587 layer
+    /// 6): with `[primitives]` on, the engine decides and this is a derived
+    /// scaffold, rebuilt whole from the engine, which layer 8 deletes. It
+    /// applies in every phase, so the copy follows a delivered or abandoned
+    /// engine convoy.
+    CopyEnginePromises {
+        promises: BTreeMap<String, BTreeMap<String, Vec<promises::Promise>>>,
+    },
     HoldTurnDelivery {
         source: String,
         hold: ConvoyAttention,
@@ -2059,6 +2068,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     | Self::SetStalled { .. }
                     | Self::SetTeardownWait { .. }
                     | Self::ObserveQueuedTurnDeliveries { .. }
+                    | Self::CopyEnginePromises { .. }
             )
             && !matches!(self, Self::MarkConvoyAbandoned { expected_phase, .. } if *expected_phase == status.phase && status.phase != ConvoyPhase::Abandoned)
         {
@@ -2114,6 +2124,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::ObservePromise { vessel, role, operation } => {
                 promises::apply(status, vessel, role, operation);
+            }
+            Self::CopyEnginePromises { promises } => {
+                status.promises = promises.clone();
             }
             Self::DiscoverSubjects { subjects, source, at } => {
                 for (subject, relationship) in subjects {

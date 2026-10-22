@@ -13,11 +13,14 @@ use flotilla_engine_store::StoreLog;
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
-    machines::convoy::{Convoy, ConvoyEdge, ConvoyRequest, MemoryConvoyWorld},
-    Home, Resource, Version, WriteError,
+    machines::convoy::{Convoy, ConvoyEdge, ConvoyRefusal, ConvoyRequest, MemoryConvoyWorld},
+    Edge as _, Home, Resource, Version, WriteError,
 };
 
 /// This home's Convoy records and the world their gates read.
+///
+/// Lock order: a write takes `home`, then `world`; [`Convoys::world`] takes
+/// `world` alone. A new path that holds both takes them in that order.
 pub struct Convoys {
     home: Mutex<Home<Convoy, StoreLog>>,
     world: Mutex<MemoryConvoyWorld>,
@@ -81,5 +84,56 @@ impl Convoys {
         let world = self.world.lock().expect("convoy world");
         home.apply(name, edge, &*world, now)?;
         Ok(home.get(name).map(Resource::version).expect("an applied edge leaves its resource"))
+    }
+}
+
+impl Convoys {
+    /// Works out edges from `name`'s current record and the world, then
+    /// applies them in order, all under the writer lock so no other write
+    /// lands between the read and the edges. Returns how many applied; the
+    /// first refusal stops the rest and is returned with the edge's position.
+    pub fn edit(
+        &self,
+        name: &str,
+        now: Timestamp,
+        plan: impl FnOnce(&Resource<Convoy>, &mut MemoryConvoyWorld) -> Result<Vec<ConvoyEdge>, String>,
+    ) -> Result<usize, EditError> {
+        let mut home = self.home.lock().expect("convoy home");
+        let mut world = self.world.lock().expect("convoy world");
+        let current = home.get(name).ok_or_else(|| EditError::Unknown(name.to_owned()))?;
+        let edges = plan(current, &mut world).map_err(EditError::Plan)?;
+        let count = edges.len();
+        for edge in edges {
+            let kind = format!("{:?}", edge.kind());
+            home.apply(name, edge, &*world, now).map_err(|error| match error {
+                WriteError::Refused(refusal) => EditError::Refused { edge: kind, refusal },
+                other => EditError::Write(format!("{other:?}")),
+            })?;
+        }
+        Ok(count)
+    }
+}
+
+/// Why [`Convoys::edit`] wrote nothing more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditError {
+    /// No Convoy of that name is homed here.
+    Unknown(String),
+    /// The caller's plan found nothing to do with the record as it is.
+    Plan(String),
+    /// The machine refused an edge.
+    Refused { edge: String, refusal: ConvoyRefusal },
+    /// The log or a declaration fault.
+    Write(String),
+}
+
+impl std::fmt::Display for EditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EditError::Unknown(name) => write!(f, "convoy `{name}` is not on the engine at this home"),
+            EditError::Plan(reason) => f.write_str(reason),
+            EditError::Refused { edge, refusal } => write!(f, "the engine refused {edge}: {refusal:?}"),
+            EditError::Write(error) => write!(f, "the engine did not write: {error}"),
+        }
     }
 }
