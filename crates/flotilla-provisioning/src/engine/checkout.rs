@@ -35,8 +35,9 @@ impl Binding for CheckoutBinding {
             CheckoutSpec::Observed(_) => return Err("an observed checkout is no engine request".into()),
         };
         // Held for its convoy, when a convoy role's: the old checkout names it by label. The
-        // holder carries no home and no ownership: the convoy finds its checkouts by it.
-        let holder = obj.metadata.labels.get(CONVOY_LABEL).map(|convoy| Holder::convoy(convoy));
+        // holder carries no home and no ownership: the convoy finds its checkouts by it. An empty
+        // label names no convoy.
+        let holder = obj.metadata.labels.get(CONVOY_LABEL).filter(|convoy| !convoy.is_empty()).map(|convoy| Holder::convoy(convoy));
         let request = CheckoutRequest {
             repository: obj.spec.repo_ref().to_string(),
             environment: local(environment, home),

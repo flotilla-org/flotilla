@@ -277,6 +277,23 @@ fn a_checkout_request_names_its_holder() {
     assert_eq!(request.environment.home, HOME);
 }
 
+// Behaviour (#3729 review): an empty holder label names no holder, and a host-direct environment
+// with no checkout root is refused before it is requested.
+#[test]
+fn an_empty_label_holds_nothing_and_a_rootless_host_direct_environment_is_refused() {
+    use flotilla_resources::{CONVOY_LABEL, VESSEL_REF_LABEL};
+
+    use super::environment::EnvironmentBinding;
+    let mut checkout = worktree(None);
+    checkout.metadata.labels.insert(CONVOY_LABEL.into(), String::new());
+    assert_eq!(CheckoutBinding::request(&checkout, HOME).expect("request").holder, None);
+    let mut environment = environment_object(false);
+    environment.metadata.labels.insert(VESSEL_REF_LABEL.into(), String::new());
+    assert_eq!(EnvironmentBinding::request(&environment, HOME).expect("request").holder, None);
+    environment.spec.host_direct.as_mut().expect("host direct").repo_default_dir = String::new();
+    assert!(EnvironmentBinding::request(&environment, HOME).expect_err("refused").contains("checkout root"));
+}
+
 // Behaviour (#3719 look-over ruling 4): a checkout held for no one is still the engine's: the
 // holder carries no ownership, so nothing refuses it.
 #[tokio::test]
