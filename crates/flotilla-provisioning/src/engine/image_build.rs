@@ -78,7 +78,8 @@ impl Binding for ImageBuildBinding {
             LifecycleState::GaveUp { cause } => Some(ImageBuildStatusPatch::Failed {
                 at,
                 failure: flotilla_resources::ImageBuildFailure {
-                    // Recipe: the old shape's terminal class, so nothing requeues it.
+                    // Recipe: the old shape's terminal class, so nothing requeues it. The real class
+                    // stays on the attempt's log entry, where the import (layer 9) reads it.
                     class: ImageBuildFailureClass::Recipe,
                     reason: cause.detail.clone(),
                 },
