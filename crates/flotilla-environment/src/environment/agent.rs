@@ -15,7 +15,7 @@ use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 use sha2::{Digest, Sha256};
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::Mutex,
+    sync::{Mutex, OnceCell},
 };
 
 use super::{EnvironmentTool, VesselAgent};
@@ -31,22 +31,38 @@ pub struct UnixAgentConnector {
     pub socket: PathBuf,
     pub executable: PathBuf,
     pub timeout: Duration,
+    executable_bytes: Arc<OnceCell<Vec<u8>>>,
+}
+impl UnixAgentConnector {
+    pub fn new(socket: PathBuf, executable: PathBuf, timeout: Duration) -> Self {
+        Self { socket, executable, timeout, executable_bytes: Arc::new(OnceCell::new()) }
+    }
+    pub(crate) fn with_executable_cache(mut self, cache: Arc<OnceCell<Vec<u8>>>) -> Self {
+        self.executable_bytes = cache;
+        self
+    }
 }
 #[async_trait]
 impl AgentConnector for UnixAgentConnector {
     async fn connect(&self) -> Result<Client, String> {
-        let executable = tokio::fs::read(&self.executable)
-            .await
-            .map_err(|e| format!("read current drydock agent {}: {e}", self.executable.display()))?;
-        if !executable.starts_with(b"\x7fELF") {
-            return Err("current drydock agent must be its Linux executable, not a host launcher script".into());
-        }
+        let executable = self
+            .executable_bytes
+            .get_or_try_init(|| async {
+                let bytes = tokio::fs::read(&self.executable)
+                    .await
+                    .map_err(|e| format!("read current drydock agent {}: {e}", self.executable.display()))?;
+                if !bytes.starts_with(b"\x7fELF") {
+                    return Err("current drydock agent must be its Linux executable, not a host launcher script".into());
+                }
+                Ok::<_, String>(bytes)
+            })
+            .await?;
         connect_current(
             || async {
                 let stream = UnixStream::connect(&self.socket).await?;
                 Transport::yamux(Box::new(stream), true, Limits::default()).await
             },
-            &executable,
+            executable,
             self.timeout,
         )
         .await
@@ -98,6 +114,14 @@ struct ForwardListener {
     path: PathBuf,
     task: tokio::task::JoinHandle<()>,
 }
+struct SocketCleanup(Option<PathBuf>);
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
 impl Drop for ForwardListener {
     fn drop(&mut self) {
         self.task.abort();
@@ -118,12 +142,8 @@ impl AgentRunner {
     async fn client(&self) -> Result<Arc<Client>, String> {
         let mut state = self.state.lock().await;
         if let Some(client) = &state.client {
-            if tokio::time::timeout(Duration::from_secs(2), client.configuration()).await.is_ok_and(|result| result.is_ok()) {
-                return Ok(client.clone());
-            }
+            return Ok(client.clone());
         }
-        // Drop stale controllers before reconnecting, releasing their endpoint claims.
-        state.client = None;
         let client = Arc::new(self.connector.connect().await?);
         client.configure(state.configuration.clone()).await.map_err(|e| e.to_string())?;
         for (id, path) in &state.targets {
@@ -131,6 +151,21 @@ impl AgentRunner {
         }
         state.client = Some(client.clone());
         Ok(client)
+    }
+
+    /// Explicit health boundary, used by readiness and the supervisor watcher.
+    /// Command/file operations use the cached client without a liveness RPC.
+    pub async fn healthy(&self) -> bool {
+        let client = self.state.lock().await.client.clone();
+        let Some(client) = client else { return false };
+        if tokio::time::timeout(Duration::from_secs(2), client.configuration()).await.is_ok_and(|result| result.is_ok()) {
+            return true;
+        }
+        let mut state = self.state.lock().await;
+        if state.client.as_ref().is_some_and(|cached| Arc::ptr_eq(cached, &client)) {
+            state.client = None;
+        }
+        false
     }
 
     pub async fn configure_environment(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
@@ -147,11 +182,7 @@ impl AgentRunner {
         let mut stream = self
             .client()
             .await?
-            .exec(Exec {
-                program: cmd.into(),
-                args: args.iter().map(|s| (*s).into()).collect(),
-                cwd: cwd.is_absolute().then(|| cwd.into()),
-            })
+            .exec(Exec { program: cmd.into(), args: args.iter().map(|s| (*s).into()).collect(), cwd: Some(absolute_cwd(cwd)?) })
             .await
             .map_err(|e| e.to_string())?;
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
@@ -202,36 +233,37 @@ impl AgentRunner {
     /// Push each regular asset through files/write, then replace generation
     /// symlinks. Never follow a link on the source host while traversing a tree.
     pub async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String> {
-        let mut entries = Vec::new();
-        let mut links = Vec::new();
-        for tool in tools {
-            for asset in &tool.assets {
-                if asset.requires_mount() {
-                    continue;
+        // Snapshot once off the async executor: identity and publication use
+        // exactly the same bytes even if a mutable source changes meanwhile.
+        let tools = tools.to_vec();
+        let (entries, mut links, mut identity) = tokio::task::spawn_blocking(move || {
+            let mut entries = Vec::new();
+            let mut links = Vec::new();
+            for tool in tools {
+                for asset in tool.assets {
+                    if !asset.requires_mount() {
+                        collect(asset.host_path.as_path(), asset.environment_path.as_path(), &mut entries, &mut links)?;
+                    }
                 }
-                collect(asset.host_path.as_path(), asset.environment_path.as_path(), &mut entries, &mut links)?;
             }
-        }
+            entries.sort();
+            links.sort();
+            let mut identity = Sha256::new();
+            let mut snapshot = Vec::new();
+            for (source, destination, mode) in entries {
+                let bytes = std::fs::read(source).map_err(|e| e.to_string())?;
+                identity.update((destination.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
+                identity.update(destination.as_os_str().as_encoded_bytes());
+                identity.update(mode.to_le_bytes());
+                identity.update((bytes.len() as u64).to_le_bytes());
+                identity.update(&bytes);
+                snapshot.push((destination, mode, bytes));
+            }
+            Ok::<_, String>((snapshot, links, identity))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         let mut layer = self.layer.lock().await;
-        let mut identity = Sha256::new();
-        use std::io::Read;
-        entries.sort();
-        links.sort();
-        for (source, destination, mode) in &entries {
-            identity.update((destination.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
-            identity.update(destination.as_os_str().as_encoded_bytes());
-            identity.update(mode.to_le_bytes());
-            let mut file = std::fs::File::open(source).map_err(|e| e.to_string())?;
-            identity.update(file.metadata().map_err(|e| e.to_string())?.len().to_le_bytes());
-            let mut buffer = [0; 65536];
-            loop {
-                let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    break;
-                }
-                identity.update(&buffer[..n]);
-            }
-        }
         for (target, destination) in &links {
             identity.update((target.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
             identity.update(target.as_os_str().as_encoded_bytes());
@@ -242,8 +274,8 @@ impl AgentRunner {
         if layer.as_ref() == Some(&identity) {
             return Ok(());
         }
-        for (source, destination, mode) in entries {
-            self.publish(&destination, tokio::fs::read(source).await.map_err(|e| e.to_string())?, Some(mode)).await?;
+        for (destination, mode, bytes) in entries {
+            self.publish(&destination, bytes, Some(mode)).await?;
         }
         // Flip current last, after every file and every stable entry point exists.
         links.sort_by_key(|(_, destination)| destination.file_name().is_some_and(|n| n == "current"));
@@ -268,7 +300,8 @@ impl Drop for RemoteStaging {
     fn drop(&mut self) {
         let client = self.client.clone();
         let path = self.path.to_string_lossy().into_owned();
-        tokio::spawn(async move {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+        runtime.spawn(async move {
             if let Ok(mut output) = client.exec(Exec { program: "rm".into(), args: vec!["-rf".into(), "--".into(), path], cwd: None }).await
             {
                 while output.next().await.is_ok_and(|event| event.is_some()) {}
@@ -277,12 +310,21 @@ impl Drop for RemoteStaging {
     }
 }
 
+fn absolute_cwd(cwd: &Path) -> Result<PathBuf, String> {
+    if !cwd.is_absolute() {
+        return Err("agent working directory must be absolute".into());
+    }
+    Ok(cwd.into())
+}
+
 type FileEntry = (PathBuf, PathBuf, u32);
 fn collect(source: &Path, destination: &Path, files: &mut Vec<FileEntry>, links: &mut Vec<(PathBuf, PathBuf)>) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let metadata = std::fs::symlink_metadata(source).map_err(|e| format!("tool asset {}: {e}", source.display()))?;
     if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(source).map_err(|e| e.to_string())?;
+        // Fleet bin links intentionally use ../tools/current. These are trusted
+        // host assets, copied as links without ever following them on the host.
         if target.is_absolute() {
             return Err("tool links must be relative".into());
         }
@@ -317,6 +359,7 @@ fn collect(source: &Path, destination: &Path, files: &mut Vec<FileEntry>, links:
 #[async_trait]
 impl VesselAgent for Arc<AgentRunner> {
     async fn ready(&self) -> Result<(), String> {
+        self.healthy().await;
         self.client().await.map(|_| ())
     }
     async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String> {
@@ -346,6 +389,7 @@ impl VesselAgent for Arc<AgentRunner> {
             }
         }
         let listener = UnixListener::bind(&path).map_err(|e| format!("bind attach forward {}: {e}", path.display()))?;
+        let mut cleanup = SocketCleanup(Some(path.clone()));
         drydock_agent::socket::protect(&path).map_err(|e| e.to_string())?;
         let client = self.client().await?;
         client.add_host_forward(id.clone(), Endpoint::Unix(guest.into())).await.map_err(|e| e.to_string())?;
@@ -370,6 +414,7 @@ impl VesselAgent for Arc<AgentRunner> {
                 });
             }
         });
+        cleanup.0 = None;
         listeners.insert(guest.into(), ForwardListener { path: path.clone(), task });
         Ok(path)
     }
@@ -397,7 +442,7 @@ impl CommandRunner for AgentRunner {
         })
     }
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
-        self.run(cmd, args, Path::new("."), &ChannelLabel::Default).await.is_ok()
+        self.run(cmd, args, Path::new("/"), &ChannelLabel::Default).await.is_ok()
     }
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
         self.publish(path, content.as_bytes().to_vec(), None).await
@@ -416,11 +461,7 @@ impl CommandRunner for AgentRunner {
         use tokio::io::AsyncWriteExt;
         let client = self.client().await?;
         let mut stream = client
-            .exec(Exec {
-                program: cmd.into(),
-                args: args.iter().map(|s| (*s).into()).collect(),
-                cwd: cwd.is_absolute().then(|| cwd.into()),
-            })
+            .exec(Exec { program: cmd.into(), args: args.iter().map(|s| (*s).into()).collect(), cwd: Some(absolute_cwd(cwd)?) })
             .await
             .map_err(|e| e.to_string())?;
         let mut file = tokio::fs::File::create(destination).await.map_err(|e| e.to_string())?;

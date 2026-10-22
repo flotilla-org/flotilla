@@ -119,6 +119,7 @@ pub struct AgentMaterialRegistry {
     codex_central_auth_path: PathBuf,
     adapters: BTreeMap<&'static str, Arc<dyn AgentMaterialAdapter>>,
     skills: SkillBundle,
+    capture_locks: tokio::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl AgentMaterialRegistry {
@@ -148,7 +149,7 @@ impl AgentMaterialRegistry {
         if env.get("FLOTILLA_FLEET_CANARY").as_deref() == Some("1") {
             adapters.insert("fleet-canary", claude_code);
         }
-        Self { homes_dir, codex_central_auth_path, adapters, skills }
+        Self { homes_dir, codex_central_auth_path, adapters, skills, capture_locks: Default::default() }
     }
 
     pub fn prepare<'a>(
@@ -516,6 +517,21 @@ done"#,
             let home = self.homes_dir.join(environment_ref);
             if !fs::try_exists(home.join(CODEX_ADAPTER_ID)).await.map_err(|e| e.to_string())? {
                 return Ok(());
+            }
+            let capture_lock = self.capture_locks.lock().await.entry(environment_ref.into()).or_default().clone();
+            let _capture = capture_lock.lock().await;
+            let mut entries = fs::read_dir(&home).await.map_err(|e| e.to_string())?;
+            while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name
+                    .strip_prefix(".guest-codex-")
+                    .and_then(|name| name.strip_suffix(".tar"))
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+                    && entry.file_type().await.map_err(|e| e.to_string())?.is_file()
+                {
+                    fs::remove_file(entry.path()).await.map_err(|e| e.to_string())?;
+                }
             }
             let temporary = home.join(format!(".guest-codex-{}.tar", uuid::Uuid::new_v4()));
             fs::write(&temporary, []).await.map_err(|e| e.to_string())?;
@@ -2734,6 +2750,7 @@ esac
         let registry = registry(temp.path());
         registry.prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.into()]), &BTreeMap::new()).await.unwrap();
         let home = registry.homes_dir.join("env-a");
+        std::fs::write(home.join(format!(".guest-codex-{}.tar", uuid::Uuid::new_v4())), "partial from previous process").unwrap();
         registry.capture_environment_home("env-a", &ArchiveRunner(false)).await.unwrap();
         assert_eq!(std::fs::read(home.join("guest-codex.tar")).unwrap(), b"session archive");
         assert!(registry.capture_environment_home("env-a", &ArchiveRunner(true)).await.is_err());

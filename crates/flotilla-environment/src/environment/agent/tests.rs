@@ -48,6 +48,9 @@ impl MemoryAgent {
         });
         Arc::new(Self { transports, current, starts, upgrades, guest, task, _directory: directory })
     }
+    pub(crate) fn stop(&self) {
+        self.task.abort();
+    }
     async fn open(&self) -> io::Result<Transport> {
         let (host, guest) = tokio::io::duplex(8192);
         self.transports.send(Box::new(guest)).await.map_err(|_| io::Error::other("test agent stopped"))?;
@@ -372,4 +375,114 @@ async fn pushes_complete_generations_and_retains_old_cleat_files() {
     }
     assert_eq!(memory.starts.load(Ordering::SeqCst), 1);
     assert_eq!(memory.upgrades.load(Ordering::SeqCst), 0);
+}
+
+// Relative cwd never silently selects the agent's default directory, including
+// the file-stream route. Default writes retain drydock's documented 0644 mode.
+#[tokio::test]
+async fn cwd_is_absolute_and_default_file_mode_is_explicit() {
+    use std::os::unix::fs::PermissionsExt;
+    let memory = MemoryAgent::new(false);
+    let directory = tempfile::tempdir().unwrap();
+    let runner = runner(&memory, directory.path());
+    for cwd in [".", "relative", "../parent", ""] {
+        assert!(runner.run("pwd", &[], Path::new(cwd), &ChannelLabel::Default).await.unwrap_err().contains("must be absolute"));
+        let output = directory.path().join("output");
+        assert!(runner.run_to_file("pwd", &[], Path::new(cwd), &output).await.unwrap_err().contains("must be absolute"));
+        assert!(!output.exists());
+    }
+    let file = directory.path().join("default-mode");
+    runner.write_file(&file, "default").await.unwrap();
+    assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o644);
+}
+
+struct ReplaceableConnector(Mutex<Arc<MemoryAgent>>);
+#[async_trait]
+impl AgentConnector for ReplaceableConnector {
+    async fn connect(&self) -> Result<Client, String> {
+        self.0.lock().await.clone().connect().await
+    }
+}
+// A transport failure during add_host_forward must remove the bound listener;
+// after explicit reconnection the same handle can retry successfully.
+#[tokio::test]
+async fn failed_forward_registration_cleans_path_and_can_retry() {
+    let memory = MemoryAgent::new(false);
+    let directory = tempfile::tempdir().unwrap();
+    let guest = directory.path().join("guest.sock");
+    let listener = UnixListener::bind(&guest).unwrap();
+    let host = directory.path().join("host");
+    std::fs::create_dir(&host).unwrap();
+    let connector = Arc::new(ReplaceableConnector(Mutex::new(memory.clone())));
+    let runner = Arc::new(AgentRunner::new(connector.clone(), host.clone()));
+    runner.ready().await.unwrap();
+    memory.stop();
+    assert!(tokio::time::timeout(Duration::from_secs(2), runner.forward_socket(&guest)).await.unwrap().is_err());
+    assert_eq!(std::fs::read_dir(&host).unwrap().count(), 0);
+    assert!(!runner.healthy().await);
+    *connector.0.lock().await = MemoryAgent::new(false);
+    let forwarded = runner.forward_socket(&guest).await.unwrap();
+    let viewer = UnixStream::connect(forwarded).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), listener.accept()).await.unwrap().unwrap();
+    drop(viewer);
+}
+
+// Reconnects within one daemon generation use the same pinned executable bytes,
+// even if the source file is later removed (e.g. fleet launcher cleanup).
+#[tokio::test]
+async fn connector_caches_generation_bytes_after_first_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("agent");
+    std::fs::write(&file, b"\x7fELFtest").unwrap();
+    let connector = UnixAgentConnector::new(directory.path().join("absent.sock"), file.clone(), Duration::from_millis(20));
+    assert!(connector.connect().await.is_err());
+    std::fs::remove_file(file).unwrap();
+    assert!(!connector.connect().await.err().unwrap().contains("read current drydock agent"));
+}
+
+struct ChangingSourceConnector {
+    memory: Arc<MemoryAgent>,
+    source: PathBuf,
+}
+#[async_trait]
+impl AgentConnector for ChangingSourceConnector {
+    async fn connect(&self) -> Result<Client, String> {
+        std::fs::write(&self.source, b"changed after snapshot").unwrap();
+        self.memory.connect().await
+    }
+}
+// Publication and the identity cache share a single immutable byte snapshot;
+// changing a source during connection cannot poison the duplicate-layer cache.
+#[tokio::test]
+async fn layer_hash_and_published_bytes_use_the_same_snapshot() {
+    use super::super::{EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind};
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let target = directory.path().join("guest/cli");
+    std::fs::write(&source, b"original snapshot").unwrap();
+    let runner = Arc::new(AgentRunner::new(
+        Arc::new(ChangingSourceConnector { memory: MemoryAgent::new(false), source: source.clone() }),
+        directory.path().into(),
+    ));
+    let first_source = directory.path().join("first-source");
+    std::fs::write(&first_source, b"first file opens the connection").unwrap();
+    let tools = [EnvironmentTool::new("cli", &target)
+        .with_asset(EnvironmentToolAsset::new(
+            &source,
+            &target,
+            EnvironmentToolAssetKind::File,
+            EnvironmentToolAssetAccess::ReadOnly,
+            "cli",
+        ))
+        .with_asset(EnvironmentToolAsset::new(
+            &first_source,
+            directory.path().join("guest/0-first"),
+            EnvironmentToolAssetKind::File,
+            EnvironmentToolAssetAccess::ReadOnly,
+            "first",
+        ))];
+    runner.push_tools(&tools).await.unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"original snapshot");
+    runner.push_tools(&tools).await.unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"changed after snapshot");
 }

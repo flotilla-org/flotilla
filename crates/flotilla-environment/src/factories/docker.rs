@@ -32,7 +32,7 @@ impl Factory for DockerEnvironmentFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        config: &dyn ProviderConfigView,
+        _config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn EnvironmentProvider>, Vec<UnmetRequirement>> {
@@ -42,7 +42,7 @@ impl Factory for DockerEnvironmentFactory {
             let provider = provider.with_agent_settings(DockerAgentSettings {
                 runtime_root: {
                     use sha2::{Digest, Sha256};
-                    Path::new("/tmp").join(&format!("fd-{:x}", Sha256::digest(config.state_dir().to_string().as_bytes()))[..23])
+                    Path::new("/tmp").join(&format!("fd-{:x}", Sha256::digest(_config.state_dir().to_string().as_bytes()))[..23])
                 },
                 executable: env
                     .find_binary("drydock-agent")

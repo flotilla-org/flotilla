@@ -218,6 +218,7 @@ pub enum ImagePullPolicy {
 }
 
 impl ImagePullPolicy {
+    #[cfg(any(unix, test))]
     fn docker_value(self) -> &'static str {
         match self {
             Self::Always => "always",
