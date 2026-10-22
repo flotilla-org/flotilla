@@ -21,8 +21,9 @@
 //!   (runtime samples, configured limits, integration, degradations);
 //! - a judgement (in progress, suspect, lost, next attempt).
 //!
-//! Nothing reads, writes or queries these tables yet: they are declared for
-//! the owner's schema look-over, before the machines are wired (layer 2).
+//! Behind `[primitives]` the daemon opens its decided store with these kinds
+//! registered beside the engine's ([`register`], layer 2). Nothing writes
+//! them yet: the reconcilers write through the engine in layer 3.
 //!
 //! [`Lifecycle`]: flotilla_state_machines::machines::lifecycle::Lifecycle
 
@@ -31,8 +32,10 @@ pub mod clone;
 pub mod environment;
 pub mod image_build;
 
-use flotilla_schema::{KindRegistry, RegistryError, Stored};
-use flotilla_state_machines::Resource;
+use std::collections::BTreeMap;
+
+use flotilla_schema::{Kind, KindRegistry, RegistryError, Stored};
+use flotilla_state_machines::{Diagram, Machine, Resource};
 
 /// Who a resource is held for: `convoy:<name>`, `ensure:<name>` or
 /// `vessel:<name>`. Interned text in its own domain (`hl`), indexed, with no
@@ -72,8 +75,25 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     Ok(())
 }
 
-/// The provisioning kinds alone, for their DDL snapshot. No store opens with
-/// them yet; the write path (layer 3) installs them behind `[primitives]`.
+/// The Mermaid diagram of each kind's machine, by kind name, for the
+/// decided store's table views.
+pub fn diagrams() -> BTreeMap<String, String> {
+    fn diagram<M: Machine>() -> (String, String)
+    where
+        Resource<M>: Kind,
+    {
+        (<Resource<M> as Kind>::KIND.to_owned(), M::definition().mermaid(Diagram::Full))
+    }
+    BTreeMap::from([
+        diagram::<environment::Environment>(),
+        diagram::<image_build::ImageBuild>(),
+        diagram::<clone::Clone>(),
+        diagram::<checkout::Checkout>(),
+    ])
+}
+
+/// The provisioning kinds alone, for their DDL snapshot and benchmark. The
+/// daemon's decided store registers them through [`register`].
 pub fn registry() -> Result<KindRegistry, RegistryError> {
     let mut registry = KindRegistry::new();
     register(&mut registry)?;

@@ -350,7 +350,8 @@ fn default_trace_sampling() -> f64 {
     1.0
 }
 
-/// The `[primitives]` section. It moves only Message for now, so it has no keys.
+/// The `[primitives]` section. It has no keys: it moves Message, and opens the
+/// decided store with the provisioning lifecycle kinds (#3629), as one switch.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrimitivesConfig {}
