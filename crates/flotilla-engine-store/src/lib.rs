@@ -116,6 +116,41 @@ impl StoreLog {
     }
 }
 
+/// A home over `log` holding every resource of `M`'s kind homed at the log's home, as the store
+/// holds them, so a restart keeps writing where it left off.
+pub fn open_home<M>(log: StoreLog) -> Result<flotilla_state_machines::Home<M, StoreLog>, String>
+where
+    M: Machine,
+    Resource<M>: Kind,
+    StoreLog: Log<M>,
+{
+    let home = log.home().to_owned();
+    let stored = {
+        let mut store = log.store().lock().expect("store reader");
+        let mut read = store.read().map_err(|error| error.to_string())?;
+        let mut stored = Vec::new();
+        let mut after = None;
+        loop {
+            let page = read.scan::<Resource<M>>(&home, after, 64).map_err(|error| error.to_string())?;
+            for id in page.ids {
+                if let Some(loaded) = read.load::<Resource<M>>(id).map_err(|error| error.to_string())? {
+                    stored.push(loaded.value.with_identity(&loaded.name, loaded.version));
+                }
+            }
+            after = page.next;
+            if after.is_none() {
+                break stored;
+            }
+        }
+    };
+    let mut opened =
+        flotilla_state_machines::Home::with_log(home.clone(), log).map_err(|errors| format!("{} home: {errors:?}", M::NAME))?;
+    for resource in stored {
+        opened.restore(resource).map_err(|error| format!("{} home: {error:?}", M::NAME))?;
+    }
+    Ok(opened)
+}
+
 /// Every entry about resource `id`, paged through `Read::about`.
 pub fn about(read: &mut Read<'_>, id: flotilla_schema_sqlite::ResourceId) -> Result<Vec<Event>, StoreError> {
     let mut entries = Vec::new();
