@@ -172,9 +172,9 @@ fn a_convoy_with_history_imports_one_to_one() {
         ]
     );
     assert_eq!(convoy.resource.label(), flotilla_state_machines::machines::convoy::ConvoyLabel::Open, "Landing imports as Open");
-    let coder_claim = convoy.history.crews.iter().find(|(_, role, _, _)| role == "coder").expect("coder's claim");
-    assert_eq!(coder_claim.2, "Done");
-    assert!(coder_claim.3.contains("\"merged\""), "{coder_claim:?}");
+    let coder_claim = convoy.history.crews.iter().find(|claim| claim.role == "coder").expect("coder's claim");
+    assert_eq!((coder_claim.vessel.as_str(), coder_claim.phase.as_str()), ("work", "Done"));
+    assert!(coder_claim.claim.contains("\"merged\""), "{coder_claim:?}");
     check(&convoy.resource).expect("the machine reaches it");
     assert_eq!(rehearse(std::slice::from_ref(&convoy)), Vec::new());
 }
@@ -229,10 +229,26 @@ fn an_open_stall_becomes_the_seats_stall_record() {
     };
     old.status.as_mut().expect("status").stalled = Some(stall(Some("supervision-1")));
     let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
-    let record = convoy.stall.expect("a stall record").spec;
+    let record = convoy.stall.as_ref().expect("a stall record").spec.clone();
     assert_eq!(record.kind, "stall");
     assert_eq!(record.subject.as_ref().map(Address::as_str), Some("project:fleet/convoy:c/role:coder"));
     assert_eq!(record.recipient.as_str(), "project:fleet/convoy:c/role:bosun");
+    // The import writes the record beside the convoy, Open, and the rehearsal reads it back.
+    assert_eq!(rehearse(std::slice::from_ref(&convoy)), Vec::new());
+    let connection = rusqlite::Connection::open_in_memory().expect("connection");
+    let mut store =
+        flotilla_schema_sqlite::Store::open(connection, HOME, flotilla_engine_store::registry().expect("registry")).expect("store");
+    flotilla_core::primitives::convoy_import::write(&mut store, &convoy).expect("written");
+    let name = flotilla_core::primitives::awaiting::record_name(&record.message);
+    let mut read = store.read().expect("read");
+    let code = <flotilla_state_machines::Resource<flotilla_state_machines::machines::awaiting_reply::AwaitingReply> as flotilla_schema::Kind>::CODE;
+    let id = read.resolve(code, &name, HOME).expect("resolve").expect("the stall record is written");
+    let stored = read
+        .load::<flotilla_state_machines::Resource<flotilla_state_machines::machines::awaiting_reply::AwaitingReply>>(id)
+        .expect("load")
+        .expect("present")
+        .value;
+    assert_eq!(*stored.spec(), record);
     old.status.as_mut().expect("status").stalled = Some(stall(None));
     let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
     assert!(convoy.stall.is_none());
@@ -260,12 +276,14 @@ fn the_claim_history_is_the_creations_log_entry() {
     assert!(matches!(events[0].cause, Cause::Create));
     let history: ClaimHistory = events[0].payload().expect("a payload").expect("decodes");
     assert_eq!(history, convoy.history);
-    assert!(history.crews[0].3.contains("first attempt"), "{history:?}");
+    assert!(history.crews[0].claim.contains("first attempt"), "{history:?}");
 }
 
 // Behaviour (the pre-roll rehearsal): every Convoy the stored-record corpus holds is imported,
-// stays on the old path, or is refused by name, and every imported one writes and reads back. The
-// current generation predates promises, so its unfinished convoys are the NoObligations list.
+// stays on the old path, or is refused by name, and every imported one writes and reads back.
+// Every unfinished, bootstrapped convoy is imported or refused; ended ones stay old. (The current
+// generation predates promises, so today its refusals are all NoObligations; a later corpus may
+// name others, which this test leaves to the report.)
 #[test]
 fn the_stored_record_corpus_rehearses() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../flotilla-store-testkit/tests/fixtures/stored-records");
@@ -293,11 +311,13 @@ fn the_stored_record_corpus_rehearses() {
     let report = rehearse_all(&records, HOME, &[], &WORLD);
     assert_eq!(report.imported.len() + report.stays_old.len() + report.refused.len(), records.len());
     assert!(report.rehearsal.is_empty(), "rehearsal refusals: {:?}", report.rehearsal);
-    assert!(
-        report.refused.iter().all(|refusal| matches!(refusal, ConvoyImportRefusal::NoObligations { .. })),
-        "only NoObligations: {:?}",
-        report.refused
-    );
+    let names: std::collections::BTreeSet<_> = records.iter().map(|record| record.metadata.name.clone()).collect();
+    let named = |refusal: &ConvoyImportRefusal| match refusal {
+        ConvoyImportRefusal::NoObligations { convoy }
+        | ConvoyImportRefusal::StandingAwaitsRuling { convoy }
+        | ConvoyImportRefusal::Unmappable { convoy, .. } => names.contains(convoy),
+    };
+    assert!(report.refused.iter().all(named), "every refusal names a corpus convoy: {:?}", report.refused);
     let unfinished = records
         .iter()
         .filter(|record| {
@@ -307,8 +327,14 @@ fn the_stored_record_corpus_rehearses() {
             })
         })
         .count();
-    assert_eq!(report.refused.len(), unfinished, "every unfinished convoy of this generation is listed");
-    eprintln!("pre-roll rehearsal: {} refused NoObligations, {} stay old", report.refused.len(), report.stays_old.len());
+    assert_eq!(report.imported.len() + report.refused.len(), unfinished, "every unfinished convoy is imported or listed");
+    eprintln!(
+        "pre-roll rehearsal: {} imported, {} refused, {} stay old: {:?}",
+        report.imported.len(),
+        report.refused.len(),
+        report.stays_old.len(),
+        report.refused.iter().map(ToString::to_string).collect::<Vec<_>>()
+    );
 }
 
 // Behaviour (found by the ceiling benchmark): several convoys rehearse at one home; the store

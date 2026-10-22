@@ -14,7 +14,7 @@
 //! | Open / Submitted / Kept / Retracted | Pending / Submitted / Kept / Retracted |
 //! | crew Done, HandedBack | dropped: derived from the promises |
 //! | crew Failed | dropped: its promises stay, for an operator verdict |
-//! | an open stall with a supervision message | an open stall record ([`ImportedStall`]) |
+//! | an open stall with a supervision message | an open stall record ([`ImportedStall`]), written beside the convoy |
 //! | claim history (message, `finished_at`, overrides, superseded claims, `landing_entry`) | the creation's log entry payload ([`ClaimHistory`]) |
 //! | `completion_refusal`, `legacy_checks` | dropped |
 //! | Landing | Open |
@@ -36,7 +36,7 @@ use flotilla_schema::{Records, State, Timestamp};
 use flotilla_state_machines::{
     kinds::{stock, Catalog},
     machines::{
-        awaiting_reply::{Awaited, AwaitingReplySpec},
+        awaiting_reply::{Awaited, AwaitingReply, AwaitingReplyLabel, AwaitingReplySpec, MemoryAwaitingReplyWorld},
         convoy::{
             AdmittedPromise, Authority, Convoy, ConvoyRequest, ConvoySpec, ConvoyState, Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld,
             Priority, Progress, Promise, PromiseId, PromiseSource, Reject, Retract, Seat, SeatName, Submission, Submit, Terms,
@@ -80,16 +80,25 @@ impl std::fmt::Display for ConvoyImportRefusal {
     }
 }
 
-/// One crew's claim, kept as history: the old claim fields the engine has no
-/// column for, each as the old status wrote it.
+/// The old claim fields the engine has no column for, kept as history.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimHistory {
-    /// `(vessel, role, phase, claim)`: the claim is the old crew record's
-    /// message, `finished_at`, `completion_override` and `superseded_claims`,
-    /// as JSON text.
-    pub crews: Vec<(String, String, String, String)>,
-    /// The old `landing_entry`, as JSON text.
+    pub crews: Vec<CrewClaim>,
+    /// The old `landing_entry`, as the old status encodes it (JSON text).
     pub landing_entry: Option<String>,
+}
+
+/// One old crew's claim.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrewClaim {
+    pub vessel: String,
+    pub role: String,
+    /// The old crew phase's stored name.
+    pub phase: String,
+    /// The old crew record's `message`, `finished_at`, `completion_override`
+    /// and `superseded_claims`, as the old status encodes them (JSON text), so
+    /// they decode with the old types.
+    pub claim: String,
 }
 
 /// An open stall carried over as the stalled seat's awaiting-reply record.
@@ -250,24 +259,28 @@ pub fn import_convoy(
     let resource = Resource::stored(name.clone(), spec, state, Version(1));
     check(&resource).map_err(refuse)?;
 
-    let history = ClaimHistory {
-        crews: status
-            .crew_work
-            .iter()
-            .flat_map(|(vessel, crew)| {
-                crew.iter().map(move |(role, work)| {
-                    let claim = serde_json::json!({
-                        "message": work.message,
-                        "finished_at": work.finished_at,
-                        "completion_override": work.completion_override,
-                        "superseded_claims": work.superseded_claims,
-                    });
-                    (vessel.clone(), role.clone(), format!("{:?}", work.phase), claim.to_string())
-                })
-            })
-            .collect(),
-        landing_entry: status.landing_entry.as_ref().map(|entry| serde_json::to_string(entry).unwrap_or_default()),
-    };
+    // History the old status cannot encode refuses the import: it is never
+    // dropped silently.
+    let encode = |what: &str, value: serde_json::Result<String>| value.map_err(|error| refuse(format!("{what} does not encode: {error}")));
+    let mut claims = Vec::new();
+    for (vessel, crew) in &status.crew_work {
+        for (role, work) in crew {
+            let phase = serde_json::to_value(work.phase)
+                .ok()
+                .and_then(|phase| phase.as_str().map(str::to_owned))
+                .ok_or_else(|| refuse(format!("crew {vessel}/{role}'s phase has no stored name")))?;
+            let claim = serde_json::json!({
+                "message": work.message,
+                "finished_at": work.finished_at,
+                "completion_override": work.completion_override,
+                "superseded_claims": work.superseded_claims,
+            });
+            let claim = encode(&format!("crew {vessel}/{role}'s claim"), serde_json::to_string(&claim))?;
+            claims.push(CrewClaim { vessel: vessel.clone(), role: role.clone(), phase, claim });
+        }
+    }
+    let landing_entry = status.landing_entry.as_ref().map(|entry| encode("the landing entry", serde_json::to_string(entry))).transpose()?;
+    let history = ClaimHistory { crews: claims, landing_entry };
 
     let (stall, unrecorded_stall) = match status.stalled.as_ref() {
         None => (None, None),
@@ -290,7 +303,7 @@ pub fn import_convoy(
                     };
                     (Some(ImportedStall { spec }), None)
                 }
-                (None, _) => (None, Some("the stall is the convoy's own, not a crew's".into())),
+                (None, _) => (None, Some("the stall names no crew (its maker is not a crew actor), so no seat awaits".into())),
                 (Some(_), None) => (None, Some("no supervision message to await (an operator-rung stall)".into())),
             }
         }
@@ -403,15 +416,34 @@ pub fn check(resource: &Resource<Convoy>) -> Result<(), String> {
     Ok(())
 }
 
+/// The open stall record an imported convoy carries, as the machine creates
+/// it, under the name the send path gives it ([`super::awaiting::record_name`]).
+pub fn stall_record(convoy: &ImportedConvoy) -> Result<Option<Resource<AwaitingReply>>, String> {
+    let Some(stall) = convoy.stall.as_ref() else {
+        return Ok(None);
+    };
+    let name = super::awaiting::record_name(&stall.spec.message);
+    let mut home = Home::<AwaitingReply>::new(&convoy.home).map_err(|error| format!("{error:?}"))?;
+    home.create(&name, stall.spec.clone(), &MemoryAwaitingReplyWorld::default(), convoy.resource.since())
+        .map_err(|error| format!("the machine refuses stall `{name}`: {error:?}"))?;
+    Ok(home.get(&name).cloned())
+}
+
 /// Writes one imported convoy at its home in `store` through the creation
-/// path: one transaction, whose log entry carries the claim history as its
-/// payload. The cut-over's importer writes each convoy so; the rehearsal does
-/// the same into a scratch store.
+/// path, with its open stall record if it has one: one transaction, whose
+/// convoy log entry carries the claim history as its payload. The cut-over's
+/// importer writes each convoy so; the rehearsal does the same into a
+/// scratch store.
 pub fn write(store: &mut flotilla_schema_sqlite::Store, convoy: &ImportedConvoy) -> Result<(), String> {
     let origin =
         flotilla_schema::Origin::new("import", convoy.resource.since()).with_payload(&convoy.history).map_err(|error| error.to_string())?;
+    let stall = stall_record(convoy)?;
     let mut write = store.write().map_err(|error| error.to_string())?;
     write.insert(convoy.resource.name(), &convoy.resource, &origin).map_err(|error| error.to_string())?;
+    if let Some(stall) = &stall {
+        let origin = flotilla_schema::Origin::new("import", stall.since());
+        write.insert(stall.name(), stall, &origin).map_err(|error| format!("stall `{}`: {error}", stall.name()))?;
+    }
     write.commit().map_err(|error| error.to_string())
 }
 
@@ -445,7 +477,8 @@ pub struct RehearsalRefusal {
 
 /// Writes every imported convoy through the creation path into a scratch
 /// store per home, with its claim history as the creation's log entry
-/// payload, then reads each back and checks it against the machine again.
+/// payload and its open stall record beside it, then reads each back and
+/// checks it against the machine again.
 pub fn rehearse(imported: &[ImportedConvoy]) -> Vec<RehearsalRefusal> {
     use flotilla_schema::Kind;
     let refuse = |convoy: &ImportedConvoy, reason: String| RehearsalRefusal { convoy: convoy.resource.name().to_owned(), reason };
@@ -485,6 +518,19 @@ pub fn rehearse(imported: &[ImportedConvoy]) -> Vec<RehearsalRefusal> {
             Ok(Some(_)) => refusals.push(refuse(convoy, "the store reads back another convoy".into())),
             Ok(None) => refusals.push(refuse(convoy, "the created convoy is missing".into())),
             Err(error) => refusals.push(refuse(convoy, error.to_string())),
+        }
+        if let Some(stall) = &convoy.stall {
+            let name = super::awaiting::record_name(&stall.spec.message);
+            let read = store.read().and_then(|mut read| {
+                let id = read.resolve(Resource::<AwaitingReply>::CODE, &name, &convoy.home)?;
+                id.map(|id| read.load::<Resource<AwaitingReply>>(id)).transpose().map(Option::flatten)
+            });
+            match read {
+                Ok(Some(loaded)) if *loaded.value.spec() == stall.spec && loaded.value.label() == AwaitingReplyLabel::Open => {}
+                Ok(Some(_)) => refusals.push(refuse(convoy, format!("the store reads back another stall `{name}`"))),
+                Ok(None) => refusals.push(refuse(convoy, format!("the stall `{name}` is missing"))),
+                Err(error) => refusals.push(refuse(convoy, format!("stall `{name}`: {error}"))),
+            }
         }
     }
     refusals
