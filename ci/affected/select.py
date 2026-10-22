@@ -34,8 +34,11 @@ def select(metadata, changed):
         # files. Unknown paths must conservatively select the entire workspace.
         if owner is not None and Path(packages[owner]["manifest_path"]).parent == root:
             targets = packages[owner].get("targets", [])
-            roots = {Path(t["src_path"]).relative_to(root).parts[0] for t in targets}
-            if path.parts[0] not in roots:
+            sources = {Path(t["src_path"]).relative_to(root).as_posix() for t in targets}
+            # Root tests/support is shared by several packages via #[path].
+            # Only src/ and explicit root targets have unambiguous ownership;
+            # other repository-level helpers conservatively select all.
+            if not file.startswith("src/") and file not in sources:
                 owner = None
         if owner is None or packages[owner]["name"].startswith("flotilla-build-features"):
             return "all"

@@ -19,7 +19,7 @@ def graph(edges):
         "workspace_root": "/repo", "workspace_members": names,
         "packages": [{"id": n, "name": n,
                       "manifest_path": "/repo/Cargo.toml" if n == "root" else f"/repo/crates/{n}/Cargo.toml",
-                      "targets": [{"src_path": "/repo/src/main.rs"}]} for n in names],
+                      "targets": [{"src_path": "/repo/src/main.rs"}, {"src_path": "/repo/tests/root.rs"}]} for n in names],
         "resolve": {"nodes": [{"id": n, "deps": [{"pkg": d, "name": "alias", "dep_kinds": [{"kind": k}]}
                                                   for d, k in edges.get(n, [])]} for n in names]},
     }
@@ -40,7 +40,7 @@ class SelectionContract(unittest.TestCase):
         for file in ("Cargo.lock", "Cargo.toml", "rust-toolchain.toml", ".cargo/config.toml",
                      ".config/nextest.toml", "ci/affected/select.py", ".github/workflows/ci.yml",
                      "crates/flotilla-build-features-time/src/lib.rs", "README.md",
-                     "crates/deleted/src/lib.rs", "../outside", "/absolute", ""):
+                     "crates/deleted/src/lib.rs", "tests/support/integration_modules.rs", "../outside", "/absolute", ""):
             with self.subTest(file=file):
                 self.assertEqual(select(graph({}), [file]), "all")
         self.assertEqual(select(graph({}), []), "all")
