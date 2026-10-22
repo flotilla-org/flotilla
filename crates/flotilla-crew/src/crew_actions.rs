@@ -382,7 +382,12 @@ impl CrewActions<'_> {
         Err("ConvoyAbandon action selected the wrong handler".to_string())
     }
 
-    pub async fn execute_action_convoy_work_force_complete(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_convoy_work_force_complete(
+        &self,
+        id: u64,
+        command: &Command,
+        dispatching_principal_ref: &Option<PrincipalRef>,
+    ) -> Result<u64, String> {
         if let CommandAction::ConvoyWorkForceComplete { convoy, work, message } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let namespace = self.crew.provisioning_namespace().await;
@@ -404,6 +409,25 @@ impl CrewActions<'_> {
                     Some(_) => Ok(()),
                 },
             };
+            // With the engine deciding, forcing work complete is an operator's
+            // attributed verdict on its crews' open promises (#3574 decision 8).
+            match convoys.get(&record_name).await {
+                Ok(current) => {
+                    if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.crew.convoy_engine, &current) {
+                        let principal = dispatching_principal_ref.as_ref().map_or("unattributed", |principal| principal.name.as_str());
+                        let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: work.clone(), role: None };
+                        let reason = message.clone().unwrap_or_else(|| "operator forced work completion".to_string());
+                        if let Err(message) = engine.keep_by_verdict(&current, &scope, principal, &reason).await {
+                            self.events.finish(id, empty_identity, CommandValue::Error { message });
+                            return Ok(id);
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.events.finish(id, empty_identity, CommandValue::Error { message: error.to_string() });
+                    return Ok(id);
+                }
+            }
             let result = match apply_resource_status_patch_checked(
                 &convoys,
                 &record_name,
@@ -419,6 +443,46 @@ impl CrewActions<'_> {
             return Ok(id);
         }
         Err("ConvoyWorkForceComplete action selected the wrong handler".to_string())
+    }
+
+    /// An operator's verdict on one promise (#3587 layer 6): the engine's
+    /// attributed `Keep` or `Retract`. It needs an operator principal, the
+    /// `[primitives]` switch, and a convoy the engine holds.
+    pub async fn execute_action_convoy_promise_verdict(
+        &self,
+        id: u64,
+        command: &Command,
+        dispatching_principal_ref: &Option<PrincipalRef>,
+    ) -> Result<u64, String> {
+        if let CommandAction::ConvoyPromiseVerdict { convoy, promise, keep, reason } = &command.action {
+            let empty_identity = self.events.start(id, command.description().to_string());
+            let result = async {
+                let principal = dispatching_principal_ref.as_ref().ok_or("a promise verdict requires an operator principal")?;
+                if reason.trim().is_empty() {
+                    return Err("a promise verdict requires a non-empty reason".to_string());
+                }
+                let namespace = self.crew.provisioning_namespace().await;
+                let record_name = resolve_local_convoy_name(self.resource_backend, &namespace, convoy).await?;
+                let current = self
+                    .resource_backend
+                    .clone()
+                    .using::<ResourceConvoy>(&namespace)
+                    .get(&record_name)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let engine = flotilla_resources::convoy::engine::deciding(&self.crew.convoy_engine, &current)
+                    .ok_or_else(|| format!("convoy `{convoy}` is not decided by the engine here; promise verdicts need `[primitives]`"))?;
+                engine.verdict(&current, promise, *keep, &principal.name, reason).await
+            }
+            .await;
+            let result = match result {
+                Ok(()) => CommandValue::Ok,
+                Err(message) => CommandValue::Error { message },
+            };
+            self.events.finish(id, empty_identity, result);
+            return Ok(id);
+        }
+        Err("ConvoyPromiseVerdict action selected the wrong handler".to_string())
     }
 }
 
