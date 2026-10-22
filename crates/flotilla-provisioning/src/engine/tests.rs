@@ -21,6 +21,7 @@ use flotilla_store::controller::{ReconcileOutcome, Reconciler};
 use super::{checkout::CheckoutBinding, clone::CloneBinding, Binding, Engine, LifecycleHome, Lifecycles, Step};
 use crate::stored::{
     checkout::{CheckoutRequest, Source},
+    environment::{DockerImage, DockerRecipe},
     Holder,
 };
 
@@ -342,7 +343,13 @@ fn environment_object(docker: bool) -> ResourceObject<flotilla_resources::Enviro
                 pull_policy: Default::default(),
                 memory_policy: Default::default(),
                 mounts: vec![],
-                env: Default::default(),
+                // A declared value, and what the vessel reconciler adds at launch today.
+                env: [
+                    ("A".to_owned(), "1".to_owned()),
+                    (flotilla_resources::CREDENTIAL_REFS_ENV.to_owned(), "[\"github\"]".to_owned()),
+                    ("FLOTILLA_CREW_SKILLS".to_owned(), "[]".to_owned()),
+                ]
+                .into(),
             }),
         }
     } else {
@@ -356,7 +363,8 @@ fn environment_object(docker: bool) -> ResourceObject<flotilla_resources::Enviro
 }
 
 // Behaviour: an environment is realised under its container, or the host-direct root; its recipe is
-// its provider's own spec, and its request names its image build at this home.
+// its provider's typed recipe (one image choice, nothing derived at launch, #3719 rulings 5-6), and
+// its request names its image build at this home.
 #[test]
 fn an_environment_is_realised_under_its_container_or_root() {
     use super::environment::EnvironmentBinding;
@@ -378,9 +386,19 @@ fn an_environment_is_realised_under_its_container_or_root() {
     let request = EnvironmentBinding::request(&held, HOME).expect("request");
     assert_eq!(request.holder, Some(Holder::vessel("convoy-a-implement")), "held for its vessel");
     assert_eq!(request.image_build.map(|build| (build.name, build.home)), Some(("image-00-amd64".into(), HOME.into())));
-    // The Docker provider's own spec is the recipe, read back by the provider.
-    let recipe = request.recipe.value().read::<flotilla_resources::DockerEnvironmentSpec>().expect("the docker recipe");
-    assert_eq!(Some(&recipe), environment_object(true).spec.docker.as_ref());
+    // The Docker provider's recipe, read back by the provider: built, so the build is the column
+    // alone, and with no credential grant or skills, which are composed at launch.
+    let recipe = request.recipe.value().read::<DockerRecipe>().expect("the docker recipe");
+    assert_eq!(recipe.image, DockerImage::Built);
+    assert_eq!(recipe.env.keys().collect::<Vec<_>>(), ["A"], "the credential grant and the skills are not stored");
+    let mut pinned = environment_object(true);
+    pinned.spec.docker.as_mut().expect("docker").image_build_ref = None;
+    let request = EnvironmentBinding::request(&pinned, HOME).expect("request");
+    assert_eq!(request.image_build, None);
+    assert_eq!(
+        request.recipe.value().read::<DockerRecipe>().expect("recipe").image,
+        DockerImage::Pinned { reference: "registry/flotilla@sha256:00".into() }
+    );
 }
 
 // Behaviour: a Ready environment whose backing the observer reports failed has vanished; the

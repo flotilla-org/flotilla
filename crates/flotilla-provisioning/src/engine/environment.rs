@@ -6,7 +6,9 @@ use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseC
 
 use super::{Binding, Step};
 use crate::stored::{
-    environment::{Environment, EnvironmentKind, EnvironmentRequest, Recipe},
+    environment::{
+        DockerImage, DockerRecipe, Environment, EnvironmentKind, EnvironmentRequest, HostDirectRecipe, Recipe, LAUNCH_DERIVED_ENV,
+    },
     Holder,
 };
 
@@ -19,11 +21,35 @@ impl Binding for EnvironmentBinding {
     fn request(obj: &ResourceObject<OldEnvironment>, home: &str) -> Result<EnvironmentRequest, String> {
         let spec = &obj.spec;
         let provider = spec.resolved_provider_address(None)?.ok_or("an environment names no provider or host")?;
-        // The provider's own spec is its recipe; only the build it names is a column.
+        // The provider's own recipe; only the build it names is a column (look-over rulings 5-6).
         let (recipe, image_build) = match (&spec.docker, &spec.host_direct) {
-            // The build is homed at its builder; the environment names it as replicated here.
-            (Some(docker), None) => (Recipe::of(docker)?, docker.image_build_ref.as_ref().map(|name| Ref::new(name.clone(), home))),
-            (None, Some(host)) => (Recipe::of(host)?, None),
+            (Some(docker), None) => {
+                // The build is homed at its builder; the environment names it as replicated here.
+                let image_build = docker.image_build_ref.as_ref().map(|name| Ref::new(name.clone(), home));
+                let recipe = DockerRecipe {
+                    // A composed image names its build, whose realised digest is read at creation;
+                    // the old spec's empty image is that placeholder.
+                    image: match image_build {
+                        Some(_) => DockerImage::Built,
+                        None => DockerImage::Pinned { reference: docker.image.clone() },
+                    },
+                    declared_adapters: docker.declared_agent_adapters.clone(),
+                    required_adapters: docker.required_agent_adapters.clone(),
+                    pull_policy: docker.pull_policy,
+                    memory_policy: docker.memory_policy.clone(),
+                    mounts: docker.mounts.clone(),
+                    // Credential grants and skills are composed at launch, never stored.
+                    env: docker
+                        .env
+                        .iter()
+                        .filter(|(key, _)| !LAUNCH_DERIVED_ENV.contains(&key.as_str()))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                };
+                recipe.validate(image_build.as_ref())?;
+                (Recipe::of(&recipe)?, image_build)
+            }
+            (None, Some(host)) => (Recipe::of(&HostDirectRecipe { repo_default_dir: host.repo_default_dir.clone() })?, None),
             _ => return Err("an environment is backed by exactly one of docker and host_direct".into()),
         };
         let recipe = Frozen::new(recipe).map_err(|error| format!("freeze the provider's recipe: {error}"))?;
