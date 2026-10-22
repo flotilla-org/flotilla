@@ -31,6 +31,7 @@ use flotilla_provisioning::stored::{
     clone::{CloneKind, CloneRequest},
     environment::{EnvironmentKind, EnvironmentRequest, Recipe},
     image_build::{Architecture, Delivery, ImageBuildKind, ImageBuildRequest, Reservation},
+    Holder,
 };
 use flotilla_quint_testkit::{
     graph::{self, bare, refusal, tick, Conformance, Report, Step},
@@ -75,6 +76,7 @@ impl Sample for EnvironmentKind {
                     .expect("recipe"),
             )
             .expect("freeze"),
+            holder: None,
         }
     }
 }
@@ -121,8 +123,7 @@ impl Sample for CheckoutKind {
             path: "/w".into(),
             source: Source::Worktree,
             clone: Some(StoredRef::new("clone", HOME)),
-            convoy: Some(StoredRef::new("convoy", HOME)),
-            ensure: None,
+            holder: Some(Holder::convoy("convoy")),
         }
     }
 }

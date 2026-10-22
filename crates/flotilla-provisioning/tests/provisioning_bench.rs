@@ -39,6 +39,7 @@ use flotilla_provisioning::stored::{
     clone::{Clone, CloneRequest},
     environment::{Environment, EnvironmentRequest, Recipe},
     image_build::{Architecture, Delivery, ImageBuild, ImageBuildRequest, Reservation},
+    Holder,
 };
 use flotilla_resources::{ImageLayerSource, ImageLayerSpec, ImageLayerTier};
 use flotilla_schema::{Address, Frozen, KindRegistry, Ref as StoredRef, Timestamp};
@@ -110,6 +111,7 @@ fn environment(n: usize, home: &str) -> EnvironmentRequest {
         provider: provider(n),
         image_build: Some(StoredRef::new(format!("image-{}", n % BUILDS), home)),
         recipe: Frozen::new(Recipe::of(&docker_recipe(n)).expect("recipe")).expect("freeze"),
+        holder: None,
     }
 }
 
@@ -142,8 +144,7 @@ fn checkout(n: usize, which: &str, home: &str) -> CheckoutRequest {
         path: format!("/workspace/{which}"),
         source: Source::Worktree,
         clone: Some(StoredRef::new(format!("clone-{n}"), home)),
-        convoy: Some(StoredRef::new(format!("convoy-{n}"), home)),
-        ensure: None,
+        holder: Some(Holder::convoy(&format!("convoy-{n}"))),
     }
 }
 

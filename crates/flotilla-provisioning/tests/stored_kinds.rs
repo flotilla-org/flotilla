@@ -315,6 +315,7 @@ fn environment_request() -> EnvironmentRequest {
                 .expect("recipe"),
         )
         .expect("freeze"),
+        holder: None,
     }
 }
 
@@ -351,8 +352,7 @@ fn policies_give_up_as_the_old_retries_did() {
         path: "/w".into(),
         source: Source::FreshClone { url: "u".into() },
         clone: None,
-        convoy: Some(Ref::new("c", "kiwi")),
-        ensure: None,
+        holder: Some(Holder::convoy("c")),
     };
     assert_eq!(failures_before_give_up::<CheckoutKind>(checkout), Some(3));
 
