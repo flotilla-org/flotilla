@@ -63,6 +63,8 @@ type ConvoyKey = (String, String, Option<flotilla_protocol::NodeId>);
 type EnsureKey = (String, String, Option<flotilla_protocol::NodeId>);
 type SessionKey = (String, String, Option<flotilla_protocol::NodeId>);
 const CONVOY_PROJECTION_COALESCE_INTERVAL: Duration = Duration::from_millis(25);
+/// How soon a convoy whose engine read failed is projected again.
+const ENGINE_READ_RETRY: Duration = Duration::from_secs(1);
 
 const CHANGE_REQUEST_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// A lookup that runs longer fails, so a hung resolver cannot hold a convoy's
@@ -1564,8 +1566,17 @@ impl Aggregator {
         let salience_changed = self.rebuild_salience_projection().await;
         let mut local_replacement = HashMap::new();
         let mut replica_replacements: HashMap<HostName, HashMap<ResourceRef, ConvoyRow>> = HashMap::new();
+        // A convoy whose engine read failed keeps its row until a retried projection reads it.
+        let mut unread: Vec<(ResourceRef, ResourceProvenance)> = Vec::new();
         for (reference, convoy) in effective_convoys {
-            let viewed = flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, &convoy);
+            let viewed = match flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, &convoy) {
+                Ok(viewed) => viewed,
+                Err(error) => {
+                    tracing::warn!(convoy = %reference.name, %error, "the engine convoy did not read; its row stays until a retry");
+                    unread.push((reference, convoy.provenance.clone()));
+                    continue;
+                }
+            };
             let row = self.summarize(&reference, &viewed);
             match convoy.provenance {
                 ResourceProvenance::Local => {
@@ -1578,19 +1589,37 @@ impl Aggregator {
             }
         }
 
+        let mut retry = Vec::new();
         let updates = if full {
             Vec::new()
         } else {
             keys.iter()
                 .filter_map(|key| {
                     let reference = self.convoy_key_ref(key)?;
-                    let row = self.effective_convoy_key(key).map(|item| {
-                        self.summarize(&reference, &flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, item))
-                    });
+                    let row = match self.effective_convoy_key(key) {
+                        Some(item) => match flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, item) {
+                            Ok(viewed) => Some(self.summarize(&reference, &viewed)),
+                            Err(error) => {
+                                // Keep the row as it is, and project it again.
+                                tracing::warn!(convoy = %reference.name, %error, "the engine convoy did not read; its row stays until a retry");
+                                retry.push(key.clone());
+                                return None;
+                            }
+                        },
+                        None => None,
+                    };
                     Some((reference, key.2.is_some(), row))
                 })
                 .collect::<Vec<_>>()
         };
+        if !retry.is_empty() || !unread.is_empty() {
+            // Project the unread convoys again shortly; their rows stay meanwhile.
+            self.projection_keys.extend(retry);
+            self.projection_full |= !unread.is_empty();
+            if let ConvoyProjectionDelivery::Coalesced { deadline } = &mut self.projection_delivery {
+                deadline.get_or_insert_with(|| Instant::now() + ENGINE_READ_RETRY);
+            }
+        }
         let (changed, removed, result_set) = {
             let mut view = self.state.write().await;
             let mut incremental_changed = Vec::new();
@@ -1609,6 +1638,22 @@ impl Aggregator {
                         }
                         None if rows.remove(&reference).is_some() => incremental_removed.push(reference),
                         _ => {}
+                    }
+                }
+            }
+            // An unread convoy keeps its prior row: neither changed nor removed.
+            for (reference, provenance) in &unread {
+                match provenance {
+                    ResourceProvenance::Local => {
+                        if let Some(row) = view.local_rows.get(reference) {
+                            local_replacement.insert(reference.clone(), row.clone());
+                        }
+                    }
+                    ResourceProvenance::Replica { .. } => {
+                        let Some(host) = reference.host.clone() else { continue };
+                        if let Some(row) = view.replica_rows.get(&host).and_then(|rows| rows.get(reference)) {
+                            replica_replacements.entry(host).or_default().insert(reference.clone(), row.clone());
+                        }
                     }
                 }
             }

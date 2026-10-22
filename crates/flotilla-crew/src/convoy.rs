@@ -225,7 +225,10 @@ impl SecondaryWatch for EngineConvoyWake {
         sender: flotilla_store::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            // The switch is off: there is nothing to follow.
+            // The switch is off: there is nothing to follow. With it on, the
+            // daemon installs the engine path while it starts, before any
+            // controller (and so this watch) is spawned (runtime.rs,
+            // `open_message_primitives`), so an empty path here means off.
             let Some(engine) = self.engine.get() else { return Ok(()) };
             let mut changes = engine.changes();
             loop {
@@ -278,7 +281,10 @@ impl Reconciler for ConvoyReconciler {
         let engine_refusal = self.admit_on_engine(obj).await;
         // With the engine holding the convoy, every promise read below is the engine's.
         let engine = deciding(&self.engine, obj);
-        let viewed = engine.is_some().then(|| viewed(&self.engine, obj, None).into_owned());
+        let viewed = match engine {
+            Some(_) => Some(viewed(&self.engine, obj).map_err(ResourceError::other)?.into_owned()),
+            None => None,
+        };
         let stale_seeds = engine.is_some() && obj.status.as_ref().is_some_and(|status| !status.promises.is_empty());
         let obj = viewed.as_ref().unwrap_or(obj);
         let capacity_wait = if obj.status.as_ref().is_none_or(|status| {

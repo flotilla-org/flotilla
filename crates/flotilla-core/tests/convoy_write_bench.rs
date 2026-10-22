@@ -157,7 +157,7 @@ async fn convoy_write_path_at_the_ceiling() {
 
     let started = Instant::now();
     for convoy in &local {
-        assert!(engine.promises(convoy, None).is_some(), "held");
+        assert!(engine.promises(convoy, None).expect("read").is_some(), "held");
     }
     report("read the engine's promises", started, local.len());
 

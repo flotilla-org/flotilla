@@ -114,10 +114,12 @@ pub trait EngineConvoys: Send + Sync {
     /// An operator's abandonment, with a reason.
     async fn abandon(&self, convoy: &ResourceObject<Convoy>, principal: &str, reason: &str) -> Result<(), String>;
 
-    /// The engine's promises of `convoy` in the old status's shape, when the
-    /// engine at `home` (the convoy's home; `None` for this one) holds it:
-    /// one keyed read, of this home's record or of the replica of another's.
-    fn promises(&self, convoy: &ResourceObject<Convoy>, home: Option<&str>) -> Option<OldPromises>;
+    /// The engine's promises of `convoy` in the old status's shape:
+    /// `Ok(Some)` when the engine at `home` (the convoy's home; `None` for
+    /// this one) holds it, `Ok(None)` when it does not, and `Err` when the
+    /// read failed. One keyed read: this home's records are in memory and
+    /// never fail; another home's is its replica in the decided store.
+    fn promises(&self, convoy: &ResourceObject<Convoy>, home: Option<&str>) -> Result<Option<OldPromises>, String>;
 
     /// The names of this home's convoys as their engine records change. No
     /// old record is written for an engine edge, so the convoy reconciler
@@ -137,27 +139,45 @@ pub fn deciding<'a>(path: &'a EngineConvoyPath, convoy: &ResourceObject<Convoy>)
     path.get().filter(|engine| engine.holds(convoy))
 }
 
-/// `convoy` as its readers see it (#3587 layer 8): with the engine's promises
-/// in place of the stored ones when the engine at its home holds it, else as
-/// stored. `home` is the convoy's home, `None` for this one.
-pub fn viewed<'a>(path: &EngineConvoyPath, convoy: &'a ResourceObject<Convoy>, home: Option<&str>) -> Cow<'a, ResourceObject<Convoy>> {
-    match path.get().and_then(|engine| engine.promises(convoy, home)) {
-        Some(promises) => {
-            let mut viewed = convoy.clone();
-            viewed.status.get_or_insert_with(Default::default).promises = promises;
-            Cow::Owned(viewed)
-        }
+/// A convoy of this home as its readers see it (#3587 layer 8): with the
+/// engine's promises in place of the stored ones when the engine holds it,
+/// else as stored. A failed read is an error, never the stored record: an
+/// engine-held convoy's stored promises were handed over, and would read as
+/// none. (This home's engine records are in memory, so it does not fail.)
+pub fn viewed<'a>(path: &EngineConvoyPath, convoy: &'a ResourceObject<Convoy>) -> Result<Cow<'a, ResourceObject<Convoy>>, String> {
+    let held = match path.get() {
+        Some(engine) => engine.promises(convoy, None)?,
+        None => None,
+    };
+    Ok(match held {
+        Some(promises) => Cow::Owned(with_promises(convoy, promises)),
         None => Cow::Borrowed(convoy),
-    }
+    })
 }
 
-/// [`viewed`] for a read that knows where its record came from.
-pub fn viewed_read(path: &EngineConvoyPath, read: &ReadResourceObject<Convoy>) -> ResourceObject<Convoy> {
+/// [`viewed`] for a read that knows where its record came from: a replica
+/// is read at its origin home. A failed read is an error, never the stored
+/// record: an engine-held convoy's stored promises were handed over, and
+/// would read as none.
+pub fn viewed_read(path: &EngineConvoyPath, read: &ReadResourceObject<Convoy>) -> Result<ResourceObject<Convoy>, String> {
     let home = match &read.provenance {
         ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str()),
         _ => None,
     };
-    viewed(path, &read.object, home).into_owned()
+    let held = match path.get() {
+        Some(engine) => engine.promises(&read.object, home)?,
+        None => None,
+    };
+    Ok(match held {
+        Some(promises) => with_promises(&read.object, promises),
+        None => read.object.clone(),
+    })
+}
+
+fn with_promises(convoy: &ResourceObject<Convoy>, promises: OldPromises) -> ResourceObject<Convoy> {
+    let mut viewed = convoy.clone();
+    viewed.status.get_or_insert_with(Default::default).promises = promises;
+    viewed
 }
 
 #[cfg(test)]
@@ -218,9 +238,13 @@ mod tests {
         async fn abandon(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
             Ok(())
         }
-        fn promises(&self, convoy: &ResourceObject<Convoy>, home: Option<&str>) -> Option<OldPromises> {
+        fn promises(&self, convoy: &ResourceObject<Convoy>, home: Option<&str>) -> Result<Option<OldPromises>, String> {
             self.asked.lock().expect("asked").push(home.map(str::to_owned));
-            (convoy.metadata.name != "unheld").then(kept)
+            match convoy.metadata.name.as_str() {
+                "unheld" => Ok(None),
+                "unreadable" => Err("replica read failed".into()),
+                _ => Ok(Some(kept())),
+            }
         }
         fn changes(&self) -> tokio::sync::broadcast::Receiver<String> {
             tokio::sync::broadcast::channel(1).1
@@ -252,24 +276,27 @@ mod tests {
     #[test]
     fn readers_see_the_engines_promises_only_where_it_holds_the_convoy() {
         let off = EngineConvoyPath::default();
-        assert!(matches!(viewed(&off, &convoy("c"), None), Cow::Borrowed(_)), "switch off: as stored");
+        assert!(matches!(viewed(&off, &convoy("c")), Ok(Cow::Borrowed(_))), "switch off: as stored");
 
         let engine = Arc::new(Holding { asked: Mutex::new(Vec::new()) });
         let on = EngineConvoyPath::default();
         let shared: Arc<dyn EngineConvoys> = engine.clone();
         assert!(on.set(shared).is_ok());
         let stored = convoy("c");
-        let seen = viewed(&on, &stored, None);
+        let seen = viewed(&on, &stored).expect("read");
         assert_eq!(seen.status.as_ref().expect("status").promises, kept());
-        assert!(matches!(viewed(&on, &convoy("unheld"), None), Cow::Borrowed(_)), "not held: as stored");
+        assert!(matches!(viewed(&on, &convoy("unheld")), Ok(Cow::Borrowed(_))), "not held: as stored");
 
         let replica = ReadResourceObject {
             object: convoy("c"),
             provenance: ResourceProvenance::Replica { origin_root: flotilla_protocol::NodeId::new("home-b"), last_synced_at: Utc::now() },
         };
-        assert_eq!(viewed_read(&on, &replica).status.expect("status").promises, kept());
+        assert_eq!(viewed_read(&on, &replica).expect("read").status.expect("status").promises, kept());
         let local = ReadResourceObject { object: convoy("c"), provenance: ResourceProvenance::Local };
-        viewed_read(&on, &local);
+        viewed_read(&on, &local).expect("read");
         assert_eq!(*engine.asked.lock().expect("asked"), vec![None, None, Some("home-b".to_owned()), None]);
+        // A failed replica read is an error, never the stored record (whose promises were handed over).
+        let unreadable = ReadResourceObject { object: convoy("unreadable"), provenance: replica.provenance.clone() };
+        assert_eq!(viewed_read(&on, &unreadable).expect_err("failed"), "replica read failed");
     }
 }

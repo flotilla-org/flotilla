@@ -411,17 +411,14 @@ impl EngineConvoys for ConvoyEngine {
         self.changes.subscribe()
     }
 
-    fn promises(&self, convoy: &ResourceObject<OldConvoy>, home: Option<&str>) -> Option<OldPromises> {
+    fn promises(&self, convoy: &ResourceObject<OldConvoy>, home: Option<&str>) -> Result<Option<OldPromises>, String> {
         let engine = match home.filter(|home| *home != self.convoys.home()) {
-            None => self.convoys.get(&convoy.metadata.name)?,
-            Some(home) => match self.convoys.replica(&convoy.metadata.name, home) {
-                Ok(found) => found?,
-                Err(error) => {
-                    tracing::warn!(convoy = %convoy.metadata.name, %home, %error, "the engine convoy replica did not read");
-                    return None;
-                }
-            },
+            None => self.convoys.get(&convoy.metadata.name),
+            Some(home) => self
+                .convoys
+                .replica(&convoy.metadata.name, home)
+                .map_err(|error| format!("convoy `{}` at {home}: the engine replica did not read: {error}", convoy.metadata.name))?,
         };
-        Some(map::old_promises(&engine, &crews(convoy)))
+        Ok(engine.map(|engine| map::old_promises(&engine, &crews(convoy))))
     }
 }

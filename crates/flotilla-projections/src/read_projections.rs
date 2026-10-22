@@ -1270,7 +1270,7 @@ impl ReadProjections<'_> {
             .max_by_key(|source| matches!(source.provenance, ResourceProvenance::Local))
             .ok_or_else(|| format!("no convoy matches `{name}`"))?;
         // With the engine holding the convoy, the promises explained are the engine's (#3587 layer 8).
-        let convoy = flotilla_resources::convoy::engine::viewed_read(self.convoy_engine, convoy_source);
+        let convoy = flotilla_resources::convoy::engine::viewed_read(self.convoy_engine, convoy_source)?;
         let now = self.clock.now();
         let (receivers, project, receiver_aliases) =
             convoy_receiver_evidence(self.message_receivers, self.backend, namespace, &convoy_sources.items, &convoy).await?;

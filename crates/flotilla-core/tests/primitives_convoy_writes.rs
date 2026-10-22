@@ -97,7 +97,7 @@ async fn old_convoy(backend: &ResourceBackend, name: &str, status: ConvoyStatus)
 /// in place (#3587 layer 8).
 async fn reread(fixture: &Fixture, name: &str) -> ResourceObject<Convoy> {
     let stored = fixture.backend.clone().using::<Convoy>(NAMESPACE).get(name).await.expect("convoy");
-    let promises = fixture.engine.promises(&stored, None).expect("the engine holds it");
+    let promises = fixture.engine.promises(&stored, None).expect("read").expect("the engine holds it");
     let mut viewed = stored;
     viewed.status.get_or_insert_with(Default::default).promises = promises;
     viewed
@@ -386,8 +386,8 @@ async fn a_replica_is_read_at_its_home() {
             })
         })
         .expect("follow");
-    assert!(home_a.engine.promises(&convoy, None).is_none(), "not this home's");
-    let seen = home_a.engine.promises(&convoy, Some("home-b")).expect("the replica");
+    assert!(home_a.engine.promises(&convoy, None).expect("read").is_none(), "not this home's");
+    let seen = home_a.engine.promises(&convoy, Some("home-b")).expect("read").expect("the replica");
     assert_eq!(seen["work"]["coder"][0].state, PromiseState::Submitted);
     assert!(!home_a.engine.holds(&convoy), "a replica is read, never decided, here");
 }

@@ -29,6 +29,8 @@ struct Recording {
     admission: Option<Admission>,
     promises: Mutex<Vec<(String, String, PromiseOperation, Actor)>>,
     views: Mutex<usize>,
+    /// The engine's change feed, when the test publishes on one.
+    changes: Mutex<Option<tokio::sync::broadcast::Sender<String>>>,
 }
 
 #[async_trait]
@@ -65,13 +67,16 @@ impl EngineConvoys for Recording {
     async fn abandon(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
         Ok(())
     }
-    fn promises(&self, convoy: &ResourceObject<Convoy>, _: Option<&str>) -> Option<OldPromises> {
+    fn promises(&self, convoy: &ResourceObject<Convoy>, _: Option<&str>) -> Result<Option<OldPromises>, String> {
         *self.views.lock().expect("views") += 1;
         // The engine's view: here, the stored promises as they are.
-        self.holds.then(|| convoy.status.as_ref().map(|status| status.promises.clone()).unwrap_or_default())
+        Ok(self.holds.then(|| convoy.status.as_ref().map(|status| status.promises.clone()).unwrap_or_default()))
     }
     fn changes(&self) -> tokio::sync::broadcast::Receiver<String> {
-        tokio::sync::broadcast::channel(1).1
+        match self.changes.lock().expect("changes").as_ref() {
+            Some(sender) => sender.subscribe(),
+            None => tokio::sync::broadcast::channel(1).1,
+        }
     }
 }
 
@@ -190,4 +195,41 @@ async fn an_engine_refusal_fails_the_convoy() {
     let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
     let Some(ConvoyStatusPatch::FailConvoy { message, .. }) = outcome.patch else { panic!("fail: {:?}", outcome.patch) };
     assert_eq!(message.as_deref(), Some("the engine refused this convoy's admission: NoObligations"));
+}
+
+// Behaviour (#3732 review): each engine edit's convoy name wakes the convoy reconciler through
+// EngineConvoyWake; with the switch off, the watch has nothing to follow and ends.
+#[tokio::test]
+async fn engine_changes_wake_the_convoy_reconciler() {
+    use flotilla_crew::convoy::EngineConvoyWake;
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+
+    let (sender, mut queue) = WorkQueueSender::channel();
+    let off: Box<dyn SecondaryWatch<Primary = Convoy>> = Box::new(EngineConvoyWake { engine: EngineConvoyPath::default() });
+    off.spawn(backend.clone(), "flotilla".into(), sender).await.expect("switch off: ends at once");
+    assert!(queue.try_recv().is_err(), "nothing queued");
+
+    let (feed, _) = tokio::sync::broadcast::channel(16);
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    *engine.changes.lock().expect("changes") = Some(feed.clone());
+    let path: EngineConvoyPath = Arc::new(OnceLock::new());
+    let shared: Arc<dyn EngineConvoys> = engine;
+    assert!(path.set(shared).is_ok());
+    let (sender, mut queue) = WorkQueueSender::channel();
+    let on: Box<dyn SecondaryWatch<Primary = Convoy>> = Box::new(EngineConvoyWake { engine: path });
+    let watch = tokio::spawn(on.spawn(backend, "flotilla".into(), sender));
+    // The watch subscribes when it starts: publish until it hears.
+    let woken = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let _ = feed.send("c".into());
+            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(20), queue.recv()).await {
+                return name;
+            }
+        }
+    })
+    .await
+    .expect("woken");
+    assert_eq!(woken, "c");
+    watch.abort();
 }
