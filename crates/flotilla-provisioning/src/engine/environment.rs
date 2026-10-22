@@ -20,6 +20,11 @@ impl Binding for EnvironmentBinding {
 
     fn request(obj: &ResourceObject<OldEnvironment>, home: &str) -> Result<EnvironmentRequest, String> {
         let spec = &obj.spec;
+        // A cloud sandbox (#3738) has no stored recipe in the look-over's shape: the old path
+        // keeps it, as it keeps one written before the switch.
+        if spec.cloud_sandbox.is_some() {
+            return Err("a cloud sandbox environment has no stored recipe yet; the old path keeps it".into());
+        }
         let provider = spec.resolved_provider_address(None)?.ok_or("an environment names no provider or host")?;
         // The provider's own recipe; only the build it names is a column (look-over rulings 5-6).
         let (recipe, image_build) = match (&spec.docker, &spec.host_direct) {
@@ -73,6 +78,8 @@ impl Binding for EnvironmentBinding {
             EnvironmentStatusPatch::MarkReady { docker_container_id, .. } => {
                 vec![Step::Realised { identity: identity(obj, docker_container_id.as_deref()) }]
             }
+            // A cloud sandbox is realised under its backing (never held while it has no recipe).
+            EnvironmentStatusPatch::MarkCloudReady { backing_id, .. } => vec![Step::Realised { identity: backing_id.clone() }],
             // A realised environment whose backing failed is no longer there.
             EnvironmentStatusPatch::MarkFailed { .. } if phase(obj) == EnvironmentPhase::Ready => vec![Step::Vanished],
             // The provider refused it: the old environment never retried a failure.

@@ -368,15 +368,34 @@ fn environment_object(docker: bool) -> ResourceObject<flotilla_resources::Enviro
                 ]
                 .into(),
             }),
+            cloud_sandbox: None,
         }
     } else {
         EnvironmentSpec {
             provider_address: Some("host:feta/provider:host-direct".parse().expect("provider")),
             host_direct: Some(HostDirectEnvironmentSpec { host_ref: String::new(), repo_default_dir: "/work".into() }),
             docker: None,
+            cloud_sandbox: None,
         }
     };
     ResourceObject { metadata: meta("env-a"), spec, status: None }
+}
+
+// Behaviour (#3738 on main): a cloud sandbox has no stored recipe in the look-over's shape, so it is
+// no engine request and the old path keeps it.
+#[test]
+fn a_cloud_sandbox_environment_stays_on_the_old_path() {
+    use super::environment::EnvironmentBinding;
+    use flotilla_resources::{CloudSandboxEnvironmentSpec, CloudSandboxSize};
+    let mut cloud = environment_object(false);
+    cloud.spec.host_direct = None;
+    cloud.spec.cloud_sandbox = Some(CloudSandboxEnvironmentSpec {
+        image: "registry/flotilla@sha256:00".into(),
+        size: CloudSandboxSize { cpus: 2, memory_bytes: 1 << 30, disk_bytes: 1 << 33 },
+        lifetime_cap_seconds: None,
+        env: Default::default(),
+    });
+    assert!(EnvironmentBinding::request(&cloud, HOME).expect_err("not held").contains("cloud sandbox"));
 }
 
 // Behaviour: an environment is realised under its container, or the host-direct root; its recipe is

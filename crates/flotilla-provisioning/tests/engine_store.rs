@@ -116,6 +116,7 @@ fn every_kind_survives_a_reopened_home() {
             provider_address: Some("host:feta/provider:host-direct".parse().expect("provider")),
             host_direct: Some(HostDirectEnvironmentSpec { host_ref: String::new(), repo_default_dir: "/work".into() }),
             docker: None,
+            cloud_sandbox: None,
         },
         status: None,
     };
