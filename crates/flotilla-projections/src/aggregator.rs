@@ -235,6 +235,9 @@ pub struct Aggregator {
     emitted_queries: HashSet<QueryId>,
     #[builder(skip)]
     attach_resolver: Option<Arc<dyn AttachCapabilityResolver>>,
+    /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4).
+    #[builder(skip = Arc::new(crate::ports::NoLifecycleReads))]
+    lifecycle_reads: Arc<dyn crate::ports::LifecycleReads>,
     #[builder(skip)]
     attach_refresh_tasks: tokio::task::JoinSet<AttachCapabilityResolution>,
     #[builder(skip)]
@@ -350,6 +353,7 @@ impl Aggregator {
             known_origins: HashSet::new(),
             emitted_queries: HashSet::new(),
             attach_resolver: None,
+            lifecycle_reads: Arc::new(crate::ports::NoLifecycleReads),
             attach_refresh_tasks: tokio::task::JoinSet::new(),
             attach_refresh_generations: HashMap::new(),
             attach_refresh_inputs: HashMap::new(),
@@ -365,6 +369,12 @@ impl Aggregator {
             event_sink,
             event_rx,
         }
+    }
+
+    /// Read engine-held provisioning resources through `reads` (#3629 layer 4).
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn crate::ports::LifecycleReads>) -> Self {
+        self.lifecycle_reads = reads;
+        self
     }
 
     pub fn with_attach_resolver_arc(mut self, resolver: Arc<dyn AttachCapabilityResolver>) -> Self {
@@ -6483,6 +6493,90 @@ mod tests {
                 }
             }
         });
+    }
+
+    // Behaviour (#3629 layer 4): behind `[primitives]` the engine's reading of a checkout decides its
+    // readiness over the old status, read by key at the checkout's home (a replica's origin root);
+    // without a reading the old status still decides.
+    #[tokio::test]
+    async fn engine_readings_decide_checkout_readiness() {
+        use flotilla_protocol::{result_set::ReadinessState, LifecycleReading};
+        use flotilla_resources::{CheckoutPhase, CheckoutStatus, VesselPhase, VesselSpec, VesselStatus};
+
+        use crate::ports::{LifecycleReads, ProvisioningKind};
+
+        /// One keyed read: the kind, name and origin asked for.
+        type Read = (ProvisioningKind, String, Option<String>);
+        #[derive(Default)]
+        struct Scripted(std::sync::Mutex<(Option<LifecycleReading>, Vec<Read>)>);
+        impl LifecycleReads for Scripted {
+            fn reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Option<LifecycleReading> {
+                let mut script = self.0.lock().expect("script");
+                script.1.push((kind, name.to_owned(), origin.map(str::to_owned)));
+                script.0.clone()
+            }
+        }
+
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Ready).call();
+        let (events, _) = broadcast::channel(128);
+        let reads = Arc::new(Scripted::default());
+        let mut aggregator =
+            Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads.clone());
+        let host = HostName::new("feta");
+        let origin = flotilla_protocol::NodeId::new("remote-origin");
+        aggregator.origin_hosts.insert(origin.clone(), host.clone());
+        let provenance = ResourceProvenance::Replica { origin_root: origin, last_synced_at: Utc::now() };
+        convoy.status.as_mut().expect("status").work.get_mut("implement").expect("work").placement =
+            Some(PlacementStatus { fields: BTreeMap::from([("host".into(), serde_json::json!(host.as_str()))]) });
+        let mut vessel = backend
+            .using::<Vessel>("flotilla")
+            .create(
+                &InputMeta::builder().name("vessel-a".into()).build(),
+                &VesselSpec {
+                    convoy_ref: convoy.metadata.name.clone(),
+                    vessel_name: "implement".into(),
+                    placement_policy_ref: "local".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
+            .await
+            .expect("vessel");
+        vessel.status = Some(VesselStatus { phase: VesselPhase::Provisioning, checkout_refs: BTreeMap::new(), ..Default::default() });
+        apply_readiness_event(
+            &mut aggregator.readiness_vessels,
+            ReadWatchEvent::Added(ReadResourceObject { object: vessel, provenance: provenance.clone() }),
+        );
+        let mut checkout = checkout_object("checkout-a", "/work/repo", RepositoryKey("repo".into())).await;
+        checkout.metadata.labels.insert(CONVOY_LABEL.into(), convoy.metadata.name.clone());
+        // The old status says Ready throughout.
+        checkout.status = Some(CheckoutStatus { phase: CheckoutPhase::Ready, ..Default::default() });
+        apply_readiness_event(
+            &mut aggregator.readiness_checkouts,
+            ReadWatchEvent::Added(ReadResourceObject { object: checkout, provenance }),
+        );
+        let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("kiwi"));
+        let blocker = |aggregator: &Aggregator| {
+            let row = aggregator.summarize(&reference, &convoy);
+            let readiness = row.readiness().clone();
+            (
+                readiness.state,
+                readiness.blockers.iter().find(|blocker| blocker.resource.name == "checkout-a").map(|blocker| blocker.reason.clone()),
+            )
+        };
+
+        assert_eq!(blocker(&aggregator).1, None, "no reading: the old status, Ready, decides");
+        reads.0.lock().expect("script").0 = Some(LifecycleReading::GaveUp { cause: "branch conflicts".into() });
+        assert_eq!(blocker(&aggregator), (ReadinessState::Failed, Some("branch conflicts".into())));
+        reads.0.lock().expect("script").0 =
+            Some(LifecycleReading::Retrying { failures: 2, next: chrono::DateTime::UNIX_EPOCH, cause: "worktree add failed".into() });
+        let (state, reason) = blocker(&aggregator);
+        assert_eq!(state, ReadinessState::Blocked);
+        assert!(reason.expect("blocked").starts_with("worktree add failed (2 failed"));
+        reads.0.lock().expect("script").0 = Some(LifecycleReading::Ready { identity: "/work/repo".into() });
+        assert_eq!(blocker(&aggregator).1, None);
+        let calls = reads.0.lock().expect("script").1.clone();
+        assert!(calls.contains(&(ProvisioningKind::Checkout, "checkout-a".into(), Some("remote-origin".into()))), "{calls:?}");
     }
 
     // #1961: Active plus pending agent work must remain provisioning, even

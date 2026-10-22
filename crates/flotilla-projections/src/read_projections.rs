@@ -110,6 +110,8 @@ pub struct ReadProjections<'a> {
     pub clock: &'a Arc<dyn Clock>,
     pub leaf_subscriptions: &'a dyn LeafSubscriptionRead,
     pub fleet: &'a FleetService,
+    /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4).
+    pub lifecycles: &'a dyn crate::ports::LifecycleReads,
 }
 
 impl ReadProjections<'_> {
@@ -933,6 +935,7 @@ impl ReadProjections<'_> {
             clock: self.clock,
             leaf_subscriptions: self.leaf_subscriptions,
             fleet: self.fleet,
+            lifecycles: self.lifecycles,
         }
     }
 
@@ -1333,14 +1336,20 @@ impl ReadProjections<'_> {
             .iter()
             .map(|checkout_name| {
                 let selected = selected_checkouts.get(checkout_name);
-                let provenance = selected.and_then(|object| {
-                    checkout_sources
-                        .iter()
-                        .find(|source| {
-                            source.object.metadata.name == object.metadata.name
-                                && source.object.metadata.resource_version == object.metadata.resource_version
-                        })
-                        .map(|source| explained_provenance(&source.provenance, self.node_id))
+                let source = selected.and_then(|object| {
+                    checkout_sources.iter().find(|source| {
+                        source.object.metadata.name == object.metadata.name
+                            && source.object.metadata.resource_version == object.metadata.resource_version
+                    })
+                });
+                let provenance = source.map(|source| explained_provenance(&source.provenance, self.node_id));
+                // One keyed engine read per checkout, at the checkout's home.
+                let lifecycle = source.and_then(|source| {
+                    let origin = match &source.provenance {
+                        flotilla_resources::ResourceProvenance::Local => None,
+                        flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+                    };
+                    self.lifecycles.reading(crate::ports::ProvisioningKind::Checkout, checkout_name, origin.as_deref())
                 });
                 let integration = selected.and_then(|checkout| checkout.status.as_ref()).map(|status| &status.integration);
                 ExplainedCheckout {
@@ -1350,6 +1359,7 @@ impl ReadProjections<'_> {
                     clean: integration.map(|status| explain_condition(&status.clean, now, LANDING_EVIDENCE_TTL)),
                     pushed: integration.map(|status| explain_condition(&status.pushed, now, LANDING_EVIDENCE_TTL)),
                     landed: integration.map(|status| explain_condition(&status.landed, now, LANDING_EVIDENCE_TTL)),
+                    lifecycle,
                 }
             })
             .collect::<Vec<_>>();

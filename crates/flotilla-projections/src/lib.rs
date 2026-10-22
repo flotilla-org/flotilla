@@ -55,6 +55,7 @@ pub fn run(
         let observed = context.observed;
         let aggregator = Aggregator::with_events(state, context.host_name, context.event_sink, context.events)
             .with_attach_resolver_arc(context.attach)
+            .with_lifecycle_reads(context.lifecycles)
             .with_change_request_resolver_arc(context.change_requests)
             .with_issue_resolver_arc(context.issues)
             .with_issue_polling_health(issue_polling);
@@ -94,4 +95,6 @@ pub struct AggregatorContext {
     pub attach: Arc<dyn AttachCapabilityResolver>,
     pub change_requests: Arc<dyn ConvoyChangeRequestResolver>,
     pub issues: Arc<dyn IssueMaterializationResolver>,
+    /// The engine's provisioning readings; `NoLifecycleReads` with the switch off.
+    pub lifecycles: Arc<dyn ports::LifecycleReads>,
 }
