@@ -134,8 +134,7 @@ impl Sample for TerminalSessionKind {
     fn request() -> TerminalSessionRequest {
         TerminalSessionRequest {
             environment: StoredRef::new("env", HOME),
-            vessel: Some(StoredRef::new("vessel", HOME)),
-            convoy: Some(StoredRef::new("convoy", HOME)),
+            holder: Some(Holder::vessel("vessel")),
             role: "coder".into(),
             pool: "cleat".into(),
             cwd: "/workspace".into(),
