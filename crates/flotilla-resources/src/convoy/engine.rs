@@ -48,12 +48,22 @@ pub struct VerdictScope {
 pub enum Admission {
     /// The engine holds it, admitted now or before.
     Held,
-    /// Not the engine's to admit: not yet bootstrapped, already deciding on
-    /// the old path, or a standing convoy (the seat-growth item on #3587
-    /// gates those). It stays on the old path.
-    Skipped(String),
-    /// The engine refused it; the refusal names why.
+    /// Not the engine's to admit; it stays on the old path.
+    Skipped(SkipReason),
+    /// The engine refused it: the machine's refusal, by name
+    /// (`NoObligations`, `UnknownProject`, ...).
     Refused(String),
+}
+
+/// Why engine admission left a convoy on the old path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Bootstrap has not frozen its workflow yet.
+    NotBootstrapped,
+    /// A standing convoy: the seat-growth item on #3587 gates those, with the import.
+    Standing,
+    /// Something is decided already; the import maps a convoy with history.
+    Decided(String),
 }
 
 /// The engine-first Convoy writer, in the old shape.

@@ -3,9 +3,12 @@
 //! One deterministic mapping serves engine admission, the crew verbs, the
 //! one-way copy back into the old status, and the layer 9 import:
 //!
-//! - **Seats** (#3574 decision 11): an old crew `(vessel, role)` is the seat
-//!   of its role, with the vessel as the discriminator only when the role
-//!   repeats across vessels.
+//! - **Seats** (#3574 decision 11): an old crew `(vessel, role)` of the
+//!   frozen workflow snapshot is the seat of its role, with the vessel as the
+//!   discriminator only when the role repeats across the snapshot's vessels.
+//!   A crew added later (a handoff target) is always discriminated by its
+//!   vessel. The snapshot never changes, so no seat is renamed by a later
+//!   crew of the same role.
 //! - **Labels** (layer 6 labels ruling): an old promise id is its label when
 //!   no other crew of the convoy uses that id; ids that repeat (each
 //!   deliverer's `template/pr`) are qualified by their seat, `@<seat>/<id>`.
@@ -40,20 +43,27 @@ pub struct Crews {
 }
 
 impl Crews {
-    /// Every crew the old status names: its admitted workflow's, and any a
-    /// handoff or promise added since.
+    /// Every crew the old status names: its admitted workflow's, seated by
+    /// the repeat rule over the frozen snapshot, and any a handoff or promise
+    /// added since, each seated under its vessel.
     pub fn of(status: &ConvoyStatus) -> Self {
-        let mut pairs = BTreeSet::new();
+        let mut admitted = BTreeSet::new();
         for vessel in status.workflow_snapshot.iter().flat_map(|snapshot| &snapshot.vessels) {
-            pairs.extend(vessel.crew.iter().map(|crew| (vessel.name.clone(), crew.role.clone())));
+            admitted.extend(vessel.crew.iter().map(|crew| (vessel.name.clone(), crew.role.clone())));
         }
+        let mut later = BTreeSet::new();
         for (vessel, crew) in &status.crew_work {
-            pairs.extend(crew.keys().map(|role| (vessel.clone(), role.clone())));
+            later.extend(crew.keys().map(|role| (vessel.clone(), role.clone())));
         }
         for (vessel, crew) in &status.promises {
-            pairs.extend(crew.keys().map(|role| (vessel.clone(), role.clone())));
+            later.extend(crew.keys().map(|role| (vessel.clone(), role.clone())));
         }
-        Self::from_pairs(pairs)
+        let mut crews = Self::from_pairs(admitted);
+        for (vessel, role) in later {
+            let seat = crews.seat(&vessel, &role);
+            crews.seats.entry((vessel, role)).or_insert(seat);
+        }
+        crews
     }
 
     fn from_pairs(pairs: BTreeSet<(String, String)>) -> Self {
@@ -71,14 +81,13 @@ impl Crews {
         Self { seats }
     }
 
-    /// The seat of `(vessel, role)`. A crew the status does not name yet (a
-    /// handoff target) is placed by the same rule.
+    /// The seat of `(vessel, role)`. A crew the snapshot does not name (a
+    /// handoff target) is seated under its vessel.
     pub fn seat(&self, vessel: &str, role: &str) -> SeatName {
-        if let Some(seat) = self.seats.get(&(vessel.to_owned(), role.to_owned())) {
-            return seat.clone();
+        match self.seats.get(&(vessel.to_owned(), role.to_owned())) {
+            Some(seat) => seat.clone(),
+            None => SeatName::new(role, vessel),
         }
-        let repeats = self.seats.keys().any(|(other, named)| named == role && other != vessel);
-        SeatName::new(role, if repeats { vessel } else { "" })
     }
 
     /// The old crew a seat stands for.

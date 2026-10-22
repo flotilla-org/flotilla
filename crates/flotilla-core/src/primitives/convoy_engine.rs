@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flotilla_resources::{
     convoy::{
-        engine::{Actor, Admission, EngineConvoys, VerdictScope},
+        engine::{Actor, Admission, EngineConvoys, SkipReason, VerdictScope},
         reconcile::is_ensured,
     },
     promises::PromiseOperation,
@@ -34,7 +34,7 @@ use flotilla_store::ResourceBackend;
 
 use super::{
     convoy_map::{self as map, Crews},
-    convoys::Convoys,
+    convoys::{Convoys, EditError},
 };
 
 /// The role a decider outside the convoy is named by in an edge's `by`.
@@ -57,25 +57,30 @@ impl ConvoyEngine {
     }
 
     /// Applies the edges `plan` works out, off the async workers, then copies
-    /// the result back. A refusal comes back as the error.
-    async fn edit(
+    /// the result back whenever any edge applied, a partial edit included. A
+    /// refusal comes back as the error; the plan's other output as the value.
+    async fn edit<T: Send + 'static>(
         &self,
         convoy: &ResourceObject<OldConvoy>,
-        plan: impl FnOnce(&Resource<Convoy>, &mut flotilla_state_machines::machines::convoy::MemoryConvoyWorld) -> Result<Vec<ConvoyEdge>, String>
+        plan: impl FnOnce(
+                &Resource<Convoy>,
+                &mut flotilla_state_machines::machines::convoy::MemoryConvoyWorld,
+            ) -> Result<(Vec<ConvoyEdge>, T), String>
             + Send
             + 'static,
-    ) -> Result<usize, String> {
+    ) -> Result<T, String> {
         let convoys = Arc::clone(&self.convoys);
         let name = convoy.metadata.name.clone();
         let now = self.now();
-        let applied = tokio::task::spawn_blocking(move || convoys.edit(&name, now, plan))
-            .await
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string())?;
+        let edited = tokio::task::spawn_blocking(move || convoys.edit(&name, now, plan)).await.map_err(|error| error.to_string())?;
+        let applied = match &edited {
+            Ok((applied, _)) => *applied,
+            Err(error) => error.applied(),
+        };
         if applied > 0 {
             self.copy_back_logged(convoy).await;
         }
-        Ok(applied)
+        edited.map(|(_, output)| output).map_err(|error: EditError| error.to_string())
     }
 
     async fn copy_back_logged(&self, convoy: &ResourceObject<OldConvoy>) {
@@ -135,13 +140,13 @@ impl EngineConvoys for ConvoyEngine {
             return Ok(Admission::Held);
         }
         let Some(status) = convoy.status.as_ref().filter(|status| status.workflow_snapshot.is_some()) else {
-            return Ok(Admission::Skipped("not bootstrapped yet".into()));
+            return Ok(Admission::Skipped(SkipReason::NotBootstrapped));
         };
         if is_ensured(convoy) {
-            return Ok(Admission::Skipped("a standing convoy waits for the seat-growth ruling and the import (#3587)".into()));
+            return Ok(Admission::Skipped(SkipReason::Standing));
         }
         if let Err(history) = map::undecided(status) {
-            return Ok(Admission::Skipped(format!("{history}; the import maps it")));
+            return Ok(Admission::Skipped(SkipReason::Decided(history)));
         }
         let request = map::request(convoy)?;
         let project = request.project.clone();
@@ -199,15 +204,17 @@ impl EngineConvoys for ConvoyEngine {
                 target: target.clone(),
                 owner: seat.clone(),
             };
-            match operation {
-                PromiseOperation::Declare { id, kind, .. } => {
-                    if found(&id).is_some() {
-                        return Ok(Vec::new());
-                    }
-                    Ok(vec![declare(&id, kind.as_str()).into()])
-                }
-                PromiseOperation::Submit { id, kind, .. } => {
-                    let (address, revision) = submitted.expect("a submission's address");
+            // An operator decides with its own authority; a crew's verbs are its seat's.
+            let (decider, authority) = match &actor {
+                Actor::Operator { principal } => (operator(principal), Authority::Operator),
+                Actor::Crew | Actor::Observer => (seat.clone(), Authority::Owner),
+            };
+            let edges = match (operation, submitted) {
+                (PromiseOperation::Declare { id, kind, .. }, _) => match found(&id) {
+                    Some(_) => Vec::new(),
+                    None => vec![declare(&id, kind.as_str()).into()],
+                },
+                (PromiseOperation::Submit { id, kind, .. }, Some((address, revision))) => {
                     let mut edges = Vec::new();
                     let (promise, owner) = match found(&id) {
                         Some(promise) => {
@@ -218,8 +225,8 @@ impl EngineConvoys for ConvoyEngine {
                             let same = current.is_some_and(|last| last.address == address);
                             let newer = current.is_some_and(|last| !revision.is_empty() && last.revision != revision);
                             match promise.progress.value {
-                                Progress::Kept if same => return Ok(Vec::new()),
-                                Progress::Submitted if same && !newer => return Ok(Vec::new()),
+                                Progress::Kept if same => return Ok((Vec::new(), ())),
+                                Progress::Submitted if same && !newer => return Ok((Vec::new(), ())),
                                 _ => {}
                             }
                             (promise.id, promise.owner.clone())
@@ -231,30 +238,35 @@ impl EngineConvoys for ConvoyEngine {
                             (promise, seat.clone())
                         }
                     };
-                    // Discovery submits on the owner's behalf; a crew's own verb is its seat.
-                    let by = if actor == Actor::Observer { owner } else { seat.clone() };
+                    // Only the owner submits: discovery and an operator submit on its behalf.
+                    let by = if actor == Actor::Crew { seat.clone() } else { owner };
                     let durable = input(&format!("{address}@{revision}"), "durable");
                     world.durable.put(&Ref::new(durable.as_str()), true);
                     edges.push(Submit { promise, by, address, revision, durable: Ref::new(durable) }.into());
-                    Ok(edges)
+                    edges
                 }
-                PromiseOperation::Retract { id, reason } => {
+                (PromiseOperation::Submit { id, .. }, None) => return Err(format!("promise `{id}`: the submission has no address")),
+                (PromiseOperation::Retract { id, reason }, _) => {
                     let promise = found(&id).ok_or_else(|| format!("unknown promise `{id}`"))?;
-                    Ok(vec![Retract { promise: promise.id, by: seat.clone(), authority: Authority::Owner, reason }.into()])
+                    vec![Retract { promise: promise.id, by: decider, authority, reason }.into()]
                 }
-                PromiseOperation::Verdict { id, verdict, .. } => {
+                (PromiseOperation::Verdict { id, verdict, .. }, _) => {
                     let promise = found(&id).ok_or_else(|| format!("unknown promise `{id}`"))?;
-                    if verdict.accepted {
-                        let submission = u32::try_from(promise.submissions.len()).unwrap_or(u32::MAX);
-                        Ok(vec![Keep::Observed { promise: promise.id, submission }.into()])
-                    } else {
-                        Ok(vec![Reject { promise: promise.id }.into()])
+                    match (verdict.accepted, &actor) {
+                        (true, Actor::Operator { .. }) => {
+                            vec![Keep::Verdict { promise: promise.id, by: decider, authority, reason: verdict.why }.into()]
+                        }
+                        (true, _) => {
+                            let submission = u32::try_from(promise.submissions.len()).unwrap_or(u32::MAX);
+                            vec![Keep::Observed { promise: promise.id, submission }.into()]
+                        }
+                        (false, _) => vec![Reject { promise: promise.id }.into()],
                     }
                 }
-            }
+            };
+            Ok((edges, ()))
         })
         .await
-        .map(drop)
     }
 
     async fn reassign(&self, convoy: &ResourceObject<OldConvoy>, vessel: &str, from: &str, to: &str) -> Result<(), String> {
@@ -264,7 +276,7 @@ impl EngineConvoys for ConvoyEngine {
         self.edit(convoy, move |current, world| {
             let mut edges: Vec<ConvoyEdge> = Vec::new();
             if from == to {
-                return Ok(edges);
+                return Ok((edges, ()));
             }
             if current.spec().seat(&to).is_none() {
                 // A handoff to a crew the convoy has no seat for fans it out under the sender.
@@ -291,10 +303,9 @@ impl EngineConvoys for ConvoyEngine {
                     .filter(|promise| promise.owner == from && open(promise))
                     .map(|promise| Reassign { promise: promise.id, to: to.clone(), by: from.clone(), authority: Authority::Owner }.into()),
             );
-            Ok(edges)
+            Ok((edges, ()))
         })
         .await
-        .map(drop)
     }
 
     async fn keep_by_verdict(
@@ -308,8 +319,6 @@ impl EngineConvoys for ConvoyEngine {
         let scope = scope.clone();
         let by = operator(principal);
         let reason = reason.to_owned();
-        let kept = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let labels = Arc::clone(&kept);
         self.edit(convoy, move |current, _| {
             let in_scope = |seat: &SeatName| {
                 crews
@@ -318,17 +327,16 @@ impl EngineConvoys for ConvoyEngine {
             };
             let promises: Vec<&Promise> =
                 current.spec().promises.iter().map(|row| &row.record).filter(|promise| open(promise) && in_scope(&promise.owner)).collect();
-            labels.lock().expect("labels").extend(promises.iter().map(|promise| promise.label.clone()));
-            Ok(promises
+            let labels = promises.iter().map(|promise| promise.label.clone()).collect();
+            let edges = promises
                 .into_iter()
                 .map(|promise| {
                     Keep::Verdict { promise: promise.id, by: by.clone(), authority: Authority::Operator, reason: reason.clone() }.into()
                 })
-                .collect())
+                .collect();
+            Ok((edges, labels))
         })
-        .await?;
-        let kept = kept.lock().expect("labels").clone();
-        Ok(kept)
+        .await
     }
 
     async fn verdict(
@@ -341,28 +349,32 @@ impl EngineConvoys for ConvoyEngine {
     ) -> Result<(), String> {
         let (label, by, reason) = (label.to_owned(), operator(principal), reason.to_owned());
         self.edit(convoy, move |current, _| {
-            let promise = current
-                .spec()
-                .promises
-                .iter()
-                .map(|row| &row.record)
-                .find(|promise| promise.label == label || map::old_id(&promise.label) == label)
-                .ok_or_else(|| format!("no promise labelled `{label}`"))?;
+            let promises: Vec<&Promise> = current.spec().promises.iter().map(|row| &row.record).collect();
+            // An exact label names one promise; a bare old id must name exactly one.
+            let promise = match promises.iter().find(|promise| promise.label == label) {
+                Some(promise) => *promise,
+                None => match promises.iter().filter(|promise| map::old_id(&promise.label) == label).collect::<Vec<_>>().as_slice() {
+                    [promise] => **promise,
+                    [] => return Err(format!("no promise labelled `{label}`")),
+                    several => {
+                        let labels = several.iter().map(|promise| format!("`{}`", promise.label)).collect::<Vec<_>>().join(", ");
+                        return Err(format!("`{label}` names several promises; give one of the labels {labels}"));
+                    }
+                },
+            };
             let edge: ConvoyEdge = if keep {
                 Keep::Verdict { promise: promise.id, by, authority: Authority::Operator, reason }.into()
             } else {
                 Retract { promise: promise.id, by, authority: Authority::Operator, reason }.into()
             };
-            Ok(vec![edge])
+            Ok((vec![edge], ()))
         })
         .await
-        .map(drop)
     }
 
     async fn deliver(&self, convoy: &ResourceObject<OldConvoy>) -> Result<(), String> {
-        self.edit(convoy, |current, _| Ok(if current.label() == ConvoyLabel::Delivered { Vec::new() } else { vec![Deliver.into()] }))
+        self.edit(convoy, |current, _| Ok((if current.label() == ConvoyLabel::Delivered { Vec::new() } else { vec![Deliver.into()] }, ())))
             .await
-            .map(drop)
     }
 
     async fn abandon(&self, convoy: &ResourceObject<OldConvoy>, principal: &str, reason: &str) -> Result<(), String> {
@@ -370,14 +382,13 @@ impl EngineConvoys for ConvoyEngine {
         self.edit(convoy, move |current, world| {
             // An ended engine convoy has nothing left to abandon.
             if current.label() != ConvoyLabel::Open {
-                return Ok(Vec::new());
+                return Ok((Vec::new(), ()));
             }
             let authority = input(&name, "abandon");
             world.authority.put(&Ref::new(authority.as_str()), true);
-            Ok(vec![flotilla_state_machines::machines::convoy::Abandon { by, reason, authority: Ref::new(authority) }.into()])
+            Ok((vec![flotilla_state_machines::machines::convoy::Abandon { by, reason, authority: Ref::new(authority) }.into()], ()))
         })
         .await
-        .map(drop)
     }
 
     async fn copy_back(&self, convoy: &ResourceObject<OldConvoy>) -> Result<bool, String> {

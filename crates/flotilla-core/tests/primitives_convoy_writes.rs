@@ -230,9 +230,9 @@ async fn handoff_reassigns_open_promises() {
     assert_eq!(old_promise(&convoy, "work", "reviewer", "template/pr").state, PromiseState::Open);
     fixture.engine.reassign(&convoy, "work", "reviewer", "fixer").await.expect("reassigned to a new seat");
     let engine = fixture.convoys.get("c").expect("held");
-    let (_, fixer) = engine.spec().seat(&SeatName::new("fixer", "")).expect("fan-out seat");
+    let (_, fixer) = engine.spec().seat(&SeatName::new("fixer", "work")).expect("fan-out seat");
     assert_eq!(fixer.parent, Some(SeatName::new("reviewer", "")));
-    assert_eq!(engine.spec().promises.iter().next().expect("promise").record.owner, SeatName::new("fixer", ""));
+    assert_eq!(engine.spec().promises.iter().next().expect("promise").record.owner, SeatName::new("fixer", "work"));
 }
 
 // Behaviour: an operator keeps a crew's open promises by verdict (the old `--force`), or keeps or
@@ -308,4 +308,90 @@ async fn two_crews_submit_promises_of_one_id() {
     assert!(labels.contains(&"@reviewer/script-ledger".to_owned()), "{labels:?}");
     // The same reference again is the submission already made.
     fixture.engine.promise(&convoy, "work", "coder", &ledger("coder"), Actor::Crew).await.expect("kept: a no-op");
+}
+
+// Behaviour (#3721 review): an operator's promise operation carries operator authority, so it
+// may retract a template promise the crew may not, and its accepted verdict is a `Keep` verdict.
+#[tokio::test]
+async fn an_operator_decides_with_its_own_authority() {
+    let fixture = fixture();
+    let convoy = admitted(&fixture, "c", bootstrapped(vec![("work", vec![crew("coder", true)])])).await;
+    let retract = PromiseOperation::Retract { id: "template/pr".into(), reason: "superseded".into() };
+    let refused = fixture.engine.promise(&convoy, "work", "coder", &retract, Actor::Crew).await.expect_err("the crew may not");
+    assert!(refused.contains("Unauthorised"), "{refused}");
+    let operator = Actor::Operator { principal: "alice".into() };
+    fixture.engine.promise(&convoy, "work", "coder", &retract, operator).await.expect("the operator may");
+    assert_eq!(old_promise(&reread(&fixture.backend, "c").await, "work", "coder", "template/pr").state, PromiseState::Retracted);
+}
+
+// Behaviour (#3721 review): a verdict names one promise. An exact label always does; a bare old
+// id shared by several promises is refused with the labels to choose from, never guessed.
+#[tokio::test]
+async fn an_ambiguous_verdict_is_refused_with_the_labels() {
+    let fixture = fixture();
+    let convoy = admitted(&fixture, "c", bootstrapped(vec![("a", vec![crew("coder", true)]), ("b", vec![crew("coder", true)])])).await;
+    let refused = fixture.engine.verdict(&convoy, "template/pr", true, "alice", "merged").await.expect_err("ambiguous");
+    assert!(refused.contains("`@coder~a/template/pr`") && refused.contains("`@coder~b/template/pr`"), "{refused}");
+    fixture.engine.verdict(&convoy, "@coder~b/template/pr", true, "alice", "merged").await.expect("exact");
+    let convoy = reread(&fixture.backend, "c").await;
+    assert_eq!(old_promise(&convoy, "a", "coder", "template/pr").state, PromiseState::Open);
+    assert_eq!(old_promise(&convoy, "b", "coder", "template/pr").state, PromiseState::Kept);
+}
+
+// Behaviour (#3721 review): seats are fixed by the frozen snapshot. A crew of a role that joins
+// another vessel later is seated under its vessel, and the admitted crew keeps its seat.
+#[test]
+fn a_later_crew_of_a_seated_role_never_renames_the_seat() {
+    let mut status = bootstrapped(vec![("a", vec![crew("coder", true)])]);
+    let crews = convoy_map::Crews::of(&status);
+    assert_eq!(crews.seat("a", "coder"), SeatName::new("coder", ""));
+    status.crew_work.entry("b".into()).or_default().insert("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build());
+    let crews = convoy_map::Crews::of(&status);
+    assert_eq!(crews.seat("a", "coder"), SeatName::new("coder", ""), "unchanged");
+    assert_eq!(crews.seat("b", "coder"), SeatName::new("coder", "b"));
+    assert_eq!(crews.crew(&SeatName::new("coder", "")), Some(("a", "coder")));
+    assert_eq!(crews.crew(&SeatName::new("coder", "b")), Some(("b", "coder")));
+}
+
+// Behaviour (#3721 review): an edit refused part-way says how many of its edges applied, and
+// those stay applied; its recorded inputs are cleared, so the world does not grow.
+#[test]
+fn a_partial_edit_reports_what_applied() {
+    use flotilla_core::primitives::convoys::EditError;
+    use flotilla_state_machines::{
+        machines::convoy::{ConvoyRefusal, Declare, PromiseId, Submit},
+        Ref, Source,
+    };
+    let fixture = fixture();
+    let request =
+        convoy_map::request(&tokio_block(old_convoy(&fixture.backend, "c", bootstrapped(vec![("work", vec![crew("coder", true)])]))))
+            .expect("request");
+    fixture.convoys.world(|world| world.projects.put(&Ref::new(request.project.as_str()), ()));
+    assert!(fixture.convoys.admit("c", request, flotilla_schema::Timestamp(1)).expect("admitted"));
+    let owner = SeatName::new("coder", "");
+    let target: flotilla_schema::Address = "project:fleet/convoy:c".parse().expect("target");
+    let error = fixture
+        .convoys
+        .edit("c", flotilla_schema::Timestamp(2), |_, world| {
+            world.durable.put(&Ref::new("other"), true);
+            let declare =
+                Declare { promise: PromiseId(9), label: "l2".into(), kind: "pr".into(), target: target.clone(), owner: owner.clone() };
+            // Not recorded as durable: refused after the Declare applied.
+            let submit = Submit {
+                promise: PromiseId(9),
+                by: owner.clone(),
+                address: target.clone(),
+                revision: "r".into(),
+                durable: Ref::new("unrecorded"),
+            };
+            Ok((vec![declare.into(), submit.into()], ()))
+        })
+        .expect_err("not durable");
+    assert!(matches!(&error, EditError::Refused { refusal: ConvoyRefusal::NotDurable, applied: 1, .. }), "{error:?}");
+    assert!(fixture.convoys.get("c").expect("held").spec().promise(PromiseId(9)).is_some(), "the declare stays");
+    assert!(fixture.convoys.world(|world| world.durable.lookup(&Ref::new("other")).is_none()), "inputs cleared");
+}
+
+fn tokio_block<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(future)
 }

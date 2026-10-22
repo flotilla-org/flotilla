@@ -208,7 +208,7 @@ impl ConvoyReconciler {
         match engine.admit(obj).await {
             Ok(Admission::Held) => None,
             Ok(Admission::Skipped(reason)) => {
-                tracing::debug!(convoy = %obj.metadata.name, %reason, "convoy stays on the old path");
+                tracing::debug!(convoy = %obj.metadata.name, ?reason, "convoy stays on the old path");
                 None
             }
             Ok(Admission::Refused(refusal)) => Some(refusal),

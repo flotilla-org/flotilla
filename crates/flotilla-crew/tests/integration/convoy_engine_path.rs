@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_resources::{
     address::{artifact_address, record_name},
-    convoy::engine::{Actor, Admission, EngineConvoyPath, EngineConvoys, VerdictScope},
+    convoy::engine::{Actor, Admission, EngineConvoyPath, EngineConvoys, SkipReason, VerdictScope},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState},
     Artifact, ArtifactSpec, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec, CrewWorkPhase,
     CrewWorkState, InputMeta, ResourceObject, StatusPatch, VesselRequirement, WorkflowSnapshot, WorkflowTemplate,
@@ -37,7 +37,7 @@ impl EngineConvoys for Recording {
         self.holds
     }
     async fn admit(&self, _: &ResourceObject<Convoy>) -> Result<Admission, String> {
-        Ok(self.admission.clone().unwrap_or(Admission::Skipped("test".into())))
+        Ok(self.admission.clone().unwrap_or(Admission::Skipped(SkipReason::NotBootstrapped)))
     }
     async fn promise(
         &self,
