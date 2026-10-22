@@ -4,6 +4,7 @@
 pub mod environment_orphans;
 pub mod image_inventory;
 pub mod reconcilers;
+pub mod stored;
 
 #[cfg(test)]
 mod test_git_repo;

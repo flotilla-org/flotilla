@@ -68,6 +68,8 @@ STATE_MACHINE_DEPENDENTS = frozenset({
     "flotilla-engine-store", "flotilla-inbox", "flotilla-inbox-testkit", "flotilla-quint-testkit",
     # #3317: the composition root and its Message path, behind `[primitives]`.
     "flotilla-core", "flotilla-daemon",
+    # #3629: the provisioning lifecycle kinds declare their specs beside their requests.
+    "flotilla-provisioning",
 })
 # #3317: the Message switch composes the engine inbox; only these use it directly.
 INBOX_DEPENDENTS = frozenset({"flotilla-core", "flotilla-daemon"})
