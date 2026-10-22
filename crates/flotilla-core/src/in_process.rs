@@ -609,6 +609,8 @@ pub struct LiveConvoyRecord {
     pub owner_host: HostName,
 }
 
+const CONVOY_ATTACH_WAIT: Duration = Duration::from_secs(60);
+
 fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<String> {
     let role = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
     let identity = convoy.spec.project_ref.as_ref().map_or_else(|| role.clone(), |project| format!("{role}@{project}"));
@@ -3325,15 +3327,18 @@ impl InProcessDaemon {
         }
         let auto_attach = self.should_auto_attach(intent.auto_attach);
         match self.admit_convoy_start(&namespace, &intent, &dispatching_principal_ref).await {
-            Ok((record_name, address, naming, warnings)) if auto_attach => {
+            Ok((record_name, address, naming, mut warnings)) if auto_attach => {
                 match self.wait_for_convoy_attach(&namespace, &record_name, &address).await {
-                    Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
-                        name: address,
-                        warnings,
-                        naming,
-                        attach_plan: Some(resolved.plan),
-                        binding: resolved.binding,
-                    },
+                    Ok((resolved, notice)) => {
+                        warnings.extend(notice);
+                        flotilla_protocol::CommandValue::ConvoyStarted {
+                            name: address,
+                            warnings,
+                            naming,
+                            binding: resolved.as_ref().and_then(|resolved| resolved.binding.clone()),
+                            attach_plan: resolved.map(|resolved| resolved.plan),
+                        }
+                    }
                     Err(message) => flotilla_protocol::CommandValue::Error { message },
                 }
             }
@@ -3357,7 +3362,12 @@ impl InProcessDaemon {
         self.finish_context_free_command(command_id, empty_repo_identity(), result);
     }
 
-    async fn wait_for_convoy_attach(&self, namespace: &str, name: &str, address: &str) -> Result<ResolvedAttach, String> {
+    async fn wait_for_convoy_attach(
+        &self,
+        namespace: &str,
+        name: &str,
+        address: &str,
+    ) -> Result<(Option<ResolvedAttach>, Option<String>), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let listed = convoys.list().await.map_err(|error| format!("watch convoy {address} while waiting to attach: {error}"))?;
         if let Some(message) = listed.items.iter().find(|convoy| convoy.metadata.name == name).and_then(convoy_start_failure) {
@@ -3367,17 +3377,15 @@ impl InProcessDaemon {
             .watch(WatchStart::resuming_from(&listed))
             .await
             .map_err(|error| format!("watch convoy {address} while waiting to attach: {error}"))?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + CONVOY_ATTACH_WAIT;
         let mut retry = tokio::time::interval(Duration::from_millis(100));
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_attach_error = "attach target is not available yet".to_string();
 
         loop {
             tokio::select! {
                 _ = retry.tick() => {
-                    match self.resolve_attach_command_internal(name).await {
-                        Ok(resolved) => return Ok(resolved),
-                        Err(message) => last_attach_error = message,
+                    if let Ok(resolved) = self.resolve_attach_command_internal(name).await {
+                        return Ok((Some(resolved), None));
                     }
                 }
                 event = watch.next() => {
@@ -3396,10 +3404,74 @@ impl InProcessDaemon {
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    return Err(format!("convoy {address} was created but no crew session became attachable: {last_attach_error}"));
+                    // Read current state: a queued watch event must not hide a failure
+                    // or deletion when the attach deadline fires at the same instant.
+                    let convoy = convoys.get(name).await.map_err(|error| match error {
+                        ResourceError::NotFound { .. } => format!("convoy {address} was deleted while waiting for a crew session"),
+                        error => format!("read convoy {address} while waiting to attach: {error}"),
+                    })?;
+                    if let Some(message) = convoy_start_failure(&convoy) {
+                        return Err(message);
+                    }
+                    if let Ok(resolved) = self.resolve_attach_command_internal(name).await {
+                        return Ok((Some(resolved), None));
+                    }
+                    let stage = self.convoy_start_stage(namespace, &convoy).await?;
+                    return Ok((None, Some(format!(
+                        "convoy {address} is still starting: {stage}; attach later with `flotilla attach {address}`"
+                    ))));
                 }
             }
         }
+    }
+
+    async fn convoy_start_stage(&self, namespace: &str, convoy: &ResourceObject<ResourceConvoy>) -> Result<String, String> {
+        let vessels = self
+            .resource_backend
+            .using::<flotilla_resources::Vessel>(namespace)
+            .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.metadata.name.clone())]))
+            .await
+            .map_err(|error| format!("read convoy vessels while waiting to attach: {error}"))?;
+        let mut stages = Vec::new();
+        // Labels select the candidates; the spec confirms ownership before a
+        // vessel's status can describe (or fail) this convoy's start.
+        for vessel in vessels.items.iter().filter(|vessel| vessel.spec.convoy_ref == convoy.metadata.name) {
+            let stage = match vessel.status.as_ref() {
+                Some(status) => {
+                    if status.phase == flotilla_resources::VesselPhase::Failed {
+                        return Err(format!(
+                            "convoy vessel {} failed while starting: {}",
+                            vessel.spec.vessel_name,
+                            status.message.as_deref().unwrap_or("vessel failed without a message")
+                        ));
+                    }
+                    status.message.clone().unwrap_or_else(|| match status.phase {
+                        flotilla_resources::VesselPhase::Ready => "waiting for its terminal session".into(),
+                        flotilla_resources::VesselPhase::Pending => "waiting for placement and its environment".into(),
+                        flotilla_resources::VesselPhase::Provisioning => "provisioning its environment and checkouts".into(),
+                        flotilla_resources::VesselPhase::Interrupted => "interrupted; waiting for recovery".into(),
+                        flotilla_resources::VesselPhase::Lost => "lost; waiting for recovery".into(),
+                        flotilla_resources::VesselPhase::Failed => unreachable!("failed vessels return above"),
+                    })
+                }
+                None => "waiting for its environment".into(),
+            };
+            stages.push(format!("vessel {}: {stage}", vessel.spec.vessel_name));
+        }
+        let phase = match convoy.status.as_ref().map(|status| status.phase).unwrap_or_default() {
+            flotilla_resources::ConvoyPhase::Pending => "pending",
+            flotilla_resources::ConvoyPhase::Active => "active",
+            flotilla_resources::ConvoyPhase::Interrupted => "interrupted",
+            flotilla_resources::ConvoyPhase::Landing => "landing",
+            flotilla_resources::ConvoyPhase::Landed => "landed",
+            flotilla_resources::ConvoyPhase::Failed => "failed",
+            flotilla_resources::ConvoyPhase::Abandoned => "abandoned",
+        };
+        let detail = convoy.status.as_ref().and_then(|status| status.message.as_deref());
+        if stages.is_empty() {
+            stages.push("waiting for its vessel and environment".into());
+        }
+        Ok(format!("{phase}{}; {}", detail.map(|detail| format!(": {detail}")).unwrap_or_default(), stages.join("; ")))
     }
 
     fn project_service(&self) -> ProjectService<'_> {

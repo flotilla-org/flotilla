@@ -1051,3 +1051,18 @@ fn dispatch_score_formats_fallback_and_positive_share() {
     score.attributes.weight = 2.0.try_into().expect("positive weight");
     assert!(super::format_dispatch_score(&score).contains("next/share=3/2"));
 }
+
+// Glue: a successful start without an attach plan prints the still-starting
+// stage and attach-later command rather than an error or a crew-ready claim.
+#[test]
+fn slow_convoy_start_prints_attach_later_hint() {
+    let notice = "convoy coder@flotilla is still starting: pending; vessel work: provisioning its environment and checkouts; attach later with `flotilla attach coder@flotilla`";
+    let output = format_command_result(&CommandValue::ConvoyStarted {
+        name: "coder@flotilla".into(),
+        naming: None,
+        warnings: vec![notice.into()],
+        attach_plan: None,
+        binding: None,
+    });
+    assert_eq!(output, format!("convoy started: coder@flotilla\nWarning: {notice}"));
+}

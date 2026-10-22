@@ -1,6 +1,7 @@
 //! Composition-root scenarios, grouped by the transaction or projection they exercise.
 //! Shared test support keeps cross-area credential staging and forge observations reusable.
 
+mod start_attach;
 mod support;
 pub(super) use support::{create_identity_convoy, create_running_session, create_test_environment, test_meta};
 mod admission;
