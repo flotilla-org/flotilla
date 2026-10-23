@@ -740,3 +740,37 @@ async fn cloud_ready_and_finalization_use_generic_backing() {
     reconciler.run_finalizer(&ready).await.unwrap();
     assert_eq!(*runtime.destroyed.lock().unwrap(), vec!["opaque-cloud-backing"]);
 }
+
+// #3765 B1: restart between creation and status publication may adopt an
+// unrecorded backing. Failed adoption is Unknown and requeues, never terminal.
+#[tokio::test]
+async fn unrecorded_cloud_adoption_failure_requeues() {
+    // Fake the provider runtime boundary; the resource reconciler is real.
+    struct AdoptionFailure;
+    #[async_trait]
+    impl EnvironmentRuntime for AdoptionFailure {
+        async fn provision_environment(&self, _: &str, _: &EnvironmentSpec) -> Result<EnvironmentProvisioning, String> {
+            Err("adoption setup failed; backing retained for retry: SSH unavailable".into())
+        }
+        async fn destroy(&self, _: &str, _: &str) -> Result<(), String> {
+            panic!("failed adoption must preserve backing")
+        }
+    }
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
+        "provider_address":"account:cloud/provider:cloud", "cloud_sandbox": {
+            "image":"image@sha256:digest", "size":{"cpus":1,"memory_bytes":1024,"disk_bytes":2048}, "env":{}
+        }
+    }))
+    .unwrap();
+    let object = backend.using::<Environment>("flotilla").create(&InputMeta::builder().name("cloud".into()).build(), &spec).await.unwrap();
+    let reconciler = EnvironmentReconciler::new(Arc::new(AdoptionFailure), backend, "flotilla");
+    let prepared = reconciler.prepare(&object).await.unwrap();
+    let outcome = reconciler.reconcile(&object, &prepared, chrono::Utc::now());
+    assert!(outcome.requeue_after.is_some(), "adoption must retry without requiring another resource event");
+    let mut status = EnvironmentStatus::default();
+    outcome.patch.unwrap().apply(&mut status);
+    assert_eq!(status.phase, EnvironmentPhase::Provisioning);
+    assert!(!status.ready);
+    assert!(status.message.unwrap().starts_with("Unknown: adoption setup failed"));
+}

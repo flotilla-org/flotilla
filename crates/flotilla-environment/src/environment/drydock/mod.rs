@@ -246,19 +246,25 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                 }
             }
         }
-        if let Some(handle) = self.active.lock().await.get(&id).and_then(std::sync::Weak::upgrade) {
+        let active = self.active.lock().await.get(&id).and_then(std::sync::Weak::upgrade);
+        if let Some(handle) = active {
             if handle.backing == environment.id && handle.image.as_str() == prepared.spec.image {
                 handle.created_for_setup.store(false, std::sync::atomic::Ordering::Release);
-                let connection = handle.connect().await?;
-                for tool in opts.tools {
-                    for asset in tool.assets {
-                        connection.deliver(asset.clone()).await?;
-                        handle.remember_asset(asset);
+                let setup = async {
+                    let connection = handle.connect().await?;
+                    for tool in opts.tools {
+                        for asset in tool.assets {
+                            connection.deliver(asset.clone()).await?;
+                            handle.remember_asset(asset);
+                        }
                     }
+                    // Re-adoption must apply rotated tokens and tool environments.
+                    connection.configure(env.clone()).await?;
+                    *handle.env.write().expect("environment") = env;
+                    Ok::<_, String>(())
                 }
-                // Re-adoption must apply rotated tokens and tool environments.
-                connection.configure(env.clone()).await?;
-                *handle.env.write().expect("environment") = env;
+                .await;
+                setup.map_err(|cause| format!("adoption setup failed; backing retained for retry: {cause}"))?;
                 return Ok(handle);
             }
         }

@@ -96,6 +96,7 @@ pub enum EnvironmentPrepared {
     Ready(Box<EnvironmentProvisioning>),
     Failed(String),
     Waiting(String),
+    RetryAdoption(String),
 }
 
 impl<R> Reconciler for EnvironmentReconciler<R>
@@ -172,6 +173,9 @@ where
                 } else {
                     match self.runtime.provision_environment(&obj.metadata.name, &obj.spec).await {
                         Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
+                        Err(message) if obj.spec.cloud_sandbox.is_some() && message.starts_with("adoption setup failed;") => {
+                            Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: {message}")))
+                        }
                         Err(message) => Ok(EnvironmentPrepared::Failed(message)),
                     }
                 }
@@ -214,13 +218,19 @@ where
                     registry_digest: provisioning.registry_digest.clone(),
                 }),
                 EnvironmentPrepared::Failed(message) => Some(EnvironmentStatusPatch::MarkFailed { message: message.clone() }),
-                EnvironmentPrepared::Waiting(message) => Some(EnvironmentStatusPatch::WaitForImageBuild { message: message.clone() }),
+                EnvironmentPrepared::Waiting(message) | EnvironmentPrepared::RetryAdoption(message) => {
+                    Some(EnvironmentStatusPatch::WaitForImageBuild { message: message.clone() })
+                }
                 EnvironmentPrepared::Foreign | EnvironmentPrepared::None => None,
             },
             _ => None,
         };
 
-        ReconcileOutcome::new(patch)
+        let mut outcome = ReconcileOutcome::new(patch);
+        if matches!(prepared, EnvironmentPrepared::RetryAdoption(_)) {
+            outcome.requeue_after = Some(std::time::Duration::from_secs(5));
+        }
+        outcome
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
