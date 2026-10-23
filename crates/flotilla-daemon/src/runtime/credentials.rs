@@ -745,6 +745,9 @@ pub(super) async fn redeliver_codex_credentials(state: &ControllerRuntimeState, 
                     "provisioned environment mounts unavailable; falling back to pushed Codex credential delivery");
                 Vec::new()
             });
+        // The fallback writes only auth.json through the guest runner. If the
+        // home is actually Shared, this reaches the same RW host mount and
+        // preserves its session files while rotating the credential.
         let result = if registry.codex_home_is_shared(&environment.metadata.name, &mounts) {
             registry.refresh_delivered_credentials(&environment.metadata.name).await
         } else {

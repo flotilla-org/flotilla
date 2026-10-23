@@ -1557,6 +1557,8 @@ mod agent_contract_tests {
                                 }
                             }
                         }
+                        // Replace the longer /usr/bin/ prefix first: replacing
+                        // /bin/ first would also rewrite that prefix's suffix.
                         let prologue = ROOT_UTILITY_SELECTION
                             .replace("/usr/bin/", &format!("{}/fallback/", root.path().display()))
                             .replace("/bin/", &format!("{}/primary/", root.path().display()));
