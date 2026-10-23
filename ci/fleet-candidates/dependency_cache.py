@@ -22,7 +22,7 @@ def cache_key(sources):
     for name in INPUTS:
         data = (sources / name).read_bytes()
         digest.update(name.encode() + b'\0' + str(len(data)).encode() + b'\0' + data)
-    return 'fleet-linux-v2-' + digest.hexdigest()
+    return 'fleet-linux-v3-' + digest.hexdigest()
 
 
 def prune_workspace(root):
