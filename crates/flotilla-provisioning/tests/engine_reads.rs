@@ -213,4 +213,10 @@ fn a_session_reads_as_its_current_launch() {
         reads.held_sessions(&Holder::vessel("vessel-a")).expect("index").into_iter().map(|view| view.name).collect();
     launches.sort();
     assert_eq!(launches, [launch(name, 1), launch(name, 2)]);
+
+    // Found however many launches there are (#3748 review): doubling past the latest, halving back.
+    for n in 3..=11 {
+        sessions.request(&launch(name, n), request(), Timestamp(10 + i64::from(n))).expect("launch");
+        assert_eq!(reads.terminal_session(name, HOME).expect("read").expect("held").name, launch(name, n));
+    }
 }

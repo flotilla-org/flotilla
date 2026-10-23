@@ -265,15 +265,25 @@ impl ProvisioningReads for StoreReads {
     }
 
     fn terminal_session(&self, name: &str, home: &str) -> Result<Option<View<TerminalSessionKind>>, ReadError> {
+        // Launches are numbered from 1 without gaps, so the latest is found by doubling past it and
+        // halving back, as the write path's `current` does: O(log launches) keyed reads.
         self.read(|read| {
-            let mut latest = None;
-            for n in 1.. {
-                match keyed(read, &super::launch(name, n), home)? {
-                    Some(view) => latest = Some(view),
-                    None => return Ok(latest),
+            let Some(first) = keyed(read, &super::launch(name, 1), home)? else { return Ok(None) };
+            let (mut held, mut probe) = ((1, first), 2u32);
+            let mut absent = loop {
+                match keyed(read, &super::launch(name, probe), home)? {
+                    Some(view) => (held, probe) = ((probe, view), probe.saturating_mul(2)),
+                    None => break probe,
+                }
+            };
+            while absent - held.0 > 1 {
+                let mid = held.0 + (absent - held.0) / 2;
+                match keyed(read, &super::launch(name, mid), home)? {
+                    Some(view) => held = (mid, view),
+                    None => absent = mid,
                 }
             }
-            Ok(latest)
+            Ok(Some(held.1))
         })
     }
 
