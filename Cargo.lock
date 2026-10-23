@@ -2485,6 +2485,7 @@ dependencies = [
  "flotilla-state-machines",
  "rusqlite",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

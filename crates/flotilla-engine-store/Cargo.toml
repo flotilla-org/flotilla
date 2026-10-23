@@ -10,6 +10,7 @@ flotilla-schema = { path = "../flotilla-schema" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
