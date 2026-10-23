@@ -101,7 +101,7 @@ impl TerminalPool for DeliveryProbePool {
         self.submission_attempts.fetch_add(1, Ordering::SeqCst);
         self.submission_attempted.notify_one();
         if self.controller_fence_unverifiable {
-            return Ok(flotilla_terminal::TerminalSubmission::AgentRestartRequired);
+            return Ok(flotilla_terminal::TerminalSubmission::ControllerFenceUnverifiable);
         }
         if self.controller_refusals.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() {
             return Ok(flotilla_terminal::TerminalSubmission::Refused("controller input is not idle".into()));

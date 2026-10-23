@@ -282,7 +282,7 @@ pub(super) async fn submit_and_confirm(
     };
     match submission {
         Ok(TerminalSubmission::Submitted) => {}
-        Ok(TerminalSubmission::AgentRestartRequired) => {
+        Ok(TerminalSubmission::ControllerFenceUnverifiable) => {
             return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable));
         }
         Ok(TerminalSubmission::Refused(reason)) => {

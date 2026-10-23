@@ -55,7 +55,7 @@ pub enum TerminalDeliveryFailure {
 }
 
 impl TerminalDeliveryFailure {
-    pub fn message(self) -> &'static str {
+    fn message(self) -> &'static str {
         match self {
             Self::ControllerFenceUnverifiable => flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE,
             Self::StartupNotReady => "agent TUI did not become ready before the message delivery deadline; no text was sent",
@@ -495,7 +495,7 @@ where
                 if let Some(message) = head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
                     if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
                         condition.message_id.as_deref() == Some(message.id.as_str())
-                            && (condition.reason == flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_REASON
+                            && (condition.is_controller_fence_unverifiable()
                                 || condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
                                 || condition.reason == TERMINAL_DELIVERY_EXPIRED_REASON
                                 || (condition.reason == TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
@@ -930,7 +930,7 @@ where
                 .status
                 .as_ref()
                 .and_then(|status| status.degraded.as_ref())
-                .is_some_and(|condition| condition.reason == flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_REASON)
+                .is_some_and(|condition| condition.is_controller_fence_unverifiable())
             || matches!(prepared, TerminalPrepared::MessageDeliveryNotSubmitted { message_id, .. } if delivery_retry_exhausted(obj.status.as_ref().map_or(1, |status| status.next_delivery_failure_count(message_id))))
         {
             actuations.push({

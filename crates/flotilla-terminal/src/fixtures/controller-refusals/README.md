@@ -2,6 +2,11 @@
 
 Captured on 2026-10-23 with the crew image's actual binary:
 `cleat 0.1.0 (89cf40cb19c4, release, opt 3, x86_64-unknown-linux-gnu, protocol 15, vt ghostty)`.
+The consumer requires cleat `89cf40c` or later on every fleet host. Keep that
+cleat revision in the same fleet/crew-image roll as this consumer; prose-only
+refusals from an older cleat deliberately remain ambiguous. The current crew
+image already supplies the revision recorded above.
+
 Each cause's JSON stores the unmodified stdout, stderr and exit code of a real
 `cleat send SESSION --submit --controller-idle 10s turn` refusal (`0ms` for busy).
 `unverifiable-inspect.json` is the corresponding actual `inspect --json` result.

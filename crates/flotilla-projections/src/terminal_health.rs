@@ -18,7 +18,7 @@ pub fn condition(status: &TerminalSessionStatus) -> Option<ExplainedTerminalCond
             .degraded
             .as_ref()
             .map(|condition| {
-                if condition.reason == flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_REASON {
+                if condition.is_controller_fence_unverifiable() {
                     ExplainedTerminalCondition::ControllerFenceUnverifiable { message: condition.message.clone() }
                 } else if condition.is_delivery() {
                     ExplainedTerminalCondition::DeliveryUnconfirmed { message: condition.message.clone() }
@@ -89,12 +89,6 @@ mod tests {
         .apply(&mut status);
         assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::DeliveryUnconfirmed { .. })));
     }
-}
-
-#[cfg(test)]
-mod controller_fence_tests {
-    use super::*;
-    use flotilla_resources::{StatusPatch, TerminalSessionStatusPatch};
 
     // A known-unsent permanent fence has its own condition and actionable crew
     // attention. Ordinary observations and expiry cannot turn it into a receipt.

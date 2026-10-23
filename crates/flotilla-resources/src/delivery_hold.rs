@@ -82,7 +82,7 @@ pub fn legacy_delivery_gate_needed(session: &ResourceObject<TerminalSession>, no
     if status.phase != crate::TerminalSessionPhase::Running {
         return false;
     }
-    if condition.reason == crate::CONTROLLER_FENCE_UNVERIFIABLE_REASON {
+    if condition.is_controller_fence_unverifiable() {
         return true;
     }
     let held = condition.reason == crate::TERMINAL_DELIVERY_EXPIRED_REASON

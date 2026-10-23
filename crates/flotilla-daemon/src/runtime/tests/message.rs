@@ -1412,7 +1412,7 @@ async fn unverifiable_controller_fence_requires_restart_without_a_confirmation_w
     assert!(pool.inputs.lock().expect("input log").is_empty());
     assert_eq!(
         super::super::message::message_transport_outcome(Ok(outcome)),
-        flotilla_agent_connector::TransportOutcome::SessionNeedsRestart {
+        flotilla_agent_connector::TransportOutcome::ControllerFenceUnverifiable {
             reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into()
         }
     );

@@ -252,9 +252,13 @@ impl MessageDelivery {
                     self.held.hold(turn.members, until);
                 }
                 Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable)) => {
+                    let Some(message_id) = turn.members.first() else {
+                        warn!(%session, "empty turn cannot record a controller fence delivery failure");
+                        continue;
+                    };
                     let terminals = self.state.daemon.resource_backend().using::<TerminalSession>(&self.namespace);
                     let patch = flotilla_resources::TerminalSessionStatusPatch::MarkControllerFenceUnverifiable {
-                        message_id: turn.members.first().cloned().unwrap_or_default(),
+                        message_id: message_id.clone(),
                         message: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into(),
                         observed_at: Utc::now(),
                     };
@@ -306,6 +310,9 @@ impl MessageDelivery {
     async fn start_turn(&mut self, holder: &Holder) -> Result<(), String> {
         // A fence failure is scoped to this child activation; MarkRunning on
         // an operator's resume clears it. No receipts or timed retries here.
+        // `holders` was read before collect_turns persisted any newly completed
+        // failures in this pass. Re-read so that stale snapshot cannot resubmit
+        // a just-refused turn before the next tick.
         let terminal = self
             .state
             .daemon
@@ -318,7 +325,7 @@ impl MessageDelivery {
             .status
             .as_ref()
             .and_then(|status| status.degraded.as_ref())
-            .is_some_and(|condition| condition.reason == flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_REASON)
+            .is_some_and(|condition| condition.is_controller_fence_unverifiable())
         {
             return Ok(());
         }

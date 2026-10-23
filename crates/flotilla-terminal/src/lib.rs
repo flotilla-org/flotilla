@@ -74,7 +74,7 @@ pub enum TerminalSubmission {
     /// A temporary controller refusal; keep the batch queued without a receipt.
     Refused(String),
     /// No input was written, but the controller fence cannot clear in this activation.
-    AgentRestartRequired,
+    ControllerFenceUnverifiable,
 }
 
 /// Pure CLI adapter for terminal session management.

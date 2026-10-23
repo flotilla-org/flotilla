@@ -3139,7 +3139,7 @@ async fn unverifiable_controller_fence_is_immediately_actionable_and_not_retried
     let transport = Arc::new(FakeMessageTransport {
         submissions: Default::default(),
         observations: Default::default(),
-        outcome: TransportOutcome::SessionNeedsRestart { reason: reason.into() },
+        outcome: TransportOutcome::ControllerFenceUnverifiable { reason: reason.into() },
         accepted: Default::default(),
         working: Default::default(),
     });
@@ -3167,4 +3167,71 @@ async fn unverifiable_controller_fence_is_immediately_actionable_and_not_retried
         assert_eq!(retry.attempts, 1);
         assert!(matches!(retry.disposition, flotilla_resources::ControllerRetryDisposition::Terminal { .. }));
     }
+}
+
+// A refused batch can persist zero through two of its three member failures
+// before a store error. Restart repairs that exact batch before accepting later
+// Working evidence, never creates a receipt, and never resubmits its input.
+#[hegel::test]
+fn partial_controller_refusal_is_repaired_before_acceptance(tc: hegel::TestCase) {
+    let completed = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let observations = tc.draw(gs::integers::<i64>().min_value(1).max_value(3));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let (backend, inbox) = delivery_inbox().await;
+        let transport = Arc::new(FakeMessageTransport {
+            submissions: Default::default(),
+            observations: Default::default(),
+            outcome: TransportOutcome::Pending,
+            accepted: Default::default(),
+            working: Default::default(),
+        });
+        inbox.reconcile_delivery(&router(&transport), at(20)).await.expect("record original submission");
+        let reason = flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE;
+        let terminals = backend.using::<flotilla_resources::TerminalSession>("flotilla");
+        flotilla_store::apply_status_patch(
+            &terminals,
+            "terminal",
+            &flotilla_resources::TerminalSessionStatusPatch::MarkControllerFenceUnverifiable {
+                message_id: "message-0".into(),
+                message: reason.into(),
+                observed_at: at(21),
+            },
+        )
+        .await
+        .expect("durable session proof");
+        let messages = backend.using::<Message>("flotilla");
+        let names: Vec<String> = (0..3).map(|index| format!("message-{index}")).collect();
+        // Seed the actual persisted states possible before each member write.
+        for name in names.iter().take(completed) {
+            let message = messages.get(name).await.expect("member");
+            let mut status = message.status.expect("submission status");
+            assert!(status.submission.is_some());
+            status.retry = Some(flotilla_resources::ControllerRetry::terminal(None, at(21), reason));
+            status.submission = None;
+            status.failed_batch_members = names.clone();
+            MessageStatusPatch::Wait { phase: MessagePhase::Deliverable, reason: reason.into(), at: at(21) }.apply(&mut status);
+            messages.update_status(name, &message.metadata.resource_version, &status).await.expect("partial failure write");
+        }
+        transport.accepted.store(true, std::sync::atomic::Ordering::SeqCst);
+        transport.working.store(true, std::sync::atomic::Ordering::SeqCst);
+        let restarted = MessageInbox::new(backend.clone(), "flotilla");
+        for index in 0..observations {
+            restarted.reconcile_delivery(&router(&transport), at(30 + index)).await.expect("repair then observe");
+            for name in &names {
+                let status = messages.get(name).await.expect("member").status.expect("failure");
+                assert!(status.resolved_receiver.is_none(), "known-unsent input cannot receive a later activity receipt");
+                assert!(status.submission.is_none());
+                assert_eq!(status.failed_batch_members, names);
+                assert_eq!(status.reason.as_deref(), Some(reason));
+                assert!(matches!(
+                    status.retry.expect("failure").disposition,
+                    flotilla_resources::ControllerRetryDisposition::Terminal { .. }
+                ));
+            }
+            assert_eq!(transport.submissions.lock().expect("inputs").len(), 1);
+        }
+        let failure = terminals.get("terminal").await.expect("terminal").status.expect("status").degraded.expect("condition");
+        assert_eq!(failure.consecutive_failures, 1, "repair preserves the original session failure episode");
+    });
 }

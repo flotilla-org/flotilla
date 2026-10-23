@@ -457,16 +457,19 @@ impl TerminalSessionStatus {
 }
 
 impl TerminalSessionDegradedCondition {
+    /// This activation cannot accept guarded input until the agent restarts.
+    pub fn is_controller_fence_unverifiable(&self) -> bool {
+        self.reason == CONTROLLER_FENCE_UNVERIFIABLE_REASON
+    }
+
     /// Delivery evidence is cleared only by an explicit delivery or lifecycle
     /// transition, never by an unrelated observation or provider recovery.
     pub fn is_delivery(&self) -> bool {
-        matches!(
-            self.reason.as_str(),
-            TERMINAL_DELIVERY_UNCONFIRMED_REASON
-                | TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
-                | TERMINAL_DELIVERY_EXPIRED_REASON
-                | CONTROLLER_FENCE_UNVERIFIABLE_REASON
-        )
+        self.is_controller_fence_unverifiable()
+            || matches!(
+                self.reason.as_str(),
+                TERMINAL_DELIVERY_UNCONFIRMED_REASON | TERMINAL_DELIVERY_NOT_SUBMITTED_REASON | TERMINAL_DELIVERY_EXPIRED_REASON
+            )
     }
 }
 

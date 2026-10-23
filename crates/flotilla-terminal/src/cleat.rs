@@ -399,7 +399,7 @@ impl TerminalPool for CleatTerminalPool {
         match self.guarded_deliver(session_name, text).await? {
             TerminalSubmission::Submitted => Ok(()),
             TerminalSubmission::Refused(reason) => Err(reason),
-            TerminalSubmission::AgentRestartRequired => Err("cleat controller fence requires an agent restart".into()),
+            TerminalSubmission::ControllerFenceUnverifiable => Err("cleat controller fence requires an agent restart".into()),
         }
     }
 
@@ -427,7 +427,7 @@ impl TerminalPool for CleatTerminalPool {
             .and_then(|(_, cause)| cause.strip_suffix(')'));
         match (output.exit_code, cause) {
             (Some(1), Some("fence-pending" | "fence-settling" | "quiet-time" | "busy")) => Ok(TerminalSubmission::Refused(reason)),
-            (Some(1), Some("fence-unverifiable")) => Ok(TerminalSubmission::AgentRestartRequired),
+            (Some(1), Some("fence-unverifiable")) => Ok(TerminalSubmission::ControllerFenceUnverifiable),
             _ => Err(reason),
         }
     }
@@ -834,7 +834,10 @@ mod tests {
                 exit_code: Some(captured["exit_code"].as_i64().unwrap() as i32),
             })]));
             let result = test_pool(runner.clone(), "cleat").guarded_deliver("agent", "turn").await;
-            assert_eq!(result, Ok(if restart { TerminalSubmission::AgentRestartRequired } else { TerminalSubmission::Refused(reason) }));
+            assert_eq!(
+                result,
+                Ok(if restart { TerminalSubmission::ControllerFenceUnverifiable } else { TerminalSubmission::Refused(reason) })
+            );
             assert_eq!(logical_calls(&runner).len(), 1);
         }
     }
@@ -906,7 +909,7 @@ mod tests {
             ]));
             assert_eq!(
                 test_pool(runner.clone(), "cleat").guarded_retry_delivery("agent", "turn").await,
-                if restart { Ok(TerminalSubmission::AgentRestartRequired) } else { Err(reason) }
+                if restart { Ok(TerminalSubmission::ControllerFenceUnverifiable) } else { Err(reason) }
             );
             assert_eq!(logical_calls(&runner).len(), 2);
         }

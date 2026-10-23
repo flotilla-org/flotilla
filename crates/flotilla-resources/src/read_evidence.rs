@@ -147,7 +147,7 @@ pub fn crew_attention(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<flotilla_protocol::CrewAttention> {
     let status = status.filter(|status| status.phase == TerminalSessionPhase::Running)?;
-    if status.degraded.as_ref().is_some_and(|condition| condition.reason == crate::CONTROLLER_FENCE_UNVERIFIABLE_REASON) {
+    if status.degraded.as_ref().is_some_and(|condition| condition.is_controller_fence_unverifiable()) {
         return Some(flotilla_protocol::CrewAttention::ControllerFenceUnverifiable);
     }
     if status.degraded.as_ref().is_some_and(|condition| condition.is_delivery()) {

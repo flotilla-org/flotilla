@@ -71,7 +71,7 @@ pub enum TransportOutcome {
     },
     /// Definitely unsent, but retrying cannot recover this session. Surface
     /// the named failure to the operator without fallback or a receipt.
-    SessionNeedsRestart {
+    ControllerFenceUnverifiable {
         reason: String,
     },
     /// Possibly submitted: never repeat it through another transport unless
