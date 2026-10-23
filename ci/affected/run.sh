@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Run the selector's arguments without eval, and report each phase separately.
 set -euo pipefail
-selection=${1:?usage: run.sh 'all | -p package ...'}
+selection=${1:?usage: run.sh 'all | none | -p package ...'}
+if [[ "$selection" == none ]]; then
+  # The selector found no Rust test input among the changed files.
+  echo 'No Rust test inputs changed; skipping compile, tests and doctests.'
+  exit 0
+fi
 if [[ "$selection" == all ]]; then
   packages=(--workspace)
 else

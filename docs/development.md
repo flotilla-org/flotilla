@@ -19,6 +19,25 @@ avoid compiling the runner. Run affected packages locally with
 and doctest timings; CI uses that full selection on main and stack top layers,
 and when `ci:full` is set.
 
+On other pull requests, `ci/affected/selection.py` maps the changed files to a
+selection:
+
+- Workspace-wide inputs select every package: `Cargo.lock`, any `Cargo.toml`,
+  `rust-toolchain.toml`, `ci/toolchain/`, `.cargo/`, `.config/nextest.toml`,
+  `ci/affected/`, `.github/workflows/ci.yml` and the `flotilla-build-features*`
+  crates.
+- A file in a package selects that package and its dependents.
+- A repository file outside every package selects the packages that read it,
+  found by scanning Rust string literals (`#[path]`, `include_str!`,
+  `concat!(env!("CARGO_MANIFEST_DIR"), "/../../...")`, workspace-root joins).
+  Files a library reads for its dependents, such as `hegel.toml`, are listed in
+  `LIBRARY_READS`. `python3 ci/affected/selection.py --explain` prints the map.
+- Any other file selects nothing. When nothing is selected, the Test job skips
+  the cache, the nextest install and compilation, and reports success.
+
+Rust source outside every package that no literal reaches selects the whole
+workspace, since a computed path may still compile it.
+
 ## Git boundary check
 
 Install `uv` and Python 3.9+ on your desk or CI runner; the crew image already
