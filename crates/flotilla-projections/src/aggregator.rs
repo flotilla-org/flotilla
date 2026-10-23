@@ -2485,6 +2485,9 @@ impl Aggregator {
     /// phase: being torn down is not being lost. When the copy is deleted, this reads the ending
     /// from the engine alone.
     pub(crate) fn vessel_phase(&self, vessel: &ReadResourceObject<Vessel>) -> VesselPhase {
+        use flotilla_protocol::LifecycleReading;
+
+        use crate::ports::ProvisioningKind;
         let old = vessel.object.status.as_ref().map(|status| status.phase).unwrap_or_default();
         if matches!(old, VesselPhase::Lost | VesselPhase::Failed) {
             return old;
@@ -2493,15 +2496,11 @@ impl Aggregator {
             ResourceProvenance::Local => None,
             ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
         };
-        match self.lifecycle_reads.reading(crate::ports::ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref()) {
+        match self.lifecycle_reads.reading(ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref()) {
             // Gone without its ending entry (a replica seeded from a snapshot) is read as broken.
             // A vessel never gives up (#3629 Q3); GaveUp is listed only so a reading the vessel
             // machine cannot produce is not read as live.
-            Some(
-                flotilla_protocol::LifecycleReading::Lost
-                | flotilla_protocol::LifecycleReading::Gone
-                | flotilla_protocol::LifecycleReading::GaveUp { .. },
-            ) => VesselPhase::Lost,
+            Some(LifecycleReading::Lost | LifecycleReading::Gone | LifecycleReading::GaveUp { .. }) => VesselPhase::Lost,
             _ => old,
         }
     }
