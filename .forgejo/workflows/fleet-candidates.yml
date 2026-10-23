@@ -72,11 +72,13 @@ jobs:
           path: |
             .fleet-cache/toolchains
             .fleet-cache/cargo
+            .fleet-cache/zig
             sources/flotilla/target
             sources/cleat/target
             sources/cleat/.tools/ghostty-src/.zig-cache
           key: ${{ steps.dependency-inputs.outputs.key }}
           restore-keys: |
+            fleet-linux-v3-
             fleet-linux-v2-
 
       - name: Build and verify the coordinated candidate
@@ -139,6 +141,7 @@ jobs:
           path: |
             .fleet-cache/toolchains
             .fleet-cache/cargo
+            .fleet-cache/zig
             sources/flotilla/target
             sources/cleat/target
             sources/cleat/.tools/ghostty-src/.zig-cache

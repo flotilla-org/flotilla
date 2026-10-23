@@ -9,11 +9,14 @@ source "$(dirname "${BASH_SOURCE[0]}")/cleat-toolchain.sh"
 toolchain_root="$PWD/.fleet-cache/toolchains"
 export CARGO_HOME="$PWD/.fleet-cache/cargo"
 export RUSTUP_HOME="$toolchain_root/rustup"
+# Ghostty's Zig package archives. Cached so builds do not refetch them from
+# GitHub, whose archive redirects can exceed Zig's HTTP header buffer.
+export ZIG_GLOBAL_CACHE_DIR="$PWD/.fleet-cache/zig"
 source "$(dirname "${BASH_SOURCE[0]}")/../toolchain/pin.sh"
 rust_toolchain="$(read_rust_pin "$(dirname "${BASH_SOURCE[0]}")/../../rust-toolchain.toml")"
 rustup_version="1.28.2"
 rustup_sha256="20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
-mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$toolchain_root"
+mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$ZIG_GLOBAL_CACHE_DIR" "$toolchain_root"
 
 cleat_sha="$(require_sha FLEET_CLEAT_SHA "${FLEET_CLEAT_SHA:-}")"
 cleat_toolchain="$toolchain_root/cleat-$cleat_sha-ghostty-toolchain.toml"
