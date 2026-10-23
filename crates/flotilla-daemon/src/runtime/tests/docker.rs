@@ -1326,7 +1326,8 @@ impl ProvisionedEnvironment for DeadAgentEnvironment {
 async fn docker_codex_home_is_a_rw_host_mount_and_is_not_pushed() {
     use flotilla_environment::environment::{docker::DockerEnvironmentProvider, ProvisionedMount, ProvisionedMountMode};
     let root = TempDir::new().unwrap();
-    let home = root.path().join("agent-homes/work/codex");
+    let home = root.path().join(".local/share/flotilla/agent-homes/work/codex");
+    let registry = test_agent_material_registry(Arc::new(TestEnvVars::new([("HOME", root.path().display().to_string())])));
     fs::create_dir_all(&home).unwrap();
     let delivery = flotilla_credentials::AgentMaterialDelivery {
         mount: ProvisionedMount::new(&home, flotilla_credentials::CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw),
@@ -1339,7 +1340,7 @@ async fn docker_codex_home_is_a_rw_host_mount_and_is_not_pushed() {
         .await
         .unwrap();
     assert_eq!(mounts, vec![delivery.mount.clone()]);
-    assert!(super::super::docker::codex_home_is_shared(&mounts));
+    assert!(registry.codex_home_is_shared("work", &mounts));
     assert!(tools.is_empty(), "the Codex home must never enter the pushed tool layer");
     // Removing Shared must select the pushed route, regardless of tool delivery.
     let mut capabilities = provider.capabilities();
@@ -1350,5 +1351,5 @@ async fn docker_codex_home_is_a_rw_host_mount_and_is_not_pushed() {
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].assets[0].host_path, delivery.mount.host_path);
     assert_eq!(tools[0].assets[0].access, flotilla_environment::environment::EnvironmentToolAssetAccess::ReadOnly);
-    assert!(!super::super::docker::codex_home_is_shared(&mounts));
+    assert!(!registry.codex_home_is_shared("work", &mounts));
 }

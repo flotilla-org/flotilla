@@ -740,8 +740,12 @@ pub(super) async fn redeliver_codex_credentials(state: &ControllerRuntimeState, 
             .daemon
             .environment_manager()
             .provisioned_mounts(&flotilla_protocol::EnvironmentId::new(environment.metadata.name.as_str()))
-            .unwrap_or_default();
-        let result = if super::docker::codex_home_is_shared(&mounts) {
+            .unwrap_or_else(|| {
+                tracing::debug!(environment = %environment.metadata.name,
+                    "provisioned environment mounts unavailable; falling back to pushed Codex credential delivery");
+                Vec::new()
+            });
+        let result = if registry.codex_home_is_shared(&environment.metadata.name, &mounts) {
             registry.refresh_delivered_credentials(&environment.metadata.name).await
         } else {
             match state.daemon.command_runner_for_environment_ref(&environment.metadata.name) {

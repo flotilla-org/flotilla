@@ -1261,6 +1261,11 @@ impl DockerEnvironmentProviderInner {
         // configured user its own copy's directory; never write the tools image.
         // Root exec overrides the crew PATH and repairs legacy PATH directory
         // ownership before publishing tools into the separate crew-owned prefix.
+        // The repair list must cover DOCKER_DEFAULT_PATH. The script's narrower
+        // PATH excludes legacy crew-owned /usr/local directories during repair.
+        // Select utilities only from absolute system paths, supporting split-/usr
+        // images as well as /bin utilities and merged-/usr images.
+        let root_path = format!("PATH={DOCKER_DEFAULT_PATH}");
         let user = host_user();
         runner
             .run(
@@ -1270,7 +1275,7 @@ impl DockerEnvironmentProviderInner {
                     "--user",
                     "0",
                     "--env",
-                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    &root_path,
                     "--env",
                     "LD_LIBRARY_PATH=",
                     "--env",
@@ -1278,7 +1283,7 @@ impl DockerEnvironmentProviderInner {
                     container,
                     "/bin/sh",
                     "-c",
-                    "PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH; /bin/mkdir -p /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin /opt/flotilla/crew-bin /run/flotilla && /bin/chown 0:0 /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && /bin/chmod go-w /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && /bin/chown -R \"$1\" /opt/drydock /opt/flotilla /run/flotilla",
+                    "PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH; mkdir=/bin/mkdir; [ -x \"$mkdir\" ] || mkdir=/usr/bin/mkdir; chown=/bin/chown; [ -x \"$chown\" ] || chown=/usr/bin/chown; chmod=/bin/chmod; [ -x \"$chmod\" ] || chmod=/usr/bin/chmod; \"$mkdir\" -p /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin /opt/flotilla/crew-bin /run/flotilla && \"$chown\" 0:0 /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && \"$chmod\" go-w /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && \"$chown\" -R \"$1\" /opt/drydock /opt/flotilla /run/flotilla",
                     "flotilla-agent-owner",
                     &user,
                 ],
@@ -1507,10 +1512,44 @@ mod agent_contract_tests {
                     let script = args[12];
                     assert!(!script.contains("chown \"$1\" /usr/local/bin"));
                     assert!(script.contains("/opt/flotilla/crew-bin"));
+                    // Execute only the unprivileged selection prologue against fake
+                    // system directories. Exhaust /bin-only, /usr/bin-only, both,
+                    // and neither: no utility is ever resolved through PATH.
+                    use std::os::unix::fs::PermissionsExt;
+                    for (primary, fallback) in [(true, false), (false, true), (true, true), (false, false)] {
+                        let root = tempfile::tempdir().unwrap();
+                        for (name, present) in [("primary", primary), ("fallback", fallback)] {
+                            let directory = root.path().join(name);
+                            std::fs::create_dir(&directory).unwrap();
+                            if present {
+                                for utility in ["mkdir", "chown", "chmod"] {
+                                    let path = directory.join(utility);
+                                    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+                                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                                }
+                            }
+                        }
+                        let prologue = script
+                            .split("; \"$mkdir\" -p")
+                            .next()
+                            .unwrap()
+                            .replace("/usr/bin/", &format!("{}/fallback/", root.path().display()))
+                            .replace("/bin/", &format!("{}/primary/", root.path().display()));
+                        let output = std::process::Command::new("/bin/sh")
+                            .args(["-c", &format!("{prologue}; printf '%s\\n' \"$mkdir\" \"$chown\" \"$chmod\"; test -x \"$mkdir\"")])
+                            .output()
+                            .unwrap();
+                        assert_eq!(output.status.success(), primary || fallback);
+                        let chosen = root.path().join(if primary { "primary" } else { "fallback" });
+                        assert_eq!(
+                            String::from_utf8(output.stdout).unwrap().lines().collect::<Vec<_>>(),
+                            ["mkdir", "chown", "chmod"].map(|utility| chosen.join(utility).display().to_string())
+                        );
+                    }
                     let root_directories = DOCKER_DEFAULT_PATH.split(':').collect::<Vec<_>>().join(" ");
-                    assert!(script.contains(&format!("/bin/chown 0:0 {root_directories}")));
-                    assert!(script.contains(&format!("/bin/chmod go-w {root_directories}")));
-                    let crew_paths = script.rsplit("/bin/chown -R ").next().unwrap().split_whitespace().skip(1);
+                    assert!(script.contains(&format!("\"$chown\" 0:0 {root_directories}")));
+                    assert!(script.contains(&format!("\"$chmod\" go-w {root_directories}")));
+                    let crew_paths = script.rsplit("\"$chown\" -R ").next().unwrap().split_whitespace().skip(1);
                     for path in crew_paths {
                         assert!(!DOCKER_DEFAULT_PATH.split(':').any(|root| Path::new(root).starts_with(path)));
                     }

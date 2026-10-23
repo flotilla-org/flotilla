@@ -661,6 +661,23 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
     expected_tokens.extend(crew_git_identity_environment());
     assert_eq!(opts.tokens, expected_tokens);
 
+    // Explicit mounts must not replace, contain, or hide managed agent material.
+    // Exhaust the exact target, an ancestor, and a descendant at the provider seam.
+    for target in [CONTAINER_CODEX_HOME.to_string(), "/tmp".to_string(), format!("{CONTAINER_CODEX_HOME}/auth.json")] {
+        let mut conflicting = spec.clone();
+        conflicting.mounts.push(flotilla_resources::EnvironmentMount {
+            source_path: home.display().to_string(),
+            target_path: target.clone(),
+            mode: flotilla_resources::EnvironmentMountMode::Rw,
+        });
+        let error = DockerControllerRuntime { state: Arc::clone(&state) }
+            .provision_docker("contained-conflicting-mount", &conflicting)
+            .await
+            .expect_err("managed material is reserved");
+        assert_eq!(error, format!("mount target {target} overlaps reserved agent material at {CONTAINER_CODEX_HOME}"));
+        assert!(provider.create_opts.lock().await.is_none(), "conflicts must fail before provider provisioning");
+    }
+
     let mut preconfigured = spec;
     preconfigured.env.insert("CODEX_HOME".to_string(), "/image/codex".to_string());
     DockerControllerRuntime { state }

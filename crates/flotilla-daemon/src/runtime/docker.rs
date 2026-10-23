@@ -325,6 +325,15 @@ impl DockerControllerRuntime {
             },
             None => Vec::new(),
         };
+        for delivery in &material_deliveries {
+            let reserved = delivery.mount.environment_path.as_path();
+            for mount in &spec.mounts {
+                let target = Path::new(&mount.target_path);
+                if target.starts_with(reserved) || reserved.starts_with(target) {
+                    return Err(format!("mount target {} overlaps reserved agent material at {}", target.display(), reserved.display()));
+                }
+            }
+        }
         let prepared_auth = match &self.state.credential_store {
             Some(store) => match self.composed_image_pull_auth(store, spec).await {
                 Ok(Some(auth)) => Some(auth),
@@ -744,8 +753,13 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         };
         match active {
             Some(handle) => {
-                if handle.agent().is_some() && !codex_home_is_shared(&handle.provisioned_mounts()) {
-                    if let Some(registry) = &self.state.agent_material {
+                if handle.agent().is_some() {
+                    if let Some(registry) = self
+                        .state
+                        .agent_material
+                        .as_ref()
+                        .filter(|registry| !registry.codex_home_is_shared(environment_ref, &handle.provisioned_mounts()))
+                    {
                         let runner = handle.runner();
                         let capture = tokio::time::timeout(
                             std::time::Duration::from_secs(30),
@@ -1063,11 +1077,4 @@ pub(super) async fn deliver_agent_material(
         }
     }
     Ok(())
-}
-
-pub(super) fn codex_home_is_shared(mounts: &[flotilla_environment::environment::ProvisionedMount]) -> bool {
-    mounts.iter().any(|mount| {
-        mount.mode == flotilla_environment::environment::ProvisionedMountMode::Rw
-            && mount.environment_path.as_path() == Path::new(flotilla_credentials::CONTAINER_CODEX_HOME)
-    })
 }

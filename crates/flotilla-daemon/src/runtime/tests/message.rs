@@ -6,9 +6,11 @@ use flotilla_resources::TerminalOccupancy;
 async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_homes() {
     use std::os::unix::fs::PermissionsExt;
 
-    // Both realized transports must rotate credentials, while explicit homes opt out.
-    // Exhaustive two-case glue coverage; the host registry and loop are real.
-    for shared in [false, true] {
+    // Owned Shared homes rotate on the host. Pushed and user-mounted homes
+    // retain agent rotation, while explicit homes opt out. Exhaust all three
+    // transport cases through the real host registry and environment manager.
+    for transport in ["pushed", "shared", "user-mount"] {
+        let shared = transport == "shared";
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
         fs::create_dir_all(&config_base).expect("config directory");
@@ -107,7 +109,17 @@ async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_ho
             .register_provisioned_environment(
                 id.clone(),
                 Arc::new(CodexTestEnvironment {
-                    mounts: if shared { vec![deliveries[0].mount.clone()] } else { Vec::new() },
+                    mounts: if transport == "pushed" {
+                        Vec::new()
+                    } else {
+                        let mut mount = deliveries[0].mount.clone();
+                        if transport == "user-mount" {
+                            let source = temp.path().join("user-home");
+                            fs::create_dir_all(&source).unwrap();
+                            mount.host_path = DaemonHostPath::new(source);
+                        }
+                        vec![mount]
+                    },
                     inner: TestInteriorEnvironment {
                         id,
                         image: ImageId::new("test"),
