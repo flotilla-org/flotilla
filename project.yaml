@@ -3,7 +3,7 @@ name: flotilla
 # single-agent-contained alias resolves to single-agent (current_builtin_workflow_name).
 default_workflow: single-agent
 image:
-  layers: [rust]
+  layers: [rust, node]
 members:
   - alias: flotilla
     url: https://github.com/flotilla-org/flotilla
