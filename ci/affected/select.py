@@ -15,6 +15,9 @@ def source_dependencies(metadata):
     and manifest-relative runtime reads. Resolve against both source and package
     directories. False positives only add coverage; missing/deleted target files
     still map by directory. Shared repository files already select all.
+    This is a relative-literal audit, not Rust expression evaluation: paths
+    assembled from a workspace root and non-../ fragments are not discovered.
+    New computed cross-package reads need an explicit dependency or fallback.
     """
     root = Path(metadata["workspace_root"]).resolve()
     members = set(metadata["workspace_members"])

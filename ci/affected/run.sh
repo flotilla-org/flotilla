@@ -23,6 +23,21 @@ time cargo "${cargo_args[@]}" nextest run "${packages[@]}" --locked --no-run
 TIMEFORMAT='run_seconds=%R'
 status=0
 time cargo "${cargo_args[@]}" nextest run "${packages[@]}" --locked || status=$?
+# Cargo rejects explicit bin-only packages with --doc, even in a mixed set.
+# Keep full-workspace semantics; filter only explicit affected selections.
+doc_packages=("${packages[@]}")
+if [[ "$selection" != all ]]; then
+  names=()
+  for ((i=1; i<${#packages[@]}; i+=2)); do names+=("${packages[i]}"); done
+  script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+  doc_selection=$(python3 "$script_dir/doctests.py" "${names[@]}")
+  read -r -a doc_packages <<< "$doc_selection"
+fi
+if (( ${#doc_packages[@]} == 0 )); then
+  echo 'No selected packages have enabled library doctests.'
+  echo 'doctest_seconds=0.000' >&2
+  exit "$status"
+fi
 TIMEFORMAT='doctest_seconds=%R'
-time cargo "${cargo_args[@]}" test --doc "${packages[@]}" --locked || status=$?
+time cargo "${cargo_args[@]}" test --doc "${doc_packages[@]}" --locked || status=$?
 exit "$status"
