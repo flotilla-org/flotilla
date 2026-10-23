@@ -112,6 +112,8 @@ pub struct ReadProjections<'a> {
     pub fleet: &'a FleetService,
     /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4).
     pub lifecycles: &'a dyn crate::ports::LifecycleReads,
+    /// The `[primitives]` Convoy path: explanations show the engine's promises (#3587 layer 8).
+    pub convoy_engine: &'a flotilla_resources::convoy::engine::EngineConvoyPath,
 }
 
 impl ReadProjections<'_> {
@@ -937,6 +939,7 @@ impl ReadProjections<'_> {
             leaf_subscriptions: self.leaf_subscriptions,
             fleet: self.fleet,
             lifecycles: self.lifecycles,
+            convoy_engine: self.convoy_engine,
         }
     }
 
@@ -1266,7 +1269,8 @@ impl ReadProjections<'_> {
             .map(|index| &convoy_sources.items[index])
             .max_by_key(|source| matches!(source.provenance, ResourceProvenance::Local))
             .ok_or_else(|| format!("no convoy matches `{name}`"))?;
-        let convoy = convoy_source.object.clone();
+        // With the engine holding the convoy, the promises explained are the engine's (#3587 layer 8).
+        let convoy = flotilla_resources::convoy::engine::viewed_read(self.convoy_engine, convoy_source)?;
         let now = self.clock.now();
         let (receivers, project, receiver_aliases) =
             convoy_receiver_evidence(self.message_receivers, self.backend, namespace, &convoy_sources.items, &convoy).await?;

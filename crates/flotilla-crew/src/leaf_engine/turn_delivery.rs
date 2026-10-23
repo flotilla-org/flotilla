@@ -246,6 +246,8 @@ impl LeafSubscriptionTable {
             .ok_or_else(|| "turn-delivery subscription disappeared".to_string())?;
         let convoys = self.inner.backend.clone().using::<Convoy>(&namespace);
         let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+        // With the engine holding the convoy, its promises are the engine's (#3587 layer 8).
+        let convoy = flotilla_resources::convoy::engine::viewed(&self.inner.convoy_engine, &convoy)?.into_owned();
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{convoy_name}` has no status"))?;
         if status
             .turn_deliveries

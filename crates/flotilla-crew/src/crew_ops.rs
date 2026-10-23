@@ -1027,6 +1027,8 @@ impl CrewService {
         let context = self.resolve_crew_context_from_routing(&routing, true).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(name).await.map_err(|e| e.to_string())?;
+        // With the engine holding it, the promises validated here are the engine's (#3587 layer 8).
+        let convoy = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, &convoy)?.into_owned();
         ensure_crew_work_is_defined(&convoy, &context)?;
         let status = convoy.status.as_ref().ok_or("convoy has no status")?;
         let work = status.crew_work.get(&context.vessel).and_then(|crew| crew.get(&context.caller_role)).ok_or("crew work is missing")?;
@@ -1179,6 +1181,8 @@ impl CrewService {
         });
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let mut convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
+        // With the engine holding it, the promises read here are the engine's (#3587 layer 8).
+        convoy = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, &convoy)?.into_owned();
         // URL parsing needs every declared forge endpoint; read this catalogue once.
         let forges = self
             .resource_backend
@@ -1231,7 +1235,8 @@ impl CrewService {
                             flotilla_resources::convoy::engine::Actor::Crew,
                         )
                         .await?;
-                    convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+                    let reread = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+                    convoy = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, &reread)?.into_owned();
                     continue;
                 }
                 convoy = apply_resource_status_patch(
@@ -1724,7 +1729,8 @@ impl CrewService {
                 .iter()
                 .filter_map(|checkout| associated_change_request_name_without_checkout_status(convoy, checkout, &forges).transpose())
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut query = crew_change_request_query(convoy, &forges)?;
+            let viewed = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, convoy)?;
+            let mut query = crew_change_request_query(&viewed, &forges)?;
             query.field_values.entry("metadata.name".into()).or_default().extend(names);
             query.fields.insert("status.state.value".into(), "merged".into());
             let records = self

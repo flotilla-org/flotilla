@@ -951,6 +951,7 @@ fn spawn_controller_loops(
                 let daemon = Arc::clone(&daemon);
                 let mut secondaries = ConvoyReconciler::federated_secondary_watches(&backend, &namespace_string);
                 secondaries.push(daemon.reconciler_wake_watch());
+                secondaries.push(Box::new(flotilla_crew::convoy::EngineConvoyWake { engine: daemon.convoy_engine_path() }));
                 (
                     secondaries,
                     ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(&namespace_string))

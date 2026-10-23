@@ -471,6 +471,9 @@ impl ReconcilerWake {
         }) {
             #[cfg(test)]
             views.row_evaluations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // With the engine holding the convoy, its promises are the engine's (#3587 layer 8).
+            let viewed = flotilla_resources::convoy::engine::viewed(&self.subscriptions.inner.convoy_engine, convoy)?;
+            let convoy = viewed.as_ref();
             let inputs = dependencies.entry(convoy.metadata.name.clone()).or_default();
             let status = convoy.status.as_ref().expect("holding convoy has status");
             for leaf in flotilla_resources::expected_change_request_leaves(convoy, &forges).unwrap_or_default() {

@@ -116,6 +116,8 @@ struct LeafSubscriptionTableInner {
     message_inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>,
     /// The `[primitives]` Message path; empty while the switch is off.
     message_path: crate::ports::MessagePath,
+    /// The `[primitives]` Convoy path: promises are read from the engine when it holds a convoy.
+    convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
     charter_brief_renderer: Arc<dyn flotilla_messaging::CharterBriefRenderer>,
     event_sink: Arc<dyn EventSink>,
     rows: Mutex<HashMap<uuid::Uuid, LeafSubscriptionRow>>,
@@ -158,6 +160,11 @@ impl LeafSubscriptionTable {
 
     pub fn with_charter_brief_renderer(mut self, renderer: Arc<dyn flotilla_messaging::CharterBriefRenderer>) -> Self {
         Arc::get_mut(&mut self.inner).expect("configure rendering before sharing subscriptions").charter_brief_renderer = renderer;
+        self
+    }
+
+    pub fn with_convoy_engine(mut self, path: flotilla_resources::convoy::engine::EngineConvoyPath) -> Self {
+        Arc::get_mut(&mut self.inner).expect("configure the convoy path before sharing subscriptions").convoy_engine = path;
         self
     }
 
@@ -219,6 +226,7 @@ impl LeafSubscriptionTable {
                 watch_views: Default::default(),
                 message_inboxes: Default::default(),
                 message_path: Default::default(),
+                convoy_engine: Default::default(),
                 charter_brief_renderer: Arc::new(flotilla_messaging::CharterProseRenderer),
                 event_sink,
                 rows: Mutex::new(HashMap::new()),

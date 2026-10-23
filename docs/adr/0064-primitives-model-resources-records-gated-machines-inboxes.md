@@ -55,6 +55,8 @@ Convoys assumed that their vessels were co-located and fixed. Many writers could
   ADR 0064 promise labels: a promise label is the permanent name of what is delivered, unique in its convoy and never reused or changed by reassignment; the owner is separate data. Seat-qualified labels exist only for imported records.
 
   ADR 0064 awaiting replies: the AwaitingReply record is written by the sender's home once the receiver has admitted the message, and a send is not finished until that record is written; this replaces "written in the send's transaction".
+
+  ADR 0064 operator-level stalls: until the operator is a principal with an inbox, stalls escalated to the operator are read from the old stall status; no stall drops out of the views.
 - **A judgement** is computed and never stored. Examples are ready, stalled, landing, kept, retry count, next attempt, stale and drift. Each judgement is a declared function with declared inputs, and it returns a value and the moment it could next change. The same function gates edges and renders listings, so the two cannot disagree.
 - **No host writes another home's resource.** It sends a message to that home, or it publishes a record of its own that the home observes.
 
