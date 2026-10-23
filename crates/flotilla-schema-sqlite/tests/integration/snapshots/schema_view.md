@@ -102,3 +102,4 @@ Interned column domains:
 | `terminal_session` | `pool` | `pl` |
 | `terminal_session` | `source_selector` | `sl` |
 | `vessel` | `class` | `vc` |
+| `vessel` | `host` | `hs` |

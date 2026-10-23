@@ -27,9 +27,18 @@ use crate::{
     Home, Log, Resource, WriteError,
 };
 
-/// A host that capacity is leased on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
-pub struct Host(pub u32);
+/// A host that capacity is leased on: the host's id as the fleet names it (a placement's
+/// target host), interned text in its own domain (`hs`). It is not a stored resource, so it is
+/// a plain column rather than a `Ref`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
+#[store(intern = "hs")]
+pub struct Host(pub String);
+
+impl Host {
+    pub fn new(id: impl Into<String>) -> Self {
+        Host(id.into())
+    }
+}
 
 /// One capacity dimension, such as cores or memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
@@ -114,7 +123,7 @@ pub fn place(request: &Request, evidence: &Evidence) -> Result<Lease, PlacementR
     if evidence.waiting.iter().any(|waiting| waiting.priority > request.priority && fits(waiting, &evidence.available)) {
         return Err(PlacementRefusal::HigherPriorityWaiting);
     }
-    Ok(Lease { request: request.clone(), host: evidence.host })
+    Ok(Lease { request: request.clone(), host: evidence.host.clone() })
 }
 
 /// One vessel's placement state at the ledger.
@@ -174,6 +183,11 @@ impl Ledger {
         self.caps.insert(convoy, quota);
     }
 
+    /// Sets one class's cap for a convoy, keeping its other classes' caps.
+    pub fn set_cap(&mut self, convoy: ConvoyId, class: VesselClass, cap: u32) {
+        self.caps.entry(convoy).or_default().insert(class, cap);
+    }
+
     /// Queues a vessel's request.
     pub fn request(&mut self, id: VesselId, request: Request) -> Result<(), LedgerError> {
         if self.vessels.contains_key(&id) {
@@ -189,11 +203,14 @@ impl Ledger {
 
     /// The host's capacity less the shapes leased on it.
     pub fn available(&self, host: Host) -> Result<Units, LedgerError> {
-        let mut available = self.hosts.get(&host).ok_or(LedgerError::UnknownHost(host))?.clone();
+        let mut available = self.hosts.get(&host).ok_or_else(|| LedgerError::UnknownHost(host.clone()))?.clone();
         for lease in self.leases().map(|(_, lease)| lease).filter(|lease| lease.host == host) {
             for (dimension, units) in &lease.request.shape {
-                let free = available.get_mut(dimension).ok_or(LedgerError::UnknownDimension { host, dimension: *dimension })?;
-                *free = free.checked_sub(*units).ok_or(LedgerError::CapacityUnderflow { host, dimension: *dimension })?;
+                let free = available
+                    .get_mut(dimension)
+                    .ok_or_else(|| LedgerError::UnknownDimension { host: host.clone(), dimension: *dimension })?;
+                *free =
+                    free.checked_sub(*units).ok_or_else(|| LedgerError::CapacityUnderflow { host: host.clone(), dimension: *dimension })?;
             }
         }
         Ok(available)
@@ -222,7 +239,7 @@ impl Ledger {
     /// Admission is a positive cap for the class, as in `admission_placement`.
     pub fn evidence(&self, id: &VesselId, host: Host) -> Result<Evidence, LedgerError> {
         let request = self.waiting(id)?;
-        let available = self.available(host)?;
+        let available = self.available(host.clone())?;
         let waiting = self
             .vessels
             .iter()
@@ -260,7 +277,7 @@ impl Ledger {
         if self.vessels.contains_key(&id) {
             return Err(LedgerError::DuplicateRequest(id));
         }
-        let host = lease.host;
+        let host = lease.host.clone();
         self.vessels.insert(id.clone(), Vessel::Leased(lease));
         if let Err(error) = self.available(host) {
             self.vessels.remove(&id);
@@ -368,6 +385,16 @@ impl<L: Log<VesselMachine>> Placements<L> {
         self.ledger.set_caps(convoy, quota);
     }
 
+    /// Sets one class's cap for a convoy, keeping its other classes' caps.
+    pub fn set_cap(&mut self, convoy: ConvoyId, class: VesselClass, cap: u32) {
+        self.ledger.set_cap(convoy, class, cap);
+    }
+
+    /// Adds a host with its capacity by dimension, as it joins after the ledger was built.
+    pub fn add_host(&mut self, host: Host, capacity: Units) -> Result<(), PlacementError> {
+        self.ledger.add_host(host, capacity).map_err(PlacementError::Ledger)
+    }
+
     /// Queues a vessel's request: Waiting, at the ledger only.
     pub fn request(&mut self, id: VesselId, request: Request) -> Result<(), PlacementError> {
         self.ledger.request(id, request).map_err(PlacementError::Ledger)
@@ -422,7 +449,9 @@ mod placements_tests {
         Cause, CauseCategory, MemoryLog, Outcome, Ref,
     };
 
-    const HOST: Host = Host(1);
+    fn host() -> Host {
+        Host::new("1")
+    }
 
     fn request(convoy: &str, cores: u32) -> Request {
         Request {
@@ -434,7 +463,7 @@ mod placements_tests {
     }
 
     fn placements(home: Home<VesselMachine, MemoryLog<VesselMachine>>) -> Placements<MemoryLog<VesselMachine>> {
-        let (mut placements, unplaced) = Placements::new(home, [(HOST, [(Dimension(0), 4)].into())]).expect("host");
+        let (mut placements, unplaced) = Placements::new(home, [(host(), [(Dimension(0), 4)].into())]).expect("host");
         assert!(unplaced.is_empty());
         placements.set_caps(ConvoyId::new("c", "home"), [(VesselClass::new("crew"), 2)].into());
         placements
@@ -449,12 +478,12 @@ mod placements_tests {
         let (a, b) = (VesselId::new("a"), VesselId::new("b"));
         placements.request(a.clone(), request("c", 3)).expect("request");
         assert!(placements.get(&a).is_none(), "a waiting request is not stored");
-        let vessel = placements.place(&a, HOST, Timestamp(1)).expect("granted");
+        let vessel = placements.place(&a, host(), Timestamp(1)).expect("granted");
         assert_eq!(*vessel.state(), LifecycleState::requested());
-        assert_eq!(vessel.spec().lease(), Lease { request: request("c", 3), host: HOST });
+        assert_eq!(vessel.spec().lease(), Lease { request: request("c", 3), host: host() });
 
         placements.request(b.clone(), request("c", 3)).expect("request");
-        assert_eq!(placements.place(&b, HOST, Timestamp(2)).expect_err("no room").refusal(), Some(PlacementRefusal::DoesNotFit));
+        assert_eq!(placements.place(&b, host(), Timestamp(2)).expect_err("no room").refusal(), Some(PlacementRefusal::DoesNotFit));
         assert!(placements.get(&b).is_none());
         assert!(matches!(placements.ledger().vessel(&b), Some(Vessel::Waiting(_))), "still waiting");
 
@@ -462,7 +491,7 @@ mod placements_tests {
         world.teardowns.put(&Ref::new("a"), true);
         placements.apply(&a, Release { teardown: Ref::new("a") }.into(), &world, Timestamp(3)).expect("released");
         assert!(placements.ledger().vessel(&a).is_none(), "the lease is freed");
-        placements.place(&b, HOST, Timestamp(4)).expect("now it fits");
+        placements.place(&b, host(), Timestamp(4)).expect("now it fits");
     }
 
     // Behaviour: a vessel takes no attempts and never gives up (`vessel.qnt` has neither edge).
@@ -471,7 +500,7 @@ mod placements_tests {
         let mut placements = placements(Home::new("home").expect("declaration"));
         let a = VesselId::new("a");
         placements.request(a.clone(), request("c", 1)).expect("request");
-        placements.place(&a, HOST, Timestamp(1)).expect("granted");
+        placements.place(&a, host(), Timestamp(1)).expect("granted");
         let failed = Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "x"), retryable: true };
         let world = MemoryLifecycleWorld::default();
         let refused = placements.apply(&a, Attempted { outcome: failed }.into(), &world, Timestamp(2)).expect_err("refused");
@@ -491,11 +520,11 @@ mod placements_tests {
         let mut placements = placements(Home::new("home").expect("declaration"));
         let a = VesselId::new("a");
         placements.request(a.clone(), request("c", 3)).expect("request");
-        placements.place(&a, HOST, Timestamp(1)).expect("granted");
+        placements.place(&a, host(), Timestamp(1)).expect("granted");
         let mut home = Home::<VesselMachine>::new("home").expect("declaration");
         home.restore(placements.get(&a).expect("held").clone()).expect("restored");
         // The host now offers two cores: the three-core lease no longer fits.
-        let (mut restarted, unplaced) = Placements::new(home, [(HOST, [(Dimension(0), 2)].into())]).expect("host");
+        let (mut restarted, unplaced) = Placements::new(home, [(host(), [(Dimension(0), 2)].into())]).expect("host");
         assert_eq!(unplaced.len(), 1);
         let mut world = MemoryLifecycleWorld::default();
         world.teardowns.put(&Ref::new("a"), true);
@@ -510,17 +539,17 @@ mod placements_tests {
         let mut placements = placements(Home::new("home").expect("declaration"));
         let a = VesselId::new("a");
         placements.request(a.clone(), request("c", 3)).expect("request");
-        placements.place(&a, HOST, Timestamp(1)).expect("granted");
+        placements.place(&a, host(), Timestamp(1)).expect("granted");
         // A second request under the same name is granted at the ledger, but its create is refused:
         // the name is taken. (Released first, so the ledger has room and no record of it.)
         let mut world = MemoryLifecycleWorld::default();
         world.teardowns.put(&Ref::new("a"), true);
         placements.apply(&a, Release { teardown: Ref::new("a") }.into(), &world, Timestamp(2)).expect("released");
         placements.request(a.clone(), request("c", 3)).expect("request again");
-        let refused = placements.place(&a, HOST, Timestamp(3)).expect_err("the name is taken");
+        let refused = placements.place(&a, host(), Timestamp(3)).expect_err("the name is taken");
         assert!(matches!(refused, PlacementError::Write(WriteError::Exists(_))));
         assert!(matches!(placements.ledger().vessel(&a), Some(Vessel::Waiting(_))), "waiting again");
-        assert_eq!(placements.ledger().available(HOST), Ok([(Dimension(0), 4)].into()), "the lease was returned");
+        assert_eq!(placements.ledger().available(host()), Ok([(Dimension(0), 4)].into()), "the lease was returned");
     }
 
     // Behaviour: a restart rebuilds the ledger's leases from the live vessels its home holds.
@@ -529,7 +558,7 @@ mod placements_tests {
         let mut placements = placements(Home::new("home").expect("declaration"));
         let a = VesselId::new("a");
         placements.request(a.clone(), request("c", 3)).expect("request");
-        placements.place(&a, HOST, Timestamp(1)).expect("granted");
+        placements.place(&a, host(), Timestamp(1)).expect("granted");
         let mut world = MemoryLifecycleWorld::default();
         world.realisations.put(&Ref::new("a"), Observed { identity: "a".into() });
         placements.apply(&a, Realise { identity: "a".into(), observed: Ref::new("a") }.into(), &world, Timestamp(2)).expect("realised");
@@ -537,6 +566,6 @@ mod placements_tests {
         let mut home = Home::<VesselMachine>::new("home").expect("declaration");
         home.restore(placements.get(&a).expect("held").clone()).expect("restored");
         let restarted = self::placements(home);
-        assert_eq!(restarted.ledger().available(HOST), Ok([(Dimension(0), 1)].into()), "the lease holds its shape again");
+        assert_eq!(restarted.ledger().available(host()), Ok([(Dimension(0), 1)].into()), "the lease holds its shape again");
     }
 }

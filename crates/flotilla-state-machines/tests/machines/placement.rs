@@ -30,7 +30,7 @@ fn request(convoy_n: u32, class: u32, shape: &[(u32, u32)], priority: u32) -> Re
 }
 
 fn evidence(available: &[(u32, u32)], waiting: Vec<Request>, live: u32, cap: u32, admitted: bool) -> Evidence {
-    Evidence { host: Host(1), available: units(available), waiting, live, cap, admitted }
+    Evidence { host: Host::new("1"), available: units(available), waiting, live, cap, admitted }
 }
 
 // Generator: shapes and capacities over dimensions 0..=2 with 0..=3 units, so
@@ -95,8 +95,8 @@ fn place_checks_the_rules_in_the_spec_order() {
     assert_eq!(place(&r, &Evidence { admitted: true, cap: 2, ..all_wrong() }), Err(PlacementRefusal::DoesNotFit));
     let fitting = Evidence { admitted: true, cap: 2, available: units(&[(0, 2)]), ..all_wrong() };
     assert_eq!(place(&r, &fitting), Err(PlacementRefusal::HigherPriorityWaiting));
-    let granted = place(&r, &Evidence { waiting: vec![], host: Host(7), ..fitting });
-    assert_eq!(granted, Ok(Lease { request: r, host: Host(7) }));
+    let granted = place(&r, &Evidence { waiting: vec![], host: Host::new("7"), ..fitting });
+    assert_eq!(granted, Ok(Lease { request: r, host: Host::new("7") }));
 }
 
 // The cap is a hard bound at its boundary: one below it places, at it is QuotaExceeded.
@@ -130,21 +130,21 @@ fn priority_blocks_only_a_fitting_higher_request() {
 fn the_ledger_reports_errors() {
     let (v1, v7) = (vessel(1), vessel(7));
     let mut ledger = Ledger::new();
-    ledger.add_host(Host(1), units(&[(0, 2)])).expect("host");
-    assert_eq!(ledger.add_host(Host(1), units(&[(0, 1)])), Err(LedgerError::DuplicateHost(Host(1))));
-    assert_eq!(ledger.available(Host(9)), Err(LedgerError::UnknownHost(Host(9))));
+    ledger.add_host(Host::new("1"), units(&[(0, 2)])).expect("host");
+    assert_eq!(ledger.add_host(Host::new("1"), units(&[(0, 1)])), Err(LedgerError::DuplicateHost(Host::new("1"))));
+    assert_eq!(ledger.available(Host::new("9")), Err(LedgerError::UnknownHost(Host::new("9"))));
     ledger.request(v1.clone(), request(1, 0, &[(0, 1)], 1)).expect("requested");
     assert_eq!(ledger.request(v1.clone(), request(1, 0, &[(0, 1)], 1)), Err(LedgerError::DuplicateRequest(v1.clone())));
-    assert_eq!(ledger.place(&v7, Host(1)).err(), Some(LedgerError::UnknownVessel(v7.clone())));
-    assert_eq!(ledger.place(&v1, Host(9)).err(), Some(LedgerError::UnknownHost(Host(9))));
-    assert_eq!(ledger.place(&v1, Host(1)).err(), Some(LedgerError::Refused(PlacementRefusal::NotAdmitted)));
+    assert_eq!(ledger.place(&v7, Host::new("1")).err(), Some(LedgerError::UnknownVessel(v7.clone())));
+    assert_eq!(ledger.place(&v1, Host::new("9")).err(), Some(LedgerError::UnknownHost(Host::new("9"))));
+    assert_eq!(ledger.place(&v1, Host::new("1")).err(), Some(LedgerError::Refused(PlacementRefusal::NotAdmitted)));
     assert_eq!(ledger.release(&v1).err(), Some(LedgerError::NotLeased(v1.clone())));
     assert!(matches!(ledger.vessel(&v1), Some(Vessel::Waiting(_))), "a refused release keeps the waiting vessel");
     assert_eq!(ledger.release(&v7).err(), Some(LedgerError::UnknownVessel(v7)));
     ledger.set_caps(convoy(1), quota(&[(0, 1)]));
-    ledger.place(&v1, Host(1)).expect("placed");
-    assert_eq!(ledger.place(&v1, Host(1)).err(), Some(LedgerError::NotWaiting(v1.clone())));
-    assert_eq!(ledger.evidence(&v1, Host(1)).err(), Some(LedgerError::NotWaiting(v1.clone())));
+    ledger.place(&v1, Host::new("1")).expect("placed");
+    assert_eq!(ledger.place(&v1, Host::new("1")).err(), Some(LedgerError::NotWaiting(v1.clone())));
+    assert_eq!(ledger.evidence(&v1, Host::new("1")).err(), Some(LedgerError::NotWaiting(v1.clone())));
 }
 
 // Release hands the lease back by value and forgets the vessel: nothing
@@ -154,11 +154,11 @@ fn the_ledger_reports_errors() {
 fn release_returns_the_lease_and_keeps_nothing() {
     let v1 = vessel(1);
     let mut ledger = Ledger::new();
-    ledger.add_host(Host(1), units(&[(0, 2)])).expect("host");
+    ledger.add_host(Host::new("1"), units(&[(0, 2)])).expect("host");
     ledger.set_caps(convoy(1), quota(&[(0, 1)]));
     ledger.request(v1.clone(), request(1, 0, &[(0, 1)], 1)).expect("requested");
-    ledger.place(&v1, Host(1)).expect("placed");
-    assert_eq!(ledger.release(&v1), Ok(Lease { request: request(1, 0, &[(0, 1)], 1), host: Host(1) }));
+    ledger.place(&v1, Host::new("1")).expect("placed");
+    assert_eq!(ledger.release(&v1), Ok(Lease { request: request(1, 0, &[(0, 1)], 1), host: Host::new("1") }));
     assert_eq!(ledger.vessel(&v1), None);
     assert_eq!(ledger.leases().count(), 0);
     assert_eq!(ledger.release(&v1), Err(LedgerError::UnknownVessel(v1.clone())));
@@ -171,16 +171,16 @@ fn release_returns_the_lease_and_keeps_nothing() {
 fn a_lease_holds_capacity_until_released() {
     let (v1, v2) = (vessel(1), vessel(2));
     let mut ledger = Ledger::new();
-    ledger.add_host(Host(1), units(&[(0, 2), (1, 1)])).expect("host");
+    ledger.add_host(Host::new("1"), units(&[(0, 2), (1, 1)])).expect("host");
     ledger.set_caps(convoy(1), quota(&[(0, 2)]));
     ledger.request(v1.clone(), request(1, 0, &[(0, 2), (1, 1)], 1)).expect("requested");
     ledger.request(v2.clone(), request(1, 0, &[(0, 1)], 1)).expect("requested");
-    ledger.place(&v1, Host(1)).expect("placed");
-    assert_eq!(ledger.available(Host(1)), Ok(units(&[(0, 0), (1, 0)])));
-    assert_eq!(ledger.place(&v2, Host(1)).err(), Some(LedgerError::Refused(PlacementRefusal::DoesNotFit)));
+    ledger.place(&v1, Host::new("1")).expect("placed");
+    assert_eq!(ledger.available(Host::new("1")), Ok(units(&[(0, 0), (1, 0)])));
+    assert_eq!(ledger.place(&v2, Host::new("1")).err(), Some(LedgerError::Refused(PlacementRefusal::DoesNotFit)));
     ledger.release(&v1).expect("released");
-    assert_eq!(ledger.available(Host(1)), Ok(units(&[(0, 2), (1, 1)])));
-    assert_eq!(ledger.place(&v2, Host(1)).cloned(), Ok(Lease { request: request(1, 0, &[(0, 1)], 1), host: Host(1) }));
+    assert_eq!(ledger.available(Host::new("1")), Ok(units(&[(0, 2), (1, 1)])));
+    assert_eq!(ledger.place(&v2, Host::new("1")).cloned(), Ok(Lease { request: request(1, 0, &[(0, 1)], 1), host: Host::new("1") }));
 }
 
 #[derive(Clone, Debug)]
@@ -221,11 +221,12 @@ fn the_ledger_keeps_caps_and_capacity(tc: hegel::TestCase) {
     // The scenario's capacities, sometimes doubled so several vessels of one
     // convoy and class fit at once and the cap is what binds.
     let scale = tc.draw(gs::integers::<u32>().min_value(1).max_value(2));
-    let capacities = BTreeMap::from([(Host(1), units(&[(0, 2 * scale), (1, scale)])), (Host(2), units(&[(0, scale), (1, 2 * scale)]))]);
+    let capacities =
+        BTreeMap::from([(Host::new("1"), units(&[(0, 2 * scale), (1, scale)])), (Host::new("2"), units(&[(0, scale), (1, 2 * scale)]))]);
     let mut caps: BTreeMap<ConvoyId, Quota> = BTreeMap::new();
     let mut ledger = Ledger::new();
     for (host, capacity) in &capacities {
-        ledger.add_host(*host, capacity.clone()).expect("host");
+        ledger.add_host(host.clone(), capacity.clone()).expect("host");
     }
     for n in 1..=2 {
         let initial: Quota = (0..2)
@@ -242,11 +243,11 @@ fn the_ledger_keeps_caps_and_capacity(tc: hegel::TestCase) {
                 assert_eq!(ledger.request(vessel(id), r).is_ok(), fresh);
             }
             Op::Place(id, host) => {
-                let expected = ledger.evidence(&vessel(id), Host(host)).and_then(|e| match ledger.vessel(&vessel(id)) {
+                let expected = ledger.evidence(&vessel(id), Host::new(host.to_string())).and_then(|e| match ledger.vessel(&vessel(id)) {
                     Some(Vessel::Waiting(r)) => place(r, &e).map_err(LedgerError::Refused),
                     _ => Err(LedgerError::NotWaiting(vessel(id))),
                 });
-                assert_eq!(ledger.place(&vessel(id), Host(host)).cloned(), expected);
+                assert_eq!(ledger.place(&vessel(id), Host::new(host.to_string())).cloned(), expected);
             }
             Op::Release(id) => {
                 let held = match ledger.vessel(&vessel(id)) {
@@ -275,7 +276,7 @@ fn the_ledger_keeps_caps_and_capacity(tc: hegel::TestCase) {
                     *free = free.checked_sub(*n).expect("host over capacity");
                 }
             }
-            assert_eq!(ledger.available(*host), Ok(expected));
+            assert_eq!(ledger.available(host.clone()), Ok(expected));
         }
     }
 }

@@ -33,3 +33,4 @@ Interned column domains:
 | `terminal_session` | `pool` | `tp` |
 | `terminal_session` | `source_capability` | `cp` |
 | `vessel` | `class` | `vc` |
+| `vessel` | `host` | `hs` |
