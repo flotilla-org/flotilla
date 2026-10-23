@@ -25,6 +25,8 @@ pub enum ProvisioningKind {
     Checkout,
     /// A terminal session's current launch, read by its record name.
     TerminalSession,
+    /// A vessel's lease on its pinned host (#3629 Q6).
+    Vessel,
 }
 
 /// The engine's readings of provisioning resources behind `[primitives]` (#3629 layer 4). Each

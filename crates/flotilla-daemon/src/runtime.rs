@@ -1222,6 +1222,7 @@ impl flotilla_projections::ports::LifecycleReads for EngineLifecycleReads {
             ProvisioningKind::Clone => self.reads.repository_clone(name, home).map(|view| view.map(|view| view.judgement)),
             ProvisioningKind::Checkout => self.reads.checkout(name, home).map(|view| view.map(|view| view.judgement)),
             ProvisioningKind::TerminalSession => self.reads.terminal_session(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::Vessel => self.reads.vessel(name, home).map(|view| view.map(|view| view.judgement)),
         };
         match judgement {
             Ok(judgement) => judgement.map(|judgement| judgement.reading()),

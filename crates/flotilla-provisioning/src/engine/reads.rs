@@ -12,7 +12,11 @@ use flotilla_schema::{Address, IndexQuery, Kind, Ref, Timestamp};
 use flotilla_schema_sqlite::{Read, ResourceId, Store, StoreError};
 use flotilla_state_machines::{
     edge_event,
-    machines::lifecycle::{Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState},
+    machines::{
+        convoy::ConvoyId,
+        lifecycle::{Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState},
+        vessel::{VesselKind, VesselSpec},
+    },
     Cause, Resource,
 };
 
@@ -136,6 +140,11 @@ pub trait ProvisioningReads: Send + Sync {
     fn held_checkouts(&self, holder: &Holder) -> Result<Vec<View<CheckoutKind>>, ReadError>;
     /// The environments held for `holder` (`environment.by_holder`): a vessel finds its environment so.
     fn held_environments(&self, holder: &Holder) -> Result<Vec<View<EnvironmentKind>>, ReadError>;
+    /// A vessel's lease, by its name at its home (#3629 Q6): Requested once granted on its pinned
+    /// host, Realised once ready, Gone once it ended.
+    fn vessel(&self, name: &str, home: &str) -> Result<Option<View<VesselKind>>, ReadError>;
+    /// A convoy's vessels (`vessel.by_convoy`), every lease, live or ended.
+    fn convoy_vessels(&self, convoy: &ConvoyId) -> Result<Vec<View<VesselKind>>, ReadError>;
 }
 
 /// The read port over one decided store.
@@ -293,6 +302,14 @@ impl ProvisioningReads for StoreReads {
 
     fn held_environments(&self, holder: &Holder) -> Result<Vec<View<EnvironmentKind>>, ReadError> {
         self.read(|read| indexed(read, &EnvironmentRequest::by_holder(holder)))
+    }
+
+    fn vessel(&self, name: &str, home: &str) -> Result<Option<View<VesselKind>>, ReadError> {
+        self.read(|read| keyed(read, name, home))
+    }
+
+    fn convoy_vessels(&self, convoy: &ConvoyId) -> Result<Vec<View<VesselKind>>, ReadError> {
+        self.read(|read| indexed(read, &VesselSpec::by_convoy(convoy)))
     }
 }
 
