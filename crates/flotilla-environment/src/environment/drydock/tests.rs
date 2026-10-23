@@ -117,6 +117,7 @@ async fn fixture_prepared(host: &HostFixture, provider: &DrydockEnvironmentProvi
         .prepare(
             "reference",
             &wire::PrepareRequest {
+                platform: None,
                 image_digest: spec.image.clone(),
                 tools_digest: "reference-fixture-tools".into(),
                 size: size(&spec.size),

@@ -6,133 +6,144 @@ use flotilla_resources::TerminalOccupancy;
 async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_homes() {
     use std::os::unix::fs::PermissionsExt;
 
-    let temp = TempDir::new().expect("tempdir");
-    let config_base = temp.path().join("config");
-    fs::create_dir_all(&config_base).expect("config directory");
-    fs::write(config_base.join("daemon.toml"), "machine_id = \"codex-redelivery-test\"\n").expect("daemon config");
-    let home = temp.path().join("home");
-    let central = home.join(".config/flotilla/credentials/codex-central/auth.json");
-    fs::create_dir_all(central.parent().expect("central credential directory")).expect("central credential directory");
-    fs::write(&central, "{\"tokens\":{\"access_token\":\"access-token-one\"}}").expect("central auth");
-    fs::set_permissions(&central, fs::Permissions::from_mode(0o600)).expect("protect central auth");
-    let config = Arc::new(ConfigStore::with_base(config_base));
-    let daemon = InProcessDaemon::new(
-        Vec::new(),
-        Arc::clone(&config),
-        fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
-        HostName::new("dinghy"),
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-    let material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([
-        ("HOME", home.display().to_string()),
-        (FLOTILLA_SKILLS_DIR_ENV, write_test_skill_sources(temp.path()).display().to_string()),
-    ]))));
-    let state = ControllerRuntimeState::new(
-        Arc::clone(&daemon),
-        config,
-        Arc::new(ProviderRegistry::new()),
-        None,
-        "host-test".to_string(),
-        "host-direct-host-test".to_string(),
-    )
-    .with_agent_material(Arc::clone(&material));
-    let required = BTreeSet::from(["codex".to_string()]);
-    let deliveries = material.prepare("work", &required, &BTreeMap::new()).await.expect("initial delivery");
-    let codex_home = deliveries[0].mount.host_path.as_path().to_path_buf();
-
-    let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
-    for (name, env) in
-        [("work", BTreeMap::new()), ("external-home", BTreeMap::from([("CODEX_HOME".to_string(), "/image/codex".to_string())]))]
-    {
-        let environment = environments
-            .create(
-                &empty_meta(name),
-                &EnvironmentSpec {
-                    cloud_sandbox: None,
-                    provider_address: None,
-                    host_direct: None,
-                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                        image_build_ref: None,
-                        memory_policy: Default::default(),
-                        host_ref: "host-test".to_string(),
-                        image: "test".to_string(),
-                        declared_agent_adapters: required.clone(),
-                        required_agent_adapters: required.clone(),
-                        pull_policy: Default::default(),
-                        mounts: Vec::new(),
-                        env,
-                    }),
-                },
-            )
-            .await
-            .expect("environment");
-        environments
-            .update_status(
-                &environment.metadata.name,
-                &environment.metadata.resource_version,
-                &flotilla_resources::EnvironmentStatus { phase: EnvironmentPhase::Ready, ready: true, ..Default::default() },
-            )
-            .await
-            .expect("ready");
-    }
-
-    // The guest process boundary records the protected files call; the registry
-    // and redelivery loop are real and must select only the managed vessel.
-    struct GuestCredentialRunner(PathBuf);
-    #[async_trait]
-    impl CommandRunner for GuestCredentialRunner {
-        async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
-            unreachable!()
-        }
-        async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
-            unreachable!()
-        }
-        async fn exists(&self, _: &str, _: &[&str]) -> bool {
-            false
-        }
-        async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
-            assert_eq!(path, Path::new(flotilla_credentials::CONTAINER_CODEX_HOME).join("auth.json"));
-            assert_eq!(mode, 0o400);
-            fs::write(&self.0, content).unwrap();
-            Ok(())
-        }
-    }
-    let guest_auth = temp.path().join("guest-auth.json");
-    let id = EnvironmentId::new("work");
-    daemon
-        .register_provisioned_environment(
-            id.clone(),
-            Arc::new(TestInteriorEnvironment {
-                id,
-                image: ImageId::new("test"),
-                runner: Arc::new(GuestCredentialRunner(guest_auth.clone())),
-                env_vars: HashMap::new(),
-                destroyed: Arc::new(AtomicBool::new(false)),
-            }),
-            EnvironmentBag::new(),
-            Some(passthrough_registry()),
+    // Both realized transports must rotate credentials, while explicit homes opt out.
+    // Exhaustive two-case glue coverage; the host registry and loop are real.
+    for shared in [false, true] {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"codex-redelivery-test\"\n").expect("daemon config");
+        let home = temp.path().join("home");
+        let central = home.join(".config/flotilla/credentials/codex-central/auth.json");
+        fs::create_dir_all(central.parent().expect("central credential directory")).expect("central credential directory");
+        fs::write(&central, "{\"tokens\":{\"access_token\":\"access-token-one\"}}").expect("central auth");
+        fs::set_permissions(&central, fs::Permissions::from_mode(0o600)).expect("protect central auth");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            HostName::new("dinghy"),
+            std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
         )
-        .unwrap();
+        .await;
+        let material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([
+            ("HOME", home.display().to_string()),
+            (FLOTILLA_SKILLS_DIR_ENV, write_test_skill_sources(temp.path()).display().to_string()),
+        ]))));
+        let state = ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            Arc::new(ProviderRegistry::new()),
+            None,
+            "host-test".to_string(),
+            "host-direct-host-test".to_string(),
+        )
+        .with_agent_material(Arc::clone(&material));
+        let required = BTreeSet::from(["codex".to_string()]);
+        let deliveries = material.prepare("work", &required, &BTreeMap::new()).await.expect("initial delivery");
+        let codex_home = deliveries[0].mount.host_path.as_path().to_path_buf();
 
-    fs::write(&central, "{\"tokens\":{\"access_token\":\"access-token-two\"}}").expect("rotate central auth");
-    redeliver_codex_credentials(&state, NAMESPACE).await.expect("redeliver the rotated credential");
+        let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
+        for (name, env) in
+            [("work", BTreeMap::new()), ("external-home", BTreeMap::from([("CODEX_HOME".to_string(), "/image/codex".to_string())]))]
+        {
+            let environment = environments
+                .create(
+                    &empty_meta(name),
+                    &EnvironmentSpec {
+                        cloud_sandbox: None,
+                        provider_address: None,
+                        host_direct: None,
+                        docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                            image_build_ref: None,
+                            memory_policy: Default::default(),
+                            host_ref: "host-test".to_string(),
+                            image: "test".to_string(),
+                            declared_agent_adapters: required.clone(),
+                            required_agent_adapters: required.clone(),
+                            pull_policy: Default::default(),
+                            mounts: Vec::new(),
+                            env,
+                        }),
+                    },
+                )
+                .await
+                .expect("environment");
+            environments
+                .update_status(
+                    &environment.metadata.name,
+                    &environment.metadata.resource_version,
+                    &flotilla_resources::EnvironmentStatus { phase: EnvironmentPhase::Ready, ready: true, ..Default::default() },
+                )
+                .await
+                .expect("ready");
+        }
 
-    assert!(fs::read_to_string(&guest_auth).unwrap().contains("access-token-two"));
-    let delivered = codex_home.join("auth.json");
-    assert!(
-        fs::read_to_string(&delivered).expect("delivered credential").contains("access-token-two"),
-        "a live crew must be moved onto the refresher's current token"
-    );
-    assert_eq!(
-        fs::metadata(&delivered).expect("delivered credential metadata").permissions().mode() & 0o777,
-        0o400,
-        "redelivery must keep the crew's copy read-only"
-    );
-    assert!(
-        !home.join(".local/share/flotilla/agent-homes/external-home").exists(),
-        "an externally managed CODEX_HOME is not ours to deliver into"
-    );
+        // The guest process boundary records the protected files call; the registry
+        // and redelivery loop are real and must select only the managed vessel.
+        struct GuestCredentialRunner(PathBuf);
+        #[async_trait]
+        impl CommandRunner for GuestCredentialRunner {
+            async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+                unreachable!()
+            }
+            async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+                unreachable!()
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+            async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+                assert_eq!(path, Path::new(flotilla_credentials::CONTAINER_CODEX_HOME).join("auth.json"));
+                assert_eq!(mode, 0o400);
+                fs::write(&self.0, content).unwrap();
+                Ok(())
+            }
+        }
+        let guest_auth = temp.path().join("guest-auth.json");
+        let id = EnvironmentId::new("work");
+        daemon
+            .register_provisioned_environment(
+                id.clone(),
+                Arc::new(CodexTestEnvironment {
+                    mounts: if shared { vec![deliveries[0].mount.clone()] } else { Vec::new() },
+                    inner: TestInteriorEnvironment {
+                        id,
+                        image: ImageId::new("test"),
+                        runner: Arc::new(GuestCredentialRunner(guest_auth.clone())),
+                        env_vars: HashMap::new(),
+                        destroyed: Arc::new(AtomicBool::new(false)),
+                    },
+                }),
+                EnvironmentBag::new(),
+                Some(passthrough_registry()),
+            )
+            .unwrap();
+
+        fs::write(&central, "{\"tokens\":{\"access_token\":\"access-token-two\"}}").expect("rotate central auth");
+        redeliver_codex_credentials(&state, NAMESPACE).await.expect("redeliver the rotated credential");
+
+        if shared {
+            assert!(!guest_auth.exists(), "mounted homes must rotate on the host without a guest push");
+        } else {
+            assert!(fs::read_to_string(&guest_auth).unwrap().contains("access-token-two"));
+        }
+        let delivered = codex_home.join("auth.json");
+        assert!(
+            fs::read_to_string(&delivered).expect("delivered credential").contains("access-token-two"),
+            "a live crew must be moved onto the refresher's current token"
+        );
+        assert_eq!(
+            fs::metadata(&delivered).expect("delivered credential metadata").permissions().mode() & 0o777,
+            0o400,
+            "redelivery must keep the crew's copy read-only"
+        );
+        assert!(
+            !home.join(".local/share/flotilla/agent-homes/external-home").exists(),
+            "an externally managed CODEX_HOME is not ours to deliver into"
+        );
+    }
 }
 
 // A permission prompt after submission proves the turn was accepted;
@@ -1455,4 +1466,36 @@ async fn unverifiable_controller_fence_requires_restart_without_a_confirmation_w
             reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into()
         }
     );
+}
+
+// Environment boundary fixture: retain the same interior runner while exposing
+// the provider's realized mounts to the production environment manager.
+struct CodexTestEnvironment {
+    inner: TestInteriorEnvironment,
+    mounts: Vec<ProvisionedMount>,
+}
+#[async_trait]
+impl ProvisionedEnvironment for CodexTestEnvironment {
+    flotilla_discovery_testkit::injected_environment_handle!();
+    fn id(&self) -> &EnvironmentId {
+        self.inner.id()
+    }
+    fn image(&self) -> &ImageId {
+        self.inner.image()
+    }
+    fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
+        self.mounts.clone()
+    }
+    fn runner(&self) -> Arc<dyn CommandRunner> {
+        self.inner.runner()
+    }
+    async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+        self.inner.observe().await
+    }
+    async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+        self.inner.env_vars().await
+    }
+    async fn destroy(&self) -> Result<(), String> {
+        self.inner.destroy().await
+    }
 }

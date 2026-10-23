@@ -1259,6 +1259,8 @@ impl DockerEnvironmentProviderInner {
     async fn start_agent(runner: &dyn CommandRunner, container: &str) -> Result<(), String> {
         // Upgrade replaces the image's binary by rename. Give the container's
         // configured user its own copy's directory; never write the tools image.
+        // Root exec overrides the crew PATH and repairs legacy PATH directory
+        // ownership before publishing tools into the separate crew-owned prefix.
         let user = host_user();
         runner
             .run(
@@ -1267,10 +1269,16 @@ impl DockerEnvironmentProviderInner {
                     "exec",
                     "--user",
                     "0",
+                    "--env",
+                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    "--env",
+                    "LD_LIBRARY_PATH=",
+                    "--env",
+                    "LD_PRELOAD=",
                     container,
-                    "sh",
+                    "/bin/sh",
                     "-c",
-                    "mkdir -p /opt/flotilla /usr/local/bin /run/flotilla; chown -R \"$1\" /opt/drydock /opt/flotilla /run/flotilla; chown \"$1\" /usr/local/bin",
+                    "PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH; /bin/mkdir -p /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin /opt/flotilla/crew-bin /run/flotilla && /bin/chown 0:0 /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && /bin/chmod go-w /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && /bin/chown -R \"$1\" /opt/drydock /opt/flotilla /run/flotilla",
                     "flotilla-agent-owner",
                     &user,
                 ],
@@ -1433,7 +1441,9 @@ mod agent_contract_tests {
                 }
                 ["inspect", "--format", "{{.Image}}", _] => Ok(PREPARED.into()),
                 ["inspect", "--format", "{{json .Config.Env}}", BACKING] => Ok(r#"["HOME=/tmp","PATH=/usr/bin:/bin"]"#.into()),
-                ["exec", "--user", "0", BACKING, "sh", "-c", script, "flotilla-agent-owner", _] => {
+                ["exec", "--user", "0", "--env", path, "--env", "LD_LIBRARY_PATH=", "--env", "LD_PRELOAD=", BACKING, "/bin/sh", "-c", script, "flotilla-agent-owner", _] =>
+                {
+                    assert_eq!(*path, format!("PATH={DOCKER_DEFAULT_PATH}"));
                     assert!(script.contains("/opt/drydock"));
                     assert!(script.contains("/opt/flotilla"));
                     Ok(String::new())
@@ -1478,6 +1488,45 @@ mod agent_contract_tests {
         async fn exists(&self, _: &str, _: &[&str]) -> bool {
             false
         }
+    }
+
+    // Root startup must use absolute programs and must leave every root PATH
+    // directory owned by root. This process-boundary fake inspects real argv.
+    #[tokio::test]
+    async fn root_startup_keeps_path_directories_root_owned() {
+        struct RootContract(AtomicBool);
+        #[async_trait]
+        impl CommandRunner for RootContract {
+            async fn run(&self, _: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+                if args.get(1) == Some(&"--user") {
+                    self.0.store(true, Ordering::SeqCst);
+                    assert_eq!(args[4], format!("PATH={DOCKER_DEFAULT_PATH}"));
+                    assert_eq!(args[6], "LD_LIBRARY_PATH=");
+                    assert_eq!(args[8], "LD_PRELOAD=");
+                    assert_eq!(args[10], "/bin/sh");
+                    let script = args[12];
+                    assert!(!script.contains("chown \"$1\" /usr/local/bin"));
+                    assert!(script.contains("/opt/flotilla/crew-bin"));
+                    let root_directories = DOCKER_DEFAULT_PATH.split(':').collect::<Vec<_>>().join(" ");
+                    assert!(script.contains(&format!("/bin/chown 0:0 {root_directories}")));
+                    assert!(script.contains(&format!("/bin/chmod go-w {root_directories}")));
+                    let crew_paths = script.rsplit("/bin/chown -R ").next().unwrap().split_whitespace().skip(1);
+                    for path in crew_paths {
+                        assert!(!DOCKER_DEFAULT_PATH.split(':').any(|root| Path::new(root).starts_with(path)));
+                    }
+                }
+                Ok(String::new())
+            }
+            async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+                unreachable!()
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+        }
+        let contract = RootContract(AtomicBool::new(false));
+        DockerEnvironmentProviderInner::start_agent(&contract, BACKING).await.unwrap();
+        assert!(contract.0.load(Ordering::SeqCst), "startup must establish ownership before supervising");
     }
 
     // Issue 3486: the hello gates provisioning; the returned handle executes

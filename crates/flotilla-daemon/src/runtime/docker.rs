@@ -366,28 +366,7 @@ impl DockerControllerRuntime {
         };
         let mut provisioned_mounts = Vec::with_capacity(spec.mounts.len() + material_deliveries.len());
         provisioned_mounts.extend(spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount));
-        for delivery in &material_deliveries {
-            if environment_spec.cloud_sandbox.is_some() || provider.receives_host_tools() {
-                let metadata = tokio::fs::symlink_metadata(delivery.mount.host_path.as_path())
-                    .await
-                    .map_err(|e| format!("agent material source: {e}"))?;
-                let kind = if metadata.is_dir() { EnvironmentToolAssetKind::Directory } else { EnvironmentToolAssetKind::File };
-                // Frozen material and the initial Pushed Codex copy travel as
-                // files after hello. Guest scratch is subsequently guest-owned;
-                // auth rotation uses the same agent runner, never a host bind.
-                tools.push(EnvironmentTool::new("agent material", delivery.mount.environment_path.as_path()).with_asset(
-                    EnvironmentToolAsset::new(
-                        delivery.mount.host_path.as_path(),
-                        delivery.mount.environment_path.as_path(),
-                        kind,
-                        EnvironmentToolAssetAccess::ReadOnly,
-                        "agent material",
-                    ),
-                ));
-            } else {
-                provisioned_mounts.push(delivery.mount.clone());
-            }
-        }
+        deliver_agent_material(&provider.capabilities(), &material_deliveries, &mut tools, &mut provisioned_mounts).await?;
         let jobs = context.rust_build_jobs().await?;
         let opts = CreateOpts {
             tokens: environment_variables,
@@ -765,7 +744,7 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         };
         match active {
             Some(handle) => {
-                if handle.agent().is_some() {
+                if handle.agent().is_some() && !codex_home_is_shared(&handle.provisioned_mounts()) {
                     if let Some(registry) = &self.state.agent_material {
                         let runner = handle.runner();
                         let capture = tokio::time::timeout(
@@ -1054,4 +1033,41 @@ pub(super) async fn probe_provisioned_environment(
     let config = ConfigStore::with_base(state.config.base_path().as_path().join(format!("env-discovery/{env_id}")));
     let registry = discovery.factories.probe_all(&bag, &config, &probe_root, handle.runner()).await;
     Ok((bag, Arc::new(registry)))
+}
+
+// Agent material chooses a transport independently of executable/tool delivery.
+pub(super) async fn deliver_agent_material(
+    capabilities: &flotilla_protocol::provider::ProviderCapabilities,
+    deliveries: &[flotilla_credentials::AgentMaterialDelivery],
+    tools: &mut Vec<EnvironmentTool>,
+    provisioned_mounts: &mut Vec<flotilla_environment::environment::ProvisionedMount>,
+) -> Result<(), String> {
+    for delivery in deliveries {
+        if !capabilities.material_modes.contains(&flotilla_protocol::provider::MaterialMode::Shared) {
+            let metadata =
+                tokio::fs::symlink_metadata(delivery.mount.host_path.as_path()).await.map_err(|e| format!("agent material source: {e}"))?;
+            let kind = if metadata.is_dir() { EnvironmentToolAssetKind::Directory } else { EnvironmentToolAssetKind::File };
+            // Providers without Shared material receive an initial copy after hello.
+            // Docker keeps the writable home host-backed for the whole session.
+            tools.push(EnvironmentTool::new("agent material", delivery.mount.environment_path.as_path()).with_asset(
+                EnvironmentToolAsset::new(
+                    delivery.mount.host_path.as_path(),
+                    delivery.mount.environment_path.as_path(),
+                    kind,
+                    EnvironmentToolAssetAccess::ReadOnly,
+                    "agent material",
+                ),
+            ));
+        } else {
+            provisioned_mounts.push(delivery.mount.clone());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn codex_home_is_shared(mounts: &[flotilla_environment::environment::ProvisionedMount]) -> bool {
+    mounts.iter().any(|mount| {
+        mount.mode == flotilla_environment::environment::ProvisionedMountMode::Rw
+            && mount.environment_path.as_path() == Path::new(flotilla_credentials::CONTAINER_CODEX_HOME)
+    })
 }

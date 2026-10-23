@@ -87,7 +87,7 @@ where
         if remaining.is_zero() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, format!("agent hello: {last}")));
         }
-        match Client::connect_current(&mut open, executable, remaining).await {
+        match Client::connect_current(&mut open, &drydock_protocol::Platform::current(), executable, remaining).await {
             Ok(client) => return Ok(client),
             Err(error) => last = error.to_string(),
         }

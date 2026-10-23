@@ -51,13 +51,13 @@ impl Drop for Forwarder {
 }
 impl Connection {
     pub async fn open(api: &dyn ProviderApi, instance: &str, id: &str, identity_file: PathBuf) -> Result<Self, String> {
-        let executable = tokio::fs::read(::drydock::local::companion("drydock-agent", "DRYDOCK_AGENT_BIN")?).await.map_err(error)?;
+        let executable = tokio::fs::read(::drydock::local::agent_build(&wire::Platform::current())?).await.map_err(error)?;
         let sessions = Arc::new(tokio::sync::Mutex::new(None));
         let saved = sessions.clone();
         let agent = drydock_agent::Client::connect_current(
             || async {
                 saved.lock().await.take();
-                let wire::Reach::Ssh { endpoint, user, host_key } =
+                let wire::Reach::Ssh { endpoint, user, host_key, .. } =
                     api.reach(instance, id).await.map_err(|_| io::Error::other("reach failed"))?
                 else {
                     return Err(io::Error::other("interim controller reach requires SSH"));
@@ -76,6 +76,7 @@ impl Connection {
                 *saved.lock().await = Some(session.clone());
                 drydock_transport::Transport::native(Arc::new(Connections { session, listener }), Default::default())
             },
+            &wire::Platform::current(),
             &executable,
             Duration::from_secs(60),
         )
@@ -202,7 +203,7 @@ impl Connector for SshConnector {
     async fn connect(&self, api: &dyn ProviderApi, instance: &str, backing: &str, key: PathBuf) -> Result<Arc<dyn Guest>, String> {
         // Fail immediately for a missing companion, rather than obscuring an
         // installation error as guest boot latency.
-        let executable = ::drydock::local::companion("drydock-agent", "DRYDOCK_AGENT_BIN")?;
+        let executable = ::drydock::local::agent_build(&wire::Platform::current())?;
         tokio::fs::metadata(executable).await.map_err(|e| format!("drydock-agent companion unavailable: {e}"))?;
         let last_error = std::sync::Mutex::new(String::new());
         let connection = tokio::time::timeout(Duration::from_secs(60), async {

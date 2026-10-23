@@ -736,9 +736,18 @@ pub(super) async fn redeliver_codex_credentials(state: &ControllerRuntimeState, 
         }
         // A redelivery failure is never fatal to the environment: the crew keeps
         // the copy it already has, and the next tick retries.
-        let result = match state.daemon.command_runner_for_environment_ref(&environment.metadata.name) {
-            Some(runner) => registry.refresh_delivered_credentials_through(&environment.metadata.name, runner.as_ref()).await,
-            None => Err("agent runner unavailable for Codex auth rotation".into()),
+        let mounts = state
+            .daemon
+            .environment_manager()
+            .provisioned_mounts(&flotilla_protocol::EnvironmentId::new(environment.metadata.name.as_str()))
+            .unwrap_or_default();
+        let result = if super::docker::codex_home_is_shared(&mounts) {
+            registry.refresh_delivered_credentials(&environment.metadata.name).await
+        } else {
+            match state.daemon.command_runner_for_environment_ref(&environment.metadata.name) {
+                Some(runner) => registry.refresh_delivered_credentials_through(&environment.metadata.name, runner.as_ref()).await,
+                None => Err("agent runner unavailable for Codex auth rotation".into()),
+            }
         };
         match result {
             Ok(true) => info!(environment = %environment.metadata.name, "redelivered the central Codex credential"),
