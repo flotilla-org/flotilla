@@ -4,8 +4,8 @@ use tracing::Instrument;
 
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_resources::convoy_address::convoy_address;
-use flotilla_resources::ResumeIntent;
 use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity, PROJECT_LABEL};
+use flotilla_resources::{Environment, EnvironmentPhase, ResumeIntent};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
@@ -2862,41 +2862,27 @@ impl CrewService {
             }
             Ok(resource) => {
                 if let Some(environment_ref) = resource.object.status.as_ref().and_then(|status| status.environment_ref.as_ref()) {
-                    match self.resource_backend.including_replicas::<flotilla_resources::Environment>(namespace).get(environment_ref).await
-                    {
-                        Ok(environment)
-                            if environment
-                                .object
-                                .status
-                                .as_ref()
-                                .is_some_and(|status| status.phase == flotilla_resources::EnvironmentPhase::Lost) =>
-                        {
-                            let reason = environment
-                                .object
-                                .status
-                                .as_ref()
-                                .and_then(|status| status.message.as_deref())
-                                .unwrap_or("environment disappeared");
-                            return Err(format!(
-                                "vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"
-                            ));
+                    match self.resource_backend.including_replicas::<Environment>(namespace).get(environment_ref).await {
+                        Ok(environment) => {
+                            if let Some(status) = environment.object.status.as_ref() {
+                                match status.phase {
+                                    EnvironmentPhase::Lost => {
+                                        let reason = status.message.as_deref().unwrap_or("environment disappeared");
+                                        return Err(format!(
+                                            "vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"
+                                        ));
+                                    }
+                                    EnvironmentPhase::Failed => {
+                                        let reason = status.message.as_deref().unwrap_or("environment provisioning failed");
+                                        return Err(format!("vessel `{vessel}` failed provisioning and cannot be resumed: {reason}"));
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
-                        Ok(environment)
-                            if environment
-                                .object
-                                .status
-                                .as_ref()
-                                .is_some_and(|status| status.phase == flotilla_resources::EnvironmentPhase::Failed) =>
-                        {
-                            let reason = environment
-                                .object
-                                .status
-                                .as_ref()
-                                .and_then(|status| status.message.as_deref())
-                                .unwrap_or("environment provisioning failed");
-                            return Err(format!("vessel `{vessel}` failed provisioning and cannot be resumed: {reason}"));
-                        }
-                        Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+                        // Missing backing alone is not an observed loss. Preserve the
+                        // existing resume path until reconciliation records its cause.
+                        Err(ResourceError::NotFound { .. }) => {}
                         Err(error) => return Err(error.to_string()),
                     }
                 }
