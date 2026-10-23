@@ -399,6 +399,7 @@ impl TerminalPool for CleatTerminalPool {
         match self.guarded_deliver(session_name, text).await? {
             TerminalSubmission::Submitted => Ok(()),
             TerminalSubmission::Refused(reason) => Err(reason),
+            TerminalSubmission::AgentRestartRequired => Err("cleat controller fence requires an agent restart".into()),
         }
     }
 
@@ -417,23 +418,33 @@ impl TerminalPool for CleatTerminalPool {
             return Ok(TerminalSubmission::Submitted);
         }
         let reason = output.stderr;
-        if output.exit_code == Some(1)
-            && matches!(
-                reason.trim(),
-                "controller input is not idle"
-                    | "controller input has not yet produced a verifiable PTY echo"
-                    | "controller input output fence is still settling"
-            )
-        {
-            Ok(TerminalSubmission::Refused(reason))
-        } else {
-            Err(reason)
+        // `send` at cleat 89cf40c has no structured-output switch. Parse only
+        // its documented reason prefix and controller.cause field, never prose.
+        let cause = reason
+            .trim()
+            .strip_prefix("controller-active: ")
+            .and_then(|diagnostic| diagnostic.rsplit_once(" (controller.cause="))
+            .and_then(|(_, cause)| cause.strip_suffix(')'));
+        match (output.exit_code, cause) {
+            (Some(1), Some("fence-pending" | "fence-settling" | "quiet-time" | "busy")) => Ok(TerminalSubmission::Refused(reason)),
+            (Some(1), Some("fence-unverifiable")) => Ok(TerminalSubmission::AgentRestartRequired),
+            _ => Err(reason),
         }
     }
 
     async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
         run!(self.runner, &self.binary, &["send-keys", session_name, "C-c"], Path::new("/"))?;
         self.deliver(session_name, text).await
+    }
+
+    async fn guarded_retry_delivery(&self, session_name: &str, text: &str) -> Result<TerminalSubmission, String> {
+        run!(self.runner, &self.binary, &["send-keys", session_name, "C-c"], Path::new("/"))?;
+        match self.guarded_deliver(session_name, text).await? {
+            // The clear already happened; do not automatically repeat it on a
+            // temporary refusal. The permanent fence still needs a named alert.
+            TerminalSubmission::Refused(reason) => Err(reason),
+            outcome => Ok(outcome),
+        }
     }
 }
 
@@ -805,20 +816,25 @@ mod tests {
     // transport errors and unrecognized failures remain ambiguous.
     #[tokio::test]
     async fn guarded_delivery_distinguishes_refusal_from_ambiguous_failure() {
-        for (reason, refused) in [
-            ("controller input is not idle", true),
-            ("controller input has not yet produced a verifiable PTY echo", true),
-            ("controller input output fence is still settling", true),
-            ("connection lost", false),
-            ("write failed: controller input is not idle", false),
+        use flotilla_provider_runtime::CommandOutput;
+        // The shipped cleat has no JSON option for send. These raw process
+        // results were captured from actual guarded sends, including every cause.
+        for (fixture, restart) in [
+            (include_str!("fixtures/controller-refusals/fence-pending.json"), false),
+            (include_str!("fixtures/controller-refusals/fence-settling.json"), false),
+            (include_str!("fixtures/controller-refusals/quiet-time.json"), false),
+            (include_str!("fixtures/controller-refusals/busy.json"), false),
+            (include_str!("fixtures/controller-refusals/fence-unverifiable.json"), true),
         ] {
-            let runner = Arc::new(MockRunner::new(vec![Err(format!("{reason}\n"))]));
+            let captured: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            let reason = captured["stderr"].as_str().unwrap().to_string();
+            let runner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
+                stdout: captured["stdout"].as_str().unwrap().into(),
+                stderr: reason.clone(),
+                exit_code: Some(captured["exit_code"].as_i64().unwrap() as i32),
+            })]));
             let result = test_pool(runner.clone(), "cleat").guarded_deliver("agent", "turn").await;
-            if refused {
-                assert_eq!(result, Ok(TerminalSubmission::Refused(format!("{reason}\n"))));
-            } else {
-                assert_eq!(result, Err(format!("{reason}\n")));
-            }
+            assert_eq!(result, Ok(if restart { TerminalSubmission::AgentRestartRequired } else { TerminalSubmission::Refused(reason) }));
             assert_eq!(logical_calls(&runner).len(), 1);
         }
     }
@@ -834,6 +850,65 @@ mod tests {
         ] {
             let runner = Arc::new(MockRunner::with_outputs(vec![response]));
             assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn").await, Err("controller input is not idle".into()));
+        }
+    }
+
+    // Only a documented reason/cause pair at a normal daemon refusal exit
+    // proves non-submission. Invalid, missing and future fields stay ambiguous.
+    #[tokio::test]
+    async fn guarded_delivery_unknown_output_stays_ambiguous() {
+        use flotilla_provider_runtime::CommandOutput;
+        let known = "controller-active: changed diagnostic (controller.cause=quiet-time)";
+        for stderr in [
+            "",
+            "connection lost",
+            "controller input is not idle",
+            "controller-active: diagnostic",
+            "controller-active: diagnostic (controller.cause=future)",
+            "error: diagnostic (controller.cause=busy)",
+            "write failed: controller-active: diagnostic (controller.cause=busy)",
+            "controller-active: diagnostic (controller.cause=busy) extra",
+        ] {
+            let runner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: stderr.into(),
+                exit_code: Some(1),
+            })]));
+            assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn").await, Err(stderr.into()));
+        }
+        // The diagnostic is deliberately different: prose is not the contract.
+        let runner =
+            Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput { stdout: String::new(), stderr: known.into(), exit_code: Some(1) })]));
+        assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn").await, Ok(TerminalSubmission::Refused(known.into())));
+        for exit_code in [None, Some(2), Some(127)] {
+            let runner =
+                Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput { stdout: String::new(), stderr: known.into(), exit_code })]));
+            assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn").await, Err(known.into()));
+        }
+        let runner = Arc::new(MockRunner::with_outputs(vec![Err(known.into())]));
+        assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn").await, Err(known.into()));
+    }
+
+    // Even the legacy clear-and-retry path must preserve the named restart
+    // condition; temporary refusals still hold because clearing already occurred.
+    #[tokio::test]
+    async fn guarded_retry_preserves_restart_failure_after_clearing() {
+        use flotilla_provider_runtime::CommandOutput;
+        for (fixture, restart) in [
+            (include_str!("fixtures/controller-refusals/fence-unverifiable.json"), true),
+            (include_str!("fixtures/controller-refusals/quiet-time.json"), false),
+        ] {
+            let captured: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            let reason = captured["stderr"].as_str().unwrap().to_string();
+            let runner = Arc::new(MockRunner::with_outputs(vec![
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), exit_code: Some(0) }),
+                Ok(CommandOutput { stdout: String::new(), stderr: reason.clone(), exit_code: Some(1) }),
+            ]));
+            assert_eq!(
+                test_pool(runner.clone(), "cleat").guarded_retry_delivery("agent", "turn").await,
+                if restart { Ok(TerminalSubmission::AgentRestartRequired) } else { Err(reason) }
+            );
+            assert_eq!(logical_calls(&runner).len(), 2);
         }
     }
 

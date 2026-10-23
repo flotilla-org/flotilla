@@ -51,11 +51,13 @@ pub enum TerminalDeliveryOutcome {
 pub enum TerminalDeliveryFailure {
     StartupNotReady,
     SubmissionUnconfirmed,
+    ControllerFenceUnverifiable,
 }
 
 impl TerminalDeliveryFailure {
-    fn message(self) -> &'static str {
+    pub fn message(self) -> &'static str {
         match self {
+            Self::ControllerFenceUnverifiable => flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE,
             Self::StartupNotReady => "agent TUI did not become ready before the message delivery deadline; no text was sent",
             Self::SubmissionUnconfirmed => {
                 "message input may have been accepted; submission evidence was not stable; delivery held without resending"
@@ -339,6 +341,7 @@ pub enum TerminalPrepared {
     Running(TerminalRuntimeState),
     MessageDelivered(String),
     MessageDeliveryPending,
+    ControllerFenceUnverifiable { message_id: String },
     MessageDeliveryUnconfirmed { message_id: String, message: String },
     MessageDeliveryNotSubmitted { message_id: String, message: String },
     Stopped,
@@ -492,7 +495,8 @@ where
                 if let Some(message) = head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
                     if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
                         condition.message_id.as_deref() == Some(message.id.as_str())
-                            && (condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
+                            && (condition.reason == flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_REASON
+                                || condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
                                 || condition.reason == TERMINAL_DELIVERY_EXPIRED_REASON
                                 || (condition.reason == TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
                                     && (delivery_retry_exhausted(condition.consecutive_failures)
@@ -575,6 +579,9 @@ where
                                 message_id: message.id.clone(),
                                 message: TerminalDeliveryFailure::StartupNotReady.message().to_string(),
                             }
+                        }
+                        TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable) => {
+                            TerminalPrepared::ControllerFenceUnverifiable { message_id: message.id.clone() }
                         }
                         TerminalDeliveryOutcome::Unconfirmed(failure) => TerminalPrepared::MessageDeliveryUnconfirmed {
                             message_id: message.id.clone(),
@@ -736,6 +743,7 @@ where
                 | TerminalPrepared::MessageDelivered(_)
                 | TerminalPrepared::MessageDeliveryPending
                 | TerminalPrepared::MessageDeliveryNotSubmitted { .. }
+                | TerminalPrepared::ControllerFenceUnverifiable { .. }
                 | TerminalPrepared::MessageDeliveryUnconfirmed { .. }
                 | TerminalPrepared::Attention(_)
                 | TerminalPrepared::AttentionStale
@@ -779,6 +787,13 @@ where
                     Some(TerminalSessionStatusPatch::MarkDeliveryNotSubmitted {
                         message_id: message_id.clone(),
                         message: format!("{message}; attempt {failures}/{DELIVERY_MAX_ATTEMPTS}; {disposition}"),
+                        observed_at: now,
+                    })
+                }
+                TerminalPrepared::ControllerFenceUnverifiable { message_id } => {
+                    Some(TerminalSessionStatusPatch::MarkControllerFenceUnverifiable {
+                        message_id: message_id.clone(),
+                        message: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into(),
                         observed_at: now,
                     })
                 }
@@ -910,6 +925,12 @@ where
         {
             actuations.push(Actuation::DeleteDemand { name: delivery_demand_name(obj) });
         } else if expired
+            || matches!(prepared, TerminalPrepared::ControllerFenceUnverifiable { .. })
+            || obj
+                .status
+                .as_ref()
+                .and_then(|status| status.degraded.as_ref())
+                .is_some_and(|condition| condition.reason == flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_REASON)
             || matches!(prepared, TerminalPrepared::MessageDeliveryNotSubmitted { message_id, .. } if delivery_retry_exhausted(obj.status.as_ref().map_or(1, |status| status.next_delivery_failure_count(message_id))))
         {
             actuations.push({
@@ -927,7 +948,7 @@ where
         let observing_pending_delivery = matches!(prepared, TerminalPrepared::Attention(_))
             && matches!(&obj.spec.source, TerminalSessionSource::Agent { message: Some(head), .. }
                 if head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())).is_some());
-        if matches!(prepared, TerminalPrepared::MessageDeliveryUnconfirmed { .. }) {
+        if matches!(prepared, TerminalPrepared::MessageDeliveryUnconfirmed { .. } | TerminalPrepared::ControllerFenceUnverifiable { .. }) {
             outcome.requeue_after = Some(Duration::from_secs(1));
         } else if matches!(prepared, TerminalPrepared::MessageDeliveryPending) || observing_pending_delivery {
             outcome.requeue_after = Some(Duration::from_millis(200));

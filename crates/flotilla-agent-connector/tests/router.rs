@@ -362,3 +362,29 @@ fn refusal_is_keyed_by_the_target_session() {
     assert_eq!(router.candidates(Operation::NewTurn, &target("live")), [TransportId::new(KEYSTROKE)]);
     assert_eq!(router.candidates(Operation::NewTurn, &target("other")).len(), 2);
 }
+
+// A session that requires an agent restart cannot recover by selecting another
+// input transport. Even accepting repeats must preserve the named failure.
+#[hegel::test]
+fn session_restart_failure_does_not_fall_back(tc: hegel::TestCase) {
+    // Cover both repeat policies and every count of alternative transports 0..=4.
+    let accept_repeat = tc.draw(gs::booleans());
+    let alternatives = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+    let calls: Calls = Default::default();
+    let failure = TransportOutcome::SessionNeedsRestart { reason: "ControllerFenceUnverifiable: exit the agent; resume".into() };
+    let offers: Vec<_> = (0..=alternatives).map(|i| TransportOffer::new(TransportId::new(format!("transport-{i}")), TUI_SHAPE)).collect();
+    let mut router = TransportRouter::new().with_connector("harness", Arc::new(Offers(offers)));
+    for i in 0..=alternatives {
+        router = router.with_transport(Arc::new(ScriptedTransport {
+            id: TransportId::new(format!("transport-{i}")),
+            outcome: failure.clone(),
+            calls: calls.clone(),
+        }));
+    }
+    router = router
+        .with_config(RouterConfig { operations: [(Operation::NewTurn, OperationPolicy { accept_repeat, ..Default::default() })].into() });
+    let routed = block_on(router.submit(&delivery("session", "turn")));
+    assert_eq!(routed.outcome, failure);
+    assert!(routed.failovers.is_empty());
+    assert_eq!(calls.lock().expect("submissions").len(), 1);
+}

@@ -251,6 +251,17 @@ impl MessageDelivery {
                         + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
                     self.held.hold(turn.members, until);
                 }
+                Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable)) => {
+                    let terminals = self.state.daemon.resource_backend().using::<TerminalSession>(&self.namespace);
+                    let patch = flotilla_resources::TerminalSessionStatusPatch::MarkControllerFenceUnverifiable {
+                        message_id: turn.members.first().cloned().unwrap_or_default(),
+                        message: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into(),
+                        observed_at: Utc::now(),
+                    };
+                    if let Err(error) = flotilla_store::apply_status_patch(&terminals, &turn.consumer.id, &patch).await {
+                        warn!(%session, %error, "could not record controller fence failure");
+                    }
+                }
                 // Never typed (the terminal was not ready in time): nothing to hold; the next pass retries.
                 Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady))
                 | Ok(TerminalDeliveryOutcome::Pending) => {}
@@ -293,6 +304,24 @@ impl MessageDelivery {
     /// Types one session's pending turns as one turn, through the same
     /// terminal reservation every other turn takes.
     async fn start_turn(&mut self, holder: &Holder) -> Result<(), String> {
+        // A fence failure is scoped to this child activation; MarkRunning on
+        // an operator's resume clears it. No receipts or timed retries here.
+        let terminal = self
+            .state
+            .daemon
+            .resource_backend()
+            .using::<TerminalSession>(&self.namespace)
+            .get(&holder.terminal.metadata.name)
+            .await
+            .map_err(|error| error.to_string())?;
+        if terminal
+            .status
+            .as_ref()
+            .and_then(|status| status.degraded.as_ref())
+            .is_some_and(|condition| condition.reason == flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_REASON)
+        {
+            return Ok(());
+        }
         let inbox = self.primitives.inbox();
         let mut turns = Vec::new();
         let mut held = Vec::new();

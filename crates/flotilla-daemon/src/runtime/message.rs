@@ -378,6 +378,9 @@ pub(super) fn message_transport_outcome(result: Result<TerminalDeliveryOutcome, 
         Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)) => {
             Outcome::Unconfirmed { reason: "cleat submission has no acceptance evidence yet".into() }
         }
+        Ok(TerminalDeliveryOutcome::Unconfirmed(failure @ TerminalDeliveryFailure::ControllerFenceUnverifiable)) => {
+            Outcome::SessionNeedsRestart { reason: failure.message().into() }
+        }
         Err(reason) => Outcome::Unconfirmed { reason },
     }
 }

@@ -2357,6 +2357,8 @@ struct DeliveringTerminalRuntime {
     observation: Mutex<Option<TerminalObservation>>,
     #[builder(default)]
     startup_not_ready: bool,
+    #[builder(default)]
+    controller_fence_unverifiable: bool,
     pending: AtomicBool,
     observation_failed: AtomicBool,
     #[builder(default)]
@@ -2441,7 +2443,9 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
             return Ok(TerminalDeliveryOutcome::Pending);
         }
         self.delivered.lock().expect("delivered mutex").push((session_id.to_string(), message.to_string(), readiness));
-        Ok(if self.startup_not_ready {
+        Ok(if self.controller_fence_unverifiable {
+            TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable)
+        } else if self.startup_not_ready {
             TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)
         } else if self.unconfirmed {
             TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)
@@ -3514,4 +3518,93 @@ async fn terminal_reconciliation_leaves_message_submissions_to_the_inbox() {
         assert!(runtime.delivered.lock().unwrap().is_empty());
         assert!(matches!(prepared, flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
     }
+}
+
+// An unverifiable fence parks known-unsent input immediately. Working hooks,
+// elapsed time, and provider recovery cannot acknowledge it or retry the agent.
+#[tokio::test]
+async fn unverifiable_controller_fence_is_named_and_requires_a_new_activation() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    create_ready_environment(&backend, "env-a").await;
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(
+            &meta("term-a"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "reviewer".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("review"),
+                    brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
+                        path: ".flotilla/briefs/reviewer.md".into(),
+                        content: "brief".into(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "demo".into(),
+                        vessel_ref: "demo-review".into(),
+                    }),
+                    message: Some(flotilla_resources::TerminalCrewMessage {
+                        id: "message-new".into(),
+                        text: "Review the amended commit".into(),
+                        sender: Default::default(),
+                        delivery: Default::default(),
+                        acknowledged: Default::default(),
+                        following: Vec::new(),
+                    }),
+                },
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("session");
+    let mut status = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
+        session_id: "cleat-session".into(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "claude".into(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
+    let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
+    let runtime = Arc::new(
+        DeliveringTerminalRuntime::builder()
+            .delivered(Mutex::default())
+            .unconfirmed(false)
+            .controller_fence_unverifiable(true)
+            .pending(AtomicBool::new(false))
+            .observation_failed(AtomicBool::new(false))
+            .build(),
+    );
+    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla");
+    let prepared = reconciler.prepare(&session).await.expect("attempt");
+    assert!(matches!(prepared, flotilla_crew::reconcilers::terminal_session::TerminalPrepared::ControllerFenceUnverifiable { .. }));
+    let now = Utc::now();
+    let outcome = reconciler.reconcile(&session, &prepared, now);
+    assert!(outcome.actuations.iter().any(|action| matches!(action, Actuation::CreateDemand { .. })), "operator gate is immediate");
+    let mut status = session.status.clone().expect("status");
+    outcome.patch.expect("named failure").apply(&mut status);
+    status.last_tool_activity_at = Some(now + chrono::Duration::seconds(1));
+    assert_eq!(status.degraded.as_ref().expect("failure").reason, flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_REASON);
+    let flagged = sessions.update_status("term-a", &session.metadata.resource_version, &status).await.expect("persist");
+    for seconds in [0, 1, 300, 3600] {
+        let prepared = reconciler.prepare(&flagged).await.expect("observe fenced activation");
+        let outcome = reconciler.reconcile(&flagged, &prepared, now + chrono::Duration::seconds(seconds));
+        if let Some(patch) = outcome.patch {
+            patch.apply(&mut status);
+        }
+        assert!(status.delivered_message_id.is_none());
+        assert_eq!(status.degraded.as_ref().expect("failure remains").reason, flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_REASON);
+    }
+    assert_eq!(runtime.delivered.lock().expect("attempts").len(), 1);
+    TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
+    assert!(status.degraded.is_none(), "resume starts a new activation");
 }

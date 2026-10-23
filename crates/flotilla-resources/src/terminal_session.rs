@@ -10,6 +10,10 @@ use crate::{
     Vessel, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
+/// A pre-write refusal that cannot recover before the agent activation ends.
+pub const CONTROLLER_FENCE_UNVERIFIABLE_REASON: &str = "ControllerFenceUnverifiable";
+pub const CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE: &str = "ControllerFenceUnverifiable: session needs an agent restart; exit the agent, then run `flotilla convoy resume` to relaunch it in the existing checkout (the earlier conversation may be lost); no message input was sent";
+
 /// An ambiguous write whose confirmation deadline elapsed; never retried.
 /// Later consumption evidence can still acknowledge the held message.
 pub const TERMINAL_DELIVERY_EXPIRED_REASON: &str = "DeliveryExpired";
@@ -458,7 +462,10 @@ impl TerminalSessionDegradedCondition {
     pub fn is_delivery(&self) -> bool {
         matches!(
             self.reason.as_str(),
-            TERMINAL_DELIVERY_UNCONFIRMED_REASON | TERMINAL_DELIVERY_NOT_SUBMITTED_REASON | TERMINAL_DELIVERY_EXPIRED_REASON
+            TERMINAL_DELIVERY_UNCONFIRMED_REASON
+                | TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
+                | TERMINAL_DELIVERY_EXPIRED_REASON
+                | CONTROLLER_FENCE_UNVERIFIABLE_REASON
         )
     }
 }
@@ -676,6 +683,11 @@ pub enum TerminalSessionStatusPatch {
         message: String,
         observed_at: DateTime<Utc>,
     },
+    MarkControllerFenceUnverifiable {
+        message_id: String,
+        message: String,
+        observed_at: DateTime<Utc>,
+    },
     MarkDeliveryUnconfirmed {
         message_id: String,
         message: String,
@@ -778,12 +790,15 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     status.message = Some(condition.message.clone());
                 }
             }
-            Self::MarkDeliveryUnconfirmed { message_id, message, observed_at }
+            Self::MarkControllerFenceUnverifiable { message_id, message, observed_at }
+            | Self::MarkDeliveryUnconfirmed { message_id, message, observed_at }
             | Self::MarkDeliveryNotSubmitted { message_id, message, observed_at } => {
                 let consecutive_failures = status.next_delivery_failure_count(message_id);
                 status.message = Some(message.clone());
                 status.degraded = Some(TerminalSessionDegradedCondition {
-                    reason: if matches!(self, Self::MarkDeliveryNotSubmitted { .. }) {
+                    reason: if matches!(self, Self::MarkControllerFenceUnverifiable { .. }) {
+                        CONTROLLER_FENCE_UNVERIFIABLE_REASON
+                    } else if matches!(self, Self::MarkDeliveryNotSubmitted { .. }) {
                         TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
                     } else {
                         TERMINAL_DELIVERY_UNCONFIRMED_REASON

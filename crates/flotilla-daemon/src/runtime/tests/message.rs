@@ -1397,3 +1397,23 @@ async fn delivery_wait_names_an_idle_crew_composer_obstruction() {
         }
     }
 }
+
+// A permanent cleat refusal exits confirmation immediately, before any write or
+// receipt, and reaches the transport as a named failure rather than an ambiguity.
+#[tokio::test(start_paused = true)]
+async fn unverifiable_controller_fence_requires_restart_without_a_confirmation_wait() {
+    let mut pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
+    pool.controller_fence_unverifiable = true;
+    let started = tokio::time::Instant::now();
+    let outcome = super::super::terminal::submit_and_confirm(&pool, None, "agent", "turn", false).await.expect("refusal");
+    assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable));
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    assert_eq!(pool.submission_attempts.load(Ordering::SeqCst), 1);
+    assert!(pool.inputs.lock().expect("input log").is_empty());
+    assert_eq!(
+        super::super::message::message_transport_outcome(Ok(outcome)),
+        flotilla_agent_connector::TransportOutcome::SessionNeedsRestart {
+            reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into()
+        }
+    );
+}

@@ -804,6 +804,7 @@ impl MessageInbox {
             TransportOutcome::NotSubmitted { reason } | TransportOutcome::Unsupported { reason } => {
                 self.failed(receivers, members, &reason, false, now).await
             }
+            TransportOutcome::SessionNeedsRestart { reason } => self.failed_permanently(receivers, members, &reason, now).await,
             TransportOutcome::Unconfirmed { reason } => {
                 self.failed(receivers, members, &format!("held pending acceptance evidence: {reason}"), true, now).await
             }
@@ -833,6 +834,43 @@ impl MessageInbox {
             }
             .instrument(flotilla_tracing::queued_span(&member.metadata.name, "receipt"))
             .await?;
+        }
+        Ok(())
+    }
+
+    async fn failed_permanently(
+        &self,
+        receivers: &MessageReceiverSnapshot,
+        members: &[ResourceObject<Message>],
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        if let Some(holder) = self.resolve_receiver(receivers, &members[0]).await? {
+            apply_status_patch(
+                &self.backend.using::<TerminalSession>(&self.namespace),
+                &holder.object.metadata.name,
+                &crate::TerminalSessionStatusPatch::MarkControllerFenceUnverifiable {
+                    message_id: members[0].metadata.name.clone(),
+                    message: reason.into(),
+                    observed_at: now,
+                },
+            )
+            .await?;
+        }
+        for member in members {
+            let current = self.messages.get(&member.metadata.name).await?;
+            if current.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+                continue;
+            }
+            let mut status = status_for(&current);
+            status.retry = Some(ControllerRetry::terminal(status.retry.as_ref(), now, reason));
+            status.submission = None;
+            status.failed_batch_members = members.iter().map(|message| message.metadata.name.clone()).collect();
+            MessageStatusPatch::Wait { phase: MessagePhase::Deliverable, reason: reason.into(), at: now }.apply(&mut status);
+            self.write(&current, &status).await?;
+            if member.metadata.name == members[0].metadata.name {
+                self.signal(receivers, &ResourceObject { status: Some(status), ..current }, now).await?;
+            }
         }
         Ok(())
     }

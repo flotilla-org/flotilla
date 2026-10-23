@@ -3129,3 +3129,42 @@ async fn submit_timeout_after_failover_holds_without_resubmission() {
         assert!(!message.status.expect("status").phase.has_delivery_evidence());
     }
 }
+
+// A permanently closed controller fence is definitely unsent, produces no
+// receipt, and immediately raises the named operator gate without budget retries.
+#[tokio::test]
+async fn unverifiable_controller_fence_is_immediately_actionable_and_not_retried() {
+    let (backend, inbox) = delivery_inbox().await;
+    let reason = flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE;
+    let transport = Arc::new(FakeMessageTransport {
+        submissions: Default::default(),
+        observations: Default::default(),
+        outcome: TransportOutcome::SessionNeedsRestart { reason: reason.into() },
+        accepted: Default::default(),
+        working: Default::default(),
+    });
+    inbox.reconcile_delivery(&router(&transport), at(20)).await.expect("refusal");
+    let gates = backend.using::<flotilla_resources::Demand>("flotilla").list().await.expect("gates").items;
+    assert_eq!(gates.len(), 1, "operator sees failure on the first attempt");
+    let description = &gates[0].metadata.annotations[flotilla_resources::delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION];
+    assert!(description.contains("ControllerFenceUnverifiable"));
+    assert!(description.contains("exit the agent"));
+    assert!(description.contains("flotilla convoy resume"));
+    assert!(!description.contains("pending acceptance evidence"));
+    assert!(!description.contains("attempt 3/3"));
+    // Reconstruct the delivery loop, then advance beyond every retry/hold bound.
+    let restarted = MessageInbox::new(backend.clone(), "flotilla");
+    for second in [21, 80, 500, 3600] {
+        restarted.reconcile_delivery(&router(&transport), at(second)).await.expect("observe parked failure");
+    }
+    assert_eq!(transport.submissions.lock().expect("submissions").len(), 1);
+    for message in backend.using::<Message>("flotilla").list().await.expect("messages").items {
+        let status = message.status.expect("status");
+        assert!(status.resolved_receiver.is_none(), "no receipt for refused input");
+        assert!(status.submission.is_none(), "known unsent input is not ambiguous");
+        assert_eq!(status.reason.as_deref(), Some(reason));
+        let retry = status.retry.expect("permanent failure");
+        assert_eq!(retry.attempts, 1);
+        assert!(matches!(retry.disposition, flotilla_resources::ControllerRetryDisposition::Terminal { .. }));
+    }
+}

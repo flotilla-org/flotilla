@@ -66,11 +66,15 @@ pub enum ScreenActivity {
     Stable,
 }
 
-/// A refused submission is known to have written no message input and may be retried.
+/// The atomic submission result. Refusals prove no input was written; only
+/// temporary refusals can recover without restarting the child activation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalSubmission {
     Submitted,
+    /// A temporary controller refusal; keep the batch queued without a receipt.
     Refused(String),
+    /// No input was written, but the controller fence cannot clear in this activation.
+    AgentRestartRequired,
 }
 
 /// Pure CLI adapter for terminal session management.
@@ -200,6 +204,13 @@ pub trait TerminalPool: Send + Sync {
     /// than assume the preceding clear can safely be repeated.
     async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
         self.deliver(session_name, text).await
+    }
+
+    /// Preserve a permanent refusal even on the legacy composer-clear path.
+    /// Other failures retain that path's conservative ambiguity policy.
+    async fn guarded_retry_delivery(&self, session_name: &str, text: &str) -> Result<TerminalSubmission, String> {
+        self.retry_delivery(session_name, text).await?;
+        Ok(TerminalSubmission::Submitted)
     }
 }
 

@@ -1,0 +1,5 @@
+{
+  "stdout": "",
+  "stderr": "controller-active: controller input output fence is still settling (controller.cause=fence-settling)\n",
+  "exit_code": 1
+}

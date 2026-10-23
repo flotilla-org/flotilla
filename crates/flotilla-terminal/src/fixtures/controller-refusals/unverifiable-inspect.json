@@ -1,0 +1,54 @@
+{
+  "recognizer": null,
+  "program_status": [],
+  "program_status_available": true,
+  "title": null,
+  "generation": 1,
+  "hosting_epoch": 1,
+  "session": {
+    "id": "record-3713-fence-unverifiable",
+    "state": "running",
+    "vt_engine": "ghostty",
+    "vt_engine_status": "functional",
+    "functional_vt_available": true,
+    "cwd": null,
+    "cmd": "stty -echo; sleep 60",
+    "tags": [
+      "purpose=probe"
+    ]
+  },
+  "terminal": {
+    "rows": 23,
+    "cols": 80
+  },
+  "process": {
+    "leader_pid": 100473,
+    "foreground_pgid": 100473,
+    "leader_cwd": "/",
+    "foreground_cwd": "/"
+  },
+  "attachments": [
+    {
+      "role": "controller",
+      "identity": {
+        "kind": "principal",
+        "name": "cleat-100476"
+      }
+    }
+  ],
+  "recording": {
+    "active": true,
+    "bytes_written": 431,
+    "markers": {}
+  },
+  "screen_activity": "stable",
+  "stable_since": 1792772568801,
+  "last_output_at": null,
+  "last_controller_input_at": 1792772568966,
+  "controller_input_generation": 1,
+  "controller_fence": {
+    "state": "unverifiable",
+    "since": 1792772568966,
+    "cause": "no-known-text"
+  }
+}
