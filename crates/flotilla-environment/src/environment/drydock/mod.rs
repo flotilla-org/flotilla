@@ -149,6 +149,7 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
             .prepare(
                 &self.instance,
                 &wire::PrepareRequest {
+                    platform: None,
                     image_digest: spec.image.clone(),
                     tools_digest: ::drydock::launch::build_tools_digest().map_err(|e| e.to_string())?.into(),
                     size: size(&spec.size),
@@ -312,6 +313,8 @@ fn size(s: &flotilla_resources::CloudSandboxSize) -> wire::Size {
 }
 fn empty_capabilities() -> wire::Capabilities {
     wire::Capabilities {
+        agent: false,
+        platforms: vec![],
         material_modes: vec![],
         checkout_strategies: vec![],
         workspace_root: String::new(),

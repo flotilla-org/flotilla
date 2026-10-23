@@ -462,6 +462,20 @@ done"#,
         &self.codex_central_auth_path
     }
 
+    /// Only this registry's own host directory establishes Shared Codex transport.
+    /// A user mount at the same guest path must retain pushed rotation/capture.
+    pub fn codex_home_is_shared(&self, environment_ref: &str, mounts: &[ProvisionedMount]) -> bool {
+        if !matches!(Path::new(environment_ref).components().collect::<Vec<_>>().as_slice(), [Component::Normal(_)]) {
+            return false;
+        }
+        let home = self.homes_dir.join(environment_ref).join(CODEX_ADAPTER_ID);
+        mounts.iter().any(|mount| {
+            mount.mode == ProvisionedMountMode::Rw
+                && mount.environment_path.as_path() == Path::new(CONTAINER_CODEX_HOME)
+                && mount.host_path.as_path() == home
+        })
+    }
+
     /// Re-copies the central `auth.json` into an already-provisioned crew home
     /// so a long-lived vessel never runs on a credential older than the last
     /// refresher tick. Returns whether the delivered copy changed.
@@ -1543,6 +1557,34 @@ esac
             ("HOME", home.to_string_lossy().into_owned()),
             (FLOTILLA_SKILLS_DIR_ENV, skills.to_string_lossy().into_owned()),
         ])))
+    }
+
+    // Shared transport requires an owned source, the exact guest home, and Rw.
+    // Exhaust those three booleans, empty/duplicate mounts, and invalid identities.
+    #[test]
+    fn shared_codex_transport_requires_the_registrys_own_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = registry(root.path());
+        for owned in [false, true] {
+            for exact in [false, true] {
+                for writable in [false, true] {
+                    let source = if owned { registry.homes_dir.join("work/codex") } else { root.path().join("user-home") };
+                    let target = if exact { CONTAINER_CODEX_HOME } else { "/different/home" };
+                    let mode = if writable { ProvisionedMountMode::Rw } else { ProvisionedMountMode::Ro };
+                    let mount = ProvisionedMount::new(source, target, mode);
+                    assert_eq!(registry.codex_home_is_shared("work", &[mount.clone(), mount]), owned && exact && writable);
+                }
+            }
+        }
+        assert!(!registry.codex_home_is_shared("work", &[]));
+        for invalid in ["", "/", "..", "work/../other"] {
+            let mount = ProvisionedMount::new(
+                registry.homes_dir.join(invalid).join(CODEX_ADAPTER_ID),
+                CONTAINER_CODEX_HOME,
+                ProvisionedMountMode::Rw,
+            );
+            assert!(!registry.codex_home_is_shared(invalid, &[mount]));
+        }
     }
 
     fn registry_for_adapter(home: &Path, adapter: &str) -> AgentMaterialRegistry {

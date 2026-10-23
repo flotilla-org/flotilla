@@ -227,6 +227,13 @@ impl DockerControllerRuntime {
                 }
             }
         }
+        // Reject parent traversal rather than guessing how a guest's symlinks
+        // resolve it. Path component comparisons already ignore redundant `.`.
+        for mount in &spec.mounts {
+            if Path::new(&mount.target_path).components().any(|part| part == std::path::Component::ParentDir) {
+                return Err(format!("mount target {} must not contain parent traversal", mount.target_path));
+            }
+        }
         for tool in &tools {
             for asset in &tool.assets {
                 let reserved_path = match asset.kind {
@@ -325,6 +332,17 @@ impl DockerControllerRuntime {
             },
             None => Vec::new(),
         };
+        // Component-wise overlap checks rely on the earlier rejection of `..`
+        // mount targets. Keep that validation ahead of reserved-path checks.
+        for delivery in &material_deliveries {
+            let reserved = delivery.mount.environment_path.as_path();
+            for mount in &spec.mounts {
+                let target = Path::new(&mount.target_path);
+                if target.starts_with(reserved) || reserved.starts_with(target) {
+                    return Err(format!("mount target {} overlaps reserved agent material at {}", target.display(), reserved.display()));
+                }
+            }
+        }
         let prepared_auth = match &self.state.credential_store {
             Some(store) => match self.composed_image_pull_auth(store, spec).await {
                 Ok(Some(auth)) => Some(auth),
@@ -366,28 +384,7 @@ impl DockerControllerRuntime {
         };
         let mut provisioned_mounts = Vec::with_capacity(spec.mounts.len() + material_deliveries.len());
         provisioned_mounts.extend(spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount));
-        for delivery in &material_deliveries {
-            if environment_spec.cloud_sandbox.is_some() || provider.receives_host_tools() {
-                let metadata = tokio::fs::symlink_metadata(delivery.mount.host_path.as_path())
-                    .await
-                    .map_err(|e| format!("agent material source: {e}"))?;
-                let kind = if metadata.is_dir() { EnvironmentToolAssetKind::Directory } else { EnvironmentToolAssetKind::File };
-                // Frozen material and the initial Pushed Codex copy travel as
-                // files after hello. Guest scratch is subsequently guest-owned;
-                // auth rotation uses the same agent runner, never a host bind.
-                tools.push(EnvironmentTool::new("agent material", delivery.mount.environment_path.as_path()).with_asset(
-                    EnvironmentToolAsset::new(
-                        delivery.mount.host_path.as_path(),
-                        delivery.mount.environment_path.as_path(),
-                        kind,
-                        EnvironmentToolAssetAccess::ReadOnly,
-                        "agent material",
-                    ),
-                ));
-            } else {
-                provisioned_mounts.push(delivery.mount.clone());
-            }
-        }
+        deliver_agent_material(&provider.capabilities(), &material_deliveries, &mut tools, &mut provisioned_mounts).await?;
         let jobs = context.rust_build_jobs().await?;
         let opts = CreateOpts {
             tokens: environment_variables,
@@ -766,7 +763,12 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         match active {
             Some(handle) => {
                 if handle.agent().is_some() {
-                    if let Some(registry) = &self.state.agent_material {
+                    if let Some(registry) = self
+                        .state
+                        .agent_material
+                        .as_ref()
+                        .filter(|registry| !registry.codex_home_is_shared(environment_ref, &handle.provisioned_mounts()))
+                    {
                         let runner = handle.runner();
                         let capture = tokio::time::timeout(
                             std::time::Duration::from_secs(30),
@@ -1054,4 +1056,34 @@ pub(super) async fn probe_provisioned_environment(
     let config = ConfigStore::with_base(state.config.base_path().as_path().join(format!("env-discovery/{env_id}")));
     let registry = discovery.factories.probe_all(&bag, &config, &probe_root, handle.runner()).await;
     Ok((bag, Arc::new(registry)))
+}
+
+// Agent material chooses a transport independently of executable/tool delivery.
+pub(super) async fn deliver_agent_material(
+    capabilities: &flotilla_protocol::provider::ProviderCapabilities,
+    deliveries: &[flotilla_credentials::AgentMaterialDelivery],
+    tools: &mut Vec<EnvironmentTool>,
+    provisioned_mounts: &mut Vec<flotilla_environment::environment::ProvisionedMount>,
+) -> Result<(), String> {
+    for delivery in deliveries {
+        if !capabilities.material_modes.contains(&flotilla_protocol::provider::MaterialMode::Shared) {
+            let metadata =
+                tokio::fs::symlink_metadata(delivery.mount.host_path.as_path()).await.map_err(|e| format!("agent material source: {e}"))?;
+            let kind = if metadata.is_dir() { EnvironmentToolAssetKind::Directory } else { EnvironmentToolAssetKind::File };
+            // Providers without Shared material receive an initial copy after hello.
+            // Docker keeps the writable home host-backed for the whole session.
+            tools.push(EnvironmentTool::new("agent material", delivery.mount.environment_path.as_path()).with_asset(
+                EnvironmentToolAsset::new(
+                    delivery.mount.host_path.as_path(),
+                    delivery.mount.environment_path.as_path(),
+                    kind,
+                    EnvironmentToolAssetAccess::ReadOnly,
+                    "agent material",
+                ),
+            ));
+        } else {
+            provisioned_mounts.push(delivery.mount.clone());
+        }
+    }
+    Ok(())
 }

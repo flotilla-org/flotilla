@@ -28,12 +28,12 @@ pub(crate) struct EnvironmentToolProviderKind(&'static str);
 pub(crate) const DOCKER_PROVIDER_KIND: EnvironmentToolProviderKind = EnvironmentToolProviderKind("docker");
 
 pub(crate) const ENVIRONMENT_FLOTILLA_DIRECTORY: &str = "/opt/flotilla/bin";
-pub(crate) const ENVIRONMENT_FLOTILLA_PATH: &str = "/usr/local/bin/flotilla";
+pub(crate) const ENVIRONMENT_FLOTILLA_PATH: &str = "/opt/flotilla/crew-bin/flotilla";
 const FLOTILLA_LAUNCHER_NAME: &str = "contained-flotilla-launcher";
 const FLOTILLA_LAUNCHER: &str = "#!/bin/sh\nexec /opt/flotilla/bin/flotilla \"$@\"\n";
-pub(crate) const ENVIRONMENT_CLEAT_PATH: &str = "/usr/local/bin/cleat";
-pub(crate) const ENVIRONMENT_CLEAT_LIBRARY_DIR: &str = "/usr/local/lib/flotilla";
-pub(crate) const ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH: &str = "/usr/local/lib/flotilla/libghostty-vt.so.0";
+pub(crate) const ENVIRONMENT_CLEAT_PATH: &str = "/opt/flotilla/crew-bin/cleat";
+pub(crate) const ENVIRONMENT_CLEAT_LIBRARY_DIR: &str = "/opt/flotilla/lib";
+pub(crate) const ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH: &str = "/opt/flotilla/lib/libghostty-vt.so.0";
 pub(crate) const ENVIRONMENT_CLEAT_RUNTIME_DIR: &str = "/var/lib/flotilla/cleat";
 const CLEAT_GHOSTTY_LIBRARY: &str = "libghostty-vt.so.0";
 #[cfg(test)]
@@ -239,6 +239,7 @@ impl EnvironmentToolFactory for FlotillaCliTool {
         ensure_flotilla_launcher(&launcher_path).await?;
         let environment_socket_path = contained_daemon_socket_path(daemon_socket_path.as_path());
         Ok(EnvironmentTool::new("flotilla", ENVIRONMENT_FLOTILLA_PATH)
+            .with_environment(EnvironmentVariableUpdate::prepend_path("PATH", "/opt/flotilla/crew-bin"))
             .with_asset(EnvironmentToolAsset::new(
                 binary_directory.to_path_buf(),
                 ENVIRONMENT_FLOTILLA_DIRECTORY,
@@ -341,6 +342,7 @@ impl EnvironmentToolFactory for CleatTool {
             .map_err(|error| format!("create durable cleat state directory {}: {error}", state_path.display()))?;
 
         Ok(EnvironmentTool::new("cleat", ENVIRONMENT_CLEAT_PATH)
+            .with_environment(EnvironmentVariableUpdate::prepend_path("PATH", "/opt/flotilla/crew-bin"))
             .with_asset(EnvironmentToolAsset::new(
                 binary_path.as_path().to_path_buf(),
                 ENVIRONMENT_CLEAT_PATH,
@@ -570,10 +572,10 @@ fi
 exec "$compiler" "$@"
 "#;
 
-pub(crate) const CONTAINED_RUSTC_WRAPPER_PATH: &str = "/usr/local/bin/flotilla-rustc-wrapper";
+pub(crate) const CONTAINED_RUSTC_WRAPPER_PATH: &str = "/opt/flotilla/crew-bin/flotilla-rustc-wrapper";
 
-pub(crate) const CONTAINED_CARGO_SHIM_DIRECTORY: &str = "/usr/local/lib/flotilla-rust-build-limits";
-pub(crate) const CONTAINED_CARGO_SHIM_PATH: &str = "/usr/local/lib/flotilla-rust-build-limits/cargo";
+pub(crate) const CONTAINED_CARGO_SHIM_DIRECTORY: &str = "/opt/flotilla/rust-build-limits";
+pub(crate) const CONTAINED_CARGO_SHIM_PATH: &str = "/opt/flotilla/rust-build-limits/cargo";
 const CARGO_BUILD_PROFILE_SHIM: &str = r#"#!/bin/sh
 # flotilla-cargo-profile-shim
 # Remove our directory before resolving Cargo (including rustup's Cargo proxy).
@@ -953,11 +955,11 @@ pub(crate) mod tests {
         .await
         .expect("prepare flotilla CLI");
 
-        assert_eq!(tool.executable.as_path(), Path::new("/usr/local/bin/flotilla"));
+        assert_eq!(tool.executable.as_path(), Path::new("/opt/flotilla/crew-bin/flotilla"));
         assert_eq!(tool.assets[0].host_path.as_path(), Path::new("/opt/flotilla/bin"));
         assert_eq!(tool.assets[0].environment_path.as_path(), Path::new("/opt/flotilla/bin"));
         assert_eq!(tool.assets[0].kind, EnvironmentToolAssetKind::Directory);
-        assert_eq!(tool.assets[1].environment_path.as_path(), Path::new("/usr/local/bin/flotilla"));
+        assert_eq!(tool.assets[1].environment_path.as_path(), Path::new("/opt/flotilla/crew-bin/flotilla"));
         assert_eq!(fs::read_to_string(tool.assets[1].host_path.as_path()).expect("read launcher"), FLOTILLA_LAUNCHER);
     }
 
@@ -1279,7 +1281,7 @@ dependency = { path = "../dependency" }
         }
         async fn prepare(&self, _name: &str, _context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
             self.preparations.fetch_add(1, Ordering::Relaxed);
-            Ok(EnvironmentTool::new("fourth", "/usr/local/bin/fourth"))
+            Ok(EnvironmentTool::new("fourth", "/opt/flotilla/crew-bin/fourth"))
         }
     }
     pub(crate) fn with_fourth_tool(mut provisioner: EnvironmentToolProvisioner) -> EnvironmentToolProvisioner {

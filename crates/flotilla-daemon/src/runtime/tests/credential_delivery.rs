@@ -645,19 +645,49 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
 
     assert_eq!(error.to_string(), "stop after capturing create options");
     let opts = provider.create_opts.lock().await.take().expect("captured create options");
-    assert!(opts.provisioned_mounts.iter().all(|mount| mount.environment_path.as_path() != Path::new(CONTAINER_CODEX_HOME)));
+    // Docker keeps the writable Codex home on the host throughout the session.
+    let mount = opts
+        .provisioned_mounts
+        .iter()
+        .find(|mount| mount.environment_path.as_path() == Path::new(CONTAINER_CODEX_HOME))
+        .expect("Codex home must be a host mount");
+    assert_eq!(mount.host_path.as_path(), home.join(".local/share/flotilla/agent-homes/contained-work/codex"));
+    assert_eq!(mount.mode, flotilla_environment::environment::ProvisionedMountMode::Rw);
     assert!(
-        opts.tools
-            .iter()
-            .flat_map(|tool| &tool.assets)
-            .any(|asset| asset.host_path.as_path() == home.join(".local/share/flotilla/agent-homes/contained-work/codex")
-                && asset.environment_path.as_path() == Path::new(CONTAINER_CODEX_HOME)
-                && asset.access == flotilla_environment::environment::EnvironmentToolAssetAccess::ReadOnly),
-        "material is a file push, not a shared host home"
+        opts.tools.iter().flat_map(|tool| &tool.assets).all(|asset| asset.environment_path.as_path() != Path::new(CONTAINER_CODEX_HOME)),
+        "a mounted Codex home must not also be pushed"
     );
     let mut expected_tokens = vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())];
     expected_tokens.extend(crew_git_identity_environment());
     assert_eq!(opts.tokens, expected_tokens);
+
+    // Explicit mounts must not replace, contain, or hide managed agent material.
+    // Exhaust the exact target, an ancestor, and a descendant at the provider seam.
+    for target in [
+        CONTAINER_CODEX_HOME.to_string(),
+        "/tmp".to_string(),
+        format!("{CONTAINER_CODEX_HOME}/auth.json"),
+        format!("{CONTAINER_CODEX_HOME}/."),
+        format!("/tmp/../{CONTAINER_CODEX_HOME}"),
+    ] {
+        let mut conflicting = spec.clone();
+        conflicting.mounts.push(flotilla_resources::EnvironmentMount {
+            source_path: home.display().to_string(),
+            target_path: target.clone(),
+            mode: flotilla_resources::EnvironmentMountMode::Rw,
+        });
+        let error = DockerControllerRuntime { state: Arc::clone(&state) }
+            .provision_docker("contained-conflicting-mount", &conflicting)
+            .await
+            .expect_err("managed material is reserved");
+        let expected = if target.contains("/../") {
+            format!("mount target {target} must not contain parent traversal")
+        } else {
+            format!("mount target {} overlaps reserved agent material at {CONTAINER_CODEX_HOME}", Path::new(&target).display())
+        };
+        assert_eq!(error, expected);
+        assert!(provider.create_opts.lock().await.is_none(), "conflicts must fail before provider provisioning");
+    }
 
     let mut preconfigured = spec;
     preconfigured.env.insert("CODEX_HOME".to_string(), "/image/codex".to_string());

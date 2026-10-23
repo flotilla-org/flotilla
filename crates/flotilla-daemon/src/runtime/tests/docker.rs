@@ -136,15 +136,16 @@ async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_
     assert_eq!(socket_mount.environment_path.as_path(), Path::new("/run/flotilla-daemon"));
     assert_eq!(socket_mount.kind, EnvironmentToolAssetKind::Directory);
     assert_ne!(socket_mount.host_path.as_path(), Path::new("/tmp"));
-    assert_eq!(
-        opts.tools[0].environment[1],
-        EnvironmentVariableUpdate::set("FLOTILLA_CONTAINED_HOST_DAEMON", "1", "the contained host-daemon requirement",),
-    );
+    assert!(opts.tools[0].environment.contains(&EnvironmentVariableUpdate::set(
+        "FLOTILLA_CONTAINED_HOST_DAEMON",
+        "1",
+        "the contained host-daemon requirement",
+    )));
     assert_eq!(opts.tools[1].executable.as_path(), Path::new(ENVIRONMENT_CLEAT_PATH));
     assert_eq!(opts.tools[1].assets[1].environment_path.as_path(), Path::new(ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH));
     assert_eq!(opts.tools[1].assets[2].host_path.as_path(), cleat_state.as_path());
     assert_eq!(opts.tools[1].assets[2].environment_path.as_path(), Path::new(ENVIRONMENT_CLEAT_RUNTIME_DIR));
-    assert_eq!(opts.tools[1].environment[1], EnvironmentVariableUpdate::prepend_path("LD_LIBRARY_PATH", ENVIRONMENT_CLEAT_LIBRARY_DIR),);
+    assert!(opts.tools[1].environment.contains(&EnvironmentVariableUpdate::prepend_path("LD_LIBRARY_PATH", ENVIRONMENT_CLEAT_LIBRARY_DIR)));
     assert!(cleat_state.as_path().is_dir(), "durable tool state must exist before the provider delivers it");
 }
 
@@ -781,7 +782,7 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
         memory_policy: Default::default(),
         mounts: vec![flotilla_resources::EnvironmentMount {
             source_path: "/host/replacement-flotilla".to_string(),
-            target_path: "/usr/local/bin/flotilla".to_string(),
+            target_path: "/opt/flotilla/crew-bin/flotilla".to_string(),
             mode: flotilla_resources::EnvironmentMountMode::Ro,
         }],
         ..spec
@@ -791,7 +792,7 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
         .await
         .expect_err("reserved CLI mount should fail provision");
 
-    assert_eq!(error.to_string(), "mount target /usr/local/bin/flotilla is reserved for the flotilla CLI");
+    assert_eq!(error.to_string(), "mount target /opt/flotilla/crew-bin/flotilla is reserved for the flotilla CLI");
     assert!(provider.create_opts.lock().await.is_none(), "reserved mount collisions should fail before invoking the provider");
 }
 
@@ -1317,4 +1318,38 @@ impl ProvisionedEnvironment for DeadAgentEnvironment {
     async fn destroy(&self) -> Result<(), String> {
         self.0.destroy().await
     }
+}
+
+// Docker Shared material must remain host-backed throughout the session, even
+// though the provider also receives pushed executable tools. One glue case.
+#[tokio::test]
+async fn docker_codex_home_is_a_rw_host_mount_and_is_not_pushed() {
+    use flotilla_environment::environment::{docker::DockerEnvironmentProvider, ProvisionedMount, ProvisionedMountMode};
+    let root = TempDir::new().unwrap();
+    let home = root.path().join(".local/share/flotilla/agent-homes/work/codex");
+    let registry = test_agent_material_registry(Arc::new(TestEnvVars::new([("HOME", root.path().display().to_string())])));
+    fs::create_dir_all(&home).unwrap();
+    let delivery = flotilla_credentials::AgentMaterialDelivery {
+        mount: ProvisionedMount::new(&home, flotilla_credentials::CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw),
+        preflight: flotilla_credentials::AgentMaterialPreflight { command: "true".into(), args: vec![], failure_context: "fixture".into() },
+    };
+    let provider = DockerEnvironmentProvider::new(Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
+    let mut tools = Vec::new();
+    let mut mounts = Vec::new();
+    super::super::docker::deliver_agent_material(&provider.capabilities(), std::slice::from_ref(&delivery), &mut tools, &mut mounts)
+        .await
+        .unwrap();
+    assert_eq!(mounts, vec![delivery.mount.clone()]);
+    assert!(registry.codex_home_is_shared("work", &mounts));
+    assert!(tools.is_empty(), "the Codex home must never enter the pushed tool layer");
+    // Removing Shared must select the pushed route, regardless of tool delivery.
+    let mut capabilities = provider.capabilities();
+    capabilities.material_modes.retain(|mode| *mode != flotilla_protocol::provider::MaterialMode::Shared);
+    mounts.clear();
+    super::super::docker::deliver_agent_material(&capabilities, std::slice::from_ref(&delivery), &mut tools, &mut mounts).await.unwrap();
+    assert!(mounts.is_empty());
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].assets[0].host_path, delivery.mount.host_path);
+    assert_eq!(tools[0].assets[0].access, flotilla_environment::environment::EnvironmentToolAssetAccess::ReadOnly);
+    assert!(!registry.codex_home_is_shared("work", &mounts));
 }

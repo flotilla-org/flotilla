@@ -30,6 +30,19 @@ use flotilla_provider_runtime::CommandRunner;
 /// Docker translates shares to the native cgroup weight when using cgroup v2.
 pub const CREW_CPU_SHARES: usize = 1024;
 
+// Absolute system utility selection, shared with the process-boundary test.
+#[cfg(unix)]
+const ROOT_UTILITY_SELECTION: &str = concat!(
+    "PATH=/usr/sbin:/usr/bin:/sbin:/bin;\n",
+    "export PATH;\n",
+    "mkdir=/bin/mkdir;\n",
+    "[ -x \"$mkdir\" ] || mkdir=/usr/bin/mkdir;\n",
+    "chown=/bin/chown;\n",
+    "[ -x \"$chown\" ] || chown=/usr/bin/chown;\n",
+    "chmod=/bin/chmod;\n",
+    "[ -x \"$chmod\" ] || chmod=/usr/bin/chmod;\n",
+);
+
 /// The `PATH` Docker gives a container whose image does not set one.
 #[cfg(any(unix, test))]
 const DOCKER_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -1259,6 +1272,26 @@ impl DockerEnvironmentProviderInner {
     async fn start_agent(runner: &dyn CommandRunner, container: &str) -> Result<(), String> {
         // Upgrade replaces the image's binary by rename. Give the container's
         // configured user its own copy's directory; never write the tools image.
+        // Root exec overrides the crew PATH and repairs legacy PATH directory
+        // ownership before publishing tools into the separate crew-owned prefix.
+        // The repair list must cover DOCKER_DEFAULT_PATH. The script's narrower
+        // PATH excludes legacy crew-owned /usr/local directories during repair.
+        // Repair directories only: recursively chowning legacy /usr/local files
+        // cannot make crew-written contents trustworthy. Root execs must keep
+        // using absolute system programs; replace the vessel from a clean image
+        // to discard any previously planted binaries.
+        // Select utilities only from absolute system paths, supporting split-/usr
+        // images as well as /bin utilities and merged-/usr images.
+        let root_script = format!(
+            "{ROOT_UTILITY_SELECTION}{}",
+            concat!(
+                "\"$mkdir\" -p /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin /opt/flotilla/crew-bin /run/flotilla && ",
+                "\"$chown\" 0:0 /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && ",
+                "\"$chmod\" go-w /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && ",
+                "\"$chown\" -R \"$1\" /opt/drydock /opt/flotilla /run/flotilla",
+            )
+        );
+        let root_path = format!("PATH={DOCKER_DEFAULT_PATH}");
         let user = host_user();
         runner
             .run(
@@ -1267,10 +1300,16 @@ impl DockerEnvironmentProviderInner {
                     "exec",
                     "--user",
                     "0",
+                    "--env",
+                    &root_path,
+                    "--env",
+                    "LD_LIBRARY_PATH=",
+                    "--env",
+                    "LD_PRELOAD=",
                     container,
-                    "sh",
+                    "/bin/sh",
                     "-c",
-                    "mkdir -p /opt/flotilla /usr/local/bin /run/flotilla; chown -R \"$1\" /opt/drydock /opt/flotilla /run/flotilla; chown \"$1\" /usr/local/bin",
+                    &root_script,
                     "flotilla-agent-owner",
                     &user,
                 ],
@@ -1433,7 +1472,9 @@ mod agent_contract_tests {
                 }
                 ["inspect", "--format", "{{.Image}}", _] => Ok(PREPARED.into()),
                 ["inspect", "--format", "{{json .Config.Env}}", BACKING] => Ok(r#"["HOME=/tmp","PATH=/usr/bin:/bin"]"#.into()),
-                ["exec", "--user", "0", BACKING, "sh", "-c", script, "flotilla-agent-owner", _] => {
+                ["exec", "--user", "0", "--env", path, "--env", "LD_LIBRARY_PATH=", "--env", "LD_PRELOAD=", BACKING, "/bin/sh", "-c", script, "flotilla-agent-owner", _] =>
+                {
+                    assert_eq!(*path, format!("PATH={DOCKER_DEFAULT_PATH}"));
                     assert!(script.contains("/opt/drydock"));
                     assert!(script.contains("/opt/flotilla"));
                     Ok(String::new())
@@ -1478,6 +1519,80 @@ mod agent_contract_tests {
         async fn exists(&self, _: &str, _: &[&str]) -> bool {
             false
         }
+    }
+
+    // Root startup must use absolute programs and must leave every root PATH
+    // directory owned by root. This process-boundary fake inspects real argv.
+    #[tokio::test]
+    async fn root_startup_keeps_path_directories_root_owned() {
+        struct RootContract(AtomicBool);
+        #[async_trait]
+        impl CommandRunner for RootContract {
+            async fn run(&self, _: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+                if args.get(1) == Some(&"--user") {
+                    self.0.store(true, Ordering::SeqCst);
+                    for value in [format!("PATH={DOCKER_DEFAULT_PATH}"), "LD_LIBRARY_PATH=".into(), "LD_PRELOAD=".into()] {
+                        assert!(args.windows(2).any(|pair| pair == ["--env", value.as_str()]));
+                    }
+                    let shell = args.iter().position(|arg| *arg == "/bin/sh").expect("absolute root shell");
+                    assert_eq!(args[shell + 1], "-c");
+                    let script = args[shell + 2];
+                    assert!(script.starts_with(ROOT_UTILITY_SELECTION));
+                    assert!(!script.contains("chown \"$1\" /usr/local/bin"));
+                    assert!(script.contains("/opt/flotilla/crew-bin"));
+                    // Execute only the unprivileged selection prologue against fake
+                    // system directories. Exhaust /bin-only, /usr/bin-only, both,
+                    // and neither: no utility is ever resolved through PATH.
+                    use std::os::unix::fs::PermissionsExt;
+                    for (primary, fallback) in [(true, false), (false, true), (true, true), (false, false)] {
+                        let root = tempfile::tempdir().unwrap();
+                        for (name, present) in [("primary", primary), ("fallback", fallback)] {
+                            let directory = root.path().join(name);
+                            std::fs::create_dir(&directory).unwrap();
+                            if present {
+                                for utility in ["mkdir", "chown", "chmod"] {
+                                    let path = directory.join(utility);
+                                    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+                                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                                }
+                            }
+                        }
+                        // Replace the longer /usr/bin/ prefix first: replacing
+                        // /bin/ first would also rewrite that prefix's suffix.
+                        let prologue = ROOT_UTILITY_SELECTION
+                            .replace("/usr/bin/", &format!("{}/fallback/", root.path().display()))
+                            .replace("/bin/", &format!("{}/primary/", root.path().display()));
+                        let output = std::process::Command::new("/bin/sh")
+                            .args(["-c", &format!("{prologue}printf '%s\\n' \"$mkdir\" \"$chown\" \"$chmod\"; test -x \"$mkdir\"")])
+                            .output()
+                            .unwrap();
+                        assert_eq!(output.status.success(), primary || fallback);
+                        let chosen = root.path().join(if primary { "primary" } else { "fallback" });
+                        assert_eq!(
+                            String::from_utf8(output.stdout).unwrap().lines().collect::<Vec<_>>(),
+                            ["mkdir", "chown", "chmod"].map(|utility| chosen.join(utility).display().to_string())
+                        );
+                    }
+                    let root_directories = DOCKER_DEFAULT_PATH.split(':').collect::<Vec<_>>().join(" ");
+                    assert!(script.contains(&format!("\"$chown\" 0:0 {root_directories}")));
+                    assert!(script.contains(&format!("\"$chmod\" go-w {root_directories}")));
+                    let crew_paths = script.rsplit("\"$chown\" -R ").next().unwrap().split_whitespace().skip(1);
+                    for path in crew_paths {
+                        assert!(!DOCKER_DEFAULT_PATH.split(':').any(|root| Path::new(root).starts_with(path)));
+                    }
+                }
+                Ok(String::new())
+            }
+            async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+                unreachable!()
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+        }
+        let contract = RootContract(AtomicBool::new(false));
+        DockerEnvironmentProviderInner::start_agent(&contract, BACKING).await.unwrap();
+        assert!(contract.0.load(Ordering::SeqCst), "startup must establish ownership before supervising");
     }
 
     // Issue 3486: the hello gates provisioning; the returned handle executes
