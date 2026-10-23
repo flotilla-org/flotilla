@@ -2482,8 +2482,8 @@ impl Aggregator {
     /// says it is live, before the one-way copy lands. The old phase says how a live vessel is
     /// doing (provisioning, ready, interrupted), and why an ended one ended (lost or failed), which
     /// the engine does not distinguish. A released lease (its teardown completed) keeps the old
-    /// phase: being torn down is not being lost. When the copy is deleted, this reads the ending
-    /// from the engine alone.
+    /// phase: being torn down is not being lost. When the copy is deleted (#3774), this reads the
+    /// ending from the engine alone.
     pub(crate) fn vessel_phase(&self, vessel: &ReadResourceObject<Vessel>) -> VesselPhase {
         use flotilla_protocol::LifecycleReading;
 
