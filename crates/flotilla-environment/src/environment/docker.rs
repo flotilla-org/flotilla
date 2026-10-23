@@ -31,7 +31,7 @@ use flotilla_provider_runtime::CommandRunner;
 pub const CREW_CPU_SHARES: usize = 1024;
 
 // Absolute system utility selection, shared with the process-boundary test.
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 const ROOT_UTILITY_SELECTION: &str = concat!(
     "PATH=/usr/sbin:/usr/bin:/sbin:/bin;\n",
     "export PATH;\n",
