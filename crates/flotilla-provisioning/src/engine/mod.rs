@@ -286,6 +286,12 @@ pub fn launch(name: &str, n: u32) -> String {
     format!("{name}#{n}")
 }
 
+/// The old object a launch key (`<old>#<n>`) is of, split at the last `#` like
+/// [`next_launch`], so an old name holding a `#` of its own is kept whole.
+pub fn launched(name: &str) -> &str {
+    name.rsplit_once('#').map_or(name, |(old, _)| old)
+}
+
 /// The launch after `name`'s (`<old>#<n>`). It splits at the last `#`, so an old name that holds
 /// a `#` of its own still parses: launch keys always end in `#<n>`.
 fn next_launch(name: &str) -> String {

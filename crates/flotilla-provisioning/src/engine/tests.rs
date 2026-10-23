@@ -666,7 +666,7 @@ async fn a_failed_launch_gives_up_and_the_next_start_is_a_new_launch() {
 fn the_latest_launch_is_found_and_an_old_name_may_hold_a_hash() {
     use flotilla_resources::TerminalSessionPhase;
 
-    use super::{at, current, launch, next_launch, terminal_session::TerminalSessionBinding};
+    use super::{at, current, launch, launched, next_launch, terminal_session::TerminalSessionBinding};
     let home = lifecycles::<TerminalSessionBinding>();
     let mut obj = session_object(TerminalSessionPhase::Starting);
     obj.metadata.name = "odd#5".into();
@@ -677,4 +677,5 @@ fn the_latest_launch_is_found_and_an_old_name_may_hold_a_hash() {
         assert_eq!(current::<TerminalSessionBinding>(home.as_ref(), &obj).0, launch("odd#5", n));
     }
     assert_eq!(next_launch("odd#5#13"), "odd#5#14");
+    assert_eq!(launched("odd#5#13"), "odd#5");
 }

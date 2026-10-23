@@ -108,6 +108,10 @@ pub struct CrewService {
     /// the engine decides each convoy it holds; empty while the switch is off.
     #[builder(default)]
     pub(crate) convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
+    /// Which seats a vessel serves (#3629 layer 8): the engine's answer once
+    /// `[primitives]` installs it, else the session labels.
+    #[builder(default)]
+    pub(crate) vessel_seats: flotilla_resources::vessel_seats::VesselSeatsPath,
     #[builder(default)]
     resource_intent_publisher: std::sync::RwLock<Option<Weak<dyn ResourceIntentPublisher>>>,
     leaf_subscriptions: LeafSubscriptionTable,
@@ -881,6 +885,27 @@ impl CrewService {
             .build())
     }
 
+    /// Which seats `vessel_ref` serves, through the one read port (#3629 layer 8).
+    async fn served_seats(
+        &self,
+        namespace: &str,
+        vessel_ref: &str,
+    ) -> Result<BTreeMap<String, flotilla_resources::ReadResourceObject<ResourceTerminalSession>>, String> {
+        if let Some(seats) = self.vessel_seats.get() {
+            return seats.seats(namespace, vessel_ref).await;
+        }
+        Ok(self
+            .resource_backend
+            .including_replicas::<ResourceTerminalSession>(namespace)
+            .list_matching_labels(&BTreeMap::from([(VESSEL_REF_LABEL.to_string(), vessel_ref.to_owned())]))
+            .await
+            .map_err(|err| err.to_string())?
+            .items
+            .into_iter()
+            .map(|session| (session.object.spec.role.clone(), session))
+            .collect())
+    }
+
     // Crew handoff consumes process state independently of the live island charter.
     async fn crew_state(&self, context: &ResolvedCrewContext, convoy: &ResourceObject<ResourceConvoy>) -> Result<CrewListResponse, String> {
         let task = convoy
@@ -890,14 +915,10 @@ impl CrewService {
             .and_then(|snapshot| snapshot.vessels.iter().find(|vessel| vessel.name == context.vessel))
             .ok_or_else(|| format!("vessel `{}` is missing from convoy `{}`", context.vessel, context.convoy))?;
         let by_role: HashMap<_, _> = self
-            .resource_backend
-            .including_replicas::<ResourceTerminalSession>(&context.namespace)
-            .list_matching_labels(&BTreeMap::from([(VESSEL_REF_LABEL.to_string(), context.vessel_ref.clone())]))
-            .await
-            .map_err(|err| err.to_string())?
-            .items
+            .served_seats(&context.namespace, &context.vessel_ref)
+            .await?
             .into_iter()
-            .map(|session| (session.object.spec.role.clone(), session.object))
+            .map(|(role, session)| (role, session.object))
             .collect();
         let credential_alerts = self
             .resource_backend

@@ -21,6 +21,7 @@ use crate::stored::{
     clone::{CloneKind, CloneRequest},
     environment::{EnvironmentKind, EnvironmentRequest},
     image_build::ImageBuildKind,
+    terminal_session::{TerminalSessionKind, TerminalSessionRequest},
     Holder,
 };
 
@@ -123,6 +124,11 @@ pub trait ProvisioningReads: Send + Sync {
     fn environment_checkouts(&self, environment: &str, home: &str) -> Result<Vec<View<CheckoutKind>>, ReadError>;
     /// An environment's clone of a repository (`clone.by_environment`).
     fn environment_clone(&self, environment: &str, home: &str, repository: &str) -> Result<Option<View<CloneKind>>, ReadError>;
+    /// The terminal sessions held for `holder` (`terminal_session.by_holder`), every launch: a
+    /// vessel finds the sessions that run in it so.
+    fn held_sessions(&self, holder: &Holder) -> Result<Vec<View<TerminalSessionKind>>, ReadError>;
+    /// A terminal session's current launch, by its old name: its latest `#<n>`, each a keyed read.
+    fn terminal_session(&self, name: &str, home: &str) -> Result<Option<View<TerminalSessionKind>>, ReadError>;
     /// A provider's live environments (`environment.live_by_provider`).
     fn provider_environments(&self, provider: &Address) -> Result<Vec<View<EnvironmentKind>>, ReadError>;
     /// The checkouts held for `holder` (`checkout.by_holder`), across homes: a finishing convoy or
@@ -252,6 +258,33 @@ impl ProvisioningReads for StoreReads {
 
     fn provider_environments(&self, provider: &Address) -> Result<Vec<View<EnvironmentKind>>, ReadError> {
         self.read(|read| indexed(read, &EnvironmentRequest::live_by_provider(provider)))
+    }
+
+    fn held_sessions(&self, holder: &Holder) -> Result<Vec<View<TerminalSessionKind>>, ReadError> {
+        self.read(|read| indexed(read, &TerminalSessionRequest::by_holder(holder)))
+    }
+
+    fn terminal_session(&self, name: &str, home: &str) -> Result<Option<View<TerminalSessionKind>>, ReadError> {
+        // Launches are numbered from 1 without gaps, so the latest is found by doubling past it and
+        // halving back, as the write path's `current` does: O(log launches) keyed reads.
+        self.read(|read| {
+            let Some(first) = keyed(read, &super::launch(name, 1), home)? else { return Ok(None) };
+            let (mut held, mut probe) = ((1, first), 2u32);
+            let mut absent = loop {
+                match keyed(read, &super::launch(name, probe), home)? {
+                    Some(view) => (held, probe) = ((probe, view), probe.saturating_mul(2)),
+                    None => break probe,
+                }
+            };
+            while absent - held.0 > 1 {
+                let mid = held.0 + (absent - held.0) / 2;
+                match keyed(read, &super::launch(name, mid), home)? {
+                    Some(view) => held = (mid, view),
+                    None => absent = mid,
+                }
+            }
+            Ok(Some(held.1))
+        })
     }
 
     fn held_checkouts(&self, holder: &Holder) -> Result<Vec<View<CheckoutKind>>, ReadError> {

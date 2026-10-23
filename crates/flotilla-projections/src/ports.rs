@@ -23,6 +23,8 @@ pub enum ProvisioningKind {
     ImageBuild,
     Clone,
     Checkout,
+    /// A terminal session's current launch, read by its record name.
+    TerminalSession,
 }
 
 /// The engine's readings of provisioning resources behind `[primitives]` (#3629 layer 4). Each

@@ -1158,6 +1158,10 @@ async fn open_provisioning_lifecycles(
     let store = daemon.decided_store()?.store();
     let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
     daemon.install_lifecycle_reads(Arc::new(EngineLifecycleReads { reads: StoreReads::new(Arc::clone(&store)), home }))?;
+    daemon.install_vessel_seats(Arc::new(EngineVesselSeats {
+        reads: StoreReads::new(Arc::clone(&store)),
+        backend: daemon.resource_backend(),
+    }))?;
     tokio::task::spawn_blocking(move || {
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
         let log = || StoreLog::new(Arc::clone(&store));
@@ -1195,6 +1199,7 @@ impl flotilla_projections::ports::LifecycleReads for EngineLifecycleReads {
             ProvisioningKind::ImageBuild => self.reads.image_build(name, home).map(|view| view.map(|view| view.judgement)),
             ProvisioningKind::Clone => self.reads.repository_clone(name, home).map(|view| view.map(|view| view.judgement)),
             ProvisioningKind::Checkout => self.reads.checkout(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::TerminalSession => self.reads.terminal_session(name, home).map(|view| view.map(|view| view.judgement)),
         };
         match judgement {
             Ok(judgement) => judgement.map(|judgement| judgement.reading()),
@@ -1203,6 +1208,57 @@ impl flotilla_projections::ports::LifecycleReads for EngineLifecycleReads {
                 None
             }
         }
+    }
+}
+
+/// Which seats a vessel serves (#3629 layer 8): its sessions by their vessel label, with each role
+/// the engine holds a launch for (`terminal_session.by_holder`, the vessel as holder) served by
+/// that launch's old session record instead. During the switch a vessel can hold launches the
+/// engine decided beside sessions only the old store knows (from before the switch, or homed
+/// elsewhere), so the labels are the base and the engine overlays them; an engine launch whose
+/// record is gone leaves the labels' answer.
+struct EngineVesselSeats {
+    reads: flotilla_provisioning::engine::reads::StoreReads,
+    backend: ResourceBackend,
+}
+
+#[async_trait::async_trait]
+impl flotilla_resources::vessel_seats::VesselSeats for EngineVesselSeats {
+    async fn seats(
+        &self,
+        namespace: &str,
+        vessel_ref: &str,
+    ) -> Result<std::collections::BTreeMap<String, flotilla_resources::ReadResourceObject<flotilla_resources::TerminalSession>>, String>
+    {
+        use flotilla_provisioning::{
+            engine::{launched, reads::ProvisioningReads},
+            stored::Holder,
+        };
+        let sessions = self.backend.including_replicas::<flotilla_resources::TerminalSession>(namespace);
+        let labelled = sessions
+            .list_matching_labels(&std::collections::BTreeMap::from([(
+                flotilla_resources::VESSEL_REF_LABEL.to_string(),
+                vessel_ref.to_owned(),
+            )]))
+            .await
+            .map_err(|error| error.to_string())?
+            .items;
+        let views = self.reads.held_sessions(&Holder::vessel(vessel_ref)).map_err(|error| error.to_string())?;
+        let mut names: Vec<String> = views.iter().map(|view| launched(&view.name).to_owned()).collect();
+        names.sort();
+        names.dedup();
+        let mut seats: std::collections::BTreeMap<_, _> =
+            labelled.into_iter().map(|session| (session.object.spec.role.clone(), session)).collect();
+        for name in names {
+            match sessions.get(&name).await {
+                Ok(session) => {
+                    seats.insert(session.object.spec.role.clone(), session);
+                }
+                Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(seats)
     }
 }
 

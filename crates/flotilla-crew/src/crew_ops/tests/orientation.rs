@@ -1,6 +1,6 @@
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_testkit::ReadCountsBackendExt;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::Utc;
 use flotilla_protocol::CrewCommandContext;
@@ -233,4 +233,54 @@ async fn crew_list_never_reads_message_history() {
         assert_eq!(response, expected, "history must not affect crew state");
         assert!(serde_json::to_value(response).unwrap()["members"][0].get("messages").is_none(), "orientation has no inbox wire field");
     }
+}
+
+/// Seats a vessel serves, answered from a fixed map, as the engine's port would.
+struct FixedSeats(BTreeMap<String, flotilla_resources::ReadResourceObject<ResourceTerminalSession>>);
+
+#[async_trait::async_trait]
+impl flotilla_resources::vessel_seats::VesselSeats for FixedSeats {
+    async fn seats(
+        &self,
+        _namespace: &str,
+        _vessel_ref: &str,
+    ) -> Result<BTreeMap<String, flotilla_resources::ReadResourceObject<ResourceTerminalSession>>, String> {
+        Ok(self.0.clone())
+    }
+}
+
+// Behaviour (#3629 layer 8): `crew list` asks which seats the vessel serves through one read port:
+// the session labels until the engine's answer is installed, and that answer afterwards.
+#[tokio::test]
+async fn crew_list_reads_a_vessels_seats_through_one_port() {
+    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
+    backend
+        .using::<Vessel>("flotilla")
+        .create(
+            &InputMeta::builder().name("vessel".into()).build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "crew".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "test".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("vessel");
+    let context = CrewCommandContext::builder().convoy("crew".into()).vessel_ref("vessel".into()).role("coder".into()).build();
+    let labelled = crew.crew_list_internal(&context).await.expect("crew state");
+    assert_ne!(labelled.members[0].state, "stopped", "the labels' session, before the port is installed");
+
+    // The port's answer: another session serving the seat, stopped.
+    let mut session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
+    session.metadata.name = "session-launch-2".into();
+    session.status =
+        Some(flotilla_resources::TerminalSessionStatus { phase: flotilla_resources::TerminalSessionPhase::Stopped, ..Default::default() });
+    let seats = BTreeMap::from([(
+        "coder".to_owned(),
+        flotilla_resources::ReadResourceObject { object: session, provenance: flotilla_resources::ResourceProvenance::Local },
+    )]);
+    crew.vessel_seats.set(Arc::new(FixedSeats(seats))).map_err(|_| "installed twice").expect("install");
+    let served = crew.crew_list_internal(&context).await.expect("crew state");
+    assert_eq!(served.members[0].state, "stopped", "the port's answer");
 }

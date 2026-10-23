@@ -2364,15 +2364,36 @@ impl Aggregator {
             .unwrap_or_else(|| self.local_host.clone())
     }
 
+    /// Whether a terminal session is running: behind `[primitives]` the engine's reading of its
+    /// current launch (#3629 layer 8), else its old phase.
+    fn session_running(&self, session: &ReadResourceObject<TerminalSession>) -> bool {
+        let origin = match &session.provenance {
+            ResourceProvenance::Local => None,
+            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+        };
+        match self.lifecycle_reads.reading(
+            crate::ports::ProvisioningKind::TerminalSession,
+            &session.object.metadata.name,
+            origin.as_deref(),
+        ) {
+            // Only a realised launch runs. A launch the engine has not realised yet (InProgress), or
+            // one that ended, does not, even while the old phase still says Running: the engine
+            // decides the launch, and the old phase is its one-way copy.
+            Some(reading) => matches!(reading, flotilla_protocol::LifecycleReading::Ready { .. }),
+            None => session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running),
+        }
+    }
+
     fn vessel_materialize(&self, namespace: &str, convoy: &str, vessel: &str, vessel_host: &HostName) -> Option<String> {
         self.convoy_sessions(namespace, convoy)
             .filter(|session| {
                 session.object.metadata.namespace == namespace
                     && session.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|value| value == convoy)
                     && session.object.metadata.labels.get(VESSEL_LABEL).is_some_and(|value| value == vessel)
-                    && session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running)
                     && self.read_host(&session.provenance).as_ref() == Some(vessel_host)
                     && self.attachable_sessions.contains(&session_key(session))
+                    // Last: behind `[primitives]` it is an engine read.
+                    && self.session_running(session)
             })
             .min_by_key(|session| &session.object.metadata.name)
             .map(|session| session.object.metadata.name.clone())
@@ -6694,6 +6715,29 @@ mod tests {
         );
         let reads = reads.reads.lock().expect("reads").clone();
         assert!(reads.contains(&(ProvisioningKind::Clone, "ops-clone".into(), None)), "{reads:?}");
+    }
+
+    // Behaviour (#3629 layer 8): behind `[primitives]` a session materializes its vessel only while
+    // the engine reads its current launch as running; an ended launch is not, whatever its old
+    // phase says. Without a reading the old phase decides.
+    #[tokio::test]
+    async fn the_engine_reading_decides_whether_a_session_runs() {
+        use flotilla_protocol::LifecycleReading;
+        use flotilla_resources::{TerminalSessionPhase, TerminalSessionStatus};
+
+        use crate::ports::ProvisioningKind;
+        let reads = Arc::new(ScriptedReadings::default());
+        let (events, _) = broadcast::channel(8);
+        let aggregator =
+            Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads.clone());
+        let mut session = session_object("terminal-ops-coder").await;
+        session.status = Some(TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() });
+        let session = ReadResourceObject { object: session, provenance: ResourceProvenance::Local };
+        assert!(aggregator.session_running(&session), "no reading: the old phase");
+        reads.set(ProvisioningKind::TerminalSession, "terminal-ops-coder", Some(LifecycleReading::Released));
+        assert!(!aggregator.session_running(&session), "its launch ended");
+        reads.set(ProvisioningKind::TerminalSession, "terminal-ops-coder", Some(LifecycleReading::Ready { identity: "s2".into() }));
+        assert!(aggregator.session_running(&session));
     }
 
     // #1961: Active plus pending agent work must remain provisioning, even

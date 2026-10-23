@@ -176,3 +176,47 @@ fn a_vessel_finds_its_environment_by_its_holder() {
     let found = reads.held_environments(&Holder::vessel("convoy-a-implement")).expect("index");
     assert_eq!(found.iter().map(|view| view.name.as_str()).collect::<Vec<_>>(), ["crew-env"]);
 }
+
+// Behaviour (#3629 layer 8): a terminal session is read by its record name as its current launch,
+// the latest `#<n>`, and a vessel's sessions through the `terminal_session.by_holder` index.
+#[test]
+fn a_session_reads_as_its_current_launch() {
+    use flotilla_provisioning::{
+        engine::launch,
+        stored::terminal_session::{Launch, TerminalSessionKind, TerminalSessionRequest},
+    };
+    let store = store();
+    let sessions: Arc<dyn Lifecycles<TerminalSessionKind>> =
+        Arc::new(LifecycleHome::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("home")));
+    let request = || TerminalSessionRequest {
+        environment: Ref::new("env-a", HOME),
+        holder: Some(Holder::vessel("vessel-a")),
+        role: "coder".into(),
+        pool: "cleat".into(),
+        cwd: "/w".into(),
+        env: Default::default(),
+        source: Launch::Tool { command: "bash".into() },
+    };
+    let name = "terminal-vessel-a-coder";
+    sessions.request(&launch(name, 1), request(), Timestamp(1)).expect("launch 1");
+    sessions.step(&launch(name, 1), &Step::Realised { identity: "s1".into() }, Timestamp(2)).expect("ran");
+    sessions.step(&launch(name, 1), &Step::Released, Timestamp(3)).expect("stopped");
+    sessions.request(&launch(name, 2), request(), Timestamp(4)).expect("launch 2");
+    sessions.step(&launch(name, 2), &Step::Realised { identity: "s2".into() }, Timestamp(5)).expect("ran again");
+
+    let reads = StoreReads::new(store);
+    let current = reads.terminal_session(name, HOME).expect("read").expect("held");
+    assert_eq!(current.name, launch(name, 2));
+    assert_eq!(current.judgement, Judgement::Ready { identity: "s2".into() });
+    assert!(reads.terminal_session("terminal-vessel-b-coder", HOME).expect("read").is_none());
+    let mut launches: Vec<String> =
+        reads.held_sessions(&Holder::vessel("vessel-a")).expect("index").into_iter().map(|view| view.name).collect();
+    launches.sort();
+    assert_eq!(launches, [launch(name, 1), launch(name, 2)]);
+
+    // Found however many launches there are (#3748 review): doubling past the latest, halving back.
+    for n in 3..=11 {
+        sessions.request(&launch(name, n), request(), Timestamp(10 + i64::from(n))).expect("launch");
+        assert_eq!(reads.terminal_session(name, HOME).expect("read").expect("held").name, launch(name, n));
+    }
+}

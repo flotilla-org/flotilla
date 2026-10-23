@@ -738,6 +738,8 @@ pub struct InProcessDaemon {
     /// The `[primitives]` Convoy path (#3587 layer 6), as crew code and the
     /// convoy reconciler reach it.
     convoy_engine_path: flotilla_resources::convoy::engine::EngineConvoyPath,
+    /// Which seats a vessel serves, the engine's answer behind `[primitives]` (#3629 layer 8).
+    vessel_seats_path: flotilla_resources::vessel_seats::VesselSeatsPath,
     message_receivers: projection_ports::MessageReceivers,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
     /// Unique identity for this daemon instance, generated at startup.
@@ -1198,6 +1200,7 @@ impl InProcessDaemon {
         let message_path = crate::primitives::MessagePath::default();
         let crew_message_path = flotilla_crew::ports::MessagePath::default();
         let convoy_engine_path = flotilla_resources::convoy::engine::EngineConvoyPath::default();
+        let vessel_seats_path = flotilla_resources::vessel_seats::VesselSeatsPath::default();
         let leaf_subscriptions =
             LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher)
                 .with_clock(Arc::clone(&clock))
@@ -1234,6 +1237,7 @@ impl InProcessDaemon {
                 .message_inboxes(Arc::clone(&message_inboxes))
                 .message_path(Arc::clone(&crew_message_path))
                 .convoy_engine(Arc::clone(&convoy_engine_path))
+                .vessel_seats(Arc::clone(&vessel_seats_path))
                 .capability_cards(flotilla_crew::crew_capabilities::CapabilityCardTracker::with_message_path(Arc::clone(
                     &crew_message_path,
                 )))
@@ -1306,6 +1310,7 @@ impl InProcessDaemon {
             message_path,
             crew_message_path,
             convoy_engine_path,
+            vessel_seats_path,
             brief_artifact_writer: Arc::clone(&brief_artifact_writer),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
@@ -2130,6 +2135,11 @@ impl InProcessDaemon {
         self.convoy_engine_path.set(convoys).map_err(|_| "the Convoy path is already installed".to_owned())?;
         let engine: Arc<dyn flotilla_crew::ports::EngineMessages> = primitives;
         self.crew_message_path.set(engine).map_err(|_| "the crew's Message path is already installed".to_owned())
+    }
+
+    /// Installs the engine's answer to which seats a vessel serves (#3629 layer 8).
+    pub fn install_vessel_seats(&self, seats: Arc<dyn flotilla_resources::vessel_seats::VesselSeats>) -> Result<(), String> {
+        self.vessel_seats_path.set(seats).map_err(|_| "the vessel seats port is already installed".to_owned())
     }
 
     /// The `[primitives]` Convoy path: empty until the switch's primitives are installed.
