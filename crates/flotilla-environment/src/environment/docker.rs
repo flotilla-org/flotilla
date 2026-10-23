@@ -79,6 +79,9 @@ pub struct DockerAgentSettings {
     pub runtime_root: PathBuf,
     pub executable: PathBuf,
 }
+/// Repository of the tags naming local crew images for the drydock layer build.
+#[cfg(unix)]
+const AGENT_IMAGE_BASE_REPOSITORY: &str = "flotilla-agent-base";
 #[cfg(unix)]
 type ConnectorFactory = dyn Fn(&Path) -> Arc<dyn AgentConnector> + Send + Sync;
 #[cfg(unix)]
@@ -1184,7 +1187,8 @@ impl DockerEnvironmentProvider {
                 return Err("Docker vessel agents currently require a Linux host and Linux agent companion".into());
             }
             let tools = drydock::launch::build_tools_digest().map_err(|e| e.to_string())?;
-            let dockerfile = format!("FROM {tools} AS tools\nFROM {}\nCOPY --from=tools /opt/drydock /opt/drydock\n", original.as_str());
+            let base = self.agent_image_base(&original).await?;
+            let dockerfile = format!("FROM {tools} AS tools\nFROM {base}\nCOPY --from=tools /opt/drydock /opt/drydock\n");
             let output = self
                 .inner
                 .runner
@@ -1202,6 +1206,21 @@ impl DockerEnvironmentProvider {
             }
             Ok(super::PreparedEnvironment::new(&self.preparation_owner, DockerPrepared { original, image: ImageId::new(digest) }))
         }
+    }
+
+    /// BuildKit reads `FROM sha256:<id>` as Docker Hub's `sha256` repository, so
+    /// a bare local image ID is first named by a tag derived from that ID.
+    /// Registry references are built from unchanged.
+    #[cfg(unix)]
+    async fn agent_image_base(&self, original: &ImageId) -> Result<String, String> {
+        let Some(hex) = original.as_str().strip_prefix("sha256:").filter(|_| flotilla_resources::is_image_digest(original.as_str())) else {
+            return Ok(original.as_str().to_string());
+        };
+        // The tag stays after the build: removing it could drop the image's
+        // last name, and concurrent preparations of one image share the tag.
+        let tag = format!("{AGENT_IMAGE_BASE_REPOSITORY}:{hex}");
+        self.inner.runner.run("docker", &["tag", original.as_str(), &tag], Path::new("/"), &ChannelLabel::Default).await?;
+        Ok(tag)
     }
 }
 
@@ -1361,7 +1380,7 @@ impl DockerEnvironmentProviderInner {
 
 #[cfg(all(test, unix))]
 mod agent_contract_tests {
-    use super::super::agent::tests::MemoryAgent;
+    use super::super::{agent::tests::MemoryAgent, contract_tests::LocalImageTags};
     use super::*;
     use flotilla_provider_runtime::CommandOutput;
     use std::sync::{
@@ -1371,6 +1390,7 @@ mod agent_contract_tests {
 
     const BASE: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const PREPARED: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const TAGGED_BASE: &str = "flotilla-agent-base:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const BACKING: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     // Process-boundary fake for Docker. Refuse calls outside the provider's
     // lifecycle contract; no Docker executable or engine participates.
@@ -1379,6 +1399,7 @@ mod agent_contract_tests {
         created: AtomicBool,
         mounts: Mutex<Vec<ProvisionedMount>>,
         calls: Mutex<Vec<Vec<String>>>,
+        tags: LocalImageTags,
     }
     #[async_trait]
     impl CommandRunner for Engine {
@@ -1390,6 +1411,7 @@ mod agent_contract_tests {
             self.calls.lock().unwrap().push(args.iter().map(|s| s.to_string()).collect());
             match args {
                 ["image", "inspect", BASE] => Ok("[]".into()),
+                ["tag", id, tag] => self.tags.tag(id, tag),
                 ["info", "--format", "{{json .}}"] => Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into()),
                 ["run", "-d", "--init", ..] => {
                     assert_eq!(&args[args.len() - 3..], [PREPARED, "sleep", "infinity"]);
@@ -1444,9 +1466,10 @@ mod agent_contract_tests {
             let file = std::str::from_utf8(input).unwrap();
             assert!(file.starts_with("FROM "));
             assert!(file.contains("@sha256:"));
-            assert!(file.ends_with(&format!("FROM {BASE}\nCOPY --from=tools /opt/drydock /opt/drydock\n")));
+            assert!(file.ends_with(&format!("FROM {TAGGED_BASE}\nCOPY --from=tools /opt/drydock /opt/drydock\n")));
             assert!(!file.contains("ENTRYPOINT"));
             assert!(!file.contains("CMD"));
+            assert_eq!(self.tags.resolve_build(file)?.as_deref(), Some(BASE));
             Ok(PREPARED.into())
         }
         async fn run_output(&self, p: &str, a: &[&str], c: &Path, l: &ChannelLabel) -> Result<CommandOutput, String> {

@@ -639,7 +639,28 @@ pub(super) fn adoption_registry(handles: Vec<EnvironmentHandle>) -> Arc<Provider
 // The only fake boundary is the Docker CLI: preparation must inspect the
 // admitted tag and resolve its local digest, without a real Docker daemon.
 pub(super) struct HeldBaselineRunner {
-    pub(super) image: String,
+    image: String,
+    tags: StdMutex<BTreeMap<String, String>>,
+}
+
+impl HeldBaselineRunner {
+    pub(super) fn new(image: impl Into<String>) -> Self {
+        Self { image: image.into(), tags: Default::default() }
+    }
+}
+
+// A Docker provider over the held baseline. Preparation never dials the agent;
+// the connector stands in for the Linux companion that non-Linux hosts require.
+pub(super) fn held_baseline_docker_provider(
+    image: impl Into<String>,
+) -> flotilla_environment::environment::docker::DockerEnvironmentProvider {
+    let provider = flotilla_environment::environment::docker::DockerEnvironmentProvider::new(Arc::new(HeldBaselineRunner::new(image)));
+    #[cfg(unix)]
+    let provider =
+        provider.with_agent_connector(Arc::new(|_: &Path| -> Arc<dyn flotilla_environment::environment::agent::AgentConnector> {
+            panic!("preparation must not connect to a vessel agent")
+        }));
+    provider
 }
 
 #[async_trait]
@@ -647,13 +668,28 @@ impl CommandRunner for HeldBaselineRunner {
     async fn run_with_input(&self, command: &str, args: &[&str], _: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         assert_eq!(command, "docker");
         assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
-        assert!(std::str::from_utf8(input).unwrap().contains("COPY --from=tools /opt/drydock /opt/drydock"));
+        let dockerfile = std::str::from_utf8(input).unwrap();
+        assert!(dockerfile.contains("COPY --from=tools /opt/drydock /opt/drydock"));
+        // BuildKit reads `FROM sha256:<hex>` as Docker Hub's `sha256` repository
+        // and pulls unknown tags; only registry digests and local tags resolve.
+        for image in dockerfile.lines().filter_map(|line| line.strip_prefix("FROM ")?.split_whitespace().next()) {
+            if !image.contains('@') && (image.starts_with("sha256:") || !self.tags.lock().unwrap().contains_key(image)) {
+                return Err(format!(
+                    "failed to resolve source metadata for docker.io/library/{image}: pull access denied, repository does not exist or may require authorization"
+                ));
+            }
+        }
         Ok(format!("sha256:{}", "b".repeat(64)))
     }
 
     async fn run(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
         assert_eq!(cmd, "docker");
         match args {
+            ["tag", id, tag] => {
+                assert_eq!(*id, format!("sha256:{}", "a".repeat(64)), "only the resolved baseline is tagged");
+                self.tags.lock().unwrap().insert(tag.to_string(), id.to_string());
+                Ok(String::new())
+            }
             ["image", "inspect", image] if *image == self.image => Ok(String::new()),
             ["--config", directory, "pull", image] if *image == self.image => {
                 assert!(directory.contains("flotilla-anonymous-"), "baseline pull must isolate ambient credentials");
