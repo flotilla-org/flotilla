@@ -47,13 +47,20 @@ pub const PINNED_CLASS: &str = "pinned";
 
 pub struct VesselBinding;
 
+impl VesselBinding {
+    /// The host `obj` was pinned to at admission, once its provisioning recorded the placement:
+    /// its lease's host. A vessel with none was never placed.
+    pub fn pinned_host(obj: &ResourceObject<OldVessel>) -> Option<&str> {
+        obj.status.as_ref().and_then(|status| status.placement_decision.as_ref()).map(|decision| decision.target_host.reference.as_str())
+    }
+}
+
 impl Binding for VesselBinding {
     type Old = OldVessel;
     type Kind = VesselKind;
 
     fn request(obj: &ResourceObject<OldVessel>, home: &str) -> Result<VesselSpec, String> {
-        let decision =
-            obj.status.as_ref().and_then(|status| status.placement_decision.as_ref()).ok_or("the vessel has no pinned host yet")?;
+        let host = Self::pinned_host(obj).ok_or("the vessel has no pinned host yet")?;
         // The convoy is homed where it was admitted: the root a federated convoy's vessel records,
         // or this home.
         let convoy_home = obj.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map_or(home, String::as_str);
@@ -62,7 +69,7 @@ impl Binding for VesselBinding {
             class: VesselClass::new(PINNED_CLASS),
             shape: BTreeMap::new(),
             priority: Priority(0),
-            host: Host::new(decision.target_host.reference.as_str()),
+            host: Host::new(host),
         })
     }
 

@@ -25,18 +25,23 @@
 //! | | Running, Lost (unobservable is a judgement, #3629 Q2) | Realised (its session id) |
 //! | | Stopped | Gone |
 //! | | Failed | GaveUp |
+//! | Vessel, placed (a lease granted on its pinned host, #3629 Q6) | Pending, Provisioning | Requested |
+//! | | Ready, Interrupted (interrupted is a judgement) | Realised (its environment; refused with none) |
+//! | | Lost, Failed (a vessel never gives up, Q3) | Gone |
+//! | Vessel, not placed yet | Pending | not stored: Waiting, at the ledger only, until the write path places it |
+//! | | Lost, Failed | not stored: it never held a lease |
+//! | | Provisioning, Ready, Interrupted | refused: no lease to import |
 //!
 //! Refused, and so listed by the rehearsal: an observed checkout (no engine request); a record whose
 //! request cannot be made (no provider, an image built and pinned at once); a Realised record with
-//! no identity to realise under. Vessels are not imported here: their lease waits on the owner's
-//! ruling on capacities (#3629 Q6), so the rehearsal lists every Vessel record as unmapped.
+//! no identity to realise under. A vessel that was never placed is noted, not refused.
 
 use std::collections::BTreeMap;
 
 use flotilla_resources::{
     Checkout as OldCheckout, CheckoutPhase, Clone as OldClone, ClonePhase, Environment as OldEnvironment, EnvironmentPhase,
     ImageBuild as OldImageBuild, ImageBuildFailureClass, ImageBuildPhase, ResourceObject, TerminalSession as OldTerminalSession,
-    TerminalSessionPhase,
+    TerminalSessionPhase, Vessel as OldVessel, VesselPhase,
 };
 use flotilla_schema::{Kind, State, Timestamp};
 use flotilla_state_machines::{
@@ -46,7 +51,7 @@ use flotilla_state_machines::{
 
 use super::{
     checkout::CheckoutBinding, clone::CloneBinding, environment::EnvironmentBinding, image_build::ImageBuildBinding, launch,
-    terminal_session::TerminalSessionBinding, Binding,
+    terminal_session::TerminalSessionBinding, vessel::VesselBinding, Binding,
 };
 
 /// A kind whose old records the import maps.
@@ -108,11 +113,6 @@ impl ImportReport {
             Err(refusal) => self.refused.push(refusal.clone()),
         }
     }
-
-    /// Lists `count` records of a kind the import does not map yet, with why.
-    pub fn unmapped(&mut self, kind: &'static str, records: impl IntoIterator<Item = String>, reason: &str) {
-        self.refused.extend(records.into_iter().map(|record| ImportRefusal { kind, record, reason: reason.to_owned() }));
-    }
 }
 
 /// A stored state's label, as the report counts it.
@@ -125,8 +125,8 @@ pub fn label(state: &LifecycleState) -> &'static str {
     }
 }
 
-/// Writes `imported` into a temporary store holding the provisioning stored kinds and
-/// TerminalSession, each as a restore at its home, reads each back and compares
+/// Writes `imported` into a temporary store holding the provisioning stored kinds, TerminalSession
+/// and the engine's crew kinds (Vessel, Ensure), each as a restore at its home, reads each back and compares
 /// ([`flotilla_engine_store::rehearse`]). A resource the store refuses, or reads back differently,
 /// is refused with its record named, keyed by its index in `imported`.
 pub fn rehearse<K>(imported: &[ImportedResource<K>]) -> BTreeMap<usize, ImportRefusal>
@@ -136,7 +136,7 @@ where
     Resource<Lifecycle<K>>: Kind,
 {
     let mut kinds = flotilla_schema::KindRegistry::new();
-    if let Err(error) = crate::stored::register(&mut kinds) {
+    if let Err(error) = crate::stored::register(&mut kinds).and_then(|()| flotilla_engine_store::register_crew(&mut kinds)) {
         let reason = format!("registry: {error:?}");
         return imported
             .iter()
@@ -173,6 +173,38 @@ where
             None => report.record(&Ok(resource)),
         }
     }
+}
+
+/// Imports and rehearses old Vessel `records` into `report` (#3629 Q6). A vessel that was placed
+/// is a lease granted on its pinned host; one never placed held no lease and is not stored, so it
+/// is noted rather than refused: a waiting one is taken on by the write path once it is placed.
+pub fn rehearse_vessels(records: &[(ResourceObject<OldVessel>, String)], report: &mut ImportReport) {
+    let mut placed = Vec::new();
+    for (vessel, home) in records {
+        let name = &vessel.metadata.name;
+        if VesselBinding::pinned_host(vessel).is_some() {
+            if vessel.status.as_ref().is_some_and(|status| status.phase == VesselPhase::Pending) {
+                // Not a state the old reconciler writes (see `imported_state`): imported, and named.
+                report.notes.push(format!("Vessel `{name}` is Pending with a recorded placement: imported as requested"));
+            }
+            placed.push((vessel.clone(), home.clone()));
+            continue;
+        }
+        match vessel.status.as_ref().map(|status| status.phase).unwrap_or_default() {
+            VesselPhase::Pending => {
+                report.notes.push(format!("Vessel `{name}` is not placed yet: waiting, not stored until the write path places it"))
+            }
+            VesselPhase::Lost | VesselPhase::Failed => report.notes.push(format!("Vessel `{name}` ended before it was placed: not stored")),
+            // Provisioning or later with no recorded placement has no lease to import: refused, so
+            // the roll lists it.
+            phase => report.refused.push(ImportRefusal {
+                kind: "Vessel",
+                record: name.clone(),
+                reason: format!("{phase:?} with no recorded placement: no lease to import; the old path keeps it"),
+            }),
+        }
+    }
+    rehearse_records::<VesselBinding>(&placed, report);
 }
 
 fn failed_by(detail: Option<&str>, fallback: &str) -> Cause {
@@ -279,6 +311,25 @@ impl Imported for TerminalSessionBinding {
             TerminalSessionPhase::Failed => {
                 LifecycleState::GaveUp { cause: failed_by(status.and_then(|status| status.message.as_deref()), "the session failed") }
             }
+        })
+    }
+}
+
+impl Imported for VesselBinding {
+    fn imported_state(obj: &ResourceObject<OldVessel>) -> Result<LifecycleState, String> {
+        let status = obj.status.as_ref();
+        Ok(match status.map(|status| status.phase).unwrap_or_default() {
+            // Placed and not yet ready. The old reconciler records a placement and Provisioning in
+            // one patch, so a placed Pending vessel is not one it writes; it maps with Provisioning
+            // rather than being refused, since its lease is as granted.
+            VesselPhase::Pending | VesselPhase::Provisioning => LifecycleState::requested(),
+            // Interrupted is a judgement (its roles stopped); the lease is realised, under its
+            // environment.
+            VesselPhase::Ready | VesselPhase::Interrupted => {
+                realised(status.and_then(|status| status.environment_ref.clone()), "environment")?
+            }
+            // A vessel that breaks after its lease ends Gone, and never gives up (Q3).
+            VesselPhase::Lost | VesselPhase::Failed => LifecycleState::Gone,
         })
     }
 }
