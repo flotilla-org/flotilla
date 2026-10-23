@@ -514,6 +514,20 @@ fn crew_load() {
         "the lease granted on its pinned host; realised; vanished, the lease freed",
     );
 
+    // The Vessel read ports (#3629 layer 8, Vessel): a vessel's lease by its name, and a convoy's
+    // vessels through the index.
+    let started = Instant::now();
+    for n in &locals {
+        let view = reads.vessel(&format!("vessel-{n}"), "local").expect("read").expect("held");
+        assert!(matches!(view.state, flotilla_state_machines::machines::lifecycle::LifecycleState::Realised { .. }));
+    }
+    eprintln!("{:>40}: {:>8.1} µs/query", "port: a vessel's lease", started.elapsed().as_secs_f64() * 1e6 / locals.len() as f64);
+    let started = Instant::now();
+    for n in &locals {
+        assert!(!reads.convoy_vessels(&convoy(*n, "local")).expect("index").is_empty());
+    }
+    eprintln!("{:>40}: {:>8.1} µs/query", "port: a convoy's vessels", started.elapsed().as_secs_f64() * 1e6 / locals.len() as f64);
+
     // A restart: the vessels' home and the ledger's leases rebuilt from the store.
     let started = Instant::now();
     let home = open_home::<Vessel>(StoreLog::new(local.clone())).expect("home");

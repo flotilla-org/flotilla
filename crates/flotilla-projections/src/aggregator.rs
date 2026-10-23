@@ -34,8 +34,8 @@ use flotilla_resources::{
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
     Demand, DemandAddressee, DemandState, Environment, Project, ReadResourceObject, ReadWatchEvent, Regard, RegardExpiryPolicy, Repository,
     Resource, ResourceError, ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState,
-    TerminalSession, TerminalSessionPhase, Vessel, VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState,
-    CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase,
+    WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{ReadResourceList, ResourceList, WatchStart};
@@ -2474,6 +2474,31 @@ impl Aggregator {
             // decides the launch, and the old phase is its one-way copy.
             Some(reading) => matches!(reading, flotilla_protocol::LifecycleReading::Ready { .. }),
             None => session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running),
+        }
+    }
+
+    /// A vessel's phase as the views read it. Behind `[primitives]` the engine decides whether its
+    /// lease is live (#3629 layer 8, Vessel): an ended lease reads Lost while the old phase still
+    /// says it is live, before the one-way copy lands. The old phase says how a live vessel is
+    /// doing (provisioning, ready, interrupted), and why an ended one ended (lost or failed), which
+    /// the engine does not distinguish.
+    pub(crate) fn vessel_phase(&self, vessel: &ReadResourceObject<Vessel>) -> VesselPhase {
+        let old = vessel.object.status.as_ref().map(|status| status.phase).unwrap_or_default();
+        if matches!(old, VesselPhase::Lost | VesselPhase::Failed) {
+            return old;
+        }
+        let origin = match &vessel.provenance {
+            ResourceProvenance::Local => None,
+            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+        };
+        match self.lifecycle_reads.reading(crate::ports::ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref()) {
+            Some(
+                flotilla_protocol::LifecycleReading::Lost
+                | flotilla_protocol::LifecycleReading::Released
+                | flotilla_protocol::LifecycleReading::Gone
+                | flotilla_protocol::LifecycleReading::GaveUp { .. },
+            ) => VesselPhase::Lost,
+            _ => old,
         }
     }
 
@@ -6831,6 +6856,44 @@ mod tests {
         assert!(!aggregator.session_running(&session), "its launch ended");
         reads.set(ProvisioningKind::TerminalSession, "terminal-ops-coder", Some(LifecycleReading::Ready { identity: "s2".into() }));
         assert!(aggregator.session_running(&session));
+    }
+
+    // Behaviour (#3629 layer 8, Vessel): behind `[primitives]` the engine decides whether a vessel's
+    // lease is live. An ended lease reads Lost while the old phase still says Ready; a live one
+    // keeps the old phase, which also keeps why an ended one ended (Failed is not read as Lost).
+    #[tokio::test]
+    async fn the_engine_reading_ends_a_vessel_the_old_phase_says_is_live() {
+        use flotilla_protocol::LifecycleReading;
+        use flotilla_resources::{VesselSpec, VesselStatus};
+
+        use crate::ports::ProvisioningKind;
+        let reads = Arc::new(ScriptedReadings::default());
+        let (events, _) = broadcast::channel(8);
+        let aggregator =
+            Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads.clone());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let mut vessel = backend
+            .using::<Vessel>("flotilla")
+            .create(
+                &InputMeta::builder().name("convoy-a-implement".into()).build(),
+                &VesselSpec {
+                    convoy_ref: "convoy-a".into(),
+                    vessel_name: "implement".into(),
+                    placement_policy_ref: "local".into(),
+                    adopted_checkout_refs: Default::default(),
+                },
+            )
+            .await
+            .expect("vessel");
+        vessel.status = Some(VesselStatus { phase: VesselPhase::Ready, ..Default::default() });
+        let mut read = ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local };
+        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Ready, "no reading: the old phase");
+        reads.set(ProvisioningKind::Vessel, "convoy-a-implement", Some(LifecycleReading::Ready { identity: "env-a".into() }));
+        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Ready);
+        reads.set(ProvisioningKind::Vessel, "convoy-a-implement", Some(LifecycleReading::Lost));
+        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Lost, "its lease ended");
+        read.object.status.as_mut().expect("status").phase = VesselPhase::Failed;
+        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Failed, "the old phase says why it ended");
     }
 
     // #1961: Active plus pending agent work must remain provisioning, even

@@ -55,7 +55,7 @@ impl Aggregator {
         });
         if let Some(vessel) = vessel {
             let status = vessel.object.status.as_ref();
-            let vessel_phase = status.map(|status| status.phase).unwrap_or_default();
+            let vessel_phase = self.vessel_phase(vessel);
             if vessel_phase == VesselPhase::Ready {
                 result.state = ReadinessState::Ready;
             } else {
