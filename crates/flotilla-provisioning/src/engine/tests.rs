@@ -1000,3 +1000,29 @@ fn a_restart_puts_each_live_lease_back_on_its_pinned_host() {
         assert_eq!(leased, [(VesselId::new("live"), Host::new("feta"))]);
     });
 }
+
+// Behaviour (#3770 review): an old patch the engine does not take is not written, so the old
+// vessel's `ready_at`, which the binding's steps read, follows the engine. A readiness refused
+// against an ended lease leaves `ready_at` unset and copies Lost; the vessel's next Lost or Failed
+// is then a Release, which an ended lease refuses too, and nothing more is written.
+#[tokio::test]
+async fn a_readiness_the_engine_does_not_take_is_not_written() {
+    use flotilla_resources::{VesselPhase, VesselStatusPatch};
+
+    use super::{decide, vessel::VesselBinding};
+    let home = placements();
+    let mut obj = vessel_object();
+    let decided = decide::<VesselBinding>(home.as_ref(), &obj, Some(provisioning(Some("feta"))), Utc::now()).patch.expect("granted");
+    decided.apply(obj.status.get_or_insert_with(Default::default));
+    // The lease ends behind the old status's back (its teardown, say).
+    home.step("convoy-a-implement", &Step::Released, super::at(Utc::now())).expect("released");
+
+    let decided = decide::<VesselBinding>(home.as_ref(), &obj, Some(vessel_ready("env-a")), Utc::now());
+    assert!(matches!(decided.patch, Some(VesselStatusPatch::MarkLost { .. })), "the copy, not the readiness: {:?}", decided.patch);
+    decided.patch.expect("copy").apply(obj.status.get_or_insert_with(Default::default));
+    let status = obj.status.as_ref().expect("status");
+    assert!(status.ready_at.is_none(), "never written ready");
+    assert_eq!(status.phase, VesselPhase::Lost);
+    let lost = VesselStatusPatch::MarkLost { message: "gone".into() };
+    assert_eq!(decide::<VesselBinding>(home.as_ref(), &obj, Some(lost), Utc::now()).patch, None, "already Lost: nothing to write");
+}

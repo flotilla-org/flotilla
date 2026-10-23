@@ -45,9 +45,12 @@ use chrono::{DateTime, Utc};
 use flotilla_resources::{ResourceError, ResourceObject, StatusPatch};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
-    machines::lifecycle::{
-        Attempted, GiveUp, Lifecycle, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed, Realise, Release,
-        Vanish,
+    machines::{
+        lifecycle::{
+            Attempted, GiveUp, Lifecycle, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed, Realise,
+            Release, Vanish,
+        },
+        vessel::VesselKind,
     },
     Home, Log, Outcome, Ref, Resource, WriteError,
 };
@@ -68,7 +71,7 @@ pub struct ProvisioningLifecycles {
     /// TerminalSession, each launch a resource (layer 7).
     pub terminal_sessions: Arc<dyn Lifecycles<TerminalSessionKind>>,
     /// Vessel, its lease placed on its pinned host (layer 7, Q6).
-    pub vessels: Arc<dyn Lifecycles<flotilla_state_machines::machines::vessel::VesselKind>>,
+    pub vessels: Arc<dyn Lifecycles<VesselKind>>,
 }
 
 /// One thing a reconciler observed about a resource's realisation, with the evidence the

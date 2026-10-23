@@ -51,7 +51,8 @@ fn spare() -> Host {
     spec_host(99)
 }
 
-/// The spec's host `n`: its id is the number's text.
+/// The spec's host `n`: its id is the number's text. The spec numbers its hosts, so this adaptor
+/// names them by number and parses a lease's host back as one; production hosts are fleet ids.
 fn spec_host(n: u32) -> Host {
     Host(n.to_string())
 }

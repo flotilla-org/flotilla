@@ -191,7 +191,9 @@ where
                 Ok(()) | Err(PlacementError::Ledger(LedgerError::DuplicateHost(_))) => {}
                 Err(error) => return Err(error.into()),
             }
-            placements.set_caps(lease.request.convoy.clone(), [(lease.request.class.clone(), u32::MAX)].into());
+            // Only the pinned class's cap: a convoy's other classes, once a capacity model adds
+            // them, keep theirs.
+            placements.set_cap(lease.request.convoy.clone(), lease.request.class.clone(), u32::MAX);
             // A request a failed write left waiting is placed again, not queued twice.
             match placements.request(id.clone(), lease.request) {
                 Ok(()) | Err(PlacementError::Ledger(LedgerError::DuplicateRequest(_))) => {}

@@ -183,6 +183,11 @@ impl Ledger {
         self.caps.insert(convoy, quota);
     }
 
+    /// Sets one class's cap for a convoy, keeping its other classes' caps.
+    pub fn set_cap(&mut self, convoy: ConvoyId, class: VesselClass, cap: u32) {
+        self.caps.entry(convoy).or_default().insert(class, cap);
+    }
+
     /// Queues a vessel's request.
     pub fn request(&mut self, id: VesselId, request: Request) -> Result<(), LedgerError> {
         if self.vessels.contains_key(&id) {
@@ -378,6 +383,11 @@ impl<L: Log<VesselMachine>> Placements<L> {
     /// Sets a convoy's quota, as admitted or readmitted.
     pub fn set_caps(&mut self, convoy: ConvoyId, quota: Quota) {
         self.ledger.set_caps(convoy, quota);
+    }
+
+    /// Sets one class's cap for a convoy, keeping its other classes' caps.
+    pub fn set_cap(&mut self, convoy: ConvoyId, class: VesselClass, cap: u32) {
+        self.ledger.set_cap(convoy, class, cap);
     }
 
     /// Adds a host with its capacity by dimension, as it joins after the ledger was built.
