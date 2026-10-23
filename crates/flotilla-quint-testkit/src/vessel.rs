@@ -47,7 +47,14 @@ use crate::{
 const NAME: &str = "v";
 const IDENTITY: &str = "vessel";
 /// The host the `live` vessel is leased on; no probe places there.
-const SPARE: Host = Host(99);
+fn spare() -> Host {
+    spec_host(99)
+}
+
+/// The spec's host `n`: its id is the number's text.
+fn spec_host(n: u32) -> Host {
+    Host(n.to_string())
+}
 
 /// Where a run's vessel resources are written: a fresh log per subject.
 pub trait VesselLogs: 'static {
@@ -84,7 +91,7 @@ fn request_value(r: &Request) -> Value {
 }
 
 fn placement_value(lease: &Lease) -> Value {
-    json!({ "request": request_value(&lease.request), "host": int(lease.host.0.into()) })
+    json!({ "request": request_value(&lease.request), "host": int(lease.host.0.parse::<i64>().expect("a spec host is a number")) })
 }
 
 fn refusal_name(r: flotilla_state_machines::placement::PlacementRefusal) -> &'static str {
@@ -131,10 +138,13 @@ impl<F: VesselLogs> Composed<F> {
         if evidence.admitted != (evidence.cap > 0) || evidence.live > 1 {
             return None;
         }
-        let mut hosts = vec![(evidence.host, evidence.available.clone())];
+        let mut hosts = vec![(evidence.host.clone(), evidence.available.clone())];
         if evidence.live == 1 {
             // Room to spare, so the live vessel's own fit is never in question.
-            hosts.push((SPARE, self.request.shape.iter().map(|(dimension, units)| (*dimension, units.saturating_mul(2).max(1))).collect()));
+            hosts.push((
+                spare(),
+                self.request.shape.iter().map(|(dimension, units)| (*dimension, units.saturating_mul(2).max(1))).collect(),
+            ));
         }
         let home = Home::with_log("home", F::log()).expect("valid declaration");
         let (mut placements, unplaced) = Placements::new(home, hosts).expect("new hosts");
@@ -144,14 +154,14 @@ impl<F: VesselLogs> Composed<F> {
             // Leased before anything else waits, so nothing outranks it.
             let live = VesselId::new("live");
             placements.request(live.clone(), self.request.clone()).expect("a new vessel");
-            placements.place(&live, SPARE, Timestamp(0)).expect("the live vessel fits the spare host under its cap");
+            placements.place(&live, spare(), Timestamp(0)).expect("the live vessel fits the spare host under its cap");
         }
         for (index, waiting) in evidence.waiting.iter().enumerate() {
             placements.request(VesselId::new(format!("waiting{index}")), waiting.clone()).expect("a new vessel");
         }
         placements.request(self.id.clone(), self.request.clone()).expect("a new vessel");
         assert_eq!(
-            placements.ledger().evidence(&self.id, evidence.host).as_ref(),
+            placements.ledger().evidence(&self.id, evidence.host.clone()).as_ref(),
             Ok(evidence),
             "the ledger presents the probe's evidence"
         );
@@ -165,7 +175,7 @@ impl<F: VesselLogs> Composed<F> {
                 Ok(_) => panic!("evidence without a ledger cannot place"),
             };
         };
-        match placements.place(&self.id, evidence.host, Timestamp(0)) {
+        match placements.place(&self.id, evidence.host.clone(), Timestamp(0)) {
             Ok(_) => {
                 F::check(placements.home());
                 self.placements = Some(placements);
@@ -209,7 +219,7 @@ impl<F: VesselLogs> Conformance for VesselConformance<F> {
         match (v.vessel().map(|vessel| vessel.state().clone()), tag(event)) {
             (Some(LifecycleState::Gone), _) => refusal("WrongState"),
             (None, "Place") => v.place(Evidence {
-                host: Host(count(&o["host"])),
+                host: spec_host(count(&o["host"])),
                 available: units(&o["available"]),
                 waiting: set(&o["waiting"]).iter().map(request_of).collect(),
                 live: count(&o["live"]),
