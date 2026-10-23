@@ -11,7 +11,9 @@ use flotilla_resources::Checkout as ResourceCheckout;
 use flotilla_resources::CheckoutPhase as ResourceCheckoutPhase;
 use flotilla_resources::CheckoutSpec as ResourceCheckoutSpec;
 use flotilla_resources::CheckoutStatus as ResourceCheckoutStatus;
+use flotilla_resources::Convoy;
 use flotilla_resources::Host as ResourceHost;
+use flotilla_resources::HostOccupancy;
 use flotilla_resources::HostStatus as ResourceHostStatus;
 use flotilla_resources::InputMeta;
 use flotilla_resources::LifecycleAuthority;
@@ -27,10 +29,12 @@ use flotilla_resources::Resource;
 use flotilla_resources::ResourceError;
 use flotilla_resources::ResourceObject;
 use flotilla_resources::ResourceProvenance;
+use flotilla_resources::Vessel;
 use flotilla_resources::WorkflowTemplate;
 use flotilla_resources::WorkflowTemplateSpec;
 use flotilla_resources::CONVOY_LABEL;
 use flotilla_store::ResourceBackend;
+use flotilla_store::StoreQuery;
 use tracing::warn;
 
 pub fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTemplateSpec, String> {
@@ -282,12 +286,30 @@ pub fn check_placement_capacity(target_host: &PlacementTargetHost, capacity: Opt
 }
 
 /// Agentless SSH hosts run crews in an account the owning daemon does not
-/// control, so they take only convoys that name their placement deliberately.
-/// Capacity-aware selection may relax this once hosts advertise their limits.
+/// control, so an uncapped one takes only convoys that name its placement
+/// deliberately. A host that declares `max_vessels` takes unpinned convoys
+/// within that cap (#3793).
 pub const AGENTLESS_SSH_PIN_ONLY: &str = "agentless SSH host takes only convoys that pin its placement";
 
 pub fn is_agentless_ssh_host(host: &ResourceObject<ResourceHost>) -> bool {
     matches!(host.spec.connection, flotilla_resources::HostConnection::AgentlessSsh { .. })
+}
+
+/// The vessel cap an agentless SSH host declares; other hosts have none.
+pub fn agentless_vessel_cap(host: &ResourceObject<ResourceHost>) -> Option<u32> {
+    is_agentless_ssh_host(host).then_some(host.spec.max_vessels).flatten()
+}
+
+/// What `host` holds against its cap, read from every convoy and vessel the
+/// store sees. The owning daemon is the only placer on its agentless hosts,
+/// so its store holds every convoy admitted there.
+pub async fn host_occupancy(backend: &ResourceBackend, namespace: &str, host: &str) -> Result<HostOccupancy, String> {
+    let query = StoreQuery { include_replicas: true, ..Default::default() };
+    let convoys =
+        home_copy_wins_by_name(backend.query_declared::<Convoy>(namespace, &query).await.map_err(|error| error.to_string())?.items);
+    let vessels =
+        home_copy_wins_by_name(backend.query_declared::<Vessel>(namespace, &query).await.map_err(|error| error.to_string())?.items);
+    Ok(HostOccupancy::count(host, &convoys, &vessels))
 }
 
 pub async fn policy_targets_agentless_ssh(backend: &ResourceBackend, namespace: &str, policy: &ResourceObject<PlacementPolicy>) -> bool {

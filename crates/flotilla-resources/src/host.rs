@@ -85,6 +85,11 @@ pub struct HostSpec {
     /// ADR 0047: absent means placement-host builds; retain default for one roll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_build_capacity: Option<crate::ImageBuildCapacity>,
+    /// The vessels an agentless SSH host declares it can hold (#3793). A
+    /// capped host takes unpinned convoys; an uncapped one takes only pinned
+    /// work. Previous-generation Host records omit it (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_vessels: Option<u32>,
 }
 
 const fn default_expected_concurrent_rust_crews() -> u32 {
@@ -98,6 +103,7 @@ impl Default for HostSpec {
             connection: HostConnection::default(),
             expected_concurrent_rust_crews: 4,
             image_build_capacity: None,
+            max_vessels: None,
         }
     }
 }

@@ -857,6 +857,7 @@ mod tests {
                 ssh_multiplex: None,
                 agentless_ssh: false,
                 supplies: Vec::new(),
+                max_vessels: None,
             },
             None,
             uuid::Uuid::nil(),
@@ -876,6 +877,7 @@ mod tests {
             ssh_multiplex: None,
             agentless_ssh: false,
             supplies: Vec::new(),
+            max_vessels: None,
         };
         let transport = SshTransport::new(
             NodeId::new("local"),
@@ -901,6 +903,7 @@ mod tests {
             ssh_multiplex: None,
             agentless_ssh: false,
             supplies: Vec::new(),
+            max_vessels: None,
         };
         let local_node = NodeId::new("local-node");
         let mut transport = SshTransport::new(
@@ -950,6 +953,7 @@ mod tests {
             ssh_multiplex: None,
             agentless_ssh: false,
             supplies: Vec::new(),
+            max_vessels: None,
         };
         let mut transport = SshTransport::new(
             NodeId::new("local-node"),
@@ -993,6 +997,7 @@ mod tests {
             ssh_multiplex: None,
             agentless_ssh: false,
             supplies: Vec::new(),
+            max_vessels: None,
         };
         let events = Arc::new(StdMutex::new(Vec::new()));
         let runner = Arc::new(FakeCommandRunner::new(
@@ -1056,6 +1061,7 @@ mod tests {
             ssh_multiplex: None,
             agentless_ssh: false,
             supplies: Vec::new(),
+            max_vessels: None,
         };
         let events = Arc::new(StdMutex::new(Vec::new()));
         let runner = Arc::new(FakeCommandRunner::new(
@@ -1097,6 +1103,7 @@ mod tests {
             ssh_multiplex: None,
             agentless_ssh: false,
             supplies: Vec::new(),
+            max_vessels: None,
         };
         match SshTransport::new(
             NodeId::new("local"),
@@ -1123,6 +1130,7 @@ mod tests {
             ssh_multiplex: None,
             agentless_ssh: false,
             supplies: Vec::new(),
+            max_vessels: None,
         };
         let transport = SshTransport::new(
             NodeId::new("local"),
@@ -1234,6 +1242,7 @@ mod tests {
             ssh_multiplex: None,
             agentless_ssh: false,
             supplies: Vec::new(),
+            max_vessels: None,
         };
         let transport = SshTransport::new(
             NodeId::new("local"),
@@ -1259,6 +1268,7 @@ mod tests {
             ssh_multiplex: None,
             agentless_ssh: false,
             supplies: Vec::new(),
+            max_vessels: None,
         };
         let mut transport = SshTransport::new(
             NodeId::new("local"),
@@ -1292,6 +1302,7 @@ mod tests {
             ssh_multiplex: None,
             agentless_ssh: false,
             supplies: Vec::new(),
+            max_vessels: None,
         };
         let mut transport = SshTransport::new(
             NodeId::new("local"),
@@ -1358,6 +1369,7 @@ mod tests {
             ssh_multiplex: None,
             agentless_ssh: false,
             supplies: Vec::new(),
+            max_vessels: None,
         };
         let mut transport = SshTransport::new(
             NodeId::new("local-test"),

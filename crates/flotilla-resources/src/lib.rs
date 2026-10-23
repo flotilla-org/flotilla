@@ -96,6 +96,7 @@ pub mod terminal_session;
 pub mod usage;
 #[doc(hidden)]
 pub mod vessel;
+mod vessel_occupancy;
 pub mod vessel_seats;
 mod watch;
 #[doc(hidden)]
@@ -243,6 +244,7 @@ pub use vessel::{
     vessel_resource_name, Vessel, VesselImage, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
+pub use vessel_occupancy::HostOccupancy;
 pub use watch::{ResourceList, ResourcePosition, ResourceTombstone, WatchEvent, WatchStart, WatchStream};
 
 #[doc(hidden)]

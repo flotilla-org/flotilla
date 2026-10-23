@@ -172,6 +172,7 @@ fn fulfilment_list_distinguishes_image_and_host_model_support() {
         toolchains: BTreeMap::new(),
         gui_session_logged_in: Some(false),
         free_vessel_slots: None,
+        max_vessels: None,
         image: None,
     };
     let response = flotilla_protocol::FulfilmentListResponse {

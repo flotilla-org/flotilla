@@ -185,6 +185,31 @@ composed `PATH` and supply variables again as its first step, so the harness
 sees the composed environment. Removing that profile run needs a cleat launch
 without a login shell (#3761).
 
+#### Vessel cap
+
+An agentless host without a cap takes only convoys that pin its placement
+(`--fulfilment host-direct-<host-id>`). Declare how many vessels it can hold and
+it takes ordinary, unpinned placement within that cap (#3793):
+
+```toml
+[hosts.b1]
+hostname = "b1.example"
+user = "flotilla"
+agentless_ssh = true
+max_vessels = 1
+```
+
+The owning daemon is the only daemon that places on its agentless hosts, and it
+counts their vessels. A vessel holds its slot from its convoy's admission until
+its teardown finishes, so a crash mid-teardown does not free the slot early.
+Among otherwise equal hosts, placement prefers the one with the most free
+slots; a host with none is chosen only when no host has room. A convoy admitted
+to a full host waits before provisioning, with "no free vessel slots" in
+`convoy explain`, and starts in admission order once a vessel on that host
+finishes teardown. `convoy explain` and `fulfilment list` show each capped
+host's free slots as `<free> of <cap>`. The cap counts vessels only: memory
+and CPU are not considered.
+
 The admission free-space floor below is checked against the SSH host's
 `~/dev/flotilla-repos` checkout volume using its remote `df` result.
 

@@ -414,7 +414,7 @@ async fn register_static_ssh_direct_environment(
     environment: &StaticEnvironmentConfig,
     host_direct: bool,
     multiplex: bool,
-) -> Result<(), String> {
+) -> Result<EnvironmentId, String> {
     let fallback_env_id = static_ssh_environment_id(config_key);
     let destination = flotilla_config::ssh_destination(&environment.hostname, environment.user.as_deref());
     let host_environment =
@@ -448,7 +448,7 @@ async fn register_static_ssh_direct_environment(
     if host_direct {
         environment_manager.set_direct_environment_ssh_destination(&env_id, destination)?;
     }
-    Ok(())
+    Ok(env_id)
 }
 
 /// #3722: a host's declared supplies, validated for its SSH runner.
@@ -499,7 +499,7 @@ async fn register_static_ssh_direct_environments(
                     flotilla_command: None,
                     supplies: remote.supplies.clone(),
                 };
-                if let Err(err) = register_static_ssh_direct_environment(
+                let registered = register_static_ssh_direct_environment(
                     environment_manager,
                     discovery,
                     label,
@@ -508,7 +508,8 @@ async fn register_static_ssh_direct_environments(
                     hosts.resolved_ssh_multiplex(label),
                 )
                 .await
-                {
+                .and_then(|env_id| environment_manager.set_direct_environment_max_vessels(&env_id, remote.max_vessels));
+                if let Err(err) = registered {
                     warn!(host = %label, %err, "failed to register agentless SSH host; continuing startup");
                 }
             }

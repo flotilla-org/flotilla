@@ -60,10 +60,10 @@ use tracing::warn;
 use crate::project_ops;
 use crate::regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome};
 use crate::support::{
-    authoritative_placement_host, check_placement_capacity, ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot,
-    home_copy_wins_by_name, host_generation, is_agentless_ssh_host, placement_actuator_host_ref, placement_host_not_ready_reason,
-    placement_host_ref, placement_target_host, policy_targets_agentless_ssh, prepared_snapshot_name, resolve_placement_provider,
-    unready_placement_refusal, AGENTLESS_SSH_PIN_ONLY,
+    agentless_vessel_cap, authoritative_placement_host, check_placement_capacity, ensure_prepared_placement_snapshot,
+    ensure_prepared_workflow_snapshot, home_copy_wins_by_name, host_generation, host_occupancy, is_agentless_ssh_host,
+    placement_actuator_host_ref, placement_host_not_ready_reason, placement_host_ref, placement_target_host, policy_targets_agentless_ssh,
+    prepared_snapshot_name, resolve_placement_provider, unready_placement_refusal, AGENTLESS_SSH_PIN_ONLY,
 };
 
 /// Routing uses replicated observations as hints; only admission may refuse on
@@ -151,6 +151,9 @@ pub struct ConvoyAdmission {
 struct AdmissionReadContext<'a> {
     runtime: AdmissionRuntime<'a>,
     backend: ResourceBackend,
+    /// Capped agentless hosts' occupancy, counted from the live store when a
+    /// request snapshot (which copies no convoys or vessels) is loaded.
+    occupancy: BTreeMap<String, flotilla_resources::HostOccupancy>,
 }
 
 /// External observations and actions available during planning. No admission
@@ -198,6 +201,7 @@ impl ConvoyAdmission {
     fn reads(&self, backend: ResourceBackend) -> AdmissionReadContext<'_> {
         AdmissionReadContext {
             backend,
+            occupancy: BTreeMap::new(),
             runtime: AdmissionRuntime {
                 config: &self.config,
                 discovery: &self.discovery,
@@ -2038,11 +2042,28 @@ impl AdmissionReadContext<'_> {
         snapshot.insert::<Repository>(repository_sources)?;
         snapshot.insert::<FulfilmentKind>(kinds)?;
         snapshot.insert::<PlacementPolicy>(policies)?;
-        snapshot.insert::<ResourceHost>(hosts)?;
         snapshot.insert::<CredentialGrant>(grants)?;
         snapshot.insert::<CredentialSpec>(credentials)?;
+        let mut occupancy = BTreeMap::new();
+        for host in hosts.items.iter().filter(|host| agentless_vessel_cap(&host.object).is_some()) {
+            let name = host.object.metadata.name.clone();
+            if let std::collections::btree_map::Entry::Vacant(entry) = occupancy.entry(name) {
+                let counted = host_occupancy(backend, namespace, entry.key()).await?;
+                entry.insert(counted);
+            }
+        }
         snapshot.insert::<ImageBuild>(builds)?;
-        Ok(owner.reads(snapshot.finish()))
+        snapshot.insert::<ResourceHost>(hosts)?;
+        let mut reads = owner.reads(snapshot.finish());
+        reads.occupancy = occupancy;
+        Ok(reads)
+    }
+
+    async fn vessel_occupancy(&self, namespace: &str, host: &str) -> Result<flotilla_resources::HostOccupancy, String> {
+        match self.occupancy.get(host) {
+            Some(occupancy) => Ok(occupancy.clone()),
+            None => host_occupancy(&self.backend, namespace, host).await,
+        }
     }
 
     async fn resolve_continuation(
@@ -2621,7 +2642,8 @@ impl AdmissionReadContext<'_> {
             if let Some(canonical_kind_host) = &canonical_kind_host {
                 kind.spec.host_ref = canonical_kind_host.to_string();
             }
-            if host.is_some_and(is_agentless_ssh_host) && pin != Some(kind.metadata.name.as_str()) {
+            let vessel_cap = host.and_then(agentless_vessel_cap);
+            if host.is_some_and(is_agentless_ssh_host) && vessel_cap.is_none() && pin != Some(kind.metadata.name.as_str()) {
                 rejected.push(refusal(AGENTLESS_SSH_PIN_ONLY.to_string()));
                 continue;
             }
@@ -2747,7 +2769,14 @@ impl AdmissionReadContext<'_> {
                         rejected.push(refusal("fulfilment kind and placement policy disagree on host or realisation".into()));
                         continue;
                     }
-                    let free_slots = facts.and_then(|facts| facts.free_vessel_slots);
+                    // A capped agentless host's slots are counted afresh: the
+                    // published fact trails the admissions just made (#3793).
+                    let free_slots = match (vessel_cap, host, purpose) {
+                        (Some(cap), Some(host), PlacementPurpose::Admission) => {
+                            Some(self.vessel_occupancy(namespace, &host.metadata.name).await?.free_slots(cap))
+                        }
+                        _ => facts.and_then(|facts| facts.free_vessel_slots),
+                    };
                     let host_ready = host.and_then(|host| host.status.as_ref()).is_some_and(|status| {
                         let mut status = status.clone();
                         status.apply_heartbeat_readiness(self.runtime.clock.now());
@@ -2777,7 +2806,7 @@ impl AdmissionReadContext<'_> {
                         composed.map(|images| images.values().map(|image| image.identity.as_str()).collect::<BTreeSet<_>>()),
                     )
                     .await?;
-                    candidates.push(KindCandidate { kind, placement, free_slots, host_ready, sleeping_until, image_cost });
+                    candidates.push(KindCandidate { kind, placement, free_slots, vessel_cap, host_ready, sleeping_until, image_cost });
                 }
                 Err(error) => rejected.push(refusal(error)),
             }
@@ -2840,6 +2869,7 @@ impl AdmissionReadContext<'_> {
                     host_ready: candidate.host_ready,
                     sleeping_until: candidate.sleeping_until,
                     free_vessel_slots: candidate.free_slots,
+                    max_vessels: candidate.vessel_cap,
                     reserved_for_platform: placement_tiebreak.reserved(candidate),
                     minimal: minimal.contains(&candidate.kind.metadata.name),
                     available: placement_tiebreak.available(candidate),
@@ -4049,6 +4079,8 @@ pub struct KindCandidate {
     pub kind: ResourceObject<FulfilmentKind>,
     pub placement: PlacementResolution,
     pub free_slots: Option<u32>,
+    /// An agentless SSH host's declared vessel cap (#3793).
+    pub vessel_cap: Option<u32>,
     pub host_ready: bool,
     pub sleeping_until: Option<DateTime<Utc>>,
     pub image_cost: flotilla_resources::ImageAcquisitionCost,
@@ -4110,6 +4142,9 @@ impl PlacementCandidateOrder for PlacementTieBreak<'_> {
                 candidate.image_cost,
                 candidate.kind.spec.cost_class,
                 Reverse(policy.spec.priority),
+                // Spread over the hosts with room: most free slots first,
+                // and an unbounded host before any counted one.
+                Reverse(candidate.free_slots.unwrap_or(u32::MAX)),
                 candidate.kind.metadata.name.clone(),
             )
         };
@@ -5913,6 +5948,7 @@ mod tests {
                     allocation: None,
                 },
                 free_slots: slots,
+                vessel_cap: None,
                 host_ready: ready,
                 sleeping_until,
             }

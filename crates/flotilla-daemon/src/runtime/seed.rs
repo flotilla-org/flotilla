@@ -109,6 +109,7 @@ pub(super) async fn ensure_host_exists(
                         connection: Default::default(),
                         expected_concurrent_rust_crews: existing.spec.expected_concurrent_rust_crews,
                         image_build_capacity: existing.spec.image_build_capacity.clone(),
+                        max_vessels: None,
                     },
                 )
                 .await

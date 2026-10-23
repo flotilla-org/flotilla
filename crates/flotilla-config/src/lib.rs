@@ -211,6 +211,10 @@ pub struct RemoteHostConfig {
     pub agentless_ssh: bool,
     /// What the host supplies to commands flotilla runs there (#3722).
     pub supplies: Vec<HostSupply>,
+    /// How many vessels an agentless host can hold at once (#3793). A capped
+    /// host takes unpinned convoys within its cap; without a cap it takes
+    /// only convoys that pin its placement.
+    pub max_vessels: Option<u32>,
 }
 
 /// One tool a host supplies: directories for `PATH` and environment
@@ -262,6 +266,8 @@ struct RawRemoteHostConfig {
     agentless_ssh: bool,
     #[serde(default)]
     supplies: Vec<HostSupply>,
+    #[serde(default)]
+    max_vessels: Option<u32>,
 }
 
 impl<'de> Deserialize<'de> for HostsConfig {
@@ -286,6 +292,7 @@ impl<'de> Deserialize<'de> for HostsConfig {
                         ssh_multiplex: host.ssh_multiplex,
                         agentless_ssh: host.agentless_ssh,
                         supplies: host.supplies,
+                        max_vessels: host.max_vessels,
                     },
                 )
             })

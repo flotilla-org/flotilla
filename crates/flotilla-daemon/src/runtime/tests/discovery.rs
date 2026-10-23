@@ -172,18 +172,28 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
             .with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
         runner,
         host_environment: Default::default(),
+        max_vessels: Some(2),
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
     };
     register_agentless_ssh_resources(&daemon.resource_backend(), NAMESPACE, &local_host_id, &profile)
         .await
         .expect("register SSH resources");
+    profile
+        .fulfilment_facts
+        .write()
+        .await
+        .insert("host-direct-ssh-test-host".into(), flotilla_resources::FulfilmentFacts { observed_at: Utc::now(), ..Default::default() });
     let claude_dir = temp.path().join(".claude");
     std::fs::create_dir_all(&claude_dir).expect("create remote Claude dir");
     std::fs::write(claude_dir.join(".credentials.json"), r#"{"claudeAiOauth":{"expiresAt":1756000000000}}"#)
         .expect("write remote credential metadata");
     apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("publish SSH observation");
     let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id).await.expect("SSH Host");
+    // #3793: the owning daemon declares the configured cap and publishes the
+    // free slots it counts for each of the host's kinds.
+    assert_eq!(host.spec.max_vessels, Some(2));
     let status = host.status.expect("SSH status");
+    assert_eq!(status.fulfilment_facts.get("host-direct-ssh-test-host").and_then(|facts| facts.free_vessel_slots), Some(2));
     assert!(status.ready);
     assert!(status.credential_expiry().expect("SSH credential expiry").contains_key(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE));
     assert!(daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE).get("host-direct-ssh-test-host").await.is_ok());
@@ -360,6 +370,7 @@ async fn agentless_host_without_a_platform_cli_is_refused_at_placement() {
         env_bag: EnvironmentBag::new(),
         runner: Arc::new(DiscoveryMockRunner::builder().on_run("uname", &["-s", "-m"], Ok(uname.into())).build()),
         host_environment: Default::default(),
+        max_vessels: None,
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
     };
     let now = chrono::Utc::now();

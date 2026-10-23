@@ -333,6 +333,17 @@ supplies = [
     );
 }
 
+// #3793: an agentless host may declare how many vessels it holds.
+#[test]
+fn parse_agentless_host_vessel_cap() {
+    let config: HostsConfig = toml::from_str("[hosts.b1]\nhostname = \"b1.example\"\nagentless_ssh = true\nmax_vessels = 1\n")
+        .expect("hosts config with a vessel cap");
+    assert_eq!(config.hosts["b1"].max_vessels, Some(1));
+    let uncapped: HostsConfig =
+        toml::from_str("[hosts.b2]\nhostname = \"b2.example\"\nagentless_ssh = true\n").expect("hosts config without a vessel cap");
+    assert_eq!(uncapped.hosts["b2"].max_vessels, None);
+}
+
 #[test]
 fn hosts_without_supplies_parse_as_an_empty_list() {
     let config: HostsConfig =
