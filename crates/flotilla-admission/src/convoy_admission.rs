@@ -2067,18 +2067,15 @@ impl AdmissionReadContext<'_> {
     }
 
     /// Record a vessel this admission placed, so its later vessels count it.
+    /// Both sides key by the chosen kind's canonical `host_ref`, the field
+    /// the candidate loop reads, so they cannot drift apart.
     fn record_placed_vessel(&self, decision: &PlacementDecision) {
-        let capped = decision.allocation.as_ref().is_some_and(|allocation| {
-            allocation.candidates.iter().any(|candidate| candidate.kind == allocation.chosen_kind && candidate.max_vessels.is_some())
-        });
-        if capped {
-            *self
-                .placed_here
-                .lock()
-                .expect("admission placement count lock poisoned")
-                .entry(decision.target_host.reference.to_string())
-                .or_default() += 1;
-        }
+        let Some(chosen) = decision.allocation.as_ref().and_then(|allocation| {
+            allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind && candidate.max_vessels.is_some())
+        }) else {
+            return;
+        };
+        *self.placed_here.lock().expect("admission placement count lock poisoned").entry(chosen.host.clone()).or_default() += 1;
     }
 
     async fn vessel_occupancy(&self, namespace: &str, host: &str) -> Result<flotilla_resources::HostOccupancy, String> {
@@ -2671,7 +2668,7 @@ impl AdmissionReadContext<'_> {
             }
             // A convoy waits until all its vessels on a host fit, so one
             // that needs more vessels there than the cap could never start.
-            let placed_here = host.map_or(0, |host| self.placed_here(&host.metadata.name));
+            let placed_here = self.placed_here(&kind.spec.host_ref);
             let needed = workflow.vessels.len().max(1) as u32 + placed_here;
             if let Some(cap) = vessel_cap.filter(|cap| needed > *cap) {
                 rejected.push(refusal(format!("convoy needs {needed} vessels here, more than the host's cap of {cap}")));
@@ -2806,7 +2803,7 @@ impl AdmissionReadContext<'_> {
                             self.vessel_occupancy(namespace, &host.metadata.name)
                                 .await?
                                 .free_slots(cap)
-                                .saturating_sub(self.placed_here(&host.metadata.name)),
+                                .saturating_sub(self.placed_here(&kind.spec.host_ref)),
                         ),
                         _ => facts.and_then(|facts| facts.free_vessel_slots),
                     };

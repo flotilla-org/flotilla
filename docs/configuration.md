@@ -212,6 +212,11 @@ finishes teardown. `convoy explain` and `fulfilment list` show each capped
 host's free slots as `<free> of <cap>`. The cap counts vessels only: memory
 and CPU are not considered.
 
+The cap is read when a convoy is admitted. Lowering `max_vessels` later does
+not move convoys already admitted to the host: one that now needs more slots
+than the new cap stays in its capacity wait until it is abandoned or the cap
+is raised.
+
 The admission free-space floor below is checked against the SSH host's
 `~/dev/flotilla-repos` checkout volume using its remote `df` result.
 
