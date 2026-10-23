@@ -135,17 +135,19 @@ impl ConvoyReconciler {
         let vessels = home_copies_first(vessels.list().await?.items);
         // A convoy not yet bootstrapped names its vessels only in its frozen
         // workflow snapshot record.
-        let mut workflow_vessels = BTreeMap::new();
-        for convoy in convoys.iter().filter(|convoy| HostOccupancy::needs_workflow_vessels(convoy, host)) {
-            match self.templates.get(pinned_workflow_ref(convoy)).await {
-                Ok(template) => {
-                    workflow_vessels
-                        .insert(convoy.metadata.name.clone(), template.spec.vessels.iter().map(|vessel| vessel.name.clone()).collect());
-                }
-                Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => return Err(error),
-            }
-        }
+        let snapshots = convoys
+            .iter()
+            .filter(|convoy| HostOccupancy::needs_workflow_vessels(convoy, host))
+            .map(|convoy| (convoy.metadata.name.clone(), pinned_workflow_ref(convoy).to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let templates = if snapshots.is_empty() { Vec::new() } else { self.templates.list_names(snapshots.values().cloned()).await? };
+        let workflow_vessels = snapshots
+            .into_iter()
+            .filter_map(|(convoy, template)| {
+                let template = templates.iter().find(|candidate| candidate.metadata.name == template)?;
+                Some((convoy, template.spec.vessels.iter().map(|vessel| vessel.name.clone()).collect()))
+            })
+            .collect();
         Ok(Some(HostOccupancy::count(host, &convoys, &vessels, &workflow_vessels)))
     }
 

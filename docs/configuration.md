@@ -208,7 +208,9 @@ Among otherwise equal hosts, placement prefers the one with the most free
 slots; a host with none is chosen only when no host has room. A convoy admitted
 to a full host waits before provisioning, with "no free vessel slots" in
 `convoy explain`, and starts in admission order once a vessel on that host
-finishes teardown. `convoy explain` and `fulfilment list` show each capped
+finishes teardown. The order is strict: an older convoy waiting for two slots
+holds back a newer one-vessel convoy even while one slot is free, so a large
+convoy is never starved by smaller ones. `convoy explain` and `fulfilment list` show each capped
 host's free slots as `<free> of <cap>`. The cap counts vessels only: memory
 and CPU are not considered.
 
