@@ -16,7 +16,8 @@
 //! Per-event cost on the local home, one transaction each: a vessel's placement (the lease's
 //! grant and the vessel's create), its realise, a session's create and realise, and an Ensure's
 //! failed attempt. The placement ledger's rebuild from the stored live vessels, as a restart does
-//! it, is timed too.
+//! it, is timed too. The engine's write paths (layer 7) are timed through `decide`: a session's
+//! launches, an Ensure's patches, and a pinned vessel's lease granted, realised and lost (Q6).
 //!
 //! Per-query reads, on a read connection, each statement's VM steps and full-scan steps counted by
 //! SQLite: a convoy's vessels (`vessel.by_convoy`), a host's live vessels (`vessel.live_by_host`,
@@ -34,14 +35,20 @@ use std::{
 
 use flotilla_engine_store::{open_home, register_crew, StoreLog};
 use flotilla_provisioning::{
-    engine::{decide, launch, reads::ProvisioningReads, terminal_session::TerminalSessionBinding, LifecycleHome, Lifecycles},
+    engine::{
+        decide, launch,
+        reads::ProvisioningReads,
+        terminal_session::TerminalSessionBinding,
+        vessel::{PlacementLifecycles, VesselBinding},
+        LifecycleHome, Lifecycles,
+    },
     stored::{
         self,
         terminal_session::{Launch, TerminalSession, TerminalSessionKind, TerminalSessionRequest},
         Holder,
     },
 };
-use flotilla_resources::{ConvoyEnsureStatusPatch, StatusPatch, TerminalSessionStatusPatch};
+use flotilla_resources::{ConvoyEnsureStatusPatch, StatusPatch, TerminalSessionStatusPatch, VesselStatusPatch};
 use flotilla_schema::{Address, KindRegistry, Ref as StoredRef, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
@@ -49,7 +56,7 @@ use flotilla_state_machines::{
         convoy::{ConvoyId, Priority, VesselClass},
         ensure::{Attempted as EnsureAttempted, Create, Ensure, EnsureSpec, Fulfiller, MemoryEnsureWorld, Record},
         lifecycle::{MemoryLifecycleWorld, Observed, Realise},
-        vessel::Vessel,
+        vessel::{Vessel, VesselKind},
     },
     placement::{Dimension, Host, Placements, Request, VesselId},
     AttemptPolicy, Cause, CauseCategory, Home, Outcome, Ref,
@@ -96,7 +103,7 @@ const CORES: Dimension = Dimension(0);
 const MEMORY: Dimension = Dimension(1);
 
 fn hosts() -> Vec<(Host, BTreeMap<Dimension, u32>)> {
-    (0..HOSTS).map(|host| (Host(host), BTreeMap::from([(CORES, 4_096), (MEMORY, 65_536)]))).collect()
+    (0..HOSTS).map(|host| (Host::new(format!("host-{host}")), BTreeMap::from([(CORES, 4_096), (MEMORY, 65_536)]))).collect()
 }
 
 fn convoy(n: usize, home: &str) -> ConvoyId {
@@ -151,7 +158,7 @@ impl Crew {
         };
         self.placements.set_caps(convoy(n, home), [(VesselClass::new("crew"), 1)].into());
         self.placements.request(id.clone(), request).expect("request");
-        self.placements.place(&id, Host((n as u32) % HOSTS), Timestamp(at)).expect("placed");
+        self.placements.place(&id, Host::new(format!("host-{}", (n as u32) % HOSTS)), Timestamp(at)).expect("placed");
         self.placements
             .apply(&id, Realise { identity: id.0.clone(), observed: Ref::new(id.0.as_str()) }.into(), &realised(&id.0), Timestamp(at + 1))
             .expect("realised");
@@ -196,6 +203,55 @@ fn standing(role: usize) -> flotilla_resources::ResourceObject<flotilla_resource
             .build(),
         status: None,
     }
+}
+
+/// Local convoy `n`'s old Vessel, pinned to one of the hosts, before provisioning.
+fn old_vessel(n: usize) -> flotilla_resources::ResourceObject<flotilla_resources::Vessel> {
+    flotilla_resources::ResourceObject {
+        metadata: meta(&format!("pinned-{n}")),
+        spec: flotilla_resources::VesselSpec {
+            convoy_ref: format!("convoy-{n}"),
+            vessel_name: "implement".into(),
+            placement_policy_ref: "docker".into(),
+            adopted_checkout_refs: BTreeMap::new(),
+        },
+        status: None,
+    }
+}
+
+/// The old Vessel patches of a pinned vessel's life: provisioning on its host, ready, lost.
+fn pinned_life(n: usize) -> [VesselStatusPatch; 3] {
+    use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
+    let host = format!("host-{}", (n as u32) % HOSTS);
+    let decision = PlacementDecision::builder()
+        .policy_name("docker".into())
+        .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(host.clone()), display_name: host })
+        .build();
+    [
+        VesselStatusPatch::MarkProvisioning {
+            observed_policy_ref: "docker".into(),
+            observed_policy_version: "1".into(),
+            placement_decision: Some(decision),
+            started_at: chrono::DateTime::UNIX_EPOCH,
+            message: None,
+            image: None,
+        },
+        VesselStatusPatch::MarkReady {
+            configured_limits: None,
+            placement_decision: None,
+            environment_ref: Some(format!("env-{n}")),
+            image_ref: None,
+            local_image_id: None,
+            registry_digest: None,
+            checkout_refs: BTreeMap::new(),
+            terminal_session_refs: vec![],
+            requested_stance: Default::default(),
+            effective_stance: Default::default(),
+            ready_at: chrono::DateTime::UNIX_EPOCH,
+            image: None,
+        },
+        VesselStatusPatch::MarkLost { message: "environment disappeared".into() },
+    ]
 }
 
 fn meta(name: &str) -> flotilla_resources::ObjectMeta {
@@ -322,7 +378,7 @@ fn crew_load() {
     }
     let started = Instant::now();
     for (n, id) in locals.iter().zip(&ids) {
-        crew.placements.place(id, Host((*n as u32 + 1) % HOSTS), Timestamp(10)).expect("placed");
+        crew.placements.place(id, Host::new(format!("host-{}", (*n as u32 + 1) % HOSTS)), Timestamp(10)).expect("placed");
     }
     per_event("placement, one transaction", ids.len(), started, "the lease checked at the ledger; the vessel's row and log entry");
     let started = Instant::now();
@@ -438,6 +494,26 @@ fn crew_load() {
     }
     per_event("ensure patch decided", ROLES * 3, started, "its edges (record, create, attempt, bind or unbind), one transaction each");
 
+    // The Vessel write path (#3629 layer 7, Q6): each local convoy's pinned vessel granted as its
+    // provisioning starts, realised, then lost, through the engine. Its lease is freed, so the
+    // restart below holds only the seeded leases.
+    let pinned: Arc<dyn Lifecycles<VesselKind>> =
+        Arc::new(PlacementLifecycles::new("local", open_home::<Vessel>(StoreLog::new(local.clone())).expect("home")).expect("placements"));
+    let started = Instant::now();
+    for n in &locals {
+        let mut obj = old_vessel(*n);
+        for patch in pinned_life(*n) {
+            let decided = decide::<VesselBinding>(pinned.as_ref(), &obj, Some(patch), chrono::Utc::now()).patch.expect("taken");
+            decided.apply(obj.status.get_or_insert_with(Default::default));
+        }
+    }
+    per_event(
+        "pinned vessel provisioned, ready, lost",
+        locals.len() * 3,
+        started,
+        "the lease granted on its pinned host; realised; vanished, the lease freed",
+    );
+
     // A restart: the vessels' home and the ledger's leases rebuilt from the store.
     let started = Instant::now();
     let home = open_home::<Vessel>(StoreLog::new(local.clone())).expect("home");
@@ -459,8 +535,14 @@ fn crew_load() {
     assert!(by_convoy.rows >= 1.0, "each convoy has its vessel");
     assert_eq!(by_convoy.fullscan_steps, 0.0, "the lookup scans no table");
     report("a convoy's vessels", &by_convoy);
-    let host_keys: Vec<Vec<String>> = (0..HOSTS).map(|host| vec![host.to_string()]).collect();
-    let live = measure(&read, "SELECT v.id FROM vessel v WHERE v.host = ?1 AND v.state IN ('rq', 'rl')", &host_keys);
+    let host_keys: Vec<Vec<String>> = (0..HOSTS).map(|host| vec![format!("host-{host}")]).collect();
+    let live = measure(
+        &read,
+        "SELECT v.id FROM vessel v WHERE v.host = (SELECT id FROM strings WHERE domain = 'hs' AND s = ?1) \
+         AND v.state IN ('rq', 'rl')",
+        &host_keys,
+    );
+    assert!(live.rows >= 1.0, "each host leases live vessels");
     assert_eq!(live.fullscan_steps, 0.0);
     report("a host's live vessels", &live);
     let holder_keys: Vec<Vec<String>> = (0..convoys).step_by(7).map(|n| vec![format!("vessel:vessel-{n}")]).collect();

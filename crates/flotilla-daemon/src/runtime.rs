@@ -34,7 +34,7 @@ use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
 use flotilla_provisioning::engine::{
     checkout::CheckoutBinding, clone::CloneBinding, environment::EnvironmentBinding, image_build::ImageBuildBinding,
-    terminal_session::TerminalSessionBinding, Engine,
+    terminal_session::TerminalSessionBinding, vessel::VesselBinding, Engine,
 };
 use flotilla_provisioning::reconcilers::{
     CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver, RepositoryReconciler,
@@ -936,12 +936,16 @@ fn spawn_controller_loops(
                 let config_dir = config_dir.clone();
                 let local_host_ref = local_host_ref.clone();
                 let additional_host_refs = additional_host_refs.clone();
+                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.vessels));
                 (
                     VesselReconciler::secondary_watches(),
-                    VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
-                        .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None }))
-                        .with_federated_dependencies(&backend, CanonicalHostId::resolved(local_host_ref))
-                        .with_additional_host_refs(additional_host_refs),
+                    Engine::<_, VesselBinding>::new(
+                        VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
+                            .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None }))
+                            .with_federated_dependencies(&backend, CanonicalHostId::resolved(local_host_ref))
+                            .with_additional_host_refs(additional_host_refs),
+                        lifecycles,
+                    ),
                 )
             }
         }),
@@ -1155,7 +1159,7 @@ async fn open_provisioning_lifecycles(
     daemon: &Arc<InProcessDaemon>,
 ) -> Result<flotilla_provisioning::engine::ProvisioningLifecycles, String> {
     use flotilla_engine_store::{open_home, StoreLog};
-    use flotilla_provisioning::engine::{reads::StoreReads, LifecycleHome, ProvisioningLifecycles};
+    use flotilla_provisioning::engine::{reads::StoreReads, vessel::PlacementLifecycles, LifecycleHome, ProvisioningLifecycles};
     let store = daemon.decided_store()?.store();
     let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
     daemon.install_lifecycle_reads(Arc::new(EngineLifecycleReads { reads: StoreReads::new(Arc::clone(&store)), home }))?;
@@ -1172,6 +1176,7 @@ async fn open_provisioning_lifecycles(
             clones: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             checkouts: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             terminal_sessions: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            vessels: Arc::new(PlacementLifecycles::new(&home, open_home(log())?)?),
         })
     })
     .await

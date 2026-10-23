@@ -846,3 +846,157 @@ fn the_latest_launch_is_found_and_an_old_name_may_hold_a_hash() {
     assert_eq!(next_launch("odd#5#13"), "odd#5#14");
     assert_eq!(launched("odd#5#13"), "odd#5");
 }
+
+fn vessel_object() -> ResourceObject<flotilla_resources::Vessel> {
+    use flotilla_resources::VesselSpec;
+    ResourceObject {
+        metadata: meta("convoy-a-implement"),
+        spec: VesselSpec {
+            convoy_ref: "convoy-a".into(),
+            vessel_name: "implement".into(),
+            placement_policy_ref: "docker".into(),
+            adopted_checkout_refs: BTreeMap::new(),
+        },
+        status: None,
+    }
+}
+
+fn provisioning(host: Option<&str>) -> flotilla_resources::VesselStatusPatch {
+    use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
+    flotilla_resources::VesselStatusPatch::MarkProvisioning {
+        observed_policy_ref: "docker".into(),
+        observed_policy_version: "1".into(),
+        placement_decision: host.map(|host| {
+            PlacementDecision::builder()
+                .policy_name("docker".into())
+                .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.into() })
+                .build()
+        }),
+        started_at: DateTime::UNIX_EPOCH,
+        message: None,
+        image: None,
+    }
+}
+
+fn vessel_ready(environment: &str) -> flotilla_resources::VesselStatusPatch {
+    flotilla_resources::VesselStatusPatch::MarkReady {
+        configured_limits: None,
+        placement_decision: None,
+        environment_ref: Some(environment.into()),
+        image_ref: None,
+        local_image_id: None,
+        registry_digest: None,
+        checkout_refs: BTreeMap::new(),
+        terminal_session_refs: vec![],
+        requested_stance: Default::default(),
+        effective_stance: Default::default(),
+        ready_at: DateTime::UNIX_EPOCH,
+        image: None,
+    }
+}
+
+fn placements(
+) -> Arc<super::vessel::PlacementLifecycles<flotilla_state_machines::MemoryLog<flotilla_state_machines::machines::vessel::Vessel>>> {
+    Arc::new(super::vessel::PlacementLifecycles::new(HOME, Home::new(HOME).expect("declaration")).expect("placements"))
+}
+
+// Behaviour (#3629 Q6, layer 7): a vessel's lease is the host pinned at admission, granted as its
+// provisioning starts with no capacity, class or priority judged. Its first readiness realises it
+// under its environment; interrupted and ready again, the lease holds; lost, it ends Gone and the
+// ledger frees the lease.
+#[tokio::test]
+async fn a_vessel_lease_is_granted_on_its_pinned_host_and_ends_gone() {
+    use flotilla_resources::VesselStatusPatch;
+    use flotilla_state_machines::placement::{Host, VesselId};
+
+    use super::vessel::{VesselBinding, PINNED_CLASS};
+    let home = placements();
+    let interrupted = VesselStatusPatch::MarkInterrupted { roles: ["coder".to_owned()].into(), message: "coder lost".into() };
+    let lost = VesselStatusPatch::MarkLost { message: "environment disappeared".into() };
+    let engine = Engine::<_, VesselBinding>::new(
+        Scripted::<flotilla_resources::Vessel>::new([
+            Some(provisioning(Some("feta"))),
+            Some(vessel_ready("env-a")),
+            Some(interrupted.clone()),
+            Some(vessel_ready("env-a")),
+            Some(lost.clone()),
+        ]),
+        Some(home.clone()),
+    );
+    let name = "convoy-a-implement";
+    let state = || home.get(name).map(|vessel| vessel.state().clone());
+    let mut obj = vessel_object();
+
+    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(provisioning(Some("feta"))));
+    let lease = home.get(name).expect("granted").spec().lease();
+    assert_eq!(lease.host, Host::new("feta"));
+    assert_eq!(lease.request.class.0, PINNED_CLASS);
+    assert!(lease.request.shape.is_empty(), "no capacity judged");
+    assert_eq!(lease.request.convoy, flotilla_schema::Ref::new("convoy-a", HOME));
+    assert_eq!(state(), Some(LifecycleState::requested()));
+
+    reconcile(&engine, &mut obj).await;
+    assert_eq!(state(), Some(LifecycleState::Realised { identity: "env-a".into() }));
+    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(interrupted), "interrupted: the lease holds");
+    assert!(reconcile(&engine, &mut obj).await.patch.is_some(), "ready again: written, no edge");
+    assert_eq!(state(), Some(LifecycleState::Realised { identity: "env-a".into() }));
+
+    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(lost));
+    assert_eq!(state(), Some(LifecycleState::Gone));
+    home.with_placements(|placements| assert!(placements.ledger().vessel(&VesselId::new(name)).is_none(), "the lease is freed"));
+}
+
+// Behaviour (#3629 Q3, Q6): a vessel that fails before it is ready returns its lease and ends Gone;
+// one with no pinned host yet is no engine request, and the old path keeps it.
+#[tokio::test]
+async fn a_vessel_failing_before_ready_returns_its_lease_and_an_unpinned_one_stays_old() {
+    use flotilla_resources::VesselStatusPatch;
+
+    use super::vessel::VesselBinding;
+    let home = placements();
+    let failed = VesselStatusPatch::MarkFailed { message: "placement policy docker not found".into() };
+    let engine = Engine::<_, VesselBinding>::new(
+        Scripted::<flotilla_resources::Vessel>::new([Some(provisioning(Some("feta"))), Some(failed.clone())]),
+        Some(home.clone()),
+    );
+    let mut obj = vessel_object();
+    reconcile(&engine, &mut obj).await;
+    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(failed));
+    assert_eq!(home.get("convoy-a-implement").map(|vessel| vessel.state().clone()), Some(LifecycleState::Gone));
+
+    let unpinned =
+        Engine::<_, VesselBinding>::new(Scripted::<flotilla_resources::Vessel>::new([Some(provisioning(None))]), Some(home.clone()));
+    let mut obj = vessel_object();
+    obj.metadata.name = "convoy-b-implement".into();
+    assert_eq!(reconcile(&unpinned, &mut obj).await.patch, Some(provisioning(None)));
+    assert!(home.get("convoy-b-implement").is_none());
+}
+
+// Behaviour (#3629 Q6): a restart rebuilds the ledger's leases from the live vessels, each on its
+// pinned host, and an ended vessel holds none.
+#[test]
+fn a_restart_puts_each_live_lease_back_on_its_pinned_host() {
+    use flotilla_state_machines::placement::{Host, VesselId};
+
+    use super::{
+        at,
+        vessel::{PlacementLifecycles, VesselBinding},
+    };
+    let home = placements();
+    let mut pinned = vessel_object();
+    provisioning(Some("feta")).apply(pinned.status.get_or_insert_with(Default::default));
+    home.request("live", VesselBinding::request(&pinned, HOME).expect("request"), at(DateTime::UNIX_EPOCH)).expect("granted");
+    home.request("ended", VesselBinding::request(&pinned, HOME).expect("request"), at(DateTime::UNIX_EPOCH)).expect("granted");
+    home.step("ended", &Step::Released, at(DateTime::UNIX_EPOCH)).expect("released");
+    let mut restarted = Home::new(HOME).expect("declaration");
+    home.with_placements(|placements| {
+        for vessel in placements.home().resources() {
+            restarted.restore(vessel.clone()).expect("restore");
+        }
+    });
+    let restored = PlacementLifecycles::new(HOME, restarted).expect("placements");
+    restored.with_placements(|placements| {
+        let leased: Vec<_> = placements.ledger().leases().map(|(id, lease)| (id.clone(), lease.host.clone())).collect();
+        assert_eq!(leased, [(VesselId::new("live"), Host::new("feta"))]);
+    });
+}

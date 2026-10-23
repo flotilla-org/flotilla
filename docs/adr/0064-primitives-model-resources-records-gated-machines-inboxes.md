@@ -185,6 +185,7 @@ ADR 0064 §"Roles, inboxes and delivery" records that addresses never carry a ho
 - **Admission grants a capacity budget.** The workflow template proposes a budget, and admission may grant less.
 - **Growth within the budget goes straight to placement.** The convoy asks placement for vessels directly. Placement is decided by the capacity pool's authoritative daemon, because the ledger is its own (2026-10-20 grill). For an agentless SSH host this is its owning daemon; for a provider account it is the daemon that holds the account's credential. Filling a role from inside a vessel, such as a subagent, uses no budget.
 - **Growth beyond the budget is a new request** to admission, in effect a readmission.
+- **A vessel's lease is its pinned host for now** (owner, 2026-10-23, #3629 Q6)**:** until a capacity model is ruled, a vessel's lease is the host pinned at admission, recorded as granted; the engine judges no capacity.
 - **Warm vessels** are a host-owned placement policy, at low priority: a host keeps N warm vessels per image. Placement may hand one to a convoy as an ownership change. Its lifecycle stays Realised, and it counts against the host while idle and against the convoy's budget from handover. Pools may later prepare more, such as a build directory seeded from a recent cache. *(This bullet predates the 2026-10-20 capacity pools and is not yet pool-aware; which pool a warm vessel counts against is for the capacity grill under #3303.)*
 
 ### Storage, replication, views

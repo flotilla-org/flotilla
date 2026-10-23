@@ -37,6 +37,7 @@ pub mod reads;
 pub mod terminal_session;
 #[cfg(test)]
 mod tests;
+pub mod vessel;
 
 use std::sync::{Arc, Mutex};
 
@@ -66,6 +67,8 @@ pub struct ProvisioningLifecycles {
     pub checkouts: Arc<dyn Lifecycles<CheckoutKind>>,
     /// TerminalSession, each launch a resource (layer 7).
     pub terminal_sessions: Arc<dyn Lifecycles<TerminalSessionKind>>,
+    /// Vessel, its lease placed on its pinned host (layer 7, Q6).
+    pub vessels: Arc<dyn Lifecycles<flotilla_state_machines::machines::vessel::VesselKind>>,
 }
 
 /// One thing a reconciler observed about a resource's realisation, with the evidence the
@@ -231,6 +234,13 @@ pub trait Binding: Send + Sync + 'static {
     /// Whether `obj`'s old status is still in its initial phase, so the engine may take it on.
     fn initial(obj: &ResourceObject<Self::Old>) -> bool;
 
+    /// Whether `patch` asks for the engine resource though it reports no step: a vessel's lease
+    /// is granted as its provisioning starts (#3629 Q6). Otherwise a resource is requested with
+    /// its first step.
+    fn requests(_obj: &ResourceObject<Self::Old>, _patch: &Patch<Self::Old>) -> bool {
+        false
+    }
+
     /// The lifecycle steps `patch` reports, in order.
     fn steps(obj: &ResourceObject<Self::Old>, patch: &Patch<Self::Old>) -> Vec<Step>;
 
@@ -314,6 +324,7 @@ pub fn decide<B: Binding>(
 ) -> Decision<B::Old> {
     let kind = <B::Kind as LifecycleKind>::NAME;
     let steps = patch.as_ref().map(|patch| B::steps(obj, patch)).unwrap_or_default();
+    let requesting = !steps.is_empty() || patch.as_ref().is_some_and(|patch| B::requests(obj, patch));
     let (mut current, held) = current::<B>(lifecycles, obj);
     // A kind with launches restarted in place: the ended launch stays ended, and this is the next.
     let held = match held {
@@ -326,7 +337,7 @@ pub fn decide<B: Binding>(
     let name = &current;
     let mut resource = match held {
         Some(resource) => resource,
-        None if !steps.is_empty() && B::initial(obj) => match B::request(obj, lifecycles.home()) {
+        None if requesting && B::initial(obj) => match B::request(&patched(obj, patch.as_ref()), lifecycles.home()) {
             Ok(request) => match lifecycles.request(name, request, at(now)) {
                 Ok(resource) => resource,
                 Err(error) => {
@@ -358,19 +369,22 @@ pub fn decide<B: Binding>(
     }
     let ended = ended(&resource);
     // The old patch is written when, written, it says what the engine holds; otherwise the copy.
-    let agrees = accepted
-        && patch.as_ref().is_some_and(|patch| {
-            let mut status = obj.status.clone().unwrap_or_default();
-            patch.apply(&mut status);
-            let patched = ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status: Some(status) };
-            B::copy(&patched, &resource).is_none()
-        });
+    let agrees = accepted && patch.is_some() && B::copy(&patched(obj, patch.as_ref()), &resource).is_none();
     if agrees {
         Decision { patch, ended }
     } else {
         // A patch with no step (an observation) still passes when the copy cannot say more.
         Decision { patch: B::copy(obj, &resource).or(if steps.is_empty() { patch } else { None }), ended }
     }
+}
+
+/// `obj` as `patch` leaves its status.
+fn patched<T: flotilla_resources::Resource<Status: Default>>(obj: &ResourceObject<T>, patch: Option<&Patch<T>>) -> ResourceObject<T> {
+    let mut status = obj.status.clone();
+    if let Some(patch) = patch {
+        patch.apply(status.get_or_insert_with(Default::default));
+    }
+    ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status }
 }
 
 /// The engine's answer to an old writer's patch.
