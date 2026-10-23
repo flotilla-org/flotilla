@@ -227,6 +227,13 @@ impl DockerControllerRuntime {
                 }
             }
         }
+        // Reject parent traversal rather than guessing how a guest's symlinks
+        // resolve it. Path component comparisons already ignore redundant `.`.
+        for mount in &spec.mounts {
+            if Path::new(&mount.target_path).components().any(|part| part == std::path::Component::ParentDir) {
+                return Err(format!("mount target {} must not contain parent traversal", mount.target_path));
+            }
+        }
         for tool in &tools {
             for asset in &tool.assets {
                 let reserved_path = match asset.kind {

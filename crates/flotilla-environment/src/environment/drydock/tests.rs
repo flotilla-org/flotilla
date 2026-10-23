@@ -133,10 +133,15 @@ async fn fixture_prepared(host: &HostFixture, provider: &DrydockEnvironmentProvi
 async fn reference_readiness_tracks_credential_delivery() {
     let host = HostFixture::start().await;
     let provider = host.provider();
+    assert!(provider.capabilities().material_modes.is_empty(), "unknown declarations cannot claim Shared");
     assert!(matches!(provider.detect_readiness().await, ProviderReadiness::MissingCredential { .. }));
     assert!(provider.prepare(&spec(), &Default::default()).await.is_err());
     host.ready().await;
     assert_eq!(provider.detect_readiness().await, ProviderReadiness::Ready);
+    let declared = provider.declaration.read().unwrap().clone().expect("readiness loaded the real hello");
+    assert_eq!(provider.capabilities().material_modes, capabilities(&declared.capabilities).material_modes);
+    assert!(provider.capabilities().material_modes.contains(&MaterialMode::Pushed));
+    assert!(!provider.capabilities().material_modes.contains(&MaterialMode::Shared));
     assert_eq!(provider.capabilities().egress_enforcement, EgressEnforcement::Advisory);
     assert_eq!(provider.capabilities().checkout_strategies, vec![CheckoutStrategy::CloneInVessel]);
 }

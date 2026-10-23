@@ -30,6 +30,19 @@ use flotilla_provider_runtime::CommandRunner;
 /// Docker translates shares to the native cgroup weight when using cgroup v2.
 pub const CREW_CPU_SHARES: usize = 1024;
 
+// Absolute system utility selection, shared with the process-boundary test.
+#[cfg(any(unix, test))]
+const ROOT_UTILITY_SELECTION: &str = concat!(
+    "PATH=/usr/sbin:/usr/bin:/sbin:/bin;\n",
+    "export PATH;\n",
+    "mkdir=/bin/mkdir;\n",
+    "[ -x \"$mkdir\" ] || mkdir=/usr/bin/mkdir;\n",
+    "chown=/bin/chown;\n",
+    "[ -x \"$chown\" ] || chown=/usr/bin/chown;\n",
+    "chmod=/bin/chmod;\n",
+    "[ -x \"$chmod\" ] || chmod=/usr/bin/chmod;\n",
+);
+
 /// The `PATH` Docker gives a container whose image does not set one.
 #[cfg(any(unix, test))]
 const DOCKER_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -1265,6 +1278,15 @@ impl DockerEnvironmentProviderInner {
         // PATH excludes legacy crew-owned /usr/local directories during repair.
         // Select utilities only from absolute system paths, supporting split-/usr
         // images as well as /bin utilities and merged-/usr images.
+        let root_script = format!(
+            "{ROOT_UTILITY_SELECTION}{}",
+            concat!(
+                "\"$mkdir\" -p /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin /opt/flotilla/crew-bin /run/flotilla && ",
+                "\"$chown\" 0:0 /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && ",
+                "\"$chmod\" go-w /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && ",
+                "\"$chown\" -R \"$1\" /opt/drydock /opt/flotilla /run/flotilla",
+            )
+        );
         let root_path = format!("PATH={DOCKER_DEFAULT_PATH}");
         let user = host_user();
         runner
@@ -1283,7 +1305,7 @@ impl DockerEnvironmentProviderInner {
                     container,
                     "/bin/sh",
                     "-c",
-                    "PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH; mkdir=/bin/mkdir; [ -x \"$mkdir\" ] || mkdir=/usr/bin/mkdir; chown=/bin/chown; [ -x \"$chown\" ] || chown=/usr/bin/chown; chmod=/bin/chmod; [ -x \"$chmod\" ] || chmod=/usr/bin/chmod; \"$mkdir\" -p /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin /opt/flotilla/crew-bin /run/flotilla && \"$chown\" 0:0 /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && \"$chmod\" go-w /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && \"$chown\" -R \"$1\" /opt/drydock /opt/flotilla /run/flotilla",
+                    &root_script,
                     "flotilla-agent-owner",
                     &user,
                 ],
@@ -1505,11 +1527,13 @@ mod agent_contract_tests {
             async fn run(&self, _: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
                 if args.get(1) == Some(&"--user") {
                     self.0.store(true, Ordering::SeqCst);
-                    assert_eq!(args[4], format!("PATH={DOCKER_DEFAULT_PATH}"));
-                    assert_eq!(args[6], "LD_LIBRARY_PATH=");
-                    assert_eq!(args[8], "LD_PRELOAD=");
-                    assert_eq!(args[10], "/bin/sh");
-                    let script = args[12];
+                    for value in [format!("PATH={DOCKER_DEFAULT_PATH}"), "LD_LIBRARY_PATH=".into(), "LD_PRELOAD=".into()] {
+                        assert!(args.windows(2).any(|pair| pair == ["--env", value.as_str()]));
+                    }
+                    let shell = args.iter().position(|arg| *arg == "/bin/sh").expect("absolute root shell");
+                    assert_eq!(args[shell + 1], "-c");
+                    let script = args[shell + 2];
+                    assert!(script.starts_with(ROOT_UTILITY_SELECTION));
                     assert!(!script.contains("chown \"$1\" /usr/local/bin"));
                     assert!(script.contains("/opt/flotilla/crew-bin"));
                     // Execute only the unprivileged selection prologue against fake
@@ -1529,14 +1553,11 @@ mod agent_contract_tests {
                                 }
                             }
                         }
-                        let prologue = script
-                            .split("; \"$mkdir\" -p")
-                            .next()
-                            .unwrap()
+                        let prologue = ROOT_UTILITY_SELECTION
                             .replace("/usr/bin/", &format!("{}/fallback/", root.path().display()))
                             .replace("/bin/", &format!("{}/primary/", root.path().display()));
                         let output = std::process::Command::new("/bin/sh")
-                            .args(["-c", &format!("{prologue}; printf '%s\\n' \"$mkdir\" \"$chown\" \"$chmod\"; test -x \"$mkdir\"")])
+                            .args(["-c", &format!("{prologue}printf '%s\\n' \"$mkdir\" \"$chown\" \"$chmod\"; test -x \"$mkdir\"")])
                             .output()
                             .unwrap();
                         assert_eq!(output.status.success(), primary || fallback);

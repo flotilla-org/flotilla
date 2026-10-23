@@ -51,6 +51,7 @@ impl Drop for Forwarder {
 }
 impl Connection {
     pub async fn open(api: &dyn ProviderApi, instance: &str, id: &str, identity_file: PathBuf) -> Result<Self, String> {
+        // TODO(#3773): choose the build from the vessel platform instead of the host.
         let executable = tokio::fs::read(::drydock::local::agent_build(&wire::Platform::current())?).await.map_err(error)?;
         let sessions = Arc::new(tokio::sync::Mutex::new(None));
         let saved = sessions.clone();
@@ -76,6 +77,7 @@ impl Connection {
                 *saved.lock().await = Some(session.clone());
                 drydock_transport::Transport::native(Arc::new(Connections { session, listener }), Default::default())
             },
+            // TODO(#3773): choose the build from the vessel platform instead of the host.
             &wire::Platform::current(),
             &executable,
             Duration::from_secs(60),
@@ -203,6 +205,7 @@ impl Connector for SshConnector {
     async fn connect(&self, api: &dyn ProviderApi, instance: &str, backing: &str, key: PathBuf) -> Result<Arc<dyn Guest>, String> {
         // Fail immediately for a missing companion, rather than obscuring an
         // installation error as guest boot latency.
+        // TODO(#3773): choose the build from the vessel platform instead of the host.
         let executable = ::drydock::local::agent_build(&wire::Platform::current())?;
         tokio::fs::metadata(executable).await.map_err(|e| format!("drydock-agent companion unavailable: {e}"))?;
         let last_error = std::sync::Mutex::new(String::new());

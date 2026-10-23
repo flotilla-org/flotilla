@@ -741,7 +741,7 @@ pub(super) async fn redeliver_codex_credentials(state: &ControllerRuntimeState, 
             .environment_manager()
             .provisioned_mounts(&flotilla_protocol::EnvironmentId::new(environment.metadata.name.as_str()))
             .unwrap_or_else(|| {
-                tracing::debug!(environment = %environment.metadata.name,
+                tracing::warn!(environment = %environment.metadata.name,
                     "provisioned environment mounts unavailable; falling back to pushed Codex credential delivery");
                 Vec::new()
             });

@@ -663,7 +663,13 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
 
     // Explicit mounts must not replace, contain, or hide managed agent material.
     // Exhaust the exact target, an ancestor, and a descendant at the provider seam.
-    for target in [CONTAINER_CODEX_HOME.to_string(), "/tmp".to_string(), format!("{CONTAINER_CODEX_HOME}/auth.json")] {
+    for target in [
+        CONTAINER_CODEX_HOME.to_string(),
+        "/tmp".to_string(),
+        format!("{CONTAINER_CODEX_HOME}/auth.json"),
+        format!("{CONTAINER_CODEX_HOME}/."),
+        format!("/tmp/../{CONTAINER_CODEX_HOME}"),
+    ] {
         let mut conflicting = spec.clone();
         conflicting.mounts.push(flotilla_resources::EnvironmentMount {
             source_path: home.display().to_string(),
@@ -674,7 +680,12 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
             .provision_docker("contained-conflicting-mount", &conflicting)
             .await
             .expect_err("managed material is reserved");
-        assert_eq!(error, format!("mount target {target} overlaps reserved agent material at {CONTAINER_CODEX_HOME}"));
+        let expected = if target.contains("/../") {
+            format!("mount target {target} must not contain parent traversal")
+        } else {
+            format!("mount target {} overlaps reserved agent material at {CONTAINER_CODEX_HOME}", Path::new(&target).display())
+        };
+        assert_eq!(error, expected);
         assert!(provider.create_opts.lock().await.is_none(), "conflicts must fail before provider provisioning");
     }
 
