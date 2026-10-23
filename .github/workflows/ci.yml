@@ -294,8 +294,15 @@ jobs:
     timeout-minutes: 40
     needs: [fmt, stack-scope]
     if: ${{ !cancelled() && needs.fmt.result == 'success' && needs.stack-scope.outputs.full != 'false' }}
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
+      # A pull request checks out its merge commit, whose first parent is the
+      # base branch it merges into: depth 2 is enough to diff against it.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
       - name: Set up pinned Rust
         id: rust-pin
         uses: ./ci/toolchain/action
@@ -311,7 +318,45 @@ jobs:
           add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: "test"
-      - run: cargo --config 'profile.dev.package."*".debug=0' test --workspace --locked
+      # The action verifies the release checksum.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.149
+      - name: Test affected-package selector
+        run: python3 -m unittest discover -s ci/affected -p test_select.py
+      - name: Select test packages
+        id: packages
+        env:
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          STACK: ${{ toJSON(github.event.pull_request.stack) }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          selection=all
+          # Non-PR events, malformed stack data and label lookup failures all
+          # keep full coverage. A stack's top layer covers the whole stack.
+          affected=false
+          if [ "$EVENT" = pull_request ] && git rev-parse --verify --quiet HEAD^1 >/dev/null; then
+            if [ "$STACK" = null ]; then
+              affected=true
+            elif jq -e '.position != null and .size != null and .position < .size' <<<"$STACK" >/dev/null; then
+              affected=true
+            fi
+            if ! labels=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name') \
+              || printf '%s\n' "$labels" | grep -qx 'ci:full'; then
+              affected=false
+            fi
+          fi
+          if [ "$affected" = true ]; then
+            git -c core.quotePath=false diff --no-renames --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed-files"
+            selection=$(python3 ci/affected/select.py "$RUNNER_TEMP/changed-files")
+          fi
+          echo "Selected: $selection"
+          echo "selection=$selection" >> "$GITHUB_OUTPUT"
+      - name: Compile, run tests and run doctests (separate timings)
+        env:
+          SELECTION: ${{ steps.packages.outputs.selection }}
+        run: ci/affected/run.sh "$SELECTION"
 
   changes:
     name: Platform changes
