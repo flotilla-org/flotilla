@@ -795,7 +795,7 @@ fn every_old_phase_imports_and_rehearses() {
 }
 
 // Behaviour (layer 9): the rehearsal lists what has no mapping, each record named: an observed
-// checkout, a Realised record with no identity, and Vessels, whose lease waits on Q6.
+// checkout, and a Realised record with no identity.
 #[test]
 fn the_rehearsal_lists_records_with_no_mapping() {
     use flotilla_resources::{EnvironmentPhase, EnvironmentStatus, ObservedCheckoutSpec};
@@ -820,9 +820,8 @@ fn the_rehearsal_lists_records_with_no_mapping() {
     let mut nameless = environment_object(true);
     nameless.status = Some(EnvironmentStatus { phase: EnvironmentPhase::Ready, ..Default::default() });
     report.record(&import::<EnvironmentBinding>(&nameless, HOME));
-    report.unmapped("Vessel", ["convoy-a-implement".to_owned()], "the vessel lease waits on the capacity ruling (#3629 Q6)");
     let listed: Vec<(&str, &str)> = report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str())).collect();
-    assert_eq!(listed, [("Checkout", "observed-a"), ("Environment", "env-a"), ("Vessel", "convoy-a-implement")]);
+    assert_eq!(listed, [("Checkout", "observed-a"), ("Environment", "env-a")]);
     assert!(report.refused[0].reason.contains("observed checkout"));
     assert!(report.refused[1].reason.contains("no container or root"));
 }
@@ -999,6 +998,82 @@ fn a_restart_puts_each_live_lease_back_on_its_pinned_host() {
         let leased: Vec<_> = placements.ledger().leases().map(|(id, lease)| (id.clone(), lease.host.clone())).collect();
         assert_eq!(leased, [(VesselId::new("live"), Host::new("feta"))]);
     });
+}
+
+// Behaviour (#3629 layer 9, Q6): each old vessel phase imports as its lease on its pinned host, and
+// the rehearsal restores each: provisioning is Requested, ready and interrupted are Realised under
+// the environment, and lost and failed are Gone (a vessel never gives up). A vessel never placed
+// is noted, not stored and not refused.
+#[test]
+fn every_vessel_phase_imports_as_its_lease() {
+    use flotilla_resources::{VesselPhase, VesselStatus};
+    use flotilla_state_machines::placement::Host;
+
+    use super::{
+        import::{import, label, rehearse_vessels, ImportReport},
+        vessel::VesselBinding,
+    };
+    let placed = |phase| {
+        let mut vessel = vessel_object();
+        provisioning(Some("feta")).apply(vessel.status.get_or_insert_with(Default::default));
+        let status = vessel.status.as_mut().expect("status");
+        status.phase = phase;
+        status.environment_ref = Some("env-a".into());
+        vessel
+    };
+    for (phase, expected) in [
+        (VesselPhase::Pending, "requested"),
+        (VesselPhase::Provisioning, "requested"),
+        (VesselPhase::Ready, "realised"),
+        (VesselPhase::Interrupted, "realised"),
+        (VesselPhase::Lost, "gone"),
+        (VesselPhase::Failed, "gone"),
+    ] {
+        let imported = import::<VesselBinding>(&placed(phase), HOME).expect("imported");
+        assert_eq!(label(imported.resource.state()), expected, "{phase:?}");
+        assert_eq!(imported.resource.spec().host, Host::new("feta"));
+    }
+    let mut nameless = placed(VesselPhase::Ready);
+    nameless.status.as_mut().expect("status").environment_ref = None;
+    let refused = import::<VesselBinding>(&nameless, HOME).err().expect("a ready vessel runs in an environment");
+    assert!(refused.reason.contains("no environment"), "{refused}");
+    let mut unplaced = vessel_object();
+    unplaced.metadata.name = "convoy-b-implement".into();
+    unplaced.status = Some(VesselStatus { phase: VesselPhase::Pending, ..Default::default() });
+    let mut odd = vessel_object();
+    odd.metadata.name = "convoy-c-implement".into();
+    odd.status = Some(VesselStatus { phase: VesselPhase::Ready, ..Default::default() });
+    // Each stored state round-trips through the rehearsal's store (#3772 review).
+    let mut records: Vec<_> = [
+        (VesselPhase::Provisioning, "convoy-p"),
+        (VesselPhase::Ready, "convoy-r"),
+        (VesselPhase::Lost, "convoy-l"),
+        (VesselPhase::Pending, "convoy-q"),
+    ]
+    .into_iter()
+    .map(|(phase, name)| {
+        let mut vessel = placed(phase);
+        vessel.metadata.name = format!("{name}-implement");
+        (vessel, HOME.to_owned())
+    })
+    .collect();
+    records.extend([(unplaced, HOME.to_owned()), (odd, HOME.to_owned())]);
+    let mut report = ImportReport::default();
+    rehearse_vessels(&records, &mut report);
+    assert_eq!(report.imported.get(&("Vessel", "requested")), Some(&2), "{report:?}");
+    for label in ["realised", "gone"] {
+        assert_eq!(report.imported.get(&("Vessel", label)), Some(&1), "{label}: {report:?}");
+    }
+    assert!(
+        report.notes.iter().any(|note| note.contains("`convoy-q-implement` is Pending with a recorded placement")),
+        "a placed Pending vessel is named: {:?}",
+        report.notes
+    );
+    assert!(report.notes.iter().any(|note| note.contains("`convoy-b-implement` is not placed yet")), "{:?}", report.notes);
+    let refused: Vec<_> = report.refused.iter().map(|refusal| (refusal.record.as_str(), refusal.reason.as_str())).collect();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].0, "convoy-c-implement", "an unplaced Ready vessel has no lease to import");
+    assert!(refused[0].1.starts_with("Ready with no recorded placement"), "{refused:?}");
 }
 
 // Behaviour (#3770 review): an old patch the engine does not take is not written, so the old

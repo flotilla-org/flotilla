@@ -1,9 +1,9 @@
 //! The lifecycle kinds' import rehearsal (#3629 layer 9): before a roll, every old Environment,
-//! ImageBuild, Clone, Checkout, TerminalSession and ConvoyEnsure the daemon holds is mapped onto
+//! ImageBuild, Clone, Checkout, TerminalSession, Vessel and ConvoyEnsure the daemon holds is mapped onto
 //! the engine, restored into a temporary store, read back, and reported as counts by kind and
-//! stored state with each unmapped record named. Vessels are listed as unmapped until their lease
-//! is ruled (#3629 Q6). The rehearsal reports; it does not fail validation while the switch is off
-//! in the live fleet.
+//! stored state with each unmapped record named. A placed Vessel is a lease granted on its pinned
+//! host (#3629 Q6); one never placed is noted, not stored. The rehearsal reports; it does not fail
+//! validation while the switch is off in the live fleet.
 
 use std::collections::BTreeMap;
 
@@ -13,7 +13,7 @@ use flotilla_provisioning::engine::{
     clone::CloneBinding,
     environment::EnvironmentBinding,
     image_build::ImageBuildBinding,
-    import::{rehearse_records, ImportRefusal, ImportReport},
+    import::{rehearse_records, rehearse_vessels, ImportRefusal, ImportReport},
     terminal_session::TerminalSessionBinding,
 };
 use flotilla_resources::{Convoy, ConvoyEnsure, K8sResourceObject, Resource, ResourceObject};
@@ -70,11 +70,8 @@ impl Documents {
         rehearse_records::<CheckoutBinding>(&records, &mut report);
         let records = self.decoded("terminalsessions", "TerminalSession", &mut report);
         rehearse_records::<TerminalSessionBinding>(&records, &mut report);
-        report.unmapped(
-            "Vessel",
-            self.0.get("vessels").into_iter().flatten().map(name),
-            "the vessel lease waits on the capacity ruling (#3629 Q6)",
-        );
+        let records = self.decoded("vessels", "Vessel", &mut report);
+        rehearse_vessels(&records, &mut report);
         // Ensures: each derived from its live convoy.
         // Each convoy's liveness, and whether it has a status yet: one with none is a fresh convoy,
         // read as live, and an Ensure bound to it is noted.
@@ -150,8 +147,9 @@ mod tests {
 
     // Behaviour (#3629 layer 9): the rehearsal maps the daemon's lifecycle records into a
     // temporary store, counts them by kind and stored state, and names each record it cannot map:
-    // here an observed checkout, a record that does not decode, and every vessel. An Ensure whose
-    // convoy is not listed imports unfulfilled, with a note.
+    // here an observed checkout and a record that does not decode. A placed vessel imports as its
+    // lease (#3629 Q6), and one not placed yet is noted. An Ensure whose convoy is not listed imports
+    // unfulfilled, with a note.
     #[test]
     fn rehearsal_counts_lifecycle_imports_and_names_the_unmapped() {
         let mut documents = Documents::default();
@@ -175,12 +173,24 @@ mod tests {
         );
         documents.0.insert(
             "vessels".into(),
-            vec![document(
-                "Vessel",
-                "convoy-a-implement",
-                serde_json::json!({"convoy_ref": "convoy-a", "vessel_name": "implement", "placement_policy_ref": "p"}),
-                Value::Null,
-            )],
+            vec![
+                document(
+                    "Vessel",
+                    "convoy-a-implement",
+                    serde_json::json!({"convoy_ref": "convoy-a", "vessel_name": "implement", "placement_policy_ref": "p"}),
+                    Value::Null,
+                ),
+                document(
+                    "Vessel",
+                    "convoy-b-implement",
+                    serde_json::json!({"convoy_ref": "convoy-b", "vessel_name": "implement", "placement_policy_ref": "p"}),
+                    serde_json::json!({
+                        "phase": "Ready",
+                        "environment_ref": "env-b",
+                        "placement_decision": {"policy_name": "p", "target_host": {"ref": "feta", "display_name": "feta"}},
+                    }),
+                ),
+            ],
         );
         documents.0.insert(
             "convoyensures".into(),
@@ -204,7 +214,9 @@ mod tests {
         let report = documents.rehearse();
         assert_eq!(report.imported.get(&("Clone", "realised")), Some(&1), "{report:?}");
         let unmapped: Vec<_> = report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str())).collect();
-        assert!(unmapped.contains(&("Vessel", "convoy-a-implement")), "{unmapped:?}");
+        assert_eq!(report.imported.get(&("Vessel", "realised")), Some(&1), "a placed vessel is its lease: {report:?}");
+        assert!(!unmapped.iter().any(|(kind, _)| *kind == "Vessel"), "{unmapped:?}");
+        assert!(report.notes.iter().any(|note| note.contains("`convoy-a-implement` is not placed yet")), "{:?}", report.notes);
         assert!(unmapped.contains(&("Checkout", "observed-a")), "{unmapped:?}");
         assert!(unmapped.contains(&("Clone", "broken-a")), "an undecodable record is named: {unmapped:?}");
         assert!(report.notes.iter().any(|note| note.contains("`governor-9`, which is not listed")), "{:?}", report.notes);
