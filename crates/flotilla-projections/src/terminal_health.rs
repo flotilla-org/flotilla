@@ -18,7 +18,9 @@ pub fn condition(status: &TerminalSessionStatus) -> Option<ExplainedTerminalCond
             .degraded
             .as_ref()
             .map(|condition| {
-                if condition.is_delivery() {
+                if condition.is_controller_fence_unverifiable() {
+                    ExplainedTerminalCondition::ControllerFenceUnverifiable { message: condition.message.clone() }
+                } else if condition.is_delivery() {
                     ExplainedTerminalCondition::DeliveryUnconfirmed { message: condition.message.clone() }
                 } else {
                     ExplainedTerminalCondition::ProviderUnavailable { message: condition.message.clone() }
@@ -86,5 +88,33 @@ mod tests {
         }
         .apply(&mut status);
         assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::DeliveryUnconfirmed { .. })));
+    }
+
+    // A known-unsent permanent fence has its own condition and actionable crew
+    // attention. Ordinary observations and expiry cannot turn it into a receipt.
+    #[test]
+    fn unverifiable_fence_explains_agent_restart_and_survives_observations() {
+        let now = chrono::Utc::now();
+        let mut status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
+        TerminalSessionStatusPatch::MarkControllerFenceUnverifiable {
+            message_id: "turn".into(),
+            message: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into(),
+            observed_at: now,
+        }
+        .apply(&mut status);
+        TerminalSessionStatusPatch::ClearReconcileDegraded.apply(&mut status);
+        TerminalSessionStatusPatch::MarkDeliveryExpired.apply(&mut status);
+        let explained = condition(&status).expect("condition");
+        assert!(matches!(explained, ExplainedTerminalCondition::ControllerFenceUnverifiable { .. }));
+        assert!(explained.to_string().contains("exit the agent"));
+        assert!(explained.to_string().contains("flotilla convoy resume"));
+        assert!(!explained.to_string().contains("unconfirmed"));
+        assert_eq!(
+            flotilla_resources::crew_attention(Some(&status), now),
+            Some(flotilla_protocol::CrewAttention::ControllerFenceUnverifiable)
+        );
+        assert!(status.delivered_message_id.is_none());
+        TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
+        assert!(condition(&status).is_none(), "a new activation clears the fence failure");
     }
 }

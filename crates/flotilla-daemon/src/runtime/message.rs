@@ -378,6 +378,9 @@ pub(super) fn message_transport_outcome(result: Result<TerminalDeliveryOutcome, 
         Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)) => {
             Outcome::Unconfirmed { reason: "cleat submission has no acceptance evidence yet".into() }
         }
+        Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable)) => {
+            Outcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() }
+        }
         Err(reason) => Outcome::Unconfirmed { reason },
     }
 }

@@ -69,6 +69,11 @@ pub enum TransportOutcome {
     NotSubmitted {
         reason: String,
     },
+    /// Definitely unsent, but retrying cannot recover this session. Surface
+    /// the named failure to the operator without fallback or a receipt.
+    ControllerFenceUnverifiable {
+        reason: String,
+    },
     /// Possibly submitted: never repeat it through another transport unless
     /// configuration accepts a repeat for the operation.
     Unconfirmed {

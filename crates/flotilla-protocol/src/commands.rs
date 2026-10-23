@@ -318,6 +318,7 @@ pub enum ExplainedTerminalCondition {
     ProcessExited { exit_code: Option<i32> },
     ProcessFailed { message: String },
     DeliveryUnconfirmed { message: String },
+    ControllerFenceUnverifiable { message: String },
 }
 
 impl std::fmt::Display for ExplainedTerminalCondition {
@@ -335,6 +336,7 @@ impl std::fmt::Display for ExplainedTerminalCondition {
                 f.write_str("; resume relaunches it in the existing checkout")
             }
             Self::ProcessFailed { message } => write!(f, "crew process failed: {message}"),
+            Self::ControllerFenceUnverifiable { message } => f.write_str(message),
             Self::DeliveryUnconfirmed { message } => write!(f, "terminal message delivery unconfirmed: {message}"),
         }
     }

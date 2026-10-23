@@ -1,0 +1,5 @@
+{
+  "stdout": "",
+  "stderr": "controller-active: controller input is not idle (controller.cause=quiet-time)\n",
+  "exit_code": 1
+}

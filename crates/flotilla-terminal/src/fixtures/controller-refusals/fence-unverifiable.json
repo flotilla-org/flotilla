@@ -1,0 +1,5 @@
+{
+  "stdout": "",
+  "stderr": "controller-active: controller input has not yet produced a verifiable PTY echo (controller.cause=fence-unverifiable)\n",
+  "exit_code": 1
+}

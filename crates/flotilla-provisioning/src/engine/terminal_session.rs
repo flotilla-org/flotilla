@@ -87,6 +87,7 @@ impl Binding for TerminalSessionBinding {
             | TerminalSessionStatusPatch::MarkMessageDelivered { .. }
             | TerminalSessionStatusPatch::MarkDeliveryExpired
             | TerminalSessionStatusPatch::MarkDeliveryNotSubmitted { .. }
+            | TerminalSessionStatusPatch::MarkControllerFenceUnverifiable { .. }
             | TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { .. }
             | TerminalSessionStatusPatch::MarkReconcileDegraded { .. }
             | TerminalSessionStatusPatch::ClearReconcileDegraded

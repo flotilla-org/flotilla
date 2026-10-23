@@ -234,8 +234,9 @@ pub use terminal_session::{
     CrewMessageDelivery, CrewMessageSender, CrewSessionStatus, InnerCommandStatus, ScreenObstruction, TerminalAttention,
     TerminalAttentionSource, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalOccupancy,
     TerminalSession, TerminalSessionAttachTarget, TerminalSessionDegradedCondition, TerminalSessionIdentity, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TERMINAL_DELIVERY_EXPIRED_REASON,
-    TERMINAL_DELIVERY_NOT_SUBMITTED_REASON, TERMINAL_DELIVERY_UNCONFIRMED_REASON,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE,
+    CONTROLLER_FENCE_UNVERIFIABLE_REASON, TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON,
+    TERMINAL_DELIVERY_UNCONFIRMED_REASON,
 };
 pub use usage::{Usage, UsagePace, UsageProviderCost, UsageSpec, UsageStatus, UsageStatusPatch, UsageWindow};
 pub use vessel::{

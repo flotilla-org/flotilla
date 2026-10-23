@@ -1,0 +1,1 @@
+cleat 0.1.0 (89cf40cb19c4, release, opt 3, x86_64-unknown-linux-gnu, protocol 15, vt ghostty)

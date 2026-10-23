@@ -276,12 +276,15 @@ pub(super) async fn submit_and_confirm(
     clear_before_delivery: bool,
 ) -> Result<TerminalDeliveryOutcome, String> {
     let submission = if clear_before_delivery {
-        pool.retry_delivery(session_id, message).await.map(|()| TerminalSubmission::Submitted)
+        pool.guarded_retry_delivery(session_id, message).await
     } else {
         pool.guarded_deliver(session_id, message).await
     };
     match submission {
         Ok(TerminalSubmission::Submitted) => {}
+        Ok(TerminalSubmission::ControllerFenceUnverifiable) => {
+            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable));
+        }
         Ok(TerminalSubmission::Refused(reason)) => {
             debug!(%session_id, %reason, "cleat refused atomic submission; keeping delivery queued");
             // Keep the in-flight batch at the FIFO head. A refusal consumes
