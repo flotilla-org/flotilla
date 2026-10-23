@@ -15,22 +15,28 @@ def source_dependencies(metadata):
     and manifest-relative runtime reads. Resolve against both source and package
     directories. False positives only add coverage; missing/deleted target files
     still map by directory. Shared repository files already select all.
-    This is a relative-literal audit, not Rust expression evaluation: paths
-    assembled from a workspace root and non-../ fragments are not discovered.
-    New computed cross-package reads need an explicit dependency or fallback.
+    Also recognise literal crates/... paths relative to the workspace root,
+    including workspace_root().join("crates/other/fixtures"). This is a literal
+    audit, not Rust expression evaluation: paths assembled from multiple
+    nonliteral fragments still need an explicit dependency or fallback.
     """
     root = Path(metadata["workspace_root"]).resolve()
     members = set(metadata["workspace_members"])
     directories = {Path(p["manifest_path"]).parent.resolve(): p["id"]
                    for p in metadata["packages"] if p["id"] in members}
+    # Selection falls back to all for external members; do not traverse trees
+    # outside the checkout while computing source edges for that fallback.
+    if any(not directory.is_relative_to(root) for directory in directories):
+        return set()
     edges = set()
     for directory, reader in directories.items():
         # The root package's source lives in src/; walking the workspace again
         # would incorrectly attribute all crates' reads to the root package.
         scan = directory / "src" if directory == root else directory
         for source in scan.rglob("*.rs"):
-            for literal in re.findall(r'"((?:\.\./)[^"\n]*)"', source.read_text()):
-                for base in (source.parent, directory):
+            for literal in re.findall(r'"((?:\.\./|crates/)[^"\n]*)"', source.read_text()):
+                bases = (root,) if literal.startswith("crates/") else (source.parent, directory)
+                for base in bases:
                     target = (base / literal).resolve()
                     owners = [(path, owner) for path, owner in directories.items()
                               if target.is_relative_to(path)]
@@ -50,8 +56,12 @@ def select(metadata, changed, extra_dependencies=()):
     root = Path(metadata["workspace_root"])
     members = set(metadata["workspace_members"])
     packages = {p["id"]: p for p in metadata["packages"] if p["id"] in members}
-    directories = sorted(((Path(p["manifest_path"]).parent.relative_to(root).as_posix(), key)
-                          for key, p in packages.items()), key=lambda item: len(item[0]), reverse=True)
+    try:
+        directories = sorted(((Path(p["manifest_path"]).parent.relative_to(root).as_posix(), key)
+                              for key, p in packages.items()), key=lambda item: len(item[0]), reverse=True)
+    except ValueError:
+        # Repository-relative diffs cannot establish ownership outside root.
+        return "all"
     reverse = {key: set() for key in members}
     # Resolved IDs handle renamed dependencies. Include every kind and target,
     # including dev/build dependencies and optional features via --all-features.

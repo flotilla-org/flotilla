@@ -3,6 +3,22 @@
 For the post-r591 provider and label cleanup, see the
 [compatibility retirement acceptance checks](compatibility-retirement-acceptance.md).
 
+## Rust tests
+
+Install the CI-pinned nextest version locally:
+
+```bash
+cargo install cargo-nextest --version 0.9.149 --locked
+```
+
+[Prebuilt nextest binaries](https://nexte.st/docs/installation/pre-built-binaries/)
+avoid compiling the runner. Run affected packages locally with
+`cargo nextest run -p <package> --locked` and, for packages with a library,
+`cargo test --doc -p <package> --locked`. Nextest does not run doctests.
+`ci/affected/run.sh 'all'` runs the full workspace with separate compile, test
+and doctest timings; CI uses that full selection on main and stack top layers,
+and when `ci:full` is set.
+
 ## Git boundary check
 
 Install `uv` and Python 3.9+ on your desk or CI runner; the crew image already

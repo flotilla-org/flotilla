@@ -45,6 +45,14 @@ class SelectionContract(unittest.TestCase):
                 self.assertEqual(select(graph({}), [file]), "all")
         self.assertEqual(select(graph({}), []), "all")
 
+    def test_external_workspace_members_fail_safe(self):
+        # An external workspace member cannot be mapped from repository-relative
+        # changed files. Fall back to all rather than crashing or omitting it.
+        metadata = graph({})
+        metadata["packages"][1]["manifest_path"] = "/outside/leaf/Cargo.toml"
+        self.assertEqual(select(metadata, ["src/main.rs"]), "all")
+        self.assertEqual(module.source_dependencies(metadata), set())
+
     def test_union_is_sorted_unique_and_independent_of_input_order(self):
         # Multiple owners form a deterministic union; repeated paths do not
         # duplicate arguments. A root source belongs only to the root package.
@@ -68,7 +76,8 @@ class SelectionContract(unittest.TestCase):
             for expression in ('#[path = "../../leaf/src/lib.rs"] mod helper;',
                                'include_str!("../../leaf/fixture.json");',
                                'include_bytes!(concat!("../../leaf/fixtures/", name));',
-                               'Path::new(env!("CARGO_MANIFEST_DIR")).join("../leaf/fixture.json");'):
+                               'Path::new(env!("CARGO_MANIFEST_DIR")).join("../leaf/fixture.json");',
+                               'workspace_root().join("crates/leaf/fixtures/data.json");'):
                 (source / "lib.rs").write_text(expression)
                 edges = module.source_dependencies(metadata)
                 self.assertIn(("leaf", "middle"), edges)
