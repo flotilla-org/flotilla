@@ -141,10 +141,13 @@ impl ConvoyReconciler {
             .map(|convoy| (convoy.metadata.name.clone(), pinned_workflow_ref(convoy).to_string()))
             .collect::<BTreeMap<_, _>>();
         let templates = if snapshots.is_empty() { Vec::new() } else { self.templates.list_names(snapshots.values().cloned()).await? };
+        let templates = templates.into_iter().map(|template| (template.metadata.name.clone(), template)).collect::<BTreeMap<_, _>>();
         let workflow_vessels = snapshots
             .into_iter()
+            // A convoy whose snapshot record is missing is left out, and `count`
+            // falls back to its pins and convoy-wide decision.
             .filter_map(|(convoy, template)| {
-                let template = templates.iter().find(|candidate| candidate.metadata.name == template)?;
+                let template = templates.get(template.as_str())?;
                 Some((convoy, template.spec.vessels.iter().map(|vessel| vessel.name.clone()).collect()))
             })
             .collect();

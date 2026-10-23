@@ -328,10 +328,13 @@ pub async fn host_occupancies(
         .list_names(snapshots.values().cloned())
         .await
         .map_err(|error| error.to_string())?;
+    let templates = templates.into_iter().map(|template| (template.metadata.name.clone(), template)).collect::<BTreeMap<_, _>>();
     let workflow_vessels = snapshots
         .into_iter()
+        // A convoy whose snapshot record is missing is left out, and `count`
+        // falls back to its pins and convoy-wide decision.
         .filter_map(|(convoy, template)| {
-            let template = templates.iter().find(|candidate| candidate.metadata.name == template)?;
+            let template = templates.get(template.as_str())?;
             Some((convoy, template.spec.vessels.iter().map(|vessel| vessel.name.clone()).collect()))
         })
         .collect();
