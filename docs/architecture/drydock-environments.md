@@ -32,7 +32,7 @@ Preparation uses `drydock::launch::build_tools_digest()` from the published
 Drydock pin `87e639cf`. The reference suite takes this production digest path.
 
 The base crew image must contain the required agent harnesses, Git, `tar`, `sh`,
-and support the module's SSH recipe. Opt-in lab forwarding also requires
+`awk`, and GNU coreutils (`du`, `df`, `stat`, `mktemp`), and support the module's SSH recipe. Opt-in lab forwarding also requires
 `socat`. Configure lab reach in host-local `drydock.toml`:
 
 ```toml
