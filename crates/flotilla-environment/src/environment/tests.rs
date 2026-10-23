@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, ImageSource};
 
 use super::{
-    contained_daemon_socket_path, docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner, CreateOpts, EnvironmentProvider,
-    EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate,
-    ImagePullPolicy, ProvisionedMount, ProvisionedMountMode,
+    contained_daemon_socket_path, contract_tests::LocalImageTags, docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner,
+    CreateOpts, EnvironmentProvider, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind,
+    EnvironmentVariableUpdate, ImagePullPolicy, ProvisionedMount, ProvisionedMountMode,
 };
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
@@ -58,6 +58,8 @@ struct RecordingRunner {
     result: Result<String, String>,
     image_environment: Mutex<VecDeque<Result<String, String>>>,
     memory_info: Option<Result<String, String>>,
+    tags: LocalImageTags,
+    dockerfiles: Mutex<Vec<String>>,
 }
 
 impl RecordingRunner {
@@ -67,11 +69,20 @@ impl RecordingRunner {
             result: Ok(output.to_string()),
             image_environment: Mutex::new(VecDeque::new()),
             memory_info: None,
+            tags: Default::default(),
+            dockerfiles: Mutex::new(vec![]),
         }
     }
 
     fn new_err(msg: &str) -> Self {
-        Self { calls: Mutex::new(vec![]), result: Err(msg.to_string()), image_environment: Mutex::new(VecDeque::new()), memory_info: None }
+        Self {
+            calls: Mutex::new(vec![]),
+            result: Err(msg.to_string()),
+            image_environment: Mutex::new(VecDeque::new()),
+            memory_info: None,
+            tags: Default::default(),
+            dockerfiles: Mutex::new(vec![]),
+        }
     }
 
     /// Answers the next `docker image inspect --format '{{json .Config.Env}}'`
@@ -109,6 +120,9 @@ impl CommandRunner for RecordingRunner {
                 .unwrap_or_else(|| Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into()));
         }
         self.calls.lock().expect("calls mutex").push((cmd.to_string(), args.iter().map(|a| a.to_string()).collect(), cwd.to_path_buf()));
+        if let ("docker", ["tag", id, tag]) = (cmd, args) {
+            return self.tags.tag(id, tag);
+        }
         if cmd == "docker" && args.starts_with(&["inspect", "--format", "{{.Image}}"]) {
             return Ok("sha256:test-image-digest\n".to_string());
         }
@@ -125,10 +139,12 @@ impl CommandRunner for RecordingRunner {
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         assert_eq!(cmd, "docker");
         assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
-        assert!(std::str::from_utf8(input).unwrap().contains("COPY --from=tools /opt/drydock /opt/drydock"));
+        let dockerfile = std::str::from_utf8(input).unwrap();
+        assert!(dockerfile.contains("COPY --from=tools /opt/drydock /opt/drydock"));
+        self.dockerfiles.lock().unwrap().push(dockerfile.into());
         self.calls.lock().unwrap().push((cmd.into(), args.iter().map(|s| s.to_string()).collect(), cwd.into()));
-        let base = std::str::from_utf8(input).unwrap().lines().nth(1).unwrap().strip_prefix("FROM ").unwrap();
-        Ok(if base.starts_with("sha256:") { base.to_string() } else { format!("sha256:{}", "a".repeat(64)) })
+        // The derived image keeps the base's identity in this double.
+        Ok(self.tags.resolve_build(dockerfile)?.unwrap_or_else(|| format!("sha256:{}", "a".repeat(64))))
     }
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         match self.run(cmd, args, cwd, label).await {
@@ -209,11 +225,12 @@ async fn exists_returns_false_on_failure() {
 struct QueuedRunner {
     calls: Mutex<Vec<(String, Vec<String>, PathBuf)>>,
     responses: Mutex<VecDeque<Result<String, String>>>,
+    tags: LocalImageTags,
 }
 
 impl QueuedRunner {
     fn new(responses: impl IntoIterator<Item = Result<String, String>>) -> Self {
-        Self { calls: Mutex::new(vec![]), responses: Mutex::new(responses.into_iter().collect()) }
+        Self { calls: Mutex::new(vec![]), responses: Mutex::new(responses.into_iter().collect()), tags: Default::default() }
     }
 
     fn calls(&self) -> Vec<(String, Vec<String>, PathBuf)> {
@@ -246,6 +263,9 @@ impl CommandRunner for QueuedRunner {
             return Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into());
         }
         self.calls.lock().expect("calls mutex").push((cmd.to_string(), args.iter().map(|a| a.to_string()).collect(), cwd.to_path_buf()));
+        if let ("docker", ["tag", id, tag]) = (cmd, args) {
+            return self.tags.tag(id, tag);
+        }
         let mut queue = self.responses.lock().expect("responses mutex");
         queue.pop_front().unwrap_or(Err("no more responses".into()))
     }
@@ -253,10 +273,11 @@ impl CommandRunner for QueuedRunner {
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         assert_eq!(cmd, "docker");
         assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
-        assert!(std::str::from_utf8(input).unwrap().contains("COPY --from=tools /opt/drydock /opt/drydock"));
+        let dockerfile = std::str::from_utf8(input).unwrap();
+        assert!(dockerfile.contains("COPY --from=tools /opt/drydock /opt/drydock"));
         self.calls.lock().unwrap().push((cmd.into(), args.iter().map(|s| s.to_string()).collect(), cwd.into()));
-        let base = std::str::from_utf8(input).unwrap().lines().nth(1).unwrap().strip_prefix("FROM ").unwrap();
-        Ok(if base.starts_with("sha256:") { base.to_string() } else { format!("sha256:{}", "a".repeat(64)) })
+        // The derived image keeps the base's identity in this double.
+        Ok(self.tags.resolve_build(dockerfile)?.unwrap_or_else(|| format!("sha256:{}", "a".repeat(64))))
     }
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         match self.run(cmd, args, cwd, label).await {
@@ -310,9 +331,44 @@ async fn preparation_adds_only_drydock_tools_to_existing_digest() {
         let selected = if present { runner } else { missing };
         let provider = super::contract_tests::docker_provider(selected.clone());
         assert_eq!(provider.prepare(&pinned_spec(), &Default::default()).await.is_ok(), present);
-        assert_eq!(selected.calls().len(), if present { 2 } else { 1 });
+        assert_eq!(selected.calls().len(), if present { 3 } else { 1 });
         assert_eq!(selected.calls()[0].1[0..2], ["image", "inspect"]);
     }
+}
+
+// #3756 on feta: BuildKit resolves `FROM sha256:<id>` as Docker Hub's `sha256`
+// repository. The double refuses that, so a bare local ID must be tagged first.
+#[tokio::test]
+#[cfg(unix)]
+async fn derived_build_names_a_bare_local_id_before_building_from_it() {
+    let id = format!("sha256:{}", "a".repeat(64));
+    let tag = format!("flotilla-agent-base:{}", "a".repeat(64));
+    let runner = Arc::new(RecordingRunner::new_ok("present"));
+    let provider = super::contract_tests::docker_provider(runner.clone());
+    provider.prepare(&pinned_spec(), &Default::default()).await.expect("prepare local digest");
+    let calls: Vec<_> = runner.calls().into_iter().map(|(_, args, _)| args).collect();
+    assert_eq!(calls[1], ["tag", id.as_str(), tag.as_str()]);
+    assert_eq!(calls[2], ["build", "--quiet", "--network=none", "-"]);
+    let dockerfiles = runner.dockerfiles.lock().unwrap().clone();
+    assert_eq!(dockerfiles.len(), 1);
+    assert!(dockerfiles[0].ends_with(&format!("\nFROM {tag}\nCOPY --from=tools /opt/drydock /opt/drydock\n")));
+}
+
+// A registry digest reference already resolves in BuildKit; it is built from
+// exactly as admitted, and no local tag is created for it.
+#[tokio::test]
+#[cfg(unix)]
+async fn derived_build_uses_a_registry_digest_reference_unchanged() {
+    let reference = format!("registry.example/crew@sha256:{}", "a".repeat(64));
+    let mut spec = pinned_spec();
+    spec.docker.as_mut().expect("docker").image = reference.clone();
+    let runner = Arc::new(RecordingRunner::new_ok("present"));
+    let provider = super::contract_tests::docker_provider(runner.clone());
+    provider.prepare(&spec, &Default::default()).await.expect("prepare registry digest");
+    assert!(runner.calls().iter().all(|(_, args, _)| args.first().is_none_or(|arg| arg != "tag")));
+    let dockerfiles = runner.dockerfiles.lock().unwrap().clone();
+    assert_eq!(dockerfiles.len(), 1);
+    assert!(dockerfiles[0].ends_with(&format!("\nFROM {reference}\nCOPY --from=tools /opt/drydock /opt/drydock\n")));
 }
 
 // Host adoption returns the injected runner and never starts or stops the host.

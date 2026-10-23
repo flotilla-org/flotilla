@@ -14,12 +14,48 @@ use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+// Docker's local image names as the CLI boundary sees them: `docker tag`
+// records a name, and a derived build resolves each FROM line as BuildKit does.
+#[derive(Default)]
+pub(super) struct LocalImageTags(Mutex<BTreeMap<String, String>>);
+impl LocalImageTags {
+    pub(super) fn tag(&self, id: &str, tag: &str) -> Result<String, String> {
+        assert!(flotilla_resources::is_image_digest(id), "only local image IDs are tagged: {id}");
+        self.0.lock().unwrap().insert(tag.into(), id.into());
+        Ok(String::new())
+    }
+
+    // BuildKit reads `FROM sha256:<hex>` as Docker Hub's `sha256` repository,
+    // and an unknown tag also falls through to a registry pull. Registry
+    // digest references resolve as written. Returns the local image ID the
+    // final stage starts from, when it names a tagged local image.
+    pub(super) fn resolve_build(&self, dockerfile: &str) -> Result<Option<String>, String> {
+        let mut base = None;
+        for image in dockerfile.lines().filter_map(|line| line.strip_prefix("FROM ")?.split_whitespace().next()) {
+            if image.contains('@') {
+                base = None;
+                continue;
+            }
+            if let Some(id) = self.0.lock().unwrap().get(image).filter(|_| !image.starts_with("sha256:")) {
+                base = Some(id.clone());
+                continue;
+            }
+            let name = if image.contains('/') { image.to_string() } else { format!("docker.io/library/{image}") };
+            return Err(format!(
+                "failed to resolve source metadata for {name}: pull access denied, repository does not exist or may require authorization"
+            ));
+        }
+        Ok(base)
+    }
+}
+
 // Process-boundary fake: a small Docker engine with persistent inventory. It
 // refuses unexpected commands rather than returning success for arbitrary input.
 #[derive(Default)]
 struct DockerEngine {
     inventory: Mutex<BTreeMap<String, String>>,
     unavailable: AtomicBool,
+    tags: LocalImageTags,
 }
 #[async_trait]
 impl CommandRunner for DockerEngine {
@@ -34,6 +70,7 @@ impl CommandRunner for DockerEngine {
         let mut inventory = self.inventory.lock().unwrap();
         match args {
             ["image", "inspect", ..] => Ok("[]".into()),
+            ["tag", id, tag] => self.tags.tag(id, tag),
             ["exec", "--user", "0", ..]
             | ["exec", _, "/opt/drydock/drydock-agent", "--supervise", "--socket", "/run/drydock/agent.sock"] => Ok(String::new()),
             ["inspect", "--format", "{{json .Config.Env}}", _] => Ok(r#"["HOME=/tmp","PATH=/usr/bin:/bin"]"#.into()),
@@ -72,7 +109,9 @@ impl CommandRunner for DockerEngine {
     async fn run_with_input(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         assert_eq!(cmd, "docker");
         assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
-        assert!(std::str::from_utf8(input).unwrap().contains("COPY --from=tools /opt/drydock /opt/drydock"));
+        let dockerfile = std::str::from_utf8(input).unwrap();
+        assert!(dockerfile.contains("COPY --from=tools /opt/drydock /opt/drydock"));
+        self.tags.resolve_build(dockerfile)?;
         Ok(DIGEST.into())
     }
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {

@@ -877,7 +877,7 @@ async fn provisioned_environment_discovers_and_registers_interior_agent_adapters
 // authored literal tags refuse.
 #[tokio::test]
 async fn fresh_contained_admission_resolves_legacy_literal_and_refuses_literal_tag() {
-    use flotilla_environment::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider, PrepareOpts};
+    use flotilla_environment::environment::{EnvironmentProvider, PrepareOpts};
     use flotilla_resources::{CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource};
 
     // Exhaust a baseline source and an authored literal. Timing/interleavings
@@ -1050,7 +1050,7 @@ async fn fresh_contained_admission_resolves_legacy_literal_and_refuses_literal_t
         ));
         let runtime = DockerControllerRuntime { state };
         let legacy_baseline = runtime.legacy_baseline_for_environment(&environment.metadata.name).await.expect("provenance");
-        let provider = DockerEnvironmentProvider::new(Arc::new(HeldBaselineRunner { image: "crew:baseline".into() }));
+        let provider = held_baseline_docker_provider("crew:baseline");
         let result = provider.prepare(&environment.spec, &PrepareOpts { legacy_baseline, ..Default::default() }).await;
         if baseline {
             assert!(result.is_ok(), "baseline prepare: {:?}", result.err());
@@ -1084,7 +1084,7 @@ async fn fresh_contained_admission_resolves_legacy_literal_and_refuses_literal_t
 // policy admits them. A literal policy or an unowned tag is never admitted.
 #[tokio::test]
 async fn legacy_baseline_admission_recovers_old_records_and_preserves_frozen_provenance() {
-    use flotilla_environment::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider, PrepareOpts};
+    use flotilla_environment::environment::{EnvironmentProvider, PrepareOpts};
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
     fs::create_dir_all(&config_base).expect("config directory");
@@ -1152,9 +1152,7 @@ async fn legacy_baseline_admission_recovers_old_records_and_preserves_frozen_pro
     ));
     let runtime = DockerControllerRuntime { state };
     assert!(runtime.legacy_baseline_for_environment("live-environment").await.expect("baseline provenance"));
-    let provider = DockerEnvironmentProvider::new(Arc::new(HeldBaselineRunner {
-        image: environment.spec.docker.as_ref().expect("docker").image.clone(),
-    }));
+    let provider = held_baseline_docker_provider(environment.spec.docker.as_ref().expect("docker").image.clone());
     provider
         .prepare(
             &environment.spec,
