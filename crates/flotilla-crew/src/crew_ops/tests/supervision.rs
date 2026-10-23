@@ -1300,3 +1300,22 @@ async fn operator_brief_survives_a_racing_nudge_until_delivery() {
     assert_eq!(records.len(), 4);
     assert!(records.iter().any(|message| message.spec.body.contains("New guidance")));
 }
+
+// Behaviour (#3587 layer 7): a send's awaiting-reply record is a stall when it supervises a
+// stalled crew, else the kind its expectation names; a send expecting nothing records nothing.
+#[test]
+fn awaiting_records_take_the_stall_or_the_expectations_kind() {
+    use flotilla_resources::MessageExpectation;
+    let outcome = MessageExpectation::Outcome {
+        condition: flotilla_protocol::Leaf {
+            address: flotilla_protocol::LeafAddress::Work { convoy: "c".into(), work: "work".into() },
+            field_path: ".crew.coder.phase".into(),
+            operator: flotilla_protocol::LeafOperator::Equal,
+            literal: "Done".into(),
+        },
+    };
+    assert_eq!(super::super::awaiting_kind(&MessageExpectation::None, Some("p/c/work/coder")), None);
+    assert_eq!(super::super::awaiting_kind(&MessageExpectation::Reply, Some("p/c/work/coder")), Some("stall"));
+    assert_eq!(super::super::awaiting_kind(&MessageExpectation::Reply, None), Some("reply"));
+    assert_eq!(super::super::awaiting_kind(&outcome, None), Some("outcome"));
+}

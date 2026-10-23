@@ -224,6 +224,33 @@ impl flotilla_crew::leaf_engine::ResourceIntentPublisher for RemoteCommandRouter
             value => Err(format!("unexpected resource intent admission result: {value:?}")),
         }
     }
+    async fn publish_admitted(
+        self: Arc<Self>,
+        namespace: &str,
+        document: serde_json::Value,
+    ) -> Result<(flotilla_protocol::ResourceRef, Option<String>), String> {
+        let router = RemoteCommandRouter { inner: self };
+        let command = Command::builder().action(CommandAction::ResourceApply { namespace: namespace.to_string(), document }).build();
+        match router.dispatch_and_wait(command, uuid::Uuid::nil()).await? {
+            CommandValue::ResourceObject(object) => {
+                let name = object
+                    .value
+                    .pointer("/metadata/name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("resource admission response has no name")?;
+                let home = object
+                    .value
+                    .pointer("/metadata/annotations")
+                    .and_then(|annotations| annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let api_version = object.value.get("apiVersion").and_then(serde_json::Value::as_str).unwrap_or("flotilla.work/v1");
+                Ok((flotilla_protocol::ResourceRef::new(api_version, &object.kind, &object.namespace, name), home))
+            }
+            CommandValue::Error { message } => Err(message),
+            value => Err(format!("unexpected resource intent admission result: {value:?}")),
+        }
+    }
     async fn patch_status(
         self: Arc<Self>,
         namespace: &str,

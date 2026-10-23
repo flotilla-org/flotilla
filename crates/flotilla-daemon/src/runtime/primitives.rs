@@ -117,6 +117,12 @@ impl MessageDelivery {
         if report != SweepReport::default() {
             debug!(namespace = %self.namespace, ?report, "engine message sweep");
         }
+        // The senders' records past their deadlines with no reply present (#3587 layer 7).
+        let awaiting = Arc::clone(self.primitives.awaiting());
+        let expired = tokio::task::spawn_blocking(move || awaiting.expire_due(now)).await.map_err(|error| error.to_string())??;
+        if !expired.is_empty() {
+            debug!(namespace = %self.namespace, ?expired, "awaiting-reply records expired");
+        }
         Ok(())
     }
 
@@ -278,7 +284,7 @@ impl MessageDelivery {
         let Some((successor, older)) = held_turns_superseded(due, &views) else { return Ok(()) };
         for message in older {
             tracing::info!(%message, %successor, "operator turn supersedes a held system turn");
-            self.primitives.supersede(message, successor).await;
+            self.primitives.supersede(message, successor, true).await;
             self.held.release(message);
         }
         Ok(())

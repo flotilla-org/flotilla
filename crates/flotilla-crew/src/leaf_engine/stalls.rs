@@ -205,6 +205,36 @@ pub(super) fn is_active_change_request_probe(
 }
 
 impl ReconcilerWake {
+    /// Withdraws this home's open stall records about `convoy`'s seats that
+    /// its stored stall status, `stalled`, does not show stalled (#3730
+    /// review): wherever the old status is cleared or leaves a seat, the
+    /// engine's record of that stall ends too. A newer stall about the same
+    /// seat replaces the older record as it is written (`await_reply`). A
+    /// failure is logged, and the next pass repeats it.
+    async fn end_settled_stalls(
+        &self,
+        namespace: &str,
+        convoy: &ResourceObject<Convoy>,
+        status: &ConvoyStatus,
+        stalled: Option<&StalledCondition>,
+    ) {
+        let Some(primitives) = self.subscriptions.message_primitives() else { return };
+        let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+        let address = |vessel: &str, role: &str| crew_role_address(project, &convoy.metadata.name, vessel, role);
+        let stalled = stalled.and_then(stalled_source_actor).map(|(vessel, role)| address(vessel, role));
+        let seats = status
+            .crew_work
+            .iter()
+            .flat_map(|(vessel, roles)| roles.keys().map(|role| address(vessel, role)))
+            .filter(|seat| Some(seat) != stalled.as_ref())
+            .collect::<Vec<_>>();
+        match primitives.end_stalls(namespace, &seats, stalled.as_deref(), "the seat's stall ended").await {
+            Ok(ended) if !ended.is_empty() => tracing::debug!(namespace, convoy = %convoy.metadata.name, ?ended, "stall records ended"),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(namespace, convoy = %convoy.metadata.name, %error, "ending settled stall records failed"),
+        }
+    }
+
     /// Judge locally authored convoys using the caller's current row snapshot.
     /// Obsolete, removed, or replica-only snapshots are skipped; the caller's
     /// convoy-watch handler must refresh the map and rebuild its rows.
@@ -368,11 +398,13 @@ impl ReconcilerWake {
                         )
                         .await
                         .map_err(|error| error.to_string())?;
+                        self.end_settled_stalls(namespace, convoy, status, None).await;
                         continue;
                     }
                 }
             }
             if !holding && status.stalled.is_none() {
+                self.end_settled_stalls(namespace, convoy, status, None).await;
                 continue;
             }
             let convoy_rows = rows.iter().filter(|row| {
@@ -1269,6 +1301,17 @@ impl ReconcilerWake {
                                         ),
                                         revision: convoy.metadata.resource_version.clone(),
                                     }])
+                                    // An operator-rung stall has no engine record until #3457 (#3587 ruling 6353447431).
+                                    .maybe_stall_of(stalled_source_actor(&condition).filter(|_| rung != StallRung::Operator).map(
+                                        |(vessel, role)| {
+                                            crew_role_address(
+                                                convoy.spec.project_ref.as_deref().unwrap_or(namespace),
+                                                &convoy.metadata.name,
+                                                vessel,
+                                                role,
+                                            )
+                                        },
+                                    ))
                                     .build();
                                 let admission = match self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await {
                                     Ok(admission) => admission,
@@ -1376,16 +1419,20 @@ impl ReconcilerWake {
                 .await
                 .map_err(|error| error.to_string())?;
             }
+            // The engine's stall records follow the stored status: only once it is written.
             if status.stalled != next {
-                if let Err(error) = flotilla_store::apply_status_patch(
+                match flotilla_store::apply_status_patch(
                     &backend.clone().using::<Convoy>(namespace),
                     &convoy.metadata.name,
-                    &flotilla_resources::ConvoyStatusPatch::SetStalled { condition: next },
+                    &flotilla_resources::ConvoyStatusPatch::SetStalled { condition: next.clone() },
                 )
                 .await
                 {
-                    tracing::warn!(namespace, convoy = %convoy.metadata.name, %error, "write stalled condition failed");
+                    Ok(_) => self.end_settled_stalls(namespace, convoy, status, next.as_ref()).await,
+                    Err(error) => tracing::warn!(namespace, convoy = %convoy.metadata.name, %error, "write stalled condition failed"),
                 }
+            } else {
+                self.end_settled_stalls(namespace, convoy, status, next.as_ref()).await;
             }
         }
         Ok(())

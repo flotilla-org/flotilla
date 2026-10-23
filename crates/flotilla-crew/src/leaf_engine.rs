@@ -58,6 +58,10 @@ pub struct CrewTurnIntent {
     pub delivery_condition: Option<Leaf>,
     #[builder(default)]
     pub expectation: flotilla_resources::MessageExpectation,
+    /// The stalled crew's role address, when this turn is a stall's
+    /// supervision: the sender's awaiting-reply record is then a stall about
+    /// that seat (#3587 layer 7).
+    pub stall_of: Option<String>,
 }
 
 /// Canonical receiver admission is a workflow latch, not a delivery receipt.
@@ -73,6 +77,15 @@ pub struct CrewTurnAdmission {
 #[async_trait]
 pub trait ResourceIntentPublisher: Send + Sync {
     async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String>;
+    /// [`Self::publish`], with the home that admitted it when the receiver
+    /// home reports one (the engine path does, #3587 layer 7).
+    async fn publish_admitted(
+        self: Arc<Self>,
+        namespace: &str,
+        document: serde_json::Value,
+    ) -> Result<(flotilla_protocol::ResourceRef, Option<String>), String> {
+        Ok((self.publish(namespace, document).await?, None))
+    }
     async fn patch_status(
         self: Arc<Self>,
         _namespace: &str,
