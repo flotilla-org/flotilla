@@ -217,6 +217,8 @@ impl Imported for ImageBuildBinding {
             failures => LifecycleState::Requested {
                 failures,
                 last_failure: Some(Failure {
+                    // A failure with no finish time reads as long past (the epoch): its backoff has
+                    // run out and the next pass retries at once, the safe direction.
                     at: status.finished_at.as_ref().map_or(Timestamp(0), Timestamp::from_datetime),
                     cause: cause(),
                     retryable: true,

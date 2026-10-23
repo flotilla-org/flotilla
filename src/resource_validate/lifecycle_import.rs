@@ -36,7 +36,9 @@ fn name(item: &Value) -> String {
     item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>").to_owned()
 }
 
-/// The home a listed record is authored at: its origin root, or this daemon.
+/// The home a listed record is authored at: its origin root, or this daemon. Records with no
+/// origin-root annotation are all this daemon's; the rehearsal restores each kind's records into a
+/// fresh store, so a clash between two of them reads as the store refusing the second.
 fn home(item: &Value) -> String {
     item.pointer("/metadata/annotations/flotilla.work~1origin-root").and_then(Value::as_str).unwrap_or("local").to_owned()
 }
@@ -74,20 +76,28 @@ impl Documents {
             "the vessel lease waits on the capacity ruling (#3629 Q6)",
         );
         // Ensures: each derived from its live convoy.
-        let live: BTreeMap<String, bool> = self
+        // Each convoy's liveness, and whether it has a status yet: one with none is a fresh convoy,
+        // read as live, and an Ensure bound to it is noted.
+        let live: BTreeMap<String, (bool, bool)> = self
             .decoded::<Convoy>("convoys", "Convoy", &mut report)
             .into_iter()
             .map(|(convoy, _)| {
-                // A convoy with no status yet is a fresh one: live.
                 let live = convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal());
-                (convoy.metadata.name, live)
+                (convoy.metadata.name, (live, convoy.status.is_some()))
             })
             .collect();
         let mut ensures = Vec::new();
         for (ensure, home) in self.decoded::<ConvoyEnsure>("convoyensures", "Ensure", &mut report) {
             let convoy = ensure.status.as_ref().and_then(|status| status.convoy_ref.clone());
             let convoy_live = match convoy.as_ref().map(|convoy| (convoy, live.get(convoy))) {
-                Some((_, Some(live))) => *live,
+                Some((_, Some((live, true)))) => *live,
+                Some((convoy, Some((live, false)))) => {
+                    report.notes.push(format!(
+                        "Ensure `{}` records convoy `{convoy}`, which has no status yet: read as live, imported bound",
+                        ensure.metadata.name
+                    ));
+                    *live
+                }
                 Some((convoy, None)) => {
                     // The safe direction: unfulfilled, so the first engine pass binds it again.
                     report.notes.push(format!(
@@ -181,6 +191,16 @@ mod tests {
                 serde_json::json!({"convoy_ref": "governor-9"}),
             )],
         );
+        documents.0.insert(
+            "convoys".into(),
+            vec![document("Convoy", "governor-1", serde_json::json!({"workflow_ref": "w", "inputs": {}}), Value::Null)],
+        );
+        documents.0.get_mut("convoyensures").expect("ensures").push(document(
+            "ConvoyEnsure",
+            "standing-reviewer",
+            serde_json::json!({"project_ref": "flotilla", "role": "reviewer", "repositories": []}),
+            serde_json::json!({"convoy_ref": "governor-1"}),
+        ));
         let report = documents.rehearse();
         assert_eq!(report.imported.get(&("Clone", "realised")), Some(&1), "{report:?}");
         let unmapped: Vec<_> = report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str())).collect();
@@ -188,5 +208,6 @@ mod tests {
         assert!(unmapped.contains(&("Checkout", "observed-a")), "{unmapped:?}");
         assert!(unmapped.contains(&("Clone", "broken-a")), "an undecodable record is named: {unmapped:?}");
         assert!(report.notes.iter().any(|note| note.contains("`governor-9`, which is not listed")), "{:?}", report.notes);
+        assert!(report.notes.iter().any(|note| note.contains("`governor-1`, which has no status yet")), "{:?}", report.notes);
     }
 }

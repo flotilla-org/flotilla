@@ -216,6 +216,80 @@ fn edges(name: &str, inbox: &Address, state: &EnsureState, patch: &ConvoyEnsureS
     edges
 }
 
+/// The Ensure an old ConvoyEnsure imports as (#3629 layer 9), its state derived from its live
+/// convoy: bound to the convoy it records while that convoy is live, held once its restart limit
+/// was reached, else unfulfilled with its strikes as the window's failures. `convoy_live` says
+/// whether the convoy it records is still live (not terminal). Its only refusal is a standing role
+/// with no address; every old status maps.
+pub fn import_ensure(ensure: &ResourceObject<ConvoyEnsure>, convoy_live: bool) -> Result<Resource<Ensure>, String> {
+    use flotilla_resources::ConvoyEnsureHoldReason;
+    let status = ensure.status.clone().unwrap_or_default();
+    let recorded: BTreeSet<Ref<Fulfiller>> = status.convoy_ref.iter().map(|convoy| fulfiller(convoy)).collect();
+    let failures = status.restart_count;
+    let last_failure = (failures > 0).then(|| Failure {
+        // Failures with no recorded window read as long past (the epoch): the engine's backoff has
+        // run out and the next pass retries at once, the safe direction.
+        at: status.retry.as_ref().map_or(Timestamp(0), |retry| Timestamp::from_datetime(&retry.first_failure_at)),
+        cause: Cause::new(CauseCategory::External, status.last_failure.clone().unwrap_or_else(|| "the standing convoy failed".into())),
+        retryable: true,
+    });
+    let state = match (&status.hold_reason, &status.convoy_ref) {
+        (Some(ConvoyEnsureHoldReason::RestartLimit), _) => {
+            EnsureState::Held { recorded: recorded.clone(), created: recorded, failures, last_failure }
+        }
+        (_, Some(convoy)) if convoy_live => {
+            EnsureState::Fulfilled { recorded: recorded.clone(), created: recorded, failures, last_failure, bound: fulfiller(convoy) }
+        }
+        _ => EnsureState::Unfulfilled { recorded: recorded.clone(), created: recorded, failures, last_failure },
+    };
+    let since = Timestamp::from_datetime(&ensure.metadata.creation_timestamp);
+    Ok(Resource::stored(
+        ensure.metadata.name.clone(),
+        EnsureSpec { inbox: standing_inbox(ensure)?, policy: ENSURE_POLICY },
+        flotilla_schema::State::new(state, since),
+        Version(1),
+    ))
+}
+
+/// Imports `ensures` (each an old ConvoyEnsure, its home, and whether the convoy it records is
+/// live) and rehearses them in a temporary store holding the crew kinds (#3629 layer 9). Returns
+/// the counts by stored state and each refused record named, with why.
+pub fn rehearse_ensures(
+    ensures: &[(ResourceObject<ConvoyEnsure>, String, bool)],
+) -> (BTreeMap<&'static str, usize>, Vec<(String, String)>) {
+    let mut refused = Vec::new();
+    let mut imported = Vec::new();
+    for (ensure, home, convoy_live) in ensures {
+        match import_ensure(ensure, *convoy_live) {
+            Ok(resource) => imported.push((home.clone(), resource)),
+            Err(reason) => refused.push((ensure.metadata.name.clone(), reason)),
+        }
+    }
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    if let Err(error) = flotilla_engine_store::register_crew(&mut kinds) {
+        refused.extend(imported.iter().map(|(_, resource)| (resource.name().to_owned(), format!("registry: {error:?}"))));
+        return (BTreeMap::new(), refused);
+    }
+    let mut failed: BTreeMap<usize, String> = flotilla_engine_store::rehearse(kinds, &imported).into_iter().collect();
+    let mut counts = BTreeMap::new();
+    for (index, (_, resource)) in imported.iter().enumerate() {
+        match failed.remove(&index) {
+            Some(reason) => refused.push((resource.name().to_owned(), reason)),
+            None => *counts.entry(ensure_label(resource.state())).or_default() += 1,
+        }
+    }
+    (counts, refused)
+}
+
+fn ensure_label(state: &EnsureState) -> &'static str {
+    match state {
+        EnsureState::Unfulfilled { .. } => "unfulfilled",
+        EnsureState::Fulfilled { .. } => "fulfilled",
+        EnsureState::Held { .. } => "held",
+        EnsureState::Retired { .. } => "retired",
+    }
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use std::collections::BTreeMap;
@@ -326,77 +400,6 @@ pub(super) mod tests {
         assert_eq!(decided, Some(limit.clone()));
         limit.apply(obj.status.get_or_insert_with(Default::default));
         assert_eq!(label(&path), "Held");
-    }
-}
-
-/// The Ensure an old ConvoyEnsure imports as (#3629 layer 9), its state derived from its live
-/// convoy: bound to the convoy it records while that convoy is live, held once its restart limit
-/// was reached, else unfulfilled with its strikes as the window's failures. `convoy_live` says
-/// whether the convoy it records is still live (not terminal).
-pub fn import_ensure(ensure: &ResourceObject<ConvoyEnsure>, convoy_live: bool) -> Result<Resource<Ensure>, String> {
-    use flotilla_resources::ConvoyEnsureHoldReason;
-    let status = ensure.status.clone().unwrap_or_default();
-    let recorded: BTreeSet<Ref<Fulfiller>> = status.convoy_ref.iter().map(|convoy| fulfiller(convoy)).collect();
-    let failures = status.restart_count;
-    let last_failure = (failures > 0).then(|| Failure {
-        at: status.retry.as_ref().map_or(Timestamp(0), |retry| Timestamp::from_datetime(&retry.first_failure_at)),
-        cause: Cause::new(CauseCategory::External, status.last_failure.clone().unwrap_or_else(|| "the standing convoy failed".into())),
-        retryable: true,
-    });
-    let state = match (&status.hold_reason, &status.convoy_ref) {
-        (Some(ConvoyEnsureHoldReason::RestartLimit), _) => {
-            EnsureState::Held { recorded: recorded.clone(), created: recorded, failures, last_failure }
-        }
-        (_, Some(convoy)) if convoy_live => {
-            EnsureState::Fulfilled { recorded: recorded.clone(), created: recorded, failures, last_failure, bound: fulfiller(convoy) }
-        }
-        _ => EnsureState::Unfulfilled { recorded: recorded.clone(), created: recorded, failures, last_failure },
-    };
-    let since = Timestamp::from_datetime(&ensure.metadata.creation_timestamp);
-    Ok(Resource::stored(
-        ensure.metadata.name.clone(),
-        EnsureSpec { inbox: standing_inbox(ensure)?, policy: ENSURE_POLICY },
-        flotilla_schema::State::new(state, since),
-        Version(1),
-    ))
-}
-
-/// Imports `ensures` (each an old ConvoyEnsure, its home, and whether the convoy it records is
-/// live) and rehearses them in a temporary store holding the crew kinds (#3629 layer 9). Returns
-/// the counts by stored state and each refused record named, with why.
-pub fn rehearse_ensures(
-    ensures: &[(ResourceObject<ConvoyEnsure>, String, bool)],
-) -> (BTreeMap<&'static str, usize>, Vec<(String, String)>) {
-    let mut refused = Vec::new();
-    let mut imported = Vec::new();
-    for (ensure, home, convoy_live) in ensures {
-        match import_ensure(ensure, *convoy_live) {
-            Ok(resource) => imported.push((home.clone(), resource)),
-            Err(reason) => refused.push((ensure.metadata.name.clone(), reason)),
-        }
-    }
-    let mut kinds = flotilla_schema::KindRegistry::new();
-    if let Err(error) = flotilla_engine_store::register_crew(&mut kinds) {
-        refused.extend(imported.iter().map(|(_, resource)| (resource.name().to_owned(), format!("registry: {error:?}"))));
-        return (BTreeMap::new(), refused);
-    }
-    let mut failed: BTreeMap<usize, String> = flotilla_engine_store::rehearse(kinds, &imported).into_iter().collect();
-    let mut counts = BTreeMap::new();
-    for (index, (_, resource)) in imported.iter().enumerate() {
-        match failed.remove(&index) {
-            Some(reason) => refused.push((resource.name().to_owned(), reason)),
-            None => *counts.entry(ensure_label(resource.state())).or_default() += 1,
-        }
-    }
-    (counts, refused)
-}
-
-fn ensure_label(state: &EnsureState) -> &'static str {
-    match state {
-        EnsureState::Unfulfilled { .. } => "unfulfilled",
-        EnsureState::Fulfilled { .. } => "fulfilled",
-        EnsureState::Held { .. } => "held",
-        EnsureState::Retired { .. } => "retired",
     }
 }
 
