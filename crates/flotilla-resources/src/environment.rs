@@ -155,8 +155,12 @@ impl<'de> Deserialize<'de> for EnvironmentSpec {
     }
 }
 
+/// Stable marker crossing the legacy string-error runtime boundary. Keep all
+/// producers and the retry classifier aligned until that boundary becomes typed.
+pub const CLOUD_ADOPTION_RETRY_PREFIX: &str = "adoption setup failed; backing retained for retry:";
+
 /// Additive cloud input approved on #3620 (2026-10-22). No credentials or reach recipes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CloudSandboxEnvironmentSpec {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub declared_agent_adapters: BTreeSet<String>,
@@ -170,6 +174,46 @@ pub struct CloudSandboxEnvironmentSpec {
     pub lifetime_cap_seconds: Option<u64>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+}
+
+impl<'de> Deserialize<'de> for CloudSandboxEnvironmentSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stored {
+            image: String,
+            size: CloudSandboxSize,
+            lifetime_cap_seconds: Option<u64>,
+            #[serde(default)]
+            env: BTreeMap<String, String>,
+            declared_agent_adapters: Option<BTreeSet<String>>,
+            required_agent_adapters: Option<BTreeSet<String>>,
+            probe_needs: Option<BTreeSet<crate::CapabilityNeed>>,
+        }
+        let mut stored = Stored::deserialize(deserializer)?;
+        // ADR 0047: remove one fleet roll after #3765. Lift preceding-generation
+        // controls on decode; write only typed fields. Explicit new fields win.
+        let adapters = stored.env.remove("FLOTILLA_REQUIRED_AGENT_ADAPTERS");
+        let needs = stored.env.remove("FLOTILLA_CLOUD_IMAGE_NEEDS");
+        stored.env.remove("FLOTILLA_DRYDOCK_LAB_FORWARD");
+        let legacy_adapters: BTreeSet<String> = if stored.declared_agent_adapters.is_none() || stored.required_agent_adapters.is_none() {
+            adapters.map(|value| serde_json::from_str(&value)).transpose().map_err(serde::de::Error::custom)?.unwrap_or_default()
+        } else {
+            BTreeSet::new()
+        };
+        let probe_needs = match stored.probe_needs {
+            Some(needs) => needs,
+            None => needs.map(|value| serde_json::from_str(&value)).transpose().map_err(serde::de::Error::custom)?.unwrap_or_default(),
+        };
+        Ok(Self {
+            image: stored.image,
+            size: stored.size,
+            lifetime_cap_seconds: stored.lifetime_cap_seconds,
+            env: stored.env,
+            declared_agent_adapters: stored.declared_agent_adapters.unwrap_or_else(|| legacy_adapters.clone()),
+            required_agent_adapters: stored.required_agent_adapters.unwrap_or(legacy_adapters),
+            probe_needs,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

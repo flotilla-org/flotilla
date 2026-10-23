@@ -110,7 +110,7 @@ impl CommandRunner for AgentRunner {
                 ExecEvent::Stdout(bytes) => {
                     // Bound host disk consumption from a busy or hostile guest.
                     written += bytes.len() as u64;
-                    if written > 512 * 1024 * 1024 {
+                    if written > CHECKPOINT_LIMIT_BYTES {
                         return Err("guest archive exceeds 512 MiB limit".into());
                     }
                     output.write_all(&bytes).await.map_err(error)?;

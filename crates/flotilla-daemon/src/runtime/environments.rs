@@ -74,6 +74,9 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
                         .await
                     {
                         Ok(result) => result,
+                        // Cancellation may follow provider creation but precede
+                        // local publication. Drop never destroys the backing;
+                        // the next pass label-adopts it via HTTP 200.
                         Err(_) => Err(format!("cloud environment {} adoption timed out; will retry", environment.metadata.name)),
                     }
                 });
@@ -176,7 +179,6 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     }
     let errors = results.into_iter().filter_map(Result::err).collect::<Vec<_>>();
     if errors.is_empty() {
-        state.local_backing_observed.store(true, Ordering::Release);
         Ok(())
     } else {
         Err(errors.join("; "))

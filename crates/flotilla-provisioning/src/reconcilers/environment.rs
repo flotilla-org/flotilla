@@ -36,6 +36,7 @@ pub struct EnvironmentReconciler<R> {
     namespace: String,
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
+    adoption_retries: std::sync::Mutex<std::collections::HashMap<String, u32>>,
 }
 
 impl<R> EnvironmentReconciler<R> {
@@ -47,6 +48,7 @@ impl<R> EnvironmentReconciler<R> {
             namespace: namespace.into(),
             local_host_ref: None,
             additional_host_refs: Default::default(),
+            adoption_retries: Default::default(),
         }
     }
 
@@ -173,7 +175,9 @@ where
                 } else {
                     match self.runtime.provision_environment(&obj.metadata.name, &obj.spec).await {
                         Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
-                        Err(message) if obj.spec.cloud_sandbox.is_some() && message.starts_with("adoption setup failed;") => {
+                        Err(message)
+                            if obj.spec.cloud_sandbox.is_some() && message.starts_with(flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX) =>
+                        {
                             Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: {message}")))
                         }
                         Err(message) => Ok(EnvironmentPrepared::Failed(message)),
@@ -218,6 +222,9 @@ where
                     registry_digest: provisioning.registry_digest.clone(),
                 }),
                 EnvironmentPrepared::Failed(message) => Some(EnvironmentStatusPatch::MarkFailed { message: message.clone() }),
+                // This legacy patch writes only generic Provisioning/ready=false
+                // and the supplied message. It stores no image-build wait state;
+                // adoption gets its own runtime variant and retry scheduling.
                 EnvironmentPrepared::Waiting(message) | EnvironmentPrepared::RetryAdoption(message) => {
                     Some(EnvironmentStatusPatch::WaitForImageBuild { message: message.clone() })
                 }
@@ -227,13 +234,19 @@ where
         };
 
         let mut outcome = ReconcileOutcome::new(patch);
+        let mut retries = self.adoption_retries.lock().expect("adoption retries");
         if matches!(prepared, EnvironmentPrepared::RetryAdoption(_)) {
-            outcome.requeue_after = Some(std::time::Duration::from_secs(5));
+            let attempt = retries.entry(obj.metadata.name.clone()).or_default();
+            outcome.requeue_after = Some(std::time::Duration::from_secs((5_u64 << *attempt).min(300)));
+            *attempt = (*attempt + 1).min(6);
+        } else {
+            retries.remove(&obj.metadata.name);
         }
         outcome
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        self.adoption_retries.lock().expect("adoption retries").remove(&obj.metadata.name);
         if !self.actuates(obj).await? {
             return Ok(());
         }

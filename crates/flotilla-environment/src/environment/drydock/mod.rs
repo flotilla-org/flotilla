@@ -6,7 +6,9 @@ mod runner;
 use super::*;
 use ::drydock::api::ProviderApi;
 use drydock_protocol as wire;
+use flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX;
 use runner::{error, AgentRunner};
+const CHECKPOINT_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 use sha2::Digest;
 use std::{collections::BTreeMap, sync::RwLock, time::Duration};
 
@@ -189,6 +191,14 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         let public = if keydir.join("id_ed25519.pub").is_file() && keydir.join("id_ed25519").is_file() {
             tokio::fs::read_to_string(keydir.join("id_ed25519.pub")).await.map_err(error)?
         } else {
+            // An existing backing still trusts the original key. Regenerating
+            // here cannot rotate that key through label-idempotent provision.
+            let backings = self.api.list(&self.instance).await.map_err(|cause| {
+                format!("{CLOUD_ADOPTION_RETRY_PREFIX} cannot verify backing before SSH key repair: {}", api_error(cause))
+            })?;
+            if backings.iter().any(|backing| backing.label.as_deref() == Some(id.as_str())) {
+                return Err(format!("{CLOUD_ADOPTION_RETRY_PREFIX} SSH keypair incomplete or missing for adopted backing; restore the controller key files; public-key rotation on adoption is unsupported"));
+            }
             remove_keys(&keydir).await?;
             ::drydock::launch::keypair(&keydir).await.map_err(api_error)?.1
         };
@@ -264,7 +274,7 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                     Ok::<_, String>(())
                 }
                 .await;
-                setup.map_err(|cause| format!("adoption setup failed; backing retained for retry: {cause}"))?;
+                setup.map_err(|cause| format!("{CLOUD_ADOPTION_RETRY_PREFIX} {cause}"))?;
                 return Ok(handle);
             }
         }
@@ -316,7 +326,7 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         .await;
         if let Err(cause) = setup {
             if !created {
-                return Err(format!("adoption setup failed; backing retained for retry: {cause}"));
+                return Err(format!("{CLOUD_ADOPTION_RETRY_PREFIX} {cause}"));
             }
             return match handle.destroy().await {
                 Ok(()) => Err(cause),
@@ -484,12 +494,14 @@ fn checkpoint_script(paths: &[String]) -> String {
     let paths = paths.iter().map(|p| runner::quote(p)).collect::<Vec<_>>().join(" ");
     format!(
         "flotilla_checkpoint_size=$(du -sb {excludes} -- {paths} 2>/dev/null | awk '{{n += $1}} END {{printf \"%.0f\", n}}'); \
-         test \"$flotilla_checkpoint_size\" -le 536870912 || exit 1; \
+         test \"$flotilla_checkpoint_size\" -le {CHECKPOINT_LIMIT_BYTES} || exit 1; \
+         flotilla_checkpoint_free=$(df -PB1 /tmp | awk 'NR == 2 {{print $4}}'); \
+         test \"$flotilla_checkpoint_free\" -ge \"$((flotilla_checkpoint_size + 1048576))\" || exit 1; \
          flotilla_checkpoint_tmp=$(mktemp /tmp/flotilla-checkpoint.XXXXXXXX) || exit 1; \
          trap 'rm -f -- \"$flotilla_checkpoint_tmp\"' EXIT; \
          tar --ignore-failed-read {excludes} -cf \"$flotilla_checkpoint_tmp\" -- {paths}; \
          flotilla_tar_status=$?; test \"$flotilla_tar_status\" -le 1 || exit 1; \
-         test \"$(stat -c%s \"$flotilla_checkpoint_tmp\")\" -le 536870912 || exit 1; \
+         test \"$(stat -c%s \"$flotilla_checkpoint_tmp\")\" -le {CHECKPOINT_LIMIT_BYTES} || exit 1; \
          cat -- \"$flotilla_checkpoint_tmp\""
     )
 }
@@ -578,6 +590,8 @@ impl ProvisionedEnvironment for DrydockEnvironment {
                 Err(e) => ObservationState::Unknown { reason: UnknownReason::ProviderApiError { message: api_error(e) } },
             }
         };
+        // Running backing plus usable guest transport is the readiness contract.
+        // A failed SSH reconnect is Unknown, never evidence that work is Gone.
         if matches!(state, ObservationState::Running) && !self.image.as_str().is_empty() {
             if let Err(message) = self.connect().await {
                 return ProviderObservation::new(ObservationState::Unknown { reason: UnknownReason::ProviderApiError { message } });

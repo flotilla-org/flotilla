@@ -750,7 +750,7 @@ async fn unrecorded_cloud_adoption_failure_requeues() {
     #[async_trait]
     impl EnvironmentRuntime for AdoptionFailure {
         async fn provision_environment(&self, _: &str, _: &EnvironmentSpec) -> Result<EnvironmentProvisioning, String> {
-            Err("adoption setup failed; backing retained for retry: SSH unavailable".into())
+            Err(format!("{} SSH unavailable", flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX))
         }
         async fn destroy(&self, _: &str, _: &str) -> Result<(), String> {
             panic!("failed adoption must preserve backing")
@@ -773,4 +773,17 @@ async fn unrecorded_cloud_adoption_failure_requeues() {
     assert_eq!(status.phase, EnvironmentPhase::Provisioning);
     assert!(!status.ready);
     assert!(status.message.unwrap().starts_with("Unknown: adoption setup failed"));
+    // Repeated failures back off and cap at five minutes; a healthy observation
+    // resets the retry budget for the next independent outage.
+    for seconds in [10, 20, 40, 80, 160, 300, 300] {
+        assert_eq!(
+            reconciler.reconcile(&object, &prepared, chrono::Utc::now()).requeue_after,
+            Some(std::time::Duration::from_secs(seconds))
+        );
+    }
+    let mut healthy = object.clone();
+    healthy.status = Some(EnvironmentStatus { phase: EnvironmentPhase::Ready, ready: true, ..Default::default() });
+    let healthy_prepared = reconciler.prepare(&healthy).await.unwrap();
+    reconciler.reconcile(&healthy, &healthy_prepared, chrono::Utc::now());
+    assert_eq!(reconciler.reconcile(&object, &prepared, chrono::Utc::now()).requeue_after, Some(std::time::Duration::from_secs(5)));
 }

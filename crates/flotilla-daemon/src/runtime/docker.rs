@@ -982,7 +982,7 @@ pub(super) async fn discard_failed_environment(
     error: String,
 ) -> String {
     if !handle.created_for_setup() {
-        return format!("adoption setup failed; backing retained for retry: {error}");
+        return format!("{} {error}", flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX);
     }
     let mut cleanup_errors = Vec::new();
     if let Err(cleanup_error) = handle.destroy().await {

@@ -436,6 +436,7 @@ async fn closed_session_reconnects_on_liveness() {
     #[derive(Default)]
     struct Recovery {
         closed: AtomicBool,
+        fail_reconnect: AtomicBool,
         connects: AtomicUsize,
         configurations: AtomicUsize,
         forwards: AtomicUsize,
@@ -468,6 +469,9 @@ async fn closed_session_reconnects_on_liveness() {
     #[async_trait]
     impl reach::Connector for Connector {
         async fn connect(&self, _: &dyn ProviderApi, _: &str, _: &str, _: PathBuf) -> Result<Arc<dyn reach::Guest>, String> {
+            if self.0.fail_reconnect.load(Ordering::SeqCst) {
+                return Err("injected unreachable SSH endpoint".into());
+            }
             self.0.closed.store(false, Ordering::SeqCst);
             self.0.connects.fetch_add(1, Ordering::SeqCst);
             Ok(Arc::new(Guest(self.0.clone())))
@@ -491,6 +495,10 @@ async fn closed_session_reconnects_on_liveness() {
     .await
     .unwrap();
     recovery.closed.store(true, Ordering::SeqCst);
+    recovery.fail_reconnect.store(true, Ordering::SeqCst);
+    assert!(matches!(handle.observe().await.state, ObservationState::Unknown { .. }));
+    assert!(matches!(host.client.inspect("reference", handle.backing_id()).await.unwrap().state, wire::Observation::Running));
+    recovery.fail_reconnect.store(false, Ordering::SeqCst);
     let observation = handle.observe().await;
     assert!(matches!(observation.state, ObservationState::Running), "{observation:?}");
     assert_eq!(recovery.connects.load(Ordering::SeqCst), 2);
@@ -561,6 +569,12 @@ async fn checkpoint_excludes_caches_and_preflights_size() {
     assert!(listing.contains("work.txt"));
     assert!(!listing.contains("target/output"));
     assert!(!listing.contains("registry/cache"));
+    // Fake only df's free-space response; all archive tools remain real.
+    let no_space =
+        format!("df() {{ printf '%s\\n' 'Filesystem blocks used available capacity mount' 'tmp 100 100 0 100% /tmp'; }}; {script}");
+    let no_space_target = directory.path().join("no-space.tar");
+    assert!(runner.run_to_file("sh", &["-c", &no_space], Path::new("/"), &no_space_target).await.is_err());
+    assert_eq!(std::fs::metadata(no_space_target).unwrap().len(), 0);
     let oversized = std::fs::File::create(root.join("oversized-work")).unwrap();
     oversized.set_len(512 * 1024 * 1024 + 1).unwrap();
     let refused = directory.path().join("refused.tar");
@@ -568,10 +582,11 @@ async fn checkpoint_excludes_caches_and_preflights_size() {
     assert_eq!(std::fs::metadata(refused).unwrap().len(), 0);
 }
 
-// #3765 F4: either missing half makes a keypair unusable; repair both halves
-// before retrying setup, while retaining the label-idempotent backing.
+// #3765 F4 / review 4: incomplete adoption keys cannot be rotated by a
+// label-idempotent POST. Preserve the existing pair and backing, report the
+// missing key distinctly, and allow recovery after the original key is restored.
 #[tokio::test]
-async fn keypair_repair_requires_both_files() {
+async fn incomplete_adoption_keypair_requires_restore() {
     let host = HostFixture::start().await;
     host.ready().await;
     let provider = host.provider();
@@ -580,13 +595,27 @@ async fn keypair_repair_requires_both_files() {
         let id = EnvironmentId::new(format!("repair-{index}"));
         let first = provider.provision(id.clone(), &prepared, Default::default()).await.unwrap();
         let directory = key_dir(&provider.directory, &id);
+        let original = tokio::fs::read(directory.join(missing)).await.unwrap();
         tokio::fs::remove_file(directory.join(missing)).await.unwrap();
-        let repaired = provider.provision(id, &prepared, Default::default()).await.unwrap();
-        assert_eq!(first.backing_id(), repaired.backing_id());
-        assert!(directory.join("id_ed25519").is_file());
-        assert!(directory.join("id_ed25519.pub").is_file());
-        repaired.destroy().await.unwrap();
+        let failure = provider.provision(id.clone(), &prepared, Default::default()).await.err().expect("adoption must not regenerate keys");
+        assert!(failure.starts_with(CLOUD_ADOPTION_RETRY_PREFIX));
+        assert!(failure.contains("SSH keypair incomplete or missing for adopted backing"));
+        assert!(!directory.join(missing).exists());
+        assert_eq!(host.client.inspect("reference", first.backing_id()).await.unwrap().id, first.backing_id());
+        tokio::fs::write(directory.join(missing), original).await.unwrap();
+        let recovered = provider.provision(id, &prepared, Default::default()).await.unwrap();
+        assert_eq!(first.backing_id(), recovered.backing_id());
+        recovered.destroy().await.unwrap();
     }
+    // With no existing backing, a stale public half is safe to replace.
+    let id = EnvironmentId::new("fresh-half-pair");
+    let directory = key_dir(&provider.directory, &id);
+    ::drydock::local::private_dir(&directory).unwrap();
+    tokio::fs::write(directory.join("id_ed25519.pub"), "stale public half").await.unwrap();
+    let fresh = provider.provision(id, &prepared, Default::default()).await.unwrap();
+    assert!(directory.join("id_ed25519").is_file());
+    assert_ne!(tokio::fs::read_to_string(directory.join("id_ed25519.pub")).await.unwrap(), "stale public half");
+    fresh.destroy().await.unwrap();
 }
 
 // #3765 S2: periodic refresh failure preserves the completed archive and makes
