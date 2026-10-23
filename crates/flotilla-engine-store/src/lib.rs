@@ -169,6 +169,60 @@ where
     Ok(opened)
 }
 
+/// The rehearsal store's own home: no record is authored there.
+pub const REHEARSAL_HOME: &str = "import-rehearsal";
+
+/// The pre-roll import rehearsal (#3629 layer 9): writes each `(home, resource)` into a temporary
+/// store over `kinds` as a restore at its home, reads it back and compares. Returns each resource
+/// the store refused, or read back differently, by its index in `imported`, with the reason: two
+/// homes' resources of one name are told apart. The store's own home is
+/// [`REHEARSAL_HOME`], so every resource restores as another home's; one claiming that home is refused.
+pub fn rehearse<M>(kinds: KindRegistry, imported: &[(String, Resource<M>)]) -> Vec<(usize, String)>
+where
+    M: Machine,
+    M::Spec: PartialEq,
+    Resource<M>: Kind,
+{
+    use flotilla_schema::Encoder;
+    let store = rusqlite::Connection::open_in_memory()
+        .map_err(|error| error.to_string())
+        .and_then(|connection| Store::open(connection, REHEARSAL_HOME, kinds).map_err(|error| error.to_string()));
+    let mut store = match store {
+        Ok(store) => store,
+        Err(error) => return (0..imported.len()).map(|index| (index, error.clone())).collect(),
+    };
+    let mut refused = Vec::new();
+    for (index, (home, resource)) in imported.iter().enumerate() {
+        if home == REHEARSAL_HOME {
+            refused.push((index, format!("homed at `{REHEARSAL_HOME}`, the rehearsal's own home")));
+            continue;
+        }
+        let result = Encoder::encode(resource).map_err(|error| error.to_string()).and_then(|rows| {
+            let snapshot = flotilla_schema_sqlite::Snapshot {
+                kind: Resource::<M>::CODE,
+                name: resource.name().to_owned(),
+                home: home.clone(),
+                version: resource.version().0,
+                rows,
+            };
+            let mut write = store.write().map_err(|error| error.to_string())?;
+            write.restore(&snapshot).map_err(|error| error.to_string())?;
+            write.commit().map_err(|error| error.to_string())?;
+            let mut read = store.read().map_err(|error| error.to_string())?;
+            let id = read.resolve(Resource::<M>::CODE, resource.name(), home).map_err(|error| error.to_string())?.ok_or("not restored")?;
+            let loaded = read.load::<Resource<M>>(id).map_err(|error| error.to_string())?.ok_or("not loaded")?;
+            if &loaded.value.with_identity(&loaded.name, loaded.version) != resource {
+                return Err("reads back differently".to_owned());
+            }
+            Ok(())
+        });
+        if let Err(reason) = result {
+            refused.push((index, reason));
+        }
+    }
+    refused
+}
+
 /// Every entry about resource `id`, paged through `Read::about`.
 pub fn about(read: &mut Read<'_>, id: flotilla_schema_sqlite::ResourceId) -> Result<Vec<Event>, StoreError> {
     let mut entries = Vec::new();

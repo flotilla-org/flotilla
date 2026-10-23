@@ -660,6 +660,173 @@ async fn a_failed_launch_gives_up_and_the_next_start_is_a_new_launch() {
     assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
 }
 
+// Behaviour (#3629 layer 9): every old phase of each kind maps to a stored state, as the import's
+// table says, and the rehearsal restores each into a temporary store and reads it back unchanged.
+// Lost sessions stay Realised (Q2), each session imports as its launch `#1`, a legacy clone
+// failure is still wanted, and a build with a retry to come keeps its failed attempts.
+#[test]
+fn every_old_phase_imports_and_rehearses() {
+    use flotilla_resources::{
+        CheckoutPhase, ClonePhase, EnvironmentPhase, EnvironmentStatus, ImageBuildFailure, ImageBuildFailureClass, ImageBuildPhase,
+        ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec, ImageBuildStatus, ImageDelivery, TerminalSessionPhase,
+        TerminalSessionStatus,
+    };
+
+    use super::{
+        environment::EnvironmentBinding,
+        image_build::ImageBuildBinding,
+        import::{import, label, rehearse, ImportReport},
+        terminal_session::TerminalSessionBinding,
+    };
+    let mut report = ImportReport::default();
+
+    let mut imported_sessions = Vec::new();
+    for (phase, expected) in [
+        (TerminalSessionPhase::Starting, "requested"),
+        (TerminalSessionPhase::Running, "realised"),
+        (TerminalSessionPhase::Lost, "realised"),
+        (TerminalSessionPhase::Stopped, "gone"),
+        (TerminalSessionPhase::Failed, "gave-up"),
+    ] {
+        let mut obj = session_object(phase);
+        obj.status = Some(TerminalSessionStatus { phase, session_id: Some("s1".into()), ..Default::default() });
+        let result = import::<TerminalSessionBinding>(&obj, HOME);
+        report.record(&result);
+        let imported = result.expect("imports");
+        assert_eq!(label(imported.resource.state()), expected, "{phase:?}");
+        assert_eq!(imported.resource.name(), "terminal-vessel-a-coder#1");
+        imported_sessions.push(imported);
+    }
+    for imported in imported_sessions {
+        assert_eq!(rehearse(&[imported]), BTreeMap::new(), "every session restores and reads back");
+    }
+    // Two records importing under one name: the rehearsal refuses the second, named.
+    let twice = [session_object(TerminalSessionPhase::Starting), session_object(TerminalSessionPhase::Starting)]
+        .map(|obj| import::<TerminalSessionBinding>(&obj, HOME).expect("imports"));
+    let refused = rehearse(&twice);
+    assert_eq!(refused.keys().collect::<Vec<_>>(), [&1], "the second, by its index");
+    assert!(refused[&1].reason.contains("already exists"), "{refused:?}");
+    // One name at two homes is two resources; the rehearsal's own home is no record's.
+    let homed = |home: &str| import::<TerminalSessionBinding>(&session_object(TerminalSessionPhase::Starting), home).expect("imports");
+    assert_eq!(rehearse(&[homed("feta"), homed("kiwi")]), BTreeMap::new(), "told apart by home");
+    let refused = rehearse(&[homed(flotilla_engine_store::REHEARSAL_HOME)]);
+    assert!(refused[&0].reason.contains("rehearsal's own home"), "{refused:?}");
+
+    let mut environments = Vec::new();
+    for (phase, expected) in [
+        (EnvironmentPhase::Pending, "requested"),
+        (EnvironmentPhase::Provisioning, "requested"),
+        (EnvironmentPhase::Ready, "realised"),
+        (EnvironmentPhase::Lost, "gone"),
+        (EnvironmentPhase::Failed, "gave-up"),
+    ] {
+        let mut obj = environment_object(true);
+        obj.status = Some(EnvironmentStatus { phase, docker_container_id: Some("c0ffee".into()), ..Default::default() });
+        let imported = import::<EnvironmentBinding>(&obj, HOME).expect("imports");
+        assert_eq!(label(imported.resource.state()), expected, "{phase:?}");
+        environments.push(imported);
+    }
+    for imported in environments {
+        assert_eq!(rehearse(&[imported]), BTreeMap::new());
+    }
+
+    let build = |phase, attempt, class| ResourceObject::<flotilla_resources::ImageBuild> {
+        metadata: meta("image-a"),
+        spec: ImageBuildResourceSpec::Current(Box::new(ImageBuildSpec {
+            identity: "sha256:feed".into(),
+            architecture: "amd64".into(),
+            layers: vec![],
+            host_ref: "feta".into(),
+            delivery: ImageDelivery::Local,
+            reservation: ImageBuildReservation { cpu: 1, disk_bytes: 1 },
+        })),
+        status: Some(ImageBuildStatus {
+            phase,
+            attempt,
+            digest: Some("sha256:beef".into()),
+            failure: Some(ImageBuildFailure { class, reason: "boom".into() }),
+            ..Default::default()
+        }),
+    };
+    let infra = ImageBuildFailureClass::Infrastructure;
+    for (obj, expected, failures) in [
+        (build(ImageBuildPhase::Queued, 2, infra), "requested", 2),
+        (build(ImageBuildPhase::Building, 3, infra), "requested", 2),
+        (build(ImageBuildPhase::Built, 1, infra), "realised", 0),
+        (build(ImageBuildPhase::Failed, 2, infra), "requested", 2),
+        (build(ImageBuildPhase::Failed, 5, infra), "gave-up", 0),
+        (build(ImageBuildPhase::Failed, 1, ImageBuildFailureClass::Recipe), "gave-up", 0),
+    ] {
+        let imported = import::<ImageBuildBinding>(&obj, HOME).expect("imports");
+        assert_eq!(label(imported.resource.state()), expected);
+        if let LifecycleState::Requested { failures: tallied, .. } = imported.resource.state() {
+            assert_eq!(*tallied, failures, "the failed attempts so far");
+        }
+        assert_eq!(rehearse(&[imported]), BTreeMap::new());
+    }
+
+    for (phase, policy, expected) in [
+        (ClonePhase::Pending, None, "requested"),
+        (ClonePhase::Cloning, None, "requested"),
+        (ClonePhase::Ready, None, "realised"),
+        (ClonePhase::Failed, None, "requested"),
+        (ClonePhase::Failed, Some(flotilla_resources::CloneFailurePolicy::Terminal), "gave-up"),
+    ] {
+        let mut obj = clone_object(Some(phase));
+        obj.status.as_mut().expect("status").failure_policy = policy;
+        let imported = import::<CloneBinding>(&obj, HOME).expect("imports");
+        assert_eq!(label(imported.resource.state()), expected, "{phase:?} {policy:?}");
+        assert_eq!(rehearse(&[imported]), BTreeMap::new());
+    }
+
+    for (phase, expected) in [
+        (CheckoutPhase::Pending, "requested"),
+        (CheckoutPhase::Ready, "realised"),
+        (CheckoutPhase::Failed, "gave-up"),
+        (CheckoutPhase::Gone, "gone"),
+    ] {
+        let mut obj = worktree(Some("convoy-a"));
+        obj.status = Some(CheckoutStatus { phase, path: Some("/work/feature".into()), ..CheckoutStatus::default() });
+        let imported = import::<CheckoutBinding>(&obj, HOME).expect("imports");
+        assert_eq!(label(imported.resource.state()), expected, "{phase:?}");
+        assert_eq!(rehearse(&[imported]), BTreeMap::new());
+    }
+    assert_eq!(report.imported.values().sum::<usize>(), 5);
+}
+
+// Behaviour (layer 9): the rehearsal lists what has no mapping, each record named: an observed
+// checkout, a Realised record with no identity, and Vessels, whose lease waits on Q6.
+#[test]
+fn the_rehearsal_lists_records_with_no_mapping() {
+    use flotilla_resources::{EnvironmentPhase, EnvironmentStatus, ObservedCheckoutSpec};
+
+    use super::{
+        environment::EnvironmentBinding,
+        import::{import, ImportReport},
+    };
+    let mut report = ImportReport::default();
+    let mut observed = worktree(Some("convoy-a"));
+    observed.metadata.name = "observed-a".into();
+    observed.spec = CheckoutSpec::Observed(
+        ObservedCheckoutSpec::builder()
+            .r#ref("main".into())
+            .path("/repo".into())
+            .repo_ref(RepositoryKey("repo".into()))
+            .host_ref("feta".into())
+            .is_main(true)
+            .build(),
+    );
+    report.record(&import::<CheckoutBinding>(&observed, HOME));
+    let mut nameless = environment_object(true);
+    nameless.status = Some(EnvironmentStatus { phase: EnvironmentPhase::Ready, ..Default::default() });
+    report.record(&import::<EnvironmentBinding>(&nameless, HOME));
+    report.unmapped("Vessel", ["convoy-a-implement".to_owned()], "the vessel lease waits on the capacity ruling (#3629 Q6)");
+    let listed: Vec<(&str, &str)> = report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str())).collect();
+    assert_eq!(listed, [("Checkout", "observed-a"), ("Environment", "env-a"), ("Vessel", "convoy-a-implement")]);
+    assert!(report.refused[0].reason.contains("observed checkout"));
+    assert!(report.refused[1].reason.contains("no container or root"));
+}
+
 // Behaviour (#3747 review): the latest launch is found however many there are, and a launch key
 // parses at its last `#`, so an old name holding a `#` of its own is kept whole.
 #[test]

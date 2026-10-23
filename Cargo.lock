@@ -1274,6 +1274,7 @@ dependencies = [
  "flotilla-projections",
  "flotilla-protocol",
  "flotilla-provider-runtime",
+ "flotilla-provisioning",
  "flotilla-resources",
  "flotilla-store",
  "flotilla-store-memory",
