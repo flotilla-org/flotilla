@@ -6898,6 +6898,9 @@ mod tests {
         assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Ready, "torn down, not lost: the old phase");
         reads.set(ProvisioningKind::Vessel, "convoy-a-implement", Some(LifecycleReading::Lost));
         assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Lost, "its lease broke");
+        // A replica seeded from a snapshot that predates the ending reads Gone: read as broken.
+        reads.set(ProvisioningKind::Vessel, "convoy-a-implement", Some(LifecycleReading::Gone));
+        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Lost, "ended, how not held here");
         read.object.status.as_mut().expect("status").phase = VesselPhase::Failed;
         assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Failed, "the old phase says why it ended");
     }
