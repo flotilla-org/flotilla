@@ -151,6 +151,7 @@ struct FleetToolsTool {
     cli: Arc<dyn EnvironmentToolFactory>,
     cleat: Arc<dyn EnvironmentToolFactory>,
     root: PathBuf,
+    publisher: flotilla_environment::tools::Publisher,
 }
 #[cfg(unix)]
 impl FleetToolsTool {
@@ -159,6 +160,7 @@ impl FleetToolsTool {
             cli: FlotillaCliTool::for_local_host(context),
             cleat: CleatTool::for_local_host(context),
             root: context.config.state_dir().join("environment-tools/fleet").as_path().to_path_buf(),
+            publisher: Default::default(),
         })
     }
 }
@@ -177,7 +179,7 @@ impl EnvironmentToolFactory for FleetToolsTool {
         let prefix = library.parent().and_then(Path::parent).ok_or("cleat library has no installation prefix")?;
         let terminfo = prefix.join("share/terminfo");
         let flotilla = cli.assets[0].host_path.as_path().join("flotilla");
-        flotilla_environment::tools::publish(
+        self.publisher.publish(
             &self.root,
             &flotilla_environment::tools::ToolsSource { flotilla: &flotilla, cleat: binary, library, terminfo: &terminfo },
         )
@@ -292,7 +294,7 @@ async fn ensure_flotilla_launcher(path: &Path) -> Result<(), String> {
         }
     }
     #[cfg(unix)]
-    {
+    if tokio::fs::metadata(path).await.map_err(|error| error.to_string())?.permissions().mode() & 0o7777 != 0o755 {
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
             .await
             .map_err(|error| format!("make flotilla CLI launcher executable at {}: {error}", path.display()))?;
@@ -743,6 +745,25 @@ pub(crate) mod tests {
 
     // Generation tools expose stable real directories and complete assets,
     // preserving image siblings while later link replacement remains visible.
+    // Unchanged reconciliation must preserve file identity so the agent's
+    // layer cache can reuse its digest; a permission repair still works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unchanged_launcher_preparation_preserves_file_identity() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = TempDir::new().unwrap();
+        let launcher = root.path().join("launcher");
+        ensure_flotilla_launcher(&launcher).await.unwrap();
+        let before = fs::metadata(&launcher).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        ensure_flotilla_launcher(&launcher).await.unwrap();
+        let after = fs::metadata(&launcher).unwrap();
+        assert_eq!((before.ino(), before.ctime(), before.ctime_nsec()), (after.ino(), after.ctime(), after.ctime_nsec()));
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o644)).unwrap();
+        ensure_flotilla_launcher(&launcher).await.unwrap();
+        assert_eq!(fs::metadata(&launcher).unwrap().permissions().mode() & 0o777, 0o755);
+    }
+
     #[tokio::test]
     async fn fleet_tools_publish_complete_generations_through_stable_directory_assets() {
         let temp = TempDir::new().unwrap();
@@ -765,6 +786,7 @@ pub(crate) mod tests {
                 runner: None,
             }),
             root: temp.path().join("provider"),
+            publisher: Default::default(),
         };
         let tool = factory.prepare("vessel", &TestToolContext).await.unwrap();
         let parent = tool.assets.iter().find(|asset| asset.environment_path.as_path() == Path::new("/opt/flotilla/bin")).unwrap();

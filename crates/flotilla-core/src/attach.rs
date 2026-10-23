@@ -731,7 +731,10 @@ impl<'a> AttachResolver<'a> {
                     }
                     match state {
                         ManagedEnvironmentKind::Provisioned(state)
-                            if realised.as_ref().is_none_or(|backing| state.handle.backing_id() == backing) => Some(state.handle),
+                            if realised.as_ref().is_none_or(|backing| state.handle.backing_id() == backing) =>
+                        {
+                            Some(state.handle)
+                        }
                         _ => None,
                     }
                 })
