@@ -414,7 +414,8 @@ async fn register_static_ssh_direct_environment(
     environment: &StaticEnvironmentConfig,
     host_direct: bool,
     multiplex: bool,
-) -> Result<EnvironmentId, String> {
+    max_vessels: Option<u32>,
+) -> Result<(), String> {
     let fallback_env_id = static_ssh_environment_id(config_key);
     let destination = flotilla_config::ssh_destination(&environment.hostname, environment.user.as_deref());
     let host_environment =
@@ -448,7 +449,8 @@ async fn register_static_ssh_direct_environment(
     if host_direct {
         environment_manager.set_direct_environment_ssh_destination(&env_id, destination)?;
     }
-    Ok(env_id)
+    environment_manager.set_direct_environment_max_vessels(&env_id, max_vessels)?;
+    Ok(())
 }
 
 /// #3722: a host's declared supplies, validated for its SSH runner.
@@ -479,7 +481,8 @@ async fn register_static_ssh_direct_environments(
     };
 
     for (config_key, environment) in &daemon_config.environments {
-        if let Err(err) = register_static_ssh_direct_environment(environment_manager, discovery, config_key, environment, false, true).await
+        if let Err(err) =
+            register_static_ssh_direct_environment(environment_manager, discovery, config_key, environment, false, true, None).await
         {
             warn!(
                 environment = %config_key,
@@ -499,17 +502,17 @@ async fn register_static_ssh_direct_environments(
                     flotilla_command: None,
                     supplies: remote.supplies.clone(),
                 };
-                let registered = register_static_ssh_direct_environment(
+                if let Err(err) = register_static_ssh_direct_environment(
                     environment_manager,
                     discovery,
                     label,
                     &environment,
                     true,
                     hosts.resolved_ssh_multiplex(label),
+                    remote.max_vessels,
                 )
                 .await
-                .and_then(|env_id| environment_manager.set_direct_environment_max_vessels(&env_id, remote.max_vessels));
-                if let Err(err) = registered {
+                {
                     warn!(host = %label, %err, "failed to register agentless SSH host; continuing startup");
                 }
             }

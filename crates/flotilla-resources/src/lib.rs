@@ -244,7 +244,7 @@ pub use vessel::{
     vessel_resource_name, Vessel, VesselImage, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
-pub use vessel_occupancy::HostOccupancy;
+pub use vessel_occupancy::{home_copies_first, HostOccupancy};
 pub use watch::{ResourceList, ResourcePosition, ResourceTombstone, WatchEvent, WatchStart, WatchStream};
 
 #[doc(hidden)]

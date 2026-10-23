@@ -26,12 +26,6 @@ use flotilla_store::{
     DefinitionResolver, PreparedSnapshotGarbageCollector, ReplicaReadResolver, TypedResolver,
 };
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
-/// Records in an order where each name's home copy comes first.
-fn home_first<T: Resource>(mut items: Vec<ReadResourceObject<T>>) -> Vec<ResourceObject<T>> {
-    items.sort_by_key(|item| !matches!(item.provenance, ResourceProvenance::Local));
-    items.into_iter().map(|item| item.object).collect()
-}
-
 // Convoy secondary watches cover work/checkouts, not arbitrary PR or artifact
 // records. A bounded retry also handles observation freshness without an event.
 const PROMISE_OBSERVATION_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
@@ -137,9 +131,22 @@ impl ConvoyReconciler {
         let (Some(convoys), Some(vessels)) = (&self.convoys, &self.federated_vessels) else {
             return Ok(None);
         };
-        let convoys = home_first(convoys.list().await?.items);
-        let vessels = home_first(vessels.list().await?.items);
-        Ok(Some(HostOccupancy::count(host, &convoys, &vessels)))
+        let convoys = home_copies_first(convoys.list().await?.items);
+        let vessels = home_copies_first(vessels.list().await?.items);
+        // A convoy not yet bootstrapped names its vessels only in its frozen
+        // workflow snapshot record.
+        let mut workflow_vessels = BTreeMap::new();
+        for convoy in convoys.iter().filter(|convoy| HostOccupancy::needs_workflow_vessels(convoy, host)) {
+            match self.templates.get(pinned_workflow_ref(convoy)).await {
+                Ok(template) => {
+                    workflow_vessels
+                        .insert(convoy.metadata.name.clone(), template.spec.vessels.iter().map(|vessel| vessel.name.clone()).collect());
+                }
+                Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Some(HostOccupancy::count(host, &convoys, &vessels, &workflow_vessels)))
     }
 
     pub fn with_federated_vessels(mut self, vessels: ReplicaReadResolver<Vessel>) -> Self {
@@ -372,9 +379,17 @@ impl Reconciler for ConvoyReconciler {
                         // A capped agentless host admits convoys in admission
                         // order while its live vessels leave room (#3793).
                         let full = match (vessel_cap, canonical.as_ref()) {
-                            (Some(cap), Some(host)) => match self.vessel_occupancy(host.as_str()).await? {
-                                Some(occupancy) => !occupancy.admits(&obj.metadata.name, cap),
-                                None => slots == Some(0),
+                            (Some(cap), Some(host)) => match self.vessel_occupancy(host.as_str()).await {
+                                Ok(Some(occupancy)) => !occupancy.admits(&obj.metadata.name, cap),
+                                Ok(None) => slots == Some(0),
+                                // An unreadable count waits rather than failing the pass.
+                                Err(error) => {
+                                    wait = Some(format!(
+                                        "capacity for fulfilment `{}` on host `{}` is unavailable: cannot count its vessels: {error}",
+                                        selected.kind, selected.host
+                                    ));
+                                    break;
+                                }
                             },
                             _ => slots == Some(0),
                         };

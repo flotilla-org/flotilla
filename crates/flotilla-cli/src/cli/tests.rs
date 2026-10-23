@@ -1067,3 +1067,13 @@ fn slow_convoy_start_prints_attach_later_hint() {
     });
     assert_eq!(output, format!("convoy started: coder@flotilla\nWarning: {notice}"));
 }
+
+// #3793: free slots show the declared cap when a host has one, and an
+// uncounted, uncapped kind reads as unbounded.
+#[test]
+fn vessel_slots_show_the_cap_beside_free_slots() {
+    assert_eq!(super::vessel_slots(Some(0), Some(1)), "0 of 1");
+    assert_eq!(super::vessel_slots(None, Some(2)), "unknown of 2");
+    assert_eq!(super::vessel_slots(Some(3), None), "3");
+    assert_eq!(super::vessel_slots(None, None), "unbounded");
+}

@@ -109,12 +109,15 @@ pub(super) async fn ensure_host_exists(
                         connection: Default::default(),
                         expected_concurrent_rust_crews: existing.spec.expected_concurrent_rust_crews,
                         image_build_capacity: existing.spec.image_build_capacity.clone(),
+                        // This path seeds the local daemon Host only. Agentless
+                        // hosts and their cap are written by
+                        // `register_agentless_ssh_resources`.
                         max_vessels: None,
                     },
                 )
                 .await
                 .map(|_| ())
-                .map_err(|err| err.to_string())
+                .map_err(|err| err.to_string());
         }
         Err(ResourceError::NotFound { .. }) => {}
         Err(err) => return Err(format!("check host {host_name}: {err}")),

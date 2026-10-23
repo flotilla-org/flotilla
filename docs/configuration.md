@@ -202,6 +202,8 @@ max_vessels = 1
 The owning daemon is the only daemon that places on its agentless hosts, and it
 counts their vessels. A vessel holds its slot from its convoy's admission until
 its teardown finishes, so a crash mid-teardown does not free the slot early.
+Every vessel a convoy's workflow places on the host counts, created or not, and
+a host is refused for a convoy that would hold more vessels there than its cap.
 Among otherwise equal hosts, placement prefers the one with the most free
 slots; a host with none is chosen only when no host has room. A convoy admitted
 to a full host waits before provisioning, with "no free vessel slots" in

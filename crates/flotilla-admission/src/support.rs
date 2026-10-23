@@ -1,5 +1,5 @@
 //! Shared admission planning and resource helpers.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use chrono::DateTime;
@@ -33,6 +33,7 @@ use flotilla_resources::Vessel;
 use flotilla_resources::WorkflowTemplate;
 use flotilla_resources::WorkflowTemplateSpec;
 use flotilla_resources::CONVOY_LABEL;
+use flotilla_resources::{home_copies_first, pinned_workflow_ref};
 use flotilla_store::ResourceBackend;
 use flotilla_store::StoreQuery;
 use tracing::warn;
@@ -300,16 +301,46 @@ pub fn agentless_vessel_cap(host: &ResourceObject<ResourceHost>) -> Option<u32> 
     is_agentless_ssh_host(host).then_some(host.spec.max_vessels).flatten()
 }
 
-/// What `host` holds against its cap, read from every convoy and vessel the
-/// store sees. The owning daemon is the only placer on its agentless hosts,
-/// so its store holds every convoy admitted there.
-pub async fn host_occupancy(backend: &ResourceBackend, namespace: &str, host: &str) -> Result<HostOccupancy, String> {
+/// What each of `hosts` holds against its cap, read from every convoy and
+/// vessel the store sees, listed once for all of them. The owning daemon is
+/// the only placer on its agentless hosts, so its store holds every convoy
+/// admitted there.
+pub async fn host_occupancies(
+    backend: &ResourceBackend,
+    namespace: &str,
+    hosts: &BTreeSet<String>,
+) -> Result<BTreeMap<String, HostOccupancy>, String> {
+    if hosts.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     let query = StoreQuery { include_replicas: true, ..Default::default() };
-    let convoys =
-        home_copy_wins_by_name(backend.query_declared::<Convoy>(namespace, &query).await.map_err(|error| error.to_string())?.items);
-    let vessels =
-        home_copy_wins_by_name(backend.query_declared::<Vessel>(namespace, &query).await.map_err(|error| error.to_string())?.items);
-    Ok(HostOccupancy::count(host, &convoys, &vessels))
+    let convoys = home_copies_first(backend.query_declared::<Convoy>(namespace, &query).await.map_err(|error| error.to_string())?.items);
+    let vessels = home_copies_first(backend.query_declared::<Vessel>(namespace, &query).await.map_err(|error| error.to_string())?.items);
+    // A convoy not yet bootstrapped names its vessels only in its frozen
+    // workflow snapshot record.
+    let snapshots = convoys
+        .iter()
+        .filter(|convoy| hosts.iter().any(|host| HostOccupancy::needs_workflow_vessels(convoy, host)))
+        .map(|convoy| (convoy.metadata.name.clone(), pinned_workflow_ref(convoy).to_string()))
+        .collect::<BTreeMap<_, _>>();
+    let templates = backend
+        .definitions::<WorkflowTemplate>(namespace)
+        .list_names(snapshots.values().cloned())
+        .await
+        .map_err(|error| error.to_string())?;
+    let workflow_vessels = snapshots
+        .into_iter()
+        .filter_map(|(convoy, template)| {
+            let template = templates.iter().find(|candidate| candidate.metadata.name == template)?;
+            Some((convoy, template.spec.vessels.iter().map(|vessel| vessel.name.clone()).collect()))
+        })
+        .collect();
+    Ok(hosts.iter().map(|host| (host.clone(), HostOccupancy::count(host, &convoys, &vessels, &workflow_vessels))).collect())
+}
+
+pub async fn host_occupancy(backend: &ResourceBackend, namespace: &str, host: &str) -> Result<HostOccupancy, String> {
+    let mut occupancies = host_occupancies(backend, namespace, &BTreeSet::from([host.to_string()])).await?;
+    Ok(occupancies.remove(host).unwrap_or_default())
 }
 
 pub async fn policy_targets_agentless_ssh(backend: &ResourceBackend, namespace: &str, policy: &ResourceObject<PlacementPolicy>) -> bool {

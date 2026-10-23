@@ -1029,3 +1029,22 @@ async fn placement_prefers_the_capped_host_with_most_free_slots() {
     }
     assert_eq!(hosts, ["b1", "b2"], "the second convoy goes to the host with more free slots");
 }
+
+// #3793: a convoy waits until all its vessels on a host fit, so a host whose
+// cap is smaller than the vessels it would hold is refused rather than left
+// to wait forever.
+#[tokio::test]
+async fn capped_agentless_host_refuses_a_convoy_with_more_vessels_than_its_cap() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = agentless_owner(&backend, &temp).await;
+    agentless_host(&backend, "b1", Some(1)).await;
+    let vessel = |name: &str| flotilla_resources::VesselRequirement::builder().name(name.to_string()).crew(Vec::new()).build();
+    let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("first"), vessel("second")]).build();
+    let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
+    let refused = daemon
+        .resolve_capability_placement("flotilla", "project", &[], &workflow, &BTreeSet::new(), &unpinned)
+        .await
+        .expect_err("two vessels cannot fit a cap of one");
+    assert!(refused.contains("convoy needs 2 vessels here, more than the host's cap of 1"), "{refused}");
+}
