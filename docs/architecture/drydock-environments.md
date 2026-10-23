@@ -29,7 +29,7 @@ Settings are module-owned and passed through unchanged. No Daytona credential
 enters the vessel or its stored Environment record.
 
 Preparation uses `drydock::launch::build_tools_digest()` from the published
-Drydock pin `87e639cf`. The reference suite takes this production digest path.
+Drydock pin `7f14b46c`. The reference suite takes this production digest path.
 
 The base crew image must contain the required agent harnesses, Git, `tar`, `sh`,
 `awk`, and GNU coreutils (`du`, `df`, `stat`, `mktemp`), and support the module's SSH recipe. Opt-in lab forwarding also requires
