@@ -398,6 +398,11 @@ pub trait ProvisionedEnvironment: Send + Sync {
         ProviderReadiness::default()
     }
 
+    /// Advisory health information that does not prevent new sessions.
+    fn health_message(&self) -> Option<String> {
+        None
+    }
+
     fn survivors(&self) -> Option<flotilla_resources::EnvironmentSurvivors> {
         None
     }

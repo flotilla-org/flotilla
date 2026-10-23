@@ -494,6 +494,12 @@ async fn cloud_unknown_does_not_abort_gone_sibling() {
             static IMAGE: std::sync::LazyLock<ImageId> = std::sync::LazyLock::new(|| ImageId::new("cloud"));
             &IMAGE
         }
+        async fn detect_readiness(&self) -> flotilla_environment::environment::ProviderReadiness {
+            flotilla_environment::environment::ProviderReadiness::Ready
+        }
+        fn health_message(&self) -> Option<String> {
+            Some("checkpoint stale: injected failure".into())
+        }
         async fn observe(&self) -> ProviderObservation {
             ProviderObservation::new(self.state.clone())
         }
@@ -526,6 +532,7 @@ async fn cloud_unknown_does_not_abort_gone_sibling() {
             state: ObservationState::Unknown { reason: UnknownReason::GuestUnresponsive },
         }),
         Arc::new(CloudHandle { id: EnvironmentId::new("b-gone"), state: ObservationState::Gone { cause: GoneCause::LifetimeCapReached } }),
+        Arc::new(CloudHandle { id: EnvironmentId::new("c-stale"), state: ObservationState::Running }),
     ];
     let mut state = ControllerRuntimeState::new(
         daemon.clone(),
@@ -567,4 +574,8 @@ async fn cloud_unknown_does_not_abort_gone_sibling() {
     assert!(reconcile_provisioned_environments(&state, NAMESPACE).await.unwrap_err().contains("unknown"));
     assert_eq!(environments.get("a-unknown").await.unwrap().status.unwrap().phase, EnvironmentPhase::Ready);
     assert_eq!(environments.get("b-gone").await.unwrap().status.unwrap().phase, EnvironmentPhase::Lost);
+    let stale = environments.get("c-stale").await.unwrap().status.unwrap();
+    assert!(stale.ready);
+    assert_eq!(stale.phase, EnvironmentPhase::Ready);
+    assert!(stale.message.unwrap().contains("checkpoint stale"));
 }

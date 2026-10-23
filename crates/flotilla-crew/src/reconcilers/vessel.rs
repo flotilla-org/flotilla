@@ -1799,10 +1799,15 @@ fn cloud_environment_spec(
             image: cloud.image.clone(),
             size: cloud.size.clone(),
             lifetime_cap_seconds: None,
-            declared_agent_adapters: docker.declared_agent_adapters,
-            required_agent_adapters: docker.required_agent_adapters,
             probe_needs,
-            env: docker.env,
+            env: {
+                let mut env = docker.env;
+                env.insert(
+                    "FLOTILLA_REQUIRED_AGENT_ADAPTERS".into(),
+                    serde_json::to_string(&docker.required_agent_adapters).expect("adapter names serialize"),
+                );
+                env
+            },
         });
     }
     spec
@@ -2167,8 +2172,8 @@ mod tests {
         );
     }
 
-    // #3765 B2: cloud staging preserves declared settings as typed fields and
-    // leaves only guest variables in env. One example covers this thin mapping.
+    // #3765 B2: cloud staging stores typed probe needs and preserves the existing
+    // adapter env control until per-member preparation lands in #3785. One example covers this thin mapping.
     #[test]
     fn cloud_staging_uses_declared_request_fields() {
         use super::cloud_environment_spec;
@@ -2195,10 +2200,9 @@ mod tests {
         let mapped = cloud_environment_spec(&policy, needs, input);
         assert!(mapped.docker.is_none());
         let cloud = mapped.cloud_sandbox.unwrap();
-        assert_eq!(cloud.declared_agent_adapters.len(), 2);
-        assert_eq!(cloud.required_agent_adapters, ["codex".into()].into_iter().collect());
+        assert_eq!(cloud.env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], r#"["codex"]"#);
         assert_eq!(cloud.probe_needs, ["toolchain:rust".parse().unwrap()].into_iter().collect());
-        assert_eq!(cloud.env, [("LANG".into(), "C.UTF-8".into())].into_iter().collect());
+        assert_eq!(cloud.env["LANG"], "C.UTF-8");
     }
 
     #[test]

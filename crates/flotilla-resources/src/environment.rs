@@ -163,10 +163,6 @@ pub const CLOUD_ADOPTION_RETRY_PREFIX: &str = "adoption setup failed; backing re
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CloudSandboxEnvironmentSpec {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub declared_agent_adapters: BTreeSet<String>,
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub required_agent_adapters: BTreeSet<String>,
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub probe_needs: BTreeSet<crate::CapabilityNeed>,
     pub image: String,
     pub size: CloudSandboxSize,
@@ -185,34 +181,18 @@ impl<'de> Deserialize<'de> for CloudSandboxEnvironmentSpec {
             lifetime_cap_seconds: Option<u64>,
             #[serde(default)]
             env: BTreeMap<String, String>,
-            declared_agent_adapters: Option<BTreeSet<String>>,
-            required_agent_adapters: Option<BTreeSet<String>>,
             probe_needs: Option<BTreeSet<crate::CapabilityNeed>>,
         }
         let mut stored = Stored::deserialize(deserializer)?;
         // ADR 0047: remove one fleet roll after #3765. Lift preceding-generation
         // controls on decode; write only typed fields. Explicit new fields win.
-        let adapters = stored.env.remove("FLOTILLA_REQUIRED_AGENT_ADAPTERS");
         let needs = stored.env.remove("FLOTILLA_CLOUD_IMAGE_NEEDS");
         stored.env.remove("FLOTILLA_DRYDOCK_LAB_FORWARD");
-        let legacy_adapters: BTreeSet<String> = if stored.declared_agent_adapters.is_none() || stored.required_agent_adapters.is_none() {
-            adapters.map(|value| serde_json::from_str(&value)).transpose().map_err(serde::de::Error::custom)?.unwrap_or_default()
-        } else {
-            BTreeSet::new()
-        };
         let probe_needs = match stored.probe_needs {
             Some(needs) => needs,
             None => needs.map(|value| serde_json::from_str(&value)).transpose().map_err(serde::de::Error::custom)?.unwrap_or_default(),
         };
-        Ok(Self {
-            image: stored.image,
-            size: stored.size,
-            lifetime_cap_seconds: stored.lifetime_cap_seconds,
-            env: stored.env,
-            declared_agent_adapters: stored.declared_agent_adapters.unwrap_or_else(|| legacy_adapters.clone()),
-            required_agent_adapters: stored.required_agent_adapters.unwrap_or(legacy_adapters),
-            probe_needs,
-        })
+        Ok(Self { image: stored.image, size: stored.size, lifetime_cap_seconds: stored.lifetime_cap_seconds, env: stored.env, probe_needs })
     }
 }
 
@@ -710,8 +690,6 @@ mod cloud_schema_tests {
         let spec = EnvironmentSpec {
             provider_address: Some("account:test/provider:daytona".parse().unwrap()),
             cloud_sandbox: Some(CloudSandboxEnvironmentSpec {
-                declared_agent_adapters: Default::default(),
-                required_agent_adapters: Default::default(),
                 probe_needs: Default::default(),
                 image: "registry/image@sha256:digest".into(),
                 size: CloudSandboxSize { cpus, memory_bytes, disk_bytes },

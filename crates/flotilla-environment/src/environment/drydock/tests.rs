@@ -94,8 +94,6 @@ impl CommandRunner for ReferenceGuest {
 pub(super) fn spec() -> flotilla_resources::EnvironmentSpec {
     flotilla_resources::EnvironmentSpec {
         cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
-            declared_agent_adapters: Default::default(),
-            required_agent_adapters: Default::default(),
             probe_needs: Default::default(),
             image: format!("example.test/crew@sha256:{}", "a".repeat(64)),
             size: flotilla_resources::CloudSandboxSize { cpus: 1, memory_bytes: 1024, disk_bytes: 1024 },
@@ -173,6 +171,13 @@ async fn reference_lifecycle_through_environment_provider() {
     let private = key_dir(&provider.directory, first.id());
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(std::fs::metadata(&private).unwrap().permissions().mode() & 0o777, 0o700);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !private.join("checkpoint.tar").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     provider.destroy(first.backing_id()).await.unwrap();
     assert!(!private.join("id_ed25519").exists());
     assert!(private.join("checkpoint.tar").exists());
@@ -668,15 +673,29 @@ async fn checkpoint_refresh_failure_reports_stale_health() {
     let prepared = fixture_prepared(&host, &provider).await;
     let id = EnvironmentId::new("checkpoint-health");
     let handle = provider.provision(id.clone(), &prepared, Default::default()).await.unwrap();
-    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !key_dir(&provider.directory, &id).join("checkpoint.tar").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
     for _ in 0..100 {
         tokio::task::yield_now().await;
     }
-    assert!(matches!(handle.detect_readiness().await, ProviderReadiness::Unknown { reason } if reason.contains("checkpoint stale")));
-    assert_eq!(tokio::fs::read(key_dir(&provider.directory, &id).join("checkpoint.tar")).await.unwrap(), b"complete");
     tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while handle.health_message().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(handle.detect_readiness().await, ProviderReadiness::Ready);
+    assert!(handle.health_message().unwrap().contains("checkpoint stale"));
+    assert_eq!(tokio::fs::read(key_dir(&provider.directory, &id).join("checkpoint.tar")).await.unwrap(), b"complete");
     handle.destroy().await.unwrap();
 }
 
@@ -694,4 +713,65 @@ async fn stale_snapshot_absence_is_confirmed_by_inspect() {
     *adopted.watch.state.write().unwrap() = Some(ObservationState::Gone { cause: GoneCause::MissingOnList });
     assert!(matches!(adopted.observe().await.state, ObservationState::Running));
     handle.destroy().await.unwrap();
+}
+
+// A checkpoint can hang or fail without delaying initial setup or re-adoption.
+#[tokio::test]
+async fn adoption_does_not_wait_for_initial_checkpoint() {
+    #[derive(Clone, Default)]
+    struct SlowCheckpoint(Arc<tokio::sync::Notify>);
+    #[async_trait]
+    impl reach::Connector for SlowCheckpoint {
+        async fn connect(&self, _: &dyn ProviderApi, _: &str, _: &str, _: PathBuf) -> Result<Arc<dyn reach::Guest>, String> {
+            Ok(Arc::new(self.clone()))
+        }
+    }
+    #[async_trait]
+    impl reach::Guest for SlowCheckpoint {
+        fn runner(&self) -> Arc<dyn CommandRunner> {
+            Arc::new(self.clone())
+        }
+        async fn configure(&self, _: BTreeMap<String, String>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn deliver(&self, _: EnvironmentToolAsset) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    #[async_trait]
+    impl CommandRunner for SlowCheckpoint {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            ReferenceGuest.run(cmd, args, cwd, label).await
+        }
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            ReferenceGuest.run_output(cmd, args, cwd, label).await
+        }
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            true
+        }
+        async fn run_to_file(&self, _: &str, _: &[&str], _: &Path, _: &Path) -> Result<(), String> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+    let host = HostFixture::start().await;
+    host.ready().await;
+    let slow = SlowCheckpoint::default();
+    let mut provider = host.provider();
+    provider.connector = Arc::new(slow.clone());
+    let prepared = fixture_prepared(&host, &provider).await;
+    let id = EnvironmentId::new("slow-checkpoint");
+    let first =
+        tokio::time::timeout(Duration::from_secs(5), provider.provision(id.clone(), &prepared, Default::default())).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), slow.0.notified()).await.unwrap();
+    drop(first);
+    drop(provider);
+    let mut restarted = host.provider();
+    restarted.connector = Arc::new(slow.clone());
+    let prepared = fixture_prepared(&host, &restarted).await;
+    let adopted =
+        tokio::time::timeout(Duration::from_secs(5), restarted.provision(id, &prepared, Default::default())).await.unwrap().unwrap();
+    assert!(!adopted.created_for_setup());
+    assert_eq!(adopted.detect_readiness().await, ProviderReadiness::Ready);
+    adopted.destroy().await.unwrap();
 }

@@ -6,8 +6,6 @@
     "cloud_sandbox": {
       "image": "example.invalid/crew@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "size": {"cpus": 2, "memory_bytes": 4294967296, "disk_bytes": 21474836480},
-      "declared_agent_adapters": ["claude-code", "codex"],
-      "required_agent_adapters": ["codex"],
       "probe_needs": ["toolchain:rust", "harness:codex>=0.160.0"],
       "env": {"LANG": "C.UTF-8"}
     }

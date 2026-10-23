@@ -390,8 +390,6 @@ fn a_cloud_sandbox_environment_stays_on_the_old_path() {
     let mut cloud = environment_object(false);
     cloud.spec.host_direct = None;
     cloud.spec.cloud_sandbox = Some(CloudSandboxEnvironmentSpec {
-        declared_agent_adapters: Default::default(),
-        required_agent_adapters: Default::default(),
         probe_needs: Default::default(),
         image: "registry/flotilla@sha256:00".into(),
         size: CloudSandboxSize { cpus: 2, memory_bytes: 1 << 30, disk_bytes: 1 << 33 },

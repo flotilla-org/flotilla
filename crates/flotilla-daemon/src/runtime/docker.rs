@@ -711,8 +711,20 @@ impl EnvironmentRuntime for DockerControllerRuntime {
                 host_ref: self.state.local_host_ref.clone(),
                 image: cloud.image.clone(),
                 image_build_ref: None,
-                declared_agent_adapters: cloud.declared_agent_adapters.clone(),
-                required_agent_adapters: cloud.required_agent_adapters.clone(),
+                declared_agent_adapters: cloud
+                    .env
+                    .get("FLOTILLA_REQUIRED_AGENT_ADAPTERS")
+                    .map(|s| serde_json::from_str(s))
+                    .transpose()
+                    .map_err(|_| "invalid required adapter declaration")?
+                    .unwrap_or_default(),
+                required_agent_adapters: cloud
+                    .env
+                    .get("FLOTILLA_REQUIRED_AGENT_ADAPTERS")
+                    .map(|s| serde_json::from_str(s))
+                    .transpose()
+                    .map_err(|_| "invalid required adapter declaration")?
+                    .unwrap_or_default(),
                 pull_policy: Default::default(),
                 memory_policy: Default::default(),
                 mounts: vec![],

@@ -211,15 +211,13 @@ fn cloud_stored_shapes_remain_decodable() {
     assert_eq!(serde_json::to_value(decision).unwrap(), placement);
     // Prior-generation input omits every new field and still decodes.
     let mut old = document["spec"].clone();
-    for field in ["declared_agent_adapters", "required_agent_adapters", "probe_needs"] {
-        old["cloud_sandbox"].as_object_mut().unwrap().remove(field);
-    }
+    old["cloud_sandbox"].as_object_mut().unwrap().remove("probe_needs");
     let old: flotilla_resources::EnvironmentSpec = serde_json::from_value(old).unwrap();
     assert!(old.cloud_sandbox.unwrap().probe_needs.is_empty());
 }
 
 // #3777 review 2 / ADR 0047: previous-generation cloud control entries retain
-// adapter/probe verification after decode, and are never written back into env.
+// probe verification after decode; adapter controls stay in env until #3785.
 // The new fixed fixture supplements the unchanged deployed corpus.
 #[test]
 fn legacy_cloud_controls_lift_into_declared_fields() {
@@ -227,24 +225,25 @@ fn legacy_cloud_controls_lift_into_declared_fields() {
     decode_stored_resource_document(&document).unwrap();
     let spec: flotilla_resources::EnvironmentSpec = serde_json::from_value(document["spec"].clone()).unwrap();
     let cloud = spec.cloud_sandbox.unwrap();
-    assert_eq!(cloud.declared_agent_adapters, ["codex".into()].into_iter().collect());
-    assert_eq!(cloud.required_agent_adapters, cloud.declared_agent_adapters);
+    assert_eq!(cloud.env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], r#"["codex"]"#);
     assert_eq!(cloud.probe_needs.len(), 2);
     let encoded = serde_json::to_value(cloud).unwrap();
-    assert_eq!(encoded["env"], serde_json::json!({"LANG":"C.UTF-8"}));
+    assert_eq!(encoded["env"], serde_json::json!({"LANG":"C.UTF-8", "FLOTILLA_REQUIRED_AGENT_ADAPTERS": "[\"codex\"]"}));
     // Explicit typed fields, including an empty set, take precedence over old
     // controls in a mixed record. Malformed retired controls cannot bypass checks.
     let mut mixed = document["spec"].clone();
-    for field in ["declared_agent_adapters", "required_agent_adapters", "probe_needs"] {
-        mixed["cloud_sandbox"][field] = serde_json::json!([]);
-    }
+    mixed["cloud_sandbox"]["probe_needs"] = serde_json::json!([]);
     let spec: flotilla_resources::EnvironmentSpec = serde_json::from_value(mixed).unwrap();
     let cloud = spec.cloud_sandbox.unwrap();
-    assert!(cloud.declared_agent_adapters.is_empty() && cloud.required_agent_adapters.is_empty() && cloud.probe_needs.is_empty());
-    assert_eq!(cloud.env, [("LANG".into(), "C.UTF-8".into())].into_iter().collect());
-    for field in ["FLOTILLA_REQUIRED_AGENT_ADAPTERS", "FLOTILLA_CLOUD_IMAGE_NEEDS"] {
-        let mut invalid = document["spec"].clone();
-        invalid["cloud_sandbox"]["env"][field] = serde_json::json!("invalid JSON");
-        assert!(serde_json::from_value::<flotilla_resources::EnvironmentSpec>(invalid).is_err());
-    }
+    assert!(cloud.probe_needs.is_empty());
+    assert_eq!(cloud.env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], r#"["codex"]"#);
+    let mut invalid = document["spec"].clone();
+    invalid["cloud_sandbox"]["env"]["FLOTILLA_CLOUD_IMAGE_NEEDS"] = serde_json::json!("invalid JSON");
+    assert!(serde_json::from_value::<flotilla_resources::EnvironmentSpec>(invalid).is_err());
+    // Adapter syntax remains the provisioning consumer's concern, as on main;
+    // the cloud decode shim must neither parse nor remove this env entry.
+    let mut adapter_control = document["spec"].clone();
+    adapter_control["cloud_sandbox"]["env"]["FLOTILLA_REQUIRED_AGENT_ADAPTERS"] = serde_json::json!("opaque adapter control");
+    let decoded: flotilla_resources::EnvironmentSpec = serde_json::from_value(adapter_control).unwrap();
+    assert_eq!(decoded.cloud_sandbox.unwrap().env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], "opaque adapter control");
 }

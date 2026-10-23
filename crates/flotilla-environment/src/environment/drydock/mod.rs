@@ -300,13 +300,16 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                     &flotilla_provider_runtime::ChannelLabel::Default,
                 )
                 .await?;
+            // Checkpoints are advisory recovery material. Neither the first archive
+            // nor a refresh may delay adoption or trigger setup rollback.
             let checkpoint = keydir.join("checkpoint.tar");
-            write_checkpoint(connection.runner(), &checkpoint, &handle.capabilities.workspace_root).await?;
             let weak = Arc::downgrade(&handle);
             let root = handle.capabilities.workspace_root.clone();
             *handle.checkpoint.lock().expect("checkpoint task") = Some(tokio::spawn(async move {
+                let mut refresh = tokio::time::interval(Duration::from_secs(30));
+                refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    refresh.tick().await;
                     let Some(handle) = weak.upgrade() else {
                         break;
                     };
@@ -319,6 +322,8 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                     }
                     .await;
                     *handle.checkpoint_error.write().expect("checkpoint health") = result.err();
+                    // Do not hold the environment alive while waiting for the next refresh.
+                    drop(handle);
                 }
             }));
             Ok::<_, String>(())
@@ -537,10 +542,10 @@ impl DrydockEnvironment {
 #[async_trait]
 impl ProvisionedEnvironment for DrydockEnvironment {
     async fn detect_readiness(&self) -> ProviderReadiness {
-        match self.checkpoint_error.read().expect("checkpoint health").clone() {
-            Some(reason) => ProviderReadiness::Unknown { reason: format!("checkpoint stale: {reason}") },
-            None => ProviderReadiness::Ready,
-        }
+        ProviderReadiness::Ready
+    }
+    fn health_message(&self) -> Option<String> {
+        self.checkpoint_error.read().expect("checkpoint health").clone().map(|reason| format!("checkpoint stale: {reason}"))
     }
     fn created_for_setup(&self) -> bool {
         self.created_for_setup.load(std::sync::atomic::Ordering::Acquire)

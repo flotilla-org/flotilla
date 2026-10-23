@@ -21,13 +21,14 @@ struct Provider {
 }
 
 pub fn split_configuration(text: &str) -> Result<(String, BTreeMap<String, LabReach>), String> {
-    let mut document: toml::Table = toml::from_str(text).map_err(|_| "invalid drydock TOML configuration")?;
-    let integration: Integration = document
-        .remove("flotilla")
-        .map(|value| value.try_into())
-        .transpose()
-        .map_err(|_| "invalid Flotilla Drydock settings")?
-        .unwrap_or_default();
+    let mut document: toml::Table = toml::from_str(text).map_err(|error| format!("invalid drydock TOML configuration: {error}"))?;
+    #[derive(Deserialize)]
+    struct Settings {
+        #[serde(default)]
+        flotilla: Integration,
+    }
+    let integration = toml::from_str::<Settings>(text).map_err(|error| format!("invalid Flotilla Drydock settings: {error}"))?.flotilla;
+    document.remove("flotilla");
     let mut reach = BTreeMap::new();
     for (name, provider) in integration.provider {
         if let Some(lab) = provider.lab_reach {
@@ -43,6 +44,14 @@ pub fn split_configuration(text: &str) -> Result<(String, BTreeMap<String, LabRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn errors_preserve_source_location() {
+        for text in ["[provider\n", "[flotilla.provider.daytona.lab_reach]\nhostname='host'\nport='wrong'\n"] {
+            let error = split_configuration(text).unwrap_err();
+            assert!(error.contains("line ") && error.contains("column "), "{error}");
+        }
+    }
+
     // #3765 B2: controller reach is host-local and never becomes provider or
     // guest settings. Generated ports cover invalid zero and the valid range.
     #[hegel::test]

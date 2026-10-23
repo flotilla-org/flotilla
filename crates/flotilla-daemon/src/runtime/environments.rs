@@ -331,6 +331,7 @@ async fn reconcile_cloud_environment(
                             state,
                             namespace,
                             &environment.metadata.name,
+                            false,
                             Some(format!("Unknown: adoption failed; will retry: {error}")),
                         )
                         .await?;
@@ -338,11 +339,14 @@ async fn reconcile_cloud_environment(
                     }
                 }
                 let health = handle.detect_readiness().await;
+                let ready = matches!(health, flotilla_environment::environment::ProviderReadiness::Ready);
                 let message = match health {
                     flotilla_environment::environment::ProviderReadiness::Unknown { reason } => Some(reason),
-                    _ => None,
+                    flotilla_environment::environment::ProviderReadiness::MissingTool { reason }
+                    | flotilla_environment::environment::ProviderReadiness::MissingCredential { reason } => Some(reason),
+                    flotilla_environment::environment::ProviderReadiness::Ready => handle.health_message(),
                 };
-                record_cloud_health(state, namespace, &environment.metadata.name, message).await?;
+                record_cloud_health(state, namespace, &environment.metadata.name, ready, message).await?;
                 Ok(())
             }
             ObservationState::Gone { cause } => {
@@ -361,7 +365,7 @@ async fn reconcile_cloud_environment(
             }
             ObservationState::Unknown { reason } => {
                 let message = format!("cloud sandbox observation unknown: {reason:?}");
-                record_cloud_health(state, namespace, &environment.metadata.name, Some(message.clone())).await?;
+                record_cloud_health(state, namespace, &environment.metadata.name, false, Some(message.clone())).await?;
                 Err(message)
             }
         },
@@ -378,11 +382,16 @@ async fn reconcile_cloud_environment(
     }
 }
 
-async fn record_cloud_health(state: &ControllerRuntimeState, namespace: &str, name: &str, message: Option<String>) -> Result<(), String> {
+async fn record_cloud_health(
+    state: &ControllerRuntimeState,
+    namespace: &str,
+    name: &str,
+    ready: bool,
+    message: Option<String>,
+) -> Result<(), String> {
     let environments = state.daemon.resource_backend().using::<Environment>(namespace);
     let current = environments.get(name).await.map_err(|e| e.to_string())?;
     let mut status = current.status.clone().unwrap_or_default();
-    let ready = message.is_none();
     if status.message != message || status.ready != ready {
         status.message = message;
         status.ready = ready;
@@ -540,4 +549,6 @@ pub(super) async fn mark_unavailable_environment(
     Ok(())
 }
 
-pub(super) const ENVIRONMENT_ADOPTION_TIMEOUT: Duration = Duration::from_secs(30);
+// Allow the 60-second SSH/agent connect budget plus asset and credential setup.
+// Checkpoint streaming runs independently of adoption.
+pub(super) const ENVIRONMENT_ADOPTION_TIMEOUT: Duration = Duration::from_secs(120);

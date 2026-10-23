@@ -711,8 +711,6 @@ async fn cloud_ready_and_finalization_use_generic_backing() {
             &EnvironmentSpec {
                 provider_address: Some("account:daytona/provider:daytona".parse().unwrap()),
                 cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
-                    declared_agent_adapters: Default::default(),
-                    required_agent_adapters: Default::default(),
                     probe_needs: Default::default(),
                     image: "image@sha256:digest".into(),
                     size: flotilla_resources::CloudSandboxSize { cpus: 2, memory_bytes: 1024, disk_bytes: 1024 },

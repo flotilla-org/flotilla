@@ -98,14 +98,17 @@ ADR 0044's amendment, and is replaced by #3312.
 A lifetime cap maps to `Gone`, and hence lost work, rather than a resumable stop.
 Unknown observations stay unknown. Event cursors resume after disconnect;
 incomplete snapshots never imply absence. Restart adoption re-enters idempotent
-provisioning to restore tools, credential staging and forwards together.
+provisioning to restore tools, credential staging and forwards together. Adoption
+has a 120-second budget to allow the 60-second SSH/agent connection and setup.
 
 The protocol currently offers no promise that Daytona storage outlives its cap,
-so survivors use a controller checkpoint. It is refreshed every 30 seconds and
+so survivors use a controller checkpoint. The first checkpoint runs in the
+background after setup, outside the adoption path; it is then refreshed every 30 seconds and
 includes the checkout, agent homes and cleat state. Status stores only its
 reference. Build outputs and caches are excluded; apparent input size and the
 exact staged archive size are checked before streaming. Failed refreshes retain
-the previous complete archive and report stale health in Environment status; destruction
+the previous complete archive and report stale health in Environment status
+without clearing readiness or preventing new terminal sessions. Destruction
 keeps that archive for the convoy's continue/abandon decision and removes its
 SSH keys. The archive is capped at 512 MiB, lives in a validated 0700 directory
 with 0600 permissions, and includes staged credentials. Until #3744 adds managed
