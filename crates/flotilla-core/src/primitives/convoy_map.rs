@@ -17,6 +17,8 @@
 //!   label, a crew's own id) is labelled by its id. A label already taken is
 //!   refused, never qualified: [`clash`] at admission, the crew verbs after.
 //!   [`old_id`] gives back the id crews submit against on the old path.
+//!   Only the import qualifies a label by its seat ([`imported_label`]),
+//!   for old ids that repeat across crews.
 //! - **Targets**: a promise is about its convoy's work, so its target is the
 //!   convoy's address.
 //! - **Submissions**: a `pr` submission is its change request's address at
@@ -116,11 +118,33 @@ pub fn label(seat: &SeatName, id: &str, kind: OldKind, source: OldSource) -> Str
 }
 
 /// The id a crew submits an engine promise against on the old path: a
-/// template promise's `template/<kind>`, else its label.
+/// template promise's `template/<kind>`, else its label less any import
+/// qualifier.
 pub fn old_id(promise: &Promise) -> String {
     match promise.source {
         PromiseSource::Template => format!("template/{}", promise.kind),
-        PromiseSource::Dispatch | PromiseSource::Crew => promise.label.clone(),
+        PromiseSource::Dispatch | PromiseSource::Crew => unqualified(&promise.label).to_owned(),
+    }
+}
+
+/// An imported label's old id: the label, less any seat qualifier. No old
+/// id starts with `@`.
+fn unqualified(label: &str) -> &str {
+    match label.strip_prefix('@').and_then(|rest| rest.split_once('/')) {
+        Some((_, id)) => id,
+        None => label,
+    }
+}
+
+/// The label an imported old promise gets (layer 9 only, #3721 look-over
+/// ruling): its old id while no other crew of the convoy uses that id, else
+/// qualified by its seat, `@<role>[~<seat>]/<id>`. Old records named promises
+/// per crew, so this keeps their ids; a new declaration is never qualified.
+pub fn imported_label(seat: &SeatName, id: &str, repeated: bool) -> String {
+    if repeated {
+        format!("@{}/{id}", seat_key(seat))
+    } else {
+        id.to_owned()
     }
 }
 
