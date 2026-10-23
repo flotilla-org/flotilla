@@ -3005,6 +3005,7 @@ impl AdmissionReadContext<'_> {
                 workflow.vessels[index] = one.vessels.remove(0);
                 if let Some(selected) = resolution.selected.as_ref() {
                     let decision = PlacementDecision {
+                        provider_workspace_root: crate::support::provider_workspace_root(&self.backend, namespace, selected).await?,
                         minimal_alternatives: alternatives.clone(),
                         escalation_reason: intent.escalation_reason.clone(),
                         policy_name: selected.metadata.name.clone(),
@@ -3058,6 +3059,7 @@ impl AdmissionReadContext<'_> {
                 image_builds.extend(builds);
                 let decision = match result.0.selected.as_ref() {
                     Some(selected) => Some(PlacementDecision {
+                        provider_workspace_root: crate::support::provider_workspace_root(&self.backend, namespace, selected).await?,
                         minimal_alternatives: result.1.clone(),
                         escalation_reason: intent.escalation_reason.clone(),
                         policy_name: selected.metadata.name.clone(),
@@ -3334,6 +3336,7 @@ impl AdmissionReadContext<'_> {
         let placement_policy = placement.selected.as_ref().map(|placement| placement.metadata.name.clone());
         let placement_decision = match placement.selected.as_ref() {
             Some(selected) => Some(PlacementDecision {
+                provider_workspace_root: crate::support::provider_workspace_root(&self.backend, namespace, selected).await?,
                 minimal_alternatives,
                 escalation_reason: intent.escalation_reason.clone(),
                 policy_name: selected.metadata.name.clone(),
@@ -5542,6 +5545,7 @@ mod tests {
                 .spec(ConvoySpec::builder().workflow_ref("scratch".into()).build())
                 .workflow(WorkflowTemplateSpec::builder().build())
                 .placement_decision(PlacementDecision {
+                    provider_workspace_root: None,
                     policy_name: "remote-policy".into(),
                     target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("remote"), display_name: "remote".into() },
                     minimal_alternatives: Vec::new(),

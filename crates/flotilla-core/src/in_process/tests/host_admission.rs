@@ -381,6 +381,7 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
         .check_remote_placement_free_space_floor(
             "flotilla",
             Some(&PlacementDecision {
+                provider_workspace_root: None,
                 minimal_alternatives: Vec::new(),
                 escalation_reason: None,
                 policy_name: "self-targeted".to_string(),
@@ -482,6 +483,7 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
         .check_remote_placement_free_space_floor(
             "flotilla",
             Some(&PlacementDecision {
+                provider_workspace_root: None,
                 minimal_alternatives: Vec::new(),
                 escalation_reason: None,
                 policy_name: "self-targeted".to_string(),
@@ -621,6 +623,7 @@ async fn admitting_host_floor_gates_only_work_that_lands_on_it() {
     .await;
     let local = daemon.local_host_id().expect("host id").to_string();
     let decision = |host: &str| PlacementDecision {
+        provider_workspace_root: None,
         policy_name: format!("host-direct-{host}"),
         target_host: PlacementTargetHost { reference: flotilla_protocol::CanonicalHostId::resolved(host), display_name: host.into() },
         minimal_alternatives: Vec::new(),

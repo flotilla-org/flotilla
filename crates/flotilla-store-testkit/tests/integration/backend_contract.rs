@@ -660,6 +660,7 @@ async fn admission_placement_is_published_with_convoy(#[case] adapter: &str) {
     let (backend, _fixture) = backend(adapter).await;
     let convoys = backend.using::<Convoy>("flotilla");
     let decision = PlacementDecision {
+        provider_workspace_root: None,
         policy_name: "admitted".into(),
         target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("home"), display_name: "Home".into() },
         minimal_alternatives: vec!["other-policy".into()],

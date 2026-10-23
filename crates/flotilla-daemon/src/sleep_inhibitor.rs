@@ -683,6 +683,7 @@ mod tests {
                 &ConvoyStatus {
                     phase,
                     placement_decision: target_host.map(|host| PlacementDecision {
+                        provider_workspace_root: None,
                         minimal_alternatives: Vec::new(),
                         escalation_reason: None,
                         policy_name: "test-policy".to_string(),
@@ -857,6 +858,7 @@ mod tests {
                 &ConvoyStatus {
                     phase: ConvoyPhase::Active,
                     placement_decision: Some(PlacementDecision {
+                        provider_workspace_root: None,
                         minimal_alternatives: Vec::new(),
                         escalation_reason: None,
                         policy_name: "test-policy".to_string(),

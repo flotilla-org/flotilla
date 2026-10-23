@@ -524,7 +524,7 @@ impl Reconciler for VesselReconciler {
             Err(message) => return Ok(VesselPrepared::failed(message)),
         };
         if placement_policy.spec.cloud_sandbox_per_vessel.is_some() {
-            let Some(root) = placement_policy.metadata.labels.get("flotilla.work/provider-workspace-root") else {
+            let Some(root) = placement_decision.as_ref().and_then(|decision| decision.provider_workspace_root.as_ref()) else {
                 return Ok(VesselPrepared::failed("cloud provider workspace root missing from frozen placement"));
             };
             if let PlacementStrategy::CloneInVessel { clone_path, .. } = &mut strategy {
@@ -552,7 +552,7 @@ impl Reconciler for VesselReconciler {
         };
         // A composed image installs exactly the harnesses its roles resolve
         // to; interior discovery verifies them instead of the policy's list.
-        if composed_image(&placement_policy, None).is_some() {
+        if composed_image(&placement_policy, None).is_some() || placement_policy.spec.cloud_sandbox_per_vessel.is_some() {
             declared_agent_adapters.clone_from(&required_adapters);
         }
         let effective_stance = strategy.effective_stance();
@@ -662,6 +662,13 @@ impl Reconciler for VesselReconciler {
                             meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
                             spec: cloud_environment_spec(
                                 &placement_policy,
+                                requirement
+                                    .crew
+                                    .iter()
+                                    .flat_map(|crew| &crew.needs)
+                                    .filter(|need| need.requires_guest_probe())
+                                    .cloned()
+                                    .collect(),
                                 EnvironmentSpec {
                                     cloud_sandbox: None,
                                     provider_address: Some(
@@ -695,18 +702,6 @@ impl Reconciler for VesselReconciler {
                                         env: environment_with_credentials(
                                             {
                                                 let mut env = env.clone();
-                                                if placement_policy.spec.cloud_sandbox_per_vessel.is_some() {
-                                                    let needs = requirement
-                                                        .crew
-                                                        .iter()
-                                                        .flat_map(|crew| &crew.needs)
-                                                        .filter(|need| need.requires_guest_probe())
-                                                        .collect::<BTreeSet<_>>();
-                                                    env.insert(
-                                                        "FLOTILLA_CLOUD_IMAGE_NEEDS".into(),
-                                                        serde_json::to_string(&needs).expect("probe needs serialize"),
-                                                    );
-                                                }
                                                 env.insert(
                                                     "FLOTILLA_CREW_SKILLS".to_string(),
                                                     serde_json::to_string(
@@ -1162,6 +1157,13 @@ impl Reconciler for VesselReconciler {
                             meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
                             spec: cloud_environment_spec(
                                 &placement_policy,
+                                requirement
+                                    .crew
+                                    .iter()
+                                    .flat_map(|crew| &crew.needs)
+                                    .filter(|need| need.requires_guest_probe())
+                                    .cloned()
+                                    .collect(),
                                 EnvironmentSpec {
                                     cloud_sandbox: None,
                                     provider_address: Some(
@@ -1779,7 +1781,11 @@ fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &s
 
 // The existing contained staging plan is runtime-only. Persist the approved
 // cloud input, never a Docker input, for a cloud policy.
-fn cloud_environment_spec(policy: &ResourceObject<PlacementPolicy>, mut spec: EnvironmentSpec) -> EnvironmentSpec {
+fn cloud_environment_spec(
+    policy: &ResourceObject<PlacementPolicy>,
+    probe_needs: BTreeSet<flotilla_resources::CapabilityNeed>,
+    mut spec: EnvironmentSpec,
+) -> EnvironmentSpec {
     if let Some(cloud) = &policy.spec.cloud_sandbox_per_vessel {
         let docker = spec.docker.take().expect("contained staging input");
         if let Some(instance) = environment_provider_labels(policy).get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL) {
@@ -1793,14 +1799,10 @@ fn cloud_environment_spec(policy: &ResourceObject<PlacementPolicy>, mut spec: En
             image: cloud.image.clone(),
             size: cloud.size.clone(),
             lifetime_cap_seconds: None,
-            env: {
-                let mut env = docker.env;
-                env.insert(
-                    "FLOTILLA_REQUIRED_AGENT_ADAPTERS".into(),
-                    serde_json::to_string(&docker.required_agent_adapters).expect("adapter names serialize"),
-                );
-                env
-            },
+            declared_agent_adapters: docker.declared_agent_adapters,
+            required_agent_adapters: docker.required_agent_adapters,
+            probe_needs,
+            env: docker.env,
         });
     }
     spec
@@ -2165,9 +2167,44 @@ mod tests {
         );
     }
 
+    // #3765 B2: cloud staging preserves declared settings as typed fields and
+    // leaves only guest variables in env. One example covers this thin mapping.
+    #[test]
+    fn cloud_staging_uses_declared_request_fields() {
+        use super::cloud_environment_spec;
+        use flotilla_resources::{EnvironmentSpec, ResourceObject};
+        let policy: ResourceObject<PlacementPolicy> = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "cloud", "namespace": "flotilla", "resource_version": "1", "labels": {}, "annotations": {}, "creation_timestamp": "2026-10-23T00:00:00Z" },
+            "spec": { "pool": "cleat", "cloud_sandbox_per_vessel": {
+                "image": "image@sha256:digest", "size": { "cpus": 2, "memory_bytes": 1024, "disk_bytes": 2048 },
+                "checkout": "clone_in_vessel", "env": {} }
+            }
+        }))
+        .unwrap();
+        let input = EnvironmentSpec {
+            docker: Some(
+                serde_json::from_value(serde_json::json!({
+                    "host_ref": "controller", "image": "carrier", "declared_agent_adapters": ["codex", "claude-code"],
+                    "required_agent_adapters": ["codex"], "env": { "LANG": "C.UTF-8" }
+                }))
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let needs = ["toolchain:rust".parse().unwrap()].into_iter().collect();
+        let mapped = cloud_environment_spec(&policy, needs, input);
+        assert!(mapped.docker.is_none());
+        let cloud = mapped.cloud_sandbox.unwrap();
+        assert_eq!(cloud.declared_agent_adapters.len(), 2);
+        assert_eq!(cloud.required_agent_adapters, ["codex".into()].into_iter().collect());
+        assert_eq!(cloud.probe_needs, ["toolchain:rust".parse().unwrap()].into_iter().collect());
+        assert_eq!(cloud.env, [("LANG".into(), "C.UTF-8".into())].into_iter().collect());
+    }
+
     #[test]
     fn waiting_message_replaces_the_structured_host_direct_environment_name() {
         let decision = PlacementDecision {
+            provider_workspace_root: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
             policy_name: "host-direct-test".to_string(),
@@ -2201,6 +2238,7 @@ mod tests {
             })
             .build();
         let decision = PlacementDecision {
+            provider_workspace_root: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
             policy_name: "host-direct-udder".to_string(),

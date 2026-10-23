@@ -305,7 +305,7 @@ pub async fn resolve_placement_provider(
     backend: &ResourceBackend,
     namespace: &str,
     policy: &mut ResourceObject<PlacementPolicy>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
     use flotilla_protocol::provider::ProviderAdvertisement;
     let target = placement_target_host(backend, namespace, policy).await?;
@@ -332,12 +332,21 @@ pub async fn resolve_placement_provider(
         if !selected.capabilities.workspace_root.to_string_lossy().starts_with('/') {
             return Err("cloud provider workspace root must be absolute".into());
         }
-        policy
-            .metadata
-            .labels
-            .insert("flotilla.work/provider-workspace-root".into(), selected.capabilities.workspace_root.to_string_lossy().into_owned());
+        return Ok(Some(selected.capabilities.workspace_root.to_string_lossy().into_owned()));
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Freeze only cloud guest roots in placement decisions, never metadata labels.
+pub async fn provider_workspace_root(
+    backend: &ResourceBackend,
+    namespace: &str,
+    policy: &ResourceObject<PlacementPolicy>,
+) -> Result<Option<String>, String> {
+    if policy.spec.cloud_sandbox_per_vessel.is_none() {
+        return Ok(None);
+    }
+    resolve_placement_provider(backend, namespace, &mut policy.clone()).await
 }
 
 pub async fn placement_actuator_host_ref(

@@ -191,3 +191,29 @@ fn previous_generation_crew_claims_decode_without_ledger_digest() {
     assert!(state.decision_ledger_digest.is_none());
     assert!(state.superseded_claims[0].decision_ledger_digest.is_none());
 }
+
+// #3765: additive fixed fixtures supplement, never regenerate, the deployed
+// corpus. Stored descriptors make these protocol types subject to ADR 0047.
+#[test]
+fn cloud_stored_shapes_remain_decodable() {
+    for fixture in [include_str!("../fixtures/cloud-vessel-placement.json"), include_str!("../fixtures/cloud-convoy-placement.json")] {
+        let document: Value = serde_json::from_str(fixture).unwrap();
+        decode_stored_resource_document(&document).expect("embedded cloud placement decision");
+    }
+    let document: Value = serde_json::from_str(include_str!("../fixtures/cloud-environment.json")).unwrap();
+    decode_stored_resource_document(&document).expect("cloud Environment spec and status");
+    let spec: flotilla_resources::EnvironmentSpec = serde_json::from_value(document["spec"].clone()).unwrap();
+    assert_eq!(serde_json::to_value(&spec).unwrap()["cloud_sandbox"], document["spec"]["cloud_sandbox"]);
+    let status: flotilla_resources::EnvironmentStatus = serde_json::from_value(document["status"].clone()).unwrap();
+    assert_eq!(serde_json::to_value(status).unwrap()["provider_descriptor"], document["status"]["provider_descriptor"]);
+    let placement: Value = serde_json::from_str(include_str!("../fixtures/cloud-placement-decision.json")).unwrap();
+    let decision: flotilla_protocol::PlacementDecision = serde_json::from_value(placement.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decision).unwrap(), placement);
+    // Prior-generation input omits every new field and still decodes.
+    let mut old = document["spec"].clone();
+    for field in ["declared_agent_adapters", "required_agent_adapters", "probe_needs"] {
+        old["cloud_sandbox"].as_object_mut().unwrap().remove(field);
+    }
+    let old: flotilla_resources::EnvironmentSpec = serde_json::from_value(old).unwrap();
+    assert!(old.cloud_sandbox.unwrap().probe_needs.is_empty());
+}

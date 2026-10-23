@@ -131,6 +131,9 @@ Rules:
 
 ### Stored shape
 
+- the interim cloud-sandbox fields as approved here, with checkout strategy inside the cloud-sandbox policy input until #3108.
+- a provider's settings are declared fields of its request, never entries smuggled through the guest environment map.
+
 - **Docker's stored fields fold into the kind-neutral shape once,** when Environment moves to the generated tables (#3108), with the schema review.
 - **Until then, new kinds use additive fields only:** `spec.provider` (instance, two-level kind, class inputs), `status.backing_id`, and matching PlacementPolicy and FulfilmentKind variants. These are ADR 0047 defaults with no shim to remove.
 - **Target outline for the schema review:**

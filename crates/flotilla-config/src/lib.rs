@@ -5,6 +5,7 @@
 //! C-free base crate. Depend only on base types (protocol, paths, resources);
 //! never on provider runtime, discovery, VCS, core, storage or composition
 //! roots. The build-graph gate enforces the same upward-dependency prohibition.
+pub mod drydock;
 pub mod dummy_fleet;
 pub mod forge_override;
 pub mod log_file;

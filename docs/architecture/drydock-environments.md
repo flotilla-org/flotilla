@@ -28,18 +28,20 @@ host binaries and missing/rejected credentials remain advertised as not-ready.
 Settings are module-owned and passed through unchanged. No Daytona credential
 enters the vessel or its stored Environment record.
 
-Preparation uses only `drydock::launch::build_tools_digest()`. At the initial
-pinned revision, `crates/drydock/tools-image.txt` is `unpublished`; preparation
-therefore refuses until the dependency is updated to a published Drydock pin,
-or the operator supplies Drydock's documented `DRYDOCK_TOOLS_IMAGE` override
-when building Flotilla and its companions. Flotilla never selects
-a substitute tools image. Reference-module tests explicitly assert this refusal
-and use reference fixture tools for the remaining lifecycle/conformance checks.
+Preparation uses `drydock::launch::build_tools_digest()` from the published
+Drydock pin `87e639cf`. The reference suite takes this production digest path.
 
 The base crew image must contain the required agent harnesses, Git, `tar`, `sh`,
 and support the module's SSH recipe. Opt-in lab forwarding also requires
-`socat`. Set `FLOTILLA_DRYDOCK_LAB_FORWARD=1` in the cloud policy's `env`
-for convoys that need the lab service. Interim lab forwarding binds
+`socat`. Configure lab reach in host-local `drydock.toml`:
+
+```toml
+[flotilla.provider.daytona.lab_reach]
+hostname = "forgejo.lab.flotilla.work"
+port = 443
+```
+
+These controller settings never enter the guest environment. Interim lab forwarding binds
 loopback port 443 and writes `/etc/hosts`, so this slice requires root in the
 vessel. Drydock appends and starts its agent; Flotilla delivers its CLI, cleat,
 initial agent material and per-crew forge/model credentials through that agent.
@@ -61,7 +63,7 @@ cloud_sandbox_per_vessel:
     memory_bytes: 4294967296
     disk_bytes: 21474836480
   checkout: clone_in_vessel
-  env: { FLOTILLA_DRYDOCK_LAB_FORWARD: "1" }
+  env: {}
 ```
 
 Admission resolves a unique controlling Host from its provider advertisements.
@@ -101,7 +103,9 @@ provisioning to restore tools, credential staging and forwards together.
 The protocol currently offers no promise that Daytona storage outlives its cap,
 so survivors use a controller checkpoint. It is refreshed every 30 seconds and
 includes the checkout, agent homes and cleat state. Status stores only its
-reference. Failed refreshes retain the previous complete archive; destruction
+reference. Build outputs and caches are excluded; apparent input size and the
+exact staged archive size are checked before streaming. Failed refreshes retain
+the previous complete archive and report stale health in Environment status; destruction
 keeps that archive for the convoy's continue/abandon decision and removes its
 SSH keys. The archive is capped at 512 MiB, lives in a validated 0700 directory
 with 0600 permissions, and includes staged credentials. Until #3744 adds managed

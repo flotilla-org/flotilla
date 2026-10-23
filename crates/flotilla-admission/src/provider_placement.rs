@@ -173,6 +173,55 @@ mod tests {
         spec.provider_requirements = Some(ProviderRequirements { class: Some(class), ..Default::default() });
         spec
     }
+    // #3765: cloud admission requires exactly one controller, validates the
+    // guest's POSIX root, and freezes that root without a metadata label.
+    // Generate absent, unique, duplicate controllers and relative roots.
+    #[hegel::test]
+    fn cloud_controller_selection_is_unique_and_root_is_absolute(tc: hegel::TestCase) {
+        use flotilla_resources::{Host, HostSpec, HostStatus, InputMeta, PlacementPolicy, ENVIRONMENT_PROVIDERS_CAPABILITY};
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+        let absolute = tc.draw(gs::booleans());
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+            for i in 0..count {
+                let hosts = backend.using::<Host>("flotilla");
+                let host = hosts
+                    .create(
+                        &InputMeta::builder().name(format!("controller-{i}")).build(),
+                        &HostSpec { display_name: format!("controller-{i}"), ..Default::default() },
+                    )
+                    .await
+                    .unwrap();
+                let mut declaration = provider(EnvironmentClass::CloudSandbox);
+                declaration.capabilities.workspace_root = if absolute { "/guest/work" } else { "relative/work" }.into();
+                hosts
+                    .update_status(
+                        &host.metadata.name,
+                        &host.metadata.resource_version,
+                        &HostStatus {
+                            capabilities: [(ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::to_value(vec![declaration]).unwrap())]
+                                .into_iter()
+                                .collect(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut policy = backend
+                .using::<PlacementPolicy>("flotilla")
+                .create(&InputMeta::builder().name("cloud".into()).build(), &policy(EnvironmentClass::CloudSandbox))
+                .await
+                .unwrap();
+            let result = crate::support::resolve_placement_provider(&backend, "flotilla", &mut policy).await;
+            assert_eq!(result.is_ok(), count == 1 && absolute);
+            if count == 1 && absolute {
+                assert_eq!(result.unwrap().as_deref(), Some("/guest/work"));
+            }
+            assert!(!policy.metadata.labels.contains_key("flotilla.work/provider-workspace-root"));
+        });
+    }
+
     fn provider(class: EnvironmentClass) -> ProviderAdvertisement {
         ProviderAdvertisement {
             instance: "sandbox".into(),

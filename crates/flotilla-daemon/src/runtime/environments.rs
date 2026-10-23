@@ -61,12 +61,22 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
         .items;
     let local_host_id = CanonicalHostId::resolved(&state.local_host_ref);
     let mut environments = Vec::new();
+    let mut cloud_reconciliations = tokio::task::JoinSet::new();
     for environment in candidates {
         if environment.spec.cloud_sandbox.is_some() {
             if environment.spec.provider_address.as_ref().is_some_and(|address| state.environment_providers.get(address).is_ok())
                 && environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Ready)
             {
-                reconcile_cloud_environment(state, namespace, &environment).await?;
+                let state = Arc::clone(state);
+                let namespace = namespace.to_owned();
+                cloud_reconciliations.spawn(async move {
+                    match tokio::time::timeout(ENVIRONMENT_ADOPTION_TIMEOUT, reconcile_cloud_environment(&state, &namespace, &environment))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(format!("cloud environment {} adoption timed out; will retry", environment.metadata.name)),
+                    }
+                });
             }
             continue;
         }
@@ -98,7 +108,7 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
         if observed {
             state.local_backing_observed.store(true, Ordering::Release);
         }
-        return Ok(());
+        return collect_cloud_reconciliations(cloud_reconciliations, Vec::new()).await;
     }
     let mut inventories = HashMap::new();
     let mut reconciliations = Vec::new();
@@ -155,9 +165,33 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
         }
     }))
     .await;
+    // Cloud uncertainty must not suppress the successful Docker inventory
+    // barrier used by standing-convoy teardown.
+    if results.iter().all(Result::is_ok) {
+        state.local_backing_observed.store(true, Ordering::Release);
+    }
+    let mut results = results;
+    if let Err(error) = collect_cloud_reconciliations(cloud_reconciliations, Vec::new()).await {
+        results.push(Err(error));
+    }
     let errors = results.into_iter().filter_map(Result::err).collect::<Vec<_>>();
     if errors.is_empty() {
         state.local_backing_observed.store(true, Ordering::Release);
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+async fn collect_cloud_reconciliations(mut jobs: tokio::task::JoinSet<Result<(), String>>, mut errors: Vec<String>) -> Result<(), String> {
+    while let Some(result) = jobs.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    if errors.is_empty() {
         Ok(())
     } else {
         Err(errors.join("; "))
@@ -290,8 +324,23 @@ async fn reconcile_cloud_environment(
         Some(handle) => match handle.observe().await.state {
             ObservationState::Running => {
                 if cached.is_none() {
-                    runtime.provision_environment(&environment.metadata.name, &environment.spec).await?;
+                    if let Err(error) = runtime.provision_environment(&environment.metadata.name, &environment.spec).await {
+                        record_cloud_health(
+                            state,
+                            namespace,
+                            &environment.metadata.name,
+                            Some(format!("Unknown: adoption failed; will retry: {error}")),
+                        )
+                        .await?;
+                        return Err(error);
+                    }
                 }
+                let health = handle.detect_readiness().await;
+                let message = match health {
+                    flotilla_environment::environment::ProviderReadiness::Unknown { reason } => Some(reason),
+                    _ => None,
+                };
+                record_cloud_health(state, namespace, &environment.metadata.name, message).await?;
                 Ok(())
             }
             ObservationState::Gone { cause } => {
@@ -308,7 +357,11 @@ async fn reconcile_cloud_environment(
                 )
                 .await
             }
-            ObservationState::Unknown { reason } => Err(format!("cloud sandbox observation unknown: {reason:?}")),
+            ObservationState::Unknown { reason } => {
+                let message = format!("cloud sandbox observation unknown: {reason:?}");
+                record_cloud_health(state, namespace, &environment.metadata.name, Some(message.clone())).await?;
+                Err(message)
+            }
         },
         None => {
             mark_unavailable_environment(
@@ -321,6 +374,19 @@ async fn reconcile_cloud_environment(
             .await
         }
     }
+}
+
+async fn record_cloud_health(state: &ControllerRuntimeState, namespace: &str, name: &str, message: Option<String>) -> Result<(), String> {
+    let environments = state.daemon.resource_backend().using::<Environment>(namespace);
+    let current = environments.get(name).await.map_err(|e| e.to_string())?;
+    let mut status = current.status.clone().unwrap_or_default();
+    let ready = message.is_none();
+    if status.message != message || status.ready != ready {
+        status.message = message;
+        status.ready = ready;
+        environments.update_status(name, &current.metadata.resource_version, &status).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub(super) async fn record_environment_observation(

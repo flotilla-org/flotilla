@@ -158,6 +158,12 @@ impl<'de> Deserialize<'de> for EnvironmentSpec {
 /// Additive cloud input approved on #3620 (2026-10-22). No credentials or reach recipes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudSandboxEnvironmentSpec {
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub declared_agent_adapters: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub required_agent_adapters: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub probe_needs: BTreeSet<crate::CapabilityNeed>,
     pub image: String,
     pub size: CloudSandboxSize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -660,6 +666,9 @@ mod cloud_schema_tests {
         let spec = EnvironmentSpec {
             provider_address: Some("account:test/provider:daytona".parse().unwrap()),
             cloud_sandbox: Some(CloudSandboxEnvironmentSpec {
+                declared_agent_adapters: Default::default(),
+                required_agent_adapters: Default::default(),
+                probe_needs: Default::default(),
                 image: "registry/image@sha256:digest".into(),
                 size: CloudSandboxSize { cpus, memory_bytes, disk_bytes },
                 lifetime_cap_seconds,
