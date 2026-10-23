@@ -17,12 +17,14 @@ else
     fi
   done
 fi
+# Cargo does not forward a --config given before an external subcommand, so
+# nextest takes it after `nextest run`; both builds then share dependencies.
 cargo_args=(--config 'profile.dev.package."*".debug=0')
 TIMEFORMAT='compile_seconds=%R'
-time cargo "${cargo_args[@]}" nextest run "${packages[@]}" --locked --no-run
+time cargo nextest run "${cargo_args[@]}" "${packages[@]}" --locked --no-run
 TIMEFORMAT='run_seconds=%R'
 status=0
-time cargo "${cargo_args[@]}" nextest run "${packages[@]}" --locked || status=$?
+time cargo nextest run "${cargo_args[@]}" "${packages[@]}" --locked || status=$?
 # Cargo rejects explicit bin-only packages with --doc, even in a mixed set.
 # Keep full-workspace semantics; filter only explicit affected selections.
 doc_packages=("${packages[@]}")
