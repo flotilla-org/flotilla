@@ -2556,7 +2556,8 @@ impl CrewService {
         let displaced = pending_message.as_ref().map(|message| message.spec.body.clone());
         let session = session?.ok_or_else(|| format!("crew member `{role}` on vessel `{vessel}` has no intact terminal session"))?;
         if session.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed) {
-            return Err(format!("crew member `{role}` on vessel `{vessel}` failed provisioning and cannot be resumed"));
+            let reason = session.object.status.as_ref().and_then(|status| status.message.as_deref()).unwrap_or("terminal session failed");
+            return Err(format!("crew member `{role}` on vessel `{vessel}` failed and cannot be resumed: {reason}"));
         }
         let receiver = crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), name, &vessel, &role);
         let resume_intent = flotilla_resources::MessageSpec::builder()
@@ -2859,7 +2860,49 @@ impl CrewService {
                     resource.object.status.as_ref().and_then(|status| status.message.as_deref()).unwrap_or("environment disappeared");
                 Err(format!("vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"))
             }
-            Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(()),
+            Ok(resource) => {
+                if let Some(environment_ref) = resource.object.status.as_ref().and_then(|status| status.environment_ref.as_ref()) {
+                    match self.resource_backend.including_replicas::<flotilla_resources::Environment>(namespace).get(environment_ref).await
+                    {
+                        Ok(environment)
+                            if environment
+                                .object
+                                .status
+                                .as_ref()
+                                .is_some_and(|status| status.phase == flotilla_resources::EnvironmentPhase::Lost) =>
+                        {
+                            let reason = environment
+                                .object
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.message.as_deref())
+                                .unwrap_or("environment disappeared");
+                            return Err(format!(
+                                "vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"
+                            ));
+                        }
+                        Ok(environment)
+                            if environment
+                                .object
+                                .status
+                                .as_ref()
+                                .is_some_and(|status| status.phase == flotilla_resources::EnvironmentPhase::Failed) =>
+                        {
+                            let reason = environment
+                                .object
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.message.as_deref())
+                                .unwrap_or("environment provisioning failed");
+                            return Err(format!("vessel `{vessel}` failed provisioning and cannot be resumed: {reason}"));
+                        }
+                        Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                Ok(())
+            }
+            Err(ResourceError::NotFound { .. }) => Ok(()),
             Err(error) => Err(error.to_string()),
         }
     }
