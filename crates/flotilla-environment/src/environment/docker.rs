@@ -1276,6 +1276,10 @@ impl DockerEnvironmentProviderInner {
         // ownership before publishing tools into the separate crew-owned prefix.
         // The repair list must cover DOCKER_DEFAULT_PATH. The script's narrower
         // PATH excludes legacy crew-owned /usr/local directories during repair.
+        // Repair directories only: recursively chowning legacy /usr/local files
+        // cannot make crew-written contents trustworthy. Root execs must keep
+        // using absolute system programs; replace the vessel from a clean image
+        // to discard any previously planted binaries.
         // Select utilities only from absolute system paths, supporting split-/usr
         // images as well as /bin utilities and merged-/usr images.
         let root_script = format!(

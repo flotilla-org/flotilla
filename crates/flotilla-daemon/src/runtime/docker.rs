@@ -332,6 +332,8 @@ impl DockerControllerRuntime {
             },
             None => Vec::new(),
         };
+        // Component-wise overlap checks rely on the earlier rejection of `..`
+        // mount targets. Keep that validation ahead of reserved-path checks.
         for delivery in &material_deliveries {
             let reserved = delivery.mount.environment_path.as_path();
             for mount in &spec.mounts {
