@@ -2,12 +2,48 @@
 """Print conservative Cargo package arguments for newline-delimited changed files."""
 import argparse
 import json
+import re
 from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 
 
-def select(metadata, changed):
+def source_dependencies(metadata):
+    """Conservatively add Cargo-invisible source and fixture dependencies.
+
+    Rust relative path literals occur in #[path], include macros (also concat),
+    and manifest-relative runtime reads. Resolve against both source and package
+    directories. False positives only add coverage; missing/deleted target files
+    still map by directory. Shared repository files already select all.
+    """
+    root = Path(metadata["workspace_root"]).resolve()
+    members = set(metadata["workspace_members"])
+    directories = {Path(p["manifest_path"]).parent.resolve(): p["id"]
+                   for p in metadata["packages"] if p["id"] in members}
+    edges = set()
+    for directory, reader in directories.items():
+        # The root package's source lives in src/; walking the workspace again
+        # would incorrectly attribute all crates' reads to the root package.
+        scan = directory / "src" if directory == root else directory
+        for source in scan.rglob("*.rs"):
+            for literal in re.findall(r'"((?:\.\./)[^"\n]*)"', source.read_text()):
+                for base in (source.parent, directory):
+                    target = (base / literal).resolve()
+                    owners = [(path, owner) for path, owner in directories.items()
+                              if target.is_relative_to(path)]
+                    if owners:
+                        owner_path, owner = max(owners, key=lambda item: len(item[0].parts))
+                        # Repository-wide inputs are not root-package sources:
+                        # changing them already selects all, without creating a
+                        # spurious root -> every reader dependency cycle.
+                        if owner_path == root and not target.is_relative_to(root / "src"):
+                            continue
+                        if owner != reader:
+                            edges.add((owner, reader))
+    return edges
+
+
+def select(metadata, changed, extra_dependencies=()):
     root = Path(metadata["workspace_root"])
     members = set(metadata["workspace_members"])
     packages = {p["id"]: p for p in metadata["packages"] if p["id"] in members}
@@ -21,10 +57,14 @@ def select(metadata, changed):
             for dependency in node["deps"]:
                 if dependency["pkg"] in members:
                     reverse[dependency["pkg"]].add(node["id"])
+    for dependency, reader in extra_dependencies:
+        reverse[dependency].add(reader)
     affected = set()
     for file in changed:
         path = PurePosixPath(file)
-        if (not file or path.is_absolute() or ".." in path.parts or file in
+        # The workspace graph guard runs inside build-features tests. Any
+        # manifest edit must exercise it, including package-local manifests.
+        if (path.name == "Cargo.toml" or not file or path.is_absolute() or ".." in path.parts or file in
                 {"Cargo.lock", "Cargo.toml", "rust-toolchain.toml", ".config/nextest.toml"}
                 or file.startswith((".cargo/", "ci/", ".github/workflows/"))):
             return "all"
@@ -63,7 +103,7 @@ def main():
     else:
         metadata = json.loads(subprocess.check_output(
             ["cargo", "metadata", "--locked", "--all-features", "--format-version", "1"], text=True))
-    print(select(metadata, args.changed_files.read_text().splitlines()))
+    print(select(metadata, args.changed_files.read_text().splitlines(), source_dependencies(metadata)))
 
 
 if __name__ == "__main__":

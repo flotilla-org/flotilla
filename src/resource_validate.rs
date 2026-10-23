@@ -1480,6 +1480,8 @@ mod tests {
 
     #[tokio::test]
     async fn on_host_candidate_reinspects_after_a_daemon_inventory_refusal() {
+        // This HTTP client must work when the test runs in its own process.
+        rigging_tls::install_default_provider();
         use std::collections::BTreeSet;
 
         use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, RepositoryKey};

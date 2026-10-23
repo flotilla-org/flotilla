@@ -31,7 +31,8 @@ The TUI is *factored, not frozen* — keep it maintained, but extract the surfac
 cargo build                                    # build
 cargo fmt --check          # CI format gate
 cargo clippy --workspace --all-targets --locked -- -D warnings  # CI clippy gate (local gate: -p <affected>, see below)
-cargo test --workspace --locked                # CI test gate (local gate: -p <affected>, see below)
+cargo nextest run --workspace --locked         # CI tests (local gate: -p <affected>, see below)
+cargo test --doc --workspace --locked           # doctests (nextest does not run these)
 python3 ci/build-graph/check.py                 # CI dependency/feature gate
 python3 -m unittest discover -s ci/build-graph -p test_check.py
 cargo fmt                  # apply pinned formatting
@@ -54,7 +55,7 @@ Before pushing, run the local gate:
 - A change that maps to no package (`ci/`, workspace `Cargo.toml`, `rust-toolchain.toml`) runs the check that owns that file: the build-graph or Git check and their tests, or `cargo check --workspace --locked` for a toolchain or workspace-manifest change.
 - A change to a widely used package (protocol, resources, store, core) still runs only its own tests locally; CI covers its dependents.
 
-CI runs the full workspace commands (`cargo clippy --workspace ...`, `cargo test --workspace --locked`); don't repeat that run locally, and fix a red CI result with a follow-up push. A local `-p` run can resolve features differently from the workspace run, so a local pass is not a CI guarantee.
+CI uses nextest plus doctests and `ci/affected/select.py` for PR test selection. Main pushes, `ci:full`, and stack top layers test the full workspace. CI runs full-workspace Clippy (`cargo clippy --workspace ...`); don't repeat that run locally, and fix a red CI result with a follow-up push. A local `-p` run can resolve features differently from the workspace run, so a local pass is not a CI guarantee.
 
 Desk and crew vessel builds keep Cargo incrementals enabled. CI builds set `CARGO_INCREMENTAL=0`. Each fleet host runs an mtime-based `cargo-sweep --time 3` daily, while `scripts/prune-target.sh` remains a size-cap backstop. See [docs/development.md](docs/development.md) for installation, scope, logs, and thresholds.
 
