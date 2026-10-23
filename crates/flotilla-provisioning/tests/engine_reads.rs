@@ -265,3 +265,65 @@ fn a_vessel_reads_as_its_lease() {
     convoy.sort();
     assert_eq!(convoy, ["convoy-a-implement", "convoy-a-review"]);
 }
+
+// Behaviour (#3771 review): the port reads a vessel by its old record's name, because the write
+// path names the engine's resource after it. Decided through the binding, read back by
+// `metadata.name`.
+#[test]
+fn a_vessel_written_through_the_binding_reads_by_its_old_name() {
+    use std::collections::BTreeMap;
+
+    use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
+    use flotilla_provisioning::engine::{
+        decide,
+        vessel::{PlacementLifecycles, VesselBinding},
+    };
+    use flotilla_resources::{ObjectMeta, ResourceObject, StatusPatch, VesselSpec as OldVesselSpec, VesselStatusPatch};
+    use flotilla_state_machines::machines::vessel::VesselKind;
+    let registry = stored::crew_registry().expect("registry");
+    let store = Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), HOME, registry).expect("store")));
+    let vessels: Arc<dyn Lifecycles<VesselKind>> = Arc::new(
+        PlacementLifecycles::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("home")).expect("placements"),
+    );
+    let mut obj = ResourceObject {
+        metadata: ObjectMeta {
+            name: "convoy-a-implement".into(),
+            namespace: "flotilla".into(),
+            resource_version: "1".into(),
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            owner_references: vec![],
+            finalizers: vec![],
+            deletion_timestamp: None,
+            creation_timestamp: chrono::DateTime::UNIX_EPOCH,
+            merge: None,
+        },
+        spec: OldVesselSpec {
+            convoy_ref: "convoy-a".into(),
+            vessel_name: "implement".into(),
+            placement_policy_ref: "docker".into(),
+            adopted_checkout_refs: BTreeMap::new(),
+        },
+        status: None,
+    };
+    let provisioning = VesselStatusPatch::MarkProvisioning {
+        observed_policy_ref: "docker".into(),
+        observed_policy_version: "1".into(),
+        placement_decision: Some(
+            PlacementDecision::builder()
+                .policy_name("docker".into())
+                .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("feta"), display_name: "feta".into() })
+                .build(),
+        ),
+        started_at: chrono::DateTime::UNIX_EPOCH,
+        message: None,
+        image: None,
+    };
+    let decided = decide::<VesselBinding>(vessels.as_ref(), &obj, Some(provisioning), chrono::Utc::now()).patch.expect("granted");
+    decided.apply(obj.status.get_or_insert_with(Default::default));
+
+    let reads = StoreReads::new(store);
+    let view = reads.vessel(&obj.metadata.name, HOME).expect("read").expect("read by the old record's name");
+    assert_eq!(view.name, obj.metadata.name);
+    assert_eq!(view.judgement, Judgement::InProgress);
+}
