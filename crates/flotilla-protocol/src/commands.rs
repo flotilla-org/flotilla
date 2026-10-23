@@ -870,6 +870,10 @@ pub struct ResourceDigest {
     pub items: Option<Vec<serde_json::Value>>,
 }
 
+/// Internal attach target used by `environment <id> shell`. It is resolved at
+/// each host hop, so no guest socket path is executed on a different host.
+pub const ENVIRONMENT_SHELL_REFERENCE_PREFIX: &str = "environment-shell/";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum CommandAction {

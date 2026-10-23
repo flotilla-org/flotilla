@@ -2,8 +2,6 @@
 # Arguments start after the first |; leading argument whitespace is ignored.
 # Scope names are exact, with no leading or trailing whitespace.
 # all runs only on windows/macos, never tender-ssh; write shared coverage once under all.
-# Compile the no-dashboard binary and exercise its startup/refusal contract in existing jobs.
-all| -p flotilla --no-default-features --locked --test vessel_agent
 windows| -p flotilla-client --locked --lib windows_tests::
 windows| -p flotilla-client --locked --lib endpoint::
 windows| -p flotilla-client --locked --lib reconnect::tests::

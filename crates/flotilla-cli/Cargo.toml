@@ -5,6 +5,10 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+serde_yml.workspace = true
+flotilla-charter = { path = "../flotilla-charter" }
+flotilla-agent = { path = "../flotilla-agent" }
+toml_edit = "0.22"
 flotilla-config = { path = "../flotilla-config" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
@@ -37,6 +41,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 libc = { workspace = true }
 
 [dev-dependencies]
+hegeltest.workspace = true
 flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
@@ -50,6 +55,7 @@ insta = "1"
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
+flotilla-daemon-testkit = { path = "../flotilla-daemon-testkit" }
 flotilla-daemon = { path = "../flotilla-daemon" }
 
 [lints]

@@ -26,3 +26,7 @@ smallvec = { version = "1", default-features = false, features = ["const_generic
 
 [lints]
 workspace = true
+
+# Hegel reaches libc in tests; match the workspace test feature context.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+libc.workspace = true

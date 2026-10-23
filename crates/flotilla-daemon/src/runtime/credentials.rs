@@ -736,7 +736,11 @@ pub(super) async fn redeliver_codex_credentials(state: &ControllerRuntimeState, 
         }
         // A redelivery failure is never fatal to the environment: the crew keeps
         // the copy it already has, and the next tick retries.
-        match registry.refresh_delivered_credentials(&environment.metadata.name).await {
+        let result = match state.daemon.command_runner_for_environment_ref(&environment.metadata.name) {
+            Some(runner) => registry.refresh_delivered_credentials_through(&environment.metadata.name, runner.as_ref()).await,
+            None => Err("agent runner unavailable for Codex auth rotation".into()),
+        };
+        match result {
             Ok(true) => info!(environment = %environment.metadata.name, "redelivered the central Codex credential"),
             Ok(false) => {}
             Err(error) => warn!(environment = %environment.metadata.name, %error, "failed to redeliver the central Codex credential"),

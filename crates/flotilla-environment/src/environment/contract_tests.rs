@@ -34,6 +34,9 @@ impl CommandRunner for DockerEngine {
         let mut inventory = self.inventory.lock().unwrap();
         match args {
             ["image", "inspect", ..] => Ok("[]".into()),
+            ["exec", "--user", "0", ..]
+            | ["exec", _, "/opt/drydock/drydock-agent", "--supervise", "--socket", "/run/drydock/agent.sock"] => Ok(String::new()),
+            ["inspect", "--format", "{{json .Config.Env}}", _] => Ok(r#"["HOME=/tmp","PATH=/usr/bin:/bin"]"#.into()),
             ["info", "--format", "{{json .}}"] => Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into()),
             ["run", ..] => {
                 let name = args.windows(2).find(|pair| pair[0] == "--name").unwrap()[1];
@@ -66,6 +69,12 @@ impl CommandRunner for DockerEngine {
             _ => panic!("unexpected Docker invocation: {args:?}"),
         }
     }
+    async fn run_with_input(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        assert_eq!(cmd, "docker");
+        assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
+        assert!(std::str::from_utf8(input).unwrap().contains("COPY --from=tools /opt/drydock /opt/drydock"));
+        Ok(DIGEST.into())
+    }
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         Ok(CommandOutput { stdout: self.run(cmd, args, cwd, label).await?, stderr: String::new(), exit_code: Some(0) })
     }
@@ -73,6 +82,23 @@ impl CommandRunner for DockerEngine {
         false
     }
 }
+#[cfg(unix)]
+pub(super) fn docker_provider(runner: Arc<dyn CommandRunner>) -> docker::DockerEnvironmentProvider {
+    use super::agent::{tests::MemoryAgent, AgentConnector};
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let keep = directory.clone();
+    let agents = Mutex::new(BTreeMap::<std::path::PathBuf, Arc<MemoryAgent>>::new());
+    docker::DockerEnvironmentProvider::new(runner)
+        .with_agent_settings(docker::DockerAgentSettings {
+            runtime_root: directory.path().into(),
+            executable: directory.path().join("current-agent"),
+        })
+        .with_agent_connector(Arc::new(move |socket| {
+            let _keep = &keep;
+            agents.lock().unwrap().entry(socket.into()).or_insert_with(|| MemoryAgent::new(false)).clone() as Arc<dyn AgentConnector>
+        }))
+}
+
 fn immutable_id(id: &str) -> String {
     format!("{:0>64}", id.strip_prefix("env-").unwrap())
 }
@@ -81,7 +107,8 @@ fn providers() -> Vec<(Arc<dyn EnvironmentProvider>, flotilla_resources::Environ
     let image_spec =
         legacy_environment_spec(&EnvironmentSpec { image: ImageSource::Registry(DIGEST.into()), token_env_vars: vec![] }).unwrap();
     vec![
-        (Arc::new(docker::DockerEnvironmentProvider::new(Arc::new(DockerEngine::default()))), image_spec.clone()),
+        #[cfg(unix)]
+        (Arc::new(docker_provider(Arc::new(DockerEngine::default()))), image_spec.clone()),
         (Arc::new(dummy::DummyEnvironmentProvider::new(Default::default())), image_spec),
         (
             Arc::new(host_direct::HostDirectEnvironmentProvider::new(Arc::new(DockerEngine::default()), Default::default())),
@@ -105,7 +132,7 @@ fn provider_lifecycle_contract(tc: hegel::TestCase) {
     let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(10));
     let operations: Vec<_> =
         (0..count).map(|_| (tc.draw(gs::integers::<usize>().min_value(0).max_value(1)), tc.draw(gs::booleans()))).collect();
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     runtime.block_on(async {
         for (provider, spec) in providers() {
             let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
@@ -149,7 +176,7 @@ fn provider_lifecycle_contract(tc: hegel::TestCase) {
 }
 
 // Prepared values cannot cross instances, including same-implementation instances.
-// The three cases exhaust the installed adapters; the public capability data
+// The available cases exhaust the installed adapters; the public capability data
 // agrees with optional accessors and the dummy has its own descriptive class.
 #[tokio::test]
 async fn provider_instances_and_declarations() {
@@ -159,15 +186,16 @@ async fn provider_instances_and_declarations() {
         let declaration = provider.capabilities();
         assert!(!declaration.workspace_root.as_os_str().is_empty());
     }
-    assert_eq!(providers()[1].0.kind(), ProviderKind::new(EnvironmentClass::Dummy, "dummy"));
+    assert!(providers().iter().any(|(provider, _)| provider.kind() == ProviderKind::new(EnvironmentClass::Dummy, "dummy")));
 }
 
 // A provider error means Unknown, never Gone. The same handle recovers
 // when the injected process boundary becomes available again.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
+#[cfg(unix)]
 async fn observation_recovers_after_provider_error() {
     let engine = Arc::new(DockerEngine::default());
-    let provider: Arc<dyn EnvironmentProvider> = Arc::new(docker::DockerEnvironmentProvider::new(engine.clone()));
+    let provider: Arc<dyn EnvironmentProvider> = Arc::new(docker_provider(engine.clone()));
     let spec = legacy_environment_spec(&EnvironmentSpec { image: ImageSource::Registry(DIGEST.into()), token_env_vars: vec![] }).unwrap();
     let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
     let id = EnvironmentId::new("env-1");
@@ -191,7 +219,9 @@ async fn observation_recovers_after_provider_error() {
 #[hegel::test]
 fn advertisement_fields_default_when_omitted(tc: hegel::TestCase) {
     use hegel::generators as gs;
-    let (provider, _) = providers().remove(tc.draw(gs::integers::<usize>().min_value(0).max_value(2)));
+    let mut available = providers();
+    let index = tc.draw(gs::integers::<usize>().min_value(0).max_value(available.len() - 1));
+    let (provider, _) = available.remove(index);
     let advertisement = ProviderAdvertisement {
         instance: "configured".into(),
         kind: Some(provider.kind()),
@@ -219,7 +249,7 @@ fn advertisement_fields_default_when_omitted(tc: hegel::TestCase) {
 // handles report requested destruction, and inventories no longer list them.
 #[tokio::test]
 async fn host_and_dummy_retirement_is_observable_and_excluded_from_inventory() {
-    for (provider, spec) in providers().into_iter().skip(1) {
+    for (provider, spec) in providers().into_iter().filter(|(provider, _)| provider.kind().implementation != "docker") {
         let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
         let id = EnvironmentId::new("env-0");
         let handle = provider.provision(id.clone(), &prepared, Default::default()).await.unwrap();

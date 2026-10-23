@@ -480,6 +480,17 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
 
 #[tokio::test]
 async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
+    teardown_archives_staged_sessions(false).await;
+}
+
+// A stopped agent cannot wedge deletion: teardown still destroys its backing
+// and archives the persistent session records already staged on the host.
+#[tokio::test]
+async fn docker_teardown_with_dead_agent_still_destroys_and_archives_staged_sessions() {
+    teardown_archives_staged_sessions(true).await;
+}
+
+async fn teardown_archives_staged_sessions(dead_agent: bool) {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
     fs::create_dir_all(&config_base).expect("config directory");
@@ -495,18 +506,24 @@ async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
     )
     .await;
     let destroyed = Arc::new(AtomicBool::new(false));
-    let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+    let capture_attempted = Arc::new(AtomicBool::new(false));
+    let interior = TestInteriorEnvironment {
         id: EnvironmentId::new("contained-restarted"),
         image: ImageId::new("contained-image"),
-        runner: Arc::new(DiscoveryMockRunner::builder().build()),
+        runner: if dead_agent {
+            Arc::new(DeadCaptureRunner(capture_attempted.clone()))
+        } else {
+            Arc::new(DiscoveryMockRunner::builder().build())
+        },
         env_vars: HashMap::new(),
         destroyed: Arc::clone(&destroyed),
-    });
+    };
+    let handle: EnvironmentHandle = if dead_agent { Arc::new(DeadAgentEnvironment(interior)) } else { Arc::new(interior) };
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
         "docker",
         flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
-        Arc::new(ListingEnvironmentProvider { handle }),
+        Arc::new(ListingEnvironmentProvider { handle: handle.clone() }),
     );
     let home = temp.path().join("home");
     let environment_home = home.join(".local/share/flotilla/agent-homes/contained-restarted");
@@ -546,6 +563,9 @@ async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
         )
         .await
         .expect("addressed environment record");
+    if dead_agent {
+        state.provisioned_environments.lock().await.insert("test-interior".into(), ActiveProvisionedEnvironment { handle });
+    }
     let runtime = DockerControllerRuntime { state };
     for invalid in ["../keep", "..", "/", ""] {
         runtime.cleanup(invalid).await.expect("unsafe names must not wedge finalization");
@@ -553,6 +573,8 @@ async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
     assert!(outside_state.join("sentinel").exists(), "unsafe cleanup must preserve unrelated state");
     runtime.destroy("contained-restarted", "test-interior").await.expect("restart teardown should rediscover and destroy the container");
 
+    assert_eq!(capture_attempted.load(Ordering::SeqCst), dead_agent);
+    assert!(runtime.state.provisioned_environments.lock().await.is_empty());
     assert!(destroyed.load(Ordering::SeqCst), "the restarted daemon must destroy the still-running lease holder");
     assert!(!environment_home.exists(), "durable environment teardown must move its persistent agent home");
     assert_eq!(
@@ -1239,4 +1261,62 @@ async fn provisioned_environment_is_destroyed_when_declared_adapter_is_missing()
 
     assert_eq!(error.to_string(), "image `contained-image` declares agent adapter `codex`, but interior discovery did not find it");
     assert!(destroyed.load(Ordering::SeqCst), "rejected environment should be destroyed");
+}
+
+// Fake only the unavailable agent transport; use real teardown and archive storage.
+struct DeadCaptureRunner(Arc<AtomicBool>);
+#[async_trait]
+impl CommandRunner for DeadCaptureRunner {
+    async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+        Err("agent unavailable".into())
+    }
+    async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+        Err("agent unavailable".into())
+    }
+    async fn exists(&self, _: &str, _: &[&str]) -> bool {
+        false
+    }
+    async fn run_to_file(&self, _: &str, _: &[&str], _: &Path, _: &Path) -> Result<(), String> {
+        self.0.store(true, Ordering::SeqCst);
+        Err("stopped container: agent unavailable".into())
+    }
+}
+struct DeadAgentEnvironment(TestInteriorEnvironment);
+struct DeadAgent;
+#[async_trait]
+impl flotilla_environment::environment::VesselAgent for DeadAgent {
+    async fn ready(&self) -> Result<(), String> {
+        Err("agent unavailable".into())
+    }
+    async fn forward_socket(&self, _: &Path) -> Result<PathBuf, String> {
+        Err("agent unavailable".into())
+    }
+    async fn push_tools(&self, _: &[flotilla_environment::environment::EnvironmentTool]) -> Result<(), String> {
+        Err("agent unavailable".into())
+    }
+}
+#[async_trait]
+impl ProvisionedEnvironment for DeadAgentEnvironment {
+    flotilla_discovery_testkit::injected_environment_handle!();
+    fn id(&self) -> &EnvironmentId {
+        self.0.id()
+    }
+    fn image(&self) -> &ImageId {
+        self.0.image()
+    }
+    fn runner(&self) -> Arc<dyn CommandRunner> {
+        self.0.runner()
+    }
+    fn agent(&self) -> Option<Arc<dyn flotilla_environment::environment::VesselAgent>> {
+        Some(Arc::new(DeadAgent))
+    }
+    async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+        self.0.observe().await
+    }
+    async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+        self.0.env_vars().await
+    }
+    async fn destroy(&self) -> Result<(), String> {
+        self.0.destroy().await
+    }
 }

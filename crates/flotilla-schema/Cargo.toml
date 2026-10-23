@@ -30,3 +30,7 @@ workspace = true
 flotilla-build-features = { path = "../flotilla-build-features" }
 flotilla-build-features-base = { path = "../flotilla-build-features-base" }
 flotilla-build-features-types = { path = "../flotilla-build-features-types" }
+
+# Hegel reaches libc in tests; match the workspace test feature context.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+libc.workspace = true

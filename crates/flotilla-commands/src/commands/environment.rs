@@ -22,6 +22,8 @@ pub struct EnvironmentNoun {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum EnvironmentVerb {
+    /// Open an ad-hoc cleat shell (uses the native fallback if the agent is dead)
+    Shell,
     /// Refresh environment data
     Refresh { repo: Option<String> },
     /// Route a command to an environment (captures remaining args)
@@ -33,6 +35,19 @@ impl EnvironmentNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         let subject = self.subjects.resolve()?.map(|subject| subject.value);
         match (subject, self.verb) {
+            (Some(subject), Some(EnvironmentVerb::Shell)) => {
+                let environment_id = EnvironmentId::parse(&subject)?;
+                Ok(Resolved::Ready(
+                    Command::builder()
+                        .action(CommandAction::AttachTransient {
+                            reference: format!("{}{environment_id}", flotilla_protocol::commands::ENVIRONMENT_SHELL_REFERENCE_PREFIX),
+                            host: None,
+                            mode: flotilla_protocol::commands::AttachMode::PreferTake,
+                        })
+                        .build(),
+                ))
+            }
+
             (Some(subject), Some(EnvironmentVerb::Refresh { repo })) => {
                 let environment_id = EnvironmentId::parse(&subject)?;
                 Ok(Resolved::NeedsContext {
@@ -56,7 +71,7 @@ impl EnvironmentNoun {
                 resolved.set_explicit_environment(environment_id);
                 Ok(resolved)
             }
-            (None, Some(EnvironmentVerb::Refresh { .. } | EnvironmentVerb::Route(_))) => {
+            (None, Some(EnvironmentVerb::Shell | EnvironmentVerb::Refresh { .. } | EnvironmentVerb::Route(_))) => {
                 Err("environment command requires an environment id subject".into())
             }
             (_, None) => Err("missing environment command".into()),
@@ -70,6 +85,7 @@ impl fmt::Display for EnvironmentNoun {
         self.subjects.write(f)?;
         if let Some(verb) = &self.verb {
             match verb {
+                EnvironmentVerb::Shell => write!(f, " shell")?,
                 EnvironmentVerb::Refresh { repo } => {
                     write!(f, " refresh")?;
                     if let Some(repo) = repo {
@@ -100,6 +116,18 @@ mod tests {
 
     fn parse(args: &[&str]) -> EnvironmentNoun {
         EnvironmentNoun::try_parse_from(args).expect("should parse")
+    }
+
+    // Glue: shell is an ad-hoc attach target, resolved anew at each host hop.
+    // Missing subjects still fail before contacting any daemon.
+    #[test]
+    fn shell_resolves_an_environment_attach_target() {
+        let resolved = parse(&["environment", "prov:crew-one", "shell"]).resolve().unwrap();
+        let Resolved::Ready(command) = resolved else {
+            panic!("shell command");
+        };
+        assert!(matches!(command.action, CommandAction::AttachTransient { reference, .. } if reference == "environment-shell/crew-one"));
+        assert!(parse(&["environment", "shell"]).resolve().is_err());
     }
 
     #[test]

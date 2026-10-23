@@ -3,13 +3,13 @@ use std::sync::Arc;
 use color_eyre::Result;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
 
-use flotilla_cli::cli::args::{Cli, EnsureSubCommand, ManifestSubCommand, ResourceManifestResolutionArgs};
+use crate::cli::args::{Cli, EnsureSubCommand, ManifestSubCommand, ResourceManifestResolutionArgs};
 
-use super::daemon::{cli_surface_from, connect_daemon, reset_sigpipe};
+use super::connection::{cli_surface_from, connect_daemon, reset_sigpipe};
 use super::resource::run_control_command;
 use super::targets::resolve_optional_host_node;
 
-pub(crate) async fn run_manifest_command(cli: &Cli, command: ManifestSubCommand, format: OutputFormat) -> Result<()> {
+pub async fn run_manifest_command(cli: &Cli, command: ManifestSubCommand, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     let ManifestSubCommand::Status { root, namespace, host } = command;
     let node_id = resolve_optional_host_node(cli, host.as_deref()).await?;
@@ -127,7 +127,7 @@ fn drifted_ensure_names(objects: impl IntoIterator<Item = serde_json::Value>) ->
     Ok(names)
 }
 
-pub(crate) async fn run_ensure_command(cli: &Cli, command: EnsureSubCommand, format: OutputFormat) -> Result<()> {
+pub async fn run_ensure_command(cli: &Cli, command: EnsureSubCommand, format: OutputFormat) -> Result<()> {
     use flotilla_client::resource::{ResourceClient, ResourceListRequest};
     let EnsureSubCommand::Roll { name, drifted, namespace, host } = command;
     let node_id = resolve_optional_host_node(cli, host.as_deref()).await?;
@@ -151,7 +151,7 @@ pub(crate) async fn run_ensure_command(cli: &Cli, command: EnsureSubCommand, for
     let total = names.len();
     let mut errors = Vec::new();
     for name in names {
-        let result = flotilla_cli::cli::run_command(
+        let result = crate::cli::run_command(
             &*daemon,
             Command {
                 node_id: node_id.clone(),
@@ -180,7 +180,7 @@ pub(crate) async fn run_ensure_command(cli: &Cli, command: EnsureSubCommand, for
     }
 }
 
-pub(super) async fn run_manifest_resolution(
+pub async fn run_manifest_resolution(
     cli: &Cli,
     args: ResourceManifestResolutionArgs,
     resolution: flotilla_protocol::ManifestResolution,

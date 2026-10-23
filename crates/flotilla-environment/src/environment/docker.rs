@@ -5,12 +5,22 @@
 
 use std::{collections::HashMap, path::Path, sync::Arc};
 
+#[cfg(unix)]
+use super::agent::{AgentConnector, AgentRunner, UnixAgentConnector};
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::{path::PathBuf, time::Duration};
+
 use async_trait::async_trait;
 use flotilla_protocol::{EnvironmentId, ImageId};
 
 use super::{
-    runner::DockerEnvironmentRunner, CreateOpts, EnvironmentBacking, EnvironmentHandle, EnvironmentProvider, EnvironmentToolAssetAccess,
-    EnvironmentToolAssetKind, EnvironmentVariableUpdate, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode,
+    runner::DockerEnvironmentRunner, EnvironmentBacking, EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount,
+};
+#[cfg(any(unix, test))]
+use super::{
+    CreateOpts, EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate, ImagePullPolicy, ProvisionedMountMode,
 };
 use crate::environment::{PrepareOpts, ProvisionOpts};
 use flotilla_provider_runtime::ChannelLabel;
@@ -21,6 +31,7 @@ use flotilla_provider_runtime::CommandRunner;
 pub const CREW_CPU_SHARES: usize = 1024;
 
 /// The `PATH` Docker gives a container whose image does not set one.
+#[cfg(any(unix, test))]
 const DOCKER_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 // ---------------------------------------------------------------------------
@@ -30,6 +41,7 @@ const DOCKER_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr
 /// An `EnvironmentProvider` that manages Docker containers as sandbox environments.
 pub struct DockerEnvironmentProvider {
     pub(super) inner: Arc<DockerEnvironmentProviderInner>,
+    #[cfg(unix)]
     preparation_owner: Arc<()>,
 }
 
@@ -51,8 +63,56 @@ impl DockerEnvironmentProvider {
     }
 
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { inner: Arc::new(DockerEnvironmentProviderInner::new(runner)), preparation_owner: Arc::new(()) }
+        Self {
+            inner: Arc::new(DockerEnvironmentProviderInner::new(runner)),
+            #[cfg(unix)]
+            preparation_owner: Arc::new(()),
+        }
     }
+}
+
+/// These are host facts, supplied by discovery. Neither a vessel nor its image
+/// chooses the current agent executable or the host runtime directory.
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct DockerAgentSettings {
+    pub runtime_root: PathBuf,
+    pub executable: PathBuf,
+}
+#[cfg(unix)]
+type ConnectorFactory = dyn Fn(&Path) -> Arc<dyn AgentConnector> + Send + Sync;
+#[cfg(unix)]
+struct AgentLease {
+    directory: PathBuf,
+    runner: Arc<AgentRunner>,
+    supervisor: tokio::task::JoinHandle<()>,
+}
+#[cfg(unix)]
+impl Drop for AgentLease {
+    fn drop(&mut self) {
+        self.supervisor.abort();
+    }
+}
+
+#[cfg(unix)]
+impl DockerEnvironmentProvider {
+    /// Configure before sharing this provider. Panics if another Arc already owns its inner state.
+    pub fn with_agent_settings(mut self, settings: DockerAgentSettings) -> Self {
+        Arc::get_mut(&mut self.inner).expect("configure before sharing provider").agent_settings = settings;
+        self
+    }
+    /// Injectable process/transport seam. Docker command tests still run the
+    /// production preparation and supervisor commands, then dial a real Agent.
+    /// Configure before sharing; panics if another Arc owns the inner state.
+    pub fn with_agent_connector(mut self, connector: Arc<ConnectorFactory>) -> Self {
+        Arc::get_mut(&mut self.inner).expect("configure before sharing provider").connector = Some(connector);
+        self
+    }
+}
+#[cfg(unix)]
+struct DockerPrepared {
+    original: ImageId,
+    image: ImageId,
 }
 
 #[cfg(unix)]
@@ -102,6 +162,10 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
     }
 
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, opts: &PrepareOpts) -> Result<super::PreparedEnvironment, String> {
+        #[cfg(all(unix, not(target_os = "linux")))]
+        if self.inner.connector.is_none() {
+            return Err("Docker vessel agents currently require a Linux host and Linux agent companion".into());
+        }
         if Some(super::EnvironmentInput::of(spec)?) != self.legacy_input() {
             return Err("Docker provider requires a Docker environment spec".into());
         }
@@ -131,7 +195,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             if !flotilla_resources::is_image_digest(digest) {
                 return Err("baseline image did not resolve to a local digest".into());
             }
-            return Ok(super::PreparedEnvironment::new(&self.preparation_owner, ImageId::new(digest)));
+            return self.prepare_agent_image(ImageId::new(digest)).await;
         }
         if !self.inner.image_exists(&spec.image, Path::new("/")).await? {
             if !registry_digest {
@@ -142,7 +206,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
                 return Err("pinned image pull succeeded but digest is not present".into());
             }
         }
-        Ok(super::PreparedEnvironment::new(&self.preparation_owner, ImageId::new(spec.image.clone())))
+        self.prepare_agent_image(ImageId::new(spec.image.clone())).await
     }
 
     async fn provision(
@@ -151,28 +215,79 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         prepared: &super::PreparedEnvironment,
         opts: ProvisionOpts,
     ) -> Result<EnvironmentHandle, String> {
-        let image = prepared.get::<ImageId>(&self.preparation_owner)?;
-        // Preparation already resolved and verified the digest; provisioning must
-        // never pull again or use registry credentials, regardless of pull policy.
-        self.create(
-            id,
-            image,
-            CreateOpts {
-                tokens: opts.tokens,
-                working_directory: opts.working_directory,
-                provisioned_mounts: opts.provisioned_mounts,
-                tools: opts.tools,
-                cpu_limit: opts.cpu_limit,
-                memory_policy: opts.memory_policy,
-                image_pull_policy: ImagePullPolicy::Never,
-                prepared_auth: Default::default(),
-            },
-        )
-        .await
+        #[cfg(not(unix))]
+        {
+            let _ = (id, opts, prepared);
+            Err("Docker vessel agents require a Unix host".into())
+        }
+        #[cfg(unix)]
+        {
+            let prepared = prepared.get::<DockerPrepared>(&self.preparation_owner)?;
+            let directory = self.inner.runtime_directory(&id)?;
+            let mut tools = opts.tools.clone();
+            // Files are pushed only after hello. Shared writable material and
+            // vessel-specific daemon sockets keep their existing mount contract.
+            for tool in &mut tools {
+                tool.assets.retain(|asset| asset.requires_mount());
+            }
+            if opts.tools.iter().flat_map(|tool| &tool.assets).any(|asset| {
+                asset.environment_path.as_path().starts_with("/run/drydock")
+                    || Path::new("/run/drydock").starts_with(asset.environment_path.as_path())
+            }) {
+                return Err("/run/drydock is reserved for this vessel's agent".into());
+            }
+            let mut mounts = opts.provisioned_mounts;
+            if mounts.iter().any(|mount| {
+                mount.environment_path.as_path().starts_with("/run/drydock")
+                    || Path::new("/run/drydock").starts_with(mount.environment_path.as_path())
+            }) {
+                return Err("/run/drydock is reserved for this vessel's agent".into());
+            }
+            mounts.push(ProvisionedMount::new(directory.join("guest"), "/run/drydock", ProvisionedMountMode::Rw));
+            let handle = self
+                .create_with_image(
+                    id.clone(),
+                    &prepared.original,
+                    &prepared.image,
+                    CreateOpts {
+                        tokens: opts.tokens,
+                        working_directory: opts.working_directory,
+                        provisioned_mounts: mounts,
+                        tools,
+                        cpu_limit: opts.cpu_limit,
+                        memory_policy: opts.memory_policy,
+                        image_pull_policy: ImagePullPolicy::Never,
+                        prepared_auth: Default::default(),
+                    },
+                )
+                .await?;
+            let result = async {
+                let lease = self.inner.agent_for(handle.backing_id(), &directory).await?;
+                lease.runner.configure_environment(self.inner.env_vars(handle.backing_id()).await?.into_iter().collect()).await?;
+                lease.runner.push_tools(&opts.tools).await?;
+                let mut mounts = handle.provisioned_mounts();
+                // Preserve the base identity across prepared-image rebuilds/adoption.
+                let base = prepared.original.clone();
+                Ok(self.inner.environment_with_agent(
+                    id,
+                    base,
+                    handle.local_image_id().map(str::to_owned),
+                    handle.backing_id().into(),
+                    handle.container_name().unwrap_or(handle.backing_id()).into(),
+                    std::mem::take(&mut mounts),
+                    lease,
+                ))
+            }
+            .await;
+            if result.is_err() {
+                let _ = self.inner.destroy(handle.backing_id()).await;
+            }
+            result
+        }
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
-        let format = r#"{{.ID}} {{.Names}}\t{{.Label "flotilla.environment"}}\t{{.Image}}\t{{.Label "flotilla.provisioned_mounts"}}"#;
+        let format = r#"{{.ID}} {{.Names}}\t{{.Label "flotilla.environment"}}\t{{if .Label "flotilla.source_image"}}{{.Label "flotilla.source_image"}}{{else}}{{.Image}}{{end}}\t{{.Label "flotilla.provisioned_mounts"}}"#;
         let output = self
             .inner
             .runner
@@ -185,6 +300,8 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             .await?;
 
         let mut handles = Vec::new();
+        #[cfg(unix)]
+        let mut adoption = tokio::task::JoinSet::new();
         for line in output.lines() {
             let parts: Vec<&str> = line.splitn(4, '\t').collect();
             if parts.len() < 4 {
@@ -205,13 +322,43 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
                 tracing::warn!(container = %container_name, "docker list output missing provisioned mount metadata");
                 return Err(format!("docker list output missing provisioned mount metadata for container {container_name}"));
             }
-            let provisioned_mounts = match serde_json::from_str(mount_metadata) {
+            let provisioned_mounts: Vec<ProvisionedMount> = match serde_json::from_str(mount_metadata) {
                 Ok(mounts) => mounts,
                 Err(err) => {
                     tracing::warn!(container = %container_name, err = %err, raw = %mount_metadata, "failed to parse provisioned mount metadata");
                     return Err(format!("failed to parse provisioned mount metadata for container {container_name}: {err}"));
                 }
             };
+            #[cfg(unix)]
+            if let Some(mount) =
+                provisioned_mounts.iter().find(|mount: &&ProvisionedMount| mount.environment_path.as_path() == Path::new("/run/drydock"))
+            {
+                let directory = mount.host_path.as_path().parent().map(Path::to_path_buf);
+                let inner = self.inner.clone();
+                let (backing, name, id, base, mounts, index) =
+                    (backing_id.clone(), container_name.clone(), env_id.clone(), image.clone(), provisioned_mounts.clone(), handles.len());
+                adoption.spawn(async move {
+                    let result = async {
+                        let directory = directory.ok_or("invalid agent mount")?;
+                        if !matches!(provider_observation(inner.runner.as_ref(), &backing).await?.state, super::ObservationState::Running) {
+                            return Ok(None);
+                        }
+                        let lease = inner.agent_for(&backing, &directory).await?;
+                        lease.runner.configure_environment(inner.env_vars(&backing).await?.into_iter().collect()).await?;
+                        Ok::<_, String>(Some(inner.environment_with_agent(
+                            EnvironmentId::new(id),
+                            ImageId::new(base),
+                            None,
+                            backing,
+                            name,
+                            mounts,
+                            lease,
+                        )))
+                    }
+                    .await;
+                    (index, result)
+                });
+            }
             handles.push(self.inner.provisioned_environment(
                 EnvironmentId::new(env_id),
                 ImageId::new(image),
@@ -222,6 +369,27 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             ));
         }
 
+        #[cfg(unix)]
+        while let Some(result) = adoption.join_next().await {
+            match result {
+                Ok((index, Ok(Some(handle)))) => handles[index] = handle,
+                Ok((_, Ok(None))) => {}
+                Ok((index, Err(error))) => {
+                    tracing::warn!(container = %handles[index].backing_id(), %error, "agent adoption failed; retaining Docker fallback")
+                }
+                Err(error) => tracing::warn!(%error, "agent adoption task failed; retaining Docker fallback"),
+            }
+        }
+        #[cfg(unix)]
+        self.inner.agents.lock().await.retain(|backing, cell| {
+            let present = handles.iter().any(|handle| handle.backing_id() == backing);
+            if !present {
+                if let Some(lease) = cell.get() {
+                    lease.supervisor.abort();
+                }
+            }
+            present
+        });
         Ok(handles)
     }
 
@@ -267,6 +435,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
     }
 }
 
+#[cfg(any(unix, test))]
 fn protected_git_mount(mount: &ProvisionedMount) -> bool {
     mount.mode == ProvisionedMountMode::Ro
         && mount.host_path.as_path() == mount.environment_path.as_path()
@@ -275,11 +444,32 @@ fn protected_git_mount(mount: &ProvisionedMount) -> bool {
 
 pub(super) struct DockerEnvironmentProviderInner {
     pub(super) runner: Arc<dyn CommandRunner>,
+    #[cfg(unix)]
+    agent_settings: DockerAgentSettings,
+    #[cfg(unix)]
+    connector: Option<Arc<ConnectorFactory>>,
+    #[cfg(unix)]
+    agent_bytes: Arc<tokio::sync::OnceCell<Vec<u8>>>,
+    #[cfg(unix)]
+    agents: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<AgentLease>>>>>,
 }
 
 impl DockerEnvironmentProviderInner {
     fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            #[cfg(unix)]
+            agent_settings: DockerAgentSettings {
+                runtime_root: PathBuf::from("/tmp/flotilla-drydock"),
+                executable: PathBuf::from("/usr/local/bin/drydock-agent"),
+            },
+            #[cfg(unix)]
+            connector: None,
+            #[cfg(unix)]
+            agents: Default::default(),
+            #[cfg(unix)]
+            agent_bytes: Default::default(),
+        }
     }
 
     async fn image_exists(&self, tag: &str, cwd: &Path) -> Result<bool, String> {
@@ -307,12 +497,14 @@ impl DockerEnvironmentProviderInner {
             local_image_id,
             inner: Arc::clone(self),
             runner,
+            agent: None,
             provisioned_mounts,
         })
     }
 
     /// Resolves `image` locally under `pull_policy` and returns the environment
     /// its config declares.
+    #[cfg(any(unix, test))]
     async fn image_environment(
         &self,
         image: &str,
@@ -351,12 +543,14 @@ impl DockerEnvironmentProviderInner {
             .collect())
     }
 
+    #[cfg(any(unix, test))]
     async fn inspect_environment(&self, image: &str) -> Result<String, String> {
         self.runner
             .run("docker", &["image", "inspect", "--format", "{{json .Config.Env}}", image], Path::new("/"), &ChannelLabel::Default)
             .await
     }
 
+    #[cfg(any(unix, test))]
     async fn pull(&self, image: &str, docker_config: Option<&str>) -> Result<(), String> {
         let mut args = Vec::new();
         if let Some(config) = docker_config {
@@ -366,6 +560,7 @@ impl DockerEnvironmentProviderInner {
         self.runner.run("docker", &args, Path::new("/"), &ChannelLabel::Default).await.map(|_| ())
     }
 
+    #[cfg(any(unix, test))]
     async fn local_image_id(&self, container_name: &str) -> Result<String, String> {
         let output = self
             .runner
@@ -416,6 +611,15 @@ impl DockerEnvironmentProviderInner {
 
     async fn destroy(&self, container_name: &str) -> Result<(), String> {
         self.runner.run("docker", &["rm", "-f", container_name], Path::new("/"), &ChannelLabel::Default).await?;
+        #[cfg(unix)]
+        let removed = self.agents.lock().await.remove(container_name);
+        #[cfg(unix)]
+        if let Some(cell) = removed {
+            if let Some(lease) = cell.get() {
+                lease.supervisor.abort();
+                self.remove_agent_directory(&lease.directory).await;
+            }
+        }
         Ok(())
     }
 }
@@ -434,6 +638,7 @@ pub struct DockerProvisionedEnvironment {
     pub(super) inner: Arc<DockerEnvironmentProviderInner>,
     pub(super) runner: Arc<dyn CommandRunner>,
     provisioned_mounts: Vec<ProvisionedMount>,
+    agent: Option<Arc<dyn super::VesselAgent>>,
 }
 
 #[async_trait]
@@ -485,6 +690,30 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
     fn runner(&self) -> Arc<dyn CommandRunner> {
         Arc::clone(&self.runner)
     }
+    fn agent(&self) -> Option<Arc<dyn super::VesselAgent>> {
+        self.agent.clone()
+    }
+    fn fallback_runner(&self) -> Option<Arc<dyn CommandRunner>> {
+        Some(Arc::new(DockerEnvironmentRunner::new(self.container_name.clone(), self.inner.runner.clone())))
+    }
+
+    fn fallback_shell_plan(&self, cwd: &Path) -> Option<flotilla_protocol::ResolvedAttachPlan> {
+        use flotilla_protocol::arg::Arg;
+        Some(flotilla_protocol::ResolvedAttachPlan::command(vec![
+            Arg::Literal("sh".into()),
+            Arg::Literal("-c".into()),
+            Arg::Quoted("printf '%s\\n' 'Vessel agent unavailable; using Docker fallback runner.' >&2; exec \"$@\"".into()),
+            Arg::Literal("flotilla-fallback-shell".into()),
+            Arg::Literal("docker".into()),
+            Arg::Literal("exec".into()),
+            Arg::Literal("-it".into()),
+            Arg::Literal("-w".into()),
+            Arg::Quoted(cwd.to_string_lossy().into_owned()),
+            Arg::Quoted(self.container_name.clone()),
+            Arg::Literal("sh".into()),
+            Arg::Literal("-l".into()),
+        ]))
+    }
 
     async fn destroy(&self) -> Result<(), String> {
         self.inner.destroy(&self.backing_id).await
@@ -493,6 +722,7 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
+#[cfg(any(unix, test))]
 struct DockerMemoryInfo {
     mem_total: u64,
     memory_limit: bool,
@@ -680,7 +910,18 @@ fn classify_inspection(inspect: &DockerInspection, oomd: &str, kernel: &str) -> 
 }
 
 impl DockerEnvironmentProvider {
+    #[cfg(test)]
     pub(super) async fn create(&self, id: EnvironmentId, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String> {
+        self.create_with_image(id, image, image, opts).await
+    }
+    #[cfg(any(unix, test))]
+    async fn create_with_image(
+        &self,
+        id: EnvironmentId,
+        image: &ImageId,
+        runtime_image: &ImageId,
+        opts: CreateOpts,
+    ) -> Result<EnvironmentHandle, String> {
         let info = self
             .inner
             .runner
@@ -767,7 +1008,8 @@ impl DockerEnvironmentProvider {
         }
         provisioned_mounts.extend(requested_mounts);
         let env_id_str = id.to_string();
-        let image_str = image.as_str().to_string();
+        let image_str = runtime_image.as_str().to_string();
+        let source_label = format!("flotilla.source_image={}", image.as_str());
         let label_val = format!("flotilla.environment={}", id);
         let mounts_label_val =
             format!("flotilla.provisioned_mounts={}", serde_json::to_string(&provisioned_mounts).map_err(|err| err.to_string())?);
@@ -791,6 +1033,8 @@ impl DockerEnvironmentProvider {
             &label_val,
             "--label",
             &mounts_label_val,
+            "--label",
+            &source_label,
             "-e",
             &env_id_env,
         ]);
@@ -923,5 +1167,566 @@ mod seam_tests {
             "exited" | "dead" => assert_eq!(actual, ObservationState::Gone { cause: expected.clone() }),
             _ => assert!(matches!(actual, ObservationState::Unknown { reason: UnknownReason::ProviderApiError { .. } })),
         }
+    }
+}
+
+impl DockerEnvironmentProvider {
+    async fn prepare_agent_image(&self, original: ImageId) -> Result<super::PreparedEnvironment, String> {
+        #[cfg(not(unix))]
+        {
+            let _ = original;
+            Err("Docker vessel agents require a Unix host".into())
+        }
+        #[cfg(unix)]
+        {
+            #[cfg(not(target_os = "linux"))]
+            if self.inner.connector.is_none() {
+                return Err("Docker vessel agents currently require a Linux host and Linux agent companion".into());
+            }
+            let tools = drydock::launch::build_tools_digest().map_err(|e| e.to_string())?;
+            let dockerfile = format!("FROM {tools} AS tools\nFROM {}\nCOPY --from=tools /opt/drydock /opt/drydock\n", original.as_str());
+            let output = self
+                .inner
+                .runner
+                .run_with_input(
+                    "docker",
+                    &["build", "--quiet", "--network=none", "-"],
+                    Path::new("/"),
+                    &ChannelLabel::Default,
+                    dockerfile.as_bytes(),
+                )
+                .await?;
+            let digest = output.lines().last().unwrap_or("").trim();
+            if !flotilla_resources::is_image_digest(digest) {
+                return Err("preparing drydock tools did not return an image digest".into());
+            }
+            Ok(super::PreparedEnvironment::new(&self.preparation_owner, DockerPrepared { original, image: ImageId::new(digest) }))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl DockerEnvironmentProviderInner {
+    async fn remove_agent_directory(&self, directory: &Path) {
+        // Mounted labels can describe legacy/external paths. Remove only the
+        // hashed child owned by this provider, never an arbitrary adopted path.
+        if directory.parent() != Some(self.agent_settings.runtime_root.as_path())
+            || !directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.len() == 24 && name.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            tracing::warn!(path = %directory.display(), "retaining external agent runtime directory");
+            return;
+        }
+        if let Err(error) = tokio::fs::remove_dir_all(directory).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %directory.display(), %error, "failed to remove agent runtime directory");
+            }
+        }
+    }
+
+    fn runtime_directory(&self, id: &EnvironmentId) -> Result<PathBuf, String> {
+        std::fs::create_dir_all(&self.agent_settings.runtime_root).map_err(|e| e.to_string())?;
+        drydock_agent::socket::private_directory(&self.agent_settings.runtime_root).map_err(|e| e.to_string())?;
+        let directory = self.agent_settings.runtime_root.join(&format!("{:x}", Sha256::digest(id.as_str().as_bytes()))[..24]);
+        drydock_agent::socket::private_directory(&directory).map_err(|e| e.to_string())?;
+        for child in ["guest", "host"] {
+            drydock_agent::socket::private_directory(&directory.join(child)).map_err(|e| e.to_string())?;
+        }
+        Ok(directory)
+    }
+
+    async fn start_agent(runner: &dyn CommandRunner, container: &str) -> Result<(), String> {
+        // Upgrade replaces the image's binary by rename. Give the container's
+        // configured user its own copy's directory; never write the tools image.
+        let user = host_user();
+        runner
+            .run(
+                "docker",
+                &[
+                    "exec",
+                    "--user",
+                    "0",
+                    container,
+                    "sh",
+                    "-c",
+                    "mkdir -p /opt/flotilla /usr/local/bin /run/flotilla; chown -R \"$1\" /opt/drydock /opt/flotilla /run/flotilla; chown \"$1\" /usr/local/bin",
+                    "flotilla-agent-owner",
+                    &user,
+                ],
+                Path::new("/"),
+                &ChannelLabel::Default,
+            )
+            .await?;
+        Self::supervise_agent(runner, container).await
+    }
+    async fn supervise_agent(runner: &dyn CommandRunner, container: &str) -> Result<(), String> {
+        runner
+            .run(
+                "docker",
+                &["exec", container, "/opt/drydock/drydock-agent", "--supervise", "--socket", "/run/drydock/agent.sock"],
+                Path::new("/"),
+                &ChannelLabel::Default,
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn agent_for(self: &Arc<Self>, container: &str, directory: &Path) -> Result<Arc<AgentLease>, String> {
+        #[cfg(not(target_os = "linux"))]
+        if self.connector.is_none() {
+            return Err("Docker vessel agents currently require a Linux host and Linux agent companion".into());
+        }
+        let cell = self.agents.lock().await.entry(container.into()).or_default().clone();
+        let lease = cell
+            .get_or_try_init(|| async {
+                Self::start_agent(self.runner.as_ref(), container).await?;
+                let socket = directory.join("guest/agent.sock");
+                let connector = match &self.connector {
+                    Some(factory) => factory(&socket),
+                    None => Arc::new(
+                        UnixAgentConnector::new(socket, self.agent_settings.executable.clone(), Duration::from_secs(30))
+                            .with_executable_cache(self.agent_bytes.clone()),
+                    ),
+                };
+                let agent = Arc::new(AgentRunner::new(connector, directory.join("host")));
+                super::VesselAgent::ready(&agent).await?;
+                let (inner, backing, watched) = (Arc::downgrade(self), container.to_string(), agent.clone());
+                let supervisor = tokio::spawn(async move {
+                    let mut delay = Duration::from_secs(2);
+                    loop {
+                        tokio::time::sleep(delay).await;
+                        if watched.healthy().await {
+                            delay = Duration::from_secs(2);
+                            continue;
+                        }
+                        let Some(inner) = inner.upgrade() else { break };
+                        // A successful empty inventory is authoritative removal;
+                        // provider API failures instead back off and remain retryable.
+                        match inner
+                            .runner
+                            .run(
+                                "docker",
+                                &["ps", "-a", "--no-trunc", "--filter", &format!("id={backing}"), "--format", "{{.ID}}"],
+                                Path::new("/"),
+                                &ChannelLabel::Default,
+                            )
+                            .await
+                        {
+                            Ok(ids) if ids.trim().is_empty() => {
+                                inner.agents.lock().await.remove(&backing);
+                                break;
+                            }
+                            Ok(_) => {
+                                if Self::supervise_agent(inner.runner.as_ref(), &backing).await.is_ok() {
+                                    let _ = super::VesselAgent::ready(&watched).await;
+                                }
+                            }
+                            Err(error) => tracing::debug!(%backing, %error, "agent supervision waiting for provider"),
+                        }
+                        delay = (delay * 2).min(Duration::from_secs(60));
+                    }
+                });
+                Ok::<_, String>(Arc::new(AgentLease { directory: directory.into(), runner: agent, supervisor }))
+            })
+            .await?;
+        Ok(lease.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn environment_with_agent(
+        self: &Arc<Self>,
+        id: EnvironmentId,
+        image: ImageId,
+        local_image_id: Option<String>,
+        backing_id: String,
+        container_name: String,
+        provisioned_mounts: Vec<ProvisionedMount>,
+        lease: Arc<AgentLease>,
+    ) -> EnvironmentHandle {
+        Arc::new(DockerProvisionedEnvironment {
+            id,
+            backing_id,
+            container_name,
+            image,
+            local_image_id,
+            inner: self.clone(),
+            runner: lease.runner.clone(),
+            agent: Some(Arc::new(lease.runner.clone())),
+            provisioned_mounts,
+        })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod agent_contract_tests {
+    use super::super::agent::tests::MemoryAgent;
+    use super::*;
+    use flotilla_provider_runtime::CommandOutput;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    };
+
+    const BASE: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PREPARED: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const BACKING: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    // Process-boundary fake for Docker. Refuse calls outside the provider's
+    // lifecycle contract; no Docker executable or engine participates.
+    #[derive(Default)]
+    struct Engine {
+        created: AtomicBool,
+        mounts: Mutex<Vec<ProvisionedMount>>,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+    #[async_trait]
+    impl CommandRunner for Engine {
+        async fn run(&self, program: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+            if program == "cat" && args.first().is_some_and(|path| path.starts_with("/sys/fs/cgroup/")) {
+                return Err("no cgroup fixture".into());
+            }
+            assert_eq!(program, "docker");
+            self.calls.lock().unwrap().push(args.iter().map(|s| s.to_string()).collect());
+            match args {
+                ["image", "inspect", BASE] => Ok("[]".into()),
+                ["info", "--format", "{{json .}}"] => Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into()),
+                ["run", "-d", "--init", ..] => {
+                    assert_eq!(&args[args.len() - 3..], [PREPARED, "sleep", "infinity"]);
+                    assert!(!args.contains(&"--entrypoint"));
+                    assert!(!args.iter().any(|arg| arg.contains("/opt/drydock/drydock-agent")));
+                    let metadata = args.iter().find_map(|arg| arg.strip_prefix("flotilla.provisioned_mounts=")).unwrap();
+                    let mounts: Vec<ProvisionedMount> = serde_json::from_str(metadata).unwrap();
+                    assert_eq!(mounts.len(), 1, "CLI layer must not be a bind mount");
+                    assert_eq!(mounts[0].environment_path.as_path(), Path::new("/run/drydock"));
+                    assert_eq!(mounts[0].mode, ProvisionedMountMode::Rw);
+                    assert_eq!(
+                        std::fs::read_dir(mounts[0].host_path.as_path()).unwrap().count(),
+                        0,
+                        "the mounted dir contains no host control sockets"
+                    );
+                    *self.mounts.lock().unwrap() = mounts;
+                    assert!(!self.created.swap(true, Ordering::SeqCst));
+                    Ok(BACKING.into())
+                }
+                ["inspect", "--format", "{{.Image}}", _] => Ok(PREPARED.into()),
+                ["inspect", "--format", "{{json .Config.Env}}", BACKING] => Ok(r#"["HOME=/tmp","PATH=/usr/bin:/bin"]"#.into()),
+                ["exec", "--user", "0", BACKING, "sh", "-c", script, "flotilla-agent-owner", _] => {
+                    assert!(script.contains("/opt/drydock"));
+                    assert!(script.contains("/opt/flotilla"));
+                    Ok(String::new())
+                }
+                ["exec", BACKING, "/opt/drydock/drydock-agent", "--supervise", "--socket", "/run/drydock/agent.sock"] => Ok(String::new()),
+                ["inspect", BACKING] => {
+                    let mut value: serde_json::Value = serde_json::from_str(include_str!("fixtures/normal-stop.json")).unwrap();
+                    value[0]["Id"] = BACKING.into();
+                    value[0]["State"]["Status"] = "running".into();
+                    Ok(value.to_string())
+                }
+                ["ps", ..] => Ok(if self.created.load(Ordering::SeqCst) {
+                    format!(
+                        "{BACKING} flotilla-env-test\ttest\t{BASE}\t{}\n",
+                        serde_json::to_string(&*self.mounts.lock().unwrap()).unwrap()
+                    )
+                } else {
+                    String::new()
+                }),
+                ["rm", "-f", BACKING] => {
+                    self.created.store(false, Ordering::SeqCst);
+                    Ok(String::new())
+                }
+                _ => panic!("unexpected Docker command: {args:?}"),
+            }
+        }
+        async fn run_with_input(&self, program: &str, args: &[&str], _: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+            assert_eq!(program, "docker");
+            assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
+            let file = std::str::from_utf8(input).unwrap();
+            assert!(file.starts_with("FROM "));
+            assert!(file.contains("@sha256:"));
+            assert!(file.ends_with(&format!("FROM {BASE}\nCOPY --from=tools /opt/drydock /opt/drydock\n")));
+            assert!(!file.contains("ENTRYPOINT"));
+            assert!(!file.contains("CMD"));
+            Ok(PREPARED.into())
+        }
+        async fn run_output(&self, p: &str, a: &[&str], c: &Path, l: &ChannelLabel) -> Result<CommandOutput, String> {
+            self.run(p, a, c, l).await.map(|stdout| CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) })
+        }
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            false
+        }
+    }
+
+    // Issue 3486: the hello gates provisioning; the returned handle executes
+    // through the real agent, and readoption keeps that runner after a roll.
+    // The fake checks preparation, fixed alongside startup and per-vessel mounts.
+    #[tokio::test]
+    async fn prepares_starts_waits_for_hello_pushes_layer_and_readopts() {
+        use super::super::{EnvironmentTool, EnvironmentToolAsset};
+        let root = tempfile::tempdir().unwrap();
+        let assets = tempfile::tempdir().unwrap();
+        let source = assets.path().join("source");
+        let destination = assets.path().join("guest/flotilla");
+        std::fs::write(&source, b"cut-down CLI").unwrap();
+        let engine = Arc::new(Engine::default());
+        let memory = MemoryAgent::new(true);
+        let shared = memory.clone();
+        let provider = DockerEnvironmentProvider::new(engine.clone())
+            .with_agent_settings(DockerAgentSettings { runtime_root: root.path().into(), executable: source.clone() })
+            .with_agent_connector(Arc::new(move |_| shared.clone()));
+        let spec = super::super::legacy_environment_spec(&flotilla_protocol::EnvironmentSpec {
+            image: flotilla_protocol::ImageSource::Registry(BASE.into()),
+            token_env_vars: Vec::new(),
+        })
+        .unwrap();
+        let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
+        let tools = vec![EnvironmentTool::new("flotilla", &destination).with_asset(EnvironmentToolAsset::new(
+            &source,
+            &destination,
+            EnvironmentToolAssetKind::File,
+            EnvironmentToolAssetAccess::ReadOnly,
+            "cut-down CLI",
+        ))];
+        let handle =
+            provider.provision(EnvironmentId::new("test"), &prepared, ProvisionOpts { tools, ..Default::default() }).await.unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), b"cut-down CLI");
+        assert!(handle.agent().is_some());
+        assert!(handle.fallback_runner().is_some());
+        assert_eq!(handle.image().as_str(), BASE);
+        assert_eq!(handle.runner().run("printf", &["agent runner"], Path::new("/"), &ChannelLabel::Default).await.unwrap(), "agent runner");
+        let readopted = provider.list().await.unwrap().pop().unwrap();
+        assert!(readopted.agent().is_some());
+        assert_eq!(readopted.runner().run("printf", &["readopted"], Path::new("/"), &ChannelLabel::Default).await.unwrap(), "readopted");
+        assert_eq!(memory.upgrades.load(Ordering::SeqCst), 1);
+        handle.destroy().await.unwrap();
+        assert!(!engine.created.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0, "destroy must remove the per-vessel runtime directory");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod runtime_path_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    // Hashing environment identities prevents traversal and gives disjoint,
+    // private guest directories. Only one guest dir is ever mounted, never its
+    // host sibling, another guest's directory or the host control directory.
+    #[test]
+    fn runtime_paths_are_private_disjoint_and_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = DockerEnvironmentProvider::new(Arc::new(flotilla_provider_runtime::ProcessCommandRunner))
+            .with_agent_settings(DockerAgentSettings { runtime_root: root.path().into(), executable: root.path().join("agent") });
+        let a = provider.inner.runtime_directory(&EnvironmentId::new("vessel-a")).unwrap();
+        for id in ["vessel-b", "../../vessel-a", "", "a/../vessel-a"] {
+            let b = provider.inner.runtime_directory(&EnvironmentId::new(id)).unwrap();
+            assert_ne!(a, b);
+            assert_eq!(b.parent(), Some(root.path()));
+            for child in ["guest", "host"] {
+                assert_eq!(std::fs::metadata(b.join(child)).unwrap().permissions().mode() & 0o777, 0o700);
+            }
+            assert!(b.join("guest/agent.sock").as_os_str().len() < 108);
+        }
+        assert!(!a.join("guest/host").exists());
+    }
+
+    #[tokio::test]
+    async fn teardown_removes_owned_runtime_directories_and_preserves_external_mounts() {
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let provider = DockerEnvironmentProvider::new(Arc::new(flotilla_provider_runtime::ProcessCommandRunner))
+            .with_agent_settings(DockerAgentSettings { runtime_root: root.path().into(), executable: root.path().join("agent") });
+        let owned = provider.inner.runtime_directory(&EnvironmentId::new("vessel")).unwrap();
+        let unowned = root.path().join("legacy");
+        std::fs::create_dir(&unowned).unwrap();
+        for directory in [&unowned, external.path()] {
+            std::fs::write(directory.join("sentinel"), b"preserve").unwrap();
+            provider.inner.remove_agent_directory(directory).await;
+            assert!(directory.join("sentinel").exists());
+        }
+        provider.inner.remove_agent_directory(&owned).await;
+        assert!(!owned.exists());
+        // Retried teardown is idempotent.
+        provider.inner.remove_agent_directory(&owned).await;
+    }
+
+    // Glue: the dead-agent diagnosis path retains an interactive tty and cwd,
+    // and tells the viewer explicitly that it is using Docker's fallback.
+    #[test]
+    fn fallback_shell_is_interactive_and_reports_the_fallback() {
+        use flotilla_protocol::{arg::Arg, ResolvedAttachAction};
+        let provider = DockerEnvironmentProvider::new(Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
+        let handle = provider.inner.provisioned_environment(
+            EnvironmentId::new("shell"),
+            ImageId::new("image"),
+            None,
+            "backing".into(),
+            "container".into(),
+            Vec::new(),
+        );
+        let plan = handle.fallback_shell_plan(Path::new("/workspace with spaces")).unwrap();
+        let [ResolvedAttachAction::Command(args)] = plan.0.as_slice() else {
+            panic!("one hop");
+        };
+        assert!(args.contains(&Arg::Literal("-it".into())));
+        assert!(args.contains(&Arg::Quoted("/workspace with spaces".into())));
+        assert!(args.contains(&Arg::Quoted("container".into())));
+        assert!(args
+            .iter()
+            .any(|arg| matches!(arg, Arg::Quoted(text) if text.contains("agent unavailable") && text.contains("fallback runner"))));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod adoption_tests {
+    use super::super::agent::tests::MemoryAgent;
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    // Fake only Docker's process boundary; agent adoption uses real protocol handlers.
+    #[derive(Default)]
+    struct Inventory {
+        rows: Mutex<Vec<(String, PathBuf)>>,
+        starts: AtomicUsize,
+    }
+    #[async_trait]
+    impl CommandRunner for Inventory {
+        async fn run(&self, program: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+            if program == "cat" {
+                return Err("no host cgroup sample".into());
+            }
+            match args {
+                ["ps", "-a", "--no-trunc", "--filter", filter, "--format", "{{.ID}}"] => {
+                    let backing = filter.strip_prefix("id=").unwrap();
+                    Ok(if self.rows.lock().unwrap().iter().any(|(id, _)| id == backing) { backing.into() } else { String::new() })
+                }
+                ["ps", ..] => Ok(self
+                    .rows
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(id, guest)| {
+                        let mounts = vec![ProvisionedMount::new(guest, "/run/drydock", ProvisionedMountMode::Rw)];
+                        format!("{id} {id}\t{id}\tbase\t{}", serde_json::to_string(&mounts).unwrap())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")),
+                ["inspect", "--format", "{{json .Config.Env}}", _] => Ok(r#"["HOME=/tmp"]"#.into()),
+                ["inspect", _] => {
+                    let mut value: serde_json::Value = serde_json::from_str(include_str!("fixtures/normal-stop.json")).unwrap();
+                    value[0]["State"]["Status"] = "running".into();
+                    Ok(value.to_string())
+                }
+                ["exec", _, "/opt/drydock/drydock-agent", "--supervise", "--socket", "/run/drydock/agent.sock"] => {
+                    self.starts.fetch_add(1, Ordering::SeqCst);
+                    Ok(String::new())
+                }
+                ["exec", "--user", "0", ..] => Ok(String::new()),
+                _ => panic!("unexpected Docker command {args:?}"),
+            }
+        }
+        async fn run_output(
+            &self,
+            _: &str,
+            _: &[&str],
+            _: &Path,
+            _: &ChannelLabel,
+        ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+            unreachable!()
+        }
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            false
+        }
+    }
+    struct Unreachable;
+    #[async_trait]
+    impl AgentConnector for Unreachable {
+        async fn connect(&self) -> Result<drydock_agent::Client, String> {
+            Err("agent unreachable".into())
+        }
+    }
+
+    // One failed agent cannot erase healthy inventory. Healthy monitoring uses
+    // the existing client; out-of-band removal retires the watcher/cache even
+    // while a caller retains the old handle.
+    #[tokio::test]
+    async fn unavailable_agent_keeps_inventory_and_removed_container_retires_supervision() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Inventory::default());
+        let memory = MemoryAgent::new(false);
+        let shared = memory.clone();
+        let bad = root.path().join("bad/guest/agent.sock");
+        for id in ["bad", "healthy"] {
+            let directory = root.path().join(id);
+            std::fs::create_dir_all(directory.join("guest")).unwrap();
+            std::fs::create_dir_all(directory.join("host")).unwrap();
+            engine.rows.lock().unwrap().push((id.into(), directory.join("guest")));
+        }
+        let provider = DockerEnvironmentProvider::new(engine.clone()).with_agent_connector(Arc::new(move |socket| {
+            if socket == bad {
+                Arc::new(Unreachable)
+            } else {
+                shared.clone()
+            }
+        }));
+        let handles = provider.list().await.unwrap();
+        assert_eq!(handles.len(), 2);
+        assert!(handles.iter().find(|h| h.id().as_str() == "bad").unwrap().agent().is_none());
+        let healthy = handles.iter().find(|h| h.id().as_str() == "healthy").unwrap();
+        assert!(healthy.agent().is_some());
+        let starts = engine.starts.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert_eq!(engine.starts.load(Ordering::SeqCst), starts, "healthy agents need no repeated Docker exec");
+        engine.rows.lock().unwrap().retain(|(id, _)| id != "healthy");
+        memory.stop();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while provider.inner.agents.lock().await.contains_key("healthy") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(healthy.agent().is_some(), "retained handle must not keep polling a removed container");
+    }
+
+    struct GatedConnector {
+        entered: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl AgentConnector for GatedConnector {
+        async fn connect(&self) -> Result<drydock_agent::Client, String> {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+    // Initialization is exclusive per backing, not across the provider map.
+    #[tokio::test]
+    async fn stalled_hello_does_not_serialize_other_vessels() {
+        let root = tempfile::tempdir().unwrap();
+        for id in ["slow", "healthy"] {
+            std::fs::create_dir_all(root.path().join(id).join("host")).unwrap();
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = entered.clone();
+        let memory = MemoryAgent::new(false);
+        let provider = DockerEnvironmentProvider::new(Arc::new(Inventory::default())).with_agent_connector(Arc::new(move |socket| {
+            if socket.to_string_lossy().contains("slow") {
+                Arc::new(GatedConnector { entered: gate.clone() })
+            } else {
+                memory.clone()
+            }
+        }));
+        let inner = provider.inner.clone();
+        let slow_directory = root.path().join("slow");
+        let slow = tokio::spawn(async move { inner.agent_for("slow", &slow_directory).await });
+        entered.notified().await;
+        let healthy = tokio::time::timeout(Duration::from_secs(1), provider.inner.agent_for("healthy", &root.path().join("healthy")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(healthy.runner.healthy().await);
+        slow.abort();
     }
 }

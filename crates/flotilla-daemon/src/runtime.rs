@@ -177,6 +177,22 @@ impl DaemonRuntime {
         )
         .await;
 
+        // Host binary identity is a composition-root fact. Resolve the real
+        // companion of this running daemon, never a fleet shell launcher whose
+        // bytes would be pushed as if they were the drydock executable.
+        #[cfg(target_os = "linux")]
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(parent) = executable.parent() {
+                let agent = parent.join("drydock-agent");
+                if agent.is_file() {
+                    if let Some(bag) = daemon.local_environment_bag() {
+                        daemon.environment_manager().replace_local_environment_bag(
+                            flotilla_discovery_api::EnvironmentBag::new().with(flotilla_discovery_api::EnvironmentAssertion::binary("drydock-agent", agent)).extend(bag.assertions().iter().filter(|assertion| !matches!(assertion, flotilla_discovery_api::EnvironmentAssertion::BinaryAvailable { name, .. } if name == "drydock-agent")).cloned()),
+                        )?;
+                    }
+                }
+            }
+        }
         let local_registry = phase("probe_local_provider_registry", probe_local_provider_registry(&daemon, &config)).await?;
         let profile = build_local_profile(&daemon, &local_registry).await?;
         let host_direct_environment_name = host_direct_environment_name(&profile.host_id);

@@ -21,7 +21,7 @@ libc = { workspace = true }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext", "os-poll"] }
-once_cell = { version = "1", features = ["std", "critical-section", "portable-atomic"] }
+once_cell = { version = "1", features = ["std", "critical-section", "portable-atomic", "race"] }
 percent-encoding = { version = "2" }
 serde = { version = "1", features = ["derive"] }
 serde_core = { version = "1", features = ["alloc"] }

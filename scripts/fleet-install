@@ -390,6 +390,9 @@ write_launcher() {
 
 ensure_launchers_and_path() {
   local name
+  for name in flotilla-vessel drydock-agent; do
+    [[ ! -x "$FLEET_ROOT/current/bin/$name" ]] || write_launcher "$name"
+  done
   for name in flotilla flotillad cleat; do
     write_launcher "$name"
   done

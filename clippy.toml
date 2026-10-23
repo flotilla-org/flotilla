@@ -95,7 +95,6 @@ absolute-paths-allowed-crates = [
     "flotilla_transport",
     "flotilla_tui",
     "flotilla_vcs",
-    "flotilla_vessel_agent",
     "form_urlencoded",
     "futures",
     "futures_channel",

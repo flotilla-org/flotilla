@@ -55,6 +55,8 @@ pub struct AgentMaterialPreflight {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentMaterialDelivery {
+    /// Host snapshot and guest destination. Docker pushes these files after
+    /// hello; preceding providers can still lower this descriptor to a mount.
     pub mount: ProvisionedMount,
     pub preflight: AgentMaterialPreflight,
 }
@@ -117,6 +119,7 @@ pub struct AgentMaterialRegistry {
     codex_central_auth_path: PathBuf,
     adapters: BTreeMap<&'static str, Arc<dyn AgentMaterialAdapter>>,
     skills: SkillBundle,
+    capture_locks: tokio::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl AgentMaterialRegistry {
@@ -146,7 +149,7 @@ impl AgentMaterialRegistry {
         if env.get("FLOTILLA_FLEET_CANARY").as_deref() == Some("1") {
             adapters.insert("fleet-canary", claude_code);
         }
-        Self { homes_dir, codex_central_auth_path, adapters, skills }
+        Self { homes_dir, codex_central_auth_path, adapters, skills, capture_locks: Default::default() }
     }
 
     pub fn prepare<'a>(
@@ -470,6 +473,81 @@ done"#,
             }
             let credential = read_central_credential(&self.codex_central_auth_path).await?;
             install_read_only_copy(&credential, &home.join(CODEX_AUTH_FILE)).await
+        })
+    }
+
+    /// Rotate a Pushed credential through the environment's runner (the
+    /// resident agent on Docker). Host staging is not mounted into new vessels.
+    /// Re-send unchanged bytes too, so a previously interrupted push converges.
+    pub fn refresh_delivered_credentials_through<'a>(
+        &'a self,
+        environment_ref: &'a str,
+        runner: &'a dyn CommandRunner,
+    ) -> BoxFuture<'a, Result<bool, String>> {
+        Box::pin(async move {
+            if !matches!(Path::new(environment_ref).components().collect::<Vec<_>>().as_slice(), [Component::Normal(_)]) {
+                return Err("environment identity must name one directory".into());
+            }
+
+            let source = self.homes_dir.join(environment_ref).join(CODEX_ADAPTER_ID).join(CODEX_AUTH_FILE);
+            if !fs::try_exists(&source).await.map_err(|e| e.to_string())? {
+                return Ok(false);
+            }
+            let changed = self.refresh_delivered_credentials(environment_ref).await?;
+            let bytes = fs::read(&source).await.map_err(|e| e.to_string())?;
+            let contents = std::str::from_utf8(&bytes).map_err(|_| "Codex credential must be UTF-8 JSON")?;
+            runner.write_file_with_mode(&Path::new(CONTAINER_CODEX_HOME).join(CODEX_AUTH_FILE), contents, CODEX_AUTH_MODE).await?;
+            Ok(changed)
+        })
+    }
+
+    /// Capture guest session/scratch records through the agent before container
+    /// teardown. The archive excludes credentials, and is kept with the existing
+    /// environment-home archive rather than reading guest files via host mounts.
+    pub fn capture_environment_home<'a>(
+        &'a self,
+        environment_ref: &'a str,
+        runner: &'a dyn CommandRunner,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            if !matches!(Path::new(environment_ref).components().collect::<Vec<_>>().as_slice(), [Component::Normal(_)]) {
+                return Err("environment identity must name one directory".into());
+            }
+
+            let home = self.homes_dir.join(environment_ref);
+            if !fs::try_exists(home.join(CODEX_ADAPTER_ID)).await.map_err(|e| e.to_string())? {
+                return Ok(());
+            }
+            let capture_lock = self.capture_locks.lock().await.entry(environment_ref.into()).or_default().clone();
+            let _capture = capture_lock.lock().await;
+            let mut entries = fs::read_dir(&home).await.map_err(|e| e.to_string())?;
+            while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name
+                    .strip_prefix(".guest-codex-")
+                    .and_then(|name| name.strip_suffix(".tar"))
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+                    && entry.file_type().await.map_err(|e| e.to_string())?.is_file()
+                {
+                    fs::remove_file(entry.path()).await.map_err(|e| e.to_string())?;
+                }
+            }
+            let temporary = home.join(format!(".guest-codex-{}.tar", uuid::Uuid::new_v4()));
+            fs::write(&temporary, []).await.map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).await.map_err(|e| e.to_string())?;
+            }
+            let result = runner
+                .run_to_file("tar", &["-C", CONTAINER_CODEX_HOME, "--exclude=auth.json", "-cf", "-", "."], Path::new("/"), &temporary)
+                .await;
+            if let Err(error) = result {
+                let _ = fs::remove_file(&temporary).await;
+                return Err(format!("capture Codex sessions through agent: {error}"));
+            }
+            fs::rename(&temporary, home.join("guest-codex.tar")).await.map_err(|e| e.to_string())
         })
     }
 
@@ -2583,6 +2661,102 @@ esac
             std::fs::read_to_string(codex_home.join("sessions/2026/09/13/rollout.jsonl")).expect("preserved rollout"),
             "{\"type\":\"session_meta\"}\n"
         );
+    }
+
+    // A central rotation is Pushed through the selected runner with final
+    // read-only permissions. Unchanged staging is re-sent after an interrupted
+    // push, so the guest converges without sharing the host credential inode.
+    #[tokio::test]
+    async fn codex_rotation_uses_the_agent_runner_and_retries_unchanged_staging() {
+        use std::sync::Mutex;
+        struct DeliveryRunner(Mutex<Vec<(PathBuf, String, u32)>>);
+        #[async_trait]
+        impl CommandRunner for DeliveryRunner {
+            async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+                panic!("credential bytes must use the files seam")
+            }
+            async fn run_output(
+                &self,
+                _: &str,
+                _: &[&str],
+                _: &Path,
+                _: &ChannelLabel,
+            ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+                unreachable!()
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+            async fn write_file_with_mode(&self, path: &Path, bytes: &str, mode: u32) -> Result<(), String> {
+                self.0.lock().unwrap().push((path.into(), bytes.into(), mode));
+                Ok(())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        write_central_auth(temp.path(), "first");
+        let registry = registry(temp.path());
+        registry.prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.into()]), &BTreeMap::new()).await.unwrap();
+        let runner = DeliveryRunner(Mutex::new(Vec::new()));
+        for token in ["first", "rotated", "rotated"] {
+            write_central_auth(temp.path(), token);
+            registry.refresh_delivered_credentials_through("env-a", &runner).await.unwrap();
+            let writes = runner.0.lock().unwrap();
+            let (path, bytes, mode) = writes.last().unwrap();
+            assert_eq!(path, &Path::new(CONTAINER_CODEX_HOME).join(CODEX_AUTH_FILE));
+            assert_eq!(*mode, CODEX_AUTH_MODE);
+            assert!(bytes.contains(token));
+        }
+        assert_eq!(runner.0.lock().unwrap().len(), 3);
+        assert!(registry.refresh_delivered_credentials_through("../other-vessel", &runner).await.is_err());
+    }
+
+    // Session capture uses the runner stream, excludes credentials, and keeps
+    // the previous complete archive when a guest read fails so teardown retries.
+    #[tokio::test]
+    async fn guest_session_capture_publishes_only_complete_archives() {
+        struct ArchiveRunner(bool);
+        #[async_trait]
+        impl CommandRunner for ArchiveRunner {
+            async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+                unreachable!()
+            }
+            async fn run_output(
+                &self,
+                _: &str,
+                _: &[&str],
+                _: &Path,
+                _: &ChannelLabel,
+            ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+                unreachable!()
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+            // Fake only the guest process boundary; archive publication is real.
+            async fn run_to_file(&self, command: &str, args: &[&str], cwd: &Path, path: &Path) -> Result<(), String> {
+                assert_eq!(command, "tar");
+                assert_eq!(args, ["-C", CONTAINER_CODEX_HOME, "--exclude=auth.json", "-cf", "-", "."]);
+                assert_eq!(cwd, Path::new("/"));
+                tokio::fs::write(path, b"session archive").await.unwrap();
+                if self.0 {
+                    Err("guest disconnected".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        write_central_auth(temp.path(), "secret");
+        let registry = registry(temp.path());
+        registry.prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.into()]), &BTreeMap::new()).await.unwrap();
+        let home = registry.homes_dir.join("env-a");
+        std::fs::write(home.join(format!(".guest-codex-{}.tar", uuid::Uuid::new_v4())), "partial from previous process").unwrap();
+        registry.capture_environment_home("env-a", &ArchiveRunner(false)).await.unwrap();
+        assert_eq!(std::fs::read(home.join("guest-codex.tar")).unwrap(), b"session archive");
+        assert!(registry.capture_environment_home("env-a", &ArchiveRunner(true)).await.is_err());
+        assert_eq!(std::fs::read(home.join("guest-codex.tar")).unwrap(), b"session archive");
+        assert!(!std::fs::read_dir(&home).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".guest-")));
+        assert!(registry.capture_environment_home("../other", &ArchiveRunner(false)).await.is_err());
     }
 
     #[tokio::test]

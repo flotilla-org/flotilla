@@ -1,15 +1,15 @@
-use flotilla_cli::terminal::client_attach_plan;
+use crate::terminal::client_attach_plan;
 
 use color_eyre::Result;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction, RepoSelector};
 
-use flotilla_cli::cli::args::Cli;
+use crate::cli::args::Cli;
 
-use super::daemon::{connect_daemon, reset_sigpipe};
+use super::connection::{connect_daemon, reset_sigpipe};
 use super::targets::{resolve_cli_repository, resolve_optional_cwd_repository, resolve_repo_from_env};
 
-pub(crate) async fn run_attach(
+pub async fn run_attach(
     cli: &Cli,
     reference: &str,
     mode: flotilla_protocol::commands::AttachMode,
@@ -97,7 +97,7 @@ pub(crate) async fn run_attach(
 /// launching the attach command — the one moment a process knows the binding
 /// (flotilla-org/flotilla#708, half 1). Best-effort: a PM-less or failed
 /// stamp never blocks the attach.
-pub(super) async fn stamp_pane_identity(reference: &str, binding: Option<&flotilla_protocol::AttachBinding>) {
+pub async fn stamp_pane_identity(reference: &str, binding: Option<&flotilla_protocol::AttachBinding>) {
     use flotilla_manifest::{pm::PmInstance, stamp::pane_stamp};
     let Some(pm) = PmInstance::detect(&|key| std::env::var(key).ok()) else {
         return;
@@ -110,6 +110,6 @@ pub(super) async fn stamp_pane_identity(reference: &str, binding: Option<&flotil
     }
 }
 
-pub(super) fn run_attach_plan(plan: &flotilla_protocol::ResolvedAttachPlan) -> Result<()> {
-    flotilla_cli::terminal::exec_attach_plan(plan).map(|never| match never {}).map_err(color_eyre::eyre::Report::msg)
+pub fn run_attach_plan(plan: &flotilla_protocol::ResolvedAttachPlan) -> Result<()> {
+    crate::terminal::exec_attach_plan(plan).map(|never| match never {}).map_err(color_eyre::eyre::Report::msg)
 }

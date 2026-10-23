@@ -20,7 +20,6 @@ members = [
     "crates/flotilla-charter",
     "crates/flotilla-client",
     "crates/flotilla-cli",
-    "crates/flotilla-vessel-agent",
     "crates/flotilla-ai-utility",
     "crates/flotilla-cloud-agent",
     "crates/flotilla-commands",
@@ -86,11 +85,11 @@ license = "Apache-2.0 OR MIT"
 # When adding dependencies anywhere in the workspace, update the external-crate
 # allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
-drydock = { git = "https://github.com/flotilla-org/drydock", rev = "4a0e4b24811e9f85c9750ce2d9a744895e66322f" }
-drydock-protocol = { git = "https://github.com/flotilla-org/drydock", rev = "4a0e4b24811e9f85c9750ce2d9a744895e66322f" }
-drydock-agent = { git = "https://github.com/flotilla-org/drydock", rev = "4a0e4b24811e9f85c9750ce2d9a744895e66322f" }
-drydock-transport = { git = "https://github.com/flotilla-org/drydock", rev = "4a0e4b24811e9f85c9750ce2d9a744895e66322f" }
-drydock-host = { git = "https://github.com/flotilla-org/drydock", rev = "4a0e4b24811e9f85c9750ce2d9a744895e66322f" }
+drydock = { git = "https://github.com/flotilla-org/drydock", rev = "7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3" }
+drydock-protocol = { git = "https://github.com/flotilla-org/drydock", rev = "7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3" }
+drydock-agent = { git = "https://github.com/flotilla-org/drydock", rev = "7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3" }
+drydock-transport = { git = "https://github.com/flotilla-org/drydock", rev = "7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3" }
+drydock-host = { git = "https://github.com/flotilla-org/drydock", rev = "7f14b46cd02dc2e1c49d29635b5a1bf4da490ee3" }
 rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "8c5fef84c6ce9c01ea56fb680a83986c1f14941d" }
 rigging-ssh = { git = "https://github.com/flotilla-org/rigging", rev = "8c5fef84c6ce9c01ea56fb680a83986c1f14941d" }
 rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "8c5fef84c6ce9c01ea56fb680a83986c1f14941d" }
@@ -161,7 +160,6 @@ flotilla-protocol = { path = "crates/flotilla-protocol" }
 flotilla-resources = { path = "crates/flotilla-resources" }
 flotilla-tui = { path = "crates/flotilla-tui", optional = true }
 flotilla-cli = { path = "crates/flotilla-cli" }
-flotilla-vessel-agent = { path = "crates/flotilla-vessel-agent" }
 ratatui = { version = "0.30", optional = true }
 tokio = { workspace = true }
 color-eyre = { workspace = true }

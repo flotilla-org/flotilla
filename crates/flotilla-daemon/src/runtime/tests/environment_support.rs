@@ -644,6 +644,13 @@ pub(super) struct HeldBaselineRunner {
 
 #[async_trait]
 impl CommandRunner for HeldBaselineRunner {
+    async fn run_with_input(&self, command: &str, args: &[&str], _: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        assert_eq!(command, "docker");
+        assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
+        assert!(std::str::from_utf8(input).unwrap().contains("COPY --from=tools /opt/drydock /opt/drydock"));
+        Ok(format!("sha256:{}", "b".repeat(64)))
+    }
+
     async fn run(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
         assert_eq!(cmd, "docker");
         match args {
