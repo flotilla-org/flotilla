@@ -39,7 +39,9 @@ pub struct FleetRoles {
 }
 
 impl FleetRoles {
-    /// The five default roles under the fleet's own name.
+    /// The five default roles under the fleet's own name, preserving its exact
+    /// spelling. Changing that identity changes the inbox addresses and strands
+    /// messages pending under the previous name; changing the charter Project does not.
     pub fn declared(fleet: &str) -> Result<Self, String> {
         if fleet.trim().is_empty() {
             return Err("FleetDesignation.spec.fleet must name a nonempty fleet".into());
