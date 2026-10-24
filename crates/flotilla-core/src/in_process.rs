@@ -17,6 +17,7 @@ use flotilla_observation::sources::{
 #[cfg(test)]
 use flotilla_protocol::PlacementDecision;
 use flotilla_resources::address::{remote_change_request_subject, same_subject};
+use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 #[cfg(test)]
 use flotilla_resources::{CapabilityNeed, ProjectSpec, Resource};
@@ -841,7 +842,8 @@ pub trait AgentlessVesselAccess: Send + Sync {
 #[async_trait]
 impl StandingConvoyBackingInspector for InProcessDaemon {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
-        flotilla_admission::convoy_ensure::ResourceStandingConvoyBackingInspector { resource_backend: self.resource_backend.clone() }
+        flotilla_admission::convoy_ensure::ResourceStandingConvoyBackingInspector::new(self.resource_backend.clone())
+            .with_lifecycle_reads(self.lifecycle_reads())
             .verify_backing_dead(convoy)
             .await
     }
@@ -1245,8 +1247,10 @@ impl InProcessDaemon {
         ));
         let admission_free_space_path = Arc::new(std::sync::RwLock::new(admission_free_space_path));
         let observed_checkout_reconciliation = Arc::new(Mutex::new(()));
+        let lifecycle_reads = Arc::new(flotilla_resources::lifecycle_reads::LateLifecycleReads::default());
         let checkout_providers = Arc::new(
             CheckoutProviders::builder()
+                .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
                 .resource_backend(resource_backend.clone())
                 .observed_resource_backend(observed_resource_backend.clone())
                 .config(Arc::clone(&config))
@@ -1258,6 +1262,7 @@ impl InProcessDaemon {
         );
         let crew = Arc::new(
             CrewService::builder()
+                .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
                 .message_inboxes(Arc::clone(&message_inboxes))
                 .message_path(Arc::clone(&crew_message_path))
                 .convoy_engine(Arc::clone(&convoy_engine_path))
@@ -1307,6 +1312,7 @@ impl InProcessDaemon {
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             self_weak: self_weak.clone(),
             admission: ConvoyAdmission::builder()
+                .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
                 .backend(resource_backend.clone())
                 .observed_backend(observed_resource_backend.clone())
                 .observed_checkout_reconciliation(Arc::clone(&observed_checkout_reconciliation))
@@ -1343,7 +1349,7 @@ impl InProcessDaemon {
             regard_lifecycle: Arc::clone(&regard_lifecycle),
             decided_store: Default::default(),
             change_stream_rounds: Default::default(),
-            lifecycle_reads: Default::default(),
+            lifecycle_reads: Arc::clone(&lifecycle_reads),
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
@@ -1656,11 +1662,12 @@ impl InProcessDaemon {
     async fn observed_repository_key_for_path(&self, path: &Path) -> Result<Option<RepositoryKey>, String> {
         let path = canonical_or_original(path);
         let namespace = self.provisioning_namespace().await;
-        let checkouts = flotilla_admission::repository_addressing::local_checkouts(
+        let checkouts = flotilla_admission::repository_addressing::local_checkouts_with_lifecycle_reads(
             &self.resource_backend,
             &self.observed_resource_backend,
             &namespace,
             self.environment_manager.local_host_id().as_str(),
+            self.lifecycle_reads.as_ref(),
         )
         .await?;
         let mut keys = checkouts
@@ -2166,6 +2173,11 @@ impl InProcessDaemon {
     /// Installs the engine's provisioning readings during composition (#3629 layer 4).
     pub fn install_lifecycle_reads(&self, reads: Arc<dyn flotilla_projections::ports::LifecycleReads>) -> Result<(), String> {
         self.lifecycle_reads.install(reads)
+    }
+
+    /// Refuse engine-enabled startup until its lifecycle read port is installed.
+    pub fn require_lifecycle_reads_installed(&self) -> Result<(), String> {
+        self.lifecycle_reads.require_installed()
     }
 
     /// The provisioning readings the views consult: the engine's once installed, none before.
@@ -2731,12 +2743,13 @@ impl InProcessDaemon {
         &self,
         selector: &flotilla_protocol::RepoSelector,
     ) -> Result<Option<RepositoryKey>, String> {
-        flotilla_admission::repository_addressing::resolve_repository(
+        flotilla_admission::repository_addressing::resolve_repository_with_lifecycle_reads(
             &self.resource_backend,
             &self.observed_resource_backend,
             &self.provisioning_namespace().await,
             self.environment_manager.local_host_id().as_str(),
             selector,
+            self.lifecycle_reads.as_ref(),
         )
         .await
     }
@@ -2780,11 +2793,12 @@ impl InProcessDaemon {
         scope: &CheckoutResolutionScope,
     ) -> Result<(PathBuf, String), String> {
         let namespace = self.provisioning_namespace().await;
-        let checkouts = flotilla_admission::repository_addressing::local_checkouts(
+        let checkouts = flotilla_admission::repository_addressing::local_checkouts_with_lifecycle_reads(
             &self.resource_backend,
             &self.observed_resource_backend,
             &namespace,
             self.environment_manager.local_host_id().as_str(),
+            self.lifecycle_reads.as_ref(),
         )
         .await?;
         let physical_selector_path = match selector {
@@ -3598,6 +3612,7 @@ impl InProcessDaemon {
             clock: &self.clock,
             namespace: &self.provisioning_namespace,
             repository_index: RepositoryIndex {
+                lifecycle_reads: self.lifecycle_reads.as_ref(),
                 backend: &self.resource_backend,
                 observed: &self.observed_resource_backend,
                 namespace: &self.provisioning_namespace,
@@ -3730,11 +3745,12 @@ impl InProcessDaemon {
             .map_err(|error| error.to_string())?;
         }
 
-        let other_tracked_keys = flotilla_admission::repository_addressing::local_checkouts(
+        let other_tracked_keys = flotilla_admission::repository_addressing::local_checkouts_with_lifecycle_reads(
             &self.resource_backend,
             &self.observed_resource_backend,
             &namespace,
             self.environment_manager.local_host_id().as_str(),
+            self.lifecycle_reads.as_ref(),
         )
         .await?
         .into_iter()
@@ -4272,11 +4288,12 @@ impl InProcessDaemon {
             return Ok(Default::default());
         }
         let mut paths = BTreeMap::<RepositoryKey, Vec<PathBuf>>::new();
-        for checkout in flotilla_admission::repository_addressing::local_checkouts(
+        for checkout in flotilla_admission::repository_addressing::local_checkouts_with_lifecycle_reads(
             &self.resource_backend,
             &self.observed_resource_backend,
             namespace,
             self.environment_manager.local_host_id().as_str(),
+            self.lifecycle_reads.as_ref(),
         )
         .await?
         {
@@ -4325,27 +4342,55 @@ impl InProcessDaemon {
                     .map_err(|error| error.to_string())?;
                 let observed =
                     self.observed_resource_backend.using::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?;
-                for checkout in durable.items.into_iter().map(|source| source.object).chain(observed.items) {
-                    if checkout.status.as_ref().is_some_and(|status| matches!(status.phase, ResourceCheckoutPhase::Gone)) {
+                let mut engine_held = BTreeSet::new();
+                let durable = durable.items.into_iter().map(|source| {
+                    let origin = match source.provenance {
+                        ResourceProvenance::Local => None,
+                        ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+                    };
+                    (source.object, origin)
+                });
+                for (checkout, origin) in durable.chain(observed.items.into_iter().map(|object| (object, None))) {
+                    let observed = matches!(checkout.spec, ResourceCheckoutSpec::Observed(_));
+                    if observed && engine_held.contains(&checkout.metadata.name) {
                         continue;
                     }
+                    let reading = if observed {
+                        None
+                    } else {
+                        self.lifecycle_reads.try_reading(
+                            flotilla_resources::lifecycle_reads::ProvisioningKind::Checkout,
+                            &checkout.metadata.name,
+                            origin.as_deref(),
+                        )?
+                    };
+                    if reading.is_some() {
+                        engine_held.insert(checkout.metadata.name.clone());
+                    }
+                    let status = match reading {
+                        Some(flotilla_protocol::LifecycleReading::Ready { .. }) => "ready".to_string(),
+                        Some(flotilla_protocol::LifecycleReading::InProgress | flotilla_protocol::LifecycleReading::Retrying { .. }) => {
+                            "pending".to_string()
+                        }
+                        Some(
+                            flotilla_protocol::LifecycleReading::GaveUp { .. } | flotilla_protocol::LifecycleReading::Exhausted { .. },
+                        ) => "failed".to_string(),
+                        Some(_) => continue,
+                        None => match checkout.status.as_ref().map(|status| status.phase) {
+                            Some(ResourceCheckoutPhase::Gone) => continue,
+                            Some(ResourceCheckoutPhase::Pending) => "pending",
+                            Some(ResourceCheckoutPhase::Ready) => "ready",
+                            Some(ResourceCheckoutPhase::Failed) => "failed",
+                            None => "observed",
+                        }
+                        .to_string(),
+                    };
                     let reference = checkout.metadata.name;
                     items.entry((String::new(), reference.clone())).or_insert(CliListRow {
                         repo: Some(checkout.spec.repo_ref().to_string()),
                         reference,
                         name: checkout.spec.branch().to_string(),
-                        status: checkout.status.map_or_else(
-                            || "observed".to_string(),
-                            |status| {
-                                match status.phase {
-                                    ResourceCheckoutPhase::Pending => "pending",
-                                    ResourceCheckoutPhase::Ready => "ready",
-                                    ResourceCheckoutPhase::Failed => "failed",
-                                    ResourceCheckoutPhase::Gone => "gone",
-                                }
-                                .to_string()
-                            },
-                        ),
+                        status,
                         provider: None,
                     });
                 }

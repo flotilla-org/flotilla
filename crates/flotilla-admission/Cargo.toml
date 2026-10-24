@@ -37,6 +37,8 @@ sha2 = { workspace = true }
 
 
 [dev-dependencies]
+flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
+flotilla-provisioning = { path = "../flotilla-provisioning" }
 flotilla-orchestration-testkit = { path = "../flotilla-orchestration-testkit" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 indexmap = { workspace = true }

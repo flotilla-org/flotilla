@@ -11,6 +11,7 @@ members = [
     "crates/flotilla-agent-connector",
     "crates/flotilla-projections",
     "crates/flotilla-provisioning",
+    "crates/flotilla-provisioning-testkit",
     "crates/flotilla-build-features",
     "crates/flotilla-capability-contract",
     "crates/flotilla-cbor",

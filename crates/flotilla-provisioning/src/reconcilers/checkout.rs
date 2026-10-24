@@ -7,7 +7,9 @@ use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY;
+use flotilla_protocol::LifecycleReading;
 use flotilla_resources::checkout_integration::{checkout_observation_lacks_convoy_association, convoy_change_request_id_for_checkout};
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{
     convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
     CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, Forge, IntegrationCondition,
@@ -164,6 +166,7 @@ pub struct CheckoutReconciler<R> {
     runtime: Arc<R>,
     checkouts: TypedResolver<Checkout>,
     clones: TypedResolver<Clone>,
+    lifecycle_reads: Arc<dyn LifecycleReads>,
     convoys: TypedResolver<Convoy>,
     forges: flotilla_store::DefinitionResolver<Forge>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
@@ -192,6 +195,7 @@ impl<R> CheckoutReconciler<R> {
             runtime,
             checkouts: backend.clone().using::<Checkout>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
+            lifecycle_reads: Arc::new(NoLifecycleReads),
             convoys: backend.clone().using::<Convoy>(namespace),
             forges: backend.definitions::<Forge>(namespace),
             federated_convoys: None,
@@ -202,6 +206,50 @@ impl<R> CheckoutReconciler<R> {
             background_removal_limit: DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
             validation_backoff: Default::default(),
         }
+    }
+
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
+        self.lifecycle_reads = reads;
+        self
+    }
+
+    fn lifecycle(&self, obj: &ResourceObject<Checkout>) -> Result<Option<LifecycleReading>, ResourceError> {
+        self.lifecycle_reads.try_reading(ProvisioningKind::Checkout, &obj.metadata.name, None).map_err(ResourceError::other)
+    }
+
+    async fn clone_dependency(
+        &self,
+        checkout: &ResourceObject<Checkout>,
+        clone: &ResourceObject<Clone>,
+    ) -> Result<Option<CheckoutPrepared>, ResourceError> {
+        if let Some(reading) =
+            self.lifecycle_reads.try_reading(ProvisioningKind::Clone, &clone.metadata.name, None).map_err(ResourceError::other)?
+        {
+            // The engine owns the retry episode; an old controller retry must not survive it.
+            self.observe_clone_retry(checkout, None).await?;
+            return Ok(match reading {
+                LifecycleReading::Ready { .. } => None,
+                LifecycleReading::InProgress | LifecycleReading::Retrying { .. } => Some(CheckoutPrepared::Waiting),
+                other => Some(CheckoutPrepared::Failed(other.reason().unwrap_or_default())),
+            });
+        }
+        self.observe_clone_retry(checkout, clone.status.as_ref().and_then(|status| status.retry.clone())).await?;
+        let status = clone.status.as_ref();
+        Ok(match status.map(|status| status.phase) {
+            Some(ClonePhase::Ready) => None,
+            Some(ClonePhase::Failed) if status.and_then(|status| status.failure_policy) == Some(CloneFailurePolicy::Terminal) => {
+                Some(CheckoutPrepared::Failed(
+                    status
+                        .and_then(|status| status.message.clone())
+                        .unwrap_or_else(|| format!("clone {} failed validation", clone.metadata.name)),
+                ))
+            }
+            Some(ClonePhase::Failed) => Some(CheckoutPrepared::RetryClone {
+                clone_name: clone.metadata.name.clone(),
+                failed_at: status.and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp),
+            }),
+            _ => Some(CheckoutPrepared::Waiting),
+        })
     }
 
     /// Bound background task admission as well as the runtime's active removals.
@@ -335,6 +383,16 @@ fn convoy_needs_delete_evidence(convoy: Option<&ResourceObject<Convoy>>) -> bool
     })
 }
 
+fn checkout_phase(obj: &ResourceObject<Checkout>, reading: Option<&LifecycleReading>) -> CheckoutPhase {
+    match reading {
+        Some(LifecycleReading::InProgress | LifecycleReading::Retrying { .. }) => CheckoutPhase::Pending,
+        Some(LifecycleReading::Ready { .. }) => CheckoutPhase::Ready,
+        Some(LifecycleReading::Exhausted { .. } | LifecycleReading::GaveUp { .. }) => CheckoutPhase::Failed,
+        Some(LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::Gone) => CheckoutPhase::Gone,
+        None => obj.status.as_ref().map(|status| status.phase).unwrap_or_default(),
+    }
+}
+
 impl<R> Reconciler for CheckoutReconciler<R>
 where
     R: CheckoutRuntime + 'static,
@@ -343,6 +401,8 @@ where
     type Prepared = CheckoutPrepared;
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        let lifecycle = self.lifecycle(obj)?;
+        let phase = checkout_phase(obj, lifecycle.as_ref());
         let lifecycle_authority = obj.metadata.lifecycle_authority()?;
         let has_convoy_owner = obj.metadata.labels.contains_key(CONVOY_LABEL)
             || obj.metadata.owner_references.iter().any(|owner| owner.kind == Convoy::API_PATHS.kind);
@@ -354,30 +414,28 @@ where
             return Ok(CheckoutPrepared::OwnerTerminal);
         }
 
-        if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) != CheckoutPhase::Pending {
-            if obj.status.as_ref().is_some_and(|status| matches!(status.phase, CheckoutPhase::Ready | CheckoutPhase::Gone)) {
+        if phase != CheckoutPhase::Pending {
+            // A gone lifecycle cannot revive; only unheld legacy checkouts can reappear.
+            if phase == CheckoutPhase::Ready || (phase == CheckoutPhase::Gone && lifecycle.is_none()) {
                 let host_checkout = match &obj.spec {
                     CheckoutSpec::Worktree(spec) => Some((&spec.env_ref, &spec.target_path)),
                     CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_some() => Some((&spec.env_ref, &spec.target_path)),
                     _ => None,
                 };
                 if let Some((env_ref, target_path)) = host_checkout {
-                    let path = obj.status.as_ref().and_then(|status| status.path.as_deref()).unwrap_or(target_path);
+                    let path = match lifecycle.as_ref() {
+                        Some(LifecycleReading::Ready { identity }) => identity.as_str(),
+                        _ => obj.status.as_ref().and_then(|status| status.path.as_deref()).unwrap_or(target_path),
+                    };
                     match self.runtime.checkout_path_exists_in(env_ref, path).await {
-                        Ok(Some(false)) if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) => {
-                            return Ok(CheckoutPrepared::Gone)
-                        }
-                        Ok(Some(true)) if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Gone) => {
-                            return Ok(CheckoutPrepared::Reappeared)
-                        }
+                        Ok(Some(false)) if phase == CheckoutPhase::Ready => return Ok(CheckoutPrepared::Gone),
+                        Ok(Some(true)) if phase == CheckoutPhase::Gone && lifecycle.is_none() => return Ok(CheckoutPrepared::Reappeared),
                         Ok(Some(_)) | Ok(None) => {}
                         Err(error) => return Ok(CheckoutPrepared::Failed(error)),
                     }
                 }
             }
-            if lifecycle_authority == Some(LifecycleAuthority::Managed)
-                && obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready)
-            {
+            if lifecycle_authority == Some(LifecycleAuthority::Managed) && phase == CheckoutPhase::Ready {
                 if let CheckoutSpec::Worktree(spec) = &obj.spec {
                     let source = match self.clones.get(&spec.clone_ref).await {
                         Ok(clone) => clone.spec.path,
@@ -394,9 +452,9 @@ where
             let refresh_after = if delete_evidence { LANDING_EVIDENCE_TTL } else { CHECKOUT_INTEGRATION_REFRESH_AFTER };
             let forges = self.forges.list().await?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
             let expected_change_request_id = convoy.as_ref().and_then(|convoy| convoy_change_request_id_for_checkout(convoy, obj, &forges));
-            if obj.status.as_ref().is_some_and(|status| {
-                status.phase == CheckoutPhase::Ready
-                    && (!integration_is_fresh(status, self.clock.now(), refresh_after)
+            if phase == CheckoutPhase::Ready
+                && obj.status.as_ref().is_none_or(|status| {
+                    !integration_is_fresh(status, self.clock.now(), refresh_after)
                         || (delete_evidence
                             && checkout_observation_lacks_convoy_association(&status.integration)
                             && convoy.as_ref().is_some_and(|convoy| {
@@ -405,8 +463,9 @@ where
                             }))
                         || expected_change_request_id.as_ref().is_some_and(|expected| {
                             status.integration.change_request.as_ref().is_some_and(|observed| &observed.id != expected)
-                        }))
-            }) {
+                        })
+                })
+            {
                 return Ok(match self.runtime.inspect_integration_in(obj.spec.env_ref().unwrap_or(""), obj, convoy.as_ref()).await {
                     Ok(status) => CheckoutPrepared::Integration { status: Box::new(status) },
                     Err(err) => CheckoutPrepared::Failed(err),
@@ -429,20 +488,21 @@ where
                 {
                     continue;
                 }
-                live_checkouts.push(other);
+                let other_phase = checkout_phase(&other, self.lifecycle(&other)?.as_ref());
+                live_checkouts.push((other, other_phase));
             }
-            sharing_ready_branch = live_checkouts.iter().any(|other| {
+            sharing_ready_branch = live_checkouts.iter().any(|(other, other_phase)| {
                 other.metadata.name != obj.metadata.name && other.metadata.deletion_timestamp.is_none()
-                    && other.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready)
+                    && *other_phase == CheckoutPhase::Ready
                     && other.spec.repo_ref() == obj.spec.repo_ref() && other.spec.branch() == obj.spec.branch()
                     && obj.metadata.labels.contains_key(CONVOY_LABEL)
                     && obj.metadata.labels.get(CONVOY_LABEL) == other.metadata.labels.get(CONVOY_LABEL)
                     && matches!((&obj.spec, &other.spec), (CheckoutSpec::FreshClone(left), CheckoutSpec::FreshClone(right)) if left.source_clone_ref.is_some() && right.source_clone_ref.is_some())
             });
-            let conflict = live_checkouts.into_iter().find(|other| {
+            let conflict = live_checkouts.into_iter().find(|(other, other_phase)| {
                 other.metadata.name != obj.metadata.name
                     && other.metadata.deletion_timestamp.is_none()
-                    && match other.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) {
+                    && match other_phase {
                         CheckoutPhase::Ready => true,
                         // Pending siblings reserve in creation order; names break timestamp ties.
                         // A refused loser remains terminally Failed even if the winner later fails.
@@ -460,7 +520,7 @@ where
                     && (continuing || other.spec.env_ref() == obj.spec.env_ref())
                     && other.spec.branch() == obj.spec.branch()
             });
-            if let Some(other) = conflict {
+            if let Some((other, _)) = conflict {
                 return Ok(CheckoutPrepared::Failed(format!(
                     "checkout branch {} conflicts with Checkout {}; choose a fresh branch name",
                     obj.spec.branch(),
@@ -499,21 +559,8 @@ where
                     }
                     Err(err) => return Err(err),
                 };
-                self.observe_clone_retry(obj, clone.status.as_ref().and_then(|status| status.retry.clone())).await?;
-                if clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
-                    if clone.status.as_ref().and_then(|status| status.failure_policy) == Some(CloneFailurePolicy::Terminal) {
-                        let message = clone
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.message.clone())
-                            .unwrap_or_else(|| format!("clone {} failed validation", clone.metadata.name));
-                        return Ok(CheckoutPrepared::Failed(message));
-                    }
-                    let failed_at = clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
-                    return Ok(CheckoutPrepared::RetryClone { clone_name: clone.metadata.name, failed_at });
-                }
-                if clone.status.as_ref().map(|status| status.phase) != Some(ClonePhase::Ready) {
-                    return Ok(CheckoutPrepared::Waiting);
+                if let Some(waiting) = self.clone_dependency(obj, &clone).await? {
+                    return Ok(waiting);
                 }
                 if clone.spec.env_ref != spec.env_ref {
                     return Ok(CheckoutPrepared::Failed("worktree clone env_ref mismatch".to_string()));
@@ -557,22 +604,8 @@ where
                     Err(ResourceError::NotFound { .. }) => return Ok(CheckoutPrepared::Waiting),
                     Err(error) => return Err(error),
                 };
-                self.observe_clone_retry(obj, clone.status.as_ref().and_then(|status| status.retry.clone())).await?;
-                if clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
-                    if clone.status.as_ref().and_then(|status| status.failure_policy) == Some(CloneFailurePolicy::Terminal) {
-                        return Ok(CheckoutPrepared::Failed(
-                            clone
-                                .status
-                                .as_ref()
-                                .and_then(|status| status.message.clone())
-                                .unwrap_or_else(|| format!("clone {clone_name} failed validation")),
-                        ));
-                    }
-                    let failed_at = clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
-                    return Ok(CheckoutPrepared::RetryClone { clone_name: clone.metadata.name, failed_at });
-                }
-                if clone.status.as_ref().map(|status| status.phase) != Some(ClonePhase::Ready) {
-                    return Ok(CheckoutPrepared::Waiting);
+                if let Some(waiting) = self.clone_dependency(obj, &clone).await? {
+                    return Ok(waiting);
                 }
                 if clone.spec.env_ref != spec.env_ref || clone.spec.repo_ref != spec.repo_ref {
                     return Ok(CheckoutPrepared::Failed("local clone source repo/env mismatch".into()));
@@ -638,7 +671,17 @@ where
         prepared: &Self::Prepared,
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
-        let patch = if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) == CheckoutPhase::Pending {
+        let lifecycle = match self.lifecycle(obj) {
+            Ok(reading) => reading,
+            Err(error) => {
+                let mut outcome = ReconcileOutcome::new(None);
+                outcome.events.push(ObjectEvent::for_object(obj, "LifecycleReadFailed", error.to_string()));
+                outcome.requeue_after = Some(CHECKOUT_PROVISIONING_REQUEUE_AFTER);
+                return outcome;
+            }
+        };
+        let phase = checkout_phase(obj, lifecycle.as_ref());
+        let patch = if phase == CheckoutPhase::Pending {
             match prepared {
                 CheckoutPrepared::Ready { prepared } => obj.spec.target_path().map(|path| CheckoutStatusPatch::MarkReady {
                     path: path.to_string(),
@@ -662,9 +705,9 @@ where
                     .and_then(|status| status.message.as_ref())
                     .map(|_| CheckoutStatusPatch::ObserveValidation { message: None }),
             }
-        } else if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Gone) {
+        } else if phase == CheckoutPhase::Gone {
             match prepared {
-                CheckoutPrepared::Reappeared => {
+                CheckoutPrepared::Reappeared if lifecycle.is_none() => {
                     obj.status.as_ref().and_then(|status| status.path.clone()).or_else(|| obj.spec.target_path().map(str::to_string)).map(
                         |path| CheckoutStatusPatch::MarkReady {
                             path,
@@ -675,7 +718,7 @@ where
                 }
                 _ => None,
             }
-        } else if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) {
+        } else if phase == CheckoutPhase::Ready {
             match prepared {
                 CheckoutPrepared::Gone => Some(CheckoutStatusPatch::MarkGone),
                 CheckoutPrepared::Integration { status } => {
@@ -718,15 +761,13 @@ where
 
         let actuations = match prepared {
             CheckoutPrepared::OwnerTerminal => vec![Actuation::DeleteCheckout { name: obj.metadata.name.clone() }],
-            CheckoutPrepared::RetryClone { clone_name, failed_at } => {
+            CheckoutPrepared::RetryClone { clone_name, failed_at } if lifecycle.is_none() || phase == CheckoutPhase::Pending => {
                 vec![Actuation::RetryClone { name: clone_name.clone(), failed_at: *failed_at }]
             }
             _ => Vec::new(),
         };
         let mut outcome = ReconcileOutcome::with_actuations(patch, actuations);
-        if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) == CheckoutPhase::Pending
-            && !matches!(prepared, CheckoutPrepared::Failed(_))
-        {
+        if phase == CheckoutPhase::Pending && !matches!(prepared, CheckoutPrepared::Failed(_)) {
             outcome.requeue_after = Some(match prepared {
                 CheckoutPrepared::ValidationUnavailable(error) => error
                     .retry_at()
@@ -871,13 +912,33 @@ where
         Ok(())
     }
 
+    fn retry_disposition(&self, obj: &ResourceObject<Self::Resource>) -> Option<flotilla_resources::ControllerRetryDisposition> {
+        use flotilla_resources::ControllerRetryDisposition;
+        match self.lifecycle(obj) {
+            Ok(Some(LifecycleReading::Retrying { next, .. })) => Some(ControllerRetryDisposition::Retryable { next_attempt_at: next }),
+            Ok(Some(LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause })) => {
+                Some(ControllerRetryDisposition::Terminal { needs: cause })
+            }
+            // Prepare reports read errors through the controller's error backoff.
+            Ok(_) | Err(_) => None,
+        }
+    }
+
     fn finalizer_name(&self) -> Option<&'static str> {
         Some("flotilla.work/checkout-cleanup")
     }
 
     fn finalizer_error_patch(&self, obj: &ResourceObject<Self::Resource>, error: &ResourceError) -> Option<CheckoutStatusPatch> {
         let message = format!("checkout teardown failed: {error}");
-        if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Failed && status.message.as_deref() == Some(&message)) {
+        let already_reported = match self.lifecycle(obj) {
+            Ok(Some(LifecycleReading::GaveUp { cause } | LifecycleReading::Exhausted { cause })) => cause == message,
+            Ok(Some(_)) | Err(_) => false,
+            Ok(None) => obj
+                .status
+                .as_ref()
+                .is_some_and(|status| status.phase == CheckoutPhase::Failed && status.message.as_deref() == Some(&message)),
+        };
+        if already_reported {
             return None;
         }
         Some(CheckoutStatusPatch::MarkFailed { message })

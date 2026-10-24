@@ -21,9 +21,8 @@ use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_resources::Resource;
 use flotilla_resources::{
-    ControllerRetry, ControllerRetryDisposition, Convoy, Demand, DemandKind, DemandSpec, Environment, EnvironmentPhase,
-    EnvironmentStatusPatch, InputMeta, Repository, RepositoryTrust, ResourceError, RetryBackoff, TerminalSession, TerminalSessionSource,
-    Vessel, VesselStatusPatch,
+    ControllerRetry, ControllerRetryDisposition, Convoy, Demand, DemandKind, DemandSpec, Environment, EnvironmentStatusPatch, InputMeta,
+    Repository, RepositoryTrust, ResourceError, RetryBackoff, TerminalSession, TerminalSessionSource, Vessel, VesselStatusPatch,
 };
 use flotilla_store::ResourceBackend;
 use tokio::task::JoinHandle;
@@ -730,7 +729,7 @@ pub(super) async fn redeliver_codex_credentials(state: &ControllerRuntimeState, 
         };
         if !spec.required_agent_adapters.contains("codex")
             || spec.env.contains_key("CODEX_HOME")
-            || environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready)
+            || !super::environments::environment_readiness(&state.daemon, &environment).await?.is_ready()
         {
             continue;
         }

@@ -26,6 +26,7 @@ serde_json = { workspace = true }
 flotilla-engine-store = { path = "../flotilla-engine-store" }
 
 [dev-dependencies]
+flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
 futures = { workspace = true }

@@ -6653,6 +6653,7 @@ mod tests {
     /// Readings scripted per resource, recording each keyed read: the kind, name and origin.
     #[derive(Default)]
     struct ScriptedReadings {
+        errors: std::sync::Mutex<HashMap<(crate::ports::ProvisioningKind, String), String>>,
         readings: std::sync::Mutex<HashMap<(crate::ports::ProvisioningKind, String), flotilla_protocol::LifecycleReading>>,
         reads: std::sync::Mutex<Vec<(crate::ports::ProvisioningKind, String, Option<String>)>>,
     }
@@ -6676,6 +6677,18 @@ mod tests {
         ) -> Option<flotilla_protocol::LifecycleReading> {
             self.reads.lock().expect("reads").push((kind, name.to_owned(), origin.map(str::to_owned)));
             self.readings.lock().expect("script").get(&(kind, name.to_owned())).cloned()
+        }
+        fn try_reading(
+            &self,
+            kind: crate::ports::ProvisioningKind,
+            name: &str,
+            origin: Option<&str>,
+        ) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
+            // Fault injection at the keyed storage read boundary.
+            match self.errors.lock().expect("errors").get(&(kind, name.to_owned())).cloned() {
+                Some(error) => Err(error),
+                None => Ok(self.reading(kind, name, origin)),
+            }
         }
     }
 
@@ -6807,6 +6820,9 @@ mod tests {
         assert_eq!(checkout(Some(LifecycleReading::InProgress)), (ReadinessState::Provisioning, blocker("being realised")));
         assert_eq!(checkout(Some(LifecycleReading::Lost)), (ReadinessState::Failed, blocker("observed absent")));
         assert!(checkout(Some(LifecycleReading::Ready { identity: "/work/repo".into() })).1.is_empty());
+        reads.errors.lock().expect("errors").insert((Kind, "checkout-a".into()), "checkout store unavailable".into());
+        assert_eq!(checkout(None), (ReadinessState::Blocked, blocker("checkout store unavailable")));
+
         let reads = reads.reads.lock().expect("reads").clone();
         assert!(reads.contains(&(Kind, "checkout-a".into(), Some("remote-origin".into()))), "{reads:?}");
     }
@@ -6833,6 +6849,11 @@ mod tests {
         assert_eq!(
             readiness_blockers(&aggregator, &reference, &convoy),
             (ReadinessState::Provisioning, vec![("checkout-a".to_owned(), "being realised".to_owned())])
+        );
+        reads.errors.lock().expect("errors").insert((ProvisioningKind::Clone, "ops-clone".into()), "decided store unavailable".into());
+        assert_eq!(
+            readiness_blockers(&aggregator, &reference, &convoy),
+            (ReadinessState::Blocked, vec![("ops-clone".into(), "decided store unavailable".into())])
         );
         let reads = reads.reads.lock().expect("reads").clone();
         assert!(reads.contains(&(ProvisioningKind::Clone, "ops-clone".into(), None)), "{reads:?}");

@@ -3793,3 +3793,58 @@ fn environment_loss_preserves_recoverable_work(tc: hegel::TestCase) {
         }
     });
 }
+
+// Terminal launch and owner-loss decisions use the engine without copying Environment status.
+// Enumerate all old phases, both ready-flag values, success, both Gone endings and empty/Unicode failures.
+#[tokio::test]
+async fn terminal_reads_its_environment_without_a_status_copy() {
+    use flotilla_provisioning::engine::environment::EnvironmentBinding;
+    use flotilla_provisioning_testkit::{Ending, LifecycleFixture};
+    use flotilla_resources::{Environment, EnvironmentPhase};
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    create_ready_environment(&backend, "env").await;
+    let records = backend.using::<Environment>("flotilla");
+    let mut env = records.get("env").await.expect("environment");
+    env = records
+        .update_status(
+            "env",
+            &env.metadata.resource_version,
+            &EnvironmentStatus { phase: EnvironmentPhase::Failed, ready: false, message: Some("stale".into()), ..Default::default() },
+        )
+        .await
+        .expect("stale status");
+    let session = backend
+        .using::<TerminalSession>("flotilla")
+        .create(
+            &meta("terminal"),
+            &TerminalSessionSpec {
+                env_ref: "env".into(),
+                role: "coder".into(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "test".into() },
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+            },
+        )
+        .await
+        .expect("session");
+    let fixture = LifecycleFixture::<EnvironmentBinding>::new(false);
+    fixture.request(&env);
+    // Only the terminal-process boundary is a stand-in.
+    let reconciler =
+        TerminalSessionReconciler::new(Arc::new(FailingTerminalRuntime), backend, "flotilla").with_lifecycle_reads(fixture.reads.clone());
+    let prepared = reconciler.prepare(&session).await.expect("requested");
+    assert!(reconciler.reconcile(&session, &prepared, Utc::now()).patch.is_none());
+    fixture.finish(&env, Ending::Ready("/workspace"));
+    let prepared = reconciler.prepare(&session).await.expect("ready");
+    assert!(
+        matches!(reconciler.reconcile(&session, &prepared, Utc::now()).patch, Some(TerminalSessionStatusPatch::MarkFailed { message, .. }) if message == "boom")
+    );
+    fixture.finish(&env, Ending::Lost("/workspace"));
+    let prepared = reconciler.prepare(&session).await.expect("lost");
+    assert!(
+        matches!(reconciler.reconcile(&session, &prepared, Utc::now()).patch, Some(TerminalSessionStatusPatch::MarkLost { reason, .. }) if reason == "environment env observed absent")
+    );
+    fixture.poison();
+    assert!(reconciler.prepare(&session).await.err().expect("checked read").to_string().contains("poisoned"));
+}

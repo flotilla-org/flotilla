@@ -524,7 +524,13 @@ mod tests {
             observed_resource_backend: &observed,
             clock: &clock,
             namespace: &namespace,
-            repository_index: RepositoryIndex { backend: &backend, observed: &observed, namespace: &namespace, host: "local-host" },
+            repository_index: RepositoryIndex {
+                lifecycle_reads: &flotilla_resources::lifecycle_reads::NoLifecycleReads,
+                backend: &backend,
+                observed: &observed,
+                namespace: &namespace,
+                host: "local-host",
+            },
             operations: &operations,
         };
         let layers = backend.using::<ImageLayer>("flotilla");
@@ -584,7 +590,13 @@ mod tests {
             observed_resource_backend: observed,
             clock,
             namespace,
-            repository_index: RepositoryIndex { backend, observed, namespace, host: "local-host" },
+            repository_index: RepositoryIndex {
+                lifecycle_reads: &flotilla_resources::lifecycle_reads::NoLifecycleReads,
+                backend,
+                observed,
+                namespace,
+                host: "local-host",
+            },
             operations,
         }
     }

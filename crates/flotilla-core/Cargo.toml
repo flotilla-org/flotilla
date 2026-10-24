@@ -75,6 +75,8 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 libc = { workspace = true }
 
 [dev-dependencies]
+flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
+flotilla-provisioning = { path = "../flotilla-provisioning" }
 rigging-replay-testkit = { workspace = true }
 flotilla-forgejo-providers = { path = "../flotilla-forgejo-providers" }
 flotilla-github-providers = { path = "../flotilla-github-providers" }

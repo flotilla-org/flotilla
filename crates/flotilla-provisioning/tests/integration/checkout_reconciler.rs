@@ -84,6 +84,7 @@ struct RecordingCheckoutRuntime {
     preserved_branch: Option<(String, BranchPreservationReason)>,
     orphaned_path: Option<String>,
     path_exists: Option<bool>,
+    path_checks: Mutex<Vec<String>>,
     protection_error: Option<String>,
     validation_failures: Mutex<usize>,
     validation_retry_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -133,7 +134,8 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         }
     }
 
-    async fn checkout_path_exists_in(&self, _env_ref: &str, _path: &str) -> Result<Option<bool>, String> {
+    async fn checkout_path_exists_in(&self, _env_ref: &str, path: &str) -> Result<Option<bool>, String> {
+        self.path_checks.lock().expect("path checks").push(path.into());
         Ok(self.path_exists)
     }
     async fn create_worktree(
@@ -1823,4 +1825,137 @@ async fn orphaned_checkout_finalizer_records_preserved_path_and_finishes() {
     let events = backend.using::<Event>(NAMESPACE).list().await.expect("events");
     assert!(events.items.iter().any(|event| event.spec.reason == "OrphanedCheckoutPreserved" && event.spec.message.contains(path)));
     assert!(matches!(runtime.removals.lock().expect("removals").as_slice(), [CheckoutRemoval::OrphanedWorktree { .. }]));
+}
+
+// Checkout dependencies follow the engine while old clone phases and messages stay stale.
+// All old phases are crossed with readiness, retries and each terminal judgement.
+#[tokio::test]
+async fn checkout_reads_clone_dependencies_without_a_status_copy() {
+    use flotilla_provisioning::engine::clone::CloneBinding;
+    use flotilla_provisioning_testkit::{Ending, LifecycleFixture};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    create_ready_clone(&backend, NAMESPACE, "source", REPO_URL, "env", "/repo").await;
+    let clones = backend.using::<Clone>(NAMESPACE);
+    let mut clone = clones.get("source").await.expect("clone");
+    let mut old = clone.status.clone().expect("status");
+    old.phase = ClonePhase::Failed;
+    old.message = Some("stale".into());
+    clone = clones.update_status("source", &clone.metadata.resource_version, &old).await.expect("stale status");
+    let checkout = backend
+        .using::<Checkout>(NAMESPACE)
+        .create(
+            &meta("checkout"),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "env".into(),
+                r#ref: "feature".into(),
+                base_ref: None,
+                target_path: "/work".into(),
+                clone_ref: "source".into(),
+            }),
+        )
+        .await
+        .expect("checkout");
+    let fixture = LifecycleFixture::<CloneBinding>::new(false);
+    fixture.request(&clone);
+    let reconciler =
+        CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime { allow_creation: true, ..Default::default() }), backend, NAMESPACE)
+            .with_lifecycle_reads(fixture.reads.clone());
+    assert!(matches!(reconciler.prepare(&checkout).await.expect("requested"), CheckoutPrepared::Waiting));
+    fixture.finish(&clone, Ending::Ready("/repo"));
+    assert!(matches!(reconciler.prepare(&checkout).await.expect("ready"), CheckoutPrepared::Ready { .. }));
+    fixture.finish(&clone, Ending::Lost("/repo"));
+    assert!(
+        matches!(reconciler.prepare(&checkout).await.expect("lost"), CheckoutPrepared::Failed(message) if message == "observed absent")
+    );
+    assert_eq!(clones.get("source").await.expect("unchanged").status, Some(old));
+    fixture.poison();
+    assert!(reconciler.prepare(&checkout).await.err().expect("checked read").to_string().contains("poisoned"));
+}
+
+// A held Checkout's engine phase governs creation, integration and publication while old status
+// stays stale. Every old phase crosses progress, readiness and endings; no ended lifecycle revives.
+pub(super) async fn assert_checkout_lifecycle(old_phase: CheckoutPhase, ending: flotilla_provisioning_testkit::Ending<'_>) {
+    use flotilla_provisioning::engine::checkout::CheckoutBinding;
+    use flotilla_provisioning_testkit::{Ending, LifecycleFixture};
+    use flotilla_resources::CheckoutStatusPatch;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    create_ready_clone(&backend, NAMESPACE, "source", REPO_URL, "env", "/repo").await;
+    let mut obj = backend
+        .using::<Checkout>(NAMESPACE)
+        .create(
+            &meta("checkout"),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "env".into(),
+                r#ref: "feature".into(),
+                base_ref: None,
+                target_path: "/work".into(),
+                clone_ref: "source".into(),
+            }),
+        )
+        .await
+        .expect("checkout");
+    obj.status = Some(CheckoutStatus { phase: old_phase, path: Some("/stale".into()), ..Default::default() });
+    let fixture = LifecycleFixture::<CheckoutBinding>::new(false);
+    fixture.request(&obj);
+    let runtime = Arc::new(RecordingCheckoutRuntime { allow_creation: true, path_exists: Some(true), ..Default::default() });
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE).with_lifecycle_reads(fixture.reads.clone());
+    let prepared = reconciler.prepare(&obj).await.expect("requested");
+    assert!(matches!(reconciler.reconcile(&obj, &prepared, chrono::Utc::now()).patch, Some(CheckoutStatusPatch::MarkReady { .. })));
+    fixture.retry(&obj, "retry");
+    assert!(matches!(reconciler.retry_disposition(&obj), Some(flotilla_resources::ControllerRetryDisposition::Retryable { .. })));
+    fixture.finish(&obj, ending);
+    assert!(reconciler.reconcile(&obj, &prepared, chrono::Utc::now()).patch.is_none());
+    let prepared = reconciler.prepare(&obj).await.expect("current phase");
+    let outcome = reconciler.reconcile(&obj, &prepared, chrono::Utc::now());
+    if matches!(ending, Ending::Ready(_)) {
+        assert!(matches!(outcome.patch, Some(CheckoutStatusPatch::UpdateIntegration { .. })));
+        assert_eq!(runtime.path_checks.lock().expect("checks").as_slice(), &["/work"]);
+    } else {
+        assert!(outcome.patch.is_none());
+    }
+    assert_eq!(obj.status.as_ref().expect("unchanged").phase, old_phase);
+    fixture.poison();
+    assert!(reconciler.prepare(&obj).await.err().expect("read failure").to_string().contains("poisoned"));
+}
+
+// Branch reservations follow sibling engine phases, not a stale Ready/Failed/Gone status.
+// Requested siblings reserve a branch; ended siblings release it regardless of old phase.
+#[tokio::test]
+async fn checkout_reserves_branches_from_sibling_engine_phases() {
+    use flotilla_provisioning::engine::checkout::CheckoutBinding;
+    use flotilla_provisioning_testkit::{Ending, LifecycleFixture};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    create_ready_clone(&backend, NAMESPACE, "source", REPO_URL, "env", "/repo").await;
+    let records = backend.using::<Checkout>(NAMESPACE);
+    let spec = CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+        repo_ref: RepositoryKey(repo_key(REPO_URL)),
+        env_ref: "env".into(),
+        r#ref: "feature".into(),
+        base_ref: None,
+        target_path: "/work".into(),
+        clone_ref: "source".into(),
+    });
+    let mut sibling = records.create(&meta("sibling"), &spec).await.expect("sibling");
+    sibling = records
+        .update_status("sibling", &sibling.metadata.resource_version, &CheckoutStatus { phase: CheckoutPhase::Gone, ..Default::default() })
+        .await
+        .expect("stale status");
+    let checkout = records.create(&meta("checkout"), &spec).await.expect("checkout");
+    let fixture = LifecycleFixture::<CheckoutBinding>::new(false);
+    fixture.request(&checkout);
+    fixture.request(&sibling);
+    let reconciler =
+        CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime { allow_creation: true, ..Default::default() }), backend, NAMESPACE)
+            .with_lifecycle_reads(fixture.reads.clone());
+    assert!(
+        matches!(reconciler.prepare(&checkout).await.expect("reserved"), CheckoutPrepared::Failed(message) if message.contains("conflicts with Checkout sibling"))
+    );
+    fixture.finish(&sibling, Ending::Lost("/work"));
+    records
+        .update_status("sibling", &sibling.metadata.resource_version, &CheckoutStatus { phase: CheckoutPhase::Ready, ..Default::default() })
+        .await
+        .expect("stale ready");
+    assert!(matches!(reconciler.prepare(&checkout).await.expect("released reservation"), CheckoutPrepared::Ready { .. }));
 }

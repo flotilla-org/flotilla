@@ -2,13 +2,11 @@
 
 use flotilla_resources::{Environment as OldEnvironment, EnvironmentPhase, EnvironmentStatusPatch, ResourceObject, VESSEL_REF_LABEL};
 use flotilla_schema::{Frozen, Ref};
-use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Outcome, Resource};
+use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Outcome};
 
 use super::{Binding, Step};
 use crate::stored::{
-    environment::{
-        DockerImage, DockerRecipe, Environment, EnvironmentKind, EnvironmentRequest, HostDirectRecipe, Recipe, LAUNCH_DERIVED_ENV,
-    },
+    environment::{DockerImage, DockerRecipe, EnvironmentKind, EnvironmentRequest, HostDirectRecipe, Recipe, LAUNCH_DERIVED_ENV},
     Holder,
 };
 
@@ -80,8 +78,6 @@ impl Binding for EnvironmentBinding {
             }
             // A cloud sandbox is realised under its backing (never held while it has no recipe).
             EnvironmentStatusPatch::MarkCloudReady { backing_id, .. } => vec![Step::Realised { identity: backing_id.clone() }],
-            // A realised environment whose backing failed is no longer there.
-            EnvironmentStatusPatch::MarkFailed { .. } if phase(obj) == EnvironmentPhase::Ready => vec![Step::Vanished],
             // The provider refused it: the old environment never retried a failure.
             EnvironmentStatusPatch::MarkFailed { message } => {
                 vec![Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, message), retryable: false })]
@@ -94,27 +90,11 @@ impl Binding for EnvironmentBinding {
         }
     }
 
-    fn copy(obj: &ResourceObject<OldEnvironment>, resource: &Resource<Environment>) -> Option<EnvironmentStatusPatch> {
-        let status = obj.status.as_ref();
-        let message = || status.and_then(|status| status.message.clone()).unwrap_or_default();
-        match (resource.state(), phase(obj)) {
-            (LifecycleState::Requested { .. }, EnvironmentPhase::Pending | EnvironmentPhase::Provisioning) => None,
-            (LifecycleState::Requested { .. }, _) => Some(EnvironmentStatusPatch::WaitForImageBuild { message: message() }),
-            (LifecycleState::Realised { .. }, EnvironmentPhase::Ready) => None,
-            (LifecycleState::Realised { identity }, _) => Some(EnvironmentStatusPatch::MarkReady {
-                configured_limits: status.and_then(|status| status.configured_limits.clone()),
-                docker_container_id: obj.spec.docker.is_some().then(|| identity.clone()),
-                image_ref: status.and_then(|status| status.image_ref.clone()),
-                local_image_id: status.and_then(|status| status.local_image_id.clone()),
-                registry_digest: status.and_then(|status| status.registry_digest.clone()),
-            }),
-            (LifecycleState::Gone, EnvironmentPhase::Lost | EnvironmentPhase::Failed) => None,
-            // The old message, when it has one, says why: the copy keeps it.
-            (LifecycleState::Gone, _) => Some(EnvironmentStatusPatch::MarkLost {
-                message: status.and_then(|status| status.message.clone()).unwrap_or_else(|| "the environment is gone".into()),
-            }),
-            (LifecycleState::GaveUp { .. }, EnvironmentPhase::Failed) => None,
-            (LifecycleState::GaveUp { cause }, _) => Some(EnvironmentStatusPatch::MarkFailed { message: cause.detail.clone() }),
+    fn steps_with_state(obj: &ResourceObject<OldEnvironment>, patch: &EnvironmentStatusPatch, state: Option<&LifecycleState>) -> Vec<Step> {
+        match (patch, state) {
+            // A realised backing failed after readiness; old status may not have caught up.
+            (EnvironmentStatusPatch::MarkFailed { .. }, Some(LifecycleState::Realised { .. })) => vec![Step::Vanished],
+            _ => Self::steps(obj, patch),
         }
     }
 }

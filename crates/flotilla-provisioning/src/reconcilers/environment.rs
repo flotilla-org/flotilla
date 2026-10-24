@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits};
+use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading};
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{
     Checkout, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentStatusPatch, Host, ImageBuildPhase, ImageDelivery,
-    ResourceError, ResourceObject,
+    ObjectEvent, ResourceError, ResourceObject,
 };
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler},
@@ -33,6 +34,7 @@ pub struct EnvironmentReconciler<R> {
     runtime: Arc<R>,
     hosts: TypedResolver<Host>,
     backend: ResourceBackend,
+    lifecycle_reads: Arc<dyn LifecycleReads>,
     namespace: String,
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
@@ -45,10 +47,30 @@ impl<R> EnvironmentReconciler<R> {
             runtime,
             hosts: backend.using::<Host>(namespace),
             backend,
+            lifecycle_reads: Arc::new(NoLifecycleReads),
             namespace: namespace.into(),
             local_host_ref: None,
             additional_host_refs: Default::default(),
             adoption_retries: Default::default(),
+        }
+    }
+
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
+        self.lifecycle_reads = reads;
+        self
+    }
+
+    fn reading(&self, obj: &ResourceObject<Environment>) -> Result<Option<LifecycleReading>, String> {
+        self.lifecycle_reads.try_reading(ProvisioningKind::Environment, &obj.metadata.name, None)
+    }
+
+    fn provisioning(obj: &ResourceObject<Environment>, reading: Option<&LifecycleReading>) -> bool {
+        match reading {
+            Some(reading) => matches!(reading, LifecycleReading::InProgress | LifecycleReading::Retrying { .. }),
+            None => matches!(
+                obj.status.as_ref().map(|status| status.phase).unwrap_or_default(),
+                EnvironmentPhase::Pending | EnvironmentPhase::Provisioning
+            ),
         }
     }
 
@@ -112,79 +134,75 @@ where
         if !self.actuates(obj).await? {
             return Ok(EnvironmentPrepared::Foreign);
         }
-        match obj.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending) {
-            EnvironmentPhase::Pending | EnvironmentPhase::Provisioning => {
-                if let Some(original) = &obj.spec.docker {
-                    let mut spec = original.clone();
-                    if let Some(name) = &original.image_build_ref {
-                        // The composed image is the per-identity build's digest.
-                        // Never fall back to another image: wait with the reason.
-                        let build = match flotilla_store::read_image_build(&self.backend, &self.namespace, name).await {
-                            Ok(build) => build,
-                            Err(ResourceError::NotFound { .. }) => {
-                                // A previous-generation per-stage build can never
-                                // be satisfied: fail so recreation relaunches it.
-                                let retired = match self
-                                    .backend
-                                    .including_replicas::<flotilla_resources::ImageBuild>(&self.namespace)
-                                    .get(name)
-                                    .await
-                                {
+        let reading = self.reading(obj).map_err(ResourceError::other)?;
+        if Self::provisioning(obj, reading.as_ref()) {
+            if let Some(original) = &obj.spec.docker {
+                let mut spec = original.clone();
+                if let Some(name) = &original.image_build_ref {
+                    // The composed image is the per-identity build's digest.
+                    // Never fall back to another image: wait with the reason.
+                    let build = match flotilla_store::read_image_build(&self.backend, &self.namespace, name).await {
+                        Ok(build) => build,
+                        Err(ResourceError::NotFound { .. }) => {
+                            // A previous-generation per-stage build can never
+                            // be satisfied: fail so recreation relaunches it.
+                            let retired =
+                                match self.backend.including_replicas::<flotilla_resources::ImageBuild>(&self.namespace).get(name).await {
                                     Ok(record) => record.object.spec.is_retired(),
                                     Err(ResourceError::NotFound { .. }) => false,
                                     Err(error) => return Err(error),
                                 };
-                                if retired {
-                                    return Ok(EnvironmentPrepared::Failed(format!(
-                                        "ImageBuild {name} is a previous-generation image build; relaunch the vessel"
-                                    )));
-                                }
-                                return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} awaiting replicated build status")));
+                            if retired {
+                                return Ok(EnvironmentPrepared::Failed(format!(
+                                    "ImageBuild {name} is a previous-generation image build; relaunch the vessel"
+                                )));
                             }
-                            Err(error) => return Err(error),
-                        };
-                        let status = build.status.clone().unwrap_or_default();
-                        let digest = match (status.phase, &status.digest) {
-                            (ImageBuildPhase::Built, Some(digest)) => digest.clone(),
-                            (phase, _) => {
-                                let reason = status.failure.as_ref().map(|failure| format!(": {}", failure.reason)).unwrap_or_default();
-                                return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} {phase:?}{reason}")));
-                            }
-                        };
-                        spec.image = digest;
-                        // A local build exists only on its builder. A registry
-                        // digest is pinned, so pulling it if absent is always
-                        // safe; the provider pulls with its pull credential.
-                        spec.pull_policy = match build.spec.current().map(|spec| &spec.delivery) {
-                            Some(ImageDelivery::Local) => DockerImagePullPolicy::Never,
-                            _ => DockerImagePullPolicy::IfNotPresent,
-                        };
-                    }
-                    match self
-                        .runtime
-                        .provision_environment(
-                            &obj.metadata.name,
-                            &flotilla_resources::EnvironmentSpec { docker: Some(spec), ..obj.spec.clone() },
-                        )
-                        .await
-                    {
-                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
-                        Err(message) if message.starts_with("waiting on build:") => Ok(EnvironmentPrepared::Waiting(message)),
-                        Err(message) => Ok(EnvironmentPrepared::Failed(message)),
-                    }
-                } else {
-                    match self.runtime.provision_environment(&obj.metadata.name, &obj.spec).await {
-                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
-                        Err(message)
-                            if obj.spec.cloud_sandbox.is_some() && message.starts_with(flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX) =>
-                        {
-                            Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: {message}")))
+                            return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} awaiting replicated build status")));
                         }
-                        Err(message) => Ok(EnvironmentPrepared::Failed(message)),
+                        Err(error) => return Err(error),
+                    };
+                    let status = build.status.clone().unwrap_or_default();
+                    let digest = match (status.phase, &status.digest) {
+                        (ImageBuildPhase::Built, Some(digest)) => digest.clone(),
+                        (phase, _) => {
+                            let reason = status.failure.as_ref().map(|failure| format!(": {}", failure.reason)).unwrap_or_default();
+                            return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} {phase:?}{reason}")));
+                        }
+                    };
+                    spec.image = digest;
+                    // A local build exists only on its builder. A registry
+                    // digest is pinned, so pulling it if absent is always
+                    // safe; the provider pulls with its pull credential.
+                    spec.pull_policy = match build.spec.current().map(|spec| &spec.delivery) {
+                        Some(ImageDelivery::Local) => DockerImagePullPolicy::Never,
+                        _ => DockerImagePullPolicy::IfNotPresent,
+                    };
+                }
+                match self
+                    .runtime
+                    .provision_environment(
+                        &obj.metadata.name,
+                        &flotilla_resources::EnvironmentSpec { docker: Some(spec), ..obj.spec.clone() },
+                    )
+                    .await
+                {
+                    Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
+                    Err(message) if message.starts_with("waiting on build:") => Ok(EnvironmentPrepared::Waiting(message)),
+                    Err(message) => Ok(EnvironmentPrepared::Failed(message)),
+                }
+            } else {
+                match self.runtime.provision_environment(&obj.metadata.name, &obj.spec).await {
+                    Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
+                    Err(message)
+                        if obj.spec.cloud_sandbox.is_some() && message.starts_with(flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX) =>
+                    {
+                        Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: {message}")))
                     }
+                    Err(message) => Ok(EnvironmentPrepared::Failed(message)),
                 }
             }
-            _ => Ok(EnvironmentPrepared::None),
+        } else {
+            Ok(EnvironmentPrepared::None)
         }
     }
 
@@ -197,8 +215,18 @@ where
         if matches!(prepared, EnvironmentPrepared::Foreign) {
             return ReconcileOutcome::new(None);
         }
-        let patch = match obj.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending) {
-            EnvironmentPhase::Pending | EnvironmentPhase::Provisioning => match prepared {
+        // The current judgement gates publication: provider work may have finished after this lifecycle ended.
+        let reading = match self.reading(obj) {
+            Ok(reading) => reading,
+            Err(error) => {
+                let mut outcome = ReconcileOutcome::new(None);
+                outcome.events.push(ObjectEvent::for_object(obj, "LifecycleReadFailed", error));
+                outcome.requeue_after = Some(std::time::Duration::from_secs(30));
+                return outcome;
+            }
+        };
+        let patch = if Self::provisioning(obj, reading.as_ref()) {
+            match prepared {
                 EnvironmentPrepared::Ready(provisioning) if obj.spec.cloud_sandbox.is_some() => {
                     match (&provisioning.backing_id, &provisioning.image_ref, &provisioning.provider_descriptor, &provisioning.survivors) {
                         (Some(backing_id), Some(image_ref), Some(provider_descriptor), Some(survivors)) => {
@@ -229,8 +257,9 @@ where
                     Some(EnvironmentStatusPatch::WaitForImageBuild { message: message.clone() })
                 }
                 EnvironmentPrepared::Foreign | EnvironmentPrepared::None => None,
-            },
-            _ => None,
+            }
+        } else {
+            None
         };
 
         let mut outcome = ReconcileOutcome::new(patch);
@@ -269,14 +298,33 @@ where
         Ok(())
     }
 
+    fn retry_disposition(&self, obj: &ResourceObject<Self::Resource>) -> Option<flotilla_resources::ControllerRetryDisposition> {
+        use flotilla_resources::ControllerRetryDisposition;
+        match self.reading(obj) {
+            Ok(Some(LifecycleReading::Retrying { next, .. })) => Some(ControllerRetryDisposition::Retryable { next_attempt_at: next }),
+            Ok(Some(LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause })) => {
+                Some(ControllerRetryDisposition::Terminal { needs: cause })
+            }
+            // A failed read is reported by prepare, allowing controller error backoff.
+            Ok(_) | Err(_) => None,
+        }
+    }
+
     fn finalizer_name(&self) -> Option<&'static str> {
         Some("flotilla.work/environment-teardown")
     }
 
     fn finalizer_error_patch(&self, obj: &ResourceObject<Self::Resource>, error: &ResourceError) -> Option<EnvironmentStatusPatch> {
         let message = format!("environment teardown failed: {error}");
-        if obj.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Failed && status.message.as_deref() == Some(&message))
-        {
+        let already_failed = match self.reading(obj) {
+            Ok(Some(LifecycleReading::GaveUp { cause } | LifecycleReading::Exhausted { cause })) => cause == message,
+            Ok(Some(_)) | Err(_) => false,
+            Ok(None) => obj
+                .status
+                .as_ref()
+                .is_some_and(|status| status.phase == EnvironmentPhase::Failed && status.message.as_deref() == Some(&message)),
+        };
+        if already_failed {
             return None;
         }
         Some(EnvironmentStatusPatch::MarkFailed { message })

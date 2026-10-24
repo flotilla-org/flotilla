@@ -206,3 +206,53 @@ async fn transient_clone_failure_remains_retryable_and_converges() {
         Some(flotilla_resources::CloneStatusPatch::MarkReady { default_branch }) if default_branch.as_deref() == Some("main")
     ));
 }
+
+// The engine decides whether cloning is still needed even when every old phase disagrees.
+// The shared property supplies stale phases and endings to this actuation contract.
+pub(super) async fn assert_clone_lifecycle(old_phase: flotilla_resources::ClonePhase, ending: flotilla_provisioning_testkit::Ending<'_>) {
+    use flotilla_provisioning::engine::clone::CloneBinding;
+    use flotilla_provisioning_testkit::LifecycleFixture;
+    use flotilla_resources::{CloneStatus, ControllerRetryDisposition};
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
+    flotilla_store::ensure_repository(&backend.using::<Repository>("flotilla"), &spec.key(), &spec).await.expect("repository");
+    let name = format!("clone-{}", spec.clone_key("env").expect("key"));
+    let mut obj = backend
+        .using::<flotilla_resources::Clone>("flotilla")
+        .create(
+            &meta(&name),
+            &CloneSpec {
+                repo_ref: spec.key(),
+                url: "https://github.com/flotilla-org/flotilla".into(),
+                env_ref: "env".into(),
+                path: "/repo".into(),
+            },
+        )
+        .await
+        .expect("clone");
+    obj.status = Some(CloneStatus { phase: old_phase, ..Default::default() });
+    let fixture = LifecycleFixture::<CloneBinding>::new(false);
+    fixture.request(&obj);
+    let reconciler =
+        CloneReconciler::new(Arc::new(FailingCloneRuntime), backend.using("flotilla")).with_lifecycle_reads(fixture.reads.clone());
+    let prepared = reconciler.prepare(&obj).await.expect("requested");
+    assert!(matches!(
+        reconciler.reconcile(&obj, &prepared, chrono::Utc::now()).patch,
+        Some(flotilla_resources::CloneStatusPatch::MarkRetrying { .. })
+    ));
+    fixture.retry(&obj, "offline");
+    assert_eq!(
+        reconciler.retry_disposition(&obj),
+        Some(ControllerRetryDisposition::Retryable {
+            next_attempt_at: flotilla_schema::Timestamp(32_000_000).to_datetime().expect("deadline"),
+        })
+    );
+    let retry = reconciler.prepare(&obj).await.expect("retry");
+    assert_eq!(reconciler.reconcile(&obj, &retry, chrono::Utc::now()).requeue_after, Some(std::time::Duration::from_secs(60)));
+    fixture.finish(&obj, ending);
+    let prepared = reconciler.prepare(&obj).await.expect("ended or ready");
+    assert!(reconciler.reconcile(&obj, &prepared, chrono::Utc::now()).patch.is_none());
+    assert_eq!(obj.status.as_ref().expect("unchanged").phase, old_phase);
+    fixture.poison();
+    assert!(reconciler.prepare(&obj).await.err().expect("read error").to_string().contains("poisoned"));
+}

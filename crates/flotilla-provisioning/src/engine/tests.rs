@@ -185,7 +185,7 @@ async fn the_engine_gives_a_clone_up_and_never_reconciles_it_again() {
 
     let prepared = engine.inner().prepared.load(Ordering::SeqCst);
     let outcome = reconcile(&engine, &mut obj).await;
-    assert_eq!(outcome.patch, None, "the copy already holds");
+    assert_eq!(outcome.patch, None, "ended clones emit no copy");
     assert_eq!(engine.inner().prepared.load(Ordering::SeqCst), prepared, "an ended resource is not reconciled again");
 }
 
@@ -246,10 +246,10 @@ async fn a_vanished_checkout_is_not_revived() {
     assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(CheckoutPhase::Gone));
 }
 
-// Behaviour: when the old status drifts from the engine (here, a Ready checkout the old status
-// shows Failed), an observation-only reconcile writes the engine's copy.
+// A checkout observation remains publishable while old phase drifts; the binding never copies
+// engine phase into that status, and the realised lifecycle remains authoritative.
 #[tokio::test]
-async fn the_copy_restores_the_engine_state_over_a_drifted_old_status() {
+async fn checkout_observations_do_not_copy_engine_phase_into_drifted_status() {
     let home = lifecycles::<CheckoutBinding>();
     let ready =
         CheckoutStatusPatch::MarkReady { path: "/work/feature".into(), commit: Some("abc".into()), branch_provenance: Default::default() };
@@ -261,9 +261,11 @@ async fn the_copy_restores_the_engine_state_over_a_drifted_old_status() {
     reconcile(&engine, &mut obj).await;
     obj.status = Some(CheckoutStatus { phase: CheckoutPhase::Failed, commit: Some("abc".into()), ..CheckoutStatus::default() });
     let outcome = reconcile(&engine, &mut obj).await;
-    assert!(
-        matches!(outcome.patch, Some(CheckoutStatusPatch::MarkReady { ref path, ref commit, .. }) if path == "/work/feature" && commit.as_deref() == Some("abc"))
-    );
+    assert_eq!(outcome.patch, Some(CheckoutStatusPatch::ObserveDegradation { message: None }));
+    assert_eq!(obj.status.as_ref().expect("status").phase, CheckoutPhase::Failed);
+    let held = home.get("checkout-a").expect("held");
+    assert_eq!(held.state(), &LifecycleState::Realised { identity: "/work/feature".into() });
+    assert_eq!(CheckoutBinding::copy(&obj, &held), None);
 }
 
 // Behaviour (#3719 look-over ruling 4): a checkout's request names who it is held for, its
@@ -438,31 +440,48 @@ fn an_environment_is_realised_under_its_container_or_root() {
     );
 }
 
-// Behaviour: a Ready environment whose backing the observer reports failed has vanished; the
-// copy then accepts Failed as Gone, so the old status does not flip between Lost and Failed.
+// Failure before readiness gives up; failure after readiness vanishes. Every old phase is
+// deliberately stale: the engine alone determines the ending and never supplies a status copy.
 #[tokio::test]
-async fn a_realised_environment_whose_backing_failed_vanishes() {
+async fn environment_failure_uses_engine_readiness_without_a_copy() {
     use super::{decide, environment::EnvironmentBinding};
-    use flotilla_resources::{EnvironmentPhase, EnvironmentStatusPatch};
-    let home = lifecycles::<EnvironmentBinding>();
-    let mut obj = environment_object(true);
-    let ready = EnvironmentStatusPatch::MarkReady {
-        configured_limits: None,
-        docker_container_id: Some("c0ffee".into()),
-        image_ref: None,
-        local_image_id: None,
-        registry_digest: None,
-    };
-    let decision = decide::<EnvironmentBinding>(home.as_ref(), &obj, Some(ready), Utc::now());
-    decision.patch.expect("ready").apply(obj.status.get_or_insert_with(Default::default));
-    let failed = EnvironmentStatusPatch::MarkFailed { message: "container exited".into() };
-    let decision = decide::<EnvironmentBinding>(home.as_ref(), &obj, Some(failed.clone()), Utc::now());
-    assert!(decision.ended);
-    assert_eq!(decision.patch, Some(failed.clone()));
-    failed.apply(obj.status.get_or_insert_with(Default::default));
-    assert_eq!(home.get("env-a").expect("held").state(), &LifecycleState::Gone);
-    assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(EnvironmentPhase::Failed));
-    assert_eq!(EnvironmentBinding::copy(&obj, &home.get("env-a").expect("held")), None);
+    use flotilla_resources::{EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch};
+    use flotilla_schema::Timestamp;
+    for old_phase in [
+        EnvironmentPhase::Pending,
+        EnvironmentPhase::Provisioning,
+        EnvironmentPhase::Ready,
+        EnvironmentPhase::Failed,
+        EnvironmentPhase::Lost,
+    ] {
+        for realised in [false, true] {
+            for cause in ["", "container exited", "失敗"] {
+                let home = lifecycles::<EnvironmentBinding>();
+                let mut obj = environment_object(true);
+                home.request("env-a", EnvironmentBinding::request(&obj, HOME).expect("request"), Timestamp(1)).expect("held");
+                if realised {
+                    home.step("env-a", &Step::Realised { identity: "container".into() }, Timestamp(2)).expect("ready");
+                }
+                obj.status = Some(EnvironmentStatus { phase: old_phase, message: Some("stale".into()), ..Default::default() });
+                let old_status = obj.status.clone();
+                let failed = EnvironmentStatusPatch::MarkFailed { message: cause.into() };
+                let decision = decide::<EnvironmentBinding>(home.as_ref(), &obj, Some(failed.clone()), Utc::now());
+                assert!(decision.ended);
+                assert_eq!(decision.patch, Some(failed));
+                let held = home.get("env-a").expect("held");
+                if realised {
+                    assert_eq!(held.state(), &LifecycleState::Gone);
+                } else {
+                    assert!(matches!(held.state(), LifecycleState::GaveUp { cause: actual } if actual.detail == cause));
+                }
+                assert_eq!(EnvironmentBinding::copy(&obj, &held), None);
+                assert_eq!(obj.status, old_status);
+                let repeated = decide::<EnvironmentBinding>(home.as_ref(), &obj, None, Utc::now());
+                assert!(repeated.ended);
+                assert_eq!(repeated.patch, None);
+            }
+        }
+    }
 }
 
 // Behaviour: an image build's infrastructure failures are retried until ImageBuild's policy
@@ -522,9 +541,8 @@ async fn image_build_failures_follow_the_build_policy() {
     assert_eq!(home.get("image-a").expect("held").state(), &LifecycleState::Realised { identity: "sha256:beef".into() });
 }
 
-// Behaviour (#3729 review): when the controller's old-status write fails after the engine took a
-// step, the next reconcile's report is a new try made by the old reconciler's prepare, so the
-// engine counts it once more; the copy then brings the old status level with the engine.
+// When a status write fails after an engine step, the next report is a new attempt.
+// The engine counts each attempt once without relying on a copied status.
 #[tokio::test]
 async fn a_lost_status_write_leaves_the_engine_counting_each_try_once() {
     let home = lifecycles::<CloneBinding>();
@@ -1101,4 +1119,77 @@ async fn a_readiness_the_engine_does_not_take_is_not_written() {
     assert_eq!(status.phase, VesselPhase::Lost);
     let lost = VesselStatusPatch::MarkLost { message: "gone".into() };
     assert_eq!(decide::<VesselBinding>(home.as_ref(), &obj, Some(lost), Utc::now()).patch, None, "already Lost: nothing to write");
+}
+
+// Storage errors between Attempted and GiveUp cannot retally one failure, including after restart.
+// Generate repeated failures, restarts and empty/ASCII/Unicode causes at the storage boundary.
+#[hegel::test]
+fn a_lifecycle_finishes_a_durable_failed_attempt_after_log_errors(tc: hegel::TestCase) {
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::{EdgeEventOf, InputRead, Log, LogError, MemoryLog, Resource, StoredState, Version};
+    use hegel::generators as gs;
+
+    use crate::stored::clone::CloneKind;
+    type Machine = Lifecycle<CloneKind>;
+
+    // This log injects a durable-storage failure before GiveUp commits; all other writes use MemoryLog.
+    struct GiveUpFailures {
+        inner: MemoryLog<Machine>,
+        remaining: Arc<AtomicUsize>,
+    }
+    impl Log<Machine> for GiveUpFailures {
+        fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<Machine>, reads: &[InputRead]) -> Result<Version, LogError> {
+            self.inner.create(writer, at, resource, reads)
+        }
+
+        fn edge(
+            &mut self,
+            previous: &StoredState<Machine>,
+            next: &Resource<Machine>,
+            event: &EdgeEventOf<Machine>,
+        ) -> Result<Version, LogError> {
+            if matches!(next.state(), LifecycleState::GaveUp { .. })
+                && self.remaining.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+            {
+                return Err(LogError::new("injected GiveUp persistence failure"));
+            }
+            self.inner.edge(previous, next, event)
+        }
+    }
+
+    let failures = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+    let restart = tc.draw(gs::booleans());
+    let messages = ["", "backing disappeared", "provider refused: accès refusé"];
+    let message = messages[tc.draw(gs::integers::<usize>().min_value(0).max_value(messages.len() - 1))];
+    let remaining = Arc::new(AtomicUsize::new(failures));
+    let new_home = || {
+        Home::<Machine, _>::with_log(HOME, GiveUpFailures { inner: MemoryLog::new(), remaining: Arc::clone(&remaining) })
+            .expect("declaration")
+    };
+    let mut lifecycles = LifecycleHome::new(HOME, new_home());
+    let obj = clone_object(Some(ClonePhase::Ready));
+    let name = &obj.metadata.name;
+    lifecycles.request(name, CloneBinding::request(&obj, HOME).expect("request"), Timestamp(1)).expect("requested");
+    let step = Step::Attempted(flotilla_state_machines::Outcome::Failed {
+        cause: flotilla_state_machines::Cause::new(flotilla_state_machines::CauseCategory::Refused, message),
+        retryable: false,
+    });
+    let mut attempted_version = None;
+    for n in 0..failures {
+        let error = lifecycles.step(name, &step, Timestamp(2 + n as i64)).expect_err("GiveUp log failure propagates");
+        assert!(error.to_string().contains("injected GiveUp persistence failure"));
+        let resource = lifecycles.get(name).expect("durable attempt");
+        assert!(matches!(resource.state(), LifecycleState::Requested { failures: 1, last_failure: Some(last) }
+            if last.cause.detail == message && !last.retryable));
+        let version = *attempted_version.get_or_insert(resource.version());
+        assert_eq!(resource.version(), version, "retry must not append another Attempted");
+        if restart {
+            let mut home = new_home();
+            home.restore(resource).expect("restore durable state");
+            lifecycles = LifecycleHome::new(HOME, home);
+        }
+    }
+    let ended = lifecycles.step(name, &step, Timestamp(10)).expect("GiveUp retry succeeds");
+    assert_eq!(ended.version().0, attempted_version.expect("durable attempt").0 + 1, "only GiveUp is appended");
+    assert!(matches!(ended.state(), LifecycleState::GaveUp { cause } if cause.detail == message));
 }

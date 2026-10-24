@@ -5,7 +5,9 @@ use std::{
     path::Path,
 };
 
+use flotilla_protocol::LifecycleReading;
 use flotilla_protocol::{RepoIdentity, RepoSelector};
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, Environment, Project, Repository, RepositoryKey};
 use flotilla_store::ResourceBackend;
 
@@ -17,6 +19,17 @@ pub async fn resolve_repository(
     namespace: &str,
     local_host: &str,
     selector: &RepoSelector,
+) -> Result<Option<RepositoryKey>, String> {
+    resolve_repository_with_lifecycle_reads(backend, observed, namespace, local_host, selector, &NoLifecycleReads).await
+}
+
+pub async fn resolve_repository_with_lifecycle_reads(
+    backend: &ResourceBackend,
+    observed: &ResourceBackend,
+    namespace: &str,
+    local_host: &str,
+    selector: &RepoSelector,
+    reads: &dyn LifecycleReads,
 ) -> Result<Option<RepositoryKey>, String> {
     let selector = match selector {
         // Legacy TUI/provider callers encode a local checkout root in RepoIdentity.
@@ -59,7 +72,7 @@ pub async fn resolve_repository(
         }
         RepoSelector::Path(cwd) => {
             let cwd = canonical_or_original(cwd);
-            let checkouts = local_checkouts(backend, observed, namespace, local_host).await?;
+            let checkouts = local_checkouts_with_lifecycle_reads(backend, observed, namespace, local_host, reads).await?;
             // Nested known checkouts scope to the deepest containing checkout.
             let mut deepest = 0;
             for checkout in checkouts {
@@ -115,6 +128,16 @@ pub async fn local_checkouts(
     namespace: &str,
     local_host: &str,
 ) -> Result<Vec<flotilla_resources::ResourceObject<Checkout>>, String> {
+    local_checkouts_with_lifecycle_reads(backend, observed, namespace, local_host, &NoLifecycleReads).await
+}
+
+pub async fn local_checkouts_with_lifecycle_reads(
+    backend: &ResourceBackend,
+    observed: &ResourceBackend,
+    namespace: &str,
+    local_host: &str,
+    reads: &dyn LifecycleReads,
+) -> Result<Vec<flotilla_resources::ResourceObject<Checkout>>, String> {
     let mut checkouts = observed
         .clone()
         .using::<Checkout>(namespace)
@@ -123,11 +146,15 @@ pub async fn local_checkouts(
         .map_err(|error| error.to_string())?
         .items
         .into_iter()
-        .map(|checkout| (checkout.metadata.name.clone(), checkout))
+        .map(|checkout| (checkout.metadata.name.clone(), (checkout, None)))
         .collect::<BTreeMap<_, _>>();
     // Match Aggregator precedence: durable status wins over its ephemeral projection.
     for source in backend.including_replicas::<Checkout>(namespace).list().await.map_err(|error| error.to_string())?.items {
-        checkouts.insert(source.object.metadata.name.clone(), source.object);
+        let origin = match source.provenance {
+            flotilla_resources::ResourceProvenance::Local => None,
+            flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+        };
+        checkouts.insert(source.object.metadata.name.clone(), (source.object, origin));
     }
     let local_environments = backend
         .including_replicas::<Environment>(namespace)
@@ -140,8 +167,24 @@ pub async fn local_checkouts(
         .map(|source| source.object.metadata.name)
         .collect::<BTreeSet<_>>();
 
-    Ok(checkouts
-        .into_values()
+    let mut ready = Vec::new();
+    for (mut checkout, origin) in checkouts.into_values() {
+        if !matches!(checkout.spec, CheckoutSpec::Observed(_)) {
+            match reads.try_reading(ProvisioningKind::Checkout, &checkout.metadata.name, origin.as_deref())? {
+                Some(LifecycleReading::Ready { identity }) => {
+                    // This transient read view supplies one authoritative phase/path pair; it is never persisted.
+                    let status = checkout.status.get_or_insert_with(Default::default);
+                    status.phase = CheckoutPhase::Ready;
+                    status.path = Some(identity);
+                }
+                Some(_) => continue,
+                None => {}
+            }
+        }
+        ready.push(checkout);
+    }
+    Ok(ready
+        .into_iter()
         .filter(|checkout| {
             if checkout.status.as_ref().is_some_and(|status| status.phase != CheckoutPhase::Ready) {
                 return false;
@@ -405,5 +448,97 @@ mod tests {
             .await
             .expect("gone checkout");
         assert_eq!(resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path("/actual/widgets".into())).await, Ok(None));
+    }
+    // Local repository addressing uses the engine's ready path and excludes every non-ready held
+    // checkout, preserving durable precedence over observations and each selected replica's origin.
+    #[tokio::test]
+    async fn repository_paths_follow_checkout_engine_without_a_copy() {
+        use flotilla_provisioning::engine::checkout::CheckoutBinding;
+        use flotilla_provisioning_testkit::{object, store_object, Ending, LifecycleFixture};
+        use flotilla_resources::{CheckoutStatus, CheckoutWorktreeSpec, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec};
+        for replica in [false, true] {
+            let durable = backend();
+            let observed = backend();
+            let author = if replica { backend() } else { durable.clone() };
+            let key = repository(&durable, "widgets", "acme/widgets").await;
+            let temp = tempfile::tempdir().expect("paths");
+            let live = temp.path().join("live");
+            let stale = temp.path().join("stale");
+            let mut env = object::<Environment>(
+                "env",
+                EnvironmentSpec {
+                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/work".into() }),
+                    ..Default::default()
+                },
+                EnvironmentStatus::default(),
+            );
+            env.metadata.namespace = "test".into();
+            store_object(&durable, env).await;
+            checkout().backend(&observed).name("managed").path(stale.to_str().expect("path")).key(key.clone()).call().await;
+            let mut checkout = object::<Checkout>(
+                "managed",
+                CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                    repo_ref: key.clone(),
+                    env_ref: "env".into(),
+                    r#ref: "main".into(),
+                    base_ref: None,
+                    target_path: stale.to_string_lossy().into_owned(),
+                    clone_ref: "source".into(),
+                }),
+                CheckoutStatus { phase: CheckoutPhase::Gone, path: Some(stale.to_string_lossy().into_owned()), ..Default::default() },
+            );
+            checkout.metadata.namespace = "test".into();
+            checkout.metadata.labels.insert(flotilla_resources::CONVOY_LABEL.into(), "crew".into());
+            let checkout = store_object(&author, checkout).await;
+            if replica {
+                durable
+                    .replica_writer::<Checkout>(flotilla_protocol::NodeId::new("home"), "test")
+                    .replace(&author.using::<Checkout>("test").list().await.expect("snapshot"), chrono::Utc::now())
+                    .await
+                    .expect("replica");
+            }
+            let fixture = LifecycleFixture::<CheckoutBinding>::new(replica);
+            fixture.request(&checkout);
+            assert!(local_checkouts_with_lifecycle_reads(&durable, &observed, "test", "local", fixture.reads.as_ref())
+                .await
+                .expect("requested")
+                .is_empty());
+            fixture.finish(&checkout, Ending::Ready(live.to_str().expect("path")));
+            assert_eq!(
+                resolve_repository_with_lifecycle_reads(
+                    &durable,
+                    &observed,
+                    "test",
+                    "local",
+                    &RepoSelector::Path(live.clone()),
+                    fixture.reads.as_ref()
+                )
+                .await
+                .expect("ready path"),
+                Some(key)
+            );
+            assert!(resolve_repository_with_lifecycle_reads(
+                &durable,
+                &observed,
+                "test",
+                "local",
+                &RepoSelector::Path(stale),
+                fixture.reads.as_ref()
+            )
+            .await
+            .expect("stale path")
+            .is_none());
+            fixture.finish(&checkout, Ending::Lost(live.to_str().expect("path")));
+            assert!(local_checkouts_with_lifecycle_reads(&durable, &observed, "test", "local", fixture.reads.as_ref())
+                .await
+                .expect("lost")
+                .is_empty());
+            assert_eq!(author.using::<Checkout>("test").get("managed").await.expect("unchanged").status, checkout.status);
+            fixture.poison();
+            assert!(local_checkouts_with_lifecycle_reads(&durable, &observed, "test", "local", fixture.reads.as_ref())
+                .await
+                .expect_err("checked read")
+                .contains("poisoned"));
+        }
     }
 }

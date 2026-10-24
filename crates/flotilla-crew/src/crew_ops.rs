@@ -4,6 +4,7 @@ use tracing::Instrument;
 
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_resources::convoy_address::convoy_address;
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity, PROJECT_LABEL};
 use flotilla_resources::{Environment, EnvironmentPhase, ResumeIntent};
 use std::{
@@ -109,6 +110,8 @@ enum SupervisorRuling {
 #[derive(bon::Builder)]
 pub struct CrewService {
     pub(crate) resource_backend: ResourceBackend,
+    #[builder(default = Arc::new(NoLifecycleReads))]
+    lifecycle_reads: Arc<dyn LifecycleReads>,
     #[builder(default)]
     capability_source: RwLock<Option<Arc<dyn flotilla_capability_contract::SessionCapabilitySource>>>,
     #[builder(default)]
@@ -1594,8 +1597,15 @@ impl CrewService {
             )
             .await
             .map_err(|err| err.to_string())?;
-        let mut checkout_list =
-            flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items).into_values().collect::<Vec<_>>();
+        let selected = flotilla_resources::select_convoy_child_sources(&convoy, &checkout_sources.items);
+        let origins = selected
+            .iter()
+            .filter_map(|(name, source)| match &source.provenance {
+                flotilla_resources::ResourceProvenance::Local => None,
+                flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some((name.clone(), origin_root.to_string())),
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut checkout_list = selected.into_values().map(|source| source.object).collect::<Vec<_>>();
         if !checkout_list.is_empty() && convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Active) {
             let inspector = self.checkout_inspector.read().expect("checkout inspector lock").clone().ok_or_else(|| {
                 tracing::warn!(convoy = name, "Active convoy checkout inspector is not configured");
@@ -1629,7 +1639,7 @@ impl CrewService {
                 }
             }
         }
-        self.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkout_list, false).await
+        self.verify_convoy_teardown_gate_at_origins(&convoy, &checkout_list, &origins, false).await
     }
 
     async fn cascade_convoy_children(&self, namespace: &str, name: &str) -> Result<(), String> {
@@ -1669,10 +1679,21 @@ impl CrewService {
         Ok(())
     }
 
+    /// Gate locally resolved checkouts; cross-root teardown retains typed origins in its private gate.
     pub async fn verify_convoy_teardown_gate_for_checkouts(
         &self,
         convoy: &ResourceObject<ResourceConvoy>,
         checkout_list: &[ResourceObject<ResourceCheckout>],
+        force: bool,
+    ) -> Result<(), String> {
+        self.verify_convoy_teardown_gate_at_origins(convoy, checkout_list, &BTreeMap::new(), force).await
+    }
+
+    async fn verify_convoy_teardown_gate_at_origins(
+        &self,
+        convoy: &ResourceObject<ResourceConvoy>,
+        checkout_list: &[ResourceObject<ResourceCheckout>],
+        origins: &BTreeMap<String, String>,
         force: bool,
     ) -> Result<(), String> {
         if force {
@@ -1759,7 +1780,20 @@ impl CrewService {
             // Gone means the checkout authority's host confirmed that the
             // worktree no longer exists. Teardown cannot lose local work in
             // that path, whether the checkout was managed or adopted.
-            if checkout.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::CheckoutPhase::Gone) {
+            let gone = match self.lifecycle_reads.try_reading(
+                ProvisioningKind::Checkout,
+                &checkout.metadata.name,
+                origins.get(&checkout.metadata.name).map(String::as_str),
+            )? {
+                Some(
+                    flotilla_protocol::LifecycleReading::Lost
+                    | flotilla_protocol::LifecycleReading::Released
+                    | flotilla_protocol::LifecycleReading::Gone,
+                ) => true,
+                Some(_) => false,
+                None => checkout.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::CheckoutPhase::Gone),
+            };
+            if gone {
                 continue;
             }
             let is_adopted = checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted);
@@ -2881,19 +2915,48 @@ impl CrewService {
                 if let Some(environment_ref) = resource.object.status.as_ref().and_then(|status| status.environment_ref.as_ref()) {
                     match self.resource_backend.including_replicas::<Environment>(namespace).get(environment_ref).await {
                         Ok(environment) => {
-                            if let Some(status) = environment.object.status.as_ref() {
-                                match status.phase {
-                                    EnvironmentPhase::Lost => {
-                                        let reason = status.message.as_deref().unwrap_or("environment disappeared");
-                                        return Err(format!(
-                                            "vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"
-                                        ));
+                            let origin = match &environment.provenance {
+                                ResourceProvenance::Local => None,
+                                ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+                            };
+                            match self.lifecycle_reads.try_reading(
+                                ProvisioningKind::Environment,
+                                &environment.object.metadata.name,
+                                origin.as_deref(),
+                            )? {
+                                Some(
+                                    flotilla_protocol::LifecycleReading::GaveUp { cause }
+                                    | flotilla_protocol::LifecycleReading::Exhausted { cause },
+                                ) => return Err(format!("vessel `{vessel}` failed provisioning and cannot be resumed: {cause}")),
+                                Some(
+                                    reading @ (flotilla_protocol::LifecycleReading::Lost
+                                    | flotilla_protocol::LifecycleReading::Released
+                                    | flotilla_protocol::LifecycleReading::Gone),
+                                ) => {
+                                    return Err(format!(
+                                        "vessel `{vessel}` is lost, recoverable: {}; rehydration is not available yet (#2872)",
+                                        reading.reason().unwrap_or_default()
+                                    ))
+                                }
+                                Some(_) => {}
+                                None => {
+                                    if let Some(status) = environment.object.status.as_ref() {
+                                        match status.phase {
+                                            EnvironmentPhase::Lost => {
+                                                let reason = status.message.as_deref().unwrap_or("environment disappeared");
+                                                return Err(format!(
+                                                    "vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"
+                                                ));
+                                            }
+                                            EnvironmentPhase::Failed => {
+                                                let reason = status.message.as_deref().unwrap_or("environment provisioning failed");
+                                                return Err(format!(
+                                                    "vessel `{vessel}` failed provisioning and cannot be resumed: {reason}"
+                                                ));
+                                            }
+                                            _ => {}
+                                        }
                                     }
-                                    EnvironmentPhase::Failed => {
-                                        let reason = status.message.as_deref().unwrap_or("environment provisioning failed");
-                                        return Err(format!("vessel `{vessel}` failed provisioning and cannot be resumed: {reason}"));
-                                    }
-                                    _ => {}
                                 }
                             }
                         }

@@ -92,6 +92,7 @@ drydock-protocol.workspace = true
 libc = { workspace = true }
 
 [dev-dependencies]
+flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 drydock-agent.workspace = true
 drydock-transport.workspace = true
 flotilla-forge-github = { path = "../flotilla-forge-github" }
