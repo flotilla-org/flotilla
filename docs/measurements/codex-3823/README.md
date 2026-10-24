@@ -105,3 +105,17 @@ all seven invocation definitions and trust states with the recorded discovery.
 - Removing the CLI trust-state override: fails on the absent trust table.
 - Both mutations reverted: 114 agent tests pass, one existing ignored test.
 - `cargo fmt --check` and affected-package Clippy with `-D warnings` pass.
+
+## Downstream launch contract
+
+The first CI run executed 4,151 selected tests: 4,150 passed and the daemon's
+`agentless_codex_crew_starts_in_a_prepared_flotilla_home` failed because it still
+asserted that the home installs the Stop hook. That pre-existing assertion
+encoded the behavior this fix removes. The contract now preserves the rendered
+launch command and checks all seven subscriptions are present once in the
+invocation and absent from the home, with invocation trust records present.
+Its existing checks for workspace trust, delivered credential location, image
+environment, and untouched host harness configuration remain in place.
+
+After that update, `cargo test -p flotilla-daemon --locked` passed all enabled
+unit, integration, scenario, load-contract and doctest targets locally.

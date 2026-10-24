@@ -178,6 +178,7 @@ const HOST_HARNESS_FILES: &[(&str, &str)] = &[
 struct AgentlessLaunch {
     host: Arc<FakeHost>,
     env: TerminalEnvVars,
+    command: String,
 }
 
 impl AgentlessLaunch {
@@ -220,9 +221,9 @@ async fn try_launch_on_agentless_host(adapter: &str, grant_claude: bool) -> Resu
     )
     .await;
     match launched {
-        Ok(session) => Ok(AgentlessLaunch { host, env: session.env_vars }),
+        Ok(session) => Ok(AgentlessLaunch { host, env: session.env_vars, command: session.command }),
         Err(error) => {
-            assert_host_harness_untouched(&AgentlessLaunch { host, env: Vec::new() });
+            assert_host_harness_untouched(&AgentlessLaunch { host, env: Vec::new(), command: String::new() });
             Err(error)
         }
     }
@@ -436,7 +437,14 @@ async fn agentless_codex_crew_starts_in_a_prepared_flotilla_home() {
     assert_eq!(launch.value("FLOTILLA_ENVIRONMENT_ID").as_deref(), Some(ENVIRONMENT));
     let Some(HostEntry::File(config)) = launch.host.entry(format!("{home}/config.toml")) else { panic!("no flotilla Codex config") };
     assert!(config.contains(&format!("[projects.\"{CHECKOUT}\"]\ntrust_level = \"trusted\"")), "trust for the checkout: {config}");
-    assert!(config.contains("command = \"flotilla hook codex stop\""), "contained Codex installs native hooks: {config}");
+    // #3823: contained crews own hooks only in invocation overrides. Check
+    // every subscription at the daemon launch boundary, without a home copy.
+    for event in ["session-start", "session-end", "user-prompt-submit", "pre-tool-use", "post-tool-use", "stop", "interrupt"] {
+        let command = format!("flotilla hook codex {event}");
+        assert!(!config.contains(&command), "home duplicates {command}: {config}");
+        assert_eq!(launch.command.matches(&command).count(), 1, "invocation defines {command} once");
+    }
+    assert!(launch.command.contains("hooks.state="), "invocation carries hook trust records");
     assert_eq!(launch.host.entry(format!("{home}/auth.json")), Some(HostEntry::Link(PathBuf::from("/home/crew/.codex/auth.json"))));
     assert_image_harness_environment(&launch);
     assert_host_harness_untouched(&launch);
