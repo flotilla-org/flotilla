@@ -74,6 +74,7 @@ fn status(phase: MessagePhase, sequence: Option<u64>, receiver: Option<ResolvedM
         retry: None,
         submission: None,
         failed_batch_members: Vec::new(),
+        ..Default::default()
     }
 }
 

@@ -577,6 +577,8 @@ pub enum ResourceSubCommand {
     /// Replace the status subresource after typed validation
     PatchStatus(ResourceStatusPatchArgs),
     /// Close a held or exhausted Message batch, preserving its submission audit.
+    /// Authorize one more delivery attempt in the existing session (may repeat uncertain input)
+    DeliverMessageBatch(MessageFailBatchArgs),
     FailMessageBatch(MessageFailBatchArgs),
     /// Get one resource by name
     Get(ResourceGetArgs),
@@ -949,6 +951,17 @@ mod tests {
             matches!(parsed.command, Some(SubCommand::Resource { command: ResourceSubCommand::FailMessageBatch(args) }) if args.name == "held" && args.reason == "cancel after inspection")
         );
         assert!(Cli::try_parse_from(["flotilla", "resource", "fail-message-batch", "held"]).is_err());
+    }
+
+    // Glue: explicit retry has its own verb and requires an auditable reason.
+    #[test]
+    fn deliver_message_batch_cli_requires_an_operator_reason() {
+        let parsed = Cli::try_parse_from(["flotilla", "resource", "deliver-message-batch", "held", "--reason", "checked composer"])
+            .expect("operator delivery command");
+        assert!(
+            matches!(parsed.command, Some(SubCommand::Resource { command: ResourceSubCommand::DeliverMessageBatch(args) }) if args.name == "held" && args.reason == "checked composer")
+        );
+        assert!(Cli::try_parse_from(["flotilla", "resource", "deliver-message-batch", "held"]).is_err());
     }
 
     #[test]

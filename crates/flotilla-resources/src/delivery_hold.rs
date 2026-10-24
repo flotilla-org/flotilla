@@ -72,7 +72,7 @@ pub fn delivery_demand(session: &ResourceObject<TerminalSession>) -> (InputMeta,
 
 /// Whether the legacy representation still owns the receiver's operator gate.
 /// The cursor must identify the held head; stale degraded history cannot retain it.
-pub fn legacy_delivery_gate_needed(session: &ResourceObject<TerminalSession>, now: DateTime<Utc>) -> bool {
+pub fn legacy_delivery_gate_needed(session: &ResourceObject<TerminalSession>, _now: DateTime<Utc>) -> bool {
     let Some(status) = session.status.as_ref() else {
         return false;
     };
@@ -86,7 +86,7 @@ pub fn legacy_delivery_gate_needed(session: &ResourceObject<TerminalSession>, no
         return true;
     }
     let held = condition.reason == crate::TERMINAL_DELIVERY_EXPIRED_REASON
-        || (condition.reason == crate::TERMINAL_DELIVERY_UNCONFIRMED_REASON && delivery_hold_overdue(condition.observed_at, now))
+        || condition.reason == crate::TERMINAL_DELIVERY_UNCONFIRMED_REASON
         || (condition.reason == crate::TERMINAL_DELIVERY_NOT_SUBMITTED_REASON && delivery_retry_exhausted(condition.consecutive_failures));
     held && matches!(&session.spec.source, crate::TerminalSessionSource::Agent { message: Some(head), .. }
         if head.next_after(status.delivered_message_id.as_deref()).is_some_and(|message| condition.message_id.as_deref() == Some(message.id.as_str())))

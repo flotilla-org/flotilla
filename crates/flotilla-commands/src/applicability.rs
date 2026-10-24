@@ -99,6 +99,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::ResourceManifestResolve { .. }
         | CommandAction::ConvoyEnsureRoll { .. }
         | CommandAction::ResourceReconcileNow { .. }
+        | CommandAction::MessageDeliverBatch { .. }
         | CommandAction::MessageFailBatch { .. }
         | CommandAction::ResourceStatusPatch { .. }
         | CommandAction::ResourceDelete { .. } => true,

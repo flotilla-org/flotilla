@@ -96,6 +96,7 @@ impl Binding for TerminalSessionBinding {
             | TerminalSessionStatusPatch::ObserveAttention { .. }
             | TerminalSessionStatusPatch::Observe { .. }
             | TerminalSessionStatusPatch::MarkCompletionPending { .. }
+            | TerminalSessionStatusPatch::ClearMessageDeliveryHold { .. }
             | TerminalSessionStatusPatch::ClearCompletionPending => vec![],
         }
     }

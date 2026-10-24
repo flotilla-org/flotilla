@@ -1999,10 +1999,14 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
                 );
             }
         }
-        for elapsed in [299, 300, 301] {
+        // A held write needs attention immediately, including before expiry.
+        for elapsed in [0, 1, 299, 300, 301] {
             let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryPending;
             let outcome = reconciler.reconcile(&flagged, &prepared, held_at + chrono::Duration::seconds(elapsed));
-            assert_eq!(outcome.actuations.iter().any(|a| matches!(a, Actuation::CreateDemand { .. })), elapsed >= 300);
+            assert!(
+                outcome.actuations.iter().any(|a| matches!(a, Actuation::CreateDemand { .. })),
+                "held delivery is visible at {elapsed}s"
+            );
         }
 
         // A post-hold tool hook proves consumption even if the crew has
@@ -2090,7 +2094,10 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
         let fresh = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
         let prepared = fresh.prepare(&flagged).await.expect("observe expired hold after restart");
         let outcome = fresh.reconcile(&flagged, &prepared, Utc::now());
-        assert!(!outcome.actuations.iter().any(|a| matches!(a, Actuation::CreateDemand { .. })));
+        assert!(
+            outcome.actuations.iter().any(|a| matches!(a, Actuation::CreateDemand { .. })),
+            "restart repairs or retains the same durable gate"
+        );
         assert_eq!(runtime.delivered.lock().expect("delivery log").len(), 1);
         // A fresh Idle observation refreshes as_of even after expiry.
         let refresh_at = status.attention.as_ref().expect("attention").as_of + chrono::Duration::seconds(6);
@@ -3554,9 +3561,10 @@ async fn terminal_reconciliation_leaves_message_submissions_to_the_inbox() {
 }
 
 // An unverifiable fence parks known-unsent input immediately. Working hooks,
-// elapsed time, and provider recovery cannot acknowledge it or retry the agent.
+// elapsed time, and provider recovery cannot acknowledge it; the same guarded
+// activation is rechecked after the retry interval.
 #[tokio::test]
-async fn unverifiable_controller_fence_is_named_and_requires_a_new_activation() {
+async fn unverifiable_controller_fence_is_named_and_rechecked_in_the_same_activation() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
@@ -3637,7 +3645,12 @@ async fn unverifiable_controller_fence_is_named_and_requires_a_new_activation() 
         assert!(status.delivered_message_id.is_none());
         assert_eq!(status.degraded.as_ref().expect("failure remains").reason, flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_REASON);
     }
-    assert_eq!(runtime.delivered.lock().expect("attempts").len(), 1);
+    let mut recheck = flagged.clone();
+    recheck.status.as_mut().unwrap().degraded.as_mut().unwrap().observed_at = Utc::now() - chrono::Duration::seconds(11);
+    let prepared = reconciler.prepare(&recheck).await.expect("recheck the same activation");
+    assert!(matches!(prepared, flotilla_crew::reconcilers::terminal_session::TerminalPrepared::ControllerFenceUnverifiable { .. }));
+    assert_eq!(runtime.delivered.lock().expect("attempts").len(), 2);
+
     TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
     assert!(status.degraded.is_none(), "resume starts a new activation");
 }

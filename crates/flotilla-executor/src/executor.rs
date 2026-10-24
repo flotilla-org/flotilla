@@ -145,6 +145,7 @@ pub async fn build_plan(
         | CommandAction::ResourceManifestResolve { .. }
         | CommandAction::ConvoyEnsureRoll { .. }
         | CommandAction::ResourceReconcileNow { .. }
+        | CommandAction::MessageDeliverBatch { .. }
         | CommandAction::MessageFailBatch { .. }
         | CommandAction::ResourceStatusPatch { .. }
         | CommandAction::ResourceDelete { .. }

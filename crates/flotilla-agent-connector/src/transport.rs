@@ -29,6 +29,8 @@ pub struct DeliveryTarget {
 /// A durable submission the host recorded before any transport I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionRef {
+    /// Explicit operator authorization to bypass the controller fence once.
+    pub operator_reason: Option<String>,
     pub batch_id: String,
     pub crew_id: String,
     pub session: String,
@@ -69,8 +71,8 @@ pub enum TransportOutcome {
     NotSubmitted {
         reason: String,
     },
-    /// Definitely unsent, but retrying cannot recover this session. Surface
-    /// the named failure to the operator without fallback or a receipt.
+    /// Definitely unsent behind an unverifiable controller fence. Keep attention
+    /// visible and recheck the same guarded transport without fallback or a receipt.
     ControllerFenceUnverifiable {
         reason: String,
     },

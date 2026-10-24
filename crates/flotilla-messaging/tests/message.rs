@@ -779,8 +779,8 @@ async fn delivery_batches_fifo_and_held_batches_resolve_without_retyping() {
     assert!(text.find("body-0").expect("find expected body in batch") < text.find("body-1").expect("find expected body in batch"));
     assert!(text.find("body-1").expect("find expected body in batch") < text.find("body-2").expect("find expected body in batch"));
     assert!(
-        backend.using::<flotilla_resources::Demand>("flotilla").list().await.expect("demands").items.is_empty(),
-        "allow late evidence before hold escalation"
+        !backend.using::<flotilla_resources::Demand>("flotilla").list().await.expect("demands").items.is_empty(),
+        "held delivery raises attention while awaiting late evidence"
     );
     restarted.reconcile_delivery(&router(&transport), at(320)).await.expect("hold deadline");
     assert_eq!(backend.using::<flotilla_resources::Demand>("flotilla").list().await.expect("demands").items.len(), 1);
@@ -3130,42 +3130,54 @@ async fn submit_timeout_after_failover_holds_without_resubmission() {
     }
 }
 
-// A permanently closed controller fence is definitely unsent, produces no
-// receipt, and immediately raises the named operator gate without budget retries.
+// #3799: a definitely-unsent refusal stays visible and is retried through the
+// same transport once the fence clears; no holder or agent restart is involved.
 #[tokio::test]
-async fn unverifiable_controller_fence_is_immediately_actionable_and_not_retried() {
+async fn unverifiable_controller_fence_recovers_in_the_same_session() {
     let (backend, inbox) = delivery_inbox().await;
-    let reason = flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE;
-    let transport = Arc::new(FakeMessageTransport {
-        submissions: Default::default(),
-        observations: Default::default(),
-        outcome: TransportOutcome::ControllerFenceUnverifiable { reason: reason.into() },
-        accepted: Default::default(),
-        working: Default::default(),
-    });
-    inbox.reconcile_delivery(&router(&transport), at(20)).await.expect("refusal");
-    let gates = backend.using::<flotilla_resources::Demand>("flotilla").list().await.expect("gates").items;
-    assert_eq!(gates.len(), 1, "operator sees failure on the first attempt");
-    let description = &gates[0].metadata.annotations[flotilla_resources::delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION];
-    assert!(description.contains("ControllerFenceUnverifiable"));
-    assert!(description.contains("exit the agent"));
-    assert!(description.contains("flotilla convoy resume"));
-    assert!(!description.contains("pending acceptance evidence"));
-    assert!(!description.contains("attempt 3/3"));
-    // Reconstruct the delivery loop, then advance beyond every retry/hold bound.
-    let restarted = MessageInbox::new(backend.clone(), "flotilla");
-    for second in [21, 80, 500, 3600] {
-        restarted.reconcile_delivery(&router(&transport), at(second)).await.expect("observe parked failure");
+    let refused = named(
+        KEYSTROKE,
+        TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
+    );
+    inbox.reconcile_delivery(&router(&refused), at(20)).await.expect("refusal");
+    let terminals = backend.using::<flotilla_resources::TerminalSession>("flotilla");
+    let original = terminals.get("terminal").await.unwrap();
+    assert_eq!(
+        flotilla_resources::crew_attention(original.status.as_ref(), at(20)),
+        Some(flotilla_protocol::CrewAttention::ControllerFenceUnverifiable)
+    );
+    let recovered = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "same session accepted turn".into() });
+    inbox.reconcile_delivery(&router(&recovered), at(30)).await.expect("retry");
+    assert_eq!(recovered.submissions.lock().unwrap().len(), 1);
+    let current = terminals.get("terminal").await.unwrap();
+    assert_eq!(current.status.as_ref().unwrap().session_id, original.status.as_ref().unwrap().session_id);
+    for message in backend.using::<Message>("flotilla").list().await.unwrap().items {
+        assert!(message.status.unwrap().resolved_receiver.is_some(), "retried input gets a receipt");
     }
-    assert_eq!(transport.submissions.lock().expect("submissions").len(), 1);
-    for message in backend.using::<Message>("flotilla").list().await.expect("messages").items {
-        let status = message.status.expect("status");
-        assert!(status.resolved_receiver.is_none(), "no receipt for refused input");
-        assert!(status.submission.is_none(), "known unsent input is not ambiguous");
-        assert_eq!(status.reason.as_deref(), Some(reason));
-        let retry = status.retry.expect("permanent failure");
-        assert_eq!(retry.attempts, 1);
-        assert!(matches!(retry.disposition, flotilla_resources::ControllerRetryDisposition::Terminal { .. }));
+    assert!(current.status.unwrap().degraded.is_none(), "receipt clears held attention");
+}
+
+// #3799: every held path, including ambiguous writes and empty receipts,
+// raises crew attention on the first held pass rather than after a timeout.
+#[tokio::test]
+async fn every_held_delivery_immediately_raises_crew_attention() {
+    for outcome in [
+        TransportOutcome::Unconfirmed { reason: "ambiguous write".into() },
+        TransportOutcome::Accepted { evidence: String::new() },
+        TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
+    ] {
+        let (backend, inbox) = delivery_inbox().await;
+        let transport = named(KEYSTROKE, outcome);
+        inbox.reconcile_delivery(&router(&transport), at(20)).await.unwrap();
+        let terminal = backend.using::<flotilla_resources::TerminalSession>("flotilla").get("terminal").await.unwrap();
+        assert!(matches!(
+            flotilla_resources::crew_attention(terminal.status.as_ref(), at(20)),
+            Some(flotilla_protocol::CrewAttention::DeliveryUnconfirmed | flotilla_protocol::CrewAttention::ControllerFenceUnverifiable)
+        ));
+        assert_eq!(backend.using::<flotilla_resources::Demand>("flotilla").list().await.unwrap().items.len(), 1);
+        inbox.fail_batch("message-2", "operator disposed of held intent", at(21)).await.unwrap();
+        let terminal = backend.using::<flotilla_resources::TerminalSession>("flotilla").get("terminal").await.unwrap();
+        assert!(terminal.status.unwrap().degraded.is_none(), "disposing of any member clears its held batch attention");
     }
 }
 
@@ -3233,5 +3245,145 @@ fn partial_controller_refusal_is_repaired_before_acceptance(tc: hegel::TestCase)
         }
         let failure = terminals.get("terminal").await.expect("terminal").status.expect("status").degraded.expect("condition");
         assert_eq!(failure.consecutive_failures, 1, "repair preserves the original session failure episode");
+    });
+}
+
+// #3799: one explicit operator command authorizes one same-session attempt,
+// preserves uncertain history, and records the authorization on the receipt.
+#[tokio::test]
+async fn operator_delivery_of_held_batch_is_audited_and_never_automatically_repeated() {
+    for accepted in [false, true] {
+        let (backend, inbox) = delivery_inbox().await;
+        let refused = named(KEYSTROKE, TransportOutcome::Unconfirmed { reason: "reply lost".into() });
+        inbox.reconcile_delivery(&router(&refused), at(20)).await.unwrap();
+        assert!(inbox.deliver_held_batch("message-0", "", at(21)).await.is_err());
+        inbox.deliver_held_batch("message-0", "operator checked composer", at(21)).await.unwrap();
+        let transport = named(
+            KEYSTROKE,
+            if accepted {
+                TransportOutcome::Accepted { evidence: "explicit operator send completed".into() }
+            } else {
+                TransportOutcome::Unconfirmed { reason: "operator send response lost".into() }
+            },
+        );
+        inbox.reconcile_delivery(&router(&transport), at(22)).await.unwrap();
+        assert_eq!(transport.submissions.lock().unwrap().len(), 1);
+        for message in backend.using::<Message>("flotilla").list().await.unwrap().items {
+            let status = message.status.unwrap();
+            assert_eq!(status.delivery_history.len(), 1, "old uncertain submission remains in audit");
+            assert!(status.operator_delivery.is_none(), "authorization consumed before transport I/O");
+            if accepted {
+                let receipt = status.resolved_receiver.unwrap();
+                assert_eq!(receipt.session, "session");
+                assert!(receipt.evidence.contains("operator checked composer"));
+            } else {
+                assert!(status.resolved_receiver.is_none());
+            }
+        }
+        inbox.reconcile_delivery(&router(&transport), at(500)).await.unwrap();
+        assert_eq!(transport.submissions.lock().unwrap().len(), 1, "uncertain operator attempt cannot be automatically retyped");
+    }
+}
+
+// #3799: authorization belongs to the inspected activation. A replacement
+// session cannot inherit it, and the operator may explicitly authorize that session.
+#[tokio::test]
+async fn operator_delivery_authorization_does_not_follow_a_replacement_session() {
+    let (backend, inbox) = delivery_inbox().await;
+    let fence = named(
+        KEYSTROKE,
+        TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
+    );
+    inbox.reconcile_delivery(&router(&fence), at(20)).await.unwrap();
+    inbox.deliver_held_batch("message-0", "inspected original", at(21)).await.unwrap();
+    // Crash/readiness interleaving after authorization consumption but before I/O.
+    let messages = backend.using::<Message>("flotilla");
+    for message in messages.list().await.unwrap().items {
+        let mut status = message.status.unwrap();
+        status.retry = None;
+        messages.update_status(&message.metadata.name, &message.metadata.resource_version, &status).await.unwrap();
+    }
+    let terminals = backend.using::<flotilla_resources::TerminalSession>("flotilla");
+    let holder = terminals.get("terminal").await.unwrap();
+    let mut status = holder.status.unwrap();
+    status.session_id = Some("replacement".into());
+    terminals.update_status("terminal", &holder.metadata.resource_version, &status).await.unwrap();
+    let accepts = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "receipt".into() });
+    inbox.reconcile_delivery(&router(&accepts), at(30)).await.unwrap();
+    assert!(accepts.submissions.lock().unwrap().is_empty(), "old authorization cannot type into a new child");
+    inbox.deliver_held_batch("message-0", "inspected replacement", at(31)).await.unwrap();
+    inbox.reconcile_delivery(&router(&accepts), at(32)).await.unwrap();
+    assert_eq!(accepts.submissions.lock().unwrap().len(), 1);
+    let receipt = backend.using::<Message>("flotilla").get("message-0").await.unwrap().status.unwrap().resolved_receiver.unwrap();
+    assert_eq!(receipt.session, "replacement");
+    assert!(receipt.evidence.contains("inspected replacement"));
+}
+
+// #3799: a later guarded attempt can itself have an ambiguous write. Its old
+// definitely-unsent proof must not authorize retyping or hide the new uncertainty.
+#[tokio::test]
+async fn ambiguous_fence_recheck_loses_its_old_unsent_proof() {
+    let (backend, inbox) = delivery_inbox().await;
+    let fence = named(
+        KEYSTROKE,
+        TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
+    );
+    inbox.reconcile_delivery(&router(&fence), at(20)).await.unwrap();
+    let uncertain = named(KEYSTROKE, TransportOutcome::Unconfirmed { reason: "new write reply lost".into() });
+    inbox.reconcile_delivery(&router(&uncertain), at(30)).await.unwrap();
+    assert_eq!(uncertain.submissions.lock().unwrap().len(), 1);
+    let terminal = backend.using::<flotilla_resources::TerminalSession>("flotilla").get("terminal").await.unwrap();
+    assert_eq!(
+        flotilla_resources::crew_attention(terminal.status.as_ref(), at(30)),
+        Some(flotilla_protocol::CrewAttention::DeliveryUnconfirmed)
+    );
+    for second in [40, 500, 3600] {
+        inbox.reconcile_delivery(&router(&uncertain), at(second)).await.unwrap();
+    }
+    assert_eq!(uncertain.submissions.lock().unwrap().len(), 1);
+    for message in backend.using::<Message>("flotilla").list().await.unwrap().items {
+        let status = message.status.unwrap();
+        assert!(status.submission.is_some());
+        assert!(status.resolved_receiver.is_none());
+    }
+}
+
+// #3799: an interrupted operator command may persist only part of its batch's
+// authorization. No prefix may bypass the fence; repeating the command repairs it.
+#[hegel::test]
+fn partial_operator_authorization_never_submits_a_batch_prefix(tc: hegel::TestCase) {
+    // Cover both incomplete boundaries of the three-member batch.
+    let completed = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let (backend, inbox) = delivery_inbox().await;
+        let fence = named(
+            KEYSTROKE,
+            TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
+        );
+        inbox.reconcile_delivery(&router(&fence), at(20)).await.unwrap();
+        let messages = backend.using::<Message>("flotilla");
+        for index in 0..completed {
+            let message = messages.get(&format!("message-{index}")).await.unwrap();
+            let mut status = message.status.unwrap();
+            status.operator_delivery = Some(flotilla_resources::OperatorMessageDelivery {
+                reason: "inspected batch".into(),
+                session: "session".into(),
+                crew_id: "crew".into(),
+            });
+            messages.update_status(&message.metadata.name, &message.metadata.resource_version, &status).await.unwrap();
+        }
+        let accepts = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "explicit send completed".into() });
+        for second in [21, 30, 500] {
+            inbox.reconcile_delivery(&router(&accepts), at(second)).await.unwrap();
+            assert!(accepts.submissions.lock().unwrap().is_empty(), "partial authorization cannot submit a prefix");
+        }
+        inbox.deliver_held_batch("message-0", "inspected batch", at(501)).await.unwrap();
+        inbox.reconcile_delivery(&router(&accepts), at(502)).await.unwrap();
+        inbox.reconcile_delivery(&router(&accepts), at(503)).await.unwrap();
+        assert_eq!(accepts.submissions.lock().unwrap().len(), 1, "repaired command delivers the complete batch once");
+        for message in messages.list().await.unwrap().items {
+            assert!(message.status.unwrap().resolved_receiver.unwrap().evidence.contains("inspected batch"));
+        }
     });
 }

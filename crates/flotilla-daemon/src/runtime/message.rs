@@ -290,6 +290,13 @@ impl AgentTransport for TerminalControllerRuntime {
             Ok(holder) => holder,
             Err(reason) => return TransportOutcome::NotSubmitted { reason },
         };
+        if batch.submission.operator_reason.is_some()
+            && (holder.status.as_ref().and_then(|status| status.session_id.as_deref()) != Some(batch.submission.session.as_str())
+                || holder.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.id.as_str())
+                    != Some(batch.submission.crew_id.as_str()))
+        {
+            return TransportOutcome::NotSubmitted { reason: "receiver changed before submission".into() };
+        }
         match self.adapter_for_spec(&holder.spec).await {
             Ok(Some(_)) => {}
             Ok(None) => return TransportOutcome::NotSubmitted { reason: "agent acceptance observations unavailable".into() },
@@ -312,8 +319,17 @@ impl AgentTransport for TerminalControllerRuntime {
         let daemon = Arc::clone(&self.state.daemon);
         let namespace = batch.target.namespace.clone();
         let members = batch.submission.members.clone();
+        let operator_reason = batch.submission.operator_reason.clone();
         let task = tokio::spawn(async move {
             let inbox = daemon.message_inbox(&namespace).await;
+            if operator_reason.is_some() {
+                // The inbox pinned this authorization to the inspected receiver.
+                if !inbox.validate_delivery_members(&members, Utc::now()).await.map_err(|error| error.to_string())? {
+                    return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
+                }
+                pool.operator_deliver(&session, &text).await?;
+                return Ok(TerminalDeliveryOutcome::Confirmed);
+            }
             deliver_guarded_and_confirm(&*pool, adapter.as_deref(), &session, &text, &inbox, &members).await
         });
         deliveries.insert(
@@ -359,7 +375,14 @@ impl AgentTransport for TerminalControllerRuntime {
             }
         };
         match delivery {
-            Some(delivery) => message_transport_outcome(delivery.task.await.unwrap_or_else(|error| Err(error.to_string()))),
+            Some(delivery) => {
+                let result = delivery.task.await.unwrap_or_else(|error| Err(error.to_string()));
+                if batch.submission.operator_reason.is_some() && matches!(&result, Ok(TerminalDeliveryOutcome::Confirmed)) {
+                    TransportOutcome::Accepted { evidence: "cleat acknowledged explicit operator submission".into() }
+                } else {
+                    message_transport_outcome(result)
+                }
+            }
             None => {
                 TransportOutcome::Unconfirmed { reason: "submission task unavailable; observing acceptance without resubmission".into() }
             }

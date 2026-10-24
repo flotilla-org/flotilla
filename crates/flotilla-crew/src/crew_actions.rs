@@ -487,6 +487,23 @@ impl CrewActions<'_> {
 }
 
 impl CrewActions<'_> {
+    pub async fn execute_action_message_deliver_batch(&self, id: u64, command: &Command) -> Result<u64, String> {
+        if let CommandAction::MessageDeliverBatch { namespace, name, reason } = &command.action {
+            let identity = self.events.start(id, command.description().to_string());
+            let result = if self.crew.message_primitives().is_some() {
+                CommandValue::Error { message: "engine delivery does not hold submission batches".into() }
+            } else {
+                match self.crew.message_inbox(namespace).await.deliver_held_batch(name, reason, self.clock.now()).await {
+                    Ok(()) => CommandValue::Ok,
+                    Err(error) => CommandValue::Error { message: error.to_string() },
+                }
+            };
+            self.events.finish(id, identity, result);
+            return Ok(id);
+        }
+        Err("MessageDeliverBatch action selected the wrong handler".into())
+    }
+
     pub async fn execute_action_message_fail_batch(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::MessageFailBatch { namespace, name, reason } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());

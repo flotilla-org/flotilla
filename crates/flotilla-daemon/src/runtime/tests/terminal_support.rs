@@ -10,10 +10,12 @@ pub(super) struct DeliveryProbePool {
     pub(super) activities: Vec<ScreenActivity>,
     pub(super) observations: AtomicUsize,
     pub(super) deliveries: AtomicUsize,
+    pub(super) lifecycle_changes: AtomicUsize,
     pub(super) retries: AtomicUsize,
     pub(super) screens: Vec<String>,
     pub(super) submission_error: bool,
-    pub(super) controller_fence_unverifiable: bool,
+    pub(super) working_after_delivery: bool,
+    pub(super) controller_fence_unverifiable: AtomicBool,
     pub(super) controller_refusals: AtomicUsize,
     pub(super) submission_attempts: AtomicUsize,
     pub(super) submission_attempted: tokio::sync::Notify,
@@ -27,10 +29,12 @@ impl DeliveryProbePool {
             activities,
             observations: AtomicUsize::new(0),
             deliveries: AtomicUsize::new(0),
+            lifecycle_changes: AtomicUsize::new(0),
             retries: AtomicUsize::new(0),
             screens: Vec::new(),
             submission_error: false,
-            controller_fence_unverifiable: false,
+            working_after_delivery: false,
+            controller_fence_unverifiable: AtomicBool::new(false),
             controller_refusals: AtomicUsize::new(0),
             submission_attempts: AtomicUsize::new(0),
             submission_attempted: tokio::sync::Notify::new(),
@@ -64,6 +68,7 @@ impl TerminalPool for DeliveryProbePool {
         _env_vars: &TerminalEnvVars,
         _tags: &[TerminalSessionTag],
     ) -> Result<(), String> {
+        self.lifecycle_changes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -78,10 +83,14 @@ impl TerminalPool for DeliveryProbePool {
     }
 
     async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
+        self.lifecycle_changes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
     async fn capture_screen(&self, _: &str) -> Result<Option<String>, String> {
+        if self.working_after_delivery && self.deliveries.load(Ordering::SeqCst) > 0 {
+            return Ok(Some("• Working (1s • esc to interrupt)".into()));
+        }
         let index = self.observations.load(Ordering::SeqCst).saturating_sub(1);
         Ok(self.screens.get(index).or_else(|| self.screens.last()).cloned())
     }
@@ -100,7 +109,7 @@ impl TerminalPool for DeliveryProbePool {
     async fn guarded_deliver(&self, session: &str, text: &str) -> Result<flotilla_terminal::TerminalSubmission, String> {
         self.submission_attempts.fetch_add(1, Ordering::SeqCst);
         self.submission_attempted.notify_one();
-        if self.controller_fence_unverifiable {
+        if self.controller_fence_unverifiable.load(Ordering::SeqCst) {
             return Ok(flotilla_terminal::TerminalSubmission::ControllerFenceUnverifiable);
         }
         if self.controller_refusals.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() {
@@ -108,6 +117,10 @@ impl TerminalPool for DeliveryProbePool {
         }
         self.deliver(session, text).await?;
         Ok(flotilla_terminal::TerminalSubmission::Submitted)
+    }
+
+    async fn operator_deliver(&self, session: &str, text: &str) -> Result<(), String> {
+        self.deliver(session, text).await
     }
 
     async fn retry_delivery(&self, _session_name: &str, _text: &str) -> Result<(), String> {

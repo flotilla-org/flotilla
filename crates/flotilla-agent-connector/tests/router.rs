@@ -80,6 +80,7 @@ fn delivery(session: &str, text: &str) -> Delivery {
         operation: Operation::NewTurn,
         target: target(session),
         submission: SubmissionRef {
+            operator_reason: None,
             batch_id: format!("batch-{text}"),
             crew_id: "crew".into(),
             session: session.into(),

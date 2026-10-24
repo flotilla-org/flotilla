@@ -12,7 +12,7 @@ use crate::{
 
 /// A pre-write refusal that cannot recover before the agent activation ends.
 pub const CONTROLLER_FENCE_UNVERIFIABLE_REASON: &str = "ControllerFenceUnverifiable";
-pub const CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE: &str = "ControllerFenceUnverifiable: session needs an agent restart; exit the agent, then run `flotilla convoy resume` to relaunch it in the existing checkout (the earlier conversation may be lost); no message input was sent";
+pub const CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE: &str = "ControllerFenceUnverifiable: no message input was sent; guarded delivery will be rechecked; inspect the held batch and use `flotilla resource deliver-message-batch` to authorize delivery in the same session";
 
 /// An ambiguous write whose confirmation deadline elapsed; never retried.
 /// Later consumption evidence can still acknowledge the held message.
@@ -457,7 +457,7 @@ impl TerminalSessionStatus {
 }
 
 impl TerminalSessionDegradedCondition {
-    /// This activation cannot accept guarded input until the agent restarts.
+    /// Guarded input was refused as definitely unsent; keep the hold visible while rechecking.
     pub fn is_controller_fence_unverifiable(&self) -> bool {
         self.reason == CONTROLLER_FENCE_UNVERIFIABLE_REASON
     }
@@ -680,6 +680,9 @@ pub enum TerminalSessionStatusPatch {
     MarkMessageDelivered {
         message_id: String,
     },
+    ClearMessageDeliveryHold {
+        message_id: String,
+    },
     MarkDeliveryExpired,
     MarkDeliveryNotSubmitted {
         message_id: String,
@@ -781,6 +784,16 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 // A fresh idle observation must follow delivery before stall
                 // supervision treats the agent as having finished this turn.
                 status.attention = None;
+            }
+            Self::ClearMessageDeliveryHold { message_id } => {
+                if status
+                    .degraded
+                    .as_ref()
+                    .is_some_and(|condition| condition.is_delivery() && condition.message_id.as_ref() == Some(message_id))
+                {
+                    status.degraded = None;
+                    status.message = None;
+                }
             }
             Self::MarkDeliveryExpired => {
                 if let Some(condition) =

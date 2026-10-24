@@ -205,6 +205,15 @@ pub struct ResolvedMessageReceiver {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct MessageStatus {
+    /// Explicit operator authorization, pinned to the receiver that was inspected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_delivery: Option<OperatorMessageDelivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_recheck_at: Option<DateTime<Utc>>,
+    /// Preserve possibly-written submissions when an operator authorizes another attempt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub delivery_history: Vec<MessageSubmission>,
     pub phase: MessagePhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_sequence: Option<u64>,
@@ -231,6 +240,9 @@ pub struct MessageStatus {
 impl Default for MessageStatus {
     fn default() -> Self {
         Self {
+            operator_delivery: None,
+            fence_recheck_at: None,
+            delivery_history: Vec::new(),
             phase: MessagePhase::Accepted,
             accepted_sequence: None,
             // An absent status has no evidence timestamp. Writers provide their clock.
@@ -247,6 +259,8 @@ impl Default for MessageStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct MessageSubmission {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_reason: Option<String>,
     pub batch_id: String,
     pub crew_id: String,
     pub session: String,
@@ -263,6 +277,13 @@ pub struct MessageSubmission {
     /// transport router (#3545), which poll the session's first offered transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorMessageDelivery {
+    pub reason: String,
+    pub session: String,
+    pub crew_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,13 +419,15 @@ impl HeldMessageBatch {
     /// One plain sentence naming the batch, why it is held and how to clear it.
     pub fn describe(&self, namespace: &str) -> String {
         format!(
-            "message batch `{}` is held for {} ({} message{}: {}): {}; clear it with `{}`",
+            "message batch `{}` is held for {} ({} message{}: {}): {}; authorize same-session delivery with `flotilla resource deliver-message-batch {} --namespace {} --reason '<why>'`; dispose of it with `{}`",
             self.batch,
             self.receiver,
             self.members.len(),
             if self.members.len() == 1 { "" } else { "s" },
             self.members.join(", "),
             self.reason,
+            self.members[0],
+            namespace,
             self.clear_command(namespace)
         )
     }

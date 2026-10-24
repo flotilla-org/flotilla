@@ -504,7 +504,8 @@ where
                 if let Some(message) = head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
                     if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
                         condition.message_id.as_deref() == Some(message.id.as_str())
-                            && (condition.is_controller_fence_unverifiable()
+                            && ((condition.is_controller_fence_unverifiable()
+                                && Utc::now().signed_duration_since(condition.observed_at) < chrono::Duration::seconds(10))
                                 || condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
                                 || condition.reason == TERMINAL_DELIVERY_EXPIRED_REASON
                                 || (condition.reason == TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
@@ -939,8 +940,12 @@ where
                 || matches!(phase, TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed | TerminalSessionPhase::Lost))
         {
             actuations.push(Actuation::DeleteDemand { name: delivery_demand_name(obj) });
-        } else if expired
-            || matches!(prepared, TerminalPrepared::ControllerFenceUnverifiable { .. })
+        } else if delivery_failure_visible
+            || expired
+            || matches!(
+                prepared,
+                TerminalPrepared::ControllerFenceUnverifiable { .. } | TerminalPrepared::MessageDeliveryUnconfirmed { .. }
+            )
             || obj
                 .status
                 .as_ref()

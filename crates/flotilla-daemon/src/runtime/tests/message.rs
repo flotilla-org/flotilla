@@ -1463,9 +1463,9 @@ async fn delivery_wait_names_an_idle_crew_composer_obstruction() {
 // A permanent cleat refusal exits confirmation immediately, before any write or
 // receipt, and reaches the transport as a named failure rather than an ambiguity.
 #[tokio::test(start_paused = true)]
-async fn unverifiable_controller_fence_requires_restart_without_a_confirmation_wait() {
-    let mut pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
-    pool.controller_fence_unverifiable = true;
+async fn unverifiable_controller_fence_is_known_unsent_without_a_confirmation_wait() {
+    let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
+    pool.controller_fence_unverifiable.store(true, Ordering::SeqCst);
     let started = tokio::time::Instant::now();
     let outcome = super::super::terminal::submit_and_confirm(&pool, None, "agent", "turn", false).await.expect("refusal");
     assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable));
@@ -1509,5 +1509,159 @@ impl ProvisionedEnvironment for CodexTestEnvironment {
     }
     async fn destroy(&self) -> Result<(), String> {
         self.inner.destroy().await
+    }
+}
+
+// #3799: a known-unsent fence refusal is recoverable in the same child,
+// either by a newly verifiable guard or by explicit operator authorization.
+#[tokio::test(start_paused = true)]
+async fn fence_hold_recovers_through_terminal_pool_in_the_same_session() {
+    use flotilla_resources::{Message, MessageRelation, MessageSpec, ROLE_LABEL, VESSEL_LABEL};
+    for operator in [false, true] {
+        let temp = TempDir::new().expect("cross-host Message fixture operation succeeds");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-pool-test\"\n")
+            .expect("cross-host Message fixture operation succeeds");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let (daemon, _) = crew_daemon(config.clone()).await;
+        let backend = daemon.resource_backend();
+        let mut probe = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
+        probe.submission_error = false;
+        probe.working_after_delivery = true;
+        probe.controller_fence_unverifiable.store(true, Ordering::SeqCst);
+
+        probe.screens = vec!["› Ask Codex to do anything".into(); 1000];
+        probe.screens.push("new tool output\n• Working (1s • esc to interrupt)\n› Ask Codex to do anything".into());
+        let pool = Arc::new(probe);
+        let mut registry = probe_local_provider_registry(&daemon, &config).await.expect("cross-host Message fixture operation succeeds");
+        Arc::get_mut(&mut registry).expect("cross-host Message fixture operation succeeds").terminal_pools.insert(
+            "message-probe",
+            ProviderDescriptor::named(ProviderCategory::TerminalPool, "message-probe"),
+            pool.clone(),
+        );
+        let profile = build_local_profile(&daemon, &registry).await.expect("cross-host Message fixture operation succeeds");
+        ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("cross-host Message fixture operation succeeds");
+        backend
+            .using::<Convoy>(NAMESPACE)
+            .create(&empty_meta("message-pool"), &ConvoySpec::builder().workflow_ref("test".into()).project_ref(NAMESPACE.into()).build())
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        create_credential_test_session(&backend, "agent", "message-pool", "message-pool-work", &profile.host_direct_environment_name())
+            .await;
+        let sessions = backend.using::<TerminalSession>(NAMESPACE);
+        let terminal = sessions.get("agent").await.expect("cross-host Message fixture operation succeeds");
+        let mut spec = terminal.spec.clone();
+        spec.pool = "message-probe".into();
+        let TerminalSessionSource::Agent { selector, .. } = &mut spec.source else { unreachable!() };
+        selector.adapter = Some("codex".into());
+        let mut metadata = InputMeta::from(&terminal.metadata);
+        metadata.labels.insert(CONVOY_LABEL.into(), "message-pool".into());
+        metadata.labels.insert(VESSEL_LABEL.into(), "work".into());
+        metadata.labels.insert(ROLE_LABEL.into(), "coder".into());
+        let terminal = sessions
+            .update(&metadata, &terminal.metadata.resource_version, &spec)
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        let mut status = terminal.status.clone().expect("cross-host Message fixture operation succeeds");
+        status.session_id = Some("agent".into());
+        status.crew = Some(flotilla_resources::CrewSessionStatus {
+            id: "original-crew".into(),
+            adapter: "codex".into(),
+            model: None,
+            stance: "trusted-implicit".into(),
+        });
+        sessions
+            .update_status("agent", &terminal.metadata.resource_version, &status)
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        let runtime = TerminalControllerRuntime {
+            state: Arc::new(ControllerRuntimeState::new(
+                daemon.clone(),
+                config,
+                registry,
+                None,
+                profile.host_id.clone(),
+                profile.host_direct_environment_name(),
+            )),
+        };
+
+        refresh_message_test_attention(&runtime, &backend, "agent").await;
+        let inbox = runtime.state.daemon.message_inbox(NAMESPACE).await;
+        inbox
+            .accept(
+                &empty_meta("held-turn"),
+                &MessageSpec::builder()
+                    .sender("system:turn-rules".into())
+                    .receiver("flotilla/message-pool/work/coder".into())
+                    .relation(MessageRelation::System)
+                    .body("recover this turn".into())
+                    .build(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let now = Utc::now();
+        inbox.reconcile_delivery(&keystroke_router(&runtime.state), now).await.unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        inbox.reconcile_delivery(&keystroke_router(&runtime.state), now + chrono::Duration::seconds(1)).await.unwrap();
+        assert!(pool.inputs.lock().unwrap().is_empty(), "refusal writes no input");
+        assert_eq!(
+            flotilla_resources::crew_attention(sessions.get("agent").await.unwrap().status.as_ref(), now),
+            Some(flotilla_protocol::CrewAttention::ControllerFenceUnverifiable)
+        );
+        if operator {
+            let mut events = daemon.subscribe();
+            let id = daemon
+                .execute(
+                    Command::builder()
+                        .action(CommandAction::MessageDeliverBatch {
+                            namespace: NAMESPACE.into(),
+                            name: "held-turn".into(),
+                            reason: "checked session and composer".into(),
+                        })
+                        .build(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(wait_for_command_result(&mut events, id).await, CommandValue::Ok));
+        } else {
+            pool.controller_fence_unverifiable.store(false, Ordering::SeqCst);
+        }
+        inbox.reconcile_delivery(&keystroke_router(&runtime.state), now + chrono::Duration::seconds(12)).await.unwrap();
+        for tick in 0..40 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(200)).await;
+            tokio::task::yield_now().await;
+            inbox
+                .reconcile_delivery(
+                    &keystroke_router(&runtime.state),
+                    now + chrono::Duration::seconds(12) + chrono::Duration::milliseconds(tick * 200),
+                )
+                .await
+                .unwrap();
+            if backend
+                .using::<Message>(NAMESPACE)
+                .get("held-turn")
+                .await
+                .unwrap()
+                .status
+                .as_ref()
+                .is_some_and(|status| status.resolved_receiver.is_some())
+            {
+                break;
+            }
+        }
+        let status = backend.using::<Message>(NAMESPACE).get("held-turn").await.unwrap().status.unwrap();
+        assert_eq!(status.resolved_receiver.as_ref().expect("same-session receipt").session, "agent");
+        assert_eq!(pool.inputs.lock().unwrap().len(), 1);
+        assert_eq!(pool.lifecycle_changes.load(Ordering::SeqCst), 0, "no child launch or termination during recovery");
+        assert_eq!(pool.retries.load(Ordering::SeqCst), 0, "no composer-clearing or harness restart");
+        assert_eq!(sessions.get("agent").await.unwrap().status.unwrap().crew.unwrap().id, "original-crew");
+        if operator {
+            let receipt = status.resolved_receiver.unwrap();
+            assert!(receipt.evidence.contains("checked session and composer"));
+            assert!(receipt.evidence.contains("cleat acknowledged explicit operator submission"));
+            assert!(!receipt.evidence.contains("Working"), "override receipt must not fabricate agent activity");
+        }
     }
 }
