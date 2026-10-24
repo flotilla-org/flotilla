@@ -504,3 +504,15 @@ async fn standing_admission_and_rollover_use_the_ensure_role_identity() {
     assert_eq!(fixture.convoys.get(name).unwrap().name(), name);
     assert!(fixture.engine.promises(&old, None).unwrap().is_some());
 }
+
+#[tokio::test]
+async fn invalid_standing_identity_refuses_admission_and_reads_without_legacy_fallback() {
+    let fixture = fixture();
+    let mut old = old_convoy(&fixture.backend, "invalid-standing", bootstrapped(vec![])).await;
+    old.metadata.annotations.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.into(), "ensure".into());
+    old.spec.role.clear();
+    assert!(fixture.engine.holds(&old), "invalid identity must stay on the error-returning engine path");
+    assert!(fixture.engine.admit(&old).await.is_err());
+    assert!(fixture.engine.promises(&old, None).is_err());
+    assert!(fixture.convoys.get("invalid-standing").is_none());
+}

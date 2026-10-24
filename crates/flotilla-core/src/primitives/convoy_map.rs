@@ -496,6 +496,8 @@ pub fn undecided(status: &ConvoyStatus) -> Result<(), String> {
 }
 
 /// The enduring obligation for each standing agent seat, excluding tool seats.
+/// IDs are assigned once from the frozen admission snapshot. AddSeat does not
+/// rebuild this snapshot or renumber the already stored duties.
 pub fn standing_duties(convoy: &ResourceObject<OldConvoy>, crews: &Crews) -> Result<BTreeMap<DutyId, Duty>, String> {
     if !is_ensured(convoy) {
         return Ok(BTreeMap::new());

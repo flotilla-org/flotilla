@@ -492,6 +492,9 @@ pub struct Rollover {
 }
 
 /// Records permission for one replacement before the caller requests its vessel.
+/// Like the spec, this edge has no actor authority: only trusted engine callers may
+/// submit it. There is currently no external command or production caller for it;
+/// any future replacement command must authorise the caller before applying it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplaceSeat(pub SeatName);
 
@@ -580,8 +583,11 @@ pub enum ConvoyWrite {
 impl RecordWrite<ConvoySpec> for ConvoyWrite {
     fn field(&self) -> &'static str {
         match self {
-            ConvoyWrite::Seat(_) | ConvoyWrite::Supervisor { .. } | ConvoyWrite::Retired { .. } | ConvoyWrite::Replaced { .. } => "seats",
-            ConvoyWrite::GenerationSeats { .. } => "seats",
+            ConvoyWrite::Seat(_)
+            | ConvoyWrite::Supervisor { .. }
+            | ConvoyWrite::Retired { .. }
+            | ConvoyWrite::Replaced { .. }
+            | ConvoyWrite::GenerationSeats { .. } => "seats",
             ConvoyWrite::GenerationDuties { .. } => "duties",
             ConvoyWrite::PromiseFloor(_) => "promise_floor",
             _ => "promises",
@@ -653,6 +659,11 @@ impl RecordWrite<ConvoySpec> for ConvoyWrite {
 /// The convoy's records, as a stored edge addresses them.
 const PROMISES: RecordsOf<Resource<Convoy>, Promise> = RecordsOf::new("promises");
 const SEATS: RecordsOf<Resource<Convoy>, Seat> = RecordsOf::new("seats");
+// Kind specs deliberately have no generated edge handles: the holder owns the
+// stored root. As with SEATS, bind this handle to that holder. The second
+// argument counts nested tables (zero for u64); it is not a column ordinal.
+const PROMISE_FLOOR: flotilla_schema::ColumnOf<Resource<Convoy>, u64> =
+    flotilla_schema::ColumnOf::new("promise_floor", 0, <flotilla_schema::adapt::AsColumns as flotilla_schema::adapt::Adapter<u64>>::encode);
 
 impl StoredWrite<Resource<Convoy>> for ConvoyWrite {
     fn store(&self, edge: StoredEdge<Resource<Convoy>>) -> Result<StoredEdge<Resource<Convoy>>, EdgeError> {
@@ -662,14 +673,7 @@ impl StoredWrite<Resource<Convoy>> for ConvoyWrite {
             ConvoyWrite::GenerationSeats { before, after } => edge.replace_records(SEATS, before, after),
             ConvoyWrite::GenerationPromises { before } => edge.replace_records(PROMISES, before, &Records::new()),
             ConvoyWrite::GenerationDuties { before, after } => edge.replace_children("duties", before, after),
-            ConvoyWrite::PromiseFloor(floor) => edge.set(
-                flotilla_schema::ColumnOf::new(
-                    "promise_floor",
-                    0,
-                    <flotilla_schema::adapt::AsColumns as flotilla_schema::adapt::Adapter<u64>>::encode,
-                ),
-                floor,
-            ),
+            ConvoyWrite::PromiseFloor(floor) => edge.set(PROMISE_FLOOR, floor),
             ConvoyWrite::Promise(promise) => edge.append(PROMISES, promise),
             ConvoyWrite::Seat(seat) => edge.append(SEATS, seat),
             ConvoyWrite::Submission { promise, submission } => edge.append_in(PROMISES, *promise, Promise::SUBMISSIONS, submission),
@@ -760,6 +764,14 @@ impl Kind for Project {
 pub struct Limits {
     pub seats: usize,
     pub replacements: u32,
+}
+impl Limits {
+    fn reference() -> Ref<ConvoyLimits> {
+        Ref::new("configured")
+    }
+    fn read(value: Option<&Self>) -> Self {
+        value.copied().unwrap_or_default()
+    }
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -1000,7 +1012,7 @@ impl Machine for Convoy {
         if !acyclic(&request.seats) {
             return Err(ConvoyRefusal::SeatCycle);
         }
-        let limits = admission.read(&Ref::<ConvoyLimits>::new("configured")).copied().unwrap_or_default();
+        let limits = Limits::read(admission.read(&Limits::reference()));
         if seats.len() > limits.seats {
             return Err(ConvoyRefusal::SeatsFull);
         }
@@ -1192,7 +1204,7 @@ fn gate_add_seat(h: &mut Handle<'_, Convoy>, add: &AddSeat) -> Result<(), Convoy
     if parent.retired {
         return Err(ConvoyRefusal::SeatRetired);
     }
-    let limit = h.read(&Ref::<ConvoyLimits>::new("configured")).copied().unwrap_or_default().seats;
+    let limit = Limits::read(h.read(&Limits::reference())).seats;
     if h.spec().seats.len() + 1 > limit {
         return Err(ConvoyRefusal::SeatsFull);
     }
@@ -1387,7 +1399,7 @@ fn gate_replace_seat(h: &mut Handle<'_, Convoy>, replace: &ReplaceSeat) -> Resul
         return Err(ConvoyRefusal::SeatRetired);
     }
     let count = seat.replacements;
-    let limit = h.read(&Ref::<ConvoyLimits>::new("configured")).copied().unwrap_or_default().replacements;
+    let limit = Limits::read(h.read(&Limits::reference())).replacements;
     if count >= limit {
         return Err(ConvoyRefusal::ReplacementsExhausted);
     }
@@ -1420,6 +1432,8 @@ fn rollover(h: &mut Handle<'_, Convoy>, state: ConvoyState, _: &Rollover) -> Con
         if seat.parent.as_ref().is_some_and(|p| !live.contains(p)) {
             seat.parent = None;
         }
+        // This is an unversioned replacement payload. GenerationSeats::apply stamps
+        // every carried row with the actual committed edge version before storage.
         after.seats.append(0, seat).expect("rollover only drops seats");
     }
     let holding = before.holding(state.retired());

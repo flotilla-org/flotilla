@@ -135,8 +135,8 @@ pub trait ConvoyImportWorld {
     /// The engine message an old Message record names, and the inbox it was
     /// sent to: the supervision message an open stall awaits.
     fn message(&self, record: &str) -> Option<(MessageRef, Address)>;
-    /// Whether standing convoys may be imported: the seat-growth item on
-    /// #3587 is ruled.
+    /// Whether this rehearsal permits standing import. The owner ruling enables
+    /// production by default; an explicit false still exercises the refusal gate.
     fn standing_ruled(&self) -> bool {
         true
     }
@@ -592,12 +592,30 @@ pub fn rehearse_all<'a>(
         }
     }
     for (_, mut generations) in standing {
-        generations.sort_by_key(|c| (c.spec.generation, c.metadata.creation_timestamp, c.metadata.name.clone()));
+        generations.sort_by(|a, b| {
+            (a.spec.generation, a.metadata.creation_timestamp, &a.metadata.name).cmp(&(
+                b.spec.generation,
+                b.metadata.creation_timestamp,
+                &b.metadata.name,
+            ))
+        });
         let Some(current) = generations.pop() else { continue };
+        let ended = |c: &ResourceObject<OldConvoy>| {
+            c.status.as_ref().is_some_and(|s| matches!(s.phase, ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Abandoned))
+        };
+        if ended(current) && generations.iter().any(|c| !ended(c)) {
+            report.refused.push(ConvoyImportRefusal::Unmappable {
+                convoy: current.metadata.name.clone(),
+                reason: "ended latest generation has an earlier live generation".into(),
+            });
+            continue;
+        }
         match import_convoy(current, home, forges, world) {
             Ok(ImportOutcome::Imported(mut imported)) => {
                 // Old generations remain in the old archive. Only their identities go
                 // into the creation's history, never into the live convoy's seats.
+                // declarations includes every status promise, including retracted and
+                // ended ones: each consumed an id even though its work is finished.
                 let floor: u64 = generations.iter().filter_map(|c| c.status.as_ref().map(|s| map::declarations(c, s).len() as u64)).sum();
                 let mut spec = imported.resource.spec().clone();
                 let mut promises = Records::new();

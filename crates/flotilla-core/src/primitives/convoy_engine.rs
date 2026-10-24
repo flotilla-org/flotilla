@@ -134,11 +134,14 @@ fn open(promise: &Promise) -> bool {
 #[async_trait]
 impl EngineConvoys for ConvoyEngine {
     fn holds(&self, convoy: &ResourceObject<OldConvoy>) -> bool {
-        map::engine_name(convoy).ok().is_some_and(|name| self.convoys.get(&name).is_some())
+        // Fail closed: route an invalid identity to this writer, whose edits return
+        // the naming error, rather than falling back to the legacy writer.
+        map::engine_name(convoy).map_or(true, |name| self.convoys.get(&name).is_some())
     }
 
     async fn admit(&self, convoy: &ResourceObject<OldConvoy>) -> Result<Admission, String> {
-        if self.holds(convoy) {
+        let name = map::engine_name(convoy)?;
+        if self.convoys.get(&name).is_some() {
             return Ok(Admission::Held);
         }
         let Some(status) = convoy.status.as_ref().filter(|status| status.workflow_snapshot.is_some()) else {
@@ -153,7 +156,6 @@ impl EngineConvoys for ConvoyEngine {
         }
         let project = request.project.clone();
         let convoys = Arc::clone(&self.convoys);
-        let name = map::engine_name(convoy)?;
         let now = self.now();
         let admitted = tokio::task::spawn_blocking(move || {
             // Old admission read the project; the engine's gate reads that record.

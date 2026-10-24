@@ -64,8 +64,6 @@ pub enum Admission {
 pub enum SkipReason {
     /// Bootstrap has not frozen its workflow yet.
     NotBootstrapped,
-    /// A standing convoy: the seat-growth item on #3587 gates those, with the import.
-    Standing,
     /// Something is decided already; the import maps a convoy with history.
     Decided(String),
 }
@@ -73,7 +71,8 @@ pub enum SkipReason {
 /// The engine-first Convoy writer, in the old shape.
 #[async_trait]
 pub trait EngineConvoys: Send + Sync {
-    /// Whether the engine holds (and so decides) this convoy.
+    /// Whether the engine decides this convoy. An invalid engine identity also
+    /// selects this path so an operation reports its error instead of using the old writer.
     fn holds(&self, convoy: &ResourceObject<Convoy>) -> bool;
 
     /// Admits a freshly bootstrapped convoy, unless the engine holds it. Only

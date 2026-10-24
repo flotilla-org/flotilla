@@ -95,6 +95,7 @@ fn standing_rollover_keeps_identity_live_seats_and_standing_duties() {
     let held = home.get(name).unwrap();
     assert_eq!(held.name(), address.as_str());
     assert_eq!(held.spec().seats.len(), 2);
+    assert!(held.spec().seats.iter().all(|row| row.version == held.version().0));
     assert_eq!(held.spec().seat(&child).unwrap().1.parent, None);
     assert_eq!(held.spec().duties.keys().copied().collect::<Vec<_>>(), vec![DutyId(0)]);
     assert!(held.spec().promises.is_empty());

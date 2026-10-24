@@ -381,3 +381,27 @@ fn standing_generations_fold_into_one_stable_convoy() {
     assert_eq!(imported.resource.spec().promise_floor, 1);
     assert_eq!(imported.resource.spec().promises.iter().next().unwrap().record.id.0, 1);
 }
+
+#[test]
+fn standing_fold_counts_retracted_ids_and_refuses_an_earlier_live_generation() {
+    let mut old = convoy("governor-1", ConvoyPhase::Active, vec![agent("governor", true)]);
+    let mut live = convoy("governor-2", ConvoyPhase::Active, vec![agent("governor", true)]);
+    for (generation, record) in [(1, &mut old), (2, &mut live)] {
+        record.spec.role = "governor".into();
+        record.spec.generation = generation;
+        record.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "ensure-governor".into());
+    }
+    operate(&mut old, "governor", PromiseOperation::Declare { id: "extra".into(), kind: PromiseKind::Pr, source: PromiseSource::Crew });
+    operate(&mut old, "governor", PromiseOperation::Retract { id: "extra".into(), reason: "ended work".into() });
+    assert_eq!(promises::owned(old.status.as_ref().unwrap(), "work", "governor").last().unwrap().state, promises::PromiseState::Retracted);
+    old.status.as_mut().unwrap().phase = ConvoyPhase::Landed;
+    let report = rehearse_all([&old, &live], HOME, &[], &World { standing_ruled: true });
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
+    assert_eq!(report.imported[0].resource.spec().promise_floor, 2);
+    assert_eq!(report.imported[0].resource.spec().promises.iter().next().unwrap().record.id.0, 2);
+    old.status.as_mut().unwrap().phase = ConvoyPhase::Active;
+    live.status.as_mut().unwrap().phase = ConvoyPhase::Landed;
+    let report = rehearse_all([&old, &live], HOME, &[], &World { standing_ruled: true });
+    assert!(report.imported.is_empty());
+    assert!(matches!(&report.refused[..], [ConvoyImportRefusal::Unmappable { reason, .. }] if reason.contains("earlier live generation")));
+}
