@@ -17,8 +17,8 @@
 // AddSeat ("c", then "d", which fills the cap of four) and Resupervise, with
 // no Declare; "g" for RetireSeat, Rollover and ReplaceSeat (one per seat),
 // where the promise settles by verdict or retraction. Their refusals are
-// probed in every convoy, once each. Declare to a retired seat, AddSeat under
-// one and Declare below the promise floor are left to convoy_deliver.
+// probed in every convoy, once each; once "b" is retired, Declare to it and
+// AddSeat under it; and once a generation has ended, Declare below the floor.
 module convoy_conformance {
   import convoy(IDS = Set(), SEAT_LIMIT = 4, REPLACEMENT_LIMIT = 1) as C from "../machines/convoy"
   type Probe = Admitted({ request: C::ConvoyRequest, result: C::Next })
@@ -81,6 +81,9 @@ module convoy_conformance {
       C::Rollover({ authorised: false }), C::ReplaceSeat("z")))
     .union(if (growthProbe(w)) Set(C::RetireSeat({ seat: "a", authorised: true }), C::RetireSeat({ seat: "b", authorised: true }),
       C::Rollover({ authorised: true }), C::ReplaceSeat("a"), C::ReplaceSeat("b")) else Set())
+    .union(if (w.retiredSeats.contains("b")) Set(C::Declare({ promise: 1, definition: definition, owner: "b" }),
+      C::AddSeat({ seat: "c", parent: "b", supervisedBy: "a", authorised: true })) else Set())
+    .union(if (w.promiseFloor > 0) Set(C::Declare({ promise: 0, definition: definition, owner: "a" })) else Set())
     .union(Set(C::Deliver))
     .union(Set(true, false).map(a => Set("", "decision").map(r => C::Abandon({ authorised: a, reason: r }))).flatten())
     .union((if (w.promises.keys().size() == 0) quotas.union(Set(increase)) else quotas).map(q =>

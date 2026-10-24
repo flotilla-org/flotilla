@@ -227,19 +227,9 @@ the Convoy graph and leaves the `convoy_deliver`, `admission_placement` and
 `reply_exchange` traces unread (`AWAITING_ENGINE` in `quint_replay.rs`) until
 it implements them (#3587 layer 4).
 
-Thirty-one external patches each change one rule in an isolated copy: missing expiry
-watermark, cancellation only from Realised, duplicate turns, bind without drain,
-resettling a promise, delivering with a promise Submitted or a lifetime duty
-holding, an owner retracting its submitted crew promise, exceeding convoy caps,
-overbooking hosts and bypassing the
-priority queue, retaining a lease after Gone, undeliverable drops with confirmed
-receipts, holding an Ensure on failures before its window or before its last success,
-giving a lifecycle up with a cause other than its last failure's or on failures
-before its last success, retiring a seat that still holds a promise or duty,
-declaring to a retired seat, adding a seat past the cap, reusing a promise id
-from an ended generation, replacing a seat past the replacement limit, resetting
-a seat's replacement count at rollover, answering a record with a message that is not its reply, and
-expiring a record over a reply already in the inboxbefore its last success. Each must produce an actual TLC invariant counterexample;
+Each patch in `mutants/` changes one rule in an isolated copy and is named for
+the fault it introduces; `mutants/check.sh` pairs it with the scenario whose
+property catches it. Each must produce an actual TLC invariant counterexample;
 parse, compiler and tool failures are errors, never mutant detection. Production
 modules contain no mutant switches. Generated specs, ITF and logs stay in `build/`.
 Shell connects compilation to TLC (`VIEW` is not exposed by Quint's TLC runtime

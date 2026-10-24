@@ -69,6 +69,7 @@ module convoy {
     | SeatRetired | SeatsFull | ReplacementsExhausted
   type Next = Moved(State) | Refused(Refusal)
   pure def validQuota(q: VesselClass -> int): bool = q.keys().forall(c => q.get(c) >= 0)
+  pure def overSeatLimit(seats: int): bool = seats > SEAT_LIMIT
   pure def lifetime(d: Duty): bool = match d.scope { | Lifetime => true | WhileOpen(_) => false }
   // The seats a seat was created under, transitively, as far as the seats go.
   pure def above(seats: Seat -> SeatRecord, seat: Seat): Set[Seat] = {
@@ -89,7 +90,7 @@ module convoy {
     else if (not(validQuota(r.quota))) Refused(InvalidQuota)
     else if (not(seatsClosed(r))) Refused(UnknownSeat)
     else if (not(acyclic(r.seats))) Refused(SeatCycle)
-    else if (r.seats.keys().size() > SEAT_LIMIT) Refused(SeatsFull)
+    else if (overSeatLimit(r.seats.keys().size())) Refused(SeatsFull)
     else Moved(Open({ spec: { project: r.project, duties: r.duties, priority: r.priority }, seats: r.seats,
       promises: r.promises.keys().mapBy(p => { promise: r.promises.get(p).promise, source: r.promises.get(p).source,
         owner: r.promises.get(p).owner, state: Pending, submissions: [] }),
@@ -192,7 +193,7 @@ module convoy {
           else if (w.seats.keys().contains(a.seat)) Refused(SeatExists)
           else if (not(w.seats.keys().contains(a.parent))) Refused(UnknownSeat)
           else if (w.retiredSeats.contains(a.parent)) Refused(SeatRetired)
-          else if (w.seats.keys().size() >= SEAT_LIMIT) Refused(SeatsFull)
+          else if (overSeatLimit(w.seats.keys().size() + 1)) Refused(SeatsFull)
           else withSeat(w, a.seat, { parent: Under(a.parent), supervisedBy: a.supervisedBy, replacements: 0 })
       // A retired seat may still be resupervised: that changes no ownership.
       | Resupervise(a) => if (not(a.authorised)) Refused(Unauthorised)
