@@ -122,6 +122,7 @@ impl Binding for VesselBinding {
                     .and_then(|status| status.message.clone())
                     .unwrap_or_else(|| "the vessel's lease has ended".into()),
             }),
+            // The engine's failure text remains authoritative while readers need this scaffold.
             (LifecycleState::GaveUp { cause }, _)
                 if obj.status.as_ref().and_then(|status| status.message.as_deref()) != Some(cause.detail.as_str())
                     || phase(obj) != VesselPhase::Failed =>
@@ -239,6 +240,7 @@ where
                 matches!(judge::<VesselKind>(resource.state(), Ending::Unknown), Judgement::Exhausted { last }
                     if failed == Some(&last))
             });
+            // A different cause is a new report and goes through Attempted's normal lifecycle gate.
             if !pending {
                 placements.apply(&id, edge, &world, at)?;
             }
