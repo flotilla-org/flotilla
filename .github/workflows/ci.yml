@@ -446,16 +446,26 @@ jobs:
       # exhaustive TLC safety, full-graph conformance and generated trace
       # replay against flotilla-state-machines, and mutants. The first compile bootstraps Quint's lazily fetched
       # Apalache jar, which check.sh's preflight requires. Deep and symbolic
-      # runs keep their own budgets outside CI. The first CI run took about
-      # 8 minutes; the owner raised the step budget to 20 (#3280) so the engine
-      # stack's conformance runs fit, and the job only runs on Quint inputs.
+      # runs keep their own budgets outside CI, and the job only runs on Quint inputs.
+      # The store-backed suites run as their own step over this step's graphs and
+      # traces (#3778), so a slow runner cannot spend one budget on both halves.
+      # Budgets, from #3778's runs: this step took about 11 minutes on a normal
+      # runner and about 18 on a slow one (every suite 1.6 to 1.7 times slower).
       - name: Check typed machines and replay Quint traces
-        timeout-minutes: 20
+        timeout-minutes: 30
         env:
           JVM_ARGS: -Xmx3g -Xss16m
+          QUINT_RUN_DIR: ${{ runner.temp }}/quint-fast
         run: |
           npm exec --yes --package=@informalsystems/quint@0.33.0 -- quint compile specs/primitives/scenarios/convoy_deliver.qnt --target tlaplus --invariant safety > /dev/null
-          npm exec --yes --package=@informalsystems/quint@0.33.0 -- specs/primitives/check.sh
+          npm exec --yes --package=@informalsystems/quint@0.33.0 -- specs/primitives/check.sh --skip-store
+      # The same job and target directory as the step above, so only the
+      # store-backed test targets and their remaining dependencies build here.
+      # Budget: about 5 minutes on a normal runner and 9 on a slow one before
+      # #3778's harness changes, which cut the Ensure walk by more than half.
+      - name: Check store-backed conformance and replay
+        timeout-minutes: 15
+        run: specs/primitives/store-conformance.sh "$RUNNER_TEMP/quint-fast"
 
   windows-client:
     name: Windows client
