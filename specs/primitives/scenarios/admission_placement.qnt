@@ -59,7 +59,7 @@ module admission_placement {
   val hostCapacity = hosts.forall(h => Set(0, 1).forall(d => used(h, d) <= capacities.get(h).get(d)))
   val goneReturnsLease = ids.forall(i => match V::vessels.get(i) {
     | Present(s) => match s {
-        | Leased(v) => match v.lifecycle { | Gone => false | _ => true }
+        | Leased(v) => match v.lifecycle { | Gone(_) => false | GaveUp(_) => false | _ => true }
         | Gone(_) => hosts.forall(h => not(leaseOn(V::vessels.get(i), h)))
         | _ => true
       }

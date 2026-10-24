@@ -19,7 +19,7 @@ module ensure_bind {
       all { E::create(1, who, ids.forall(i => not(L::live(L::resources.get(i)))), L::resources.get(who) == L::Absent), L::request(who) },
       all { L::realise(who, true, true), E::unchanged },
       all { L::release(who, true), E::unchanged },
-      all { L::vanish(who, true), E::unchanged },
+      all { L::vanish(who, true, L::Lost), E::unchanged },
       all { E::bind(1, who, L::realised(L::resources.get(who)), true), L::unchanged },
       all { E::unbind(1, who, L::gone(L::resources.get(who))), L::unchanged },
       all { book.history.length() < maxAttempts, E::attempt(1, who, outcome), L::unchanged },

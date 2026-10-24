@@ -19,7 +19,7 @@ module vessel_conformance {
   pure val events = placements
     .union(bools.map(p => bools.map(m => V::Realise({ present: p, matches: m }))).flatten())
     .union(bools.map(c => V::Release({ complete: c })))
-    .union(bools.map(a => V::Vanish({ absent: a })))
+    .union(bools.map(a => V::Vanish({ absent: a, cause: V::lostCause })))
   action init = {
     nondet r = requests.oneOf()
     all { state' = V::Waiting(r), probe' = Started }

@@ -21,6 +21,7 @@ jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
 [ -r "$jar" ] || { echo "missing readable Apalache jar: $jar; install Apalache or set APALACHE_JAR" >&2; exit 2; }
 mkdir -p build
 quint test tests/stream_properties.qnt --backend typescript
+quint test tests/lifecycle_endings.qnt --backend typescript
 if [ -n "${QUINT_RUN_DIR:-}" ]; then
   # A fresh directory only: stale graphs or traces would stand in for a missing export.
   if [ -e "$QUINT_RUN_DIR" ] && [ -n "$(ls -A "$QUINT_RUN_DIR")" ]; then
