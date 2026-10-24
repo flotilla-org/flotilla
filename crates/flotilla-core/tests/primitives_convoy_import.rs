@@ -237,6 +237,25 @@ fn an_open_stall_becomes_the_seats_stall_record() {
     assert_eq!(record.recipient.as_str(), "project:fleet/convoy:c/role:bosun");
     // The import writes the record beside the convoy, Open, and the rehearsal reads it back.
     assert_eq!(rehearse(std::slice::from_ref(&convoy)), Vec::new());
+    // Numeric engine IDs are internal to the promise table. A carried stall
+    // names a seat and a message, so folding must not rewrite either reference.
+    let mut standing = old.clone();
+    standing.spec.role = "coder".into();
+    standing.spec.generation = 2;
+    standing.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "ensure-coder".into());
+    let mut earlier = standing.clone();
+    earlier.metadata.name = "c-previous".into();
+    earlier.spec.generation = 1;
+    earlier.status.as_mut().unwrap().phase = ConvoyPhase::Landed;
+    let folded = rehearse_all([&earlier, &standing], HOME, &[], &World { standing_ruled: true });
+    assert!(folded.refused.is_empty(), "{:?}", folded.refused);
+    assert!(folded.rehearsal.is_empty(), "{:?}", folded.rehearsal);
+    let folded = &folded.imported[0];
+    assert_eq!(folded.resource.spec().promises.iter().next().unwrap().record.id.0, 1);
+    let carried = &folded.stall.as_ref().unwrap().spec;
+    assert_eq!(carried.message, record.message);
+    assert_eq!(carried.subject.as_ref().unwrap().as_str(), "project:fleet/convoy:coder/role:coder");
+
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
     let mut store =
         flotilla_schema_sqlite::Store::open(connection, HOME, flotilla_engine_store::registry().expect("registry")).expect("store");
@@ -380,6 +399,10 @@ fn standing_generations_fold_into_one_stable_convoy() {
     assert_eq!(imported.resource.spec().seats.len(), 1);
     assert_eq!(imported.resource.spec().promise_floor, 1);
     assert_eq!(imported.resource.spec().promises.iter().next().unwrap().record.id.0, 1);
+    live.spec.generation = 1;
+    let duplicate = rehearse_all([&live, &old], HOME, &[], &World { standing_ruled: true });
+    assert!(duplicate.imported.is_empty());
+    assert!(matches!(&duplicate.refused[..], [ConvoyImportRefusal::Unmappable { reason, .. }] if reason.contains("duplicate")));
 }
 
 #[test]

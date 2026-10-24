@@ -110,6 +110,20 @@ fn standing_rollover_keeps_identity_live_seats_and_standing_duties() {
         assert_eq!(&loaded.value, held);
         assert_eq!(loaded.value.spec().seats.len(), 2);
         assert!(loaded.value.spec().promises.is_empty());
+        let changes = read.changes(id, 0, 100).unwrap();
+        let mut replica = Store::open(rusqlite::Connection::open_in_memory().unwrap(), "replica", convoy_registry().unwrap()).unwrap();
+        let mut write = replica.write().unwrap();
+        for change in &changes[..changes.len() - 1] {
+            write.apply(change).unwrap();
+        }
+        let peer_id = write.resolve(Resource::<Convoy>::CODE, name, "home").unwrap().unwrap();
+        let before = write.load::<Resource<Convoy>>(peer_id).unwrap().unwrap();
+        assert_eq!(before.value.spec().seats.len(), 3);
+        assert_eq!(before.value.spec().promises.len(), 1);
+        write.apply(changes.last().unwrap()).unwrap();
+        let after = write.load::<Resource<Convoy>>(peer_id).unwrap().unwrap();
+        assert_eq!(&after.value, held, "replica drops the ended generation's rows");
+        write.commit().unwrap();
     }
     assert!(matches!(
         home.apply(name, ReplaceSeat(a.clone()), &world, Timestamp(6)),

@@ -599,6 +599,13 @@ pub fn rehearse_all<'a>(
                 &b.metadata.name,
             ))
         });
+        if generations.windows(2).any(|pair| pair[0].spec.generation == pair[1].spec.generation) {
+            report.refused.push(ConvoyImportRefusal::Unmappable {
+                convoy: generations.last().unwrap().metadata.name.clone(),
+                reason: "duplicate standing convoy generation numbers".into(),
+            });
+            continue;
+        }
         let Some(current) = generations.pop() else { continue };
         // No status means a fresh, not-ended generation. import_convoy leaves an
         // unbootstrapped latest generation on the old path for admission at bootstrap.
