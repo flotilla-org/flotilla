@@ -1,5 +1,5 @@
 //! Stage a real contained Codex launch through the production adapter.
-//! Usage: cargo run -p flotilla-agent --example stage_codex_crew -- /absolute/probe-root /absolute/codex
+//! Usage: cargo run -p flotilla-agent --example stage_codex_crew -- /absolute/probe-root /absolute/codex [--restricted]
 use std::{path::PathBuf, sync::Arc};
 
 use flotilla_agent::adapter::{AgentAdapterRegistry, AgentLaunchRequest};
@@ -14,7 +14,12 @@ async fn main() {
     let root = PathBuf::from(args.next().expect("probe root"));
     assert!(root.is_absolute());
     let binary = args.next().expect("absolute Codex binary");
-    let restricted = args.next().as_deref() == Some("--restricted");
+    let restricted = match args.next().as_deref() {
+        None => false,
+        Some("--restricted") => true,
+        Some(other) => panic!("unknown option {other}; expected --restricted"),
+    };
+    assert!(args.next().is_none(), "unexpected trailing argument");
     let home = root.join("home");
     let workspace = root.join("workspace");
     std::fs::create_dir_all(&home).unwrap();

@@ -16,7 +16,8 @@ The captures are real observations, and do not claim to show the requested
 before-fix review prompt. The operator authorized opening the PR with this
 limitation after one further same-home relaunch check. That check also did not
 reproduce hook review before or after the fix. The fresh-crew check on feta
-after the roll remains the operator acceptance step.
+after the roll remains the operator acceptance step, tracked in
+[follow-up #3827](https://github.com/flotilla-org/flotilla/issues/3827).
 
 ## Exact conditions tried
 
@@ -49,8 +50,8 @@ The fixed same-home relaunch starts a new conversation; it does not use
 - [After](after.txt): the same capture after the fix and one completed turn.
 - [Baseline discovery](before-hooks-list.json): 14 hooks, all trusted.
 - [Fixed discovery](../../../crates/flotilla-agent/src/fixtures/codex-3823/hooks-list.json):
-  seven hooks, all trusted and enabled. The adjacent `config.toml` and
-  `launch.json` are the actual staged inputs, copied without editing.
+  seven hooks, all trusted and enabled. The [staged config](config.toml) and
+  [launch plan](launch.json) here are the actual staged inputs, copied without editing.
 - [Baseline sink](before-events.jsonl) and [fixed sink](after-events.jsonl):
   native stdin payloads and argv recorded at the `flotilla hook` process
   boundary. No production daemon was contacted.

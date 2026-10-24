@@ -1102,6 +1102,8 @@ async fn seed_codex_workspace_trust(
         // Invocation overrides are the single owner of crew hooks. Remove the
         // previous generation's home definitions so Codex does not discover
         // and execute both layers (#3823). Preserve unrelated user hooks.
+        // Empty groups intentionally retain matcher indices for user trust;
+        // features.hooks stays enabled for hooks owned by other integrations.
         crate::update_codex_hooks(&mut document, false, &config.path)?;
     }
     let projects = document
@@ -2810,7 +2812,10 @@ mod tests {
                 } else {
                     key.to_string()
                 };
-                let state_override = crate::codex_hook_overrides().pop().unwrap();
+                let state_override = crate::codex_hook_overrides()
+                    .into_iter()
+                    .find(|entry| entry.starts_with("hooks.state="))
+                    .expect("invocation hook trust override");
                 assert!(plan.command.contains(&state_override), "launch includes trust records");
                 let state = state_override.parse::<DocumentMut>().unwrap();
                 assert_eq!(state["hooks"]["state"][&key]["trusted_hash"].as_str(), hook["currentHash"].as_str());
