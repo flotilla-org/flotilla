@@ -246,6 +246,9 @@ pub struct ExplainedCheckout {
     pub pushed: Option<ExplainedCondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landed: Option<ExplainedCondition>,
+    /// The engine's judgement of the checkout, when `[primitives]` is on and the engine holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<crate::LifecycleReading>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +318,7 @@ pub enum ExplainedTerminalCondition {
     ProcessExited { exit_code: Option<i32> },
     ProcessFailed { message: String },
     DeliveryUnconfirmed { message: String },
+    ControllerFenceUnverifiable { message: String },
 }
 
 impl std::fmt::Display for ExplainedTerminalCondition {
@@ -332,6 +336,7 @@ impl std::fmt::Display for ExplainedTerminalCondition {
                 f.write_str("; resume relaunches it in the existing checkout")
             }
             Self::ProcessFailed { message } => write!(f, "crew process failed: {message}"),
+            Self::ControllerFenceUnverifiable { message } => f.write_str(message),
             Self::DeliveryUnconfirmed { message } => write!(f, "terminal message delivery unconfirmed: {message}"),
         }
     }
@@ -867,6 +872,10 @@ pub struct ResourceDigest {
     pub items: Option<Vec<serde_json::Value>>,
 }
 
+/// Internal attach target used by `environment <id> shell`. It is resolved at
+/// each host hop, so no guest socket path is executed on a different host.
+pub const ENVIRONMENT_SHELL_REFERENCE_PREFIX: &str = "environment-shell/";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum CommandAction {
@@ -931,6 +940,15 @@ pub enum CommandAction {
         work: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+    },
+    /// An operator keeps (or retracts) one promise by its label, with a
+    /// reason: the engine's verdict edge (#3587 layer 6). Refused while
+    /// `[primitives]` is off or the engine does not hold the convoy.
+    ConvoyPromiseVerdict {
+        convoy: String,
+        promise: String,
+        keep: bool,
+        reason: String,
     },
     ConvoyDelete {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1300,6 +1318,8 @@ impl Command {
             CommandAction::ArchiveSession { .. } => "Archiving session...",
             CommandAction::GenerateBranchName { .. } => "Generating branch name...",
             CommandAction::ConvoyWorkForceComplete { .. } => "Force-completing work...",
+            CommandAction::ConvoyPromiseVerdict { keep: true, .. } => "Keeping promise by verdict...",
+            CommandAction::ConvoyPromiseVerdict { keep: false, .. } => "Retracting promise by verdict...",
             CommandAction::ConvoyDelete { .. } => "Deleting convoy...",
             CommandAction::ConvoyLink { .. } => "Linking convoy subject...",
             CommandAction::ConvoyUnlink { .. } => "Unlinking convoy subject...",
@@ -1759,6 +1779,14 @@ mod tests {
                     convoy: "convoy-a".into(),
                     work: "implement".into(),
                     message: Some("done".into()),
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::ConvoyPromiseVerdict {
+                    convoy: "convoy-a".into(),
+                    promise: "template/pr".into(),
+                    keep: true,
+                    reason: "merged by hand".into(),
                 })
                 .build(),
             Command::builder()

@@ -178,6 +178,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.filter.outputs.run == 'true'
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           shared-key: cleat-environment
           cache-workspace-crates: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -243,6 +248,11 @@ jobs:
       # and thrashed the repo's 10GB cache pool against compose's blobs.
       - uses: Swatinem/rust-cache@v2
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: "clippy"
       - run: cargo --config 'profile.dev.package."*".debug=0' clippy --workspace --all-targets --locked -- -D warnings
@@ -266,6 +276,11 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: "relay-wasm"
       - run: cargo --config 'profile.dev.package."*".debug=0' build -p flotilla-relay --target wasm32-unknown-unknown --locked
@@ -279,19 +294,75 @@ jobs:
     timeout-minutes: 40
     needs: [fmt, stack-scope]
     if: ${{ !cancelled() && needs.fmt.result == 'success' && needs.stack-scope.outputs.full != 'false' }}
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
+      # A pull request checks out its merge commit, whose first parent is the
+      # base branch it merges into: depth 2 is enough to diff against it.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
       - name: Set up pinned Rust
         id: rust-pin
         uses: ./ci/toolchain/action
+      # Selection runs before the cache restore and nextest install, so a pull
+      # request without Rust test inputs (selection `none`) skips both and the
+      # run step reports success without compiling: Test is a required check.
+      - name: Test affected-package selector
+        run: python3 -m unittest discover -s ci/affected -p test_selection.py
+      - name: Select test packages
+        id: packages
+        env:
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          STACK: ${{ toJSON(github.event.pull_request.stack) }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          selection=all
+          # Non-PR events, malformed stack data and label lookup failures all
+          # keep full coverage. A stack's top layer covers the whole stack.
+          affected=false
+          if [ "$EVENT" = pull_request ] && git rev-parse --verify --quiet HEAD^1 >/dev/null; then
+            if [ "$STACK" = null ]; then
+              affected=true
+            elif jq -e '.position != null and .size != null and .position < .size' <<<"$STACK" >/dev/null; then
+              affected=true
+            fi
+            if ! labels=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name') \
+              || printf '%s\n' "$labels" | grep -qx 'ci:full'; then
+              affected=false
+            fi
+          fi
+          if [ "$affected" = true ]; then
+            git -c core.quotePath=false diff --no-renames --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed-files"
+            selection=$(python3 ci/affected/selection.py "$RUNNER_TEMP/changed-files")
+          fi
+          echo "Selected: $selection"
+          echo "selection=$selection" >> "$GITHUB_OUTPUT"
       # Caches dependency artifacts only (workspace-member artifacts are
       # pruned before save) — the previous whole-target cache reached 4.5GB
       # and thrashed the repo's 10GB cache pool against compose's blobs.
-      - uses: Swatinem/rust-cache@v2
+      - if: steps.packages.outputs.selection != 'none'
+        uses: Swatinem/rust-cache@v2
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          shared-key: "test"
-      - run: cargo --config 'profile.dev.package."*".debug=0' test --workspace --locked
+          # Bumped when the build profile changes: an exact key hit never saves.
+          shared-key: "test-v2"
+      # The action verifies the release checksum.
+      - if: steps.packages.outputs.selection != 'none'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.149
+      - name: Compile, run tests and run doctests (separate timings)
+        env:
+          SELECTION: ${{ steps.packages.outputs.selection }}
+        run: ci/affected/run.sh "$SELECTION"
 
   changes:
     name: Platform changes
@@ -345,9 +416,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Set up pinned Rust
+        id: rust-pin
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           shared-key: "quint"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@v4
@@ -369,16 +446,26 @@ jobs:
       # exhaustive TLC safety, full-graph conformance and generated trace
       # replay against flotilla-state-machines, and mutants. The first compile bootstraps Quint's lazily fetched
       # Apalache jar, which check.sh's preflight requires. Deep and symbolic
-      # runs keep their own budgets outside CI. The first CI run took about
-      # 8 minutes; the owner raised the step budget to 20 (#3280) so the engine
-      # stack's conformance runs fit, and the job only runs on Quint inputs.
+      # runs keep their own budgets outside CI, and the job only runs on Quint inputs.
+      # The store-backed suites run as their own step over this step's graphs and
+      # traces (#3778), so a slow runner cannot spend one budget on both halves.
+      # Budgets, from #3778's runs: this step took about 11 minutes on a normal
+      # runner and about 18 on a slow one (every suite 1.6 to 1.7 times slower).
       - name: Check typed machines and replay Quint traces
-        timeout-minutes: 20
+        timeout-minutes: 30
         env:
           JVM_ARGS: -Xmx3g -Xss16m
+          QUINT_RUN_DIR: ${{ runner.temp }}/quint-fast
         run: |
           npm exec --yes --package=@informalsystems/quint@0.33.0 -- quint compile specs/primitives/scenarios/convoy_deliver.qnt --target tlaplus --invariant safety > /dev/null
-          npm exec --yes --package=@informalsystems/quint@0.33.0 -- specs/primitives/check.sh
+          npm exec --yes --package=@informalsystems/quint@0.33.0 -- specs/primitives/check.sh --skip-store
+      # The same job and target directory as the step above, so only the
+      # store-backed test targets and their remaining dependencies build here.
+      # Budget: about 5 minutes on a normal runner and 9 on a slow one before
+      # #3778's harness changes, which cut the Ensure walk by more than half.
+      - name: Check store-backed conformance and replay
+        timeout-minutes: 15
+        run: specs/primitives/store-conformance.sh "$RUNNER_TEMP/quint-fast"
 
   windows-client:
     name: Windows client
@@ -394,6 +481,11 @@ jobs:
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           shared-key: "windows-client"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo --config 'profile.dev.package."*".debug=0' clippy -p flotilla-client -p flotilla-manifest -p flotilla-transport --locked -- -D warnings
@@ -428,6 +520,11 @@ jobs:
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
+          # Key on the repository's pin alone: rust-cache's environment hash also
+          # lists every toolchain the runner image preinstalls, so two image
+          # versions in rollout split one cache into two and PRs miss main's.
+          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
+          add-rust-environment-hash-key: false
           shared-key: "macos-peer-identity"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run selected macOS tests

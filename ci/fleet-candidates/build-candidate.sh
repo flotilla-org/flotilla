@@ -163,6 +163,10 @@ python3 "$(dirname "$0")/generation_validation.py" codex-home "$codex_home_bundl
   cd "$flotilla_root"
   export FLOTILLA_BUILD_ID="${flotilla_sha:0:12}"
   cargo build --locked --release --bin flotilla --bin flotillad
+  if [[ "$platform" == linux-* ]]; then
+    cargo build --locked --release -p flotilla-cli --bin flotilla-vessel
+    cargo build --locked --release -p drydock-agent --bin drydock-agent
+  fi
 )
 
 (
@@ -177,6 +181,10 @@ python3 "$(dirname "$0")/generation_validation.py" codex-home "$codex_home_bundl
 
 install -m 0755 "$flotilla_root/target/release/flotilla" "$bundle/bin/flotilla"
 install -m 0755 "$flotilla_root/target/release/flotillad" "$bundle/bin/flotillad"
+if [[ "$platform" == linux-* ]]; then
+  install -m 0755 "$flotilla_root/target/release/flotilla-vessel" "$bundle/bin/flotilla-vessel"
+  install -m 0755 "$flotilla_root/target/release/drydock-agent" "$bundle/bin/drydock-agent"
+fi
 install -m 0755 "$cleat_root/target/release/cleat" "$bundle/bin/cleat"
 package_cleat_terminfo "$cleat_root" "$bundle"
 

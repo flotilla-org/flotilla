@@ -290,16 +290,16 @@ impl AgentTransport for TerminalControllerRuntime {
             Ok(holder) => holder,
             Err(reason) => return TransportOutcome::NotSubmitted { reason },
         };
-        match self.adapter_for_spec(&holder.spec) {
+        match self.adapter_for_spec(&holder.spec).await {
             Ok(Some(_)) => {}
             Ok(None) => return TransportOutcome::NotSubmitted { reason: "agent acceptance observations unavailable".into() },
             Err(reason) => return TransportOutcome::NotSubmitted { reason },
         }
-        let pool = match self.pool_for_spec(&holder.spec) {
+        let pool = match self.pool_for_spec(&holder.spec).await {
             Ok(pool) => pool,
             Err(reason) => return TransportOutcome::NotSubmitted { reason },
         };
-        let adapter = match self.adapter_for_spec(&holder.spec) {
+        let adapter = match self.adapter_for_spec(&holder.spec).await {
             Ok(adapter) => adapter,
             Err(reason) => return TransportOutcome::NotSubmitted { reason },
         };
@@ -377,6 +377,9 @@ pub(super) fn message_transport_outcome(result: Result<TerminalDeliveryOutcome, 
         }
         Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)) => {
             Outcome::Unconfirmed { reason: "cleat submission has no acceptance evidence yet".into() }
+        }
+        Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable)) => {
+            Outcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() }
         }
         Err(reason) => Outcome::Unconfirmed { reason },
     }

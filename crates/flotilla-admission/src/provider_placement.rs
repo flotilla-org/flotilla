@@ -22,14 +22,14 @@ pub fn match_provider<'a>(
     if spec.provider_requirements.is_some() && requirements.instance.is_none() && requirements.class.is_none() {
         return Err(format!("{host}: provider requirements need an instance or class"));
     }
-    let checkout = match (&spec.host_direct, &spec.docker_per_vessel) {
-        (Some(_), None) => {
+    let checkout = match (&spec.host_direct, &spec.docker_per_vessel, &spec.cloud_sandbox_per_vessel) {
+        (Some(_), None, None) => {
             if requirements.instance.is_none() && requirements.class.is_none() {
                 requirements.class = Some(EnvironmentClass::HostDirect);
             }
             Some(CheckoutStrategy::HostWorktree)
         }
-        (None, Some(docker)) => {
+        (None, Some(docker), None) => {
             if requirements.instance.is_none() && requirements.class.is_none() {
                 requirements.class = Some(EnvironmentClass::Container);
             }
@@ -39,6 +39,12 @@ pub fn match_provider<'a>(
                 DockerCheckoutStrategy::FreshCloneInContainer { .. } => CheckoutStrategy::CloneInVessel,
             })
         }
+        (None, None, Some(_)) => {
+            if requirements.instance.is_none() && requirements.class.is_none() {
+                requirements.class = Some(EnvironmentClass::CloudSandbox);
+            }
+            Some(CheckoutStrategy::CloneInVessel)
+        }
         _ => return Err(format!("{host}: placement must define exactly one execution strategy")),
     };
     // Class fixes input shape (ADR 0058); capabilities still determine behavior.
@@ -46,7 +52,11 @@ pub fn match_provider<'a>(
     // Express this input-shape constraint as data; no class dispatch chooses
     // provider operations. The matcher only tests membership in that constraint.
     let host_adoption_classes = [EnvironmentClass::HostDirect];
-    let incompatible_class = |class| host_adoption_classes.contains(&class) != spec.host_direct.is_some();
+    let cloud_input_classes = [EnvironmentClass::CloudSandbox];
+    let incompatible_class = |class| {
+        host_adoption_classes.contains(&class) != spec.host_direct.is_some()
+            || cloud_input_classes.contains(&class) != spec.cloud_sandbox_per_vessel.is_some()
+    };
     let strategy = if spec.host_direct.is_some() { "host-direct" } else { "per-vessel" };
     let shape_hint = "use host_direct for host adoption or docker_per_vessel for per-vessel provisioning";
     if let Some(class) = requirements.class.filter(|class| incompatible_class(*class)) {
@@ -151,15 +161,74 @@ mod tests {
                 checkout: flotilla_resources::HostDirectPlacementPolicyCheckout::Worktree,
             });
         }
+        if class == EnvironmentClass::CloudSandbox {
+            spec.docker_per_vessel = None;
+            spec.cloud_sandbox_per_vessel = Some(flotilla_resources::CloudSandboxPerVesselPlacementPolicySpec {
+                image: "image@sha256:digest".into(),
+                size: flotilla_resources::CloudSandboxSize { cpus: 1, memory_bytes: 1024, disk_bytes: 1024 },
+                checkout: flotilla_resources::CloudSandboxCheckout::CloneInVessel,
+                env: Default::default(),
+            });
+        }
         spec.provider_requirements = Some(ProviderRequirements { class: Some(class), ..Default::default() });
         spec
     }
+    // #3765: cloud admission requires exactly one controller, validates the
+    // guest's POSIX root, and freezes that root without a metadata label.
+    // Generate absent, unique, duplicate controllers and relative roots.
+    #[hegel::test]
+    fn cloud_controller_selection_is_unique_and_root_is_absolute(tc: hegel::TestCase) {
+        use flotilla_resources::{Host, HostSpec, HostStatus, InputMeta, PlacementPolicy, ENVIRONMENT_PROVIDERS_CAPABILITY};
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+        let absolute = tc.draw(gs::booleans());
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+            for i in 0..count {
+                let hosts = backend.using::<Host>("flotilla");
+                let host = hosts
+                    .create(
+                        &InputMeta::builder().name(format!("controller-{i}")).build(),
+                        &HostSpec { display_name: format!("controller-{i}"), ..Default::default() },
+                    )
+                    .await
+                    .unwrap();
+                let mut declaration = provider(EnvironmentClass::CloudSandbox);
+                declaration.capabilities.workspace_root = if absolute { "/guest/work" } else { "relative/work" }.into();
+                hosts
+                    .update_status(
+                        &host.metadata.name,
+                        &host.metadata.resource_version,
+                        &HostStatus {
+                            capabilities: [(ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::to_value(vec![declaration]).unwrap())]
+                                .into_iter()
+                                .collect(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut policy = backend
+                .using::<PlacementPolicy>("flotilla")
+                .create(&InputMeta::builder().name("cloud".into()).build(), &policy(EnvironmentClass::CloudSandbox))
+                .await
+                .unwrap();
+            let result = crate::support::resolve_placement_provider(&backend, "flotilla", &mut policy).await;
+            assert_eq!(result.is_ok(), count == 1 && absolute);
+            if count == 1 && absolute {
+                assert_eq!(result.unwrap().as_deref(), Some("/guest/work"));
+            }
+            assert!(!policy.metadata.labels.contains_key("flotilla.work/provider-workspace-root"));
+        });
+    }
+
     fn provider(class: EnvironmentClass) -> ProviderAdvertisement {
         ProviderAdvertisement {
             instance: "sandbox".into(),
             kind: Some(ProviderKind::new(class, "open-implementation-name")),
             readiness: ProviderReadiness::Ready,
             capabilities: ProviderCapabilities {
+                workspace_root: "/workspace".into(),
                 material_modes: vec![MaterialMode::Frozen, MaterialMode::Pushed, MaterialMode::Shared],
                 checkout_strategies: vec![CheckoutStrategy::HostWorktree, CheckoutStrategy::HostClone, CheckoutStrategy::CloneInVessel],
                 egress_enforcement: EgressEnforcement::Enforced,

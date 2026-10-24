@@ -647,3 +647,51 @@ async fn operator_docker_checkout_survives_seed_passes() {
         assert_eq!(policies.get(&seeded_name).await.expect("manifest policy").spec, requested);
     }
 }
+
+// #3765 S6: a cloud policy migrates only on its uniquely advertised controller;
+// its fulfilment kind retains the cloud realisation and resolved host identity.
+#[tokio::test]
+async fn cloud_policy_migration_uses_unique_controller() {
+    use flotilla_protocol::provider::{EnvironmentClass, ProviderAdvertisement, ProviderKind, ProviderReadiness};
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let hosts = backend.using::<Host>(NAMESPACE);
+    let host = hosts
+        .create(&empty_meta("cloud-controller"), &flotilla_resources::HostSpec { display_name: "controller".into(), ..Default::default() })
+        .await
+        .unwrap();
+    hosts
+        .update_status(
+            &host.metadata.name,
+            &host.metadata.resource_version,
+            &flotilla_resources::HostStatus {
+                capabilities: [(
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::to_value(vec![ProviderAdvertisement {
+                        instance: "daytona".into(),
+                        kind: Some(ProviderKind::new(EnvironmentClass::CloudSandbox, "daytona")),
+                        readiness: ProviderReadiness::Ready,
+                        ..Default::default()
+                    }])
+                    .unwrap(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let spec: flotilla_resources::PlacementPolicySpec = serde_json::from_value(serde_json::json!({
+        "pool": "cleat", "provider_requirements": {"instance":"daytona", "class":"cloud_sandbox"},
+        "cloud_sandbox_per_vessel": {"image":"image@sha256:digest", "size":{"cpus":1,"memory_bytes":1024,"disk_bytes":2048}, "checkout":"clone_in_vessel", "env":{}}
+    })).unwrap();
+    backend.using::<PlacementPolicy>(NAMESPACE).create(&empty_meta("cloud"), &spec).await.unwrap();
+    let listed_hosts = hosts.list().await.unwrap().items;
+    let policies = backend.using::<PlacementPolicy>(NAMESPACE).list().await.unwrap().items;
+    migrate_listed_placement_policies(&backend, NAMESPACE, "other-host", "linux", &listed_hosts, policies.clone()).await.unwrap();
+    assert!(backend.using::<FulfilmentKind>(NAMESPACE).get("cloud").await.is_err());
+    migrate_listed_placement_policies(&backend, NAMESPACE, "cloud-controller", "linux", &listed_hosts, policies).await.unwrap();
+    let kind = backend.using::<FulfilmentKind>(NAMESPACE).get("cloud").await.unwrap();
+    assert_eq!(kind.spec.host_ref, "cloud-controller");
+    assert!(matches!(kind.spec.realisation, flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { .. }));
+}

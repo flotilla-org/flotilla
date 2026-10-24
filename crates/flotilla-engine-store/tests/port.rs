@@ -180,3 +180,51 @@ fn legacy_session_rows_decode_after_the_documented_activity_upgrade() {
     assert_eq!(observation.activity_since, Timestamp(2));
     assert_eq!(observation.activity_cause, "UserPromptSubmit");
 }
+
+// Behaviour (#3755): a panic in one writer rolls back its rows and cached IDs;
+// another kind's home can then create and apply edges, and homes can reopen.
+// This deterministic scenario uses real in-memory SQLite and unwinds while the
+// shared mutex and a populated write transaction are both held.
+#[test]
+fn poisoned_writer_does_not_take_down_other_homes() {
+    let store = store();
+    let log = MessageLog::new(store.clone());
+    let mut messages = Home::<Message, MessageLog>::with_log(HOME, log.clone()).unwrap();
+    let mut sessions = Home::<AgentSession, StoreLog>::with_log(HOME, log.consumers()).unwrap();
+    sessions.create("seed", (), &MemoryAgentSessionWorld::default(), Timestamp(1)).unwrap();
+    let seed = sessions.get("seed").unwrap().clone();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut locked = store.lock().unwrap();
+        let mut write = locked.write().unwrap();
+        write.insert("rolled-back", &seed, &flotilla_schema::Origin::new("panicking-writer", Timestamp(2))).unwrap();
+        panic!("writer panicked before commit");
+    }));
+    assert!(panic.is_err());
+    assert!(store.is_poisoned());
+
+    // The already-open Message home must survive another kind's writer panic.
+    let message = name("after-panic");
+    let mut world = MemoryMessageWorld::default();
+    messages.create(&message, spec(Expectation::Nothing), &world, Timestamp(3)).unwrap();
+    assert_eq!(messages.get(&message).unwrap().version().0, 2, "rolled-back sequence is reusable");
+    world.binding.put(&Ref::new(inbox().as_str()), InboxBinding::Unbound { since: Timestamp(0) });
+    messages.apply(&message, DropMessage { reason: DropReason::Undeliverable }, &world, Timestamp(50)).unwrap();
+
+    // Reusing the rolled-back identity exercises the string and identity caches.
+    sessions.create("rolled-back", (), &MemoryAgentSessionWorld::default(), Timestamp(4)).unwrap();
+    sessions
+        .apply(
+            "rolled-back",
+            Receive { message: message.clone(), transport: Transport::Turn },
+            &MemoryAgentSessionWorld::default(),
+            Timestamp(5),
+        )
+        .unwrap();
+    let reopened = flotilla_engine_store::open_home::<AgentSession>(StoreLog::new(store.clone())).unwrap();
+    assert_eq!(reopened.get("rolled-back"), sessions.get("rolled-back"));
+    let mut locked = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut read = locked.read().unwrap();
+    assert_eq!(read.last_sequence(HOME).unwrap(), 5);
+    let receipts = log.receipt_log(&mut read, [message.as_str()]).unwrap();
+    assert!(receipts.lookup(&Ref::<Receipts>::new(message.as_str())).is_some());
+}

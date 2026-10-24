@@ -11,6 +11,7 @@ use flotilla_environment::environment::EnvironmentHandle;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_provisioning::engine::environment::EnvironmentBinding;
 use flotilla_resources::{
     Checkout, Environment, EnvironmentPhase, EnvironmentStatusPatch, ResourceError, ResourceObject, Vessel, VesselStatusPatch,
 };
@@ -60,7 +61,28 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
         .items;
     let local_host_id = CanonicalHostId::resolved(&state.local_host_ref);
     let mut environments = Vec::new();
+    let mut cloud_reconciliations = tokio::task::JoinSet::new();
     for environment in candidates {
+        if environment.spec.cloud_sandbox.is_some() {
+            if environment.spec.provider_address.as_ref().is_some_and(|address| state.environment_providers.get(address).is_ok())
+                && environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Ready)
+            {
+                let state = Arc::clone(state);
+                let namespace = namespace.to_owned();
+                cloud_reconciliations.spawn(async move {
+                    match tokio::time::timeout(ENVIRONMENT_ADOPTION_TIMEOUT, reconcile_cloud_environment(&state, &namespace, &environment))
+                        .await
+                    {
+                        Ok(result) => result,
+                        // Cancellation may follow provider creation but precede
+                        // local publication. Drop never destroys the backing;
+                        // the next pass label-adopts it via HTTP 200.
+                        Err(_) => Err(format!("cloud environment {} adoption timed out; will retry", environment.metadata.name)),
+                    }
+                });
+            }
+            continue;
+        }
         let Some(spec) = environment.spec.docker.as_ref() else {
             continue;
         };
@@ -89,7 +111,7 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
         if observed {
             state.local_backing_observed.store(true, Ordering::Release);
         }
-        return Ok(());
+        return collect_cloud_reconciliations(cloud_reconciliations, Vec::new()).await;
     }
     let mut inventories = HashMap::new();
     let mut reconciliations = Vec::new();
@@ -146,9 +168,32 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
         }
     }))
     .await;
+    // Cloud uncertainty must not suppress the successful Docker inventory
+    // barrier used by standing-convoy teardown.
+    if results.iter().all(Result::is_ok) {
+        state.local_backing_observed.store(true, Ordering::Release);
+    }
+    let mut results = results;
+    if let Err(error) = collect_cloud_reconciliations(cloud_reconciliations, Vec::new()).await {
+        results.push(Err(error));
+    }
     let errors = results.into_iter().filter_map(Result::err).collect::<Vec<_>>();
     if errors.is_empty() {
-        state.local_backing_observed.store(true, Ordering::Release);
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+async fn collect_cloud_reconciliations(mut jobs: tokio::task::JoinSet<Result<(), String>>, mut errors: Vec<String>) -> Result<(), String> {
+    while let Some(result) = jobs.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    if errors.is_empty() {
         Ok(())
     } else {
         Err(errors.join("; "))
@@ -217,6 +262,12 @@ pub(super) async fn reconcile_provisioned_environment(
         }
     }
 
+    if let Some(agent) = handle.agent() {
+        let context = super::docker::DockerToolContext { state, host_ref: &spec.host_ref, jobs: tokio::sync::OnceCell::new() };
+        let tools = state.environment_tools.prepare(crate::environment_tools::DOCKER_PROVIDER_KIND, env_id.as_str(), &context).await?;
+        agent.push_tools(&tools).await?;
+    }
+
     // Retry the socket even when the interior registry was already adopted.
     // A bind failure must not become a permanently skipped reconciliation step.
     if let Some(sockets) = &state.environment_sockets {
@@ -252,6 +303,103 @@ pub(super) async fn reconcile_provisioned_environment(
 
 /// Persist diagnostics before marking backing lost: dependency watchers may
 /// immediately start teardown, and neither inspect nor cgroup evidence survives it.
+/// Cloud liveness uses provider facts, including cap loss. Restart adoption
+/// re-enters ordinary idempotent provisioning so forwarding and credentials are
+/// restored together; a cached image/SSH recipe never proves liveness.
+async fn reconcile_cloud_environment(
+    state: &Arc<ControllerRuntimeState>,
+    namespace: &str,
+    environment: &ResourceObject<Environment>,
+) -> Result<(), String> {
+    use flotilla_environment::environment::ObservationState;
+    use flotilla_provisioning::reconcilers::EnvironmentRuntime;
+    let runtime = super::docker::DockerControllerRuntime { state: state.clone() };
+    let provider = runtime.provider_for_environment(&environment.metadata.name).await?;
+    let id = EnvironmentId::new(&environment.metadata.name);
+    let cached =
+        state.provisioned_environments.lock().await.values().find(|active| active.handle.id() == &id).map(|active| active.handle.clone());
+    let handle = match cached.clone() {
+        Some(handle) => Some(handle),
+        None => provider.inspect(&id).await?,
+    };
+    match handle {
+        Some(handle) => match handle.observe().await.state {
+            ObservationState::Running => {
+                if cached.is_none() {
+                    if let Err(error) = runtime.provision_environment(&environment.metadata.name, &environment.spec).await {
+                        record_cloud_health(
+                            state,
+                            namespace,
+                            &environment.metadata.name,
+                            false,
+                            Some(format!("Unknown: adoption failed; will retry: {error}")),
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                }
+                let health = handle.detect_readiness().await;
+                let ready = matches!(health, flotilla_environment::environment::ProviderReadiness::Ready);
+                let message = match health {
+                    flotilla_environment::environment::ProviderReadiness::Unknown { reason } => Some(reason),
+                    flotilla_environment::environment::ProviderReadiness::MissingTool { reason }
+                    | flotilla_environment::environment::ProviderReadiness::MissingCredential { reason } => Some(reason),
+                    flotilla_environment::environment::ProviderReadiness::Ready => handle.health_message(),
+                };
+                record_cloud_health(state, namespace, &environment.metadata.name, ready, message).await?;
+                Ok(())
+            }
+            ObservationState::Gone { cause } => {
+                mark_unavailable_environment(state, namespace, &id, BackingDisposition::Lost, &format!("cloud sandbox gone: {cause:?}"))
+                    .await
+            }
+            ObservationState::Stopped { cause } => {
+                mark_unavailable_environment(
+                    state,
+                    namespace,
+                    &id,
+                    BackingDisposition::Lost,
+                    &format!("cloud sandbox stopped and resume is unavailable: {cause:?}"),
+                )
+                .await
+            }
+            ObservationState::Unknown { reason } => {
+                let message = format!("cloud sandbox observation unknown: {reason:?}");
+                record_cloud_health(state, namespace, &environment.metadata.name, false, Some(message.clone())).await?;
+                Err(message)
+            }
+        },
+        None => {
+            mark_unavailable_environment(
+                state,
+                namespace,
+                &id,
+                BackingDisposition::Lost,
+                "cloud sandbox missing from authoritative provider inventory",
+            )
+            .await
+        }
+    }
+}
+
+async fn record_cloud_health(
+    state: &ControllerRuntimeState,
+    namespace: &str,
+    name: &str,
+    ready: bool,
+    message: Option<String>,
+) -> Result<(), String> {
+    let environments = state.daemon.resource_backend().using::<Environment>(namespace);
+    let current = environments.get(name).await.map_err(|e| e.to_string())?;
+    let mut status = current.status.clone().unwrap_or_default();
+    if status.message != message || status.ready != ready {
+        status.message = message;
+        status.ready = ready;
+        environments.update_status(name, &current.metadata.resource_version, &status).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 pub(super) async fn record_environment_observation(
     state: &ControllerRuntimeState,
     namespace: &str,
@@ -322,6 +470,7 @@ pub(super) async fn mark_unavailable_environment(
 ) -> Result<(), String> {
     let registered_container = state.daemon.environment_container_name(env_id);
     state.daemon.remove_provisioned_environment(env_id);
+    state.provisioned_environments.lock().await.retain(|_, active| active.handle.id() != env_id);
     if let Some(container_id) = registered_container {
         state.provisioned_environments.lock().await.remove(&container_id);
     }
@@ -354,18 +503,52 @@ pub(super) async fn mark_unavailable_environment(
     } else {
         format!("{message}; recover work from retained checkout(s): {}", retained_paths.join(", "))
     };
-    flotilla_store::apply_status_patch(
-        &state.daemon.resource_backend().using::<Environment>(namespace),
-        env_id.as_str(),
-        &match disposition {
-            BackingDisposition::Lost => EnvironmentStatusPatch::MarkLost { message: message.clone() },
-            BackingDisposition::Failed => EnvironmentStatusPatch::MarkFailed { message: message.clone() },
-        },
-    )
-    .await
-    .map_err(|error| format!("mark unavailable environment {env_id}: {error}"))?;
+    let environments = state.daemon.resource_backend().using::<Environment>(namespace);
+    let mut patch = Some(match disposition {
+        BackingDisposition::Lost => EnvironmentStatusPatch::MarkLost { message: message.clone() },
+        BackingDisposition::Failed => EnvironmentStatusPatch::MarkFailed { message: message.clone() },
+    });
+    // Behind `[primitives]` the engine decides first (#3629 layer 3): the old status is written
+    // only as the engine's answer.
+    if let Some(engine) = &state.provisioning {
+        match environments.get(env_id.as_str()).await {
+            Ok(environment) => {
+                // The engine's steps are synchronous SQLite transactions; they run off the async
+                // workers, as in `Engine::prepare`.
+                let lifecycles = Arc::clone(&engine.environments);
+                patch = tokio::task::spawn_blocking(move || {
+                    flotilla_provisioning::engine::decide::<EnvironmentBinding>(
+                        lifecycles.as_ref(),
+                        &environment,
+                        patch,
+                        chrono::Utc::now(),
+                    )
+                    .patch
+                })
+                .await
+                .map_err(|error| format!("mark unavailable environment {env_id}: engine decision: {error}"))?;
+                if patch.is_none() {
+                    // A refused edge (a backing lost before it was realised) or one the engine
+                    // already took: the old status stays as it is.
+                    tracing::info!(environment = %env_id, "the engine took no edge for this backing; its old status is unchanged");
+                }
+            }
+            Err(ResourceError::NotFound { .. }) => {
+                tracing::debug!(environment = %env_id, "environment record gone; nothing to mark");
+                patch = None;
+            }
+            Err(error) => return Err(format!("mark unavailable environment {env_id}: {error}")),
+        }
+    }
+    if let Some(patch) = patch {
+        flotilla_store::apply_status_patch(&environments, env_id.as_str(), &patch)
+            .await
+            .map_err(|error| format!("mark unavailable environment {env_id}: {error}"))?;
+    }
     warn!(environment = %env_id, %message, "provisioned environment backing is unavailable");
     Ok(())
 }
 
-pub(super) const ENVIRONMENT_ADOPTION_TIMEOUT: Duration = Duration::from_secs(30);
+// Allow the 60-second SSH/agent connect budget plus asset and credential setup.
+// Checkpoint streaming runs independently of adoption.
+pub(super) const ENVIRONMENT_ADOPTION_TIMEOUT: Duration = Duration::from_secs(120);

@@ -200,6 +200,7 @@ fn terminal_convoy_phase_clears_pending_brief() {
 #[test]
 fn placement_decision_is_written_once_without_overwriting_concurrent_status() {
     let first = PlacementDecision {
+        provider_workspace_root: None,
         minimal_alternatives: Vec::new(),
         escalation_reason: None,
         policy_name: "host-direct-kiwi".to_string(),
@@ -209,6 +210,7 @@ fn placement_decision_is_written_once_without_overwriting_concurrent_status() {
         allocation: None,
     };
     let second = PlacementDecision {
+        provider_workspace_root: None,
         minimal_alternatives: Vec::new(),
         escalation_reason: None,
         policy_name: "host-direct-feta".to_string(),

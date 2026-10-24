@@ -96,6 +96,8 @@ pub mod terminal_session;
 pub mod usage;
 #[doc(hidden)]
 pub mod vessel;
+mod vessel_occupancy;
+pub mod vessel_seats;
 mod watch;
 #[doc(hidden)]
 pub mod workflow_template;
@@ -150,9 +152,10 @@ pub use dispatch_hold::{
 };
 pub use dispatch_observation::{DispatchObservation, DispatchObservationSpec, DISPATCH_RECONCILER_PROVENANCE};
 pub use environment::{
-    host_direct_environment_name, validate_environment_provider_address, DockerEnvironmentSpec, Environment, EnvironmentMemoryPolicy,
-    EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch,
-    HostDirectEnvironmentSpec, HOST_DIRECT_NAME_PREFIX,
+    host_direct_environment_name, validate_environment_provider_address, CloudSandboxEnvironmentSpec, CloudSandboxSize,
+    DockerEnvironmentSpec, Environment, EnvironmentMemoryPolicy, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
+    EnvironmentProviderDescriptor, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, EnvironmentSurvivors,
+    HostDirectEnvironmentSpec, CLOUD_ADOPTION_RETRY_PREFIX, HOST_DIRECT_NAME_PREFIX,
 };
 pub use error::{FinalizerWaitReason, ResourceError};
 pub use event::{Event, EventRegarding, EventSpec, ObjectEvent, DEFAULT_EVENT_TTL_SECONDS};
@@ -185,9 +188,9 @@ pub use manifest_root::{
     ResolutionAction, ResolutionOutcome,
 };
 pub use placement_policy::{
-    DockerCheckoutStrategy, DockerImagePullPolicy, DockerImageSource, DockerPerVesselPlacementPolicySpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, PlacementPolicy, PlacementPolicySpec, ProviderRequirements,
-    DOCKER_POLICY_NAME_PREFIX,
+    CloudSandboxCheckout, CloudSandboxPerVesselPlacementPolicySpec, DockerCheckoutStrategy, DockerImagePullPolicy, DockerImageSource,
+    DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, PlacementPolicy,
+    PlacementPolicySpec, ProviderRequirements, DOCKER_POLICY_NAME_PREFIX,
 };
 pub use platform::Platform;
 pub use prepared_snapshot::{content_hash, is_prepared_snapshot, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND};
@@ -232,14 +235,16 @@ pub use terminal_session::{
     CrewMessageDelivery, CrewMessageSender, CrewSessionStatus, InnerCommandStatus, ScreenObstruction, TerminalAttention,
     TerminalAttentionSource, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalOccupancy,
     TerminalSession, TerminalSessionAttachTarget, TerminalSessionDegradedCondition, TerminalSessionIdentity, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TERMINAL_DELIVERY_EXPIRED_REASON,
-    TERMINAL_DELIVERY_NOT_SUBMITTED_REASON, TERMINAL_DELIVERY_UNCONFIRMED_REASON,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE,
+    CONTROLLER_FENCE_UNVERIFIABLE_REASON, TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON,
+    TERMINAL_DELIVERY_UNCONFIRMED_REASON,
 };
 pub use usage::{Usage, UsagePace, UsageProviderCost, UsageSpec, UsageStatus, UsageStatusPatch, UsageWindow};
 pub use vessel::{
     vessel_resource_name, Vessel, VesselImage, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
+pub use vessel_occupancy::{home_copies_first, HostOccupancy};
 pub use watch::{ResourceList, ResourcePosition, ResourceTombstone, WatchEvent, WatchStart, WatchStream};
 
 #[doc(hidden)]
@@ -284,7 +289,7 @@ macro_rules! for_each_registered_resource {
 pub use fulfilment_kind::{effective_grants, version_at_least, CapabilityNeed};
 pub use message::{
     message_record_name, HeldMessageBatch, Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec,
-    MessageStatus, MessageStatusPatch, MessageSubmission, ResolvedMessageReceiver,
+    MessageStatus, MessageStatusPatch, MessageSubmission, ResolvedMessageReceiver, STALL_KIND,
 };
 pub use message_inbox::{
     message_expectation_open, message_supersedes, parse_topic_address, qualify_message_address, qualify_message_spec,

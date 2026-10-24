@@ -56,7 +56,6 @@ use flotilla_environment::environment::EnvironmentVariableUpdate;
 use flotilla_environment::environment::PreparedEnvironmentAuth;
 use flotilla_environment::environment::ProvisionedEnvironment;
 use flotilla_environment::environment::ProvisionedMount;
-use flotilla_environment::environment::ProvisionedMountMode;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_projections::aggregator_projection::AggregatorProjectionState;
@@ -144,6 +143,7 @@ mod message;
 mod seed;
 mod supervisor_turns;
 mod terminal;
+mod vessel_seats;
 mod work_credentials;
 
 fn test_controller_vcs(runner: Arc<dyn CommandRunner>, checkout: &str) -> Arc<dyn flotilla_vcs::vcs::Vcs> {
@@ -170,3 +170,5 @@ mod placement_support;
 mod recovery_scenario;
 
 mod terminal_support;
+
+mod vessel_support;

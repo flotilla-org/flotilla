@@ -152,6 +152,7 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
         .create(
             &empty_meta_with_labels("quartermaster-work", BTreeMap::from([(CONVOY_LABEL.to_string(), "quartermaster".to_string())])),
             &flotilla_resources::EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
@@ -415,6 +416,7 @@ async fn failed_environment_readoption_does_not_block_a_live_sibling() {
         .create(
             &empty_meta(orphaned_id.as_str()),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
@@ -470,4 +472,110 @@ async fn failed_environment_readoption_does_not_block_a_live_sibling() {
     assert!(daemon.environment_registry_for_environment(&bad_id).is_none());
     assert!(daemon.environment_registry_for_environment(&orphaned_id).is_none());
     assert!(daemon.environment_registry_for_environment(&good_id).is_some(), "live sibling should still be adopted");
+}
+
+// #3765 S1/S6: cloud Unknown must not abort a sibling's loss detection.
+// The in-memory provider represents the remote API boundary; durable status
+// transitions run through the real runtime and resource backend.
+#[tokio::test]
+async fn cloud_unknown_does_not_abort_gone_sibling() {
+    use flotilla_environment::environment::{GoneCause, ObservationState, ProviderObservation, UnknownReason};
+    struct CloudHandle {
+        id: EnvironmentId,
+        state: ObservationState,
+    }
+    #[async_trait]
+    impl ProvisionedEnvironment for CloudHandle {
+        flotilla_discovery_testkit::injected_environment_handle!();
+        fn id(&self) -> &EnvironmentId {
+            &self.id
+        }
+        fn image(&self) -> &ImageId {
+            static IMAGE: std::sync::LazyLock<ImageId> = std::sync::LazyLock::new(|| ImageId::new("cloud"));
+            &IMAGE
+        }
+        async fn detect_readiness(&self) -> flotilla_environment::environment::ProviderReadiness {
+            flotilla_environment::environment::ProviderReadiness::Ready
+        }
+        fn health_message(&self) -> Option<String> {
+            Some("checkpoint stale: injected failure".into())
+        }
+        async fn observe(&self) -> ProviderObservation {
+            ProviderObservation::new(self.state.clone())
+        }
+        async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+            Ok(Default::default())
+        }
+        fn runner(&self) -> Arc<dyn CommandRunner> {
+            Arc::new(DiscoveryMockRunner::builder().build())
+        }
+        async fn destroy(&self) -> Result<(), String> {
+            panic!("liveness must never destroy backing")
+        }
+    }
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("config")).unwrap();
+    fs::write(temp.path().join("config/daemon.toml"), r#"machine_id = "cloud-liveness-test""#).unwrap();
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        config.clone(),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+        HostName::new("controller"),
+        Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
+    let address: flotilla_address::Address = "account:cloud/provider:cloud".parse().unwrap();
+    let handles: Vec<EnvironmentHandle> = vec![
+        Arc::new(CloudHandle {
+            id: EnvironmentId::new("a-unknown"),
+            state: ObservationState::Unknown { reason: UnknownReason::GuestUnresponsive },
+        }),
+        Arc::new(CloudHandle { id: EnvironmentId::new("b-gone"), state: ObservationState::Gone { cause: GoneCause::LifetimeCapReached } }),
+        Arc::new(CloudHandle { id: EnvironmentId::new("c-stale"), state: ObservationState::Running }),
+    ];
+    let mut state = ControllerRuntimeState::new(
+        daemon.clone(),
+        config,
+        Arc::new(ProviderRegistry::new()),
+        None,
+        daemon.local_host_id().unwrap().to_string(),
+        "direct".into(),
+    );
+    state.environment_providers.insert(address.clone(), Arc::new(AdoptionEnvironmentProvider { handles: handles.clone() })).unwrap();
+    let state = Arc::new(state);
+    let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
+    for handle in &handles {
+        let spec: flotilla_resources::EnvironmentSpec = serde_json::from_value(serde_json::json!({
+            "provider_address": address.to_string(), "cloud_sandbox": {
+                "image": "cloud", "size": {"cpus":1,"memory_bytes":1024,"disk_bytes":1024}, "env": {} }
+        }))
+        .unwrap();
+        let object = environments.create(&empty_meta(handle.id().as_str()), &spec).await.unwrap();
+        environments
+            .update_status(
+                &object.metadata.name,
+                &object.metadata.resource_version,
+                &flotilla_resources::EnvironmentStatus {
+                    phase: EnvironmentPhase::Ready,
+                    ready: true,
+                    backing_id: Some(handle.backing_id().into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .provisioned_environments
+            .lock()
+            .await
+            .insert(handle.id().to_string(), ActiveProvisionedEnvironment { handle: handle.clone() });
+    }
+    assert!(reconcile_provisioned_environments(&state, NAMESPACE).await.unwrap_err().contains("unknown"));
+    assert_eq!(environments.get("a-unknown").await.unwrap().status.unwrap().phase, EnvironmentPhase::Ready);
+    assert_eq!(environments.get("b-gone").await.unwrap().status.unwrap().phase, EnvironmentPhase::Lost);
+    let stale = environments.get("c-stale").await.unwrap().status.unwrap();
+    assert!(stale.ready);
+    assert_eq!(stale.phase, EnvironmentPhase::Ready);
+    assert!(stale.message.unwrap().contains("checkpoint stale"));
 }

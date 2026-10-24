@@ -13,6 +13,7 @@ pub(super) struct DeliveryProbePool {
     pub(super) retries: AtomicUsize,
     pub(super) screens: Vec<String>,
     pub(super) submission_error: bool,
+    pub(super) controller_fence_unverifiable: bool,
     pub(super) controller_refusals: AtomicUsize,
     pub(super) submission_attempts: AtomicUsize,
     pub(super) submission_attempted: tokio::sync::Notify,
@@ -29,6 +30,7 @@ impl DeliveryProbePool {
             retries: AtomicUsize::new(0),
             screens: Vec::new(),
             submission_error: false,
+            controller_fence_unverifiable: false,
             controller_refusals: AtomicUsize::new(0),
             submission_attempts: AtomicUsize::new(0),
             submission_attempted: tokio::sync::Notify::new(),
@@ -98,6 +100,9 @@ impl TerminalPool for DeliveryProbePool {
     async fn guarded_deliver(&self, session: &str, text: &str) -> Result<flotilla_terminal::TerminalSubmission, String> {
         self.submission_attempts.fetch_add(1, Ordering::SeqCst);
         self.submission_attempted.notify_one();
+        if self.controller_fence_unverifiable {
+            return Ok(flotilla_terminal::TerminalSubmission::ControllerFenceUnverifiable);
+        }
         if self.controller_refusals.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() {
             return Ok(flotilla_terminal::TerminalSubmission::Refused("controller input is not idle".into()));
         }

@@ -667,6 +667,7 @@ fn convoy_request(state: &Value) -> ConvoyRequest {
         .map(|pair| {
             let record = &pair[1];
             let promise = convoy::AdmittedPromise {
+                label: format!("p{}", small(&pair[0])),
                 kind: text(&record["promise"]["kind"]).into(),
                 target: address(&record["promise"]["target"]),
                 source: source_of(&record["source"]),
@@ -879,6 +880,7 @@ fn convoy_deliver(trace: &Trace, tally: &mut Tally) {
             "declare" => {
                 let edge = convoy::Declare {
                     promise: PromiseId(1),
+                    label: "p1".into(),
                     kind: "opaque".into(),
                     target: itf::address_of("target"),
                     owner: picked_seat(),
@@ -1002,7 +1004,7 @@ fn request_value(request: &placement::Request) -> Value {
 
 /// The spec's `Placement = { request, host }`: a lease, one-to-one.
 fn lease_value(lease: &Lease) -> Value {
-    json!({ "request": request_value(&lease.request), "host": int(lease.host.0.into()) })
+    json!({ "request": request_value(&lease.request), "host": int(lease.host.0.parse::<i64>().expect("a spec host is a number")) })
 }
 
 /// What a placement read: the request placed and the ledger's evidence.
@@ -1022,14 +1024,17 @@ struct Fleet {
     returned: BTreeMap<i64, Lease>,
 }
 
-const HOSTS: [Host; 2] = [Host(1), Host(2)];
+/// The scenario's hosts: spec host `n` is named by the number's text.
+fn hosts() -> [Host; 2] {
+    [Host::new("1"), Host::new("2")]
+}
 
 impl Fleet {
     /// The scenario's hosts: two dimensions, so shapes cannot pool across hosts.
     fn new() -> Self {
         let mut ledger = Ledger::new();
-        ledger.add_host(Host(1), BTreeMap::from([(Dimension(0), 2), (Dimension(1), 1)])).expect("host 1");
-        ledger.add_host(Host(2), BTreeMap::from([(Dimension(0), 1), (Dimension(1), 2)])).expect("host 2");
+        ledger.add_host(Host::new("1"), BTreeMap::from([(Dimension(0), 2), (Dimension(1), 1)])).expect("host 1");
+        ledger.add_host(Host::new("2"), BTreeMap::from([(Dimension(0), 1), (Dimension(1), 2)])).expect("host 2");
         Fleet {
             convoys: Home::new("home").expect("declaration"),
             ledger,
@@ -1106,11 +1111,11 @@ impl Fleet {
                 continue;
             }
             let vessel = VesselId::new(id.to_string());
-            for host in HOSTS {
+            for host in hosts() {
                 tally.probes += 1;
                 let mut trial = self.ledger.clone();
-                let evidence = trial.evidence(&vessel, host).expect("a waiting vessel's evidence");
-                let Ok(lease) = trial.place(&vessel, host).cloned() else { continue };
+                let evidence = trial.evidence(&vessel, host.clone()).expect("a waiting vessel's evidence");
+                let Ok(lease) = trial.place(&vessel, host.clone()).cloned() else { continue };
                 for convoy in [1, 2] {
                     let convoy = ConvoyId::new(convoy.to_string(), "home");
                     for class in [class(0), class(1)] {
@@ -1118,8 +1123,8 @@ impl Fleet {
                         assert!(live <= cap, "{step}: placing vessel {id} on {host:?} leases {live} of {convoy:?} {class:?}, cap {cap}");
                     }
                 }
-                for checked in HOSTS {
-                    assert!(trial.available(checked).is_ok(), "{step}: placing vessel {id} on {host:?} oversubscribes {checked:?}");
+                for checked in hosts() {
+                    assert!(trial.available(checked.clone()).is_ok(), "{step}: placing vessel {id} on {host:?} oversubscribes {checked:?}");
                 }
                 let jumped =
                     evidence.waiting.iter().find(|w| w.priority > lease.request.priority && placement::fits(w, &evidence.available));
@@ -1139,7 +1144,7 @@ impl Fleet {
             lifecycle_end_refuses(&mut self.vessels, &vessel.0, "vessel", now, step, tally);
             let unknown = Err(LedgerError::UnknownVessel(vessel.clone()));
             assert_eq!(self.ledger.release(&vessel).map(|_| ()), unknown, "{step}: vessel {id} returned twice");
-            assert_eq!(self.ledger.place(&vessel, Host(1)).map(|_| ()), unknown, "{step}: vessel {id} placed again");
+            assert_eq!(self.ledger.place(&vessel, Host::new("1")).map(|_| ()), unknown, "{step}: vessel {id} placed again");
             tally.refusals += 2;
         }
     }
@@ -1174,8 +1179,8 @@ fn admission_placement(trace: &Trace, tally: &mut Tally) {
             }
             // The harness records what the placement read, then the vessel's lifecycle starts.
             "place" => {
-                let host = Host(small(step.pick("host")));
-                let evidence = fleet.ledger.evidence(&vessel, host).unwrap_or_else(|error| panic!("{step}: evidence: {error:?}"));
+                let host = Host::new(small(step.pick("host")).to_string());
+                let evidence = fleet.ledger.evidence(&vessel, host.clone()).unwrap_or_else(|error| panic!("{step}: evidence: {error:?}"));
                 ledger_ok(fleet.ledger.place(&vessel, host).map(|_| ()), tally);
                 let request = match fleet.ledger.vessel(&vessel) {
                     Some(placement::Vessel::Leased(lease)) => lease.request.clone(),

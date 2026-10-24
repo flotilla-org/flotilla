@@ -39,7 +39,7 @@ pub(crate) fn expand(input: &DeriveInput, fields: &FieldsNamed, type_attrs: Type
     match (&type_attrs.kind, type_attrs.code.clone()) {
         (Some(kind), Some((code, _))) => {
             check_kind_name(kind)?;
-            let indexes = Indexes::parse(&type_attrs.indexes, &fields, None)?;
+            let indexes = Indexes::parse(&type_attrs.indexes, &fields, None, false)?;
             let handles = handles(input, &fields, true)?;
             let kind = kind_impls(input, &fields, kind, &code, &indexes, type_attrs.edges.as_ref());
             Ok(quote!(#kind #handles))
@@ -48,7 +48,7 @@ pub(crate) fn expand(input: &DeriveInput, fields: &FieldsNamed, type_attrs: Type
         (None, Some((_, span))) => Err(syn::Error::new(span, "`code` on a struct needs `kind = \"Name\"`")),
         (None, None) => {
             refuse_edges(&type_attrs)?;
-            let indexes = Indexes::parse(&type_attrs.indexes, &fields, None)?;
+            let indexes = Indexes::parse(&type_attrs.indexes, &fields, None, true)?;
             let handles = handles(input, &fields, false)?;
             let part = part_impls(input, &fields, &indexes);
             Ok(quote!(#part #handles))
@@ -215,7 +215,7 @@ fn spec_impls(
             return Err(refuse(field.ident, "the holder's state is the field `state`; rename this field"));
         }
     }
-    let indexes = Indexes::parse(indexes, fields, Some(state))?;
+    let indexes = Indexes::parse(indexes, fields, Some(state), false)?;
     let schema = schema();
     let ident = &input.ident;
     let element = element_impl(input, fields, TokenStream::new());

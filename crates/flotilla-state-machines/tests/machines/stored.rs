@@ -62,6 +62,7 @@ fn project() -> Address {
 
 fn promise() -> AdmittedPromise {
     AdmittedPromise {
+        label: "template/pr".into(),
         kind: "k".into(),
         target: Address::project("t").expect("target"),
         source: PromiseSource::Template,
@@ -200,7 +201,7 @@ fn lease_of(convoy: &str, units: u32) -> Lease {
     let convoy = flotilla_schema::Ref::new(convoy, "admitting-host");
     Lease {
         request: Request { convoy, class: VesselClass::new("1"), shape: [(Dimension(0), units)].into(), priority: Priority(2) },
-        host: Host(3),
+        host: Host::new("3"),
     }
 }
 
@@ -210,13 +211,13 @@ fn lease_of(convoy: &str, units: u32) -> Lease {
 #[test]
 fn the_host_ledger_is_rebuilt_from_live_vessels() {
     let mut before = Ledger::new();
-    before.add_host(Host(3), [(Dimension(0), 10)].into()).expect("host");
+    before.add_host(Host::new("3"), [(Dimension(0), 10)].into()).expect("host");
     let mut vessels = Home::<Vessel>::new("capacity-host").expect("valid");
     for (name, units) in [("a", 4), ("b", 3), ("gone", 2)] {
         let lease = lease_of("c", units);
         before.set_caps(lease.request.convoy.clone(), [(VesselClass::new("1"), 5)].into());
         before.request(VesselId::new(name), lease.request.clone()).expect("requested");
-        let placed = before.place(&VesselId::new(name), Host(3)).expect("placed").clone();
+        let placed = before.place(&VesselId::new(name), Host::new("3")).expect("placed").clone();
         vessels.create(name, placed.into(), &MemoryLifecycleWorld::default(), Timestamp(0)).expect("created");
     }
     let mut world = MemoryLifecycleWorld::default();
@@ -235,18 +236,18 @@ fn the_host_ledger_is_rebuilt_from_live_vessels() {
         })
         .collect();
     let mut after = Ledger::new();
-    after.add_host(Host(3), [(Dimension(0), 10)].into()).expect("host");
+    after.add_host(Host::new("3"), [(Dimension(0), 10)].into()).expect("host");
     for (id, lease) in live_leases(&stored) {
         after.restore(id, lease).expect("restored");
     }
     assert_eq!(after.leases().collect::<Vec<_>>(), before.leases().collect::<Vec<_>>());
-    assert_eq!(after.available(Host(3)), Ok([(Dimension(0), 3)].into()));
+    assert_eq!(after.available(Host::new("3")), Ok([(Dimension(0), 3)].into()));
     let convoy = lease_of("c", 0).request.convoy;
     assert_eq!(after.live(&convoy, &VesselClass::new("1")), before.live(&convoy, &VesselClass::new("1")));
     assert_eq!(after.restore(VesselId::new("a"), lease_of("c", 1)), Err(LedgerError::DuplicateRequest(VesselId::new("a"))));
     assert_eq!(
         after.restore(VesselId::new("big"), lease_of("c", 4)),
-        Err(LedgerError::CapacityUnderflow { host: Host(3), dimension: Dimension(0) })
+        Err(LedgerError::CapacityUnderflow { host: Host::new("3"), dimension: Dimension(0) })
     );
     assert_eq!(after.leases().count(), 2, "a refused restore leaves the ledger as it was");
 }
@@ -352,6 +353,7 @@ fn convoy_and_awaiting_reply_round_trip() {
             1,
             Promise {
                 id: PromiseId(0),
+                label: "template/pr".into(),
                 kind: "pr".into(),
                 target: project(),
                 source: PromiseSource::Dispatch,

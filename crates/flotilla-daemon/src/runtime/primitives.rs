@@ -117,6 +117,12 @@ impl MessageDelivery {
         if report != SweepReport::default() {
             debug!(namespace = %self.namespace, ?report, "engine message sweep");
         }
+        // The senders' records past their deadlines with no reply present (#3587 layer 7).
+        let awaiting = Arc::clone(self.primitives.awaiting());
+        let expired = tokio::task::spawn_blocking(move || awaiting.expire_due(now)).await.map_err(|error| error.to_string())??;
+        if !expired.is_empty() {
+            debug!(namespace = %self.namespace, ?expired, "awaiting-reply records expired");
+        }
         Ok(())
     }
 
@@ -245,6 +251,21 @@ impl MessageDelivery {
                         + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
                     self.held.hold(turn.members, until);
                 }
+                Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable)) => {
+                    let Some(message_id) = turn.members.first() else {
+                        warn!(%session, "empty turn cannot record a controller fence delivery failure");
+                        continue;
+                    };
+                    let terminals = self.state.daemon.resource_backend().using::<TerminalSession>(&self.namespace);
+                    let patch = flotilla_resources::TerminalSessionStatusPatch::MarkControllerFenceUnverifiable {
+                        message_id: message_id.clone(),
+                        message: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into(),
+                        observed_at: Utc::now(),
+                    };
+                    if let Err(error) = flotilla_store::apply_status_patch(&terminals, &turn.consumer.id, &patch).await {
+                        warn!(%session, %error, "could not record controller fence failure");
+                    }
+                }
                 // Never typed (the terminal was not ready in time): nothing to hold; the next pass retries.
                 Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady))
                 | Ok(TerminalDeliveryOutcome::Pending) => {}
@@ -278,7 +299,7 @@ impl MessageDelivery {
         let Some((successor, older)) = held_turns_superseded(due, &views) else { return Ok(()) };
         for message in older {
             tracing::info!(%message, %successor, "operator turn supersedes a held system turn");
-            self.primitives.supersede(message, successor).await;
+            self.primitives.supersede(message, successor, true).await;
             self.held.release(message);
         }
         Ok(())
@@ -287,6 +308,27 @@ impl MessageDelivery {
     /// Types one session's pending turns as one turn, through the same
     /// terminal reservation every other turn takes.
     async fn start_turn(&mut self, holder: &Holder) -> Result<(), String> {
+        // A fence failure is scoped to this child activation; MarkRunning on
+        // an operator's resume clears it. No receipts or timed retries here.
+        // `holders` was read before collect_turns persisted any newly completed
+        // failures in this pass. Re-read so that stale snapshot cannot resubmit
+        // a just-refused turn before the next tick.
+        let terminal = self
+            .state
+            .daemon
+            .resource_backend()
+            .using::<TerminalSession>(&self.namespace)
+            .get(&holder.terminal.metadata.name)
+            .await
+            .map_err(|error| error.to_string())?;
+        if terminal
+            .status
+            .as_ref()
+            .and_then(|status| status.degraded.as_ref())
+            .is_some_and(|condition| condition.is_controller_fence_unverifiable())
+        {
+            return Ok(());
+        }
         let inbox = self.primitives.inbox();
         let mut turns = Vec::new();
         let mut held = Vec::new();
@@ -339,8 +381,8 @@ impl MessageDelivery {
         }
         self.supersede_held_system_turns(&due, held, &roles, &records).await?;
         let runtime = TerminalControllerRuntime { state: Arc::clone(&self.state) };
-        let pool = runtime.pool_for_spec(&holder.terminal.spec)?;
-        let adapter = runtime.adapter_for_spec(&holder.terminal.spec)?;
+        let pool = runtime.pool_for_spec(&holder.terminal.spec).await?;
+        let adapter = runtime.adapter_for_spec(&holder.terminal.spec).await?;
         let text = texts.join("\n\n");
         let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
         if deliveries.contains_key(&holder.session_id) {

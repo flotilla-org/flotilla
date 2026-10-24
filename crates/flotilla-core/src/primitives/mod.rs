@@ -10,7 +10,13 @@
 //! ports here ([`OldStoreRecords`]), so each kind that moves later swaps
 //! one implementation.
 
+pub mod awaiting;
 pub mod convert;
+pub mod convoy_engine;
+pub mod convoy_import;
+pub mod convoy_map;
+pub mod convoys;
+pub mod ensures;
 pub mod import;
 pub mod ports;
 pub mod roles;
@@ -214,6 +220,9 @@ pub struct MessagePrimitives {
     service: Arc<Service>,
     inbox: SqliteInbox,
     sessions: Arc<Sessions>,
+    convoys: Arc<convoys::Convoys>,
+    convoy_engine: Arc<convoy_engine::ConvoyEngine>,
+    awaiting: Arc<awaiting::AwaitingReplies>,
     world: Arc<GateWorld>,
     backend: ResourceBackend,
     system: Arc<Mutex<Option<Address>>>,
@@ -242,7 +251,7 @@ impl MessagePrimitives {
         let store = service.store();
         let log = flotilla_engine_store::MessageLog::new(store);
         let receipts = log.consumers();
-        let world = Arc::new(GateWorld::new(clock));
+        let world = Arc::new(GateWorld::new(Arc::clone(&clock)));
         let system = Arc::new(Mutex::new(None));
         let inbox = SqliteInbox::open(
             home,
@@ -277,11 +286,17 @@ impl MessagePrimitives {
         for session in names {
             sessions.home.lock().expect("session home").restore(session).map_err(|error| format!("{error:?}"))?;
         }
+        let convoys = Arc::new(convoys::Convoys::open(home, &service)?);
+        let convoy_engine = Arc::new(convoy_engine::ConvoyEngine::new(Arc::clone(&convoys), backend.clone(), Arc::clone(&clock)));
+        let awaiting = Arc::new(awaiting::AwaitingReplies::open(home, &service)?);
         Ok(Self {
             home: home.to_owned(),
             service,
             inbox,
             sessions,
+            convoys,
+            convoy_engine,
+            awaiting,
             world,
             system,
             consumers: Mutex::new(BTreeSet::new()),
@@ -305,6 +320,18 @@ impl MessagePrimitives {
     }
     pub fn sessions(&self) -> &Arc<Sessions> {
         &self.sessions
+    }
+    /// This home's Convoy records (#3587 layer 6).
+    pub fn convoys(&self) -> &Arc<convoys::Convoys> {
+        &self.convoys
+    }
+    /// This home's AwaitingReply records (#3587 layer 7).
+    pub fn awaiting(&self) -> &Arc<awaiting::AwaitingReplies> {
+        &self.awaiting
+    }
+    /// The engine-first Convoy writer in the old shape (#3587 layer 6).
+    pub fn convoy_engine(&self) -> &Arc<convoy_engine::ConvoyEngine> {
+        &self.convoy_engine
     }
     pub fn world(&self) -> &Arc<GateWorld> {
         &self.world
@@ -403,21 +430,177 @@ impl MessagePrimitives {
         });
         let supersedes = spec.supersedes.clone();
         let inbox_address = spec.inbox.clone();
+        let in_reply_to = spec.in_reply_to.clone();
         let id = self.inbox.enqueue_as(spec, name).await.map_err(|error| ResourceError::invalid(error.to_string()))?;
         self.located.lock().expect("located").insert(name.to_owned(), (id.clone(), self.home.clone()));
-        let _ = inbox_address;
-        if let Some(older) = supersedes.filter(|older| older.home == self.home) {
-            self.supersede(&older.name, &id).await;
-        }
-        match self.view(namespace, name).await {
-            Ok(Some(view)) => Ok(view.object),
-            // The engine keeps no vessel; when no holder names it, answer with the producer's own intent.
-            Ok(None) => Ok(admitted_intent(namespace, name, intent)),
-            Err(error) => {
-                tracing::warn!(message = %name, %error, "admitted message has no old-shaped view; answering with its intent");
-                Ok(admitted_intent(namespace, name, intent))
+        // A reply landing in its sender's inbox here answers the sender's record (#3587 layer 7).
+        if in_reply_to.is_some() {
+            let awaiting = Arc::clone(&self.awaiting);
+            let reply = MessageRef::new(id.clone(), self.home.clone());
+            let now = self.world.now();
+            match tokio::task::spawn_blocking(move || awaiting.landed(&reply, &inbox_address, in_reply_to.as_ref(), now)).await {
+                Ok(Ok(Some(record))) => tracing::debug!(%record, "a reply answered its awaiting record"),
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => tracing::warn!(message = %name, %error, "answering the awaiting record failed"),
+                Err(error) => tracing::warn!(message = %name, %error, "answering the awaiting record did not run"),
             }
         }
+        if let Some(older) = supersedes.filter(|older| older.home == self.home) {
+            // A successor that awaits a reply withdraws its predecessor's record once
+            // its own is written (`await_reply`), so the sender never reads as not waiting.
+            let awaits = !matches!(intent.expectation, flotilla_resources::MessageExpectation::None);
+            self.supersede(&older.name, &id, !awaits).await;
+        }
+        let mut object = match self.view(namespace, name).await {
+            Ok(Some(view)) => view.object,
+            // The engine keeps no vessel; when no holder names it, answer with the producer's own intent.
+            Ok(None) => admitted_intent(namespace, name, intent),
+            Err(error) => {
+                tracing::warn!(message = %name, %error, "admitted message has no old-shaped view; answering with its intent");
+                admitted_intent(namespace, name, intent)
+            }
+        };
+        // The home that admitted it: the sender records its awaiting reply against this (#3587 layer 7).
+        object.metadata.annotations.insert(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION.to_owned(), self.home.clone());
+        Ok(object)
+    }
+
+    /// Records the sender's half of a send expecting a reply or an outcome
+    /// (#3587 layer 7), once the message is admitted at `home`, its
+    /// receiver's. The record is homed here, the sender's home, and named by
+    /// the message. A reply that already landed in the sender's inbox here
+    /// answers it at once. A send expecting nothing records nothing.
+    pub async fn await_reply(
+        &self,
+        namespace: &str,
+        name: &str,
+        intent: &OldSpec,
+        home: &str,
+        kind: &str,
+        about: Option<&str>,
+    ) -> Result<bool, String> {
+        use flotilla_resources::MessageExpectation;
+        use flotilla_state_machines::machines::awaiting_reply::{Awaited, AwaitingReplySpec};
+        let awaited = match intent.expectation {
+            MessageExpectation::None => return Ok(false),
+            MessageExpectation::Reply => Awaited::Reply,
+            MessageExpectation::Outcome { .. } => Awaited::Outcome,
+        };
+        let roles = self.roles(namespace).await?;
+        let records = self.records(namespace).await.map_err(|error| error.to_string())?;
+        let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
+        let sender = match conversion.sender(&intent.sender) {
+            Ok(sender) => sender,
+            // A producer with no inbox at a home (a system producer with no
+            // fleet role, or a person until #3457) cannot receive the reply,
+            // so nothing awaits it there; recording nothing is the answer.
+            Err(_) if intent.sender.starts_with("system:") || intent.sender.starts_with("principal:") => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let recipient = conversion.inbox(&intent.receiver)?;
+        let message = MessageRef::new(Address::message(&recipient, name).map_err(|error| error.to_string())?.as_str(), home);
+        let subject = about.map(|about| conversion.inbox(about)).transpose()?;
+        // The predecessor whose record this send's record replaces, wherever it is homed.
+        let superseded = match &intent.supersedes {
+            Some(older) => {
+                let read = self.read_message(older, Some(recipient.clone())).await?;
+                Some(MessageRef::new(read.id, read.home))
+            }
+            None => None,
+        };
+        let spec = AwaitingReplySpec {
+            message: message.clone(),
+            sender: sender.clone(),
+            recipient,
+            subject,
+            kind: kind.to_owned(),
+            awaited,
+            deadline: intent.deadline.as_ref().map(convert::timestamp),
+        };
+        let awaiting = Arc::clone(&self.awaiting);
+        let service = Arc::clone(&self.service);
+        let here = self.home.clone();
+        let now = self.world.now();
+        tokio::task::spawn_blocking(move || {
+            // What this record replaces, withdrawn only once it is written, so the
+            // seat or the sender never reads as not waiting in between. A repeat
+            // withdraws again what an earlier attempt left open.
+            let replace = |spec: &AwaitingReplySpec| -> Result<(), String> {
+                if let (true, Some(subject)) = (spec.kind == awaiting::STALL, &spec.subject) {
+                    let keep = awaiting::record_name(&spec.message);
+                    awaiting.end_stalls(std::slice::from_ref(subject), Some(&keep), "replaced by a newer stall about the seat", now)?;
+                }
+                if let Some(older) = &superseded {
+                    awaiting.withdraw(older, &spec.sender, &format!("superseded by {}", spec.message.name), now)?;
+                }
+                Ok(())
+            };
+            // A repeat finds its record and stops: the reply scan ran when it was written.
+            if let Some(existing) = awaiting.get(&message) {
+                return match *existing.spec() == spec {
+                    true => replace(&spec).map(|()| false),
+                    false => Err(format!("AwaitingReply for `{}` is recorded as {:?}, not {spec:?}", message.name, existing.spec())),
+                };
+            }
+            let recorded = awaiting.record(spec.clone(), now)?;
+            replace(&spec)?;
+            // A reply may have landed before the record: replies are indexed by what they answer.
+            let replies = service
+                .with_store(|store| {
+                    let mut read = store.read()?;
+                    let mut found = Vec::new();
+                    let mut after = None;
+                    loop {
+                        let page =
+                            read.page(&flotilla_state_machines::machines::message::MessageSpec::by_reply(&message), after.as_ref(), 64)?;
+                        for id in page.ids {
+                            if let Some(loaded) = read.load::<Resource<Message>>(id)? {
+                                if loaded.home == here {
+                                    found.push((MessageRef::new(loaded.name, loaded.home), loaded.value.spec().inbox.clone()));
+                                }
+                            }
+                        }
+                        after = page.next;
+                        if after.is_none() {
+                            return Ok(found);
+                        }
+                    }
+                })
+                .map_err(|error| error.to_string())?;
+            // Each reply is its own evidence: one that fails does not stop the others.
+            let failures: Vec<String> =
+                replies.iter().filter_map(|(reply, inbox)| awaiting.landed(reply, inbox, Some(&message), now).err()).collect();
+            match failures.is_empty() {
+                true => Ok(recorded),
+                false => Err(format!("recorded, but answering it from earlier replies failed: {}", failures.join("; "))),
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    /// Withdraws this home's open stall records about `seats`, crew role
+    /// addresses the old stall status shows not stalled (#3730 review). Each
+    /// seat's records are about its role's address, which another seat of
+    /// the same role shares; `stalled`'s keeps its records. With no open
+    /// stall here it reads nothing.
+    pub async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: Option<&str>, reason: &str) -> Result<Vec<String>, String> {
+        if seats.is_empty() || !self.awaiting.any_open_stall() {
+            return Ok(Vec::new());
+        }
+        let roles = self.roles(namespace).await?;
+        let records = self.records(namespace).await.map_err(|error| error.to_string())?;
+        let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
+        let kept = stalled.map(|seat| conversion.inbox(seat)).transpose()?;
+        let mut subjects = Vec::new();
+        for seat in seats {
+            let subject = conversion.inbox(seat)?;
+            if Some(&subject) != kept.as_ref() && !subjects.contains(&subject) {
+                subjects.push(subject);
+            }
+        }
+        let (awaiting, reason, now) = (Arc::clone(&self.awaiting), reason.to_owned(), self.world.now());
+        tokio::task::spawn_blocking(move || awaiting.end_stalls(&subjects, None, &reason, now)).await.map_err(|error| error.to_string())?
     }
 
     /// One message by its old record name, in the old shape: from this
@@ -470,14 +653,32 @@ impl MessagePrimitives {
     }
 
     /// Drops `older` as superseded by `newer`, both homed here, once its
-    /// successor is admitted. Already ended is no error.
-    pub async fn supersede(&self, older: &str, newer: &str) {
+    /// successor is admitted, and with `withdraw` its sender's record here.
+    /// Already ended is no error.
+    pub async fn supersede(&self, older: &str, newer: &str, withdraw: bool) {
         let Ok(by) = newer.parse::<Address>() else { return };
         self.world
             .update(|world| world.supersession.put(&flotilla_state_machines::Ref::new(newer), Supersedes { older: older.to_owned() }));
-        if let Err(error) = self.inbox.drop(older, DropReason::Superseded { by }).await {
+        if let Err(error) = self.inbox.drop(older, DropReason::Superseded { by: by.clone() }).await {
             // The sweep follows the successor in the log and retries.
             tracing::warn!(%older, %newer, %error, "superseded message did not drop yet");
+            return;
+        }
+        // Its sender's record here, if it awaited a reply, waits no longer (#3587 layer 7).
+        if withdraw {
+            self.withdraw_awaiting(older, &by, &format!("superseded by {newer}")).await;
+        }
+    }
+
+    /// Withdraws the awaiting record of a message dropped here, when its
+    /// sender's record is homed here too.
+    async fn withdraw_awaiting(&self, message: &str, by: &Address, reason: &str) {
+        let awaiting = Arc::clone(&self.awaiting);
+        let (message, by, reason, now) = (MessageRef::new(message, self.home.clone()), by.clone(), reason.to_owned(), self.world.now());
+        match tokio::task::spawn_blocking(move || awaiting.withdraw(&message, &by, &reason, now)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "withdrawing the awaiting record failed"),
+            Err(error) => tracing::warn!(%error, "withdrawing the awaiting record did not run"),
         }
     }
 
@@ -494,7 +695,9 @@ impl MessagePrimitives {
         let records = self.records(namespace).await.map_err(|error| error.to_string())?;
         let authority = records.convoy_address(convoy)?;
         self.world.update(|world| world.authority.put(&flotilla_state_machines::Ref::new(authority.as_str()), true));
-        self.inbox.drop(&id, DropReason::Withdrawn { by, authority }).await.map_err(|error| error.to_string())
+        self.inbox.drop(&id, DropReason::Withdrawn { by: by.clone(), authority }).await.map_err(|error| error.to_string())?;
+        self.withdraw_awaiting(&id, &by, "withdrawn by an operator").await;
+        Ok(())
     }
 
     /// The engine id and home of the message an old record name names, in
@@ -704,6 +907,23 @@ impl flotilla_crew::ports::EngineMessages for MessagePrimitives {
     }
     async fn withdraw(&self, namespace: &str, record: &str, convoy: &str) -> Result<(), String> {
         MessagePrimitives::withdraw(self, namespace, record, convoy).await
+    }
+    fn home(&self) -> String {
+        self.home.clone()
+    }
+    async fn await_reply(
+        &self,
+        namespace: &str,
+        name: &str,
+        intent: &OldSpec,
+        home: &str,
+        kind: &str,
+        about: Option<&str>,
+    ) -> Result<bool, String> {
+        MessagePrimitives::await_reply(self, namespace, name, intent, home, kind, about).await
+    }
+    async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: Option<&str>, reason: &str) -> Result<Vec<String>, String> {
+        MessagePrimitives::end_stalls(self, namespace, seats, stalled, reason).await
     }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
         Box::new(EngineCharterNotices { primitives: self, namespace: namespace.to_owned() })

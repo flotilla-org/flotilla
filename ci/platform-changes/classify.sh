@@ -37,17 +37,20 @@ shared='^(Cargo\.(toml|lock)|crates/[^/]+/Cargo\.toml|rust-toolchain\.toml|\.git
 # the CLI definitions whose unoptimised stack frames must fit Windows' 1 MiB
 # main thread (#2588). Elsewhere, a change reaches Windows only through
 # platform-conditional code, matched in the diff.
-windows_paths="${shared}|^(src/|tests/vessel_agent\.rs|crates/flotilla-client/|crates/flotilla-cli/|crates/flotilla-vessel-agent/|crates/flotilla-commands/|crates/flotilla-transport/|crates/flotilla-manifest/src/sink|crates/flotilla-tui/src/(terminal|run))"
+windows_paths="${shared}|^(src/|crates/flotilla-client/|crates/flotilla-cli/|crates/flotilla-commands/|crates/flotilla-transport/|crates/flotilla-manifest/src/sink|crates/flotilla-tui/src/(terminal|run))"
 windows_content='^[+-].*(cfg(_attr|!)?\(.*(windows|unix|target_os|target_family|target_vendor)|std::os::(unix|windows)|libc::|nix::|Unix(Stream|Listener|Datagram)|::unix::|pre_exec|setsid)'
 
 # The macOS job runs the daemon's peer-identity tests (server::caller).
-macos_paths="${shared}|^(tests/vessel_agent\.rs|crates/flotilla-daemon/src/server/caller|crates/flotilla-transport/)"
+macos_paths="${shared}|^(crates/flotilla-daemon/src/server/caller|crates/flotilla-transport/)"
 macos_content='^[+-].*(target_os *= *"macos"|target_vendor *= *"apple")'
 
 # The Quint quick tier (#3280) checks the typed machine specs, their full-graph
 # conformance and trace replay against the state-machine engine (#3319). It
 # reads only those trees, plus the compiler pin, the workflow and this classifier.
-quint_paths='^(specs/primitives/|crates/flotilla-state-machines/|crates/flotilla-inbox(-testkit)?/|crates/flotilla-quint-testkit/|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/platform-changes/)'
+# The provisioning lifecycle kinds run the lifecycle graph through their stored
+# kinds (#3629), so their declarations and that harness are Quint inputs too, as is
+# the crew kinds' run through the decided store.
+quint_paths='^(specs/primitives/|crates/flotilla-state-machines/|crates/flotilla-provisioning/(src/stored/|tests/lifecycle_conformance\.rs)|crates/flotilla-engine-store/tests/crew_conformance\.rs|crates/flotilla-inbox(-testkit)?/|crates/flotilla-quint-testkit/|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/platform-changes/)'
 
 # An empty content pattern decides on paths alone.
 decide() {

@@ -5,7 +5,7 @@
 //! [`MessageLog`] adds Message admission, assigned inside the create's
 //! transaction. Receipts are served as a [`ReceiptLog`] from `Read::about`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use flotilla_schema::{Cbor, Event, Identity, Kind, KindRegistry, KindSpec, Labelled, Origin, RegistryError, StateData, Timestamp};
 use flotilla_schema_sqlite::{AboutCursor, Read, Stamp, Store, StoreError};
@@ -14,8 +14,9 @@ use flotilla_state_machines::{
         agent_session::AgentSession,
         awaiting_reply::AwaitingReply,
         consumer::Consumer,
-        convoy,
+        convoy, ensure,
         message::{Message, ReceiptLog},
+        vessel,
     },
     EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, StoredWrite, Version,
 };
@@ -40,6 +41,8 @@ pub fn machine_registry() -> Result<MachineRegistry, RegistryError> {
     }
     register!(Message);
     register!(AgentSession);
+    register!(convoy::Convoy);
+    register!(AwaitingReply);
     Ok(MachineRegistry { kinds, diagrams })
 }
 pub fn registry() -> Result<KindRegistry, RegistryError> {
@@ -48,8 +51,9 @@ pub fn registry() -> Result<KindRegistry, RegistryError> {
 
 /// The kinds the Convoy stack moves (#3587): Convoy, with its seats,
 /// promises, submissions and duties as its records, and AwaitingReply. Both
-/// codes are the production registry's. Nothing opens a store with these
-/// yet; the write path (layer 6) moves them into [`machine_registry`].
+/// codes are the production registry's, and both are in [`machine_registry`]
+/// since the write path (layer 6) and the send path (layer 7). The benchmark
+/// opens a store with both.
 pub fn convoy_registry() -> Result<KindRegistry, RegistryError> {
     let mut kinds = KindRegistry::new();
     kinds.register::<Resource<convoy::Convoy>>()?;
@@ -57,8 +61,39 @@ pub fn convoy_registry() -> Result<KindRegistry, RegistryError> {
     Ok(kinds)
 }
 
+/// Registers the engine's crew kinds the `[primitives]` switch moves (#3629 layer 6): Vessel,
+/// the placement lease, and Ensure, each under its production code.
+pub fn register_crew(kinds: &mut KindRegistry) -> Result<(), RegistryError> {
+    kinds.register::<Resource<vessel::Vessel>>()?;
+    kinds.register::<Resource<ensure::Ensure>>()?;
+    Ok(())
+}
+
+/// The machine diagram of each kind [`register_crew`] registers, by kind name.
+pub fn crew_diagrams() -> std::collections::BTreeMap<String, String> {
+    [
+        (Resource::<vessel::Vessel>::KIND.to_owned(), vessel::Vessel::definition().mermaid(flotilla_state_machines::Diagram::Full)),
+        (Resource::<ensure::Ensure>::KIND.to_owned(), ensure::Ensure::definition().mermaid(flotilla_state_machines::Diagram::Full)),
+    ]
+    .into()
+}
+
 fn refused(error: impl std::error::Error + Send + Sync + 'static) -> LogError {
     LogError::new(error)
+}
+
+// A panicking write drops rusqlite's rollback-on-drop transaction and its
+// Pending overlay (IDs and watermarks). Shared caches contain only committed
+// IDs; a partially promoted commit leaves valid entries or cache misses. Reads
+// cache only committed IDs, and identity removal only invalidates cache entries.
+// No resource state is cached in Store, so there is nothing to rebuild here.
+// Recover as the provisioning and Ensure home wrappers do above this log.
+fn lock_store(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
+    store.lock().unwrap_or_else(|poisoned| {
+        let store = poisoned.into_inner();
+        tracing::warn!(home = store.home(), "recovering poisoned decided-store lock");
+        store
+    })
 }
 
 /// One home's engine log over a shared [`Store`]. Every kind the store
@@ -74,7 +109,7 @@ pub struct StoreLog {
 impl StoreLog {
     /// A log homed at the store's own home, accepting AgentSession receipts.
     pub fn new(store: Arc<Mutex<Store>>) -> Self {
-        let home = store.lock().expect("store writer").home().to_owned();
+        let home = lock_store(&store).home().to_owned();
         Self { store, home, receipts: ReceiptLog::new() }
     }
 
@@ -112,6 +147,95 @@ impl StoreLog {
         }
         Ok(log)
     }
+}
+
+/// A home over `log` holding every resource of `M`'s kind homed at the log's home, as the store
+/// holds them, so a restart keeps writing where it left off.
+pub fn open_home<M>(log: StoreLog) -> Result<flotilla_state_machines::Home<M, StoreLog>, String>
+where
+    M: Machine,
+    Resource<M>: Kind,
+    StoreLog: Log<M>,
+{
+    let home = log.home().to_owned();
+    let stored = {
+        let mut store = lock_store(log.store());
+        let mut read = store.read().map_err(|error| error.to_string())?;
+        let mut stored = Vec::new();
+        let mut after = None;
+        loop {
+            let page = read.scan::<Resource<M>>(&home, after, 64).map_err(|error| error.to_string())?;
+            for id in page.ids {
+                if let Some(loaded) = read.load::<Resource<M>>(id).map_err(|error| error.to_string())? {
+                    stored.push(loaded.value.with_identity(&loaded.name, loaded.version));
+                }
+            }
+            after = page.next;
+            if after.is_none() {
+                break stored;
+            }
+        }
+    };
+    let mut opened =
+        flotilla_state_machines::Home::with_log(home.clone(), log).map_err(|errors| format!("{} home: {errors:?}", M::NAME))?;
+    for resource in stored {
+        opened.restore(resource).map_err(|error| format!("{} home: {error:?}", M::NAME))?;
+    }
+    Ok(opened)
+}
+
+/// The rehearsal store's own home: no record is authored there.
+pub const REHEARSAL_HOME: &str = "import-rehearsal";
+
+/// The pre-roll import rehearsal (#3629 layer 9): writes each `(home, resource)` into a temporary
+/// store over `kinds` as a restore at its home, reads it back and compares. Returns each resource
+/// the store refused, or read back differently, by its index in `imported`, with the reason: two
+/// homes' resources of one name are told apart. The store's own home is
+/// [`REHEARSAL_HOME`], so every resource restores as another home's; one claiming that home is refused.
+pub fn rehearse<M>(kinds: KindRegistry, imported: &[(String, Resource<M>)]) -> Vec<(usize, String)>
+where
+    M: Machine,
+    M::Spec: PartialEq,
+    Resource<M>: Kind,
+{
+    use flotilla_schema::Encoder;
+    let store = rusqlite::Connection::open_in_memory()
+        .map_err(|error| error.to_string())
+        .and_then(|connection| Store::open(connection, REHEARSAL_HOME, kinds).map_err(|error| error.to_string()));
+    let mut store = match store {
+        Ok(store) => store,
+        Err(error) => return (0..imported.len()).map(|index| (index, error.clone())).collect(),
+    };
+    let mut refused = Vec::new();
+    for (index, (home, resource)) in imported.iter().enumerate() {
+        if home == REHEARSAL_HOME {
+            refused.push((index, format!("homed at `{REHEARSAL_HOME}`, the rehearsal's own home")));
+            continue;
+        }
+        let result = Encoder::encode(resource).map_err(|error| error.to_string()).and_then(|rows| {
+            let snapshot = flotilla_schema_sqlite::Snapshot {
+                kind: Resource::<M>::CODE,
+                name: resource.name().to_owned(),
+                home: home.clone(),
+                version: resource.version().0,
+                rows,
+            };
+            let mut write = store.write().map_err(|error| error.to_string())?;
+            write.restore(&snapshot).map_err(|error| error.to_string())?;
+            write.commit().map_err(|error| error.to_string())?;
+            let mut read = store.read().map_err(|error| error.to_string())?;
+            let id = read.resolve(Resource::<M>::CODE, resource.name(), home).map_err(|error| error.to_string())?.ok_or("not restored")?;
+            let loaded = read.load::<Resource<M>>(id).map_err(|error| error.to_string())?.ok_or("not loaded")?;
+            if &loaded.value.with_identity(&loaded.name, loaded.version) != resource {
+                return Err("reads back differently".to_owned());
+            }
+            Ok(())
+        });
+        if let Err(reason) = result {
+            refused.push((index, reason));
+        }
+    }
+    refused
 }
 
 /// Every entry about resource `id`, paged through `Read::about`.
@@ -161,7 +285,7 @@ where
 {
     fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<M>, reads: &[InputRead]) -> Result<Version, LogError> {
         let origin = Origin::new(writer, at).with_payload(&reads.to_vec()).map_err(refused)?;
-        let mut store = self.store.lock().expect("store writer");
+        let mut store = lock_store(&self.store);
         let mut write = store.write().map_err(refused)?;
         let stamp = write.insert(resource.name(), resource, &origin).map_err(refused)?;
         write.commit().map_err(refused)?;
@@ -182,7 +306,7 @@ where
         let master = |name: &str| Identity { kind: Resource::<Message>::CODE, name: name.to_owned(), home: self.home.clone() };
         let edge = next.stored_edge_about(previous, event, master).map_err(refused)?;
         let edge = writes.iter().try_fold(edge, |edge, write| write.store(edge)).map_err(refused)?;
-        let mut store = self.store.lock().expect("store writer");
+        let mut store = lock_store(&self.store);
         let mut write = store.write().map_err(refused)?;
         let id =
             write.resolve(Resource::<M>::CODE, next.name(), &self.home).map_err(refused)?.ok_or_else(|| LogError::new("not stored"))?;
@@ -230,7 +354,7 @@ impl Log<Message> for MessageLog {
         reads: &[InputRead],
     ) -> Result<Resource<Message>, LogError> {
         let origin = Origin::new(writer, at).with_payload(&reads.to_vec()).map_err(refused)?;
-        let mut store = self.inner.store.lock().expect("store writer");
+        let mut store = lock_store(&self.inner.store);
         let mut write = store.write().map_err(refused)?;
         let mut spec = resource.spec().clone();
         spec.admitted_seq = write.last_sequence(&self.inner.home).map_err(refused)? + 1;

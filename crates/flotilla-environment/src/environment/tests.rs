@@ -5,12 +5,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, HostName, ImageSource};
+use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, ImageSource};
 
 use super::{
-    contained_daemon_socket_path, docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner, CreateOpts, EnvironmentProvider,
-    EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate,
-    ImagePullPolicy, ProvisionedMount, ProvisionedMountMode,
+    contained_daemon_socket_path, contract_tests::LocalImageTags, docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner,
+    CreateOpts, EnvironmentProvider, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind,
+    EnvironmentVariableUpdate, ImagePullPolicy, ProvisionedMount, ProvisionedMountMode,
 };
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
@@ -58,6 +58,8 @@ struct RecordingRunner {
     result: Result<String, String>,
     image_environment: Mutex<VecDeque<Result<String, String>>>,
     memory_info: Option<Result<String, String>>,
+    tags: LocalImageTags,
+    dockerfiles: Mutex<Vec<String>>,
 }
 
 impl RecordingRunner {
@@ -67,11 +69,20 @@ impl RecordingRunner {
             result: Ok(output.to_string()),
             image_environment: Mutex::new(VecDeque::new()),
             memory_info: None,
+            tags: Default::default(),
+            dockerfiles: Mutex::new(vec![]),
         }
     }
 
     fn new_err(msg: &str) -> Self {
-        Self { calls: Mutex::new(vec![]), result: Err(msg.to_string()), image_environment: Mutex::new(VecDeque::new()), memory_info: None }
+        Self {
+            calls: Mutex::new(vec![]),
+            result: Err(msg.to_string()),
+            image_environment: Mutex::new(VecDeque::new()),
+            memory_info: None,
+            tags: Default::default(),
+            dockerfiles: Mutex::new(vec![]),
+        }
     }
 
     /// Answers the next `docker image inspect --format '{{json .Config.Env}}'`
@@ -109,6 +120,9 @@ impl CommandRunner for RecordingRunner {
                 .unwrap_or_else(|| Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into()));
         }
         self.calls.lock().expect("calls mutex").push((cmd.to_string(), args.iter().map(|a| a.to_string()).collect(), cwd.to_path_buf()));
+        if let ("docker", ["tag", id, tag]) = (cmd, args) {
+            return self.tags.tag(id, tag);
+        }
         if cmd == "docker" && args.starts_with(&["inspect", "--format", "{{.Image}}"]) {
             return Ok("sha256:test-image-digest\n".to_string());
         }
@@ -122,6 +136,16 @@ impl CommandRunner for RecordingRunner {
         self.result.clone()
     }
 
+    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        assert_eq!(cmd, "docker");
+        assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
+        let dockerfile = std::str::from_utf8(input).unwrap();
+        assert!(dockerfile.contains("COPY --from=tools /opt/drydock /opt/drydock"));
+        self.dockerfiles.lock().unwrap().push(dockerfile.into());
+        self.calls.lock().unwrap().push((cmd.into(), args.iter().map(|s| s.to_string()).collect(), cwd.into()));
+        // The derived image keeps the base's identity in this double.
+        Ok(self.tags.resolve_build(dockerfile)?.unwrap_or_else(|| format!("sha256:{}", "a".repeat(64))))
+    }
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         match self.run(cmd, args, cwd, label).await {
             Ok(stdout) => Ok(CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) }),
@@ -201,11 +225,12 @@ async fn exists_returns_false_on_failure() {
 struct QueuedRunner {
     calls: Mutex<Vec<(String, Vec<String>, PathBuf)>>,
     responses: Mutex<VecDeque<Result<String, String>>>,
+    tags: LocalImageTags,
 }
 
 impl QueuedRunner {
     fn new(responses: impl IntoIterator<Item = Result<String, String>>) -> Self {
-        Self { calls: Mutex::new(vec![]), responses: Mutex::new(responses.into_iter().collect()) }
+        Self { calls: Mutex::new(vec![]), responses: Mutex::new(responses.into_iter().collect()), tags: Default::default() }
     }
 
     fn calls(&self) -> Vec<(String, Vec<String>, PathBuf)> {
@@ -228,14 +253,32 @@ impl QueuedRunner {
 impl CommandRunner for QueuedRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
         // Host capacity probe fixture, independent of the command under test.
+        if args.starts_with(&["exec", "--user", "0"])
+            || matches!(args, ["exec", _, "/opt/drydock/drydock-agent", "--supervise", "--socket", "/run/drydock/agent.sock"])
+        {
+            return Ok(String::new());
+        }
+
         if cmd == "docker" && args == ["info", "--format", "{{json .}}"] {
             return Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into());
         }
         self.calls.lock().expect("calls mutex").push((cmd.to_string(), args.iter().map(|a| a.to_string()).collect(), cwd.to_path_buf()));
+        if let ("docker", ["tag", id, tag]) = (cmd, args) {
+            return self.tags.tag(id, tag);
+        }
         let mut queue = self.responses.lock().expect("responses mutex");
         queue.pop_front().unwrap_or(Err("no more responses".into()))
     }
 
+    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        assert_eq!(cmd, "docker");
+        assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
+        let dockerfile = std::str::from_utf8(input).unwrap();
+        assert!(dockerfile.contains("COPY --from=tools /opt/drydock /opt/drydock"));
+        self.calls.lock().unwrap().push((cmd.into(), args.iter().map(|s| s.to_string()).collect(), cwd.into()));
+        // The derived image keeps the base's identity in this double.
+        Ok(self.tags.resolve_build(dockerfile)?.unwrap_or_else(|| format!("sha256:{}", "a".repeat(64))))
+    }
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         match self.run(cmd, args, cwd, label).await {
             Ok(stdout) => Ok(CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) }),
@@ -278,18 +321,54 @@ fn pinned_spec() -> flotilla_resources::EnvironmentSpec {
 }
 
 // The subprocess double represents the Docker CLI. A held digest prepares
-// without building or pulling; absent local-only digests wait on ImageBuild.
+// without pulling/rebuilding the base; absent local-only digests wait on ImageBuild.
 #[tokio::test]
-async fn preparation_uses_existing_digest_and_never_builds() {
+#[cfg(unix)]
+async fn preparation_adds_only_drydock_tools_to_existing_digest() {
     for present in [true, false] {
         let runner = Arc::new(RecordingRunner::new_ok("present"));
         let missing = Arc::new(RecordingRunner::new_err("absent"));
         let selected = if present { runner } else { missing };
-        let provider = DockerEnvironmentProvider::new(selected.clone());
+        let provider = super::contract_tests::docker_provider(selected.clone());
         assert_eq!(provider.prepare(&pinned_spec(), &Default::default()).await.is_ok(), present);
-        assert_eq!(selected.calls().len(), 1);
+        assert_eq!(selected.calls().len(), if present { 3 } else { 1 });
         assert_eq!(selected.calls()[0].1[0..2], ["image", "inspect"]);
     }
+}
+
+// #3756 on feta: BuildKit resolves `FROM sha256:<id>` as Docker Hub's `sha256`
+// repository. The double refuses that, so a bare local ID must be tagged first.
+#[tokio::test]
+#[cfg(unix)]
+async fn derived_build_names_a_bare_local_id_before_building_from_it() {
+    let id = format!("sha256:{}", "a".repeat(64));
+    let tag = format!("flotilla-agent-base:{}", "a".repeat(64));
+    let runner = Arc::new(RecordingRunner::new_ok("present"));
+    let provider = super::contract_tests::docker_provider(runner.clone());
+    provider.prepare(&pinned_spec(), &Default::default()).await.expect("prepare local digest");
+    let calls: Vec<_> = runner.calls().into_iter().map(|(_, args, _)| args).collect();
+    assert_eq!(calls[1], ["tag", id.as_str(), tag.as_str()]);
+    assert_eq!(calls[2], ["build", "--quiet", "--network=none", "-"]);
+    let dockerfiles = runner.dockerfiles.lock().unwrap().clone();
+    assert_eq!(dockerfiles.len(), 1);
+    assert!(dockerfiles[0].ends_with(&format!("\nFROM {tag}\nCOPY --from=tools /opt/drydock /opt/drydock\n")));
+}
+
+// A registry digest reference already resolves in BuildKit; it is built from
+// exactly as admitted, and no local tag is created for it.
+#[tokio::test]
+#[cfg(unix)]
+async fn derived_build_uses_a_registry_digest_reference_unchanged() {
+    let reference = format!("registry.example/crew@sha256:{}", "a".repeat(64));
+    let mut spec = pinned_spec();
+    spec.docker.as_mut().expect("docker").image = reference.clone();
+    let runner = Arc::new(RecordingRunner::new_ok("present"));
+    let provider = super::contract_tests::docker_provider(runner.clone());
+    provider.prepare(&spec, &Default::default()).await.expect("prepare registry digest");
+    assert!(runner.calls().iter().all(|(_, args, _)| args.first().is_none_or(|arg| arg != "tag")));
+    let dockerfiles = runner.dockerfiles.lock().unwrap().clone();
+    assert_eq!(dockerfiles.len(), 1);
+    assert!(dockerfiles[0].ends_with(&format!("\nFROM {reference}\nCOPY --from=tools /opt/drydock /opt/drydock\n")));
 }
 
 // Host adoption returns the injected runner and never starts or stops the host.
@@ -301,6 +380,7 @@ async fn host_adoption_is_idempotent_and_preparation_is_instance_scoped() {
     let provider = HostDirectEnvironmentProvider::new(runner.clone(), Default::default());
     let other = HostDirectEnvironmentProvider::new(runner.clone(), Default::default());
     let spec = flotilla_resources::EnvironmentSpec {
+        cloud_sandbox: None,
         provider_address: None,
         host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/".into() }),
         docker: None,
@@ -1336,113 +1416,6 @@ async fn environment_runner_transforms_commands_for_container() {
     assert_eq!(cwd, Path::new("/"));
 }
 
-/// Integration test: three-hop composition — SSH → docker exec → terminal attach.
-///
-/// Builds a HopPlan with RemoteToHost + EnterEnvironment + RunCommand and resolves
-/// it end-to-end using mock resolvers. Asserts that the output is correctly nested:
-/// SSH wrapping docker exec wrapping the terminal attach command.
-#[test]
-fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
-    use std::collections::HashMap;
-
-    use flotilla_protocol::arg::{flatten, Arg};
-
-    use crate::hop_chain::environment::DockerEnvironmentHopResolver;
-    use crate::hop_chain::remote::RemoteHopResolver;
-    use crate::hop_chain::resolver::HopResolver;
-    use crate::hop_chain::Hop;
-    use crate::hop_chain::HopPlan;
-    use crate::hop_chain::ResolutionContext;
-    use crate::hop_chain::ResolvedAction;
-
-    // ── Mock resolvers ───────────────────────────────────────────────
-
-    /// A minimal mock RemoteHopResolver for wrap mode:
-    /// pops the inner Command, wraps with ssh <host> <NestedCommand(inner)>.
-    struct MockRemote;
-    impl RemoteHopResolver for MockRemote {
-        fn resolve_wrap(&self, host: &HostName, context: &mut ResolutionContext) -> Result<(), String> {
-            let inner_action = context.actions.pop().ok_or("mock: no inner action")?;
-            let ResolvedAction::Command(inner_args) = inner_action;
-            let mut ssh_args = vec![Arg::Literal("ssh".into()), Arg::Quoted(host.as_str().to_string())];
-            ssh_args.push(Arg::NestedCommand(inner_args));
-            context.actions.push(ResolvedAction::Command(ssh_args));
-            Ok(())
-        }
-    }
-
-    // ── Build the HopResolver ────────────────────────────────────────
-
-    let mut containers = HashMap::new();
-    containers.insert(EnvironmentId::new("env1"), "container-abc".to_string());
-    let docker_env = Arc::new(DockerEnvironmentHopResolver::new(containers));
-
-    let resolver = HopResolver::new(Arc::new(MockRemote), docker_env);
-
-    // ── Build the HopPlan: RemoteToHost → EnterEnvironment → RunCommand ──
-
-    let plan = HopPlan(vec![
-        Hop::RemoteToHost { host: HostName::new("feta") },
-        Hop::EnterEnvironment { env_id: EnvironmentId::new("env1"), provider: "docker".into() },
-        Hop::RunCommand { command: vec![Arg::Literal("cleat".into()), Arg::Literal("attach".into()), Arg::Literal("sess-123".into())] },
-    ]);
-
-    // ── Resolve from a different host ────────────────────────────────
-
-    let mut context = ResolutionContext {
-        current_host: HostName::new("local-host"),
-        current_environment: None,
-        working_directory: None,
-        actions: Vec::new(),
-        nesting_depth: 0,
-    };
-
-    let resolved = resolver.resolve(&plan, &mut context).expect("resolve should succeed");
-
-    // ── Assert output structure ──────────────────────────────────────
-
-    // Should produce a single Command action (all wrapped)
-    assert_eq!(resolved.0.len(), 1, "three-hop wrap should produce exactly one Command action");
-
-    let ResolvedAction::Command(outer_args) = &resolved.0[0];
-
-    // Outermost: ssh <host> <NestedCommand(...)>
-    assert_eq!(outer_args[0], Arg::Literal("ssh".into()), "outermost command should be ssh");
-    assert_eq!(outer_args[1], Arg::Quoted("feta".into()), "ssh target should be feta");
-    assert_eq!(outer_args.len(), 3, "ssh args should have exactly 3 elements (ssh, target, nested)");
-
-    // Middle: a client-side supervisor wrapping docker exec and the terminal attach.
-    let docker_nested = match &outer_args[2] {
-        Arg::NestedCommand(args) => args,
-        other => panic!("expected NestedCommand for docker layer, got {other:?}"),
-    };
-    assert_eq!(docker_nested[0], Arg::Literal("sh".into()), "middle command should be the supervisor shell");
-    assert_eq!(docker_nested[1], Arg::Literal("-c".into()));
-    let Arg::Quoted(wrapper) = &docker_nested[2] else { panic!("expected quoted supervisor") };
-    assert!(wrapper.contains("trap cleanup EXIT HUP INT TERM"));
-    assert!(wrapper.contains("kill -KILL \"$pid\""));
-    assert_eq!(docker_nested[4], Arg::Quoted("container-abc".into()), "docker exec target should be container-abc");
-
-    // Innermost args are flattened directly into the docker exec invocation
-    assert_eq!(docker_nested[7], Arg::Literal("cleat".into()), "innermost command should be cleat");
-    assert_eq!(docker_nested[8], Arg::Literal("attach".into()), "cleat subcommand should be attach");
-    assert_eq!(docker_nested[9], Arg::Literal("sess-123".to_string()), "cleat should attach to correct session");
-    assert_eq!(docker_nested.len(), 10, "docker nested should have exactly 10 args");
-
-    // Verify flatten produces the expected structure
-    let flat = flatten(outer_args, 0);
-    assert!(flat.starts_with("ssh "), "flattened output should start with ssh: {flat}");
-    assert!(flat.contains("docker exec"), "should contain supervised docker exec: {flat}");
-    assert!(flat.contains("container-abc"), "should contain the quoted container target: {flat}");
-    assert!(flat.contains("cleat attach"), "should contain cleat attach: {flat}");
-    assert!(flat.contains("sess-123"), "should contain session id: {flat}");
-
-    // Verify nesting depth updated for both remote and environment hops
-    assert_eq!(context.nesting_depth, 2, "nesting_depth should be 2 after remote + environment hops");
-    assert_eq!(context.current_host.as_str(), "feta", "current_host should be updated to feta");
-    assert_eq!(context.current_environment, Some(EnvironmentId::new("env1")), "current_environment should be env1");
-}
-
 // #2653: every contained environment must bound RAM and disable swap by default.
 #[tokio::test]
 async fn create_bounds_memory_and_swap() {
@@ -1701,17 +1674,24 @@ async fn list_backings_rejects_incomplete_identity() {
 // Docker provisioning consumes only its own preparation, uses the prepared
 // image without an implicit pull, and exposes the environment runner and mounts.
 #[tokio::test]
+#[cfg(unix)]
 async fn docker_provisions_prepared_digest_and_refuses_another_instance() {
-    let runner = Arc::new(QueuedRunner::new([Ok("held".into()), Ok("container-id".into()), Ok(format!("sha256:{}", "a".repeat(64)))]));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
-    let other = DockerEnvironmentProvider::new(runner.clone());
+    let runner = Arc::new(QueuedRunner::new([
+        Ok("held".into()),
+        Ok("container-id".into()),
+        Ok(format!("sha256:{}", "a".repeat(64))),
+        Ok(r#"["HOME=/tmp","PATH=/usr/bin:/bin"]"#.into()),
+    ]));
+    let provider = super::contract_tests::docker_provider(runner.clone());
+    let other = super::contract_tests::docker_provider(runner.clone());
     let prepared = provider.prepare(&pinned_spec(), &Default::default()).await.expect("prepare held digest");
     let id = EnvironmentId::new("prepared-docker");
     assert!(other.provision(id.clone(), &prepared, Default::default()).await.is_err());
     let handle = provider.provision(id.clone(), &prepared, Default::default()).await.expect("provision");
     assert_eq!(handle.id(), &id);
     assert_eq!(handle.image().as_str(), pinned_spec().docker.expect("docker").image);
-    assert!(handle.provisioned_mounts().is_empty());
+    assert_eq!(handle.provisioned_mounts().len(), 1);
+    assert_eq!(handle.provisioned_mounts()[0].environment_path.as_path(), Path::new("/run/drydock"));
     let calls = runner.calls();
     let run = calls.iter().find(|(_, args, _)| args.first().is_some_and(|arg| arg == "run")).expect("container run");
     assert!(run.1.windows(2).any(|args| args == ["--pull", "never"]));
@@ -1721,21 +1701,22 @@ async fn docker_provisions_prepared_digest_and_refuses_another_instance() {
 // preparation reports pull/verification failures without classifying them as build demand.
 // The queued runner stands in for Docker's subprocess interface.
 #[tokio::test]
+#[cfg(unix)]
 async fn preparation_pulls_only_pinned_registry_content() {
     let mut spec = pinned_spec();
     spec.docker.as_mut().expect("docker").image = format!("registry.example/crew@sha256:{}", "a".repeat(64));
     let mut opts = super::PrepareOpts { legacy_baseline: false, prepared_auth: test_registry_auth("/private/operation-auth") };
     let runner = Arc::new(QueuedRunner::new([Err("not held".into()), Ok("pulled".into()), Ok("held".into())]));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = super::contract_tests::docker_provider(runner.clone());
     provider.prepare(&spec, &opts).await.expect("pull existing digest");
     let calls = runner.calls();
-    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.len(), 4);
     assert_eq!(calls[1].1, ["--config", "/private/operation-auth", "pull", spec.docker.as_ref().expect("docker").image.as_str()]);
-    let absent = DockerEnvironmentProvider::new(Arc::new(QueuedRunner::new([Err("not held".into()), Err("not published".into())])));
+    let absent = super::contract_tests::docker_provider(Arc::new(QueuedRunner::new([Err("not held".into()), Err("not published".into())])));
     opts.prepared_auth = test_registry_auth("/private/operation-auth");
     let error = absent.prepare(&spec, &opts).await.err().expect("pull failed");
     assert!(error.starts_with("pinned image pull failed:"));
-    let absent_after_pull = DockerEnvironmentProvider::new(Arc::new(QueuedRunner::new([
+    let absent_after_pull = super::contract_tests::docker_provider(Arc::new(QueuedRunner::new([
         Err("not held".into()),
         Ok("pulled".into()),
         Err("still absent".into()),
@@ -1764,6 +1745,7 @@ async fn preparation_refuses_mutable_or_malformed_image_identity() {
 // Live pre-#2731 fleet records carry a baseline tag and no ImageBuild ref.
 // A controller-admitted baseline remains launchable, but runs the resolved digest.
 #[tokio::test]
+#[cfg(unix)]
 async fn live_baseline_tag_without_image_build_provisions_a_digest() {
     let tag = "forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-10-02.d9e59d8c.dbd6e440";
     let digest = format!("sha256:{}", "b".repeat(64));
@@ -1774,8 +1756,9 @@ async fn live_baseline_tag_without_image_build_provisions_a_digest() {
             Ok(digest.clone()),
             Ok("container-id".into()),
             Ok(digest.clone()),
+            Ok(r#"["HOME=/tmp","PATH=/usr/bin:/bin"]"#.into()),
         ]));
-        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let provider = super::contract_tests::docker_provider(runner.clone());
         let mut spec = pinned_spec();
         let docker = spec.docker.as_mut().expect("docker");
         docker.image = tag.into();
@@ -1790,9 +1773,15 @@ async fn live_baseline_tag_without_image_build_provisions_a_digest() {
         assert_eq!(handle.image().as_str(), digest);
         let calls = runner.calls();
         assert_eq!(calls[1].1, ["pull", tag]);
-        assert!(calls[3].1.contains(&digest));
-        assert!(!calls[3].1.contains(&tag.to_string()));
-        assert!(calls[3].1.windows(2).any(|args| args == ["--pull", "never"]));
+        assert!(calls.iter().find(|(_, args, _)| args.first().is_some_and(|arg| arg == "run")).unwrap().1.contains(&digest));
+        assert!(!calls.iter().find(|(_, args, _)| args.first().is_some_and(|arg| arg == "run")).unwrap().1.contains(&tag.to_string()));
+        assert!(calls
+            .iter()
+            .find(|(_, args, _)| args.first().is_some_and(|arg| arg == "run"))
+            .unwrap()
+            .1
+            .windows(2)
+            .any(|args| args == ["--pull", "never"]));
     }
 }
 
@@ -1842,4 +1831,15 @@ async fn create_rejects_nested_tool_mounts_but_accepts_adjacent_paths() {
         let result = provider.create(EnvironmentId::new("nested"), &flotilla_protocol::ImageId::new("image"), opts).await;
         assert_eq!(result.is_err(), rejected, "target {target}");
     }
+}
+
+// Unsupported platforms still exercise the provider's explicit refusal rather
+// than compiling a Unix transport fixture into the Windows test binary.
+#[cfg(not(unix))]
+#[tokio::test]
+async fn docker_agent_provisioning_reports_unsupported_host() {
+    let provider = DockerEnvironmentProvider::new(Arc::new(RecordingRunner::new_ok("")));
+    let prepared = super::PreparedEnvironment::new(&Arc::new(()), ());
+    let error = provider.provision(EnvironmentId::new("unsupported"), &prepared, Default::default()).await.err().unwrap();
+    assert!(error.contains("require a Unix host"));
 }

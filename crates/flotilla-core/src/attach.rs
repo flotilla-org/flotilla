@@ -10,19 +10,16 @@ use std::{
 
 use flotilla_charter::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION;
 use flotilla_config::ConfigStore;
-use flotilla_environment::hop_chain::{
-    environment::DockerEnvironmentHopResolver,
-    remote::{NoopRemoteHopResolver, SshConnection, SshRemoteHopResolver},
-    resolver::HopResolver,
-    Hop, HopPlan, ResolutionContext,
-};
+use flotilla_environment::hop_chain::remote::{SshConnection, SshRemoteHopResolver};
+use flotilla_projections::ports::ProvisioningKind;
+
 use flotilla_protocol::{
     arg::Arg,
     commands::AttachMode,
     qualified_path::HostId,
     result_set::{CheckoutRow, Rows},
-    AttachBinding, CanonicalHostId, ConvoyPhase, EnvironmentId, FleetListRow, FleetStaleness, HostName, ResolvedAttachAction,
-    ResolvedAttachPlan,
+    AttachBinding, CanonicalHostId, ConvoyPhase, EnvironmentId, FleetListRow, FleetStaleness, HostName, LifecycleReading,
+    ResolvedAttachAction, ResolvedAttachPlan,
 };
 use flotilla_resources::{
     terminal_session_attach_target_with_stale_status, Convoy as ResourceConvoy, ConvoyPhase as ResourceConvoyPhase,
@@ -36,6 +33,7 @@ use super::{discover_repo_for_environment, LiveConvoyRecord};
 use flotilla_discovery::{registry::ProviderRegistry, DiscoveryRuntime};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_projections::aggregator_projection::AggregatorProjectionState;
+use flotilla_provider_runtime::host_environment::HostEnvironment;
 use flotilla_resources::convoy_address::{convoy_address, RoleAddress};
 use flotilla_terminal::TerminalSessionLiveness;
 
@@ -89,6 +87,10 @@ pub(super) struct AttachResolver<'a> {
     pub(super) local_environment_id: &'a EnvironmentId,
     pub(super) host_name: &'a HostName,
     pub(super) namespace: &'a std::sync::RwLock<String>,
+    /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4).
+    pub(super) lifecycle_reads: &'a dyn flotilla_projections::ports::LifecycleReads,
+    /// Sessions on agentless hosts attach through their vessel's agent (#3792).
+    pub(super) agentless_vessels: Option<Arc<dyn super::AgentlessVesselAccess>>,
 }
 
 impl<'a> AttachResolver<'a> {
@@ -116,7 +118,63 @@ impl<'a> AttachResolver<'a> {
         mode: AttachMode,
         project_context: Option<&str>,
     ) -> Result<ResolvedAttach, String> {
+        if let Some(id) = reference.strip_prefix(flotilla_protocol::commands::ENVIRONMENT_SHELL_REFERENCE_PREFIX) {
+            return self.environment_shell(id, reference, host, mode).await;
+        }
         self.resolve_attach_with_context(reference, host, transient, mode, project_context).await
+    }
+
+    async fn environment_shell(
+        &self,
+        id: &str,
+        reference: &str,
+        host: Option<&HostName>,
+        mode: AttachMode,
+    ) -> Result<ResolvedAttach, String> {
+        let namespace = self.provisioning_namespace().await;
+        let environment = self.resource_backend.using::<ResourceEnvironment>(&namespace).get(id).await.map_err(|e| e.to_string())?;
+        let spec = environment.spec.docker.as_ref().ok_or("environment shell requires a contained environment")?;
+        let owner = self.target_host_with_reads(&AttachReadContext::default(), &namespace, &spec.host_ref).await?;
+        if host.is_some_and(|requested| requested != &owner) {
+            return Err(format!("environment {id} is not on the requested host"));
+        }
+        let binding = AttachBinding::builder().host(owner.clone()).namespace(namespace).session(reference.to_string()).build();
+        if owner != *self.host_name {
+            return Ok(ResolvedAttach {
+                plan: self.recursive_attach_plan_for_remote(&owner, reference, mode).await?,
+                binding: Some(binding),
+            });
+        }
+        let handle = self
+            .environment_manager
+            .managed_environments()
+            .into_iter()
+            .find_map(|(name, state)| {
+                if name.as_str() != id {
+                    return None;
+                }
+                match state {
+                    ManagedEnvironmentKind::Provisioned(state) => Some(state.handle),
+                    _ => None,
+                }
+            })
+            .ok_or("environment has no live handle")?;
+        let cwd = ExecutionEnvironmentPath::new(handle.capabilities().workspace_root);
+        let agent = handle.agent();
+        if let Some(agent) = agent {
+            if agent.ready().await.is_ok() {
+                let registry = self.registry_for_resource_environment(&AttachReadContext::default(), &environment, cwd.as_path()).await?;
+                let pool = registry.terminal_pools.get("cleat").map(|(_, pool)| pool.clone()).ok_or("environment has no cleat pool")?;
+                let session = format!("flotilla-shell-{}", uuid::Uuid::new_v4());
+                pool.ensure_session(&session, "exec \"${SHELL:-/bin/sh}\" -l", &cwd, &Vec::new(), &[]).await?;
+                let endpoint = pool.cleat_endpoint(&session).await?.ok_or("shell has no cleat endpoint")?;
+                let guest = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
+                let socket = agent.forward_socket(&guest).await?;
+                return Ok(ResolvedAttach { plan: cleat_socket_attach_plan(&socket, &endpoint.session, mode), binding: Some(binding) });
+            }
+        }
+        let plan = handle.fallback_shell_plan(cwd.as_path()).ok_or("agent unavailable and environment has no fallback shell")?;
+        Ok(ResolvedAttach { plan, binding: Some(binding) })
     }
 
     pub(super) async fn resolve_transient(&self, reference: &str, host: Option<&HostName>) -> Result<ResolvedAttach, String> {
@@ -582,26 +640,28 @@ impl<'a> AttachResolver<'a> {
             .map(|spec| spec.host_ref.as_str())
             .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
             .ok_or_else(|| format!("environment {} has no host binding", session.spec.env_ref))?;
-        if let Some(destination) =
-            self.environment_manager.managed_environments().into_iter().find(|(id, _)| id.as_str() == session.spec.env_ref).and_then(
-                |(_, state)| match state {
-                    ManagedEnvironmentKind::Direct(direct) => direct.ssh_destination,
-                    _ => None,
-                },
-            )
+        if let Some((destination, host_environment)) = self
+            .environment_manager
+            .managed_environments()
+            .into_iter()
+            .find(|(id, _)| id.as_str() == session.spec.env_ref)
+            .and_then(|(_, state)| match state {
+                ManagedEnvironmentKind::Direct(direct) => direct.ssh_destination.map(|destination| (destination, direct.host_environment)),
+                _ => None,
+            })
         {
+            // #3792: a session in a vessel attaches through the vessel's agent,
+            // as a Docker vessel's does; the owning daemon resolves it.
+            if let Some(access) = &self.agentless_vessels {
+                let target = terminal_session_attach_target_with_stale_status(session)?;
+                if let Some(attach) = access.attach(&session.spec, target.session_id, seat).await {
+                    let (socket, name) = attach?;
+                    return Ok((cleat_socket_attach_plan(&socket, &name, seat), self.host_name.clone()));
+                }
+            }
             let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
             let attach_args = self.terminal_pool_attach_args(reads, session, &environment, &cwd, seat).await?;
-            let plan = ResolvedAttachPlan::command(vec![
-                Arg::Literal("ssh".to_string()),
-                Arg::Literal("-tt".to_string()),
-                Arg::Literal("-o".to_string()),
-                Arg::Literal("BatchMode=yes".to_string()),
-                Arg::Quoted(destination),
-                Arg::Literal("sh".to_string()),
-                Arg::Literal("-lc".to_string()),
-                Arg::NestedCommand(attach_args),
-            ]);
+            let plan = agentless_ssh_attach_plan(destination, &host_environment, attach_args);
             // The owning daemon resolves future attach requests; the target
             // has no flotillad to receive a recursive attach command.
             return Ok((plan, self.host_name.clone()));
@@ -666,25 +726,38 @@ impl<'a> AttachResolver<'a> {
         let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
         let attach_args = self.terminal_pool_attach_args(reads, session, environment, &cwd, seat).await?;
         if environment.spec.docker.is_some() {
-            let environment_id = EnvironmentId::new(session.spec.env_ref.clone());
-            let container_name = environment.status.as_ref().and_then(|status| status.docker_container_id.as_deref());
-            let container_name =
-                container_name.ok_or_else(|| format!("environment {} has no docker container id", session.spec.env_ref))?;
-            let environment_resolver =
-                DockerEnvironmentHopResolver::new(HashMap::from([(environment_id.clone(), container_name.to_string())]));
-            let hop_resolver = HopResolver::new(Arc::new(NoopRemoteHopResolver), Arc::new(environment_resolver));
-            let plan = HopPlan(vec![
-                Hop::EnterEnvironment { env_id: environment_id, provider: "docker".to_string() },
-                Hop::RunCommand { command: attach_args },
-            ]);
-            let mut context = ResolutionContext {
-                current_host: self.host_name.clone(),
-                current_environment: None,
-                working_directory: Some(cwd),
-                actions: Vec::new(),
-                nesting_depth: 0,
+            // The engine's realised backing is authoritative behind [primitives].
+            // Attach through its live agent handle, never a stale prior backing.
+            let realised = match self.lifecycle_reads.reading(ProvisioningKind::Environment, &environment.metadata.name, None) {
+                Some(LifecycleReading::Ready { identity }) => Some(identity),
+                _ => None,
             };
-            return hop_resolver.resolve(&plan, &mut context).map(|resolved| ResolvedAttachPlan(resolved.0));
+            let handle = self
+                .environment_manager
+                .managed_environments()
+                .into_iter()
+                .find_map(|(id, state)| {
+                    if id.as_str() != session.spec.env_ref {
+                        return None;
+                    }
+                    match state {
+                        ManagedEnvironmentKind::Provisioned(state)
+                            if realised.as_ref().is_none_or(|backing| state.handle.backing_id() == backing) =>
+                        {
+                            Some(state.handle)
+                        }
+                        _ => None,
+                    }
+                })
+                .ok_or_else(|| format!("environment {} has no live handle", session.spec.env_ref))?;
+            let agent = handle.agent().ok_or("vessel has no agent; use environment shell for diagnosis")?;
+            let registry = self.registry_for_resource_environment(reads, environment, cwd.as_path()).await?;
+            let pool = registry.terminal_pools.get(&session.spec.pool).map(|(_, pool)| pool.clone()).ok_or("terminal pool unavailable")?;
+            let target = terminal_session_attach_target_with_stale_status(session)?;
+            let endpoint = pool.cleat_endpoint(target.session_id).await?.ok_or("vessel attach requires a cleat socket endpoint")?;
+            let guest = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
+            let socket = agent.forward_socket(&guest).await?;
+            return Ok(cleat_socket_attach_plan(&socket, &endpoint.session, seat));
         }
         Ok(ResolvedAttachPlan(vec![ResolvedAttachAction::Command(attach_args)]))
     }
@@ -790,6 +863,24 @@ impl<'a> AttachResolver<'a> {
 }
 
 use flotilla_projections::ports::ResolvedAttach;
+
+/// Attach to a session on an agentless SSH host: the terminal pool's attach
+/// command runs in the host's composed environment, never its login profile
+/// (#3722).
+fn agentless_ssh_attach_plan(destination: String, host_environment: &HostEnvironment, attach_args: Vec<Arg>) -> ResolvedAttachPlan {
+    let mut remote = vec![Arg::Literal(host_environment.shell_prelude())];
+    remote.extend(attach_args);
+    ResolvedAttachPlan::command(vec![
+        Arg::Literal("ssh".to_string()),
+        Arg::Literal("-tt".to_string()),
+        Arg::Literal("-o".to_string()),
+        Arg::Literal("BatchMode=yes".to_string()),
+        Arg::Quoted(destination),
+        Arg::Literal("sh".to_string()),
+        Arg::Literal("-c".to_string()),
+        Arg::NestedCommand(remote),
+    ])
+}
 fn attach_convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
     match phase {
         ResourceConvoyPhase::Pending => ConvoyPhase::Pending,
@@ -1184,6 +1275,23 @@ fn transient_checkout_session_name(checkout: &CheckoutRow) -> String {
     format!("flotilla-checkout-{}", &digest[..32])
 }
 
+fn cleat_socket_attach_plan(socket: &Path, session: &str, seat: AttachMode) -> ResolvedAttachPlan {
+    let mut args = vec![
+        Arg::Literal("cleat".into()),
+        Arg::Literal("attach".into()),
+        Arg::Literal("--socket".into()),
+        Arg::Quoted(socket.to_string_lossy().into_owned()),
+        Arg::Literal("--no-create".into()),
+    ];
+    match seat {
+        AttachMode::Default => {}
+        AttachMode::Strict => args.push(Arg::Literal("--strict".into())),
+        AttachMode::PreferTake | AttachMode::Take => args.push(Arg::Literal("--take".into())),
+    }
+    args.push(Arg::Quoted(session.into()));
+    ResolvedAttachPlan::command(args)
+}
+
 #[cfg(test)]
 mod tests {
     use flotilla_store_testkit::ReadCountsBackendExt;
@@ -1204,6 +1312,60 @@ mod tests {
     use crate::testkits::discovery::fake_discovery;
     use flotilla_config::ConfigStore;
     use flotilla_daemon_api::daemon::DaemonHandle;
+
+    // #3722: attach to an agentless session runs its command in the host's
+    // composed environment. The plan's remote part runs here as sshd runs it,
+    // with a login profile that must not be read.
+    #[cfg(unix)]
+    #[test]
+    fn agentless_attach_composes_the_host_environment_without_its_login_profile() {
+        use flotilla_protocol::{arg::flatten, attach_plan::ResolvedAttachAction};
+        use flotilla_provider_runtime::host_environment::HostSupply;
+
+        let home = tempfile::tempdir().expect("remote home");
+        std::fs::write(home.path().join(".profile"), "echo read > \"$HOME/profile-read\"\n").expect("login profile");
+        let host =
+            HostEnvironment::new(vec![HostSupply { name: "cleat".into(), path: vec!["~/.local/opt/cleat/bin".into()], env: Vec::new() }])
+                .expect("declared supply");
+        let plan = agentless_ssh_attach_plan("crew@b1".into(), &host, vec![Arg::Literal("printf '%s' \"$PATH\"".into())]);
+        let [ResolvedAttachAction::Command(args)] = plan.0.as_slice() else { panic!("one command: {plan:?}") };
+        assert_eq!(flatten(&args[..5], 0), "ssh -tt -o BatchMode=yes 'crew@b1'");
+        // sshd hands the rest of the command line to the user's shell.
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &flatten(&args[5..], 0)])
+            .env_clear()
+            .env("HOME", home.path())
+            .output()
+            .expect("remote shell");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("utf-8"),
+            format!("{}/.local/opt/cleat/bin:/usr/local/bin:/usr/bin:/bin", home.path().display())
+        );
+        assert!(!home.path().join("profile-read").exists(), "attach read the login profile");
+    }
+
+    // The vessel hop executes the host cleat client and forwards only a socket.
+    // Generate every seat mode plus socket/session names needing shell quoting.
+    #[hegel::test]
+    fn vessel_attach_plan_preserves_socket_session_and_seat(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let modes = [AttachMode::Default, AttachMode::PreferTake, AttachMode::Strict, AttachMode::Take];
+        let mode = modes[tc.draw(gs::integers::<usize>().min_value(0).max_value(3))];
+        let names = ["plain", "with spaces", "with'quote", "Unicode-λ"];
+        let name = names[tc.draw(gs::integers::<usize>().min_value(0).max_value(3))];
+        let socket = PathBuf::from(format!("/tmp/{name}/socket"));
+        let plan = cleat_socket_attach_plan(&socket, name, mode);
+        let [ResolvedAttachAction::Command(args)] = plan.0.as_slice() else {
+            panic!("one hop");
+        };
+        assert_eq!(args[0], Arg::Literal("cleat".into()));
+        assert!(args.windows(2).any(|pair| pair == [Arg::Literal("--socket".into()), Arg::Quoted(socket.to_string_lossy().into_owned())]));
+        assert_eq!(args.last(), Some(&Arg::Quoted(name.into())));
+        assert_eq!(args.contains(&Arg::Literal("--take".into())), matches!(mode, AttachMode::PreferTake | AttachMode::Take));
+        assert_eq!(args.contains(&Arg::Literal("--strict".into())), mode == AttachMode::Strict);
+        assert!(!args.contains(&Arg::Literal("docker".into())));
+    }
 
     // Attach scenarios need a daemon and providers, independent of standing-convoy admission.
     async fn attach_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir) {

@@ -20,7 +20,7 @@ use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
-use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
 use flotilla_provisioning::reconcilers::clone::runtime::CloneFlights;
 use flotilla_provisioning::reconcilers::{CheckoutRemoval, ForgeDefaultBranchResolver};
 use flotilla_resources::{Convoy, ConvoyProvisioningState, Environment, Host, HostSpec, ResourceError, ResourceObject};
@@ -52,8 +52,8 @@ pub(super) struct ControllerRuntimeState {
     pub(super) agentless_ssh: HashMap<String, AgentlessSshProfile>,
     pub(super) environment_tools: EnvironmentToolProvisioner,
     pub(super) environment_sockets: Option<EnvironmentSocketService>,
-    /// Forwarded environment sockets and CLI delivery for agentless hosts (#3618).
-    pub(super) agentless_reach: Option<Arc<super::agentless_reach::AgentlessReach>>,
+    /// The vessel agents on agentless hosts (#3792).
+    pub(super) agentless_vessels: Option<Arc<super::agentless_vessels::AgentlessVessels>>,
     /// Where host-direct Claude Code crews post their hooks, when flotillad listens on TCP.
     pub(super) hook_endpoint: Option<HookEndpoint>,
     pub(super) credential_store: Option<Arc<CredentialStore>>,
@@ -76,6 +76,9 @@ pub(super) struct ControllerRuntimeState {
     pub(super) forge_default_branches: Option<Arc<dyn ForgeDefaultBranchResolver>>,
     /// Per-kind controller loop load metrics (#3206).
     pub(super) controller_metrics: Arc<ControllerMetricsRegistry>,
+    /// The provisioning kinds' engine homes behind `[primitives]` (#3629): the single writer
+    /// of the resources they hold. Absent with the switch off.
+    pub(super) provisioning: Option<flotilla_provisioning::engine::ProvisioningLifecycles>,
 }
 
 impl ControllerRuntimeState {
@@ -115,10 +118,11 @@ impl ControllerRuntimeState {
         self
     }
 
-    /// Agentless crews reach the daemon only through forwarded environment
-    /// sockets, so reach exists exactly when the socket server does.
-    pub(super) fn with_agentless_reach(mut self, reach: Option<Arc<super::agentless_reach::AgentlessReach>>) -> Self {
-        self.agentless_reach = reach;
+    /// Agentless crews reach the daemon only through their vessel agent's
+    /// forward to an environment socket, so vessels exist exactly when the
+    /// socket server does.
+    pub(super) fn with_agentless_vessels(mut self, vessels: Option<Arc<super::agentless_vessels::AgentlessVessels>>) -> Self {
+        self.agentless_vessels = vessels;
         self
     }
 
@@ -128,14 +132,20 @@ impl ControllerRuntimeState {
     }
 
     pub(super) async fn rust_build_jobs(&self, host_ref: &str) -> Result<usize, String> {
+        self.rust_build_jobs_through(host_ref, None).await
+    }
+
+    /// As [`Self::rust_build_jobs`], counting an agentless host's cores through
+    /// `runner` (a vessel's agent, #3792) rather than its SSH runner.
+    pub(super) async fn rust_build_jobs_through(&self, host_ref: &str, runner: Option<&dyn CommandRunner>) -> Result<usize, String> {
         let host_spec = match self.daemon.resource_backend().using::<Host>(&self.namespace).get(host_ref).await {
             Ok(host) => host.spec,
             Err(ResourceError::NotFound { .. }) if host_ref == self.local_host_ref => HostSpec::default(),
             Err(error) => return Err(format!("read build fulfilment setting for host {host_ref}: {error}")),
         };
         let cores = if let Some(profile) = self.agentless_ssh_for_host(host_ref) {
-            profile
-                .runner
+            runner
+                .unwrap_or(profile.runner.as_ref())
                 .run("getconf", &["_NPROCESSORS_ONLN"], Path::new("/"), &ChannelLabel::Default)
                 .await?
                 .trim()
@@ -149,10 +159,29 @@ impl ControllerRuntimeState {
         Ok(host_spec.rust_build_jobs(cores))
     }
 
-    pub(super) async fn rustc_wrapper_for_environment(&self, env_ref: &str) -> Result<PathBuf, String> {
+    /// The prepared vessel on an agentless host (#3792).
+    pub(super) async fn vessel_access(
+        &self,
+        profile: &AgentlessSshProfile,
+        vessel: &str,
+    ) -> Result<Arc<super::agentless_vessels::VesselAccess>, String> {
+        let vessels =
+            self.agentless_vessels.as_ref().ok_or("EnvironmentSocketUnavailable: agentless vessels require a crew socket server")?;
+        let preparation = super::agentless_vessels::VesselPreparation {
+            tools: &self.environment_tools,
+            discovery: self.daemon.discovery_runtime(),
+            config: &self.config,
+        };
+        vessels.access(&preparation, profile, vessel).await
+    }
+
+    /// The Rust linker wrapper for a session in `env_ref`, staged on an
+    /// agentless host through `runner` when given (a vessel's agent, #3792).
+    pub(super) async fn rustc_wrapper_for_environment(&self, env_ref: &str, runner: Option<&dyn CommandRunner>) -> Result<PathBuf, String> {
         if let Some(profile) = self.agentless_ssh.get(env_ref) {
-            let base = profile.runner.writable_config_base(None, self.config.state_dir().as_path()).await?;
-            return stage_remote_rustc_wrapper(profile.runner.as_ref(), &base).await;
+            let runner = runner.unwrap_or(profile.runner.as_ref());
+            let base = runner.writable_config_base(None, self.config.state_dir().as_path()).await?;
+            return stage_remote_rustc_wrapper(runner, &base).await;
         }
         stage_local_rustc_wrapper_async(self.config.state_dir().as_path().to_path_buf()).await
     }
@@ -171,6 +200,14 @@ impl ControllerRuntimeState {
         let mut environment_providers = flotilla_discovery::registry::EnvironmentProviderRegistry::default();
         let place = flotilla_address::Address::root(flotilla_address::Kind::Host, &local_host_ref).expect("local host identity");
         environment_providers.register_place(&place, &local_registry.environment_providers).expect("unique local provider addresses");
+        let account_classes = [flotilla_protocol::provider::EnvironmentClass::CloudSandbox];
+        for (_, provider) in local_registry.environment_providers.iter().filter(|(_, p)| account_classes.contains(&p.kind().class)) {
+            let instance = local_registry.environment_providers.instance_name(provider).expect("registered instance");
+            let address = flotilla_address::Address::root(flotilla_address::Kind::Account, instance)
+                .and_then(|p| p.child(flotilla_address::Kind::Provider, instance))
+                .expect("account provider address");
+            environment_providers.insert(address, provider.clone()).expect("unique cloud provider address");
+        }
         Self {
             environment_providers,
             local_core_count: std::thread::available_parallelism,
@@ -183,7 +220,7 @@ impl ControllerRuntimeState {
             agentless_ssh: HashMap::new(),
             environment_tools,
             environment_sockets: None,
-            agentless_reach: None,
+            agentless_vessels: None,
             hook_endpoint: None,
             credential_store: None,
             agent_material: None,
@@ -200,7 +237,16 @@ impl ControllerRuntimeState {
             checkout_removals: Semaphore::new(DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY.get()),
             forge_default_branches: None,
             controller_metrics: Arc::default(),
+            provisioning: None,
         }
+    }
+
+    pub(super) fn with_provisioning_lifecycles(
+        mut self,
+        lifecycles: Option<flotilla_provisioning::engine::ProvisioningLifecycles>,
+    ) -> Self {
+        self.provisioning = lifecycles;
+        self
     }
 
     pub(super) fn with_controller_metrics(mut self, metrics: Arc<ControllerMetricsRegistry>) -> Self {

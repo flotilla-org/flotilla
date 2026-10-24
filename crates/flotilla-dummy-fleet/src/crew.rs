@@ -379,12 +379,13 @@ impl Crew {
         )
         .ok()?;
         // Open obligations can move to a peer during handoffs. Submit this
-        // script's own final ledger explicitly, even if its template moved.
+        // script's own final ledger explicitly, even if its template moved,
+        // under a label naming that deliverable: labels are unique per convoy.
         if !self.script_finished {
             self.persist(CommandAction::CrewPromise {
                 context: self.identity.context(),
                 operation: CrewPromiseOperation::Submit {
-                    promise: Some("script-ledger".into()),
+                    promise: Some(format!("script-ledger-{}", self.identity.role)),
                     kind: "decision-ledger".into(),
                     reference: name.clone(),
                     metadata: BTreeMap::new(),

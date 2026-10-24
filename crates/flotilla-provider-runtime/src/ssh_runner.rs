@@ -8,11 +8,14 @@ use flotilla_protocol::arg::shell_quote;
 use uuid::Uuid;
 
 use crate::{
-    atomic_write_script, helper_exec_script, managed_helper_install_words, managed_helper_path, rename_command_timeout, ChannelLabel,
-    CommandOutput, CommandRunner, FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
+    atomic_write_script, helper_exec_script, host_environment::HostEnvironment, managed_helper_install_words, managed_helper_path,
+    rename_command_timeout, ChannelLabel, CommandOutput, CommandRunner, FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
 
-const REMOTE_WRITABLE_BASE_SCRIPT: &str = "if [ -n \"${XDG_RUNTIME_DIR:-}\" ] \
+/// Resolves the remote user's writable flotilla base, as `writable_*_base`
+/// report it. Shared with agents on the same hosts (#3792), so one host keeps
+/// one answer whichever path runs the command.
+pub const REMOTE_WRITABLE_BASE_SCRIPT: &str = "if [ -n \"${XDG_RUNTIME_DIR:-}\" ] \
                                                && [ -d \"$XDG_RUNTIME_DIR\" ] \
                                                && [ -w \"$XDG_RUNTIME_DIR\" ] \
                                                && mkdir -p \"$XDG_RUNTIME_DIR/flotilla\"; then \
@@ -36,15 +39,26 @@ const REMOTE_WRITABLE_BASE_SCRIPT: &str = "if [ -n \"${XDG_RUNTIME_DIR:-}\" ] \
 ///
 /// This is intentionally narrow: it shells out to `ssh` for direct-environment
 /// execution and discovery, but it does not model daemon-to-daemon transport.
+///
+/// #3722: every command runs in a non-login `sh -c` with the host's composed
+/// environment (its declared supplies and the system tail); the remote user's
+/// login profile is never read.
 pub struct SshCommandRunner {
     destination: String,
     multiplex: bool,
     runner: Arc<dyn CommandRunner>,
+    environment: HostEnvironment,
 }
 
 impl SshCommandRunner {
     pub fn new(destination: impl Into<String>, multiplex: bool, runner: Arc<dyn CommandRunner>) -> Self {
-        Self { destination: destination.into(), multiplex, runner }
+        Self { destination: destination.into(), multiplex, runner, environment: HostEnvironment::default() }
+    }
+
+    /// Run every command with `environment`'s supplies composed in.
+    pub fn with_environment(mut self, environment: HostEnvironment) -> Self {
+        self.environment = environment;
+        self
     }
 
     fn ssh_prefix_args(&self) -> Vec<&str> {
@@ -57,7 +71,7 @@ impl SshCommandRunner {
     }
 
     /// `ssh` joins every argument after the destination with spaces, and the
-    /// remote login shell parses that string again. Send the remote command as
+    /// remote user's shell parses that string again. Send the remote command as
     /// one argument whose words are quoted, so the remote shell recovers exactly
     /// these words: a multi-line script stays one `sh -c` operand, and a script's
     /// own positional arguments reach it.
@@ -68,7 +82,15 @@ impl SshCommandRunner {
     }
 
     fn ssh_shell_args(&self, script: &str) -> Vec<String> {
-        self.ssh_remote_args(&["sh", "-lc", script])
+        self.ssh_remote_args(&["sh", "-c", &format!("{}{script}", self.environment.shell_prelude())])
+    }
+
+    /// Run `words` as an argv in the composed environment.
+    fn ssh_composed_args(&self, words: &[&str]) -> Vec<String> {
+        let launcher = format!("{}exec \"$@\"", self.environment.shell_prelude());
+        let mut composed = vec!["sh", "-c", launcher.as_str(), "flotilla-composed-environment"];
+        composed.extend_from_slice(words);
+        self.ssh_remote_args(&composed)
     }
 
     fn remote_exec_script(&self, cmd: &str, args: &[&str], cwd: &Path) -> String {
@@ -157,8 +179,8 @@ impl CommandRunner for SshCommandRunner {
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
         let temp_suffix = Uuid::new_v4().to_string();
         let path_str = path.to_string_lossy().into_owned();
-        let install_words = managed_helper_install_words("-lc", FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT);
-        let install_args = self.ssh_remote_args(&as_strs(&install_words));
+        let install_words = managed_helper_install_words("-c", FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT);
+        let install_args = self.ssh_composed_args(&as_strs(&install_words));
         let output = self.runner.run("ssh", &as_strs(&install_args), Path::new("/"), &ChannelLabel::Default).await?;
         let helper_path = managed_helper_path(&output, FLOTILLA_HELPER_NAME)?;
         let helper_script = helper_exec_script(&helper_path, "ensure-file-if-absent", &[&path_str, content, &temp_suffix])?;
@@ -203,8 +225,11 @@ mod tests {
 
     use async_trait::async_trait;
 
+    use flotilla_protocol::arg::shell_quote;
+
     use super::{SshCommandRunner, REMOTE_WRITABLE_BASE_SCRIPT};
     use crate::command_timeout_message;
+    use crate::host_environment::{HostEnvironment, HostSupply};
     use crate::test_support::TimeoutOnlyRunner;
     use crate::ChannelLabel;
     use crate::CommandOutput;
@@ -336,6 +361,13 @@ mod tests {
         }
     }
 
+    /// The remote command for `script` on a host with no declared supplies:
+    /// a non-login `sh -c` that composes `PATH` before the script.
+    fn remote(script: &str) -> String {
+        let script = format!("{}{script}", HostEnvironment::default().shell_prelude());
+        ["sh", "-c", script.as_str()].map(shell_quote).join(" ")
+    }
+
     fn ssh_call_args(calls: &[(String, Vec<String>, PathBuf)]) -> &Vec<String> {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "ssh");
@@ -357,7 +389,7 @@ mod tests {
         assert_eq!(args[2], "BatchMode=yes");
         assert_eq!(args[3], "alice@feta.local");
         assert_eq!(args.len(), 5, "the remote command is one argument");
-        assert_eq!(args[4], r#"'sh' '-lc' 'cd '\''/repo with space'\'' && exec '\''git'\'' '\''status'\'' '\''--short'\'''"#);
+        assert_eq!(args[4], remote("cd '/repo with space' && exec 'git' 'status' '--short'"));
     }
 
     #[tokio::test]
@@ -384,7 +416,7 @@ mod tests {
         assert_eq!(&args[3..9], ["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/flotilla-ssh-%C", "-o", "ControlPersist=60"]);
         assert_eq!(args[9], "alice@feta.local");
         assert_eq!(args.len(), 11, "the remote command is one argument");
-        assert_eq!(args[10], r#"'sh' '-lc' 'cd '\''/repo'\'' && exec '\''git'\'' '\''status'\'''"#);
+        assert_eq!(args[10], remote("cd '/repo' && exec 'git' 'status'"));
     }
 
     #[tokio::test]
@@ -401,7 +433,7 @@ mod tests {
         assert_eq!(args[2], "BatchMode=yes");
         assert_eq!(args[3], "alice@feta.local");
         assert_eq!(args.len(), 5, "the remote command is one argument");
-        assert_eq!(args[4], r#"'sh' '-lc' 'cd '\''/'\'' && exec '\''cleat'\'' '\''--version'\'''"#);
+        assert_eq!(args[4], remote("cd '/' && exec 'cleat' '--version'"));
     }
 
     #[tokio::test]
@@ -501,14 +533,14 @@ mod tests {
         let install_args = &calls[0].1;
         assert_eq!(&install_args[..4], ["-T", "-o", "BatchMode=yes", "alice@feta.local"]);
         assert_eq!(install_args.len(), 5, "the installer is one remote command argument");
-        assert!(install_args[4].starts_with("'sh' '-lc' '"));
+        assert!(install_args[4].starts_with("'sh' '-c' 'PATH="), "{}", install_args[4]);
         assert!(install_args[4].contains("helpers/$helper_hash"));
         assert!(install_args[4].contains("'flotilla-bootstrap-install-managed-script' 'flotilla-helper' '"));
 
         let args = &calls[1].1;
         assert_eq!(&args[..4], ["-T", "-o", "BatchMode=yes", "alice@feta.local"]);
         assert_eq!(args.len(), 5, "the helper call is one remote command argument");
-        assert!(args[4].starts_with("'sh' '-lc' '"));
+        assert!(args[4].starts_with("'sh' '-c' 'PATH="), "{}", args[4]);
         assert!(args[4].contains("flotilla-helper"));
         assert!(args[4].contains("ensure-file-if-absent"));
         assert!(args[4].contains("/etc/flotilla/config.toml"));
@@ -573,6 +605,78 @@ mod tests {
         async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
             true
         }
+    }
+
+    /// #3722: a remote home whose login profile prepends a directory holding a
+    /// `gh`, and a declared supply holding another.
+    fn profiled_loopback(environment: HostEnvironment) -> (tempfile::TempDir, SshCommandRunner) {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().expect("remote home");
+        for directory in ["profile-bin", "supplied/bin"] {
+            let directory = home.path().join(directory);
+            std::fs::create_dir_all(&directory).expect("tool directory");
+            let gh = directory.join("gh");
+            std::fs::write(&gh, "#!/bin/sh\n").expect("gh");
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).expect("executable gh");
+        }
+        std::fs::write(
+            home.path().join(".profile"),
+            "PATH=\"$HOME/profile-bin:$PATH\"; export PATH\nPROFILE_READ=1; export PROFILE_READ\n",
+        )
+        .expect("login profile");
+        let runner = SshCommandRunner::new("alice@feta.local", false, std::sync::Arc::new(LoopbackSsh { home: home.path().to_path_buf() }))
+            .with_environment(environment);
+        (home, runner)
+    }
+
+    fn supplied_tool() -> HostEnvironment {
+        HostEnvironment::new(vec![HostSupply {
+            name: "tool".into(),
+            path: vec!["~/supplied/bin".into()],
+            env: vec![("TOOL_HOME".into(), "~/supplied".into())],
+        }])
+        .expect("valid supply")
+    }
+
+    // #3722: no remote command reads the login profile. Mutation check:
+    // `sh -lc` in `ssh_shell_args` puts `profile-bin` first and fails this.
+    #[tokio::test]
+    async fn remote_commands_compose_supplies_and_never_read_the_login_profile() {
+        let (home, runner) = profiled_loopback(supplied_tool());
+        let home_text = home.path().display().to_string();
+
+        let report = runner
+            .run(
+                "sh",
+                &["-c", "printf '%s\\n' \"$PATH\" \"$(command -v gh)\" \"${PROFILE_READ:-no}\" \"$TOOL_HOME\""],
+                home.path(),
+                &ChannelLabel::Default,
+            )
+            .await
+            .expect("remote report");
+
+        assert_eq!(
+            report.lines().collect::<Vec<_>>(),
+            [
+                format!("{home_text}/supplied/bin:/usr/local/bin:/usr/bin:/bin"),
+                format!("{home_text}/supplied/bin/gh"),
+                "no".to_string(),
+                format!("{home_text}/supplied"),
+            ]
+        );
+    }
+
+    // #3722: file writes and the managed helper go through the same
+    // composed, profile-free shell.
+    #[tokio::test]
+    async fn helper_installation_runs_without_the_login_profile() {
+        let (home, runner) = profiled_loopback(HostEnvironment::default());
+        std::fs::write(home.path().join(".profile"), "exit 7\n").expect("failing login profile");
+        let target = home.path().join(".local/state/flotilla/host-id");
+
+        assert_eq!(runner.ensure_file(&target, "id\n").await.expect("ensure file"), "id\n");
+        runner.write_file(&home.path().join("brief.md"), "brief\n").await.expect("write file");
+        assert_eq!(std::fs::read_to_string(home.path().join("brief.md")).expect("brief"), "brief\n");
     }
 
     fn loopback_runner() -> (tempfile::TempDir, SshCommandRunner) {

@@ -36,6 +36,7 @@ pub struct EnvironmentReconciler<R> {
     namespace: String,
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
+    adoption_retries: std::sync::Mutex<std::collections::HashMap<String, u32>>,
 }
 
 impl<R> EnvironmentReconciler<R> {
@@ -47,6 +48,7 @@ impl<R> EnvironmentReconciler<R> {
             namespace: namespace.into(),
             local_host_ref: None,
             additional_host_refs: Default::default(),
+            adoption_retries: Default::default(),
         }
     }
 
@@ -82,6 +84,8 @@ impl<R> EnvironmentReconciler<R> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvironmentProvisioning {
     pub configured_limits: Option<ConfiguredResourceLimits>,
+    pub provider_descriptor: Option<Box<flotilla_resources::EnvironmentProviderDescriptor>>,
+    pub survivors: Option<flotilla_resources::EnvironmentSurvivors>,
     pub backing_id: Option<String>,
     pub image_ref: Option<String>,
     pub local_image_id: Option<String>,
@@ -91,9 +95,10 @@ pub struct EnvironmentProvisioning {
 pub enum EnvironmentPrepared {
     Foreign,
     None,
-    Ready(EnvironmentProvisioning),
+    Ready(Box<EnvironmentProvisioning>),
     Failed(String),
     Waiting(String),
+    RetryAdoption(String),
 }
 
 impl<R> Reconciler for EnvironmentReconciler<R>
@@ -163,13 +168,18 @@ where
                         )
                         .await
                     {
-                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(provisioning)),
+                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
                         Err(message) if message.starts_with("waiting on build:") => Ok(EnvironmentPrepared::Waiting(message)),
                         Err(message) => Ok(EnvironmentPrepared::Failed(message)),
                     }
                 } else {
                     match self.runtime.provision_environment(&obj.metadata.name, &obj.spec).await {
-                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(provisioning)),
+                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
+                        Err(message)
+                            if obj.spec.cloud_sandbox.is_some() && message.starts_with(flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX) =>
+                        {
+                            Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: {message}")))
+                        }
                         Err(message) => Ok(EnvironmentPrepared::Failed(message)),
                     }
                 }
@@ -189,6 +199,21 @@ where
         }
         let patch = match obj.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending) {
             EnvironmentPhase::Pending | EnvironmentPhase::Provisioning => match prepared {
+                EnvironmentPrepared::Ready(provisioning) if obj.spec.cloud_sandbox.is_some() => {
+                    match (&provisioning.backing_id, &provisioning.image_ref, &provisioning.provider_descriptor, &provisioning.survivors) {
+                        (Some(backing_id), Some(image_ref), Some(provider_descriptor), Some(survivors)) => {
+                            Some(EnvironmentStatusPatch::MarkCloudReady {
+                                backing_id: backing_id.clone(),
+                                image_ref: image_ref.clone(),
+                                provider_descriptor: provider_descriptor.clone(),
+                                survivors: survivors.clone(),
+                            })
+                        }
+                        _ => Some(EnvironmentStatusPatch::MarkFailed {
+                            message: "cloud provider omitted backing, image, descriptor or survivors".into(),
+                        }),
+                    }
+                }
                 EnvironmentPrepared::Ready(provisioning) => Some(EnvironmentStatusPatch::MarkReady {
                     configured_limits: provisioning.configured_limits.clone(),
                     docker_container_id: provisioning.backing_id.clone(),
@@ -197,16 +222,31 @@ where
                     registry_digest: provisioning.registry_digest.clone(),
                 }),
                 EnvironmentPrepared::Failed(message) => Some(EnvironmentStatusPatch::MarkFailed { message: message.clone() }),
-                EnvironmentPrepared::Waiting(message) => Some(EnvironmentStatusPatch::WaitForImageBuild { message: message.clone() }),
+                // This legacy patch writes only generic Provisioning/ready=false
+                // and the supplied message. It stores no image-build wait state;
+                // adoption gets its own runtime variant and retry scheduling.
+                EnvironmentPrepared::Waiting(message) | EnvironmentPrepared::RetryAdoption(message) => {
+                    Some(EnvironmentStatusPatch::WaitForImageBuild { message: message.clone() })
+                }
                 EnvironmentPrepared::Foreign | EnvironmentPrepared::None => None,
             },
             _ => None,
         };
 
-        ReconcileOutcome::new(patch)
+        let mut outcome = ReconcileOutcome::new(patch);
+        let mut retries = self.adoption_retries.lock().expect("adoption retries");
+        if matches!(prepared, EnvironmentPrepared::RetryAdoption(_)) {
+            let attempt = retries.entry(obj.metadata.name.clone()).or_default();
+            outcome.requeue_after = Some(std::time::Duration::from_secs((5_u64 << *attempt).min(300)));
+            *attempt = (*attempt + 1).min(6);
+        } else {
+            retries.remove(&obj.metadata.name);
+        }
+        outcome
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        self.adoption_retries.lock().expect("adoption retries").remove(&obj.metadata.name);
         if !self.actuates(obj).await? {
             return Ok(());
         }
@@ -217,7 +257,9 @@ where
         if !self.backend.query_declared::<Checkout>(&self.namespace, &query).await?.items.is_empty() {
             return Err(ResourceError::FinalizerPending);
         }
-        if let Some(container_id) = obj.status.as_ref().and_then(|status| status.docker_container_id.as_deref()) {
+        if let Some(container_id) =
+            obj.status.as_ref().and_then(|status| status.backing_id.as_deref().or(status.docker_container_id.as_deref()))
+        {
             self.runtime.destroy(&obj.metadata.name, container_id).await.map_err(ResourceError::other)?;
         } else if obj.spec.provider_address.is_some() || obj.spec.docker.is_some() {
             self.runtime.destroy_unrecorded(&obj.metadata.name).await.map_err(ResourceError::other)?;

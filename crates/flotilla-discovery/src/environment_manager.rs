@@ -14,6 +14,7 @@ use flotilla_resources::host_direct_environment_name;
 
 use async_trait::async_trait;
 use flotilla_config::ConfigStore;
+use flotilla_provider_runtime::host_environment::HostEnvironment;
 
 use crate::environments::{CreateProvisionedEnvironmentRequest, EnvironmentLifecycle, Environments};
 use crate::registry::ProviderRegistry;
@@ -50,6 +51,11 @@ pub struct DirectEnvironmentState {
     pub display_name: Option<String>,
     pub registry: Option<Arc<ProviderRegistry>>,
     pub ssh_destination: Option<String>,
+    /// The host's declared supplies, which its SSH runner composes into every
+    /// command and a session launch composes into the harness environment.
+    pub host_environment: HostEnvironment,
+    /// An agentless SSH host's declared vessel cap (#3793).
+    pub max_vessels: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -109,6 +115,8 @@ impl EnvironmentManager {
                 display_name,
                 registry: None,
                 ssh_destination: None,
+                host_environment: HostEnvironment::default(),
+                max_vessels: None,
             }),
         );
 
@@ -154,6 +162,8 @@ impl EnvironmentManager {
                     display_name,
                     registry: None,
                     ssh_destination: None,
+                    host_environment: HostEnvironment::default(),
+                    max_vessels: None,
                 }));
                 Ok(())
             }
@@ -225,6 +235,28 @@ impl EnvironmentManager {
         match managed.get_mut(env_id) {
             Some(ManagedEnvironmentKind::Direct(state)) => {
                 state.ssh_destination = Some(destination);
+                Ok(())
+            }
+            _ => Err(format!("direct environment not found: {env_id}")),
+        }
+    }
+
+    pub fn set_direct_environment_host_environment(&self, env_id: &EnvironmentId, host_environment: HostEnvironment) -> Result<(), String> {
+        let mut managed = self.managed.lock().expect("environment manager lock poisoned");
+        match managed.get_mut(env_id) {
+            Some(ManagedEnvironmentKind::Direct(state)) => {
+                state.host_environment = host_environment;
+                Ok(())
+            }
+            _ => Err(format!("direct environment not found: {env_id}")),
+        }
+    }
+
+    pub fn set_direct_environment_max_vessels(&self, env_id: &EnvironmentId, max_vessels: Option<u32>) -> Result<(), String> {
+        let mut managed = self.managed.lock().expect("environment manager lock poisoned");
+        match managed.get_mut(env_id) {
+            Some(ManagedEnvironmentKind::Direct(state)) => {
+                state.max_vessels = max_vessels;
                 Ok(())
             }
             _ => Err(format!("direct environment not found: {env_id}")),

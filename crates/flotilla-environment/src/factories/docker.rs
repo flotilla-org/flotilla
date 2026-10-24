@@ -10,6 +10,8 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
+#[cfg(unix)]
+use crate::environment::docker::DockerAgentSettings;
 use crate::environment::docker::DockerEnvironmentProvider;
 use crate::environment::EnvironmentProvider;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -34,13 +36,29 @@ impl Factory for DockerEnvironmentFactory {
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn EnvironmentProvider>, Vec<UnmetRequirement>> {
-        // Check EnvironmentBag first (preferred pattern)
+        let build = || {
+            let provider = DockerEnvironmentProvider::new(runner.clone());
+            #[cfg(unix)]
+            let provider = provider.with_agent_settings(DockerAgentSettings {
+                runtime_root: {
+                    use sha2::{Digest, Sha256};
+                    Path::new("/tmp").join(&format!("fd-{:x}", Sha256::digest(_config.state_dir().to_string().as_bytes()))[..23])
+                },
+                executable: env
+                    .find_binary("drydock-agent")
+                    .map(|binary| binary.as_path().to_path_buf())
+                    .or_else(|| {
+                        env.find_binary("flotilla").and_then(|binary| binary.as_path().parent().map(|parent| parent.join("drydock-agent")))
+                    })
+                    .unwrap_or_else(|| Path::new("/usr/local/bin/drydock-agent").to_path_buf()),
+            });
+            Arc::new(provider) as Arc<dyn EnvironmentProvider>
+        };
         if env.find_binary("docker").is_some() {
-            return Ok(Arc::new(DockerEnvironmentProvider::new(runner)));
+            return Ok(build());
         }
-        // Fallback: try running docker directly
         match runner.run("docker", &["--version"], Path::new("/"), &ChannelLabel::Default).await {
-            Ok(_) => Ok(Arc::new(DockerEnvironmentProvider::new(runner))),
+            Ok(_) => Ok(build()),
             Err(_) => Err(vec![UnmetRequirement::MissingBinary("docker".into())]),
         }
     }

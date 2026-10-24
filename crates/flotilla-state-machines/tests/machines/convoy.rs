@@ -35,8 +35,8 @@ fn seat_row(role: &str, parent: Option<&str>) -> Seat {
     Seat { role: role.into(), seat: String::new(), parent: parent.map(seat), supervised_by: address("supervisor") }
 }
 
-fn admitted(source: PromiseSource, owner: &str) -> AdmittedPromise {
-    AdmittedPromise { kind: "pr".into(), target: address("target"), source, owner: seat(owner) }
+fn admitted(id: u32, source: PromiseSource, owner: &str) -> AdmittedPromise {
+    AdmittedPromise { label: format!("p{id}"), kind: "pr".into(), target: address("target"), source, owner: seat(owner) }
 }
 
 fn lifetime(owner: &str) -> Duty {
@@ -47,7 +47,7 @@ fn lifetime(owner: &str) -> Duty {
 fn request(promises: &[(u32, PromiseSource)]) -> ConvoyRequest {
     ConvoyRequest {
         project: project(),
-        promises: promises.iter().map(|(id, source)| (PromiseId(*id), admitted(*source, "coder"))).collect(),
+        promises: promises.iter().map(|(id, source)| (PromiseId(*id), admitted(*id, *source, "coder"))).collect(),
         duties: BTreeMap::new(),
         seats: vec![seat_row("lead", None), seat_row("coder", Some("lead"))],
         quota: quota(&[("standard", 1)]),
@@ -198,7 +198,7 @@ fn admission_reads_the_project_by_address() {
 fn admission_refuses_an_owner_that_is_no_seat() {
     let mut home = Home::<Convoy>::new("home").expect("valid declaration");
     let mut orphan = request(&[(0, PromiseSource::Template)]);
-    orphan.promises.insert(PromiseId(1), admitted(PromiseSource::Template, "nobody"));
+    orphan.promises.insert(PromiseId(1), admitted(1, PromiseSource::Template, "nobody"));
     let mut unparented = request(&[(0, PromiseSource::Template)]);
     unparented.seats.push(seat_row("reviewer", Some("nobody")));
     let mut twice = request(&[(0, PromiseSource::Template)]);
@@ -230,7 +230,13 @@ fn admission_refuses_a_seat_cycle() {
 #[test]
 fn declare_adds_a_crew_promise_once() {
     let mut home = convoy(request(&[(0, PromiseSource::Template)]));
-    let declare = |id: u32, owner: &str| Declare { promise: PromiseId(id), kind: "pr".into(), target: address("t"), owner: seat(owner) };
+    let declare = |id: u32, owner: &str| Declare {
+        promise: PromiseId(id),
+        label: format!("p{id}"),
+        kind: "pr".into(),
+        target: address("t"),
+        owner: seat(owner),
+    };
     assert_eq!(apply(&mut home, declare(1, "nobody")), refused(ConvoyRefusal::UnknownSeat));
     apply(&mut home, declare(1, "coder")).expect("declared");
     let promise = home.get("c").expect("exists").spec().promise(PromiseId(1)).expect("row").1.clone();
@@ -293,7 +299,7 @@ fn keep_reads_current_evidence_or_a_verdict() {
 #[test]
 fn retraction_follows_the_source() {
     let mut home = convoy(request(&[(0, PromiseSource::Template)]));
-    let declare = Declare { promise: PromiseId(1), kind: "pr".into(), target: address("t"), owner: seat("coder") };
+    let declare = Declare { promise: PromiseId(1), label: "p1".into(), kind: "pr".into(), target: address("t"), owner: seat("coder") };
     apply(&mut home, declare).expect("declared");
     assert_eq!(apply(&mut home, retract(0, "coder", Authority::Owner)), refused(ConvoyRefusal::Unauthorised));
     assert_eq!(apply(&mut home, retract(1, "lead", Authority::Owner)), refused(ConvoyRefusal::Unauthorised), "not its owner");

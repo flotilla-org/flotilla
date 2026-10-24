@@ -61,6 +61,8 @@ pub struct PlacementViableCandidate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct PlacementDecision {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_workspace_root: Option<String>,
     pub policy_name: String,
     pub target_host: PlacementTargetHost,
     #[builder(default)]
@@ -102,6 +104,10 @@ pub struct FulfilmentAllocationCandidate {
     pub host_ready: bool,
     pub sleeping_until: Option<chrono::DateTime<chrono::Utc>>,
     pub free_vessel_slots: Option<u32>,
+    /// The vessel cap an agentless SSH host declares (#3793). Absent in
+    /// previous-generation convoy statuses (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_vessels: Option<u32>,
     pub reserved_for_platform: bool,
     pub minimal: bool,
     pub available: bool,

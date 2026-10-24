@@ -136,15 +136,16 @@ async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_
     assert_eq!(socket_mount.environment_path.as_path(), Path::new("/run/flotilla-daemon"));
     assert_eq!(socket_mount.kind, EnvironmentToolAssetKind::Directory);
     assert_ne!(socket_mount.host_path.as_path(), Path::new("/tmp"));
-    assert_eq!(
-        opts.tools[0].environment[1],
-        EnvironmentVariableUpdate::set("FLOTILLA_CONTAINED_HOST_DAEMON", "1", "the contained host-daemon requirement",),
-    );
+    assert!(opts.tools[0].environment.contains(&EnvironmentVariableUpdate::set(
+        "FLOTILLA_CONTAINED_HOST_DAEMON",
+        "1",
+        "the contained host-daemon requirement",
+    )));
     assert_eq!(opts.tools[1].executable.as_path(), Path::new(ENVIRONMENT_CLEAT_PATH));
     assert_eq!(opts.tools[1].assets[1].environment_path.as_path(), Path::new(ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH));
     assert_eq!(opts.tools[1].assets[2].host_path.as_path(), cleat_state.as_path());
     assert_eq!(opts.tools[1].assets[2].environment_path.as_path(), Path::new(ENVIRONMENT_CLEAT_RUNTIME_DIR));
-    assert_eq!(opts.tools[1].environment[1], EnvironmentVariableUpdate::prepend_path("LD_LIBRARY_PATH", ENVIRONMENT_CLEAT_LIBRARY_DIR),);
+    assert!(opts.tools[1].environment.contains(&EnvironmentVariableUpdate::prepend_path("LD_LIBRARY_PATH", ENVIRONMENT_CLEAT_LIBRARY_DIR)));
     assert!(cleat_state.as_path().is_dir(), "durable tool state must exist before the provider delivers it");
 }
 
@@ -480,6 +481,17 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
 
 #[tokio::test]
 async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
+    teardown_archives_staged_sessions(false).await;
+}
+
+// A stopped agent cannot wedge deletion: teardown still destroys its backing
+// and archives the persistent session records already staged on the host.
+#[tokio::test]
+async fn docker_teardown_with_dead_agent_still_destroys_and_archives_staged_sessions() {
+    teardown_archives_staged_sessions(true).await;
+}
+
+async fn teardown_archives_staged_sessions(dead_agent: bool) {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
     fs::create_dir_all(&config_base).expect("config directory");
@@ -495,18 +507,24 @@ async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
     )
     .await;
     let destroyed = Arc::new(AtomicBool::new(false));
-    let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+    let capture_attempted = Arc::new(AtomicBool::new(false));
+    let interior = TestInteriorEnvironment {
         id: EnvironmentId::new("contained-restarted"),
         image: ImageId::new("contained-image"),
-        runner: Arc::new(DiscoveryMockRunner::builder().build()),
+        runner: if dead_agent {
+            Arc::new(DeadCaptureRunner(capture_attempted.clone()))
+        } else {
+            Arc::new(DiscoveryMockRunner::builder().build())
+        },
         env_vars: HashMap::new(),
         destroyed: Arc::clone(&destroyed),
-    });
+    };
+    let handle: EnvironmentHandle = if dead_agent { Arc::new(DeadAgentEnvironment(interior)) } else { Arc::new(interior) };
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
         "docker",
         flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
-        Arc::new(ListingEnvironmentProvider { handle }),
+        Arc::new(ListingEnvironmentProvider { handle: handle.clone() }),
     );
     let home = temp.path().join("home");
     let environment_home = home.join(".local/share/flotilla/agent-homes/contained-restarted");
@@ -538,6 +556,7 @@ async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
         .create(
             &empty_meta("contained-restarted"),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: Some("host:host-test/provider:docker".parse().expect("provider address")),
                 host_direct: None,
                 docker: None,
@@ -545,6 +564,9 @@ async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
         )
         .await
         .expect("addressed environment record");
+    if dead_agent {
+        state.provisioned_environments.lock().await.insert("test-interior".into(), ActiveProvisionedEnvironment { handle });
+    }
     let runtime = DockerControllerRuntime { state };
     for invalid in ["../keep", "..", "/", ""] {
         runtime.cleanup(invalid).await.expect("unsafe names must not wedge finalization");
@@ -552,6 +574,8 @@ async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
     assert!(outside_state.join("sentinel").exists(), "unsafe cleanup must preserve unrelated state");
     runtime.destroy("contained-restarted", "test-interior").await.expect("restart teardown should rediscover and destroy the container");
 
+    assert_eq!(capture_attempted.load(Ordering::SeqCst), dead_agent);
+    assert!(runtime.state.provisioned_environments.lock().await.is_empty());
     assert!(destroyed.load(Ordering::SeqCst), "the restarted daemon must destroy the still-running lease holder");
     assert!(!environment_home.exists(), "durable environment teardown must move its persistent agent home");
     assert_eq!(
@@ -615,6 +639,7 @@ async fn docker_orphan_cleanup_without_persisted_status_reaps_backing() {
         .create(
             &empty_meta("env-lost-status"),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
@@ -757,7 +782,7 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
         memory_policy: Default::default(),
         mounts: vec![flotilla_resources::EnvironmentMount {
             source_path: "/host/replacement-flotilla".to_string(),
-            target_path: "/usr/local/bin/flotilla".to_string(),
+            target_path: "/opt/flotilla/crew-bin/flotilla".to_string(),
             mode: flotilla_resources::EnvironmentMountMode::Ro,
         }],
         ..spec
@@ -767,7 +792,7 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
         .await
         .expect_err("reserved CLI mount should fail provision");
 
-    assert_eq!(error.to_string(), "mount target /usr/local/bin/flotilla is reserved for the flotilla CLI");
+    assert_eq!(error.to_string(), "mount target /opt/flotilla/crew-bin/flotilla is reserved for the flotilla CLI");
     assert!(provider.create_opts.lock().await.is_none(), "reserved mount collisions should fail before invoking the provider");
 }
 
@@ -853,7 +878,7 @@ async fn provisioned_environment_discovers_and_registers_interior_agent_adapters
 // authored literal tags refuse.
 #[tokio::test]
 async fn fresh_contained_admission_resolves_legacy_literal_and_refuses_literal_tag() {
-    use flotilla_environment::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider, PrepareOpts};
+    use flotilla_environment::environment::{EnvironmentProvider, PrepareOpts};
     use flotilla_resources::{CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource};
 
     // Exhaust a baseline source and an authored literal. Timing/interleavings
@@ -1026,7 +1051,7 @@ async fn fresh_contained_admission_resolves_legacy_literal_and_refuses_literal_t
         ));
         let runtime = DockerControllerRuntime { state };
         let legacy_baseline = runtime.legacy_baseline_for_environment(&environment.metadata.name).await.expect("provenance");
-        let provider = DockerEnvironmentProvider::new(Arc::new(HeldBaselineRunner { image: "crew:baseline".into() }));
+        let provider = held_baseline_docker_provider("crew:baseline");
         let result = provider.prepare(&environment.spec, &PrepareOpts { legacy_baseline, ..Default::default() }).await;
         if baseline {
             assert!(result.is_ok(), "baseline prepare: {:?}", result.err());
@@ -1060,7 +1085,7 @@ async fn fresh_contained_admission_resolves_legacy_literal_and_refuses_literal_t
 // policy admits them. A literal policy or an unowned tag is never admitted.
 #[tokio::test]
 async fn legacy_baseline_admission_recovers_old_records_and_preserves_frozen_provenance() {
-    use flotilla_environment::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider, PrepareOpts};
+    use flotilla_environment::environment::{EnvironmentProvider, PrepareOpts};
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
     fs::create_dir_all(&config_base).expect("config directory");
@@ -1128,9 +1153,7 @@ async fn legacy_baseline_admission_recovers_old_records_and_preserves_frozen_pro
     ));
     let runtime = DockerControllerRuntime { state };
     assert!(runtime.legacy_baseline_for_environment("live-environment").await.expect("baseline provenance"));
-    let provider = DockerEnvironmentProvider::new(Arc::new(HeldBaselineRunner {
-        image: environment.spec.docker.as_ref().expect("docker").image.clone(),
-    }));
+    let provider = held_baseline_docker_provider(environment.spec.docker.as_ref().expect("docker").image.clone());
     provider
         .prepare(
             &environment.spec,
@@ -1237,4 +1260,159 @@ async fn provisioned_environment_is_destroyed_when_declared_adapter_is_missing()
 
     assert_eq!(error.to_string(), "image `contained-image` declares agent adapter `codex`, but interior discovery did not find it");
     assert!(destroyed.load(Ordering::SeqCst), "rejected environment should be destroyed");
+}
+
+// Fake only the unavailable agent transport; use real teardown and archive storage.
+struct DeadCaptureRunner(Arc<AtomicBool>);
+#[async_trait]
+impl CommandRunner for DeadCaptureRunner {
+    async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+        Err("agent unavailable".into())
+    }
+    async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+        Err("agent unavailable".into())
+    }
+    async fn exists(&self, _: &str, _: &[&str]) -> bool {
+        false
+    }
+    async fn run_to_file(&self, _: &str, _: &[&str], _: &Path, _: &Path) -> Result<(), String> {
+        self.0.store(true, Ordering::SeqCst);
+        Err("stopped container: agent unavailable".into())
+    }
+}
+struct DeadAgentEnvironment(TestInteriorEnvironment);
+struct DeadAgent;
+#[async_trait]
+impl flotilla_environment::environment::VesselAgent for DeadAgent {
+    async fn ready(&self) -> Result<(), String> {
+        Err("agent unavailable".into())
+    }
+    async fn forward_socket(&self, _: &Path) -> Result<PathBuf, String> {
+        Err("agent unavailable".into())
+    }
+    async fn push_tools(&self, _: &[flotilla_environment::environment::EnvironmentTool]) -> Result<(), String> {
+        Err("agent unavailable".into())
+    }
+}
+#[async_trait]
+impl ProvisionedEnvironment for DeadAgentEnvironment {
+    flotilla_discovery_testkit::injected_environment_handle!();
+    fn id(&self) -> &EnvironmentId {
+        self.0.id()
+    }
+    fn image(&self) -> &ImageId {
+        self.0.image()
+    }
+    fn runner(&self) -> Arc<dyn CommandRunner> {
+        self.0.runner()
+    }
+    fn agent(&self) -> Option<Arc<dyn flotilla_environment::environment::VesselAgent>> {
+        Some(Arc::new(DeadAgent))
+    }
+    async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+        self.0.observe().await
+    }
+    async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+        self.0.env_vars().await
+    }
+    async fn destroy(&self) -> Result<(), String> {
+        self.0.destroy().await
+    }
+}
+
+// Docker Shared material must remain host-backed throughout the session, even
+// though the provider also receives pushed executable tools. One glue case.
+#[tokio::test]
+async fn docker_codex_home_is_a_rw_host_mount_and_is_not_pushed() {
+    use flotilla_environment::environment::{docker::DockerEnvironmentProvider, ProvisionedMount, ProvisionedMountMode};
+    let root = TempDir::new().unwrap();
+    let home = root.path().join(".local/share/flotilla/agent-homes/work/codex");
+    let registry = test_agent_material_registry(Arc::new(TestEnvVars::new([("HOME", root.path().display().to_string())])));
+    fs::create_dir_all(&home).unwrap();
+    let delivery = flotilla_credentials::AgentMaterialDelivery {
+        mount: ProvisionedMount::new(&home, flotilla_credentials::CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw),
+        preflight: flotilla_credentials::AgentMaterialPreflight { command: "true".into(), args: vec![], failure_context: "fixture".into() },
+    };
+    let provider = DockerEnvironmentProvider::new(Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
+    let mut tools = Vec::new();
+    let mut mounts = Vec::new();
+    super::super::docker::deliver_agent_material(&provider.capabilities(), std::slice::from_ref(&delivery), &mut tools, &mut mounts)
+        .await
+        .unwrap();
+    assert_eq!(mounts, vec![delivery.mount.clone()]);
+    assert!(registry.codex_home_is_shared("work", &mounts));
+    assert!(tools.is_empty(), "the Codex home must never enter the pushed tool layer");
+    // Removing Shared must select the pushed route, regardless of tool delivery.
+    let mut capabilities = provider.capabilities();
+    capabilities.material_modes.retain(|mode| *mode != flotilla_protocol::provider::MaterialMode::Shared);
+    mounts.clear();
+    super::super::docker::deliver_agent_material(&capabilities, std::slice::from_ref(&delivery), &mut tools, &mut mounts).await.unwrap();
+    assert!(mounts.is_empty());
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].assets[0].host_path, delivery.mount.host_path);
+    assert_eq!(tools[0].assets[0].access, flotilla_environment::environment::EnvironmentToolAssetAccess::ReadOnly);
+    assert!(!registry.codex_home_is_shared("work", &mounts));
+}
+
+// #3765 S6: a missing guest harness must fail the actual cloud image probe,
+// even when no adapter was discovered. Empty needs require no guest command.
+#[tokio::test]
+async fn cloud_image_probe_refuses_missing_harness() {
+    let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+        id: EnvironmentId::new("cloud-probe"),
+        image: ImageId::new("cloud-image"),
+        runner: Arc::new(DiscoveryMockRunner::builder().on_run("mkdir", &["-p", "/tmp/flotilla/probe"], Ok(String::new())).build()),
+        env_vars: HashMap::new(),
+        destroyed: Arc::new(AtomicBool::new(false)),
+    });
+    let bag = EnvironmentBag::new();
+    assert!(super::super::docker::verify_cloud_image_needs(&BTreeSet::new(), "cloud-image", &handle, &bag).await.is_ok());
+    let needs = [flotilla_resources::CapabilityNeed::Harness { adapter: "missing-harness".into(), minimum_version: "1.0.0".into() }]
+        .into_iter()
+        .collect();
+    let error = super::super::docker::verify_cloud_image_needs(&needs, "cloud-image", &handle, &bag).await.unwrap_err();
+    assert!(error.contains("missing-harness"), "{error}");
+}
+
+// #3765 B1: post-provider credential/probe failures must preserve an adopted
+// backing too. The fake represents the remote environment destruction boundary.
+#[tokio::test]
+async fn controller_setup_rollback_preserves_adopted_backing() {
+    struct Adopted(TestInteriorEnvironment);
+    #[async_trait]
+    impl ProvisionedEnvironment for Adopted {
+        flotilla_discovery_testkit::injected_environment_handle!();
+        fn created_for_setup(&self) -> bool {
+            false
+        }
+        fn id(&self) -> &EnvironmentId {
+            &self.0.id
+        }
+        fn image(&self) -> &ImageId {
+            &self.0.image
+        }
+        async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+            self.0.observe().await
+        }
+        async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+            self.0.env_vars().await
+        }
+        fn runner(&self) -> Arc<dyn CommandRunner> {
+            self.0.runner()
+        }
+        async fn destroy(&self) -> Result<(), String> {
+            self.0.destroy().await
+        }
+    }
+    let destroyed = Arc::new(AtomicBool::new(false));
+    let handle: EnvironmentHandle = Arc::new(Adopted(TestInteriorEnvironment {
+        id: EnvironmentId::new("adopted"),
+        image: ImageId::new("cloud"),
+        runner: Arc::new(DiscoveryMockRunner::builder().build()),
+        env_vars: Default::default(),
+        destroyed: destroyed.clone(),
+    }));
+    let message = super::super::docker::discard_failed_environment(&handle, None, None, "adopted", "injected setup failure".into()).await;
+    assert!(message.contains("retained for retry"));
+    assert!(!destroyed.load(Ordering::SeqCst));
 }

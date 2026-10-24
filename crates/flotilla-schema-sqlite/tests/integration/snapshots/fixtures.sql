@@ -199,6 +199,7 @@ CREATE TABLE "convoy_promises" (
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
   "id" INTEGER NOT NULL,
+  "label" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "kind" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "target" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "source" TEXT NOT NULL CHECK ("source" IN ('cr', 'dp', 'tp')),
@@ -235,6 +236,7 @@ CREATE TABLE "convoy_retired" (
   FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "convoy_open_by_project" ON "convoy" ("project") WHERE "state" IN ('op');
+CREATE UNIQUE INDEX "convoy_promises_by_label" ON "convoy_promises" ("convoy", "label");
 CREATE INDEX "convoy_promises_submissions_by_address" ON "convoy_promises_submissions" ("address");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'state', 'ab', 'Abandoned'),
@@ -302,6 +304,7 @@ CREATE VIEW "convoy_promises_view" AS SELECT
   "convoy_promises"."pos",
   "convoy_promises"."version",
   "convoy_promises"."id",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises"."label") AS "label",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises"."kind") AS "kind",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises"."target") AS "target",
   (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'promises.source' AND "code" = "convoy_promises"."source") AS "source",
@@ -1243,7 +1246,7 @@ CREATE TABLE "vessel" (
   "convoy" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
   "class" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "priority" INTEGER NOT NULL,
-  "host" INTEGER NOT NULL,
+  "host" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "state" TEXT NOT NULL CHECK ("state" IN ('go', 'gu', 'rl', 'rq')),
   "state_since" INTEGER NOT NULL,
   "failures" INTEGER,
@@ -1338,7 +1341,7 @@ CREATE VIEW "vessel_view" AS SELECT
   "vessel"."convoy",
   (SELECT "s" FROM "strings" WHERE "id" = "vessel"."class") AS "class",
   "vessel"."priority",
-  "vessel"."host",
+  (SELECT "s" FROM "strings" WHERE "id" = "vessel"."host") AS "host",
   (SELECT "name" FROM "codes" WHERE "kind" = 've' AND "field" = 'state' AND "code" = "vessel"."state") AS "state",
   "vessel"."state_since",
   "vessel"."failures",

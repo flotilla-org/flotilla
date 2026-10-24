@@ -55,9 +55,11 @@ pub fn run(
         let observed = context.observed;
         let aggregator = Aggregator::with_events(state, context.host_name, context.event_sink, context.events)
             .with_attach_resolver_arc(context.attach)
+            .with_lifecycle_reads(context.lifecycles)
             .with_change_request_resolver_arc(context.change_requests)
             .with_issue_resolver_arc(context.issues)
-            .with_issue_polling_health(issue_polling);
+            .with_issue_polling_health(issue_polling)
+            .with_convoy_engine(context.convoy_engine, namespace);
         aggregator
             .run(
                 AggregatorResolvers::builder()
@@ -94,4 +96,9 @@ pub struct AggregatorContext {
     pub attach: Arc<dyn AttachCapabilityResolver>,
     pub change_requests: Arc<dyn ConvoyChangeRequestResolver>,
     pub issues: Arc<dyn IssueMaterializationResolver>,
+    /// The engine's provisioning readings; `NoLifecycleReads` with the switch off.
+    pub lifecycles: Arc<dyn ports::LifecycleReads>,
+    /// The `[primitives]` Convoy path: rows show the engine's promises when it
+    /// holds a convoy (#3587 layer 8). Empty while the switch is off.
+    pub convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
 }

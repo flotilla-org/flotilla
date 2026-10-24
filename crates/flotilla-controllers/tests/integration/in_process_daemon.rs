@@ -123,9 +123,11 @@ struct ReceiverIntentPublisher {
 }
 
 /// The single remote command string `SshCommandRunner` hands to `ssh`: the
-/// remote shell re-parses it, so every word arrives quoted.
+/// remote shell re-parses it, so every word arrives quoted. A non-login shell
+/// composes the host's environment (no supplies declared here) first.
 fn ssh_remote_command(script: &str) -> String {
-    ["sh", "-lc", script].iter().map(|word| flotilla_protocol::arg::shell_quote(word)).collect::<Vec<_>>().join(" ")
+    let script = format!("{}{script}", flotilla_provider_runtime::host_environment::HostEnvironment::default().shell_prelude());
+    ["sh", "-c", script.as_str()].iter().map(|word| flotilla_protocol::arg::shell_quote(word)).collect::<Vec<_>>().join(" ")
 }
 
 #[async_trait]
@@ -9312,6 +9314,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         .create(
             &InputMeta::builder().name("idle-environment".to_string()).build(),
             &flotilla_resources::EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
                     host_ref: local_host_ref,

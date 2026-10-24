@@ -58,6 +58,10 @@ pub struct CrewTurnIntent {
     pub delivery_condition: Option<Leaf>,
     #[builder(default)]
     pub expectation: flotilla_resources::MessageExpectation,
+    /// The stalled crew's role address, when this turn is a stall's
+    /// supervision: the sender's awaiting-reply record is then a stall about
+    /// that seat (#3587 layer 7).
+    pub stall_of: Option<String>,
 }
 
 /// Canonical receiver admission is a workflow latch, not a delivery receipt.
@@ -73,6 +77,15 @@ pub struct CrewTurnAdmission {
 #[async_trait]
 pub trait ResourceIntentPublisher: Send + Sync {
     async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String>;
+    /// [`Self::publish`], with the home that admitted it when the receiver
+    /// home reports one (the engine path does, #3587 layer 7).
+    async fn publish_admitted(
+        self: Arc<Self>,
+        namespace: &str,
+        document: serde_json::Value,
+    ) -> Result<(flotilla_protocol::ResourceRef, Option<String>), String> {
+        Ok((self.publish(namespace, document).await?, None))
+    }
     async fn patch_status(
         self: Arc<Self>,
         _namespace: &str,
@@ -103,6 +116,8 @@ struct LeafSubscriptionTableInner {
     message_inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>,
     /// The `[primitives]` Message path; empty while the switch is off.
     message_path: crate::ports::MessagePath,
+    /// The `[primitives]` Convoy path: promises are read from the engine when it holds a convoy.
+    convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
     charter_brief_renderer: Arc<dyn flotilla_messaging::CharterBriefRenderer>,
     event_sink: Arc<dyn EventSink>,
     rows: Mutex<HashMap<uuid::Uuid, LeafSubscriptionRow>>,
@@ -145,6 +160,11 @@ impl LeafSubscriptionTable {
 
     pub fn with_charter_brief_renderer(mut self, renderer: Arc<dyn flotilla_messaging::CharterBriefRenderer>) -> Self {
         Arc::get_mut(&mut self.inner).expect("configure rendering before sharing subscriptions").charter_brief_renderer = renderer;
+        self
+    }
+
+    pub fn with_convoy_engine(mut self, path: flotilla_resources::convoy::engine::EngineConvoyPath) -> Self {
+        Arc::get_mut(&mut self.inner).expect("configure the convoy path before sharing subscriptions").convoy_engine = path;
         self
     }
 
@@ -206,6 +226,7 @@ impl LeafSubscriptionTable {
                 watch_views: Default::default(),
                 message_inboxes: Default::default(),
                 message_path: Default::default(),
+                convoy_engine: Default::default(),
                 charter_brief_renderer: Arc::new(flotilla_messaging::CharterProseRenderer),
                 event_sink,
                 rows: Mutex::new(HashMap::new()),

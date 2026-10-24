@@ -25,7 +25,22 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rigging-tls = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+drydock.workspace = true
+clap = { version = "4", features = ["derive", "string"] }
+data-encoding = "2"
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+drydock-protocol.workspace = true
+drydock-agent.workspace = true
+drydock-transport.workspace = true
+rigging-ssh.workspace = true
+rigging-stream.workspace = true
+futures.workspace = true
+http.workspace = true
+tempfile.workspace = true
 libc.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+drydock-host.workspace = true
 
 [dev-dependencies]
 flotilla-terminal = { path = "../flotilla-terminal" }

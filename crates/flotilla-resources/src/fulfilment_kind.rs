@@ -194,6 +194,12 @@ impl CapabilityNeed {
         }
     }
 
+    /// Needs that can be verified by read-only commands in a provisioned guest.
+    pub fn requires_guest_probe(&self) -> bool {
+        matches!(self, Self::Toolchain(_) | Self::Harness { .. })
+            || matches!(self, Self::Capability(value) if value.starts_with("harness:"))
+    }
+
     /// Image-provided needs are distinct from host privileges and hardware.
     pub fn is_image_need(&self) -> bool {
         match self {
@@ -303,6 +309,9 @@ impl fmt::Display for FulfilmentCostClass {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "realisation", rename_all = "snake_case")]
 pub enum FulfilmentRealisation {
+    CloudSandboxPerVessel {
+        image: String,
+    },
     DockerPerVessel {
         /// `None` is the vessel's composed image.
         #[serde(
@@ -319,15 +328,15 @@ impl FulfilmentKindSpec {
     /// Translate live policy topology without changing admission's policy path.
     /// Operator-authored grants may subsequently refine this initial set.
     pub fn from_policy(policy: &PlacementPolicySpec, host_platform: &str) -> Result<Self, String> {
-        let (host_ref, realisation, grants) = match (&policy.docker_per_vessel, &policy.host_direct) {
-            (Some(DockerPerVesselPlacementPolicySpec { host_ref, image, .. }), None) => {
+        let (host_ref, realisation, grants) = match (&policy.docker_per_vessel, &policy.host_direct, &policy.cloud_sandbox_per_vessel) {
+            (Some(DockerPerVesselPlacementPolicySpec { host_ref, image, .. }), None, None) => {
                 let grants = BTreeSet::from([
                     FulfilmentGrant::platform(Platform::Linux.to_string()),
                     FulfilmentGrant::network("scoped".to_string()),
                 ]);
                 (host_ref.clone(), FulfilmentRealisation::DockerPerVessel { image: image.clone() }, grants)
             }
-            (None, Some(HostDirectPlacementPolicySpec { host_ref, .. })) => {
+            (None, Some(HostDirectPlacementPolicySpec { host_ref, .. }), None) => {
                 let grants = BTreeSet::from([
                     FulfilmentGrant::platform(host_platform.to_string()),
                     FulfilmentGrant::host_account_reach(),
@@ -336,6 +345,11 @@ impl FulfilmentKindSpec {
                 ]);
                 (host_ref.clone(), FulfilmentRealisation::HostDirect, grants)
             }
+            (None, None, Some(cloud)) => (
+                String::new(),
+                FulfilmentRealisation::CloudSandboxPerVessel { image: cloud.image.clone() },
+                BTreeSet::from([FulfilmentGrant::platform(Platform::Linux.to_string()), FulfilmentGrant::network("open".into())]),
+            ),
             _ => return Err("placement policy must define exactly one realisation".to_string()),
         };
         Ok(Self { host_ref, pool: policy.pool.clone(), cost_class: FulfilmentCostClass::default(), grants, realisation })

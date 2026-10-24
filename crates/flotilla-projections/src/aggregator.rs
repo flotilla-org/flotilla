@@ -34,8 +34,8 @@ use flotilla_resources::{
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
     Demand, DemandAddressee, DemandState, Environment, Project, ReadResourceObject, ReadWatchEvent, Regard, RegardExpiryPolicy, Repository,
     Resource, ResourceError, ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState,
-    TerminalSession, TerminalSessionPhase, Vessel, VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState,
-    CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase,
+    WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{ReadResourceList, ResourceList, WatchStart};
@@ -63,6 +63,8 @@ type ConvoyKey = (String, String, Option<flotilla_protocol::NodeId>);
 type EnsureKey = (String, String, Option<flotilla_protocol::NodeId>);
 type SessionKey = (String, String, Option<flotilla_protocol::NodeId>);
 const CONVOY_PROJECTION_COALESCE_INTERVAL: Duration = Duration::from_millis(25);
+/// How soon a convoy whose engine read failed is projected again.
+const ENGINE_READ_RETRY: Duration = Duration::from_secs(1);
 
 const CHANGE_REQUEST_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// A lookup that runs longer fails, so a hung resolver cannot hold a convoy's
@@ -222,6 +224,10 @@ pub struct Aggregator {
     #[builder(skip)]
     checkout_replicas: HashMap<(String, String, flotilla_protocol::NodeId), ReadResourceObject<Checkout>>,
     bootstrapping: bool,
+    /// The `[primitives]` Convoy path (#3587 layer 8), and the namespace its
+    /// changed convoys are named in.
+    convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
+    engine_namespace: String,
     #[builder(skip)]
     projection_delivery: ConvoyProjectionDelivery,
     #[builder(skip)]
@@ -235,6 +241,9 @@ pub struct Aggregator {
     emitted_queries: HashSet<QueryId>,
     #[builder(skip)]
     attach_resolver: Option<Arc<dyn AttachCapabilityResolver>>,
+    /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4).
+    #[builder(skip = Arc::new(crate::ports::NoLifecycleReads))]
+    lifecycle_reads: Arc<dyn crate::ports::LifecycleReads>,
     #[builder(skip)]
     attach_refresh_tasks: tokio::task::JoinSet<AttachCapabilityResolution>,
     #[builder(skip)]
@@ -343,6 +352,8 @@ impl Aggregator {
             readiness_clones: BTreeMap::new(),
             checkout_replicas: HashMap::new(),
             bootstrapping: false,
+            convoy_engine: Default::default(),
+            engine_namespace: String::new(),
             projection_delivery: ConvoyProjectionDelivery::Immediate,
             projection_full: false,
             convoy_inputs: ConvoyInputs::default(),
@@ -350,6 +361,7 @@ impl Aggregator {
             known_origins: HashSet::new(),
             emitted_queries: HashSet::new(),
             attach_resolver: None,
+            lifecycle_reads: Arc::new(crate::ports::NoLifecycleReads),
             attach_refresh_tasks: tokio::task::JoinSet::new(),
             attach_refresh_generations: HashMap::new(),
             attach_refresh_inputs: HashMap::new(),
@@ -365,6 +377,19 @@ impl Aggregator {
             event_sink,
             event_rx,
         }
+    }
+
+    /// Read engine-held provisioning resources through `reads` (#3629 layer 4).
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn crate::ports::LifecycleReads>) -> Self {
+        self.lifecycle_reads = reads;
+        self
+    }
+
+    /// Rows read a convoy's promises from the engine when it holds the convoy.
+    pub fn with_convoy_engine(mut self, engine: flotilla_resources::convoy::engine::EngineConvoyPath, namespace: &str) -> Self {
+        self.convoy_engine = engine;
+        self.engine_namespace = namespace.to_owned();
+        self
     }
 
     pub fn with_attach_resolver_arc(mut self, resolver: Arc<dyn AttachCapabilityResolver>) -> Self {
@@ -520,6 +545,9 @@ impl Aggregator {
         self.emit_scoped_convoy_result_sets().await;
         self.emit_awareness_result_sets().await;
 
+        // An engine edge writes no old record: follow the engine's changes to
+        // re-project the convoy's row (#3587 layer 8).
+        let mut engine_changes = self.convoy_engine.get().map(|engine| engine.changes());
         let mut change_request_sweep =
             tokio::time::interval_at(Instant::now() + CHANGE_REQUEST_SWEEP_INTERVAL, CHANGE_REQUEST_SWEEP_INTERVAL);
         change_request_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -552,7 +580,21 @@ impl Aggregator {
                 }
             };
             tokio::pin!(projection_flush);
+            let engine_change = async {
+                match engine_changes.as_mut() {
+                    Some(changes) => changes.recv().await,
+                    None => futures::future::pending().await,
+                }
+            };
             tokio::select! {
+                change = engine_change => match change {
+                    Ok(name) => self.engine_convoy_changed(&name).await,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!(missed, "aggregator lagged behind the engine's convoy changes");
+                        self.rebuild_local_projection().await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => engine_changes = None,
+                },
                 () = &mut projection_flush => {
                     self.projection_delivery = ConvoyProjectionDelivery::Coalesced { deadline: None };
                     self.flush_local_projection().await;
@@ -1168,6 +1210,21 @@ impl Aggregator {
         }
     }
 
+    /// This home's convoy `name` changed on the engine: re-project its row.
+    async fn engine_convoy_changed(&mut self, name: &str) {
+        let keys: Vec<ConvoyKey> = self
+            .convoy_keys_by_name
+            .get(&(self.engine_namespace.clone(), name.to_owned()))
+            .into_iter()
+            .flat_map(|keys| keys.iter().filter(|key| key.2.is_none()).cloned())
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        self.projection_keys.extend(keys);
+        self.schedule_local_projection().await;
+    }
+
     fn has_convoy(&self, namespace: &str, name: &str) -> bool {
         self.convoy_keys_by_name
             .get(&(namespace.to_string(), name.to_string()))
@@ -1509,8 +1566,18 @@ impl Aggregator {
         let salience_changed = self.rebuild_salience_projection().await;
         let mut local_replacement = HashMap::new();
         let mut replica_replacements: HashMap<HostName, HashMap<ResourceRef, ConvoyRow>> = HashMap::new();
+        // A convoy whose engine read failed keeps its row until a retried projection reads it.
+        let mut unread: Vec<(ResourceRef, ResourceProvenance)> = Vec::new();
         for (reference, convoy) in effective_convoys {
-            let row = self.summarize(&reference, &convoy.object);
+            let viewed = match flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, &convoy) {
+                Ok(viewed) => viewed,
+                Err(error) => {
+                    tracing::warn!(convoy = %reference.name, %error, "the engine convoy did not read; its row stays until a retry");
+                    unread.push((reference, convoy.provenance.clone()));
+                    continue;
+                }
+            };
+            let row = self.summarize(&reference, &viewed);
             match convoy.provenance {
                 ResourceProvenance::Local => {
                     local_replacement.insert(row.resource.clone(), row);
@@ -1522,17 +1589,37 @@ impl Aggregator {
             }
         }
 
+        let mut retry = Vec::new();
         let updates = if full {
             Vec::new()
         } else {
             keys.iter()
                 .filter_map(|key| {
                     let reference = self.convoy_key_ref(key)?;
-                    let row = self.effective_convoy_key(key).map(|item| self.summarize(&reference, &item.object));
+                    let row = match self.effective_convoy_key(key) {
+                        Some(item) => match flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, item) {
+                            Ok(viewed) => Some(self.summarize(&reference, &viewed)),
+                            Err(error) => {
+                                // Keep the row as it is, and project it again.
+                                tracing::warn!(convoy = %reference.name, %error, "the engine convoy did not read; its row stays until a retry");
+                                retry.push(key.clone());
+                                return None;
+                            }
+                        },
+                        None => None,
+                    };
                     Some((reference, key.2.is_some(), row))
                 })
                 .collect::<Vec<_>>()
         };
+        if !retry.is_empty() || !unread.is_empty() {
+            // Project the unread convoys again shortly; their rows stay meanwhile.
+            self.projection_keys.extend(retry);
+            self.projection_full |= !unread.is_empty();
+            if let ConvoyProjectionDelivery::Coalesced { deadline } = &mut self.projection_delivery {
+                deadline.get_or_insert_with(|| Instant::now() + ENGINE_READ_RETRY);
+            }
+        }
         let (changed, removed, result_set) = {
             let mut view = self.state.write().await;
             let mut incremental_changed = Vec::new();
@@ -1551,6 +1638,22 @@ impl Aggregator {
                         }
                         None if rows.remove(&reference).is_some() => incremental_removed.push(reference),
                         _ => {}
+                    }
+                }
+            }
+            // An unread convoy keeps its prior row: neither changed nor removed.
+            for (reference, provenance) in &unread {
+                match provenance {
+                    ResourceProvenance::Local => {
+                        if let Some(row) = view.local_rows.get(reference) {
+                            local_replacement.insert(reference.clone(), row.clone());
+                        }
+                    }
+                    ResourceProvenance::Replica { .. } => {
+                        let Some(host) = reference.host.clone() else { continue };
+                        if let Some(row) = view.replica_rows.get(&host).and_then(|rows| rows.get(reference)) {
+                            replica_replacements.entry(host).or_default().insert(reference.clone(), row.clone());
+                        }
                     }
                 }
             }
@@ -2354,15 +2457,64 @@ impl Aggregator {
             .unwrap_or_else(|| self.local_host.clone())
     }
 
+    /// Whether a terminal session is running: behind `[primitives]` the engine's reading of its
+    /// current launch (#3629 layer 8), else its old phase.
+    fn session_running(&self, session: &ReadResourceObject<TerminalSession>) -> bool {
+        let origin = match &session.provenance {
+            ResourceProvenance::Local => None,
+            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+        };
+        match self.lifecycle_reads.reading(
+            crate::ports::ProvisioningKind::TerminalSession,
+            &session.object.metadata.name,
+            origin.as_deref(),
+        ) {
+            // Only a realised launch runs. A launch the engine has not realised yet (InProgress), or
+            // one that ended, does not, even while the old phase still says Running: the engine
+            // decides the launch, and the old phase is its one-way copy.
+            Some(reading) => matches!(reading, flotilla_protocol::LifecycleReading::Ready { .. }),
+            None => session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running),
+        }
+    }
+
+    /// A vessel's phase as the views read it. Behind `[primitives]` the engine decides whether its
+    /// lease is live (#3629 layer 8, Vessel): a lease that broke reads Lost while the old phase still
+    /// says it is live, before the one-way copy lands. The old phase says how a live vessel is
+    /// doing (provisioning, ready, interrupted), and why an ended one ended (lost or failed), which
+    /// the engine does not distinguish. A released lease (its teardown completed) keeps the old
+    /// phase: being torn down is not being lost. When the copy is deleted (#3774), this reads the
+    /// ending from the engine alone.
+    pub(crate) fn vessel_phase(&self, vessel: &ReadResourceObject<Vessel>) -> VesselPhase {
+        use flotilla_protocol::LifecycleReading;
+
+        use crate::ports::ProvisioningKind;
+        let old = vessel.object.status.as_ref().map(|status| status.phase).unwrap_or_default();
+        if matches!(old, VesselPhase::Lost | VesselPhase::Failed) {
+            return old;
+        }
+        let origin = match &vessel.provenance {
+            ResourceProvenance::Local => None,
+            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+        };
+        match self.lifecycle_reads.reading(ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref()) {
+            // Gone without its ending entry (a replica seeded from a snapshot) is read as broken.
+            // A vessel never gives up (#3629 Q3); GaveUp is listed only so a reading the vessel
+            // machine cannot produce is not read as live.
+            Some(LifecycleReading::Lost | LifecycleReading::Gone | LifecycleReading::GaveUp { .. }) => VesselPhase::Lost,
+            _ => old,
+        }
+    }
+
     fn vessel_materialize(&self, namespace: &str, convoy: &str, vessel: &str, vessel_host: &HostName) -> Option<String> {
         self.convoy_sessions(namespace, convoy)
             .filter(|session| {
                 session.object.metadata.namespace == namespace
                     && session.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|value| value == convoy)
                     && session.object.metadata.labels.get(VESSEL_LABEL).is_some_and(|value| value == vessel)
-                    && session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running)
                     && self.read_host(&session.provenance).as_ref() == Some(vessel_host)
                     && self.attachable_sessions.contains(&session_key(session))
+                    // Last: behind `[primitives]` it is an engine read.
+                    && self.session_running(session)
             })
             .min_by_key(|session| &session.object.metadata.name)
             .map(|session| session.object.metadata.name.clone())
@@ -4837,6 +4989,7 @@ mod tests {
             .create(
                 &InputMeta::builder().name(name.to_string()).build(),
                 &EnvironmentSpec {
+                    cloud_sandbox: None,
                     provider_address: None,
                     host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".to_string(), repo_default_dir: "/repo".to_string() }),
                     docker: None,
@@ -6495,6 +6648,261 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// Readings scripted per resource, recording each keyed read: the kind, name and origin.
+    #[derive(Default)]
+    struct ScriptedReadings {
+        readings: std::sync::Mutex<HashMap<(crate::ports::ProvisioningKind, String), flotilla_protocol::LifecycleReading>>,
+        reads: std::sync::Mutex<Vec<(crate::ports::ProvisioningKind, String, Option<String>)>>,
+    }
+
+    impl ScriptedReadings {
+        fn set(&self, kind: crate::ports::ProvisioningKind, name: &str, reading: Option<flotilla_protocol::LifecycleReading>) {
+            let mut readings = self.readings.lock().expect("script");
+            match reading {
+                Some(reading) => readings.insert((kind, name.to_owned()), reading),
+                None => readings.remove(&(kind, name.to_owned())),
+            };
+        }
+    }
+
+    impl crate::ports::LifecycleReads for ScriptedReadings {
+        fn reading(
+            &self,
+            kind: crate::ports::ProvisioningKind,
+            name: &str,
+            origin: Option<&str>,
+        ) -> Option<flotilla_protocol::LifecycleReading> {
+            self.reads.lock().expect("reads").push((kind, name.to_owned(), origin.map(str::to_owned)));
+            self.readings.lock().expect("script").get(&(kind, name.to_owned())).cloned()
+        }
+    }
+
+    /// A convoy with a provisioning vessel on `host` (a replica's when `remote`), a checkout
+    /// `checkout-a` whose old status is Ready, and, when `clone` is set, its worktree's local clone
+    /// `ops-clone`, also Ready in the old status.
+    async fn engine_readiness_fixture(
+        remote: bool,
+        clone: bool,
+        reads: Arc<ScriptedReadings>,
+    ) -> (Aggregator, ResourceRef, ResourceObject<Convoy>) {
+        use flotilla_resources::{CheckoutPhase, CheckoutStatus, VesselPhase, VesselSpec, VesselStatus};
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Ready).call();
+        let (events, _) = broadcast::channel(128);
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads);
+        let host = HostName::new(if remote { "feta" } else { "kiwi" });
+        let provenance = if remote {
+            let origin = flotilla_protocol::NodeId::new("remote-origin");
+            aggregator.origin_hosts.insert(origin.clone(), host.clone());
+            ResourceProvenance::Replica { origin_root: origin, last_synced_at: Utc::now() }
+        } else {
+            ResourceProvenance::Local
+        };
+        convoy.status.as_mut().expect("status").work.get_mut("implement").expect("work").placement =
+            Some(PlacementStatus { fields: BTreeMap::from([("host".into(), serde_json::json!(host.as_str()))]) });
+        let mut vessel = backend
+            .using::<Vessel>("flotilla")
+            .create(
+                &InputMeta::builder().name("vessel-a".into()).build(),
+                &VesselSpec {
+                    convoy_ref: convoy.metadata.name.clone(),
+                    vessel_name: "implement".into(),
+                    placement_policy_ref: "local".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
+            .await
+            .expect("vessel");
+        vessel.status = Some(VesselStatus { phase: VesselPhase::Provisioning, checkout_refs: BTreeMap::new(), ..Default::default() });
+        apply_readiness_event(
+            &mut aggregator.readiness_vessels,
+            ReadWatchEvent::Added(ReadResourceObject { object: vessel, provenance: provenance.clone() }),
+        );
+        let mut checkout = checkout_object("checkout-a", "/work/repo", RepositoryKey("repo".into())).await;
+        checkout.metadata.labels.insert(CONVOY_LABEL.into(), convoy.metadata.name.clone());
+        checkout.status = Some(CheckoutStatus { phase: CheckoutPhase::Ready, ..Default::default() });
+        if clone {
+            checkout.spec = CheckoutSpec::Worktree(
+                flotilla_resources::CheckoutWorktreeSpec::builder()
+                    .repo_ref(RepositoryKey("repo".into()))
+                    .env_ref("local".into())
+                    .r#ref("main".into())
+                    .target_path("/work/ops".into())
+                    .clone_ref("ops-clone".into())
+                    .build(),
+            );
+            let mut clone = backend
+                .using::<CloneResource>("flotilla")
+                .create(
+                    &InputMeta::builder().name("ops-clone".into()).build(),
+                    &flotilla_resources::CloneSpec::builder()
+                        .repo_ref(RepositoryKey("repo".into()))
+                        .url("https://forgejo.test/ops".into())
+                        .env_ref("local".into())
+                        .path("/work/ops".into())
+                        .build(),
+                )
+                .await
+                .expect("clone");
+            clone.status = Some(flotilla_resources::CloneStatus { phase: flotilla_resources::ClonePhase::Ready, ..Default::default() });
+            apply_readiness_event(
+                &mut aggregator.readiness_clones,
+                ReadWatchEvent::Added(ReadResourceObject { object: clone, provenance: provenance.clone() }),
+            );
+        }
+        apply_readiness_event(
+            &mut aggregator.readiness_checkouts,
+            ReadWatchEvent::Added(ReadResourceObject { object: checkout, provenance }),
+        );
+        let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("kiwi"));
+        (aggregator, reference, convoy)
+    }
+
+    /// The readiness state, and each checkout and clone blocker's resource name and reason.
+    fn readiness_blockers(
+        aggregator: &Aggregator,
+        reference: &ResourceRef,
+        convoy: &ResourceObject<Convoy>,
+    ) -> (flotilla_protocol::result_set::ReadinessState, Vec<(String, String)>) {
+        let row = aggregator.summarize(reference, convoy);
+        let readiness = row.readiness().clone();
+        let provisioning =
+            |blocker: &&flotilla_protocol::result_set::ReadinessBlocker| matches!(blocker.resource.kind.as_str(), "Checkout" | "Clone");
+        (
+            readiness.state,
+            readiness.blockers.iter().filter(provisioning).map(|blocker| (blocker.resource.name.clone(), blocker.reason.clone())).collect(),
+        )
+    }
+
+    // Behaviour (#3629 layer 4): behind `[primitives]` the engine's reading of a checkout decides its
+    // readiness over the old status, read by key at the checkout's home (a replica's origin root);
+    // without a reading the old status still decides.
+    #[tokio::test]
+    async fn engine_readings_decide_checkout_readiness() {
+        use flotilla_protocol::{result_set::ReadinessState, LifecycleReading};
+
+        use crate::ports::ProvisioningKind::Checkout as Kind;
+        let reads = Arc::new(ScriptedReadings::default());
+        let (aggregator, reference, convoy) = engine_readiness_fixture(true, false, reads.clone()).await;
+        let checkout = |reading| {
+            reads.set(Kind, "checkout-a", reading);
+            readiness_blockers(&aggregator, &reference, &convoy)
+        };
+        let blocker = |reason: &str| vec![("checkout-a".to_owned(), reason.to_owned())];
+
+        assert!(checkout(None).1.is_empty(), "no reading: the old status, Ready, decides");
+        assert_eq!(
+            checkout(Some(LifecycleReading::GaveUp { cause: "branch conflicts".into() })),
+            (ReadinessState::Failed, blocker("branch conflicts"))
+        );
+        let (state, blockers) = checkout(Some(LifecycleReading::Retrying {
+            failures: 2,
+            next: chrono::DateTime::UNIX_EPOCH,
+            cause: "worktree add failed".into(),
+        }));
+        assert_eq!(state, ReadinessState::Blocked);
+        assert!(blockers[0].1.starts_with("worktree add failed (2 failed"));
+        assert_eq!(checkout(Some(LifecycleReading::InProgress)), (ReadinessState::Provisioning, blocker("being realised")));
+        assert_eq!(checkout(Some(LifecycleReading::Lost)), (ReadinessState::Failed, blocker("observed absent")));
+        assert!(checkout(Some(LifecycleReading::Ready { identity: "/work/repo".into() })).1.is_empty());
+        let reads = reads.reads.lock().expect("reads").clone();
+        assert!(reads.contains(&(Kind, "checkout-a".into(), Some("remote-origin".into()))), "{reads:?}");
+    }
+
+    // Behaviour (#3629 layer 4, #3731 review): a worktree's clone is read from the engine too, at
+    // this home for a local clone; it blocks the vessel beside its checkout, whichever of the
+    // engine and the old status decides the checkout.
+    #[tokio::test]
+    async fn engine_readings_decide_clone_readiness() {
+        use flotilla_protocol::{result_set::ReadinessState, LifecycleReading};
+
+        use crate::ports::ProvisioningKind;
+        let reads = Arc::new(ScriptedReadings::default());
+        let (aggregator, reference, convoy) = engine_readiness_fixture(false, true, reads.clone()).await;
+        reads.set(ProvisioningKind::Checkout, "checkout-a", Some(LifecycleReading::InProgress));
+        reads.set(ProvisioningKind::Clone, "ops-clone", Some(LifecycleReading::GaveUp { cause: "repository not found".into() }));
+        let (state, blockers) = readiness_blockers(&aggregator, &reference, &convoy);
+        assert_eq!(state, ReadinessState::Failed);
+        assert_eq!(
+            blockers,
+            vec![("ops-clone".to_owned(), "repository not found".to_owned()), ("checkout-a".to_owned(), "being realised".to_owned())]
+        );
+        reads.set(ProvisioningKind::Clone, "ops-clone", Some(LifecycleReading::Ready { identity: "/work/ops".into() }));
+        assert_eq!(
+            readiness_blockers(&aggregator, &reference, &convoy),
+            (ReadinessState::Provisioning, vec![("checkout-a".to_owned(), "being realised".to_owned())])
+        );
+        let reads = reads.reads.lock().expect("reads").clone();
+        assert!(reads.contains(&(ProvisioningKind::Clone, "ops-clone".into(), None)), "{reads:?}");
+    }
+
+    // Behaviour (#3629 layer 8): behind `[primitives]` a session materializes its vessel only while
+    // the engine reads its current launch as running; an ended launch is not, whatever its old
+    // phase says. Without a reading the old phase decides.
+    #[tokio::test]
+    async fn the_engine_reading_decides_whether_a_session_runs() {
+        use flotilla_protocol::LifecycleReading;
+        use flotilla_resources::{TerminalSessionPhase, TerminalSessionStatus};
+
+        use crate::ports::ProvisioningKind;
+        let reads = Arc::new(ScriptedReadings::default());
+        let (events, _) = broadcast::channel(8);
+        let aggregator =
+            Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads.clone());
+        let mut session = session_object("terminal-ops-coder").await;
+        session.status = Some(TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() });
+        let session = ReadResourceObject { object: session, provenance: ResourceProvenance::Local };
+        assert!(aggregator.session_running(&session), "no reading: the old phase");
+        reads.set(ProvisioningKind::TerminalSession, "terminal-ops-coder", Some(LifecycleReading::Released));
+        assert!(!aggregator.session_running(&session), "its launch ended");
+        reads.set(ProvisioningKind::TerminalSession, "terminal-ops-coder", Some(LifecycleReading::Ready { identity: "s2".into() }));
+        assert!(aggregator.session_running(&session));
+    }
+
+    // Behaviour (#3629 layer 8, Vessel): behind `[primitives]` the engine decides whether a vessel's
+    // lease is live. A broken lease reads Lost while the old phase still says Ready; a released one
+    // (torn down) and a live one keep the old phase, which also keeps why an ended one ended
+    // (Failed is not read as Lost).
+    #[tokio::test]
+    async fn the_engine_reading_ends_a_vessel_the_old_phase_says_is_live() {
+        use flotilla_protocol::LifecycleReading;
+        use flotilla_resources::{VesselSpec, VesselStatus};
+
+        use crate::ports::ProvisioningKind;
+        let reads = Arc::new(ScriptedReadings::default());
+        let (events, _) = broadcast::channel(8);
+        let aggregator =
+            Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads.clone());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let mut vessel = backend
+            .using::<Vessel>("flotilla")
+            .create(
+                &InputMeta::builder().name("convoy-a-implement".into()).build(),
+                &VesselSpec {
+                    convoy_ref: "convoy-a".into(),
+                    vessel_name: "implement".into(),
+                    placement_policy_ref: "local".into(),
+                    adopted_checkout_refs: Default::default(),
+                },
+            )
+            .await
+            .expect("vessel");
+        vessel.status = Some(VesselStatus { phase: VesselPhase::Ready, ..Default::default() });
+        let mut read = ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local };
+        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Ready, "no reading: the old phase");
+        reads.set(ProvisioningKind::Vessel, "convoy-a-implement", Some(LifecycleReading::Ready { identity: "env-a".into() }));
+        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Ready);
+        reads.set(ProvisioningKind::Vessel, "convoy-a-implement", Some(LifecycleReading::Released));
+        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Ready, "torn down, not lost: the old phase");
+        reads.set(ProvisioningKind::Vessel, "convoy-a-implement", Some(LifecycleReading::Lost));
+        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Lost, "its lease broke");
+        // A replica seeded from a snapshot that predates the ending reads Gone: read as broken.
+        reads.set(ProvisioningKind::Vessel, "convoy-a-implement", Some(LifecycleReading::Gone));
+        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Lost, "ended, how not held here");
+        read.object.status.as_mut().expect("status").phase = VesselPhase::Failed;
+        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Failed, "the old phase says why it ended");
     }
 
     // #1961: Active plus pending agent work must remain provisioning, even

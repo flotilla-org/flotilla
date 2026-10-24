@@ -168,12 +168,25 @@ fn describe(step: &Step) -> String {
     }
 }
 
+/// How much of a replayed path [`build`] compares with the spec.
+#[derive(Clone, Copy, PartialEq)]
+enum Replay {
+    /// The initial state and the state after every step: the reachable-state pass.
+    EveryState,
+    /// Every step's acceptance and the final state only. A probe's path is one the
+    /// reachable-state pass already checked state by state: breadth-first paths form a
+    /// tree, so each prefix is the checked path of an ancestor state.
+    FinalState,
+}
+
 /// Replays `path` through the real engine, checking each step.
-fn build<M: Conformance>(path: &Path) -> Result<M::Subject, String> {
+fn build<M: Conformance>(path: &Path, replay: Replay) -> Result<M::Subject, String> {
     let mut subject = M::create(&path.initial);
-    let rust = normalise(&M::encode(&subject));
-    if rust != normalise(&path.initial) {
-        return Err(format!("initial {}: rust created {}", show(&path.initial), show(&rust)));
+    if replay == Replay::EveryState || path.steps.is_empty() {
+        let rust = normalise(&M::encode(&subject));
+        if rust != normalise(&path.initial) {
+            return Err(format!("initial {}: rust created {}", show(&path.initial), show(&rust)));
+        }
     }
     for (index, edge) in path.steps.iter().enumerate() {
         let context = || format!("path step {index} from {} by {}", show(&edge.from), show(&edge.event));
@@ -182,9 +195,11 @@ fn build<M: Conformance>(path: &Path) -> Result<M::Subject, String> {
             Step::Accepted => {}
             other => return Err(format!("{}: spec moved to {}, rust {}", context(), show(&edge.to), describe(&other))),
         }
-        let rust = normalise(&M::encode(&subject));
-        if rust != normalise(&edge.to) {
-            return Err(format!("{}: spec moved to {}, rust reached {}", context(), show(&edge.to), show(&rust)));
+        if replay == Replay::EveryState || index + 1 == path.steps.len() {
+            let rust = normalise(&M::encode(&subject));
+            if rust != normalise(&edge.to) {
+                return Err(format!("{}: spec moved to {}, rust reached {}", context(), show(&edge.to), show(&rust)));
+            }
         }
     }
     Ok(subject)
@@ -246,7 +261,7 @@ pub fn check<M: Conformance>(nodes: &[Value], report: &mut Report) {
 
     // Every reachable state is constructible by its path, step by step.
     for path in paths.values() {
-        if let Err(problem) = build::<M>(path) {
+        if let Err(problem) = build::<M>(path, Replay::EveryState) {
             report.disagreements.push(problem);
         }
     }
@@ -258,7 +273,7 @@ pub fn check<M: Conformance>(nodes: &[Value], report: &mut Report) {
             continue;
         };
         // A path that fails to build was reported above.
-        let Ok(mut subject) = build::<M>(path) else { continue };
+        let Ok(mut subject) = build::<M>(path, Replay::FinalState) else { continue };
         M::prepare(&mut subject, &probe.event);
         let before = M::version(&subject);
         let step = M::apply(&mut subject, &probe.event);

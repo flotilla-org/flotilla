@@ -97,6 +97,9 @@ def require_size(value, description="size", *, allow_zero=False):
 
 
 def allowed_payload(path, platform=None):
+    # Optional for prior-generation rollback; the producer always ships these.
+    if path in {"bin/flotilla-vessel", "bin/drydock-agent"}:
+        return platform.startswith("linux-")
     if path in REQUIRED_PAYLOAD or path in CANARY_PAYLOAD:
         return True
     pure = PurePosixPath(path)
@@ -542,7 +545,8 @@ def validate_release(root, outer, platform):
     codex_home = root.joinpath(*CODEX_HOME_PREFIX)
     if codex_home.exists():
         validate_codex_home_template(codex_home)
-    for rel in ("bin/flotilla", "bin/flotillad", "bin/cleat"):
+    binaries = {"bin/flotilla", "bin/flotillad", "bin/cleat"} | (expected & {"bin/flotilla-vessel", "bin/drydock-agent"})
+    for rel in binaries:
         if not os.access(root / rel, os.X_OK):
             raise ValidationError(f"release binary is not executable: {rel}")
     return manifest, entry

@@ -13,6 +13,7 @@ scenarios/    compositions and their safety / conditional liveness properties
 mutants/      single-definition overrides; each must violate a property
 conformance/  per-machine harnesses whose full reachable graphs the engine must match
 check.sh      fast exhaustive safety, graph conformance, ITF replay, mutants
+store-conformance.sh  the fast tier's store-backed graph conformance and replay
 symbolic.sh   bounded SMT checks
 viewer.html   local, standalone ITF viewer
 ```
@@ -172,8 +173,10 @@ npm exec --yes --package=@informalsystems/quint@0.33.0 -- quint compile specs/pr
 npm exec --yes --package=@informalsystems/quint@0.33.0 -- specs/primitives/check.sh
 ```
 
-CI runs this as the Quint quick tier job (#3280), within a 20-minute step budget,
-whenever these specs, the engine crate, the compiler pin, the workflow or the
+`check.sh` ends by running `store-conformance.sh` on its artifacts: the suites
+that replay graphs and traces through the decided SQLite store. CI runs it as the
+Quint quick tier job (#3280) in two steps, `check.sh --skip-store` and then
+`store-conformance.sh`, each with its own time budget (#3778), whenever these specs, the engine crate, the compiler pin, the workflow or the
 platform classifier change. There is
 one TLC run per scenario for its aggregate safety invariant, not one per property.
 The fast bounds use two named sessions (initial consumer and replacement), two
@@ -199,6 +202,9 @@ ITF value encoding. The engine's `tests/conformance` then rebuilds every reachab
 state through the real `Home` along a path in that graph, and applies every probed
 event. The engine must accept exactly the moves the spec's `step` makes, reach the
 same state value, and refuse where the spec refuses with the same `Refusal` variant.
+Paths are breadth-first, so each path's prefixes are the paths of states already
+checked step by step; a probe replays its from-state's path checking each step's
+acceptance and the final state, then applies its event in a fresh subject.
 Each adaptor encodes the Rust state (with the immutable spec where the Quint state
 carries request data, and the `Attempted` log entries for the attempt histories
 of Ensure and the lifecycle) in the spec's shape and compares it whole,
@@ -206,6 +212,17 @@ checking each state's tally against those entries; its module doc lists the few 
 Harness events carry the evidence a home could observe, and the test maps each
 evidence field onto the world the gate reads. Each harness comment states its
 event domain.
+
+The provisioning lifecycle kinds (Environment, ImageBuild, Clone and Checkout,
+#3629) run the same lifecycle graph through their stored kinds:
+`crates/flotilla-provisioning/tests/lifecycle_conformance.rs` writes every edge
+through the decided store's log and reads the state back from the stored row and
+its log entries, under the spec's policy. TerminalSession (#3629 layer 6) runs
+the same graph there. `crates/flotilla-engine-store/tests/crew_conformance.rs`
+runs `vessel.qnt` against the production placement composition
+(`placement::Placements`) and `ensure.qnt` against the Ensure, both through the
+decided store, with the adaptors the engine's own conformance uses
+(`flotilla-quint-testkit`'s `vessel` and `ensure`).
 
 Rust replay (`crates/flotilla-state-machines/tests/quint_replay.rs`) reads
 `mbt::actionTaken` and the `Some`/`None` picks from `mbt::nondetPicks`, and

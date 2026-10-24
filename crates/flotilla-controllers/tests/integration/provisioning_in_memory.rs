@@ -51,6 +51,8 @@ impl EnvironmentRuntime for FakeDockerRuntime {
         let spec = spec.docker.as_ref().expect("Docker scenario input");
 
         Ok(EnvironmentProvisioning {
+            provider_descriptor: None,
+            survivors: None,
             configured_limits: Some(ConfiguredResourceLimits {
                 cpus: Some(4),
                 cpu_shares: None,
@@ -563,6 +565,7 @@ async fn environment_controller_marks_docker_environment_ready() {
         .create(
             &controller_meta().name("docker-env").call(),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
@@ -783,6 +786,7 @@ async fn vessel_controller_finalizer_deletes_vessel_owned_children_but_preserves
                 .labels([(VESSEL_REF_LABEL.to_string(), "workspace-delete".to_string())].into_iter().collect())
                 .call(),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: Some(HostDirectEnvironmentSpec {
                     host_ref: "01HXYZ".to_string(),

@@ -45,7 +45,7 @@ pub fn spec(tc: &TestCase, pick: Pick) -> VesselSpec {
         class: VesselClass::new(name(tc)),
         shape: shape(tc, pick.nth(2)),
         priority: Priority(tc.draw(gs::integers::<u32>())),
-        host: Host(tc.draw(gs::integers::<u32>().max_value(3))),
+        host: Host::new(format!("host-{}", tc.draw(gs::integers::<u32>().max_value(3)))),
     }
 }
 

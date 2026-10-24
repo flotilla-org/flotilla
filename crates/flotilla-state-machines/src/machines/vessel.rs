@@ -63,8 +63,9 @@ pub struct VesselSpec {
     #[store(child)]
     pub shape: BTreeMap<Dimension, u32>,
     pub priority: Priority,
-    /// The placement host: a capacity-ledger id, not a stored resource, so
-    /// a plain column rather than a `Ref`.
+    /// The placement host: the host's id as the fleet names it, interned
+    /// text (`hs`). It is not a stored resource, so a plain column rather
+    /// than a `Ref`.
     pub host: Host,
 }
 
@@ -73,7 +74,7 @@ impl VesselSpec {
     pub fn lease(&self) -> Lease {
         let request =
             Request { convoy: self.convoy.clone(), class: self.class.clone(), shape: self.shape.clone(), priority: self.priority };
-        Lease { request, host: self.host }
+        Lease { request, host: self.host.clone() }
     }
 }
 

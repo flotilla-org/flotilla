@@ -37,6 +37,64 @@ CREATE TABLE stream_history (
 CREATE TABLE codes (
   kind TEXT NOT NULL, field TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
   PRIMARY KEY (kind, field, code)) STRICT, WITHOUT ROWID;
+CREATE TABLE "awaiting_reply" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "message" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
+  "sender" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "recipient" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "subject" INTEGER REFERENCES "strings" ("id"),
+  "kind" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "awaited" TEXT NOT NULL CHECK ("awaited" IN ('ou', 're')),
+  "deadline" INTEGER,
+  "state" TEXT NOT NULL CHECK ("state" IN ('an', 'ex', 'op', 'wd')),
+  "state_since" INTEGER NOT NULL,
+  "reason" TEXT,
+  CHECK (CASE WHEN "state" = 'op'
+      THEN "reason" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 'an'
+      THEN "reason" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 'ex'
+      THEN "reason" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 'wd'
+      THEN "reason" IS NOT NULL
+      END)
+) STRICT;
+CREATE INDEX "awaiting_reply_by_message" ON "awaiting_reply" ("message");
+CREATE INDEX "awaiting_reply_deadline" ON "awaiting_reply" ("deadline") WHERE "state" IN ('op') AND "deadline" IS NOT NULL;
+CREATE INDEX "awaiting_reply_open_by_sender" ON "awaiting_reply" ("sender") WHERE "state" IN ('op');
+CREATE INDEX "awaiting_reply_open_by_subject" ON "awaiting_reply" ("subject") WHERE "state" IN ('op') AND "subject" IS NOT NULL;
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('ar', 'awaited', 'ou', 'Outcome'),
+  ('ar', 'awaited', 're', 'Reply'),
+  ('ar', 'state', 'an', 'Answered'),
+  ('ar', 'state', 'ex', 'Expired'),
+  ('ar', 'state', 'op', 'Open'),
+  ('ar', 'state', 'wd', 'Withdrawn'),
+  ('ar', 'log:edge', 'an', 'Answer'),
+  ('ar', 'log:edge', 'ex', 'Expire'),
+  ('ar', 'log:edge', 'wd', 'Withdraw'),
+  ('ar', 'log:label', 'an', 'Answered'),
+  ('ar', 'log:label', 'ex', 'Expired'),
+  ('ar', 'log:label', 'op', 'Open'),
+  ('ar', 'log:label', 'wd', 'Withdrawn');
+CREATE VIEW "awaiting_reply_view" AS SELECT
+  "awaiting_reply"."id",
+  "awaiting_reply"."version",
+  "awaiting_reply"."message",
+  (SELECT "s" FROM "strings" WHERE "id" = "awaiting_reply"."sender") AS "sender",
+  (SELECT "s" FROM "strings" WHERE "id" = "awaiting_reply"."recipient") AS "recipient",
+  (SELECT "s" FROM "strings" WHERE "id" = "awaiting_reply"."subject") AS "subject",
+  (SELECT "s" FROM "strings" WHERE "id" = "awaiting_reply"."kind") AS "kind",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ar' AND "field" = 'awaited' AND "code" = "awaiting_reply"."awaited") AS "awaited",
+  "awaiting_reply"."deadline",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ar' AND "field" = 'state' AND "code" = "awaiting_reply"."state") AS "state",
+  "awaiting_reply"."state_since",
+  "awaiting_reply"."reason"
+FROM "awaiting_reply";
 CREATE TABLE "agent_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -84,6 +142,196 @@ CREATE VIEW "agent_session_view" AS SELECT
   "agent_session"."activity_cause",
   (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'reason' AND "code" = "agent_session"."reason") AS "reason"
 FROM "agent_session";
+CREATE TABLE "convoy" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "project" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "priority" INTEGER NOT NULL,
+  "kinds" BLOB NOT NULL REFERENCES "objects" ("hash"),
+  "state" TEXT NOT NULL CHECK ("state" IN ('ab', 'de', 'op')),
+  "state_since" INTEGER NOT NULL,
+  "reason" TEXT,
+  CHECK (CASE WHEN "state" = 'op'
+      THEN "reason" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 'de'
+      THEN "reason" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 'ab'
+      THEN "reason" IS NOT NULL
+      END)
+) STRICT;
+CREATE TABLE "convoy_duties" (
+  "convoy" INTEGER NOT NULL,
+  "key" INTEGER NOT NULL,
+  "owner_role" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "owner_seat" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "scope" TEXT NOT NULL CHECK ("scope" IN ('lt', 'wo')),
+  "terms" BLOB NOT NULL,
+  PRIMARY KEY ("convoy", "key"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE TABLE "convoy_duties_scope_promises" (
+  "convoy" INTEGER NOT NULL,
+  "duties_key" INTEGER NOT NULL,
+  "value" INTEGER NOT NULL,
+  PRIMARY KEY ("convoy", "duties_key", "value"),
+  FOREIGN KEY ("convoy", "duties_key") REFERENCES "convoy_duties" ("convoy", "key") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE TABLE "convoy_seats" (
+  "convoy" INTEGER NOT NULL,
+  "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
+  "role" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "seat" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "parent_role" INTEGER REFERENCES "strings" ("id"),
+  "parent_seat" INTEGER REFERENCES "strings" ("id"),
+  "supervised_by" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  PRIMARY KEY ("convoy", "pos"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE,
+  CHECK (CASE WHEN "parent_role" IS NOT NULL
+      THEN "parent_seat" IS NOT NULL
+      ELSE "parent_seat" IS NULL
+      END)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE "convoy_promises" (
+  "convoy" INTEGER NOT NULL,
+  "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
+  "id" INTEGER NOT NULL,
+  "label" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "kind" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "target" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "source" TEXT NOT NULL CHECK ("source" IN ('cr', 'dp', 'tp')),
+  "owner_role" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "owner_seat" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "progress" TEXT NOT NULL CHECK ("progress" IN ('ke', 'pe', 'rt', 'su')),
+  "progress_since" INTEGER NOT NULL,
+  PRIMARY KEY ("convoy", "pos"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE TABLE "convoy_promises_submissions" (
+  "convoy" INTEGER NOT NULL,
+  "promises_pos" INTEGER NOT NULL,
+  "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
+  "address" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "revision" TEXT NOT NULL,
+  "by_role" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "by_seat" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  PRIMARY KEY ("convoy", "promises_pos", "pos"),
+  FOREIGN KEY ("convoy", "promises_pos") REFERENCES "convoy_promises" ("convoy", "pos") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE TABLE "convoy_quota" (
+  "convoy" INTEGER NOT NULL,
+  "key" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "value" INTEGER NOT NULL,
+  PRIMARY KEY ("convoy", "key"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE TABLE "convoy_retired" (
+  "convoy" INTEGER NOT NULL,
+  "value" INTEGER NOT NULL,
+  PRIMARY KEY ("convoy", "value"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE INDEX "convoy_open_by_project" ON "convoy" ("project") WHERE "state" IN ('op');
+CREATE UNIQUE INDEX "convoy_promises_by_label" ON "convoy_promises" ("convoy", "label");
+CREATE INDEX "convoy_promises_submissions_by_address" ON "convoy_promises_submissions" ("address");
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('cv', 'state', 'ab', 'Abandoned'),
+  ('cv', 'state', 'de', 'Delivered'),
+  ('cv', 'state', 'op', 'Open'),
+  ('cv', 'duties.scope', 'lt', 'Lifetime'),
+  ('cv', 'duties.scope', 'wo', 'WhileOpen'),
+  ('cv', 'promises.source', 'cr', 'Crew'),
+  ('cv', 'promises.source', 'dp', 'Dispatch'),
+  ('cv', 'promises.source', 'tp', 'Template'),
+  ('cv', 'promises.progress', 'ke', 'Kept'),
+  ('cv', 'promises.progress', 'pe', 'Pending'),
+  ('cv', 'promises.progress', 'rt', 'Retracted'),
+  ('cv', 'promises.progress', 'su', 'Submitted'),
+  ('cv', 'log:edge', 'ab', 'Abandon'),
+  ('cv', 'log:edge', 'as', 'AddSeat'),
+  ('cv', 'log:edge', 'dc', 'Declare'),
+  ('cv', 'log:edge', 'de', 'Deliver'),
+  ('cv', 'log:edge', 'ke', 'Keep'),
+  ('cv', 'log:edge', 'ra', 'Readmit'),
+  ('cv', 'log:edge', 'rd', 'RetireDuty'),
+  ('cv', 'log:edge', 'rj', 'Reject'),
+  ('cv', 'log:edge', 'rs', 'Reassign'),
+  ('cv', 'log:edge', 'rt', 'Retract'),
+  ('cv', 'log:edge', 'su', 'Submit'),
+  ('cv', 'log:edge', 'sv', 'Resupervise'),
+  ('cv', 'log:label', 'ab', 'Abandoned'),
+  ('cv', 'log:label', 'de', 'Delivered'),
+  ('cv', 'log:label', 'op', 'Open');
+CREATE VIEW "convoy_view" AS SELECT
+  "convoy"."id",
+  "convoy"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy"."project") AS "project",
+  "convoy"."priority",
+  "convoy"."kinds",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'state' AND "code" = "convoy"."state") AS "state",
+  "convoy"."state_since",
+  "convoy"."reason"
+FROM "convoy";
+CREATE VIEW "convoy_duties_view" AS SELECT
+  "convoy_duties"."convoy",
+  "convoy_duties"."key",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_duties"."owner_role") AS "owner_role",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_duties"."owner_seat") AS "owner_seat",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'duties.scope' AND "code" = "convoy_duties"."scope") AS "scope",
+  "convoy_duties"."terms"
+FROM "convoy_duties";
+CREATE VIEW "convoy_duties_scope_promises_view" AS SELECT
+  "convoy_duties_scope_promises"."convoy",
+  "convoy_duties_scope_promises"."duties_key",
+  "convoy_duties_scope_promises"."value"
+FROM "convoy_duties_scope_promises";
+CREATE VIEW "convoy_seats_view" AS SELECT
+  "convoy_seats"."convoy",
+  "convoy_seats"."pos",
+  "convoy_seats"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."role") AS "role",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."seat") AS "seat",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."parent_role") AS "parent_role",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."parent_seat") AS "parent_seat",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."supervised_by") AS "supervised_by"
+FROM "convoy_seats";
+CREATE VIEW "convoy_promises_view" AS SELECT
+  "convoy_promises"."convoy",
+  "convoy_promises"."pos",
+  "convoy_promises"."version",
+  "convoy_promises"."id",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises"."label") AS "label",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises"."kind") AS "kind",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises"."target") AS "target",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'promises.source' AND "code" = "convoy_promises"."source") AS "source",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises"."owner_role") AS "owner_role",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises"."owner_seat") AS "owner_seat",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'promises.progress' AND "code" = "convoy_promises"."progress") AS "progress",
+  "convoy_promises"."progress_since"
+FROM "convoy_promises";
+CREATE VIEW "convoy_promises_submissions_view" AS SELECT
+  "convoy_promises_submissions"."convoy",
+  "convoy_promises_submissions"."promises_pos",
+  "convoy_promises_submissions"."pos",
+  "convoy_promises_submissions"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises_submissions"."address") AS "address",
+  "convoy_promises_submissions"."revision",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises_submissions"."by_role") AS "by_role",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises_submissions"."by_seat") AS "by_seat"
+FROM "convoy_promises_submissions";
+CREATE VIEW "convoy_quota_view" AS SELECT
+  "convoy_quota"."convoy",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_quota"."key") AS "key",
+  "convoy_quota"."value"
+FROM "convoy_quota";
+CREATE VIEW "convoy_retired_view" AS SELECT
+  "convoy_retired"."convoy",
+  "convoy_retired"."value"
+FROM "convoy_retired";
 CREATE TABLE "message" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

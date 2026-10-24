@@ -14,9 +14,9 @@ use flotilla_discovery::run_provisioned_host_detectors;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_environment::environment::CreateOpts;
 use flotilla_environment::environment::EnvironmentHandle;
-use flotilla_environment::environment::EnvironmentToolAssetKind;
 use flotilla_environment::environment::EnvironmentVariableUpdate;
 use flotilla_environment::environment::{contained_daemon_socket_path, DAEMON_SOCKET_ENV};
+use flotilla_environment::environment::{EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
@@ -180,19 +180,23 @@ impl DockerControllerRuntime {
                     environment.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned(),
                 ),
                 Err(ResourceError::NotFound { .. }) => {
-                    (EnvironmentSpec { provider_address: None, host_direct: None, docker: Some(spec.clone()) }, None)
+                    (EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) }, None)
                 }
                 Err(error) => return Err(error.to_string()),
             };
-        environment_spec.docker = Some(spec.clone());
+        if environment_spec.cloud_sandbox.is_none() {
+            environment_spec.docker = Some(spec.clone());
+        }
         let provider = self.provider_for_spec(name, &environment_spec, instance.as_deref()).await?;
-        let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new() };
+        let jobs = environment_spec.cloud_sandbox.as_ref().map(|cloud| cloud.size.cpus as usize);
+        let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new_with(jobs) };
         let mut tools = if provider.receives_host_tools() {
             self.state.environment_tools.prepare(DOCKER_PROVIDER_KIND, name, &context).await?
         } else {
             Vec::new()
         };
         if provider.receives_host_tools() {
+            let cloud = environment_spec.cloud_sandbox.is_some();
             let sockets = self
                 .state
                 .environment_sockets
@@ -209,7 +213,7 @@ impl DockerControllerRuntime {
                     }
                 }
                 for asset in &mut tool.assets {
-                    if asset.kind == EnvironmentToolAssetKind::UnixSocket {
+                    if !cloud && asset.kind == EnvironmentToolAssetKind::UnixSocket {
                         // Mount a dedicated directory containing only this socket.
                         // Keeping the directory stable permits socket replacement on restart.
                         asset.host_path = flotilla_protocol::DaemonHostPath::new(
@@ -221,6 +225,13 @@ impl DockerControllerRuntime {
                         asset.kind = EnvironmentToolAssetKind::Directory;
                     }
                 }
+            }
+        }
+        // Reject parent traversal rather than guessing how a guest's symlinks
+        // resolve it. Path component comparisons already ignore redundant `.`.
+        for mount in &spec.mounts {
+            if Path::new(&mount.target_path).components().any(|part| part == std::path::Component::ParentDir) {
+                return Err(format!("mount target {} must not contain parent traversal", mount.target_path));
             }
         }
         for tool in &tools {
@@ -321,6 +332,17 @@ impl DockerControllerRuntime {
             },
             None => Vec::new(),
         };
+        // Component-wise overlap checks rely on the earlier rejection of `..`
+        // mount targets. Keep that validation ahead of reserved-path checks.
+        for delivery in &material_deliveries {
+            let reserved = delivery.mount.environment_path.as_path();
+            for mount in &spec.mounts {
+                let target = Path::new(&mount.target_path);
+                if target.starts_with(reserved) || reserved.starts_with(target) {
+                    return Err(format!("mount target {} overlaps reserved agent material at {}", target.display(), reserved.display()));
+                }
+            }
+        }
         let prepared_auth = match &self.state.credential_store {
             Some(store) => match self.composed_image_pull_auth(store, spec).await {
                 Ok(Some(auth)) => Some(auth),
@@ -362,9 +384,7 @@ impl DockerControllerRuntime {
         };
         let mut provisioned_mounts = Vec::with_capacity(spec.mounts.len() + material_deliveries.len());
         provisioned_mounts.extend(spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount));
-        for delivery in &material_deliveries {
-            provisioned_mounts.push(delivery.mount.clone());
-        }
+        deliver_agent_material(&provider.capabilities(), &material_deliveries, &mut tools, &mut provisioned_mounts).await?;
         let jobs = context.rust_build_jobs().await?;
         let opts = CreateOpts {
             tokens: environment_variables,
@@ -620,6 +640,18 @@ impl DockerControllerRuntime {
                 .await);
             }
         };
+        if let Some(cloud) = &environment_spec.cloud_sandbox {
+            if let Err(error) = verify_cloud_image_needs(&cloud.probe_needs, &cloud.image, &handle, &bag).await {
+                return Err(discard_failed_environment(
+                    &handle,
+                    self.state.credential_store.as_deref(),
+                    self.state.agent_material.as_deref(),
+                    name,
+                    error,
+                )
+                .await);
+            }
+        }
         if let Err(error) = verify_declared_agent_adapters(spec, &registry) {
             return Err(discard_failed_environment(
                 &handle,
@@ -646,9 +678,13 @@ impl DockerControllerRuntime {
             .await);
         }
         let handle_registry_digest = handle.registry_digest().map(str::to_owned);
+        let provider_descriptor = handle.provider_descriptor().map(Box::new);
+        let survivors = handle.survivors();
         self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { handle });
         Ok(EnvironmentProvisioning {
             backing_id: Some(container_id),
+            provider_descriptor,
+            survivors,
             image_ref: Some(image_ref),
             local_image_id: Some(local_image_id),
             registry_digest: handle_registry_digest,
@@ -670,16 +706,38 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         spec: &EnvironmentSpec,
     ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
         use flotilla_provisioning::reconcilers::EnvironmentProvisioning;
+        if let Some(cloud) = &spec.cloud_sandbox {
+            let carrier = flotilla_resources::DockerEnvironmentSpec {
+                host_ref: self.state.local_host_ref.clone(),
+                image: cloud.image.clone(),
+                image_build_ref: None,
+                declared_agent_adapters: cloud
+                    .env
+                    .get("FLOTILLA_REQUIRED_AGENT_ADAPTERS")
+                    .map(|s| serde_json::from_str(s))
+                    .transpose()
+                    .map_err(|_| "invalid required adapter declaration")?
+                    .unwrap_or_default(),
+                required_agent_adapters: cloud
+                    .env
+                    .get("FLOTILLA_REQUIRED_AGENT_ADAPTERS")
+                    .map(|s| serde_json::from_str(s))
+                    .transpose()
+                    .map_err(|_| "invalid required adapter declaration")?
+                    .unwrap_or_default(),
+                pull_policy: Default::default(),
+                memory_policy: Default::default(),
+                mounts: vec![],
+                env: cloud.env.clone(),
+            };
+            return self.provision_docker(name, &carrier).await;
+        }
         if let Some(docker) = &spec.docker {
             return self.provision_docker(name, docker).await;
         }
         let provider = self.provider_for_environment(name).await?;
         let prepared = provider.prepare(spec, &Default::default()).await?;
         let handle = provider.provision(EnvironmentId::new(name), &prepared, Default::default()).await?;
-        // A re-provisioned agentless Environment may reach the daemon again (#3618).
-        if let Some(reach) = &self.state.agentless_reach {
-            reach.admit(&EnvironmentId::new(name)).await;
-        }
         let facts = EnvironmentProvisioning {
             backing_id: Some(handle.backing_id().to_string()),
             local_image_id: handle.local_image_id().map(str::to_owned),
@@ -691,17 +749,48 @@ impl EnvironmentRuntime for DockerControllerRuntime {
     }
 
     async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String> {
-        let active = self.state.provisioned_environments.lock().await.remove(container_id);
+        let active = {
+            let environments = self.state.provisioned_environments.lock().await;
+            environments
+                .get(container_id)
+                .or_else(|| environments.values().find(|active| active.handle.id().as_str() == environment_ref))
+                .map(|active| active.handle.clone())
+        };
         match active {
-            Some(active) => active.handle.destroy().await?,
+            Some(handle) => {
+                if handle.agent().is_some() {
+                    if let Some(registry) = self
+                        .state
+                        .agent_material
+                        .as_ref()
+                        .filter(|registry| !registry.codex_home_is_shared(environment_ref, &handle.provisioned_mounts()))
+                    {
+                        let runner = handle.runner();
+                        let capture = tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            registry.capture_environment_home(environment_ref, runner.as_ref()),
+                        )
+                        .await;
+                        match capture {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                warn!(environment = environment_ref, %error, "session capture failed; continuing environment teardown")
+                            }
+                            Err(_) => warn!(environment = environment_ref, "session capture timed out; continuing environment teardown"),
+                        }
+                    }
+                }
+                handle.destroy().await?
+            }
             None => {
                 let provider = self.provider_for_environment(environment_ref).await?;
                 provider.destroy(container_id).await?;
             }
         }
         // Recovery addresses Docker by full immutable ID, while adopted handles
-        // may still be indexed by container name. Remove the requested map key above,
-        // then retire any other cached handle whose Environment ID matches.
+        // may still be indexed by container name. Retire all cached handles for
+        // the Environment after destruction succeeds. Capture is best effort: a
+        // stopped or unreachable agent must never prevent deletion.
         self.state.provisioned_environments.lock().await.retain(|_, active| active.handle.id().as_str() != environment_ref);
         let _ = self.state.daemon.remove_provisioned_environment(&EnvironmentId::new(environment_ref));
         self.cleanup(environment_ref).await
@@ -720,9 +809,9 @@ impl EnvironmentRuntime for DockerControllerRuntime {
     }
 
     async fn cleanup(&self, environment_ref: &str) -> Result<(), String> {
-        // An agentless host's forward goes with its Environment (#3618).
-        if let Some(reach) = &self.state.agentless_reach {
-            reach.retire(&EnvironmentId::new(environment_ref)).await?;
+        // An agentless host's vessel agents go with its Environment (#3792).
+        if let (Some(vessels), Some(profile)) = (&self.state.agentless_vessels, self.state.agentless_ssh.get(environment_ref)) {
+            vessels.retire_environment(profile).await;
         }
         if let Some(sockets) = &self.state.environment_sockets {
             sockets.remove(&EnvironmentId::new(environment_ref)).await?;
@@ -795,6 +884,57 @@ impl EnvironmentRuntime for DockerControllerRuntime {
     }
 }
 
+struct GuestProbeEnvironment<'a>(&'a EnvironmentBag);
+impl flotilla_provider_runtime::EnvVars for GuestProbeEnvironment<'_> {
+    fn get(&self, key: &str) -> Option<String> {
+        if key == "FLOTILLA_PROBE_MODELS" {
+            Some(String::new())
+        } else {
+            self.0.find_env_var(key).map(str::to_owned)
+        }
+    }
+}
+pub(super) async fn verify_cloud_image_needs(
+    needs: &BTreeSet<flotilla_resources::CapabilityNeed>,
+    image: &str,
+    handle: &EnvironmentHandle,
+    bag: &EnvironmentBag,
+) -> Result<(), String> {
+    if needs.is_empty() {
+        return Ok(());
+    }
+    // This helper adopts an already-running command endpoint only for detection;
+    // it never provisions or selects a runtime for the sandbox.
+    let detector = flotilla_environment::environment::command_provider(
+        flotilla_environment::environment::EnvironmentInput::HostDirect,
+        handle.runner(),
+    );
+    let kind = flotilla_resources::FulfilmentKindSpec {
+        host_ref: String::new(),
+        pool: "cleat".into(),
+        cost_class: Default::default(),
+        grants: Default::default(),
+        realisation: flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { image: image.to_owned() },
+    };
+    let facts = crate::fulfilment_probe::probe_kind(
+        &kind,
+        crate::fulfilment_probe::DetectionTarget { image: None, provider: detector.as_ref() },
+        true,
+        &*handle.runner(),
+        &GuestProbeEnvironment(bag),
+        Path::new("/tmp/flotilla/probe"),
+        &mut Default::default(),
+    )
+    .await?;
+    let missing =
+        needs.iter().filter(|need| !need.covered_by(&Default::default(), Some(&facts))).map(ToString::to_string).collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("cloud image does not satisfy {}", missing.join(", ")))
+    }
+}
+
 pub(super) fn verify_declared_agent_adapters(
     spec: &flotilla_resources::DockerEnvironmentSpec,
     registry: &ProviderRegistry,
@@ -849,6 +989,9 @@ pub(super) async fn discard_failed_environment(
     environment_ref: &str,
     error: String,
 ) -> String {
+    if !handle.created_for_setup() {
+        return format!("{} {error}", flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX);
+    }
     let mut cleanup_errors = Vec::new();
     if let Err(cleanup_error) = handle.destroy().await {
         cleanup_errors.push(format!("destroy rejected environment: {cleanup_error}"));
@@ -906,4 +1049,34 @@ pub(super) async fn probe_provisioned_environment(
     let config = ConfigStore::with_base(state.config.base_path().as_path().join(format!("env-discovery/{env_id}")));
     let registry = discovery.factories.probe_all(&bag, &config, &probe_root, handle.runner()).await;
     Ok((bag, Arc::new(registry)))
+}
+
+// Agent material chooses a transport independently of executable/tool delivery.
+pub(super) async fn deliver_agent_material(
+    capabilities: &flotilla_protocol::provider::ProviderCapabilities,
+    deliveries: &[flotilla_credentials::AgentMaterialDelivery],
+    tools: &mut Vec<EnvironmentTool>,
+    provisioned_mounts: &mut Vec<flotilla_environment::environment::ProvisionedMount>,
+) -> Result<(), String> {
+    for delivery in deliveries {
+        if !capabilities.material_modes.contains(&flotilla_protocol::provider::MaterialMode::Shared) {
+            let metadata =
+                tokio::fs::symlink_metadata(delivery.mount.host_path.as_path()).await.map_err(|e| format!("agent material source: {e}"))?;
+            let kind = if metadata.is_dir() { EnvironmentToolAssetKind::Directory } else { EnvironmentToolAssetKind::File };
+            // Providers without Shared material receive an initial copy after hello.
+            // Docker keeps the writable home host-backed for the whole session.
+            tools.push(EnvironmentTool::new("agent material", delivery.mount.environment_path.as_path()).with_asset(
+                EnvironmentToolAsset::new(
+                    delivery.mount.host_path.as_path(),
+                    delivery.mount.environment_path.as_path(),
+                    kind,
+                    EnvironmentToolAssetAccess::ReadOnly,
+                    "agent material",
+                ),
+            ));
+        } else {
+            provisioned_mounts.push(delivery.mount.clone());
+        }
+    }
+    Ok(())
 }

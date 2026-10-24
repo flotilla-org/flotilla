@@ -736,7 +736,27 @@ pub(super) async fn redeliver_codex_credentials(state: &ControllerRuntimeState, 
         }
         // A redelivery failure is never fatal to the environment: the crew keeps
         // the copy it already has, and the next tick retries.
-        match registry.refresh_delivered_credentials(&environment.metadata.name).await {
+        let mounts = state
+            .daemon
+            .environment_manager()
+            .provisioned_mounts(&flotilla_protocol::EnvironmentId::new(environment.metadata.name.as_str()))
+            .unwrap_or_else(|| {
+                tracing::warn!(environment = %environment.metadata.name,
+                    "provisioned environment mounts unavailable; falling back to pushed Codex credential delivery");
+                Vec::new()
+            });
+        // The fallback writes only auth.json through the guest runner. If the
+        // home is actually Shared, this reaches the same RW host mount and
+        // preserves its session files while rotating the credential.
+        let result = if registry.codex_home_is_shared(&environment.metadata.name, &mounts) {
+            registry.refresh_delivered_credentials(&environment.metadata.name).await
+        } else {
+            match state.daemon.command_runner_for_environment_ref(&environment.metadata.name) {
+                Some(runner) => registry.refresh_delivered_credentials_through(&environment.metadata.name, runner.as_ref()).await,
+                None => Err("agent runner unavailable for Codex auth rotation".into()),
+            }
+        };
+        match result {
             Ok(true) => info!(environment = %environment.metadata.name, "redelivered the central Codex credential"),
             Ok(false) => {}
             Err(error) => warn!(environment = %environment.metadata.name, %error, "failed to redeliver the central Codex credential"),

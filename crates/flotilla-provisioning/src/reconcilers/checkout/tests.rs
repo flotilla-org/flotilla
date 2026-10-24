@@ -281,6 +281,7 @@ async fn empty_convoy_sweep_respects_namespaces_and_hosts() {
             .create(
                 &empty_meta(name),
                 &EnvironmentSpec {
+                    cloud_sandbox: None,
                     provider_address: None,
                     host_direct: Some(HostDirectEnvironmentSpec {
                         host_ref: host.into(),
@@ -320,6 +321,7 @@ async fn empty_convoy_sweep_fails_closed_on_listing_errors() {
             .create(
                 &empty_meta("host-direct"),
                 &EnvironmentSpec {
+                    cloud_sandbox: None,
                     provider_address: None,
                     host_direct: Some(HostDirectEnvironmentSpec {
                         host_ref: "local".into(),

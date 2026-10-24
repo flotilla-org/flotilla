@@ -98,6 +98,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -229,6 +251,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -593,6 +621,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "critical-section"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
+
+[[package]]
 name = "crokey"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -862,6 +896,151 @@ dependencies = [
 ]
 
 [[package]]
+name = "drydock"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/drydock?rev=e3e5f6969fcade32576d340d549c7e85d1f7ec18#e3e5f6969fcade32576d340d549c7e85d1f7ec18"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "clap",
+ "drydock-agent",
+ "drydock-client",
+ "drydock-protocol",
+ "drydock-transport",
+ "futures",
+ "http",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "percent-encoding",
+ "reqwest 0.13.2",
+ "rigging-http-client",
+ "rigging-http-serve",
+ "rigging-paths",
+ "rigging-process",
+ "rigging-stream",
+ "rigging-tls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 1.1.3+spec-1.1.0",
+ "uuid",
+]
+
+[[package]]
+name = "drydock-agent"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/drydock?rev=e3e5f6969fcade32576d340d549c7e85d1f7ec18#e3e5f6969fcade32576d340d549c7e85d1f7ec18"
+dependencies = [
+ "axum",
+ "bytes",
+ "drydock-protocol",
+ "drydock-transport",
+ "hickory-proto",
+ "http",
+ "http-body-util",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "socket2",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-vsock",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "drydock-client"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/drydock?rev=e3e5f6969fcade32576d340d549c7e85d1f7ec18#e3e5f6969fcade32576d340d549c7e85d1f7ec18"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "drydock-protocol",
+ "futures",
+ "http",
+ "reqwest 0.13.2",
+ "rigging-http-client",
+ "rigging-stream",
+ "rigging-tls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "drydock-host"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/drydock?rev=e3e5f6969fcade32576d340d549c7e85d1f7ec18#e3e5f6969fcade32576d340d549c7e85d1f7ec18"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "axum",
+ "chrono",
+ "drydock-protocol",
+ "futures",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "reqwest 0.13.2",
+ "rigging-http-client",
+ "rigging-http-serve",
+ "rigging-stream",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "drydock-protocol"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/drydock?rev=e3e5f6969fcade32576d340d549c7e85d1f7ec18#e3e5f6969fcade32576d340d549c7e85d1f7ec18"
+dependencies = [
+ "base64 0.23.1",
+ "chrono",
+ "ipnet",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "utoipa",
+]
+
+[[package]]
+name = "drydock-transport"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/drydock?rev=e3e5f6969fcade32576d340d549c7e85d1f7ec18#e3e5f6969fcade32576d340d549c7e85d1f7ec18"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tokio-vsock",
+ "tracing",
+ "yamux",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -946,6 +1125,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "enum-as-inner"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1e6a265c649f3f5979b601d26f1d05ada116434c87741c9493cb56218f76cbc"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1084,13 +1275,13 @@ dependencies = [
  "flotilla-projections",
  "flotilla-protocol",
  "flotilla-provider-runtime",
+ "flotilla-provisioning",
  "flotilla-resources",
  "flotilla-store",
  "flotilla-store-memory",
  "flotilla-test-support",
  "flotilla-tui",
  "flotilla-vcs",
- "flotilla-vessel-agent",
  "hegeltest",
  "libc",
  "ratatui",
@@ -1225,6 +1416,7 @@ dependencies = [
  "flotilla-build-features-base",
  "flotilla-build-features-types",
  "hegeltest",
+ "libc",
  "serde",
  "smallvec",
 ]
@@ -1289,6 +1481,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-executor",
+ "futures-io",
  "futures-sink",
  "futures-util",
  "generic-array",
@@ -1577,6 +1770,7 @@ dependencies = [
  "color-eyre",
  "comfy-table",
  "crossterm",
+ "flotilla-agent",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -1595,6 +1789,7 @@ dependencies = [
  "flotilla-core",
  "flotilla-daemon",
  "flotilla-daemon-api",
+ "flotilla-daemon-testkit",
  "flotilla-discovery-testkit",
  "flotilla-manifest",
  "flotilla-paths",
@@ -1603,13 +1798,16 @@ dependencies = [
  "flotilla-store",
  "flotilla-store-memory",
  "futures",
+ "hegeltest",
  "humantime",
  "insta",
  "libc",
  "serde",
  "serde_json",
+ "serde_yml",
  "tempfile",
  "tokio",
+ "toml_edit 0.22.27",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1884,7 +2082,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "base64",
+ "base64 0.22.1",
  "bon",
  "bytes",
  "chrono",
@@ -2006,10 +2204,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "base64",
+ "base64 0.22.1",
  "bon",
  "bytes",
  "chrono",
+ "drydock",
+ "drydock-agent",
+ "drydock-protocol",
+ "drydock-transport",
  "flotilla-address",
  "flotilla-admission",
  "flotilla-agent",
@@ -2280,10 +2482,13 @@ dependencies = [
  "flotilla-build-features-sqlite",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-quint-testkit",
  "flotilla-schema",
  "flotilla-schema-sqlite",
  "flotilla-state-machines",
  "rusqlite",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -2294,6 +2499,13 @@ dependencies = [
  "axum",
  "bon",
  "chrono",
+ "clap",
+ "data-encoding",
+ "drydock",
+ "drydock-agent",
+ "drydock-host",
+ "drydock-protocol",
+ "drydock-transport",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -2309,9 +2521,13 @@ dependencies = [
  "flotilla-replay-testkit",
  "flotilla-resources",
  "flotilla-terminal",
+ "futures",
  "hegeltest",
+ "http",
  "libc",
  "reqwest 0.13.2",
+ "rigging-ssh",
+ "rigging-stream",
  "rigging-tls",
  "serde",
  "serde_json",
@@ -2831,7 +3047,7 @@ dependencies = [
 name = "flotilla-protocol"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bon",
  "chrono",
  "flotilla-build-features",
@@ -2923,11 +3139,16 @@ dependencies = [
  "flotilla-config",
  "flotilla-core",
  "flotilla-discovery-testkit",
+ "flotilla-engine-store",
  "flotilla-environment",
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-provider-runtime",
+ "flotilla-quint-testkit",
  "flotilla-resources",
+ "flotilla-schema",
+ "flotilla-schema-sqlite",
+ "flotilla-state-machines",
  "flotilla-store",
  "flotilla-store-memory",
  "flotilla-store-sqlite",
@@ -3111,6 +3332,7 @@ dependencies = [
  "flotilla-cbor",
  "flotilla-schema-derive",
  "hegeltest",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -3147,6 +3369,7 @@ dependencies = [
  "flotilla-schema",
  "flotilla-state-machines",
  "hegeltest",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3162,6 +3385,7 @@ dependencies = [
  "flotilla-quint-testkit",
  "flotilla-schema",
  "hegeltest",
+ "libc",
  "serde",
  "serde_json",
  "smallvec",
@@ -3173,7 +3397,7 @@ name = "flotilla-store"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "bon",
  "bytes",
  "chrono",
@@ -3212,7 +3436,7 @@ name = "flotilla-store-http"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "bon",
  "bytes",
  "chrono",
@@ -3254,7 +3478,7 @@ name = "flotilla-store-memory"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "bon",
  "bytes",
  "chrono",
@@ -3292,7 +3516,7 @@ name = "flotilla-store-sqlite"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "bon",
  "bytes",
  "chrono",
@@ -3525,19 +3749,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "flotilla-vessel-agent"
-version = "0.1.0"
-dependencies = [
- "flotilla-build-features",
- "flotilla-build-features-async",
- "flotilla-build-features-logging",
- "flotilla-build-features-tracing",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3834,6 +4045,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hickory-proto"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8a6fe56c0038198998a6f217ca4e7ef3a5e51f46163bd6dd60b5c71ca6c6502"
+dependencies = [
+ "async-trait",
+ "cfg-if",
+ "data-encoding",
+ "enum-as-inner",
+ "futures-channel",
+ "futures-util",
+ "idna",
+ "ipnet",
+ "once_cell",
+ "rand 0.9.2",
+ "thiserror 2.0.18",
+ "tinyvec",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3948,7 +4181,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -4274,7 +4507,7 @@ version = "11.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "881733cbc631fc9e472e24447ce32a64bedf2da498d6d8570b08edc87de71f65"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "ed25519-dalek",
  "getrandom 0.2.17",
  "hmac",
@@ -4429,7 +4662,7 @@ version = "1.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0aeb26bf5e836cc1c341c8106051b573f1766dfa05aa87f0b98be5e51b02303"
 dependencies = [
- "nix",
+ "nix 0.29.0",
  "winapi",
 ]
 
@@ -4546,6 +4779,25 @@ dependencies = [
  "libc",
  "memoffset",
 ]
+
+[[package]]
+name = "nix"
+version = "0.31.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d6d0705320c1e6ba1d912b5e37cf18071b6c2e9b7fa8215a1e8a7651966f5d3"
+dependencies = [
+ "bitflags 2.11.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
+]
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "nom"
@@ -4691,7 +4943,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fbfbfff40aeccab00ec8a910b57ca8ecf4319b335c542f2edcd19dd25a1e2a00"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "form_urlencoded",
@@ -4725,6 +4977,10 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+dependencies = [
+ "critical-section",
+ "portable-atomic",
+]
 
 [[package]]
 name = "once_cell_polyfill"
@@ -4882,7 +5138,7 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde_core",
 ]
 
@@ -5475,7 +5731,7 @@ version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "futures-util",
@@ -5517,7 +5773,7 @@ version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab3f43e3283ab1488b624b44b0e988d0acea0b3214e694730a055cb6b2efa801"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "encoding_rs",
  "futures-channel",
@@ -5568,7 +5824,7 @@ dependencies = [
 [[package]]
 name = "rigging-http-client"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=0e17afbd10eab95614a2033159d2dabde30e5eea#0e17afbd10eab95614a2033159d2dabde30e5eea"
+source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5582,7 +5838,7 @@ dependencies = [
 [[package]]
 name = "rigging-http-serve"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=0e17afbd10eab95614a2033159d2dabde30e5eea#0e17afbd10eab95614a2033159d2dabde30e5eea"
+source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
@@ -5596,9 +5852,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-paths"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
+dependencies = [
+ "rigging-process",
+]
+
+[[package]]
 name = "rigging-process"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=0e17afbd10eab95614a2033159d2dabde30e5eea#0e17afbd10eab95614a2033159d2dabde30e5eea"
+source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
 dependencies = [
  "async-trait",
  "libc",
@@ -5611,7 +5875,7 @@ dependencies = [
 [[package]]
 name = "rigging-replay-testkit"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=0e17afbd10eab95614a2033159d2dabde30e5eea#0e17afbd10eab95614a2033159d2dabde30e5eea"
+source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
 dependencies = [
  "async-trait",
  "axum",
@@ -5630,9 +5894,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-ssh"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
+dependencies = [
+ "async-trait",
+ "rigging-stream",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "rigging-stream"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "rigging-tls"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=0e17afbd10eab95614a2033159d2dabde30e5eea#0e17afbd10eab95614a2033159d2dabde30e5eea"
+source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
 dependencies = [
  "reqwest 0.13.2",
  "rustls",
@@ -6407,7 +6690,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4676b37242ccbd1aabf56edb093a4827dc49086c0ffd764a5705899e0f35f8f7"
 dependencies = [
  "anyhow",
- "base64",
+ "base64 0.22.1",
  "bitflags 2.11.0",
  "fancy-regex",
  "filedescriptor",
@@ -6418,7 +6701,7 @@ dependencies = [
  "libc",
  "log",
  "memmem",
- "nix",
+ "nix 0.29.0",
  "num-derive",
  "num-traits",
  "ordered-float",
@@ -6599,6 +6882,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-stream"
+version = "0.1.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-tungstenite"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6622,10 +6916,24 @@ checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "futures-util",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tokio-vsock"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b319ef9394889dab2e1b4f0085b45ba11d0c79dc9d1a9d1afc057d009d0f1c7"
+dependencies = [
+ "bytes",
+ "futures",
+ "libc",
+ "tokio",
+ "vsock",
 ]
 
 [[package]]
@@ -7011,6 +7319,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "utoipa"
+version = "5.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bde15df68e80b16c7d16b9616e80770ad158988daa56a27dccd1e55558b0160"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_json",
+ "utoipa-gen",
+]
+
+[[package]]
+name = "utoipa-gen"
+version = "5.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba0b99ee52df3028635d93840c797102da61f8a7bb3cf751032455895b52ef8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "uuid"
 version = "1.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7050,6 +7381,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "vsock"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba782755fc073877e567c2253c0be48e4aa9a254c232d36d3985dfae0bd5205"
+dependencies = [
+ "libc",
+ "nix 0.31.2",
 ]
 
 [[package]]
@@ -7831,6 +8172,22 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+
+[[package]]
+name = "yamux"
+version = "0.13.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1991f6690292030e31b0144d73f5e8368936c58e45e7068254f7138b23b00672"
+dependencies = [
+ "futures",
+ "log",
+ "nohash-hasher",
+ "parking_lot",
+ "pin-project",
+ "rand 0.9.2",
+ "static_assertions",
+ "web-time",
+]
 
 [[package]]
 name = "yoke"

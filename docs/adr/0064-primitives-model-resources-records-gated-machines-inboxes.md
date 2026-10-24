@@ -51,6 +51,14 @@ Convoys assumed that their vessels were co-located and fixed. Many writers could
   a retired seat's name is reserved for the rest of its generation; Rollover clears retired seats, so a later generation may reuse the name, and the live record never accumulates seat history.
 
   ADR 0064 Convoy records: a change-request observation finds its submission through a full index on the submission address (one lookup per event); there is no partial index on open convoys.
+
+  ADR 0064 promise labels: a promise's label is stored per convoy and is the name crews and views use; kinds stay declarations.
+
+  ADR 0064 promise labels: a promise label is the permanent name of what is delivered, unique in its convoy and never reused or changed by reassignment; the owner is separate data. Seat-qualified labels exist only for imported records.
+
+  ADR 0064 awaiting replies: the AwaitingReply record is written by the sender's home once the receiver has admitted the message, and a send is not finished until that record is written; this replaces "written in the send's transaction".
+
+  ADR 0064 operator-level stalls: until the operator is a principal with an inbox, stalls escalated to the operator are read from the old stall status; no stall drops out of the views.
 - **A judgement** is computed and never stored. Examples are ready, stalled, landing, kept, retry count, next attempt, stale and drift. Each judgement is a declared function with declared inputs, and it returns a value and the moment it could next change. The same function gates edges and renders listings, so the two cannot disagree.
 - **No host writes another home's resource.** It sends a message to that home, or it publishes a record of its own that the home observes.
 
@@ -93,7 +101,9 @@ How the Convoy and Message machines behave:
 
 How Checkouts and lends behave:
 - **One Checkout per writing role.** The shared unit is the branch, not a directory. Each writing role gets its own Checkout, a worktree made from a per-host, per-repository Clone that convoys on that host share. Roles share by pushing branches, and hand over by committing and pushing.
-- **A Checkout is owned by the role's owner:** the convoy for convoy roles, the Ensure for standing roles. Its home is the host it lives on. A replacement session on the same host reuses it. A replacement on another host means `release`, observing Gone, then creating a new Checkout from the last pushed commit.
+- **A Checkout is held for its role's owner** (owner's schema look-over, 2026-10-22, #3719 ruling 4)**:** a Checkout is held for its role's owner (the convoy for convoy roles, the Ensure for standing roles), recorded as an indexed holder address with no ownership semantics. An Environment records its Vessel the same way. Its home is the host it lives on. A replacement session on the same host reuses it. A replacement on another host means `release`, observing Gone, then creating a new Checkout from the last pushed commit.
+- **A TerminalSession is held for its vessel** (owner's schema look-over of #3720, 2026-10-22)**:** a TerminalSession records the vessel it is held for as an indexed holder address, like Checkout and Environment; its convoy is the vessel's. Its realised pool session id is not indexed.
+- **A lifecycle resource is never revived** (owner, 2026-10-22, #3629 Q1-Q5). A lifecycle resource is never revived. Once Gone it stays Gone, and its holder or owner requests a new resource; this covers sessions per launch, replacement vessels and replacement checkouts. Membership in a convoy is the member's own indexed reference, with no edge on the Convoy. A vessel that breaks after its lease ends Gone, and the requester limits replacements in its own state.
 - **Inside a vessel is the crew's business.** Extra branches and worktrees inside a vessel, such as a stack lead's subagents, live inside the crew's Checkout. Flotilla knows the deliverables (promised branches and change requests, observed on the forge) and the Checkout, whose release removes everything inside it.
 - **A lend** lets another role, or a person, borrow a resource the owner holds: a Checkout, a process with an open port, or a jackstay stream. It is a relation asserted by the lender, with terms: who, mode (read-only or shared-write), and until a time or an event. The environment enforces the mode where it can. In a workflow with a co-placed coder and reviewer, their sharing of local files is a lend, not a shared placement owner.
 - **A lend gates release.** The lender's `release` is refused while an unexpired lend exists, unless the borrower has returned it or an authorised override records a reason. A lend until an event that never comes stays unexpired until it is returned or overridden. Return is the borrower's edge. Loss is `vanish`, with a message to the borrower.
@@ -177,6 +187,7 @@ ADR 0064 §"Roles, inboxes and delivery" records that addresses never carry a ho
 - **Admission grants a capacity budget.** The workflow template proposes a budget, and admission may grant less.
 - **Growth within the budget goes straight to placement.** The convoy asks placement for vessels directly. Placement is decided by the capacity pool's authoritative daemon, because the ledger is its own (2026-10-20 grill). For an agentless SSH host this is its owning daemon; for a provider account it is the daemon that holds the account's credential. Filling a role from inside a vessel, such as a subagent, uses no budget.
 - **Growth beyond the budget is a new request** to admission, in effect a readmission.
+- **A vessel's lease is its pinned host for now** (owner, 2026-10-23, #3629 Q6)**:** until a capacity model is ruled, a vessel's lease is the host pinned at admission, recorded as granted; the engine judges no capacity.
 - **Warm vessels** are a host-owned placement policy, at low priority: a host keeps N warm vessels per image. Placement may hand one to a convoy as an ownership change. Its lifecycle stays Realised, and it counts against the host while idle and against the convoy's budget from handover. Pools may later prepare more, such as a build directory seeded from a recent cache. *(This bullet predates the 2026-10-20 capacity pools and is not yet pool-aware; which pool a warm vessel counts against is for the capacity grill under #3303.)*
 
 ### Storage, replication, views
@@ -202,6 +213,8 @@ ADR 0064 §"Roles, inboxes and delivery" records that addresses never carry a ho
 - **Identity rows are tombstones** (#3392 G2, as revised by G9). Deleting a resource keeps its identity row and name string, so a `Ref` never dangles: a reference to a deleted or archived target resolves to its identity row, and a reader that finds no current row routes to the archive. Only expunging the resource removes its identity row and name string.
 - **Kind codes** (#3373 ruling 6). The production kind registry (`flotilla_state_machines::kinds`) lists every production kind under the code it holds for good. A code is allocated there once and never reused. Test kinds register beside the production kinds, so the registry refuses a test kind that takes a production code.
 - **Vessel is a stored kind; the host ledger is a view** (#3373 ruling 6, #3392 ruling D5). The stored Vessel is `Resource<Vessel>`, declared by its spec, the lease: the placement request and the host, with the lifecycle state; its edges, attempts among them, are its log entries. Placement is not a table of its own: the host ledger is a view over the leases of live vessels, indexed by host, and a ledger is rebuilt from them after a restart rather than kept, so a restart loses no lease. Each other lifecycle kind (Environment, Checkout, Clone, ImageBuild, TerminalSession) declares its spec beside its request, in the crate that owns that request, when the kind moves to this store; the engine supplies the state, edge-event and attempt types it stores.
+- **A provider's recipe is its own document** (owner's schema look-over, 2026-10-22, #3719). A stored lifecycle kind's request holds the provider's own recipe as a provider-owned document, not as variant columns in the shared table, so a new provider never changes the shared schema. Columns are for what is queried.
+- **Nothing derived at launch is stored** (owner's schema look-over, 2026-10-22, #3719 rulings 5-6). Stored resources never hold launch-time derived data such as credential grants or skills; those are composed at launch. A Docker environment's image is either pinned or built, never both.
 - **Edge payloads name edges by code** (#3373 ruling 6). An edge's document holds `[code, arguments]`, never the edge's variant name, so renaming an edge changes no stored payload. The header's edge code and the document's agree.
 - **Crates and attributes.** The derive is `flotilla-schema-derive`, re-exported by the backend-neutral `flotilla-schema` (descriptors, DDL, the kind-code registry); the rusqlite runtime is `flotilla-schema-sqlite`. As ruled on #3215, the attribute list is closed: field attributes `child`, `records`, `history`, `frozen`, `cbor` (an inline canonical-CBOR document, added by the owner's ruling of 2026-10-15), `intern`, `flatten` and `state`, the variant attribute `code`, and the type attributes `kind`, `code`, `state` (a spec's state, #3392 ruling D5), `index` and `labels` (added by the owner's ruling of 2026-10-16 on #3373). The schema review of 2026-10-17 (#3392 A7) adds the field attribute `alias = "old"`, which a renamed field takes beside its shape attribute so its columns and table answer to the old name and earlier log entries still apply, and the kind attribute `edges = E`, naming the code enum of the kind's edges, the only edge codes its entries may carry (a machine's `Resource<M>` declares its machine's edges itself, so a spec takes none). Any other shape fails to compile; adding to the list is a reviewed decision.
 
@@ -251,6 +264,8 @@ followers run before the first registered kind is installed; until then both rou
 
 **Definitions.** A definition is homed at the ManifestRoot that declares it, and edited through git. Undeclared definitions are homed where they were created. Multi-writer merge metadata and field ownership are removed.
 
+ADR carry: a standing ConvoyEnsure is acted on by exactly one host — its declared driver when it names one, otherwise its definition home (the declaring ManifestRoot's host, or the creating host for an undeclared ensure).
+
 ### Not Kubernetes
 
 Flotilla resources will not be Kubernetes CRDs. Kubernetes, if used, is an environment provider. The following are dropped:
@@ -276,6 +291,8 @@ The following stay:
 ADR 0064 §"Switch-over" records the `[primitives]` switch and its dummy-fleet guard, the phase-to-state import table with named refusals, and old-store reads behind named ports during the transition.
 
 ADR 0064 §"Switch-over" records that Message moves over only after the change stream (#3463), so cross-host reads come from local replicas and misses are marked remote.
+
+ADR 0064 §"Switch-over": with `[primitives]` on, the engine is the single writer for each kind it holds. Any old-shape copy is a one-way, derived scaffold, deleted by the read-port layer.
 
 There is no double-write path and no long-lived branch.
 1. **Build alongside.** The new code is built on main in new crates, behind one switch in the composition root.

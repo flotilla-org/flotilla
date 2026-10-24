@@ -388,6 +388,7 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
                 .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), first_ref.clone())]))
                 .build(),
             &ResourceEnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {

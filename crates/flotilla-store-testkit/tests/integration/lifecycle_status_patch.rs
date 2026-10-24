@@ -120,6 +120,7 @@ define_patch_kinds! {
     TerminalObserveDaemonReach => NONE,
     TerminalMarkMessageDelivered => NONE,
     TerminalMarkDeliveryExpired => NONE,
+    TerminalMarkControllerFenceUnverifiable => NONE,
     TerminalMarkDeliveryUnconfirmed => NONE,
     TerminalMarkDeliveryNotSubmitted => NONE,
     TerminalObserveAttention => NONE,
@@ -182,7 +183,9 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::MarkWorkFailed { .. } => PatchKind::ConvoyMarkWorkFailed,
         ConvoyStatusPatch::MarkWorkCancelled { .. } => PatchKind::ConvoyMarkWorkCancelled,
         ConvoyStatusPatch::MarkConvoyAbandoned { .. } => PatchKind::ConvoyMarkConvoyAbandoned,
-        ConvoyStatusPatch::Promise { .. } | ConvoyStatusPatch::ObservePromise { .. } => PatchKind::ConvoyPromise,
+        ConvoyStatusPatch::Promise { .. } | ConvoyStatusPatch::ObservePromise { .. } | ConvoyStatusPatch::HandPromisesToEngine => {
+            PatchKind::ConvoyPromise
+        }
         ConvoyStatusPatch::MarkCrewCompleted { .. } => PatchKind::ConvoyMarkCrewCompleted,
         ConvoyStatusPatch::DeriveCrewDone { .. } => PatchKind::ConvoyDeriveCrewDone,
         ConvoyStatusPatch::MarkCrewFailed { .. } => PatchKind::ConvoyMarkCrewFailed,
@@ -209,6 +212,7 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
         TerminalSessionStatusPatch::ObserveDaemonReach { .. } => PatchKind::TerminalObserveDaemonReach,
         TerminalSessionStatusPatch::MarkMessageDelivered { .. } => PatchKind::TerminalMarkMessageDelivered,
         TerminalSessionStatusPatch::MarkDeliveryExpired => PatchKind::TerminalMarkDeliveryExpired,
+        TerminalSessionStatusPatch::MarkControllerFenceUnverifiable { .. } => PatchKind::TerminalMarkControllerFenceUnverifiable,
         TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { .. } => PatchKind::TerminalMarkDeliveryUnconfirmed,
         TerminalSessionStatusPatch::MarkDeliveryNotSubmitted { .. } => PatchKind::TerminalMarkDeliveryNotSubmitted,
         TerminalSessionStatusPatch::MarkStopped { .. } => PatchKind::TerminalMarkStopped,

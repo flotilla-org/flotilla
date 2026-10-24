@@ -68,6 +68,8 @@ STATE_MACHINE_DEPENDENTS = frozenset({
     "flotilla-engine-store", "flotilla-inbox", "flotilla-inbox-testkit", "flotilla-quint-testkit",
     # #3317: the composition root and its Message path, behind `[primitives]`.
     "flotilla-core", "flotilla-daemon",
+    # #3629: the provisioning lifecycle kinds declare their specs beside their requests.
+    "flotilla-provisioning",
 })
 # #3317: the Message switch composes the engine inbox; only these use it directly.
 INBOX_DEPENDENTS = frozenset({"flotilla-core", "flotilla-daemon"})
@@ -86,7 +88,7 @@ VESSEL_UI_PACKAGES = frozenset({"flotilla-tui", "ratatui", "ratatui-core", "rata
 
 def vessel_graph_violations(tree):
     names = {package.split()[0] for package in tree}
-    return [f"vessel CLI: must not depend on {name}" for name in sorted(names & VESSEL_UI_PACKAGES)]
+    return [f"vessel CLI: must not depend on {name}" for name in sorted(names & (VESSEL_UI_PACKAGES | {"flotilla-core", "flotilla-daemon"}))]
 
 
 def c_free_violations(name, tree):
@@ -194,12 +196,6 @@ def violations(metadata):
                 pending.extend(production[node])
         return reached - {start}
 
-    # The resident agent owns startup and transports, never host orchestration.
-    if "flotilla-vessel-agent" in packages:
-        for target in sorted(reached_from("flotilla-vessel-agent")):
-            if not target.startswith("flotilla-build-features"):
-                errors.append(f"flotilla-vessel-agent: must not depend on {target}; the agent has no host runtime dependencies")
-
     # The schema crates stay a self-contained stack: anything they reach, directly or through an
     # allowed crate, must itself be allowed. Upward schema edges are refused the same way.
     for position, schema in enumerate(SCHEMA_CRATES):
@@ -289,7 +285,7 @@ def main(arguments=()):
     metadata = json.loads(cargo("metadata", "--locked", "--format-version", "1"))
     errors = violations(metadata)
     tree_arguments = ("tree", "--locked", "--prefix", "none", "--format", "{p}|{f}")
-    vessel = tree_features(cargo(*tree_arguments, "-p", "flotilla", "--no-default-features", "--edges", "normal,build", *target_arguments))
+    vessel = tree_features(cargo(*tree_arguments, "-p", "flotilla-cli", "--edges", "normal,build", *target_arguments))
     errors.extend(vessel_graph_violations(vessel))
     members = [package for package in metadata["packages"] if package["id"] in metadata["workspace_members"]]
     # Resolver 2 unifies dependency features within a command. Compare to

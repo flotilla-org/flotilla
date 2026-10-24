@@ -72,6 +72,7 @@ async fn actuator_refuses_delivery_and_hold_after_service_stops() {
         message_subject: None,
         delivery_condition: None,
         expectation: Default::default(),
+        stall_of: None,
     };
     assert_eq!(actuator.deliver(&request).await.expect_err("stopped delivery"), "daemon stopped before turn delivery");
     assert_eq!(

@@ -33,6 +33,9 @@ pub(super) async fn crew_message_views(
     message_views(backend, namespace, &super::projection_ports::MessageReceiverEvidence(receivers, None), None, &BTreeSet::new()).await
 }
 
+/// The `[primitives]` Convoy path, off: explanations read the stored promises.
+static NO_CONVOY_ENGINE: std::sync::LazyLock<flotilla_resources::convoy::engine::EngineConvoyPath> =
+    std::sync::LazyLock::new(Default::default);
 /// Receiver evidence with the switch off: Messages are read from the old store.
 static OLD_STORE_RECEIVERS: std::sync::LazyLock<super::projection_ports::MessageReceivers> =
     std::sync::LazyLock::new(|| super::projection_ports::MessageReceivers(Default::default()));
@@ -243,6 +246,60 @@ mod tests {
         assert_eq!(row.supervisor_absence_reason.as_deref(), Some("no current stall condition recorded for this obligation"));
     }
 
+    // Behaviour (#3587 ruling 6353447431): until the operator has an inbox at a home (#3457), a stall
+    // escalated to the operator has no engine stall record, so the engine reads the seat as not
+    // stalled; the stall view reads the old stall status for it and still lists it as stalled.
+    #[tokio::test]
+    async fn an_operator_level_stall_shows_as_stalled_without_an_engine_record() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let convoys = backend.using::<ResourceConvoy>("flotilla");
+        let convoy = convoys
+            .create(&InputMeta::builder().name("demo".into()).build(), &ConvoySpec::builder().workflow_ref("scratch".into()).build())
+            .await
+            .expect("convoy");
+        let stall = flotilla_resources::StalledCondition {
+            leaves: Vec::new(),
+            maker: Some(flotilla_resources::LeafMaker::Actor { vessel: "work".into(), role: "coder".into() }),
+            evidence: "no supervisor answered".into(),
+            source: flotilla_resources::StallEvidenceSource::LeafEngine,
+            cause: None,
+            began_at: Utc::now(),
+            rung: flotilla_resources::StallRung::Operator,
+            supervisor: None,
+            supervision_message: None,
+            supervision_index: None,
+            supervision_exhausted: true,
+            reason: None,
+            proposed_disposition: None,
+            nudge_history: Vec::new(),
+        };
+        convoys
+            .update_status(
+                "demo",
+                &convoy.metadata.resource_version,
+                &ConvoyStatus { phase: ConvoyPhase::Active, stalled: Some(stall), ..Default::default() },
+            )
+            .await
+            .expect("an operator-level stall");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = Arc::new(
+            flotilla_schema_sqlite::stream::Service::open(
+                &dir.path().join("decided.sqlite"),
+                "home-a",
+                flotilla_engine_store::registry().expect("registry"),
+            )
+            .expect("store"),
+        );
+        use crate::primitives::awaiting::AwaitingReplies;
+        let records = AwaitingReplies::open("home-a", &service).expect("records");
+        let seat: flotilla_address::Address = "project:flotilla/convoy:demo/role:coder".parse().expect("seat");
+        assert!(!records.stalled(&seat).expect("read"), "no engine stall record at the operator rung");
+        let response = ReadProjections::crew_stalls(&backend, false, Utc::now()).await.expect("stalls");
+        assert_eq!(response.rows.len(), 1, "{:?}", response.rows);
+        assert_eq!((response.rows[0].vessel.as_str(), response.rows[0].role.as_str()), ("work", "coder"));
+        assert_eq!(response.rows[0].rung, Some(flotilla_resources::StallRung::Operator));
+    }
+
     struct ProjectionFixture {
         temp: tempfile::TempDir,
         backend: ResourceBackend,
@@ -321,6 +378,8 @@ mod tests {
                 clock: &self.clock,
                 leaf_subscriptions: &self.subscriptions,
                 fleet: &self.fleet,
+                lifecycles: &flotilla_projections::ports::NoLifecycleReads,
+                convoy_engine: &NO_CONVOY_ENGINE,
             }
         }
 

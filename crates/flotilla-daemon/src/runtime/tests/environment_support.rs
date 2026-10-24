@@ -62,61 +62,6 @@ impl CommandRunner for SshProvisioningRecordingRunner {
     }
 }
 
-/// Stands in for the controller's `ssh -R`: it binds the requested remote
-/// listener (a local path here, as the SSH host is this machine) and holds it
-/// until killed. The forwarded bytes themselves are covered by server tests.
-#[derive(Default)]
-pub(super) struct ListeningSsh;
-
-struct ListeningForward(Option<tokio::net::UnixListener>, PathBuf);
-
-#[async_trait]
-impl flotilla_provider_runtime::CommandProcess for ListeningForward {
-    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
-        use std::os::unix::process::ExitStatusExt;
-        Ok(self.0.is_none().then(|| std::process::ExitStatus::from_raw(0)))
-    }
-
-    async fn kill(&mut self) -> Result<(), String> {
-        self.0 = None;
-        let _ = std::fs::remove_file(&self.1);
-        Ok(())
-    }
-
-    async fn wait(&mut self) -> Result<std::process::ExitStatus, String> {
-        use std::os::unix::process::ExitStatusExt;
-        Ok(std::process::ExitStatus::from_raw(0))
-    }
-}
-
-#[async_trait]
-impl CommandRunner for ListeningSsh {
-    async fn run(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-        Err(format!("unexpected controller command {cmd}"))
-    }
-
-    async fn run_output(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
-        Err(format!("unexpected controller command {cmd}"))
-    }
-
-    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
-        false
-    }
-
-    async fn spawn_long_lived(
-        &self,
-        _cmd: &str,
-        args: &[&str],
-        _cwd: &Path,
-        _label: &ChannelLabel,
-    ) -> Result<Box<dyn flotilla_provider_runtime::CommandProcess>, String> {
-        let spec = args[args.iter().position(|arg| *arg == "-R").ok_or("no reverse forward")? + 1];
-        let remote = PathBuf::from(spec.split_once(':').ok_or("malformed forward")?.0);
-        let listener = tokio::net::UnixListener::bind(&remote).map_err(|error| error.to_string())?;
-        Ok(Box::new(ListeningForward(Some(listener), remote)))
-    }
-}
-
 pub(super) struct CredentialInteriorRunner(pub(super) DiscoveryMockRunner, pub(super) Option<Arc<AtomicBool>>);
 
 #[derive(Default)]
@@ -592,6 +537,7 @@ pub(super) async fn create_ready_docker_environment(
         .create(
             &empty_meta(name),
             &EnvironmentSpec {
+                cloud_sandbox: None,
                 provider_address: None,
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
@@ -638,14 +584,57 @@ pub(super) fn adoption_registry(handles: Vec<EnvironmentHandle>) -> Arc<Provider
 // The only fake boundary is the Docker CLI: preparation must inspect the
 // admitted tag and resolve its local digest, without a real Docker daemon.
 pub(super) struct HeldBaselineRunner {
-    pub(super) image: String,
+    image: String,
+    tags: StdMutex<BTreeMap<String, String>>,
+}
+
+impl HeldBaselineRunner {
+    pub(super) fn new(image: impl Into<String>) -> Self {
+        Self { image: image.into(), tags: Default::default() }
+    }
+}
+
+// A Docker provider over the held baseline. Preparation never dials the agent;
+// the connector stands in for the Linux companion that non-Linux hosts require.
+pub(super) fn held_baseline_docker_provider(
+    image: impl Into<String>,
+) -> flotilla_environment::environment::docker::DockerEnvironmentProvider {
+    let provider = flotilla_environment::environment::docker::DockerEnvironmentProvider::new(Arc::new(HeldBaselineRunner::new(image)));
+    #[cfg(unix)]
+    let provider =
+        provider.with_agent_connector(Arc::new(|_: &Path| -> Arc<dyn flotilla_environment::environment::agent::AgentConnector> {
+            panic!("preparation must not connect to a vessel agent")
+        }));
+    provider
 }
 
 #[async_trait]
 impl CommandRunner for HeldBaselineRunner {
+    async fn run_with_input(&self, command: &str, args: &[&str], _: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        assert_eq!(command, "docker");
+        assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
+        let dockerfile = std::str::from_utf8(input).unwrap();
+        assert!(dockerfile.contains("COPY --from=tools /opt/drydock /opt/drydock"));
+        // BuildKit reads `FROM sha256:<hex>` as Docker Hub's `sha256` repository
+        // and pulls unknown tags; only registry digests and local tags resolve.
+        for image in dockerfile.lines().filter_map(|line| line.strip_prefix("FROM ")?.split_whitespace().next()) {
+            if !image.contains('@') && (image.starts_with("sha256:") || !self.tags.lock().unwrap().contains_key(image)) {
+                return Err(format!(
+                    "failed to resolve source metadata for docker.io/library/{image}: pull access denied, repository does not exist or may require authorization"
+                ));
+            }
+        }
+        Ok(format!("sha256:{}", "b".repeat(64)))
+    }
+
     async fn run(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
         assert_eq!(cmd, "docker");
         match args {
+            ["tag", id, tag] => {
+                assert_eq!(*id, format!("sha256:{}", "a".repeat(64)), "only the resolved baseline is tagged");
+                self.tags.lock().unwrap().insert(tag.to_string(), id.to_string());
+                Ok(String::new())
+            }
             ["image", "inspect", image] if *image == self.image => Ok(String::new()),
             ["--config", directory, "pull", image] if *image == self.image => {
                 assert!(directory.contains("flotilla-anonymous-"), "baseline pull must isolate ambient credentials");

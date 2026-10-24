@@ -1,3 +1,7 @@
+#[cfg(unix)]
+pub mod agent;
+#[cfg(unix)]
+pub mod drydock;
 mod seam;
 pub use seam::*;
 pub mod docker;
@@ -39,9 +43,9 @@ pub struct CreateOpts {
     pub provisioned_mounts: Vec<ProvisionedMount>,
     /// Tools that must be made available inside the environment.
     ///
-    /// Providers choose how to deliver these assets. Docker currently lowers
-    /// them to bind mounts; remote sandbox providers may upload files or expose
-    /// sockets through their own transport.
+    /// Providers choose how to deliver these assets. Docker pushes read-only
+    /// files after the agent hello; writable shared material and vessel-specific
+    /// daemon endpoints remain mounts.
     pub tools: Vec<EnvironmentTool>,
     pub image_pull_policy: ImagePullPolicy,
     pub prepared_auth: PreparedEnvironmentAuth,
@@ -135,6 +139,14 @@ pub struct EnvironmentToolAsset {
 }
 
 impl EnvironmentToolAsset {
+    /// Host endpoints remain vessel-specific mounts until the daemon-forward
+    /// contract lands (#3485). Writable shared material is not a pushed file.
+    pub fn requires_mount(&self) -> bool {
+        self.kind == EnvironmentToolAssetKind::UnixSocket
+            || self.access == EnvironmentToolAssetAccess::SharedWritable
+            || self.environment_path.as_path() == Path::new(CONTAINED_DAEMON_SOCKET_DIRECTORY)
+    }
+
     pub fn new(
         host_path: impl Into<PathBuf>,
         environment_path: impl Into<PathBuf>,
@@ -206,6 +218,7 @@ pub enum ImagePullPolicy {
 }
 
 impl ImagePullPolicy {
+    #[cfg(any(unix, test))]
     fn docker_value(self) -> &'static str {
         match self {
             Self::Always => "always",
@@ -246,6 +259,14 @@ impl ProvisionedMount {
     pub fn new(host_path: impl Into<PathBuf>, environment_path: impl Into<PathBuf>, mode: ProvisionedMountMode) -> Self {
         Self { host_path: DaemonHostPath::new(host_path), environment_path: ExecutionEnvironmentPath::new(environment_path), mode }
     }
+}
+
+/// Host-facing capabilities of the one resident vessel agent.
+#[async_trait]
+pub trait VesselAgent: Send + Sync {
+    async fn ready(&self) -> Result<(), String>;
+    async fn forward_socket(&self, guest: &Path) -> Result<PathBuf, String>;
+    async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String>;
 }
 
 /// A live handle to a provisioned sandbox environment.
@@ -361,6 +382,12 @@ pub trait EnvironmentProvider: Send + Sync {
 /// A handle to a single provisioned sandbox environment instance.
 #[async_trait]
 pub trait ProvisionedEnvironment: Send + Sync {
+    /// Setup rollback is permitted only for a backing created by this call.
+    /// Adoption failures preserve the backing for a later retry.
+    fn created_for_setup(&self) -> bool {
+        true
+    }
+
     /// Opaque identity interpreted only by this provider, independent of transport.
     fn backing_id(&self) -> &str;
     async fn observe(&self) -> ProviderObservation;
@@ -371,6 +398,17 @@ pub trait ProvisionedEnvironment: Send + Sync {
         ProviderReadiness::default()
     }
 
+    /// Advisory health information that does not prevent new sessions.
+    fn health_message(&self) -> Option<String> {
+        None
+    }
+
+    fn survivors(&self) -> Option<flotilla_resources::EnvironmentSurvivors> {
+        None
+    }
+    fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
+        None
+    }
     fn id(&self) -> &EnvironmentId;
     fn image(&self) -> &ImageId;
     /// Immutable content digest of the image actually backing this environment.
@@ -396,6 +434,16 @@ pub trait ProvisionedEnvironment: Send + Sync {
     /// This must not include the provisioning host's ambient environment.
     async fn env_vars(&self) -> Result<HashMap<String, String>, String>;
     fn runner(&self) -> Arc<dyn CommandRunner>;
+    fn agent(&self) -> Option<Arc<dyn VesselAgent>> {
+        None
+    }
+    fn fallback_runner(&self) -> Option<Arc<dyn CommandRunner>> {
+        None
+    }
+    fn fallback_shell_plan(&self, _cwd: &Path) -> Option<flotilla_protocol::ResolvedAttachPlan> {
+        None
+    }
+
     async fn destroy(&self) -> Result<(), String>;
 }
 
@@ -406,6 +454,7 @@ pub fn legacy_environment_spec(spec: &flotilla_protocol::EnvironmentSpec) -> Res
         return Err("waiting on build: declare an ImageBuild and pin its resulting digest".into());
     };
     Ok(flotilla_resources::EnvironmentSpec {
+        cloud_sandbox: None,
         provider_address: None,
         host_direct: None,
         docker: Some(flotilla_resources::DockerEnvironmentSpec {

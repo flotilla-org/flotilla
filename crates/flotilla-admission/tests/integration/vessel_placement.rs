@@ -33,6 +33,7 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
             &convoy.metadata.resource_version,
             &ConvoyStatus {
                 placement_decision: Some(PlacementDecision {
+                    provider_workspace_root: None,
                     minimal_alternatives: Vec::new(),
                     escalation_reason: None,
                     policy_name: "host-direct-feta".to_string(),
@@ -148,6 +149,7 @@ async fn owning_daemon_projects_a_vessel_placed_on_its_agentless_ssh_host() {
             &convoy.metadata.resource_version,
             &ConvoyStatus {
                 placement_decision: Some(PlacementDecision {
+                    provider_workspace_root: None,
                     minimal_alternatives: Vec::new(),
                     escalation_reason: None,
                     policy_name: "host-direct-ssh-host".to_string(),
@@ -256,6 +258,7 @@ async fn placement_status_churn_does_not_spin() {
                 &convoy.metadata.resource_version,
                 &ConvoyStatus {
                     placement_decision: Some(PlacementDecision {
+                        provider_workspace_root: None,
                         minimal_alternatives: Vec::new(),
                         escalation_reason: None,
                         policy_name: "host-direct".into(),

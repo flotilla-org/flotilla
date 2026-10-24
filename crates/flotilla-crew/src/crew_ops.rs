@@ -4,8 +4,8 @@ use tracing::Instrument;
 
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_resources::convoy_address::convoy_address;
-use flotilla_resources::ResumeIntent;
 use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity, PROJECT_LABEL};
+use flotilla_resources::{Environment, EnvironmentPhase, ResumeIntent};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
@@ -81,6 +81,20 @@ pub async fn resolve_local_convoy_name(backend: &ResourceBackend, namespace: &st
     }
 }
 
+/// The sender's awaiting-reply record kind for a send (#3587 layer 7): none
+/// for a send expecting nothing, a stall for a stalled crew's supervision,
+/// else the expectation's own.
+fn awaiting_kind(expectation: &flotilla_resources::MessageExpectation, stall_of: Option<&str>) -> Option<&'static str> {
+    use flotilla_resources::MessageExpectation;
+    match (expectation, stall_of) {
+        (MessageExpectation::None, _) => None,
+        // A stalled crew's supervision is a stall, whatever it expects back.
+        (_, Some(_)) => Some(flotilla_resources::STALL_KIND),
+        (MessageExpectation::Reply, None) => Some("reply"),
+        (MessageExpectation::Outcome { .. }, None) => Some("outcome"),
+    }
+}
+
 /// An authorized supervision decision; escalation carries its admitted recipient.
 enum SupervisorRuling {
     Resume,
@@ -104,6 +118,14 @@ pub struct CrewService {
     /// The `[primitives]` switch's Message path; empty while it is off.
     #[builder(default)]
     pub(crate) message_path: crate::ports::MessagePath,
+    /// The `[primitives]` switch's Convoy path (#3587 layer 6): with it set,
+    /// the engine decides each convoy it holds; empty while the switch is off.
+    #[builder(default)]
+    pub(crate) convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
+    /// Which seats a vessel serves (#3629 layer 8): the engine's answer once
+    /// `[primitives]` installs it, else the session labels.
+    #[builder(default)]
+    pub(crate) vessel_seats: flotilla_resources::vessel_seats::VesselSeatsPath,
     #[builder(default)]
     resource_intent_publisher: std::sync::RwLock<Option<Weak<dyn ResourceIntentPublisher>>>,
     leaf_subscriptions: LeafSubscriptionTable,
@@ -877,6 +899,27 @@ impl CrewService {
             .build())
     }
 
+    /// Which seats `vessel_ref` serves, through the one read port (#3629 layer 8).
+    async fn served_seats(
+        &self,
+        namespace: &str,
+        vessel_ref: &str,
+    ) -> Result<BTreeMap<String, flotilla_resources::ReadResourceObject<ResourceTerminalSession>>, String> {
+        if let Some(seats) = self.vessel_seats.get() {
+            return seats.seats(namespace, vessel_ref).await;
+        }
+        Ok(self
+            .resource_backend
+            .including_replicas::<ResourceTerminalSession>(namespace)
+            .list_matching_labels(&BTreeMap::from([(VESSEL_REF_LABEL.to_string(), vessel_ref.to_owned())]))
+            .await
+            .map_err(|err| err.to_string())?
+            .items
+            .into_iter()
+            .map(|session| (session.object.spec.role.clone(), session))
+            .collect())
+    }
+
     // Crew handoff consumes process state independently of the live island charter.
     async fn crew_state(&self, context: &ResolvedCrewContext, convoy: &ResourceObject<ResourceConvoy>) -> Result<CrewListResponse, String> {
         let task = convoy
@@ -886,14 +929,10 @@ impl CrewService {
             .and_then(|snapshot| snapshot.vessels.iter().find(|vessel| vessel.name == context.vessel))
             .ok_or_else(|| format!("vessel `{}` is missing from convoy `{}`", context.vessel, context.convoy))?;
         let by_role: HashMap<_, _> = self
-            .resource_backend
-            .including_replicas::<ResourceTerminalSession>(&context.namespace)
-            .list_matching_labels(&BTreeMap::from([(VESSEL_REF_LABEL.to_string(), context.vessel_ref.clone())]))
-            .await
-            .map_err(|err| err.to_string())?
-            .items
+            .served_seats(&context.namespace, &context.vessel_ref)
+            .await?
             .into_iter()
-            .map(|session| (session.object.spec.role.clone(), session.object))
+            .map(|(role, session)| (role, session.object))
             .collect();
         let credential_alerts = self
             .resource_backend
@@ -988,6 +1027,8 @@ impl CrewService {
         let context = self.resolve_crew_context_from_routing(&routing, true).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(name).await.map_err(|e| e.to_string())?;
+        // With the engine holding it, the promises validated here are the engine's (#3587 layer 8).
+        let convoy = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, &convoy)?.into_owned();
         ensure_crew_work_is_defined(&convoy, &context)?;
         let status = convoy.status.as_ref().ok_or("convoy has no status")?;
         let work = status.crew_work.get(&context.vessel).and_then(|crew| crew.get(&context.caller_role)).ok_or("crew work is missing")?;
@@ -1090,6 +1131,13 @@ impl CrewService {
                 PromiseOperation::Retract { id, reason }
             }
         };
+        if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
+            // The engine decides (#3587 layer 6): its refusal is the answer, and
+            // the old status follows by the one-way copy.
+            return engine
+                .promise(&convoy, &context.vessel, &context.caller_role, &operation, flotilla_resources::convoy::engine::Actor::Crew)
+                .await;
+        }
         let updated = apply_resource_status_patch(
             &convoys,
             name,
@@ -1133,6 +1181,8 @@ impl CrewService {
         });
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let mut convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
+        // With the engine holding it, the promises read here are the engine's (#3587 layer 8).
+        convoy = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, &convoy)?.into_owned();
         // URL parsing needs every declared forge endpoint; read this catalogue once.
         let forges = self
             .resource_backend
@@ -1175,6 +1225,20 @@ impl CrewService {
                     self.clock.now(),
                 )
             }) {
+                if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
+                    engine
+                        .promise(
+                            &convoy,
+                            &context.vessel,
+                            &context.caller_role,
+                            &operation,
+                            flotilla_resources::convoy::engine::Actor::Crew,
+                        )
+                        .await?;
+                    let reread = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+                    convoy = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, &reread)?.into_owned();
+                    continue;
+                }
                 convoy = apply_resource_status_patch(
                     &convoys,
                     convoy_name,
@@ -1206,6 +1270,16 @@ impl CrewService {
             return Ok(CommandValue::CrewCompletionAdvisory { pending });
         }
         let principal = principal.ok_or_else(|| "`--force` requires an operator principal".to_string())?;
+        if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
+            // `--force` is an operator's attributed verdict on the crew's open
+            // promises (#3574 decision 8); the engine refuses what it may not keep.
+            let scope = flotilla_resources::convoy::engine::VerdictScope {
+                vessel: context.vessel.clone(),
+                role: Some(context.caller_role.clone()),
+            };
+            let reason = message.clone().unwrap_or_else(|| "operator forced completion".to_string());
+            engine.keep_by_verdict(&convoy, &scope, &principal.name, &reason).await?;
+        }
         apply_resource_status_patch(
             &convoys,
             convoy_name,
@@ -1655,7 +1729,8 @@ impl CrewService {
                 .iter()
                 .filter_map(|checkout| associated_change_request_name_without_checkout_status(convoy, checkout, &forges).transpose())
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut query = crew_change_request_query(convoy, &forges)?;
+            let viewed = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, convoy)?;
+            let mut query = crew_change_request_query(&viewed, &forges)?;
             query.field_values.entry("metadata.name".into()).or_default().extend(names);
             query.fields.insert("status.state.value".into(), "merged".into());
             let records = self
@@ -1780,6 +1855,23 @@ impl CrewService {
                     continue;
                 }
             };
+            let base_ref = match &checkout.spec {
+                flotilla_resources::CheckoutSpec::Worktree(spec) => spec.base_ref.as_deref(),
+                flotilla_resources::CheckoutSpec::FreshClone(spec) => spec.base_ref.as_deref(),
+                // Observed checkouts declare no base; VCS resolves origin/HEAD.
+                flotilla_resources::CheckoutSpec::Observed(_) => None,
+            };
+            // An untouched checkout has no branch work to archive. If the base
+            // cannot be verified, retain the best-effort push to preserve work.
+            if matches!(vcs.commits_beyond_base(base_ref).await, Ok((_, 0))) {
+                outcomes.push(
+                    CheckoutArchiveOutcome::builder()
+                        .checkout(checkout.metadata.name)
+                        .status(CheckoutArchiveStatus::NothingToArchive)
+                        .build(),
+                );
+                continue;
+            }
             let output = vcs.push_current_branch("origin").await;
             let outcome = match output {
                 Ok(output) if output.success() => {
@@ -1838,8 +1930,12 @@ impl CrewService {
         // retrying the command is safe because archiving is best-effort.
         let archives = self.archive_convoy_checkouts_best_effort(namespace, name).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let expected_phase =
-            convoys.get(name).await.map_err(|err| err.to_string())?.status.map_or(ConvoyPhase::Pending, |status| status.phase);
+        let current = convoys.get(name).await.map_err(|err| err.to_string())?;
+        if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &current) {
+            let principal = principal_ref.map_or("unattributed", |principal| principal.name.as_str());
+            engine.abandon(&current, principal, reason).await?;
+        }
+        let expected_phase = current.status.map_or(ConvoyPhase::Pending, |status| status.phase);
         let authority = match principal_ref {
             Some(principal) if principal.name == PrincipalRef::IMPLICIT_NAME => WorkCompletionAuthority::HumanOverride,
             Some(principal) => WorkCompletionAuthority::Principal(principal.clone()),
@@ -2094,6 +2190,10 @@ impl CrewService {
         };
         let environment_ref = target_session.as_ref().or(anchor.as_ref()).expect("target or anchor session").spec.env_ref.clone();
         let previous_status = convoy.status.clone().ok_or_else(|| format!("convoy `{}` has no status", context.convoy))?;
+        if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
+            // Handoff is the engine's `Reassign` of the sender's open promises (#3574 decision 3).
+            engine.reassign(&convoy, &context.vessel, &context.caller_role, target).await?;
+        }
         let reopened = apply_resource_status_patch(
             &convoys,
             &context.convoy,
@@ -2473,7 +2573,8 @@ impl CrewService {
         let displaced = pending_message.as_ref().map(|message| message.spec.body.clone());
         let session = session?.ok_or_else(|| format!("crew member `{role}` on vessel `{vessel}` has no intact terminal session"))?;
         if session.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed) {
-            return Err(format!("crew member `{role}` on vessel `{vessel}` failed provisioning and cannot be resumed"));
+            let reason = session.object.status.as_ref().and_then(|status| status.message.as_deref()).unwrap_or("terminal session failed");
+            return Err(format!("crew member `{role}` on vessel `{vessel}` failed and cannot be resumed: {reason}"));
         }
         let receiver = crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), name, &vessel, &role);
         let resume_intent = flotilla_resources::MessageSpec::builder()
@@ -2718,6 +2819,9 @@ impl CrewService {
         );
         match self.message_record(&request.namespace, &name).await {
             Ok(existing) if self.same_message_intent(&existing.object.spec, &intent) => {
+                // A repeat records what an earlier send could not (record is idempotent).
+                self.record_awaiting(&request.namespace, &name, &intent, self.admitted_home(&existing), request.stall_of.as_deref())
+                    .await?;
                 return Ok(CrewTurnAdmission {
                     new_turn: false,
                     rung: TurnDeliveryRung::WarmSession,
@@ -2739,7 +2843,8 @@ impl CrewService {
         let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
         let (message, new_turn) = if let Some(publisher) = publisher {
             let document = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":request.namespace}, "spec":intent});
-            let reference = publisher.publish(&request.namespace, document).await?;
+            let (reference, home) = publisher.publish_admitted(&request.namespace, document).await?;
+            self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await?;
             (reference, true)
         } else {
             if holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
@@ -2757,6 +2862,8 @@ impl CrewService {
                 flotilla_messaging::MessageAdmission::Accepted(object) => object,
                 flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
             };
+            let home = object.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
+            self.record_awaiting(&request.namespace, &object.metadata.name, &intent, home, request.stall_of.as_deref()).await?;
             (ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, object.metadata.name), !existing)
         };
         Ok(CrewTurnAdmission { message, new_turn, rung: TurnDeliveryRung::WarmSession })
@@ -2770,7 +2877,35 @@ impl CrewService {
                     resource.object.status.as_ref().and_then(|status| status.message.as_deref()).unwrap_or("environment disappeared");
                 Err(format!("vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"))
             }
-            Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(()),
+            Ok(resource) => {
+                if let Some(environment_ref) = resource.object.status.as_ref().and_then(|status| status.environment_ref.as_ref()) {
+                    match self.resource_backend.including_replicas::<Environment>(namespace).get(environment_ref).await {
+                        Ok(environment) => {
+                            if let Some(status) = environment.object.status.as_ref() {
+                                match status.phase {
+                                    EnvironmentPhase::Lost => {
+                                        let reason = status.message.as_deref().unwrap_or("environment disappeared");
+                                        return Err(format!(
+                                            "vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"
+                                        ));
+                                    }
+                                    EnvironmentPhase::Failed => {
+                                        let reason = status.message.as_deref().unwrap_or("environment provisioning failed");
+                                        return Err(format!("vessel `{vessel}` failed provisioning and cannot be resumed: {reason}"));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        // Missing backing alone is not an observed loss. Preserve the
+                        // existing resume path until reconciliation records its cause.
+                        Err(ResourceError::NotFound { .. }) => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                Ok(())
+            }
+            Err(ResourceError::NotFound { .. }) => Ok(()),
             Err(error) => Err(error.to_string()),
         }
     }
@@ -2849,6 +2984,9 @@ impl CrewService {
         };
         match self.message_record(&request.namespace, &name).await {
             Ok(existing) if self.same_message_intent(&existing.object.spec, &intent) => {
+                // A repeat records what an earlier send could not (record is idempotent).
+                self.record_awaiting(&request.namespace, &name, &intent, self.admitted_home(&existing), request.stall_of.as_deref())
+                    .await?;
                 return Ok(CrewTurnAdmission {
                     new_turn: false,
                     rung,
@@ -2858,7 +2996,7 @@ impl CrewService {
                         .as_ref()
                         .and_then(|status| status.canonical_predecessor.clone())
                         .unwrap_or_else(|| ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &name)),
-                })
+                });
             }
             Ok(_) => return Err("message producer ID already names different intent".into()),
             Err(ResourceError::NotFound { .. }) => {}
@@ -2924,7 +3062,9 @@ impl CrewService {
                     "apiVersion": "flotilla.work/v1", "kind": "Message",
                     "metadata": { "name": name, "namespace": request.namespace }, "spec": intent
                 });
-                publisher.publish(&request.namespace, document).await?
+                let (reference, home) = publisher.publish_admitted(&request.namespace, document).await?;
+                self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await?;
+                reference
             } else {
                 if matches!(target.provenance, ResourceProvenance::Replica { .. })
                     || holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. }))
@@ -2939,6 +3079,8 @@ impl CrewService {
                     flotilla_messaging::MessageAdmission::Accepted(record) => record,
                     flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
                 };
+                let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
+                self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await?;
                 ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.metadata.name)
             };
             Ok(message)
@@ -3233,7 +3375,9 @@ impl CrewService {
     ) -> Result<ResourceRef, String> {
         match self.message_record(namespace, name).await {
             Ok(existing) if self.same_message_intent(&existing.object.spec, intent) => {
-                return Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, &existing.object.metadata.name))
+                // A repeat records what an earlier send could not (record is idempotent).
+                self.record_awaiting(namespace, name, intent, self.admitted_home(&existing), None).await?;
+                return Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, &existing.object.metadata.name));
             }
             Ok(_) => return Err("message producer ID already names different intent".into()),
             Err(ResourceError::NotFound { .. }) => {}
@@ -3241,7 +3385,10 @@ impl CrewService {
         }
         let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
         if let Some(publisher) = publisher {
-            return publisher.publish(namespace, serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":namespace}, "spec":intent})).await;
+            let document = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":namespace}, "spec":intent});
+            let (reference, home) = publisher.publish_admitted(namespace, document).await?;
+            self.record_awaiting(namespace, name, intent, home, None).await?;
+            return Ok(reference);
         }
         let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, namespace, &intent.receiver)
             .await
@@ -3257,7 +3404,48 @@ impl CrewService {
             flotilla_messaging::MessageAdmission::Accepted(record) => record,
             flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
         };
+        let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
+        self.record_awaiting(namespace, &record.metadata.name, intent, home, None).await?;
         Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
+    }
+
+    /// The home that admitted an engine message, from where it was read.
+    fn admitted_home(&self, read: &flotilla_resources::ReadResourceObject<flotilla_resources::Message>) -> Option<String> {
+        match &read.provenance {
+            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str().to_owned()),
+            ResourceProvenance::Local => self.message_primitives().map(|engine| engine.home()),
+        }
+    }
+
+    /// With `[primitives]` on, records the sender's half of a send expecting
+    /// a reply or an outcome, once its receiver's home admitted it at `home`
+    /// (#3587 layer 7): a stall's supervision about the stalled crew, or a
+    /// plain reply or outcome. Nothing is recorded off the engine path.
+    ///
+    /// A send is not finished until its record is written (#3587 ruling
+    /// 6353439323): a failed record is the send's error, so its producer
+    /// repeats the send, and the repeat, finding the message admitted,
+    /// writes the record.
+    async fn record_awaiting(
+        &self,
+        namespace: &str,
+        name: &str,
+        intent: &flotilla_resources::MessageSpec,
+        home: Option<String>,
+        stall_of: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(kind) = awaiting_kind(&intent.expectation, stall_of) else { return Ok(()) };
+        let Some(engine) = self.message_primitives() else { return Ok(()) };
+        let Some(home) = home else {
+            // A receiver home off the engine path answers without it, on every repeat.
+            tracing::debug!(message = %name, "the receiver home reported no admitting home; no awaiting-reply record");
+            return Ok(());
+        };
+        engine
+            .await_reply(namespace, name, intent, &home, kind, stall_of)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("message `{name}` is admitted, but its awaiting-reply record is not written yet: {error}"))
     }
 
     async fn execute_turn_delivery_hold(&self, request: &CrewTurnIntent, act: &HoldAct, reason: &str) -> Result<(), String> {

@@ -400,8 +400,12 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
     let runner = Arc::new(MockRunner::new(vec![
         Ok("git version 2.43.0".to_string()),
         Ok("git version 2.43.0".to_string()),
+        // Git process boundary: unknown base retains best-effort push behavior.
+        Err("base unknown".to_string()),
         Ok("archived".to_string()),
+        Err("base unknown".to_string()),
         Err("remote rejected".to_string()),
+        Err("base unknown".to_string()),
         Ok("archived stale head".to_string()),
     ]));
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -474,6 +478,73 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
     assert_eq!(
         runner.calls().iter().filter(|(command, args)| command == "git" && args.first().is_some_and(|arg| arg == "push")).count(),
         3
+    );
+}
+
+// #3815: abandon archives unique commits, but must not publish an untouched
+// checkout's branch. Real Git push effects prove which checkout was archived.
+#[tokio::test]
+async fn abandon_archive_pushes_only_checkout_with_commits_beyond_base() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").unwrap();
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = std::process::Command::new("git").current_dir(cwd).args(args).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let remote = temp.path().join("remote.git");
+    git(temp.path(), &["init", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut discovery = fake_discovery_with_runner(false, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
+    discovery.repo_detectors.clear();
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::local(),
+        backend.clone(),
+        Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let repository = RepositorySpec::remote("https://github.com/acme/archive").unwrap().key();
+    for (name, advanced) in [("at-base", false), ("advanced", true)] {
+        let path = temp.path().join(name);
+        git(temp.path(), &["clone", remote.to_str().unwrap(), path.to_str().unwrap()]);
+        if !advanced {
+            git(&path, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "base"]);
+            git(&path, &["push", "origin", "main"]);
+        }
+        git(&path, &["remote", "set-head", "origin", "-a"]);
+        git(&path, &["switch", "-c", name]);
+        if advanced {
+            git(&path, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "work"]);
+        }
+        backend
+            .using::<ResourceCheckout>("flotilla")
+            .create(
+                &InputMeta::builder()
+                    .name(name.to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "archive-convoy".to_string())]))
+                    .build(),
+                &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                    r#ref: name.to_string(),
+                    path: path.to_str().unwrap().to_string(),
+                    repo_ref: repository.clone(),
+                    host_ref: "archive-test".into(),
+                    is_main: false,
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.unwrap();
+    assert_eq!(
+        outcomes.iter().map(|o| (o.checkout.as_str(), o.status)).collect::<Vec<_>>(),
+        vec![("advanced", CheckoutArchiveStatus::Archived), ("at-base", CheckoutArchiveStatus::NothingToArchive)]
+    );
+    assert_eq!(
+        git(temp.path(), &["--git-dir", remote.to_str().unwrap(), "for-each-ref", "--format=%(refname:short)", "refs/heads"]),
+        "advanced\nmain\n"
     );
 }
 
@@ -591,6 +662,7 @@ fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
                 allocation: None,
             },
             free_slots: Some(1),
+            vessel_cap: None,
             host_ready: true,
             image_cost: ImageAcquisitionCost::Held,
             sleeping_until: None,

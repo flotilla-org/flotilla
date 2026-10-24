@@ -5,6 +5,7 @@
 //! C-free base crate. Depend only on base types (protocol, paths, resources);
 //! never on provider runtime, discovery, VCS, core, storage or composition
 //! roots. The build-graph gate enforces the same upward-dependency prohibition.
+pub mod drydock;
 pub mod dummy_fleet;
 pub mod forge_override;
 pub mod log_file;
@@ -209,6 +210,67 @@ pub struct RemoteHostConfig {
     /// This host has no flotillad. The owning daemon may use SSH to actuate
     /// host-direct placements there, but it must not enter the peer mesh.
     pub agentless_ssh: bool,
+    /// What the host supplies to commands flotilla runs there (#3722).
+    pub supplies: Vec<HostSupply>,
+    /// How many vessels an agentless host can hold at once (#3793). A capped
+    /// host takes unpinned convoys within its cap; without a cap it takes
+    /// only convoys that pin its placement.
+    pub max_vessels: Option<u32>,
+    /// How the owning daemon reaches the vessel agents it runs on an agentless
+    /// host (#3792). Absent, the host takes no vessels.
+    pub vessel_agent: Option<VesselAgentReachConfig>,
+}
+
+/// The explicit SSH recipe for an agentless host's vessel agents (#3792).
+/// Drydock's SSH transport reads no ambient SSH configuration, so the host
+/// key is pinned here and the key file named, never taken from `~/.ssh`.
+///
+/// ```toml
+/// [hosts.b1.vessel_agent]
+/// identity_file = "~/.ssh/flotilla-b1"
+/// host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA..."
+/// # Optional: the address when `hostname` is an SSH config alias, and the port.
+/// address = "b1.example"
+/// port = 22
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VesselAgentReachConfig {
+    /// Private key file on the owning daemon's host. A leading `~` is that
+    /// host's home.
+    pub identity_file: PathBuf,
+    /// The host's raw OpenSSH public key (`ssh-ed25519 AAAA...`), not a
+    /// fingerprint or a known-hosts line.
+    pub host_key: String,
+    /// The address to connect to; defaults to the host's `hostname`.
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+}
+
+const fn default_ssh_port() -> u16 {
+    22
+}
+
+/// One tool a host supplies: directories for `PATH` and environment
+/// variables, never a script. A leading `~` means the remote user's home.
+///
+/// ```toml
+/// supplies = [
+///   { name = "rust", path = ["~/.cargo/bin"], env = { RUSTUP_HOME = "~/.rustup", CARGO_HOME = "~/.cargo" } },
+/// ]
+/// ```
+///
+/// The format is shared with drydock's vessel agent (flotilla-org/drydock#55).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostSupply {
+    pub name: String,
+    #[serde(default)]
+    pub path: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// The same login-address rule is used for daemon peers and direct SSH
@@ -238,6 +300,12 @@ struct RawRemoteHostConfig {
     ssh_multiplex: Option<bool>,
     #[serde(default)]
     agentless_ssh: bool,
+    #[serde(default)]
+    supplies: Vec<HostSupply>,
+    #[serde(default)]
+    max_vessels: Option<u32>,
+    #[serde(default)]
+    vessel_agent: Option<VesselAgentReachConfig>,
 }
 
 impl<'de> Deserialize<'de> for HostsConfig {
@@ -261,6 +329,9 @@ impl<'de> Deserialize<'de> for HostsConfig {
                         user: host.user,
                         ssh_multiplex: host.ssh_multiplex,
                         agentless_ssh: host.agentless_ssh,
+                        supplies: host.supplies,
+                        max_vessels: host.max_vessels,
+                        vessel_agent: host.vessel_agent,
                     },
                 )
             })
@@ -350,7 +421,8 @@ fn default_trace_sampling() -> f64 {
     1.0
 }
 
-/// The `[primitives]` section. It moves only Message for now, so it has no keys.
+/// The `[primitives]` section. It has no keys: it moves Message, and opens the
+/// decided store with the provisioning lifecycle kinds (#3629), as one switch.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrimitivesConfig {}
@@ -613,6 +685,9 @@ pub struct StaticEnvironmentConfig {
     pub display_name: Option<String>,
     #[serde(default)]
     pub flotilla_command: Option<String>,
+    /// What the host supplies to commands run there, as for `hosts.toml` (#3722).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supplies: Vec<HostSupply>,
 }
 
 /// Host-local observation seed. Intentionally incapable of carrying per-path

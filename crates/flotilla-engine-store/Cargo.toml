@@ -9,9 +9,12 @@ description = "The ADR 0064 engine's storage port: Log and ReceiptLog over floti
 flotilla-schema = { path = "../flotilla-schema" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
+rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
-rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
+flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

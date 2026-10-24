@@ -15,6 +15,100 @@ pub struct ToolsSource<'a> {
     pub terminfo: &'a Path,
 }
 
+/// Cache generation publication by source file identity. One publisher is
+/// shared by the daemon's tool factory across all vessels and reconciles.
+#[derive(Default)]
+pub struct Publisher {
+    published: std::sync::Mutex<Option<(String, PathBuf)>>,
+}
+impl Publisher {
+    pub fn publish(&self, root: &Path, source: &ToolsSource<'_>) -> io::Result<PathBuf> {
+        self.publish_with(root, source, |input, output, hash, expected| copy_asset(input, output, hash, expected))
+    }
+
+    fn publish_with(
+        &self,
+        root: &Path,
+        source: &ToolsSource<'_>,
+        transfer: impl FnMut(&mut fs::File, &mut fs::File, &mut Sha256, u64) -> io::Result<()>,
+    ) -> io::Result<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+        let mut cached = self.published.lock().map_err(|_| io::Error::other("tool publisher lock poisoned"))?;
+        let mut identity = Sha256::new();
+        identity.update(root.as_os_str().as_encoded_bytes());
+        for (name, path) in source_files(source)? {
+            let metadata = fs::metadata(&path)?;
+            for path in [&name, &path] {
+                identity.update((path.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
+                identity.update(path.as_os_str().as_encoded_bytes());
+            }
+            for value in [
+                metadata.dev(),
+                metadata.ino(),
+                metadata.len(),
+                u64::from(metadata.mode()),
+                metadata.mtime() as u64,
+                metadata.mtime_nsec() as u64,
+                metadata.ctime() as u64,
+                metadata.ctime_nsec() as u64,
+            ] {
+                identity.update(value.to_le_bytes());
+            }
+        }
+        let identity = format!("{:x}", identity.finalize());
+        if let Some((previous, target)) = cached.as_ref() {
+            if previous == &identity {
+                let _lock = publication_lock(root)?;
+                if published_links_intact(root, target) {
+                    clear_staging(root)?;
+                    return Ok(target.clone());
+                }
+            }
+        }
+        let target = publish_with(root, source, transfer)?;
+        *cached = Some((identity, target.clone()));
+        Ok(target)
+    }
+}
+
+fn published_links_intact(root: &Path, target: &Path) -> bool {
+    let matches = |path: PathBuf, expected: &Path| fs::read_link(path).is_ok_and(|actual| actual == expected);
+    if !target.is_dir() || !matches(root.join("tools/current"), Path::new(target.file_name().expect("generation"))) {
+        return false;
+    }
+    for name in ["flotilla", "cleat"] {
+        if !matches(root.join("bin").join(name), &Path::new("../tools/current/bin").join(name)) {
+            return false;
+        }
+    }
+    if !matches(root.join("lib/libghostty-vt.so.0"), Path::new("../tools/current/lib/libghostty-vt.so.0")) {
+        return false;
+    }
+    let Ok(mut entries) = fs::read_dir(target.join("share/terminfo")) else { return false };
+    entries.all(|entry| {
+        entry.is_ok_and(|entry| {
+            matches(
+                root.join("share/terminfo").join(entry.file_name()),
+                &Path::new("../../tools/current/share/terminfo").join(entry.file_name()),
+            )
+        })
+    })
+}
+
+fn source_files(source: &ToolsSource<'_>) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    let mut files = vec![
+        (PathBuf::from("bin/flotilla"), source.flotilla.to_path_buf()),
+        (PathBuf::from("bin/cleat"), source.cleat.to_path_buf()),
+        (PathBuf::from("lib/libghostty-vt.so.0"), source.library.to_path_buf()),
+    ];
+    collect(source.terminfo, Path::new("share/terminfo"), &mut files)?;
+    if !files.iter().any(|(name, _)| name == Path::new("share/terminfo/x/xterm-ghostty")) {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "cleat release lacks xterm-ghostty terminfo"));
+    }
+    files.sort();
+    Ok(files)
+}
+
 /// Stage a complete immutable generation before publishing it atomically.
 /// A provider-root filesystem lock serializes publication and pruning across
 /// daemon restarts and concurrent provisioning requests.
@@ -29,16 +123,7 @@ fn publish_with(
 ) -> io::Result<PathBuf> {
     let _lock = publication_lock(root)?;
     clear_staging(root)?;
-    let mut files = vec![
-        (PathBuf::from("bin/flotilla"), source.flotilla.to_path_buf()),
-        (PathBuf::from("bin/cleat"), source.cleat.to_path_buf()),
-        (PathBuf::from("lib/libghostty-vt.so.0"), source.library.to_path_buf()),
-    ];
-    collect(source.terminfo, Path::new("share/terminfo"), &mut files)?;
-    if !files.iter().any(|(name, _)| name == Path::new("share/terminfo/x/xterm-ghostty")) {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "cleat release lacks xterm-ghostty terminfo"));
-    }
-    files.sort();
+    let files = source_files(source)?;
     fs::create_dir_all(root.join("tools"))?;
     let staging = root.join("tools").join(format!(".staging-{}", uuid::Uuid::new_v4()));
     // Stream each immutable staged snapshot into the framed digest. Memory is
@@ -282,6 +367,51 @@ fn prune_local_for(root: &Path, processes: &Path, owner: u32) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Scenario: repeated preparation across vessels reuses the published hash
+    // without transferring binary bytes. Equal-size replacement invalidates it;
+    // removing a stable entry point still causes publication to repair it.
+    #[test]
+    fn publisher_caches_file_identity_and_repairs_missing_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("provider");
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("terminfo/x")).unwrap();
+        for file in ["flotilla", "cleat", "library", "terminfo/x/xterm-ghostty"] {
+            fs::write(source.join(file), b"old").unwrap();
+        }
+        let assets = ToolsSource {
+            flotilla: &source.join("flotilla"),
+            cleat: &source.join("cleat"),
+            library: &source.join("library"),
+            terminfo: &source.join("terminfo"),
+        };
+        let publisher = Publisher::default();
+        let transfers = std::cell::Cell::new(0);
+        let transfer = |input: &mut fs::File, output: &mut fs::File, hash: &mut Sha256, expected| {
+            transfers.set(transfers.get() + 1);
+            copy_asset(input, output, hash, expected)
+        };
+        let first = publisher.publish_with(&root, &assets, transfer).unwrap();
+        assert_eq!(transfers.get(), 4);
+        let abandoned = root.join("tools/.staging-interrupted");
+        fs::create_dir_all(&abandoned).unwrap();
+        fs::write(abandoned.join("partial"), b"interrupted").unwrap();
+        assert_eq!(publisher.publish_with(&root, &assets, transfer).unwrap(), first);
+        assert!(!abandoned.exists(), "cached publication still reclaims abandoned staging under the root lock");
+        assert_eq!(transfers.get(), 4, "unchanged preparation never rereads binary content");
+        let replacement = source.join("replacement");
+        fs::write(&replacement, b"new").unwrap();
+        fs::rename(replacement, assets.flotilla).unwrap();
+        let updated = publisher.publish_with(&root, &assets, transfer).unwrap();
+        assert_ne!(first, updated);
+        assert_eq!(fs::read(root.join("bin/flotilla")).unwrap(), b"new");
+        assert_eq!(transfers.get(), 8);
+        fs::remove_file(root.join("bin/flotilla")).unwrap();
+        assert_eq!(publisher.publish_with(&root, &assets, transfer).unwrap(), updated);
+        assert_eq!(fs::read(root.join("bin/flotilla")).unwrap(), b"new");
+        assert_eq!(transfers.get(), 12);
+    }
+
     // Mode-only rolls must publish the requested executable permissions.
     // Abandoned crash intermediates are collected by publication and pruning.
     #[test]

@@ -131,6 +131,10 @@ pub enum MessageRelation {
 
 pub use flotilla_protocol::MessageReference;
 
+/// The sender's awaiting-reply record kind of a stall: a Reply-expectation
+/// message about the stalled seat (#3574 ruling 2, #3587 layer 7).
+pub const STALL_KIND: &str = "stall";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageExpectation {

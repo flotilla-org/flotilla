@@ -1,0 +1,125 @@
+//! #3792 test doubles for agentless vessels: a vessel agent that runs its
+//! commands through the host runner it is given, as the real agent runs them
+//! on the host, and records what the controller configured.
+
+use super::*;
+
+use super::agentless_vessels::{AgentlessVessels, HostRefusal, VesselAgents, VesselHandle, VesselPaths};
+use crate::server::environment_sockets::{EnvironmentSocketRegistry, EnvironmentSocketService};
+use flotilla_discovery::DiscoveryRuntime;
+use flotilla_environment::environment::{EnvironmentTool, VesselAgent};
+
+/// What the controller did to one vessel's agent.
+#[derive(Clone, Debug, Default)]
+pub(super) struct RecordedVessel {
+    pub(super) environment: BTreeMap<String, String>,
+    /// `(guest, host)` daemon forwards.
+    pub(super) forwards: Vec<(PathBuf, PathBuf)>,
+    pub(super) tool_pushes: usize,
+    pub(super) closed: bool,
+}
+
+/// Opens every vessel onto `runner`, keyed by its agent directory, and gives
+/// each the same provider `registry`.
+pub(super) struct RunnerVesselAgents {
+    runner: Arc<dyn CommandRunner>,
+    registry: Arc<ProviderRegistry>,
+    pub(super) vessels: Arc<StdMutex<BTreeMap<PathBuf, RecordedVessel>>>,
+    pub(super) refusals: StdMutex<Vec<HostRefusal>>,
+}
+
+impl RunnerVesselAgents {
+    pub(super) fn new(runner: Arc<dyn CommandRunner>, registry: Arc<ProviderRegistry>) -> Arc<Self> {
+        Arc::new(Self { runner, registry, vessels: Arc::default(), refusals: StdMutex::default() })
+    }
+
+    pub(super) fn recorded(&self, paths: &VesselPaths) -> RecordedVessel {
+        self.vessels.lock().expect("vessels").get(&paths.agent).cloned().unwrap_or_default()
+    }
+}
+
+struct RunnerVessel {
+    agent: PathBuf,
+    runner: Arc<dyn CommandRunner>,
+    vessels: Arc<StdMutex<BTreeMap<PathBuf, RecordedVessel>>>,
+}
+
+impl RunnerVessel {
+    fn record(&self, change: impl FnOnce(&mut RecordedVessel)) {
+        change(self.vessels.lock().expect("vessels").entry(self.agent.clone()).or_default());
+    }
+}
+
+#[async_trait]
+impl VesselAgent for RunnerVessel {
+    async fn ready(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn push_tools(&self, _tools: &[EnvironmentTool]) -> Result<(), String> {
+        self.record(|vessel| vessel.tool_pushes += 1);
+        Ok(())
+    }
+    async fn forward_socket(&self, _guest: &Path) -> Result<PathBuf, String> {
+        Err("the runner vessel serves no attach".into())
+    }
+}
+
+#[async_trait]
+impl VesselHandle for RunnerVessel {
+    fn runner(&self) -> Arc<dyn CommandRunner> {
+        Arc::clone(&self.runner)
+    }
+    fn agent(&self) -> Arc<dyn VesselAgent> {
+        Arc::new(RunnerVessel { agent: self.agent.clone(), runner: Arc::clone(&self.runner), vessels: Arc::clone(&self.vessels) })
+    }
+    async fn configure_environment(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
+        self.record(|vessel| vessel.environment = environment);
+        Ok(())
+    }
+    async fn forward_daemon(&self, guest: &Path, host: &Path) -> Result<(), String> {
+        self.record(|vessel| vessel.forwards.push((guest.into(), host.into())));
+        Ok(())
+    }
+    async fn close(&self) {
+        self.record(|vessel| vessel.closed = true);
+    }
+}
+
+#[async_trait]
+impl VesselAgents for RunnerVesselAgents {
+    async fn host_refusals(&self, _profile: &AgentlessSshProfile) -> Vec<HostRefusal> {
+        self.refusals.lock().expect("refusals").clone()
+    }
+    async fn open(&self, _profile: &AgentlessSshProfile, paths: &VesselPaths, _local: &Path) -> Result<Arc<dyn VesselHandle>, String> {
+        Ok(Arc::new(RunnerVessel { agent: paths.agent.clone(), runner: Arc::clone(&self.runner), vessels: Arc::clone(&self.vessels) }))
+    }
+    async fn probe(
+        &self,
+        _discovery: &DiscoveryRuntime,
+        _config: &ConfigStore,
+        _profile: &AgentlessSshProfile,
+        _handle: &dyn VesselHandle,
+        _environment: &BTreeMap<String, String>,
+    ) -> Result<Arc<ProviderRegistry>, String> {
+        Ok(Arc::clone(&self.registry))
+    }
+}
+
+/// A real environment-socket service whose accept loop holds connections open.
+pub(super) fn held_socket_service(state: &Path) -> EnvironmentSocketService {
+    EnvironmentSocketService::new(
+        Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
+        DaemonHostPath::new(state.join("env")),
+        |listener, _, _| {
+            tokio::spawn(async move {
+                let _listener = listener;
+                std::future::pending::<()>().await
+            })
+        },
+    )
+}
+
+/// The vessel manager over `agents`, with sockets and attach directories in `state`.
+pub(super) fn vessels_over(agents: Arc<dyn VesselAgents>, state: &Path) -> Arc<AgentlessVessels> {
+    Arc::new(AgentlessVessels::new(agents, held_socket_service(state), state.join("vessels")))
+}

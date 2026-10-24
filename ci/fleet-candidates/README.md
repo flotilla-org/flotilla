@@ -570,15 +570,20 @@ real-host acceptance is performed after merge.
 
 ### Linux dependency cache
 
-The `fleet-linux-v2-` key hashes both selected source trees' `Cargo.lock` and
+The `fleet-linux-v3-` key hashes both selected source trees' `Cargo.lock` and
 `rust-toolchain.toml` files plus Cleat's `tools/ghostty-toolchain.toml` (Zig and
 Ghostty pins). Cleat's Rust pin is a conservative extra input: the coordinated
 build and cache pruning both override it with the selected Flotilla Rust pin.
 This avoids downloading Cleat's potentially different compiler just to prune.
 Sources are fetched before restore; source commit IDs and skill
 revisions do not enter the key. Missing inputs refuse the build rather than
-silently producing a partial key. The v2 restore prefix can seed a changed
+silently producing a partial key. The v3 restore prefix (then v2) can seed a changed
 lockfile or pin from the last dependency cache, but only an exact hit skips save.
+
+The cache also holds Zig's global package cache (`ZIG_GLOBAL_CACHE_DIR`,
+set to `.fleet-cache/zig` by `setup-linux-toolchain.sh`), so Ghostty's package
+archives are fetched once per Ghostty pin rather than on every run. v3 added
+this path; the prefix bump makes the first v3 run save it.
 
 After a successful candidate build, validation and upload, a cache miss cleans
 all workspace packages in both Cargo profiles and removes incremental output

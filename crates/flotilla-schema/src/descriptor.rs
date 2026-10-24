@@ -244,6 +244,10 @@ pub struct Index {
     pub order: Vec<String>,
     /// Conjoined; empty for a full index.
     pub predicate: Vec<Condition>,
+    /// No two rows of one owner share the `eq` columns. Only on a nested table, whose index then
+    /// leads with the owner's key ([`TableSet::index_key`]): a root row's uniqueness would span
+    /// every resource of a store, replicas included, which no home could decide alone.
+    pub unique: bool,
 }
 
 /// One term of a partial-index predicate. Kept structured so the DDL and every query render the
@@ -298,6 +302,8 @@ pub enum IndexProblem {
     Codes(String),
     #[error("column {0} is not nullable, so `is_some` would be always true")]
     NotNullable(String),
+    #[error("a unique index belongs on a nested table, unique within its owner, with eq columns only and no predicate")]
+    Unique,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -431,6 +437,9 @@ impl TableSet {
         if index.eq.is_empty() && index.order.is_empty() {
             return Err(IndexProblem::NoColumns);
         }
+        if index.unique && (root.parent.is_none() || index.eq.is_empty() || !index.order.is_empty() || !index.predicate.is_empty()) {
+            return Err(IndexProblem::Unique);
+        }
         let column =
             |name: &str| root.columns.iter().find(|column| column.name == name).ok_or_else(|| IndexProblem::UnknownColumn(name.to_owned()));
         let mut seen = BTreeSet::new();
@@ -473,6 +482,23 @@ impl TableSet {
         self.tables.iter().map(|table| table.name.clone()).chain(self.indexes.iter().map(Index::object_name)).chain(references).chain(views)
     }
 
+    /// An index's key as rendered: a unique index on a nested table leads with its owner's key
+    /// (the resource's row id, then the parent rows' keys), so it is unique within one owner,
+    /// as a seat name is within one convoy; any other index is its `eq` then `order` columns.
+    pub fn index_key(&self, index: &Index) -> Vec<String> {
+        let mut key = Vec::new();
+        if index.unique {
+            let table = self.tables.iter().find(|table| table.name == index.table);
+            debug_assert!(table.is_some(), "`validate` refuses an index on table `{}`, which this set does not hold", index.table);
+            if let Some(table) = table {
+                key.push(self.parent_key_column().to_owned());
+                key.extend(table.parent_key().iter().map(|column| column.name.clone()));
+            }
+        }
+        key.extend(index.columns().map(str::to_owned));
+        key
+    }
+
     /// One index per reference column of a child table, named `<column>_ref` (partial on the
     /// column being present when it is nullable), so the foreign-key check of removing an identity
     /// (an expunge) searches each child table rather than scanning it (#3392 lane 3 ruling 1).
@@ -501,6 +527,7 @@ impl TableSet {
                     eq: vec![column.name.clone()],
                     order: Vec::new(),
                     predicate,
+                    unique: false,
                 });
             }
         }

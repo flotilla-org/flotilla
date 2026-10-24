@@ -86,9 +86,14 @@ getrandom = { version = "0.2", default-features = false, features = ["std"] }
 subtle = "2"
 
 [target.'cfg(unix)'.dependencies]
+drydock.workspace = true
+drydock-protocol.workspace = true
+
 libc = { workspace = true }
 
 [dev-dependencies]
+drydock-agent.workspace = true
+drydock-transport.workspace = true
 flotilla-forge-github = { path = "../flotilla-forge-github" }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
 rigging-replay-testkit = { workspace = true }

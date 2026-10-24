@@ -323,6 +323,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     let started_at = Utc.timestamp_opt(10, 0).single().expect("timestamp");
     let ready_at = Utc.timestamp_opt(20, 0).single().expect("timestamp");
     let placement_decision = PlacementDecision {
+        provider_workspace_root: None,
         minimal_alternatives: Vec::new(),
         escalation_reason: None,
         policy_name: "docker-on-01HXYZ".to_string(),
@@ -348,6 +349,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     VesselStatusPatch::MarkProvisioning {
         image: None,
         placement_decision: Some(PlacementDecision {
+            provider_workspace_root: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
             policy_name: "replacement-must-not-win".to_string(),

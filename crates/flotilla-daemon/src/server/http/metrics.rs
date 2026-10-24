@@ -368,6 +368,8 @@ mod tests {
     // Host/Origin. This glue test needs no fleet, controllers or resync polling.
     #[tokio::test]
     async fn metrics_tcp_policy_and_disabled_route() {
+        // This HTTP client must work when the test runs in its own process.
+        rigging_tls::install_default_provider();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("daemon.toml"), "machine_id = \"metrics-policy\"\n").unwrap();
         let config = Arc::new(flotilla_config::ConfigStore::with_base(dir.path().to_path_buf()));

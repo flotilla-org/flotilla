@@ -158,6 +158,7 @@ use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_projections::fleet::FleetService;
 use flotilla_projections::host_registry::HostCounts;
 use flotilla_projections::host_registry::HostQueryDetails;
+use flotilla_provider_runtime::host_environment::{HostEnvironment, HostSupply};
 use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
@@ -413,10 +414,15 @@ async fn register_static_ssh_direct_environment(
     environment: &StaticEnvironmentConfig,
     host_direct: bool,
     multiplex: bool,
+    max_vessels: Option<u32>,
 ) -> Result<(), String> {
     let fallback_env_id = static_ssh_environment_id(config_key);
     let destination = flotilla_config::ssh_destination(&environment.hostname, environment.user.as_deref());
-    let runner = Arc::new(SshCommandRunner::new(destination.clone(), multiplex, Arc::clone(&discovery.runner)));
+    let host_environment =
+        host_environment(&environment.supplies).map_err(|error| format!("host configuration error for {config_key}: {error}"))?;
+    let runner = Arc::new(
+        SshCommandRunner::new(destination.clone(), multiplex, Arc::clone(&discovery.runner)).with_environment(host_environment.clone()),
+    );
     tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, runner.run("true", &[], Path::new("/"), &ChannelLabel::Default))
         .await
         .map_err(|_| format!("ssh preflight timed out for {}", environment.hostname))?
@@ -439,10 +445,26 @@ async fn register_static_ssh_direct_environment(
         env_bag = env_bag.with(EnvironmentAssertion::env_var("DISPLAY_NAME", display_name));
     }
     environment_manager.register_direct_environment(env_id.clone(), runner, env_bag, host_id)?;
+    environment_manager.set_direct_environment_host_environment(&env_id, host_environment)?;
     if host_direct {
         environment_manager.set_direct_environment_ssh_destination(&env_id, destination)?;
     }
+    environment_manager.set_direct_environment_max_vessels(&env_id, max_vessels)?;
     Ok(())
+}
+
+/// #3722: a host's declared supplies, validated for its SSH runner.
+fn host_environment(supplies: &[flotilla_config::HostSupply]) -> Result<HostEnvironment, String> {
+    HostEnvironment::new(
+        supplies
+            .iter()
+            .map(|supply| HostSupply {
+                name: supply.name.clone(),
+                path: supply.path.clone(),
+                env: supply.env.iter().map(|(name, value)| (name.clone(), value.clone())).collect(),
+            })
+            .collect(),
+    )
 }
 
 async fn register_static_ssh_direct_environments(
@@ -459,7 +481,8 @@ async fn register_static_ssh_direct_environments(
     };
 
     for (config_key, environment) in &daemon_config.environments {
-        if let Err(err) = register_static_ssh_direct_environment(environment_manager, discovery, config_key, environment, false, true).await
+        if let Err(err) =
+            register_static_ssh_direct_environment(environment_manager, discovery, config_key, environment, false, true, None).await
         {
             warn!(
                 environment = %config_key,
@@ -477,6 +500,7 @@ async fn register_static_ssh_direct_environments(
                     user: remote.user.clone(),
                     display_name: Some(remote.expected_host_name.clone()),
                     flotilla_command: None,
+                    supplies: remote.supplies.clone(),
                 };
                 if let Err(err) = register_static_ssh_direct_environment(
                     environment_manager,
@@ -485,6 +509,7 @@ async fn register_static_ssh_direct_environments(
                     &environment,
                     true,
                     hosts.resolved_ssh_multiplex(label),
+                    remote.max_vessels,
                 )
                 .await
                 {
@@ -675,6 +700,9 @@ use flotilla_projections::dispatch_board::DispatchBoardInputs;
 pub struct InProcessDaemon {
     change_stream_rounds: change_stream::Rounds,
     decided_store: std::sync::Mutex<Option<Arc<flotilla_schema_sqlite::stream::Service>>>,
+    /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4), installed with
+    /// the decided store's provisioning homes; none before, and none with the switch off.
+    lifecycle_reads: Arc<flotilla_projections::ports::LateLifecycleReads>,
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
     event_source: Arc<BroadcastEventSink>,
@@ -711,6 +739,11 @@ pub struct InProcessDaemon {
     message_path: crate::primitives::MessagePath,
     /// The same path, as crew code reaches it: through its EngineMessages port.
     crew_message_path: flotilla_crew::ports::MessagePath,
+    /// The `[primitives]` Convoy path (#3587 layer 6), as crew code and the
+    /// convoy reconciler reach it.
+    convoy_engine_path: flotilla_resources::convoy::engine::EngineConvoyPath,
+    /// Which seats a vessel serves, the engine's answer behind `[primitives]` (#3629 layer 8).
+    vessel_seats_path: flotilla_resources::vessel_seats::VesselSeatsPath,
     message_receivers: projection_ports::MessageReceivers,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
     /// Unique identity for this daemon instance, generated at startup.
@@ -739,6 +772,8 @@ pub struct InProcessDaemon {
     fleet: FleetService,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
     operator_reconciler: RwLock<Option<Arc<dyn OperatorReconciler>>>,
+    /// Sessions on agentless hosts run in their vessels' agents (#3792).
+    agentless_vessels: std::sync::RwLock<Option<Arc<dyn AgentlessVesselAccess>>>,
     /// Process-lifetime host discovery, independent of tracked-root membership.
     /// Heartbeats publish these observations into Host status.
     local_provider_statuses: Vec<HostProviderStatus>,
@@ -784,6 +819,23 @@ impl ConvoyEnsureAdmission for InProcessDaemon {
 #[async_trait]
 pub trait OperatorReconciler: Send + Sync {
     async fn reconcile_now(&self, namespace: &str, kind: &str, name: &str) -> Result<String, String>;
+}
+
+/// #3792: a session on an agentless host runs in its vessel's drydock agent,
+/// which the daemon runtime owns. Its files and its attach go through that
+/// agent; each method answers `None` for a session elsewhere.
+#[async_trait]
+pub trait AgentlessVesselAccess: Send + Sync {
+    /// The runner for commands and files in the session's vessel.
+    async fn runner(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Option<Result<Arc<dyn CommandRunner>, String>>;
+    /// Attach to the session's cleat through its vessel's agent: a local
+    /// socket forwarded to the vessel's cleat, and the session's name there.
+    async fn attach(
+        &self,
+        spec: &flotilla_resources::TerminalSessionSpec,
+        session_id: &str,
+        seat: AttachMode,
+    ) -> Option<Result<(std::path::PathBuf, String), String>>;
 }
 
 #[async_trait]
@@ -1170,11 +1222,14 @@ impl InProcessDaemon {
         let message_inboxes = Arc::new(Mutex::new(HashMap::new()));
         let message_path = crate::primitives::MessagePath::default();
         let crew_message_path = flotilla_crew::ports::MessagePath::default();
+        let convoy_engine_path = flotilla_resources::convoy::engine::EngineConvoyPath::default();
+        let vessel_seats_path = flotilla_resources::vessel_seats::VesselSeatsPath::default();
         let leaf_subscriptions =
             LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher)
                 .with_clock(Arc::clone(&clock))
                 .with_message_inboxes(Arc::clone(&message_inboxes))
                 .with_message_path(Arc::clone(&crew_message_path))
+                .with_convoy_engine(Arc::clone(&convoy_engine_path))
                 .with_charter_brief_renderer(Arc::new(flotilla_crew::charter_notifications::LiveCharterBriefRenderer::new(
                     resource_backend.clone(),
                     Arc::clone(&config),
@@ -1205,6 +1260,8 @@ impl InProcessDaemon {
             CrewService::builder()
                 .message_inboxes(Arc::clone(&message_inboxes))
                 .message_path(Arc::clone(&crew_message_path))
+                .convoy_engine(Arc::clone(&convoy_engine_path))
+                .vessel_seats(Arc::clone(&vessel_seats_path))
                 .capability_cards(flotilla_crew::crew_capabilities::CapabilityCardTracker::with_message_path(Arc::clone(
                     &crew_message_path,
                 )))
@@ -1276,6 +1333,8 @@ impl InProcessDaemon {
             message_receivers: projection_ports::MessageReceivers(Arc::clone(&message_path)),
             message_path,
             crew_message_path,
+            convoy_engine_path,
+            vessel_seats_path,
             brief_artifact_writer: Arc::clone(&brief_artifact_writer),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
@@ -1284,6 +1343,7 @@ impl InProcessDaemon {
             regard_lifecycle: Arc::clone(&regard_lifecycle),
             decided_store: Default::default(),
             change_stream_rounds: Default::default(),
+            lifecycle_reads: Default::default(),
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
@@ -1297,6 +1357,7 @@ impl InProcessDaemon {
             ),
             repository_inspector: RwLock::new(None),
             operator_reconciler: RwLock::new(None),
+            agentless_vessels: std::sync::RwLock::new(None),
             local_provider_statuses,
             local_placement_provider_statuses: RwLock::new(Vec::new()),
         });
@@ -1475,6 +1536,27 @@ impl InProcessDaemon {
 
     pub async fn set_operator_reconciler(&self, reconciler: Arc<dyn OperatorReconciler>) {
         *self.operator_reconciler.write().await = Some(reconciler);
+    }
+
+    pub fn set_agentless_vessel_access(&self, access: Arc<dyn AgentlessVesselAccess>) {
+        *self.agentless_vessels.write().expect("agentless vessels lock poisoned") = Some(access);
+    }
+
+    /// The runner for a session's files: its vessel's agent on an agentless
+    /// host (#3792), otherwise its environment's runner. `None` when neither
+    /// is known; an error when the vessel's agent cannot be reached.
+    pub async fn command_runner_for_session(
+        &self,
+        spec: &flotilla_resources::TerminalSessionSpec,
+    ) -> Option<Result<Arc<dyn CommandRunner>, String>> {
+        let access = self.agentless_vessels.read().expect("agentless vessels lock poisoned").clone();
+        if let Some(runner) = match access {
+            Some(access) => access.runner(spec).await,
+            None => None,
+        } {
+            return Some(runner);
+        }
+        self.command_runner_for_environment_ref(&spec.env_ref).map(Ok)
     }
 
     pub async fn set_work_credential_reconciler(&self, reconciler: Arc<dyn WorkCredentialReconciler>) {
@@ -2081,12 +2163,34 @@ impl InProcessDaemon {
         Ok(())
     }
 
+    /// Installs the engine's provisioning readings during composition (#3629 layer 4).
+    pub fn install_lifecycle_reads(&self, reads: Arc<dyn flotilla_projections::ports::LifecycleReads>) -> Result<(), String> {
+        self.lifecycle_reads.install(reads)
+    }
+
+    /// The provisioning readings the views consult: the engine's once installed, none before.
+    pub fn lifecycle_reads(&self) -> Arc<dyn flotilla_projections::ports::LifecycleReads> {
+        self.lifecycle_reads.clone()
+    }
+
     /// Installs the `[primitives]` Message path during composition (#3317),
     /// after its decided store. Absent, every Message stays in the old store.
     pub fn install_message_primitives(&self, primitives: Arc<crate::primitives::MessagePrimitives>) -> Result<(), String> {
         self.message_path.set(Arc::clone(&primitives)).map_err(|_| "the Message path is already installed".to_owned())?;
+        let convoys: Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> = primitives.convoy_engine().clone();
+        self.convoy_engine_path.set(convoys).map_err(|_| "the Convoy path is already installed".to_owned())?;
         let engine: Arc<dyn flotilla_crew::ports::EngineMessages> = primitives;
         self.crew_message_path.set(engine).map_err(|_| "the crew's Message path is already installed".to_owned())
+    }
+
+    /// Installs the engine's answer to which seats a vessel serves (#3629 layer 8).
+    pub fn install_vessel_seats(&self, seats: Arc<dyn flotilla_resources::vessel_seats::VesselSeats>) -> Result<(), String> {
+        self.vessel_seats_path.set(seats).map_err(|_| "the vessel seats port is already installed".to_owned())
+    }
+
+    /// The `[primitives]` Convoy path: empty until the switch's primitives are installed.
+    pub fn convoy_engine_path(&self) -> flotilla_resources::convoy::engine::EngineConvoyPath {
+        Arc::clone(&self.convoy_engine_path)
     }
 
     /// The `[primitives]` Message path, when the switch is on.
@@ -2498,7 +2602,8 @@ impl InProcessDaemon {
             flotilla_protocol::CommandAction::CrewSupervise { namespace, convoy, .. } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), convoy.as_str())
             }
-            flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, .. } => {
+            flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, .. }
+            | flotilla_protocol::CommandAction::ConvoyPromiseVerdict { convoy, .. } => {
                 (self.provisioning_namespace().await, convoy.as_str())
             }
             flotilla_protocol::CommandAction::CrewPromise { context, .. }
@@ -4032,9 +4137,11 @@ impl InProcessDaemon {
             environment_manager: self,
             host_name: &self.host_name,
             node_id: &self.node_id,
+            lifecycles: self.lifecycle_reads.as_ref(),
             clock: &self.clock,
             leaf_subscriptions: &self.leaf_subscription_diagnostics,
             fleet: &self.fleet,
+            convoy_engine: &self.convoy_engine_path,
         }
     }
 
@@ -4640,6 +4747,8 @@ impl InProcessDaemon {
             local_environment_id: &self.local_environment_id,
             host_name: &self.host_name,
             namespace: &self.provisioning_namespace,
+            lifecycle_reads: self.lifecycle_reads.as_ref(),
+            agentless_vessels: self.agentless_vessels.read().expect("agentless vessels lock poisoned").clone(),
         }
     }
 
@@ -5285,7 +5394,10 @@ impl InProcessDaemon {
                 return boxed_action!(crew.execute_action_convoy_abandon(id, &command, &caller, &dispatching_principal_ref))
             }
             CommandAction::ConvoyWorkForceComplete { .. } => {
-                return boxed_action!(crew.execute_action_convoy_work_force_complete(id, &command))
+                return boxed_action!(crew.execute_action_convoy_work_force_complete(id, &command, &dispatching_principal_ref))
+            }
+            CommandAction::ConvoyPromiseVerdict { .. } => {
+                return boxed_action!(crew.execute_action_convoy_promise_verdict(id, &command, &dispatching_principal_ref))
             }
             CommandAction::ConvoyStart { .. } => {
                 return boxed_action!(admission.execute_action_convoy_start(id, &command, &dispatching_principal_ref))

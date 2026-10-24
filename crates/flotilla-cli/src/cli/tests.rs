@@ -172,6 +172,7 @@ fn fulfilment_list_distinguishes_image_and_host_model_support() {
         toolchains: BTreeMap::new(),
         gui_session_logged_in: Some(false),
         free_vessel_slots: None,
+        max_vessels: None,
         image: None,
     };
     let response = flotilla_protocol::FulfilmentListResponse {
@@ -446,6 +447,7 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         skills: BTreeMap::new(),
         allocation: Vec::new(),
         placement: Some(PlacementDecision {
+            provider_workspace_root: None,
             policy_name: "macos-scarce".into(),
             target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("comte"), display_name: "comte".into() },
             minimal_alternatives: Vec::new(),
@@ -1065,4 +1067,14 @@ fn slow_convoy_start_prints_attach_later_hint() {
         binding: None,
     });
     assert_eq!(output, format!("convoy started: coder@flotilla\nWarning: {notice}"));
+}
+
+// #3793: free slots show the declared cap when a host has one, and an
+// uncounted, uncapped kind reads as unbounded.
+#[test]
+fn vessel_slots_show_the_cap_beside_free_slots() {
+    assert_eq!(super::vessel_slots(Some(0), Some(1)), "0 of 1");
+    assert_eq!(super::vessel_slots(None, Some(2)), "unknown of 2");
+    assert_eq!(super::vessel_slots(Some(3), None), "3");
+    assert_eq!(super::vessel_slots(None, None), "unbounded");
 }

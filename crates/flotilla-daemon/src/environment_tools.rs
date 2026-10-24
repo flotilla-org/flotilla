@@ -26,14 +26,17 @@ use tokio::sync::OnceCell;
 pub(crate) struct EnvironmentToolProviderKind(&'static str);
 
 pub(crate) const DOCKER_PROVIDER_KIND: EnvironmentToolProviderKind = EnvironmentToolProviderKind("docker");
+/// A vessel on an agentless SSH host (#3792): only the generation layer,
+/// published under the vessel's own prefix, since nothing there is mounted.
+pub(crate) const AGENTLESS_SSH_PROVIDER_KIND: EnvironmentToolProviderKind = EnvironmentToolProviderKind("agentless-ssh");
 
 pub(crate) const ENVIRONMENT_FLOTILLA_DIRECTORY: &str = "/opt/flotilla/bin";
-pub(crate) const ENVIRONMENT_FLOTILLA_PATH: &str = "/usr/local/bin/flotilla";
+pub(crate) const ENVIRONMENT_FLOTILLA_PATH: &str = "/opt/flotilla/crew-bin/flotilla";
 const FLOTILLA_LAUNCHER_NAME: &str = "contained-flotilla-launcher";
 const FLOTILLA_LAUNCHER: &str = "#!/bin/sh\nexec /opt/flotilla/bin/flotilla \"$@\"\n";
-pub(crate) const ENVIRONMENT_CLEAT_PATH: &str = "/usr/local/bin/cleat";
-pub(crate) const ENVIRONMENT_CLEAT_LIBRARY_DIR: &str = "/usr/local/lib/flotilla";
-pub(crate) const ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH: &str = "/usr/local/lib/flotilla/libghostty-vt.so.0";
+pub(crate) const ENVIRONMENT_CLEAT_PATH: &str = "/opt/flotilla/crew-bin/cleat";
+pub(crate) const ENVIRONMENT_CLEAT_LIBRARY_DIR: &str = "/opt/flotilla/lib";
+pub(crate) const ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH: &str = "/opt/flotilla/lib/libghostty-vt.so.0";
 pub(crate) const ENVIRONMENT_CLEAT_RUNTIME_DIR: &str = "/var/lib/flotilla/cleat";
 const CLEAT_GHOSTTY_LIBRARY: &str = "libghostty-vt.so.0";
 #[cfg(test)]
@@ -51,6 +54,11 @@ pub(crate) trait EnvironmentToolFactory: Send + Sync {
 #[async_trait]
 pub(crate) trait EnvironmentToolContext: Send + Sync {
     async fn rust_build_jobs(&self) -> Result<usize, String>;
+    /// Where the generation layer is published in the environment, when it is
+    /// not a container's fixed `/opt/flotilla`.
+    fn tools_prefix(&self) -> Option<&Path> {
+        None
+    }
 }
 
 struct LocalToolContext<'a> {
@@ -151,6 +159,7 @@ struct FleetToolsTool {
     cli: Arc<dyn EnvironmentToolFactory>,
     cleat: Arc<dyn EnvironmentToolFactory>,
     root: PathBuf,
+    publisher: flotilla_environment::tools::Publisher,
 }
 #[cfg(unix)]
 impl FleetToolsTool {
@@ -159,6 +168,7 @@ impl FleetToolsTool {
             cli: FlotillaCliTool::for_local_host(context),
             cleat: CleatTool::for_local_host(context),
             root: context.config.state_dir().join("environment-tools/fleet").as_path().to_path_buf(),
+            publisher: Default::default(),
         })
     }
 }
@@ -166,7 +176,7 @@ impl FleetToolsTool {
 #[async_trait]
 impl EnvironmentToolFactory for FleetToolsTool {
     fn provider_kinds(&self) -> &[EnvironmentToolProviderKind] {
-        &[DOCKER_PROVIDER_KIND]
+        &[DOCKER_PROVIDER_KIND, AGENTLESS_SSH_PROVIDER_KIND]
     }
     async fn prepare(&self, name: &str, context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
         let mut cli = self.cli.prepare(name, context).await?;
@@ -177,14 +187,17 @@ impl EnvironmentToolFactory for FleetToolsTool {
         let prefix = library.parent().and_then(Path::parent).ok_or("cleat library has no installation prefix")?;
         let terminfo = prefix.join("share/terminfo");
         let flotilla = cli.assets[0].host_path.as_path().join("flotilla");
-        flotilla_environment::tools::publish(
+        self.publisher.publish(
             &self.root,
             &flotilla_environment::tools::ToolsSource { flotilla: &flotilla, cleat: binary, library, terminfo: &terminfo },
         )
         .map_err(|error| format!(
-            "publish fleet tools: {error}; Docker vessel provisioning requires Linux fleet tools: flotilla, cleat, libghostty-vt.so.0, and compiled xterm-ghostty at {}; build/install a complete fleet candidate (cleat prepare supplies share/terminfo)",
+            "publish fleet tools: {error}; vessel provisioning requires Linux fleet tools: flotilla, cleat, libghostty-vt.so.0, and compiled xterm-ghostty at {}; build/install a complete fleet candidate (cleat prepare supplies share/terminfo)",
             terminfo.display()
         ))?;
+        if let Some(prefix) = context.tools_prefix() {
+            return Ok(generation_layer(&self.root, prefix));
+        }
         cli.assets.remove(0);
         for directory in ["tools", "bin", "lib", "share/terminfo"] {
             cli.assets.push(EnvironmentToolAsset::new(
@@ -212,6 +225,24 @@ impl EnvironmentToolFactory for FleetToolsTool {
     }
 }
 
+/// The published generation (CLI, cleat, its library and terminfo) under
+/// `prefix`, as real directories of relative links: nothing that needs a mount
+/// or root. The environment composes its own variables around it (#3792).
+#[cfg(unix)]
+fn generation_layer(root: &Path, prefix: &Path) -> EnvironmentTool {
+    let mut layer = EnvironmentTool::new("flotilla", prefix.join("bin/flotilla"));
+    for directory in ["tools", "bin", "lib", "share/terminfo"] {
+        layer = layer.with_asset(EnvironmentToolAsset::new(
+            root.join(directory),
+            prefix.join(directory),
+            EnvironmentToolAssetKind::Directory,
+            EnvironmentToolAssetAccess::ReadOnly,
+            "generation tools",
+        ));
+    }
+    layer
+}
+
 struct FlotillaCliTool {
     binary_path: Result<DaemonHostPath, String>,
     daemon_socket_path: Result<DaemonHostPath, String>,
@@ -237,6 +268,7 @@ impl EnvironmentToolFactory for FlotillaCliTool {
         ensure_flotilla_launcher(&launcher_path).await?;
         let environment_socket_path = contained_daemon_socket_path(daemon_socket_path.as_path());
         Ok(EnvironmentTool::new("flotilla", ENVIRONMENT_FLOTILLA_PATH)
+            .with_environment(EnvironmentVariableUpdate::prepend_path("PATH", "/opt/flotilla/crew-bin"))
             .with_asset(EnvironmentToolAsset::new(
                 binary_directory.to_path_buf(),
                 ENVIRONMENT_FLOTILLA_DIRECTORY,
@@ -292,7 +324,7 @@ async fn ensure_flotilla_launcher(path: &Path) -> Result<(), String> {
         }
     }
     #[cfg(unix)]
-    {
+    if tokio::fs::metadata(path).await.map_err(|error| error.to_string())?.permissions().mode() & 0o7777 != 0o755 {
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
             .await
             .map_err(|error| format!("make flotilla CLI launcher executable at {}: {error}", path.display()))?;
@@ -339,6 +371,7 @@ impl EnvironmentToolFactory for CleatTool {
             .map_err(|error| format!("create durable cleat state directory {}: {error}", state_path.display()))?;
 
         Ok(EnvironmentTool::new("cleat", ENVIRONMENT_CLEAT_PATH)
+            .with_environment(EnvironmentVariableUpdate::prepend_path("PATH", "/opt/flotilla/crew-bin"))
             .with_asset(EnvironmentToolAsset::new(
                 binary_path.as_path().to_path_buf(),
                 ENVIRONMENT_CLEAT_PATH,
@@ -461,37 +494,22 @@ fn resolve_cleat_binary(path: &Path) -> Result<DaemonHostPath, String> {
     resolve_cleat_binary_from(path, &current_dir, search_path.as_deref())
 }
 
-// Also the agentless CLI source on every platform (#3618).
-pub(crate) fn adjacent_flotilla_binary(daemon_binary: &Path) -> Result<DaemonHostPath, String> {
-    let parent = daemon_binary.parent().ok_or_else(|| format!("daemon binary has no parent directory: {}", daemon_binary.display()))?;
-    let flotilla_binary = parent.join("flotilla");
-    if !flotilla_binary.is_file() {
-        return Err(format!("flotilla binary not found next to daemon at {}", flotilla_binary.display()));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let permissions = std::fs::metadata(&flotilla_binary)
-            .map_err(|error| format!("inspect flotilla binary at {}: {error}", flotilla_binary.display()))?
-            .permissions();
-        if permissions.mode() & 0o111 == 0 {
-            return Err(format!("flotilla binary is not executable: {}", flotilla_binary.display()));
-        }
-    }
-    Ok(DaemonHostPath::new(flotilla_binary))
-}
-
 fn running_daemon_flotilla_binary() -> Result<DaemonHostPath, String> {
     #[cfg(target_os = "linux")]
     {
-        let daemon_binary = std::env::current_exe().map_err(|error| format!("resolve running daemon binary: {error}"))?;
-        adjacent_flotilla_binary(&daemon_binary)
+        let daemon = std::env::current_exe().map_err(|e| format!("resolve running daemon: {e}"))?;
+        let binary = daemon.parent().ok_or("daemon executable has no parent")?.join("flotilla-vessel");
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(&binary)
+            .map_err(|e| format!("cut-down vessel CLI {}: {e}; build/install flotilla-vessel with this generation", binary.display()))?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err("cut-down vessel CLI must be executable".into());
+        }
+        Ok(DaemonHostPath::new(binary))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        Err("daemon-adjacent flotilla injection requires a Linux host; generation-addressed environment binaries are not available yet"
-            .to_string())
+        Err("Docker vessel tools require a Linux host".into())
     }
 }
 
@@ -562,10 +580,10 @@ fi
 exec "$compiler" "$@"
 "#;
 
-pub(crate) const CONTAINED_RUSTC_WRAPPER_PATH: &str = "/usr/local/bin/flotilla-rustc-wrapper";
+pub(crate) const CONTAINED_RUSTC_WRAPPER_PATH: &str = "/opt/flotilla/crew-bin/flotilla-rustc-wrapper";
 
-pub(crate) const CONTAINED_CARGO_SHIM_DIRECTORY: &str = "/usr/local/lib/flotilla-rust-build-limits";
-pub(crate) const CONTAINED_CARGO_SHIM_PATH: &str = "/usr/local/lib/flotilla-rust-build-limits/cargo";
+pub(crate) const CONTAINED_CARGO_SHIM_DIRECTORY: &str = "/opt/flotilla/rust-build-limits";
+pub(crate) const CONTAINED_CARGO_SHIM_PATH: &str = "/opt/flotilla/rust-build-limits/cargo";
 const CARGO_BUILD_PROFILE_SHIM: &str = r#"#!/bin/sh
 # flotilla-cargo-profile-shim
 # Remove our directory before resolving Cargo (including rustup's Cargo proxy).
@@ -722,7 +740,6 @@ impl EnvironmentToolFactory for RustBuildLimitsTool {
 pub(crate) mod tests {
     use std::{
         fs,
-        os::unix::fs::PermissionsExt,
         process::Command as ProcessCommand,
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -737,6 +754,25 @@ pub(crate) mod tests {
 
     // Generation tools expose stable real directories and complete assets,
     // preserving image siblings while later link replacement remains visible.
+    // Unchanged reconciliation must preserve file identity so the agent's
+    // layer cache can reuse its digest; a permission repair still works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unchanged_launcher_preparation_preserves_file_identity() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = TempDir::new().unwrap();
+        let launcher = root.path().join("launcher");
+        ensure_flotilla_launcher(&launcher).await.unwrap();
+        let before = fs::metadata(&launcher).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        ensure_flotilla_launcher(&launcher).await.unwrap();
+        let after = fs::metadata(&launcher).unwrap();
+        assert_eq!((before.ino(), before.ctime(), before.ctime_nsec()), (after.ino(), after.ctime(), after.ctime_nsec()));
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o644)).unwrap();
+        ensure_flotilla_launcher(&launcher).await.unwrap();
+        assert_eq!(fs::metadata(&launcher).unwrap().permissions().mode() & 0o777, 0o755);
+    }
+
     #[tokio::test]
     async fn fleet_tools_publish_complete_generations_through_stable_directory_assets() {
         let temp = TempDir::new().unwrap();
@@ -759,6 +795,7 @@ pub(crate) mod tests {
                 runner: None,
             }),
             root: temp.path().join("provider"),
+            publisher: Default::default(),
         };
         let tool = factory.prepare("vessel", &TestToolContext).await.unwrap();
         let parent = tool.assets.iter().find(|asset| asset.environment_path.as_path() == Path::new("/opt/flotilla/bin")).unwrap();
@@ -771,6 +808,32 @@ pub(crate) mod tests {
             .all(|update| !matches!(update, EnvironmentVariableUpdate::PrependPath { name, .. } if name == "LD_LIBRARY_PATH")));
         assert!(tool.assets.iter().all(|asset| asset.kind != EnvironmentToolAssetKind::File
             || asset.environment_path.as_path() == Path::new(ENVIRONMENT_FLOTILLA_PATH)));
+        // #3792: a vessel on an agentless host takes the same generation as
+        // real directories under its own prefix: nothing to mount, no file
+        // outside the prefix, and no variables of the container's.
+        struct PrefixContext(PathBuf);
+        #[async_trait]
+        impl EnvironmentToolContext for PrefixContext {
+            async fn rust_build_jobs(&self) -> Result<usize, String> {
+                unreachable!("the generation layer has no build limits")
+            }
+            fn tools_prefix(&self) -> Option<&Path> {
+                Some(&self.0)
+            }
+        }
+        let prefix = PathBuf::from("/home/crew/.local/state/flotilla/vessels/0123456789abcdef");
+        let layer = factory.prepare("host-direct-b1", &PrefixContext(prefix.clone())).await.unwrap();
+        let mapped = layer
+            .assets
+            .iter()
+            .map(|asset| (asset.host_path.as_path().to_path_buf(), asset.environment_path.as_path().to_path_buf()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mapped,
+            ["tools", "bin", "lib", "share/terminfo"].map(|directory| (factory.root.join(directory), prefix.join(directory))).to_vec()
+        );
+        assert!(layer.assets.iter().all(|asset| asset.kind == EnvironmentToolAssetKind::Directory && !asset.requires_mount()));
+        assert!(layer.environment.is_empty());
         fs::write(release.join("bin/cleat"), b"second").unwrap();
         factory.prepare("another-vessel", &TestToolContext).await.unwrap();
         assert_eq!(fs::read(parent.host_path.as_path().join("cleat")).unwrap(), b"second");
@@ -782,7 +845,7 @@ pub(crate) mod tests {
             let bytes = fs::read(&path).unwrap();
             fs::remove_file(&path).unwrap();
             let error = factory.prepare("missing-assets", &TestToolContext).await.unwrap_err();
-            assert!(error.contains("Docker vessel provisioning requires Linux fleet tools"), "{error}");
+            assert!(error.contains("vessel provisioning requires Linux fleet tools"), "{error}");
             assert!(error.contains("share/terminfo"), "{error}");
             assert_eq!(fs::read(factory.root.join("bin/cleat")).unwrap(), b"second");
             fs::write(path, bytes).unwrap();
@@ -868,31 +931,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn resolves_flotilla_binary_adjacent_to_daemon() {
-        let temp = TempDir::new().expect("tempdir");
-        let daemon_binary = temp.path().join("flotillad");
-        let flotilla_binary = temp.path().join("flotilla");
-        fs::write(&daemon_binary, b"daemon").expect("write daemon");
-        fs::write(&flotilla_binary, b"cli").expect("write cli");
-        fs::set_permissions(&flotilla_binary, fs::Permissions::from_mode(0o755)).expect("make cli executable");
-
-        assert_eq!(adjacent_flotilla_binary(&daemon_binary).expect("adjacent flotilla binary"), DaemonHostPath::new(flotilla_binary),);
-    }
-
-    #[test]
-    fn rejects_non_executable_flotilla_binary_adjacent_to_daemon() {
-        let temp = TempDir::new().expect("tempdir");
-        let daemon_binary = temp.path().join("flotillad");
-        let flotilla_binary = temp.path().join("flotilla");
-        fs::write(&daemon_binary, "").expect("daemon binary");
-        fs::write(&flotilla_binary, "").expect("flotilla binary");
-
-        let error = adjacent_flotilla_binary(&daemon_binary).expect_err("non-executable flotilla binary should be rejected");
-
-        assert_eq!(error, format!("flotilla binary is not executable: {}", flotilla_binary.display()));
-    }
-
-    #[test]
     fn stages_only_the_flotilla_cli_for_contained_directory_mounts() {
         let temp = TempDir::new().expect("tempdir");
         let source_directory = temp.path().join("target/debug");
@@ -925,11 +963,11 @@ pub(crate) mod tests {
         .await
         .expect("prepare flotilla CLI");
 
-        assert_eq!(tool.executable.as_path(), Path::new("/usr/local/bin/flotilla"));
+        assert_eq!(tool.executable.as_path(), Path::new("/opt/flotilla/crew-bin/flotilla"));
         assert_eq!(tool.assets[0].host_path.as_path(), Path::new("/opt/flotilla/bin"));
         assert_eq!(tool.assets[0].environment_path.as_path(), Path::new("/opt/flotilla/bin"));
         assert_eq!(tool.assets[0].kind, EnvironmentToolAssetKind::Directory);
-        assert_eq!(tool.assets[1].environment_path.as_path(), Path::new("/usr/local/bin/flotilla"));
+        assert_eq!(tool.assets[1].environment_path.as_path(), Path::new("/opt/flotilla/crew-bin/flotilla"));
         assert_eq!(fs::read_to_string(tool.assets[1].host_path.as_path()).expect("read launcher"), FLOTILLA_LAUNCHER);
     }
 
@@ -1251,7 +1289,7 @@ dependency = { path = "../dependency" }
         }
         async fn prepare(&self, _name: &str, _context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
             self.preparations.fetch_add(1, Ordering::Relaxed);
-            Ok(EnvironmentTool::new("fourth", "/usr/local/bin/fourth"))
+            Ok(EnvironmentTool::new("fourth", "/opt/flotilla/crew-bin/fourth"))
         }
     }
     pub(crate) fn with_fourth_tool(mut provisioner: EnvironmentToolProvisioner) -> EnvironmentToolProvisioner {

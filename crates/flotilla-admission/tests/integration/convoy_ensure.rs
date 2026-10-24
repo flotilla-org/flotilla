@@ -326,3 +326,33 @@ async fn two_origins_admit_identical_placements_without_authorship_collision() {
 async fn unavailable_declared_driver_surfaces_named_admission_conditions_without_fallback() {
     ensure_scenarios::unavailable_declared_driver_surfaces_named_admission_conditions_without_fallback(&Controller).await;
 }
+
+// Driverless ensures act only at their ManifestRoot home, despite local copies.
+#[tokio::test]
+async fn declared_driverless_ensure_has_one_acting_home() {
+    ensure_scenarios::driverless_ensure_has_one_acting_home(&Controller, true, &[2, 0, 1, 0, 2, 1]).await;
+}
+
+// Undeclared driverless ensures act only where they were created.
+#[tokio::test]
+async fn undeclared_driverless_ensure_has_one_acting_home() {
+    ensure_scenarios::driverless_ensure_has_one_acting_home(&Controller, false, &[2, 1, 0, 1, 2, 0]).await;
+}
+
+// ADR 0064: arbitrary repeated host passes preserve one acting home, both
+// after declaration and while undeclared, for successful and refused admissions.
+#[hegel::test]
+fn generated_driverless_ensure_has_one_acting_home(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let declared = tc.draw(gs::booleans());
+    // Generate repeated/interleaved host passes; the suffix visits every host
+    // and exercises home steady state even when the random prefix omits it.
+    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
+    let mut passes: Vec<usize> = (0..count).map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(2))).collect();
+    passes.extend([2, 1, 0, 1, 2, 0]);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(ensure_scenarios::driverless_ensure_has_one_acting_home(&Controller, declared, &passes));
+}

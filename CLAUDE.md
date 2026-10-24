@@ -31,7 +31,8 @@ The TUI is *factored, not frozen* — keep it maintained, but extract the surfac
 cargo build                                    # build
 cargo fmt --check          # CI format gate
 cargo clippy --workspace --all-targets --locked -- -D warnings  # CI clippy gate (local gate: -p <affected>, see below)
-cargo test --workspace --locked                # CI test gate (local gate: -p <affected>, see below)
+cargo nextest run --workspace --locked         # CI tests (local gate: -p <affected>, see below)
+cargo test --doc --workspace --locked           # doctests (nextest does not run these)
 python3 ci/build-graph/check.py                 # CI dependency/feature gate
 python3 -m unittest discover -s ci/build-graph -p test_check.py
 cargo fmt                  # apply pinned formatting
@@ -54,7 +55,7 @@ Before pushing, run the local gate:
 - A change that maps to no package (`ci/`, workspace `Cargo.toml`, `rust-toolchain.toml`) runs the check that owns that file: the build-graph or Git check and their tests, or `cargo check --workspace --locked` for a toolchain or workspace-manifest change.
 - A change to a widely used package (protocol, resources, store, core) still runs only its own tests locally; CI covers its dependents.
 
-CI runs the full workspace commands (`cargo clippy --workspace ...`, `cargo test --workspace --locked`); don't repeat that run locally, and fix a red CI result with a follow-up push. A local `-p` run can resolve features differently from the workspace run, so a local pass is not a CI guarantee.
+CI uses nextest plus doctests and `ci/affected/selection.py` for PR test selection: workspace-wide inputs select every package, crate files and the repository files crates read select those crates and their dependents, and other files (docs, specs, other workflows) select none. `python3 ci/affected/selection.py --explain` prints the derived read map. Main pushes, `ci:full`, and stack top layers test the full workspace. CI runs full-workspace Clippy (`cargo clippy --workspace ...`); don't repeat that run locally, and fix a red CI result with a follow-up push. A local `-p` run can resolve features differently from the workspace run, so a local pass is not a CI guarantee.
 
 Desk and crew vessel builds keep Cargo incrementals enabled. CI builds set `CARGO_INCREMENTAL=0`. Each fleet host runs an mtime-based `cargo-sweep --time 3` daily, while `scripts/prune-target.sh` remains a size-cap backstop. See [docs/development.md](docs/development.md) for installation, scope, logs, and thresholds.
 
@@ -161,7 +162,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-charter` | Charter inputs read through a `RevisionedTree` (Git via `Vcs`, or a local directory): `project.yaml` declarations, operational entries and their provenance annotations, charter locks and source status |
 | `flotilla-executor` | Provider-backed command handlers, step plans and resolution, remote step batches and host orchestration ports |
 | `flotilla-observation` | Provider-neutral change-request, issue and forge observation, demand servicing and observed-resource projection |
-| `flotilla-provisioning` | Environment, ImageBuild, Checkout, Clone and Repository reconcilers; orphaned-environment and image-inventory loops |
+| `flotilla-provisioning` | Environment, ImageBuild, Checkout, Clone and Repository reconcilers; orphaned-environment and image-inventory loops; the provisioning kinds' and TerminalSession's engine lifecycle specs (`stored`, #3629) and their write path behind `[primitives]` (`engine`: each old reconciler's patches decided by the engine, with a one-way copy back; TerminalSession's launches each a resource of its own; Vessel's lease placed on its pinned host, #3629 Q6; `engine::import`, old records mapped onto the engine for the pre-roll rehearsal) |
 | `flotilla-admission` | Convoy admission, standing-convoy reconciliation, vessel placement projection, placement planning, project operations and composed-image planning; host orchestration through owned ports |
 | `flotilla-crew` | Crew operations and actions, capability cards, the leaf engine, the decision log, charter notifications, review bundles, and the Vessel, TerminalSession and Convoy reconcilers; host collaborators through owned ports |
 | `flotilla-core` | Refresh and `InProcessDaemon` composition root; implements admission, crew and observation ports |
@@ -171,7 +172,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-daemon-api` | `DaemonHandle` and event publication interfaces, query subscription token, build identity and lifecycle lock file |
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
 | `flotilla-cli` | Shared CLI parsing/output, image-check client, PM connector and foreground terminal attachment; no dashboard renderer |
-| `flotilla-vessel-agent` | Narrow resident vessel startup, environment configuration, logging and shutdown; no store, reconcilers or providers |
+| `flotilla-vessel` (in `flotilla-cli`) | Pushed CLI for domain commands, artifacts and hooks; no daemon or TUI. Drydock owns the resident agent |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap and event loop; selected by the root default-on `tui` feature |
 | `flotilla-daemon` | Runtime supervision, socket server and the one HTTP router (ADR 0065) on every listener, replication composition and routed transport, peer networking, multi-host command routing |
 | `flotilla-address` | ADR 0066 addresses: typed `kind:value` segments, canonical encoding, forge-kind normalisation, lenient input through a Forge lookup, `record_name`, references and the condition/template grammar; no flotilla dependencies |
@@ -182,9 +183,9 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-resources` | Resource kinds, lifecycle authority, typed list/watch shapes and shared pure helpers, including convoy-address selection, terminal delivery/attention evidence, unmet-expectation explanations and landing-evidence freshness; no storage dependencies |
 | `flotilla-state-machines` | ADR 0064 engine: machine declarations whose states are values, with typed edge dispatch and stable codes, gated edges at a single writer, judgements and typed reads through a recording handle, and each machine's stored kind; uses `flotilla-schema`'s records, time, codes and edge events and `flotilla-address`'s conditions, and reaches no other workspace crate; its production dependents are the engine-store and inbox crates and, behind the `[primitives]` switch, `flotilla-core` and `flotilla-daemon` (#3317) |
 | `flotilla-inbox` | Async InboxBackend contract over the Message engine, memory and SQLite implementations; no production callers until #3317 |
-| `flotilla-engine-store` | The engine's storage port: `Log` over `flotilla-schema-sqlite` (creation through `insert`, edges through `apply_edge`, one transaction per write), Message admission in the create transaction, `ReceiptLog` from `Read::about`, and the `[primitives]` switch's kind registry (Message and AgentSession) with its DDL snapshot (#3317) |
+| `flotilla-engine-store` | The engine's storage port: `Log` over `flotilla-schema-sqlite` (creation through `insert`, edges through `apply_edge`, one transaction per write), Message admission in the create transaction, `ReceiptLog` from `Read::about`, the `[primitives]` switch's kind registry (Message and AgentSession) with its DDL snapshot (#3317), `open_home`, a machine's home restored from the store, and `register_crew`, the engine's Vessel and Ensure for the decided store (#3629) |
 | `flotilla-inbox-testkit` | Dev-only shared inbox scenarios, generated claim interleavings and Message race adapter, generic over backend factories |
-| `flotilla-quint-testkit` | Dev-only shared ITF parser, graph walker, trace/stream helpers and Message race mapping for engine and inbox adapters |
+| `flotilla-quint-testkit` | Dev-only shared ITF parser, graph walker, trace/stream helpers, Message race mapping, and the vessel and Ensure conformance adaptors over any log, for engine, store and inbox adapters |
 | `flotilla-messaging` | Resource-backed inbox admission, delivery through the agent-connector `TransportRouter`, retention, conditions and receiver/role routing |
 | `flotilla-store` | Object-safe `Store`, typed resolvers, replica/watch machinery, store queries, generic request snapshots and merged definition-catalog reads, and the generic controller runtime || `flotilla-store-memory` | In-memory storage and observed replicas; no native persistence dependencies |
 | `flotilla-store-sqlite` | SQLite persistence, schema, transactions and decode quarantine |

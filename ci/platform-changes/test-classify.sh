@@ -33,6 +33,9 @@ check "connector tests run Windows" pull_request false "crates/flotilla-cli/src/
 check "transport change runs both" merge_group false "crates/flotilla-transport/src/message.rs" "" "windows=true macos=true quint=false "
 check "caller change runs macOS" pull_request false "crates/flotilla-daemon/src/server/caller.rs" "" "windows=false macos=true quint=false "
 # The compiler pin and its assertion are shared platform-job inputs.
+check "provisioning stored kinds run Quint" pull_request false "crates/flotilla-provisioning/src/stored/clone.rs" "" "windows=false macos=false quint=true "
+check "crew kinds through the store run Quint" pull_request false "crates/flotilla-engine-store/tests/crew_conformance.rs" "" "windows=false macos=false quint=true "
+check "provisioning reconcilers do not run Quint" pull_request false "crates/flotilla-provisioning/src/reconcilers/clone.rs" "" "windows=false macos=false quint=false "
 check "compiler pin runs every job" pull_request false "rust-toolchain.toml" "" "windows=true macos=true quint=true "
 check "selector changes run both" pull_request false "ci/platform-tests/selectors.txt" "" "windows=true macos=true quint=false "
 check "local Rust action changes run both" pull_request false "ci/toolchain/action/action.yml" "" "windows=true macos=true quint=false "
@@ -85,9 +88,6 @@ check "empty diff lines are not Quint content" pull_request false "crates/flotil
 large_diff=$'+#[cfg(unix)]\n'$(printf '+line %s padding padding padding\n' $(seq 1 200000))
 check "early content hit in a large diff runs Windows" pull_request false "crates/flotilla-core/src/x.rs" \
   "$large_diff" "windows=true macos=false quint=false "
-
-check "agent process contract runs both platform jobs" pull_request false "tests/vessel_agent.rs" "" \
-  "windows=true macos=true quint=false "
 
 if ((failures > 0)); then
   echo "$failures platform-changes classification test(s) failed" >&2

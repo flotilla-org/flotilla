@@ -1,6 +1,6 @@
 //! Daemon composition, startup restoration, and resource-controller wiring.
 
-pub(crate) mod agentless_reach;
+pub(crate) mod agentless_vessels;
 mod credentials;
 mod discovery;
 mod docker;
@@ -32,6 +32,10 @@ use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
+use flotilla_provisioning::engine::{
+    checkout::CheckoutBinding, clone::CloneBinding, environment::EnvironmentBinding, image_build::ImageBuildBinding,
+    terminal_session::TerminalSessionBinding, vessel::VesselBinding, Engine,
+};
 use flotilla_provisioning::reconcilers::{
     CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver, RepositoryReconciler,
 };
@@ -154,8 +158,10 @@ impl DaemonRuntime {
         let daemon_config = config.load_daemon_config()?;
         // ADR 0064 switch-over (#3317): `[primitives]` moves Message onto the
         // engine and its store; refused without `[dummy_fleet]`. Absent, nothing changes.
+        let mut provisioning_lifecycles = None;
         if daemon_config.primitives()?.is_some() {
             phase("open_message_primitives", open_message_primitives(&daemon, &config)).await?;
+            provisioning_lifecycles = Some(open_provisioning_lifecycles(&daemon).await?);
         }
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
@@ -171,6 +177,22 @@ impl DaemonRuntime {
         )
         .await;
 
+        // Host binary identity is a composition-root fact. Resolve the real
+        // companion of this running daemon, never a fleet shell launcher whose
+        // bytes would be pushed as if they were the drydock executable.
+        #[cfg(target_os = "linux")]
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(parent) = executable.parent() {
+                let agent = parent.join("drydock-agent");
+                if agent.is_file() {
+                    if let Some(bag) = daemon.local_environment_bag() {
+                        daemon.environment_manager().replace_local_environment_bag(
+                            flotilla_discovery_api::EnvironmentBag::new().with(flotilla_discovery_api::EnvironmentAssertion::binary("drydock-agent", agent)).extend(bag.assertions().iter().filter(|assertion| !matches!(assertion, flotilla_discovery_api::EnvironmentAssertion::BinaryAvailable { name, .. } if name == "drydock-agent")).cloned()),
+                        )?;
+                    }
+                }
+            }
+        }
         let local_registry = phase("probe_local_provider_registry", probe_local_provider_registry(&daemon, &config)).await?;
         let profile = build_local_profile(&daemon, &local_registry).await?;
         let host_direct_environment_name = host_direct_environment_name(&profile.host_id);
@@ -255,16 +277,19 @@ impl DaemonRuntime {
             &registered_image_caches,
         )
         .await?;
-        // #3618: agentless crews reach the daemon through forwarded environment sockets.
-        let agentless_reach = match (&options.environment_sockets, daemon.local_command_runner()) {
-            (Some(sockets), Some(local)) => Some(Arc::new(agentless_reach::AgentlessReach::new(
-                local,
+        // #3792: agentless hosts run each vessel through its own drydock agent,
+        // whose guest forward carries crews to a per-vessel environment socket.
+        let agentless_vessels = options.environment_sockets.as_ref().map(|sockets| {
+            use sha2::Digest;
+            let state = config.state_dir().as_path().to_string_lossy().into_owned();
+            // Short, like Docker's agent root: attach sockets live below it.
+            let local = std::path::Path::new("/tmp").join(&format!("fv-{:x}", sha2::Sha256::digest(state.as_bytes()))[..23]);
+            Arc::new(agentless_vessels::AgentlessVessels::new(
+                Arc::new(agentless_vessels::SshVesselAgents::default()),
                 sockets.clone(),
-                agentless_reach::CliSource::for_controller(),
-                agentless_reach::ForwardTiming::default(),
-            ))),
-            _ => None,
-        };
+                local,
+            ))
+        });
         let mut registered_ssh_profiles = Vec::new();
         for ssh in ssh_profiles {
             if let Err(error) = phase(
@@ -278,7 +303,7 @@ impl DaemonRuntime {
             }
             if let Err(error) = phase(
                 "apply_agentless_ssh_observation",
-                apply_agentless_ssh_observation(&daemon, &options.namespace, &ssh, Some(&credential_store), agentless_reach.as_deref()),
+                apply_agentless_ssh_observation(&daemon, &options.namespace, &ssh, Some(&credential_store), agentless_vessels.as_deref()),
             )
             .await
             {
@@ -359,19 +384,32 @@ impl DaemonRuntime {
             let namespace = options.namespace.clone();
             let ssh = ssh.clone();
             let credential_store = Arc::clone(&credential_store);
-            let agentless_reach = agentless_reach.clone();
+            let agentless_vessels = agentless_vessels.clone();
             tasks.push(spawn_periodic_task(options.heartbeat_interval, PeriodicTaskStart::AfterInterval, move || {
                 let daemon = Arc::clone(&daemon);
                 let namespace = namespace.clone();
                 let ssh = ssh.clone();
                 let credential_store = Arc::clone(&credential_store);
-                let agentless_reach = agentless_reach.clone();
+                let agentless_vessels = agentless_vessels.clone();
                 async move {
                     if let Err(error) =
-                        apply_agentless_ssh_observation(&daemon, &namespace, &ssh, Some(&credential_store), agentless_reach.as_deref())
+                        apply_agentless_ssh_observation(&daemon, &namespace, &ssh, Some(&credential_store), agentless_vessels.as_deref())
                             .await
                     {
                         warn!(host = %ssh.provisioning.host_id, %error, "failed to publish SSH host observation");
+                    }
+                    // #3792: a removed vessel's agent goes with it, including
+                    // one removed while this daemon was down.
+                    if let Some(vessels) = &agentless_vessels {
+                        let retired = async {
+                            let live = agentless_vessels::live_vessels(&daemon.resource_backend(), &namespace, ssh.environment_id.as_str())
+                                .await?;
+                            vessels.retire_absent(&ssh, &live).await
+                        }
+                        .await;
+                        if let Err(error) = retired {
+                            warn!(host = %ssh.provisioning.host_id, %error, "failed to retire removed vessels' agents");
+                        }
                     }
                 }
             }));
@@ -420,12 +458,26 @@ impl DaemonRuntime {
 
         let controller_metrics = Arc::new(flotilla_store::load_metrics::ControllerMetricsRegistry::default());
         let mut controller_state = None;
+        // Behind `[primitives]` the engine's Ensure decides standing-convoy status (#3629 layer 7).
+        let ensure_engine = match provisioning_lifecycles {
+            Some(_) => {
+                let store = daemon.decided_store()?.store();
+                let path = tokio::task::spawn_blocking(move || {
+                    flotilla_core::primitives::ensures::EngineEnsurePath::open(store, Arc::new(SystemClock))
+                })
+                .await
+                .map_err(|error| error.to_string())??;
+                Some(Arc::new(path) as Arc<dyn flotilla_admission::convoy_ensure::EngineEnsures>)
+            }
+            None => None,
+        };
         daemon
             .install_convoy_ensure_reconciler(Arc::new(
                 EnsureReconciler::builder()
                     .teardown(daemon.convoy_teardown())
                     .resource_backend(daemon.resource_backend())
                     .clock(Arc::new(SystemClock))
+                    .maybe_engine(ensure_engine)
                     .build(),
             ))
             .await;
@@ -475,7 +527,7 @@ impl DaemonRuntime {
                     profile.host_direct_environment_name(),
                 )
                 .with_environment_sockets(options.environment_sockets.clone())
-                .with_agentless_reach(agentless_reach.clone())
+                .with_agentless_vessels(agentless_vessels.clone())
                 .with_hook_endpoint(options.hook_endpoint.clone())
                 .with_checkout_removal_concurrency(daemon_config.checkout_removal_concurrency)
                 .with_namespace(options.namespace.clone())
@@ -486,8 +538,12 @@ impl DaemonRuntime {
                 .with_image_inventory(image_inventory)
                 .with_image_build_service(image_build_service)
                 .with_forge_default_branches(forge_default_branches)
-                .with_controller_metrics(Arc::clone(&controller_metrics)),
+                .with_controller_metrics(Arc::clone(&controller_metrics))
+                .with_provisioning_lifecycles(provisioning_lifecycles.clone()),
             );
+            if state.agentless_vessels.is_some() {
+                daemon.set_agentless_vessel_access(Arc::new(agentless_vessels::VesselSessions { state: Arc::downgrade(&state) }));
+            }
             phase(
                 "set_operator_reconciler",
                 daemon.set_operator_reconciler(Arc::new(RuntimeOperatorReconciler {
@@ -832,12 +888,16 @@ fn spawn_controller_loops(
             move |backend: ResourceBackend, namespace_string: String| {
                 let local_host_ref = state.local_host_ref.clone();
                 let additional_host_refs = state.agentless_host_refs();
+                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.environments));
                 let state = Arc::clone(&state);
                 (
                     vec![],
-                    EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, &namespace_string)
-                        .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
-                        .with_additional_host_refs(additional_host_refs),
+                    Engine::<_, EnvironmentBinding>::new(
+                        EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, &namespace_string)
+                            .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
+                            .with_additional_host_refs(additional_host_refs),
+                        lifecycles,
+                    ),
                 )
             }
         }),
@@ -846,9 +906,12 @@ fn spawn_controller_loops(
             move |backend: ResourceBackend, namespace_string: String| {
                 (
                     vec![],
-                    CloneReconciler::new(
-                        Arc::new(RoutingCloneRuntime { state: Arc::clone(&state) }),
-                        backend.using::<Repository>(&namespace_string),
+                    Engine::<_, CloneBinding>::new(
+                        CloneReconciler::new(
+                            Arc::new(RoutingCloneRuntime { state: Arc::clone(&state) }),
+                            backend.using::<Repository>(&namespace_string),
+                        ),
+                        state.provisioning.as_ref().map(|engine| Arc::clone(&engine.clones)),
                     ),
                 )
             }
@@ -861,18 +924,22 @@ fn spawn_controller_loops(
                 // initialized from this value by with_checkout_removal_concurrency.
                 // A namespace-local task cap alone cannot pace all removals.
                 let removal_concurrency = state.checkout_removal_concurrency;
+                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.checkouts));
                 (
                     CheckoutReconciler::<RoutingCheckoutRuntime>::federated_secondary_watches(&backend, &namespace_string),
-                    CheckoutReconciler::new(
-                        Arc::new(RoutingCheckoutRuntime {
-                            state,
-                            change_requests: Some(backend.including_replicas::<ChangeRequest>(&namespace_string)),
-                        }),
-                        backend.clone(),
-                        &namespace_string,
-                    )
-                    .with_background_removal_limit(removal_concurrency)
-                    .with_federated_convoys(&backend, &namespace_string),
+                    Engine::<_, CheckoutBinding>::new(
+                        CheckoutReconciler::new(
+                            Arc::new(RoutingCheckoutRuntime {
+                                state,
+                                change_requests: Some(backend.including_replicas::<ChangeRequest>(&namespace_string)),
+                            }),
+                            backend.clone(),
+                            &namespace_string,
+                        )
+                        .with_background_removal_limit(removal_concurrency)
+                        .with_federated_convoys(&backend, &namespace_string),
+                        lifecycles,
+                    ),
                 )
             }
         }),
@@ -882,12 +949,16 @@ fn spawn_controller_loops(
                 let local_host_ref = state.local_host_ref.clone();
                 let additional_host_refs = state.agentless_host_refs();
                 let state = Arc::clone(&state);
+                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.terminal_sessions));
                 (
                     vec![],
-                    TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
-                        .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
-                        .with_additional_host_refs(additional_host_refs)
-                        .with_federated_convoys(&backend, &namespace_string),
+                    Engine::<_, TerminalSessionBinding>::new(
+                        TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
+                            .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
+                            .with_additional_host_refs(additional_host_refs)
+                            .with_federated_convoys(&backend, &namespace_string),
+                        lifecycles,
+                    ),
                 )
             }
         }),
@@ -900,12 +971,16 @@ fn spawn_controller_loops(
                 let config_dir = config_dir.clone();
                 let local_host_ref = local_host_ref.clone();
                 let additional_host_refs = additional_host_refs.clone();
+                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.vessels));
                 (
                     VesselReconciler::secondary_watches(),
-                    VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
-                        .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None }))
-                        .with_federated_dependencies(&backend, CanonicalHostId::resolved(local_host_ref))
-                        .with_additional_host_refs(additional_host_refs),
+                    Engine::<_, VesselBinding>::new(
+                        VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
+                            .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None }))
+                            .with_federated_dependencies(&backend, CanonicalHostId::resolved(local_host_ref))
+                            .with_additional_host_refs(additional_host_refs),
+                        lifecycles,
+                    ),
                 )
             }
         }),
@@ -915,10 +990,13 @@ fn spawn_controller_loops(
                 let daemon = Arc::clone(&daemon);
                 let mut secondaries = ConvoyReconciler::federated_secondary_watches(&backend, &namespace_string);
                 secondaries.push(daemon.reconciler_wake_watch());
+                secondaries.push(Box::new(flotilla_crew::convoy::EngineConvoyWake { engine: daemon.convoy_engine_path() }));
                 (
                     secondaries,
                     ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(&namespace_string))
+                        .with_engine(daemon.convoy_engine_path())
                         .with_hosts(backend.including_replicas::<Host>(&namespace_string))
+                        .with_convoys(backend.including_replicas::<Convoy>(&namespace_string))
                         .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                         .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))
                         .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
@@ -971,17 +1049,21 @@ fn spawn_controller_loops(
         let service = state.image_build_service.clone();
         let host = state.local_host_ref.clone();
         let probe_wrapper: Arc<str> = flotilla_agent::process::with_preludes("exec \"$@\"").into();
+        let image_build_lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.image_builds));
         controllers.push(controller!(flotilla_resources::ImageBuild, {
             move |backend: ResourceBackend, namespace_string: String| {
                 (
                     vec![],
-                    flotilla_provisioning::reconcilers::ImageBuildReconciler::new(
-                        service.clone(),
-                        Arc::clone(&materials),
-                        &backend,
-                        &namespace_string,
-                        &host,
-                        &probe_wrapper,
+                    Engine::<_, ImageBuildBinding>::new(
+                        flotilla_provisioning::reconcilers::ImageBuildReconciler::new(
+                            service.clone(),
+                            Arc::clone(&materials),
+                            &backend,
+                            &namespace_string,
+                            &host,
+                            &probe_wrapper,
+                        ),
+                        image_build_lifecycles.clone(),
                     ),
                 )
             }
@@ -1046,14 +1128,52 @@ fn spawn_controller_loops(
     controllers
 }
 
+/// The decided store's kinds behind `[primitives]`: Message and AgentSession
+/// (#3317), the provisioning lifecycle kinds and TerminalSession, and the
+/// engine's Vessel and Ensure (#3629), each under its production code.
+pub(crate) fn decided_registry() -> Result<flotilla_schema::KindRegistry, flotilla_schema::RegistryError> {
+    let mut registry = flotilla_engine_store::registry()?;
+    flotilla_provisioning::stored::register(&mut registry)?;
+    flotilla_engine_store::register_crew(&mut registry)?;
+    Ok(registry)
+}
+
+/// The machine diagram of each kind in [`decided_registry`], by kind name.
+pub(crate) fn decided_diagrams() -> Result<std::collections::BTreeMap<String, String>, flotilla_schema::RegistryError> {
+    let mut diagrams = flotilla_engine_store::machine_registry()?.diagrams;
+    diagrams.extend(flotilla_provisioning::stored::diagrams());
+    diagrams.extend(flotilla_engine_store::crew_diagrams());
+    Ok(diagrams)
+}
+
+#[cfg(test)]
+mod decided_kinds_tests {
+    // Behaviour (#3629 layers 2 and 6): behind `[primitives]` the decided store holds the
+    // provisioning lifecycle kinds and the crew kinds beside Message and AgentSession, and every
+    // kind it holds has its machine's diagram for the table views.
+    #[test]
+    fn the_decided_store_holds_the_provisioning_kinds_with_their_diagrams() {
+        let registry = super::decided_registry().expect("no code is held twice");
+        let kinds: Vec<&str> = registry.iter().map(|set| set.kind.as_str()).collect();
+        for kind in ["Message", "AgentSession", "Environment", "ImageBuild", "Clone", "Checkout", "TerminalSession", "Vessel", "Ensure"] {
+            assert!(kinds.contains(&kind), "{kind} in {kinds:?}");
+        }
+        let diagrams = super::decided_diagrams().expect("diagrams");
+        assert_eq!(diagrams.len(), kinds.len());
+        for kind in kinds {
+            assert!(diagrams[kind].contains("stateDiagram"), "{kind}");
+        }
+    }
+}
+
 /// Opens the engine path behind `[primitives]` (#3317): the decided store
-/// with Message and AgentSession, homed at this daemon's node id, and the
+/// with the [`decided_registry`] kinds, homed at this daemon's node id, and the
 /// Message path over it. Installed before peer tasks start, so every peer's
 /// log is followed from the first connection.
 async fn open_message_primitives(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Result<(), String> {
     let path = config.state_dir().as_path().join("decided.sqlite");
     let home = daemon.node_id().as_str().to_owned();
-    let registry = flotilla_engine_store::registry().map_err(|error| format!("decided store registry: {error:?}"))?;
+    let registry = decided_registry().map_err(|error| format!("decided store registry: {error:?}"))?;
     let service = Arc::new(
         flotilla_schema_sqlite::stream::Service::open(&path, &home, registry)
             .map_err(|error| format!("open decided store {}: {error}", path.display()))?,
@@ -1067,6 +1187,122 @@ async fn open_message_primitives(daemon: &Arc<InProcessDaemon>, config: &ConfigS
     .await
     .map_err(|error| error.to_string())??;
     daemon.install_message_primitives(Arc::new(primitives))
+}
+
+/// The provisioning kinds' engine homes over the decided store (#3629 layer 3), each restored
+/// with the resources this home holds.
+async fn open_provisioning_lifecycles(
+    daemon: &Arc<InProcessDaemon>,
+) -> Result<flotilla_provisioning::engine::ProvisioningLifecycles, String> {
+    use flotilla_engine_store::{open_home, StoreLog};
+    use flotilla_provisioning::engine::{reads::StoreReads, vessel::PlacementLifecycles, LifecycleHome, ProvisioningLifecycles};
+    let store = daemon.decided_store()?.store();
+    let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
+    daemon.install_lifecycle_reads(Arc::new(EngineLifecycleReads { reads: StoreReads::new(Arc::clone(&store)), home }))?;
+    daemon.install_vessel_seats(Arc::new(EngineVesselSeats {
+        reads: StoreReads::new(Arc::clone(&store)),
+        backend: daemon.resource_backend(),
+    }))?;
+    tokio::task::spawn_blocking(move || {
+        let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
+        let log = || StoreLog::new(Arc::clone(&store));
+        Ok(ProvisioningLifecycles {
+            environments: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            image_builds: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            clones: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            checkouts: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            terminal_sessions: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            vessels: Arc::new(PlacementLifecycles::new(&home, open_home(log())?)?),
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// The views' provisioning readings over the decided store (#3629 layer 4): one keyed read each,
+/// at the named home or this one.
+struct EngineLifecycleReads {
+    reads: flotilla_provisioning::engine::reads::StoreReads,
+    home: String,
+}
+
+impl flotilla_projections::ports::LifecycleReads for EngineLifecycleReads {
+    fn reading(
+        &self,
+        kind: flotilla_projections::ports::ProvisioningKind,
+        name: &str,
+        origin: Option<&str>,
+    ) -> Option<flotilla_protocol::LifecycleReading> {
+        use flotilla_projections::ports::ProvisioningKind;
+        use flotilla_provisioning::engine::reads::ProvisioningReads;
+        let home = origin.unwrap_or(&self.home);
+        let judgement = match kind {
+            ProvisioningKind::Environment => self.reads.environment(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::ImageBuild => self.reads.image_build(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::Clone => self.reads.repository_clone(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::Checkout => self.reads.checkout(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::TerminalSession => self.reads.terminal_session(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::Vessel => self.reads.vessel(name, home).map(|view| view.map(|view| view.judgement)),
+        };
+        match judgement {
+            Ok(judgement) => judgement.map(|judgement| judgement.reading()),
+            Err(error) => {
+                tracing::warn!(?kind, resource = name, %error, "engine reading failed; the view reads the old status");
+                None
+            }
+        }
+    }
+}
+
+/// Which seats a vessel serves (#3629 layer 8): its sessions by their vessel label, with each role
+/// the engine holds a launch for (`terminal_session.by_holder`, the vessel as holder) served by
+/// that launch's old session record instead. During the switch a vessel can hold launches the
+/// engine decided beside sessions only the old store knows (from before the switch, or homed
+/// elsewhere), so the labels are the base and the engine overlays them; an engine launch whose
+/// record is gone leaves the labels' answer.
+struct EngineVesselSeats {
+    reads: flotilla_provisioning::engine::reads::StoreReads,
+    backend: ResourceBackend,
+}
+
+#[async_trait::async_trait]
+impl flotilla_resources::vessel_seats::VesselSeats for EngineVesselSeats {
+    async fn seats(
+        &self,
+        namespace: &str,
+        vessel_ref: &str,
+    ) -> Result<std::collections::BTreeMap<String, flotilla_resources::ReadResourceObject<flotilla_resources::TerminalSession>>, String>
+    {
+        use flotilla_provisioning::{
+            engine::{launched, reads::ProvisioningReads},
+            stored::Holder,
+        };
+        let sessions = self.backend.including_replicas::<flotilla_resources::TerminalSession>(namespace);
+        let labelled = sessions
+            .list_matching_labels(&std::collections::BTreeMap::from([(
+                flotilla_resources::VESSEL_REF_LABEL.to_string(),
+                vessel_ref.to_owned(),
+            )]))
+            .await
+            .map_err(|error| error.to_string())?
+            .items;
+        let views = self.reads.held_sessions(&Holder::vessel(vessel_ref)).map_err(|error| error.to_string())?;
+        let mut names: Vec<String> = views.iter().map(|view| launched(&view.name).to_owned()).collect();
+        names.sort();
+        names.dedup();
+        let mut seats: std::collections::BTreeMap<_, _> =
+            labelled.into_iter().map(|session| (session.object.spec.role.clone(), session)).collect();
+        for name in names {
+            match sessions.get(&name).await {
+                Ok(session) => {
+                    seats.insert(session.object.spec.role.clone(), session);
+                }
+                Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(seats)
+    }
 }
 
 /// Daemon-owned image build state: the owned builder's Buildx state, build
@@ -1093,3 +1329,84 @@ const OWNED_BUILDER_NAME: &str = "flotilla-images";
 mod test_git_repo;
 #[cfg(test)]
 mod tests;
+
+/// Optional provider-only Drydock configuration. Supervision remains at the
+/// composition root; the adapter sees only ProviderApi and host readiness.
+#[cfg(unix)]
+async fn compose_drydock(
+    config: &ConfigStore,
+    registry: &mut ProviderRegistry,
+    env: &dyn flotilla_provider_runtime::EnvVars,
+) -> Result<(), String> {
+    use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
+    use flotilla_environment::environment::{drydock::DrydockEnvironmentProvider, EnvironmentProvider};
+    let path = config.base_path().as_path().join("drydock.toml");
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read drydock provider configuration: {error}")),
+    };
+    let (provider_text, lab_reach) = flotilla_config::drydock::split_configuration(&text)?;
+    let configuration = drydock::config::Config::parse(&provider_text)?;
+    if configuration.provider.is_empty() {
+        return Ok(());
+    }
+    let mut providers = Vec::new();
+    let mut credentials = std::collections::BTreeMap::new();
+    let mut modules = std::collections::BTreeMap::new();
+    for (name, provider) in &configuration.provider {
+        modules.insert(
+            provider.module.clone(),
+            drydock_protocol::ModuleConfiguration { name: provider.module.clone(), entrypoint: provider.module.clone() },
+        );
+        credentials.insert(name.clone(), provider.credential.reference(env)?);
+        providers.push(drydock_protocol::ProviderConfiguration {
+            name: name.clone(),
+            module: provider.module.clone(),
+            settings: provider.settings.clone(),
+            credential: drydock_protocol::CredentialMode::Direct { credential_reference: name.clone() },
+        });
+    }
+    let binary = drydock::local::companion("drydock-host", "DRYDOCK_HOST_BIN").unwrap_or_else(|_| PathBuf::from("drydock-host"));
+    let supervisor = drydock::Supervisor::new(
+        config.state_dir().as_path().join("drydock-hosts"),
+        Arc::new(drydock::credentials::BuiltinCredentials::default()),
+    );
+    let host = Arc::new(
+        supervisor
+            .start(drydock::HostSpec {
+                name: "rust".into(),
+                connection: drydock::HostConnection::Managed {
+                    command: vec![binary.to_string_lossy().into_owned()],
+                    runtime: None,
+                    proxy_environment: Default::default(),
+                },
+                configuration: drydock_protocol::HostConfiguration { modules: modules.into_values().collect(), providers },
+                credentials,
+            })
+            .await
+            .map_err(|error| error.to_string())?,
+    );
+    for (name, provider) in configuration.provider {
+        if registry.environment_providers.contains_key(&name) {
+            return Err(format!("duplicate environment provider instance {name}"));
+        }
+        let adapter: Arc<dyn EnvironmentProvider> = Arc::new(
+            DrydockEnvironmentProvider::new(
+                Arc::new(host.client.clone()),
+                name.clone(),
+                provider.module,
+                config.state_dir().as_path().join("drydock-keys"),
+            )
+            .with_host(host.clone())
+            .with_lab_reach(lab_reach.get(&name).map(|reach| (reach.hostname.clone(), reach.port))),
+        );
+        adapter.detect_readiness().await;
+        registry.environment_providers.insert(
+            name.clone(),
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, &name),
+            adapter,
+        );
+    }
+    Ok(())
+}

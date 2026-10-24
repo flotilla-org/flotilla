@@ -82,6 +82,9 @@ pub fn legacy_delivery_gate_needed(session: &ResourceObject<TerminalSession>, no
     if status.phase != crate::TerminalSessionPhase::Running {
         return false;
     }
+    if condition.is_controller_fence_unverifiable() {
+        return true;
+    }
     let held = condition.reason == crate::TERMINAL_DELIVERY_EXPIRED_REASON
         || (condition.reason == crate::TERMINAL_DELIVERY_UNCONFIRMED_REASON && delivery_hold_overdue(condition.observed_at, now))
         || (condition.reason == crate::TERMINAL_DELIVERY_NOT_SUBMITTED_REASON && delivery_retry_exhausted(condition.consecutive_failures));

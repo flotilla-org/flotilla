@@ -33,6 +33,11 @@ impl FieldOwnedResource for PlacementPolicy {
         FieldOwnership::new("spec.priority", WriterRole::Operator),
         FieldOwnership::new("spec.provider_requirements", WriterRole::Operator),
         FieldOwnership::new("spec.host_direct", WriterRole::ReconcileLoop),
+        FieldOwnership::new("spec.cloud_sandbox_per_vessel", WriterRole::Operator),
+        FieldOwnership::new("spec.cloud_sandbox_per_vessel.image", WriterRole::Operator),
+        FieldOwnership::new("spec.cloud_sandbox_per_vessel.size", WriterRole::Operator),
+        FieldOwnership::new("spec.cloud_sandbox_per_vessel.checkout", WriterRole::Operator),
+        FieldOwnership::new("spec.cloud_sandbox_per_vessel.env", WriterRole::Operator),
         FieldOwnership::new("spec.docker_per_vessel", WriterRole::ReconcileLoop),
         FieldOwnership::new("spec.docker_per_vessel.host_ref", WriterRole::ReconcileLoop),
         FieldOwnership::new("spec.docker_per_vessel.image", WriterRole::Operator),
@@ -100,6 +105,23 @@ pub struct PlacementPolicySpec {
     pub host_direct: Option<HostDirectPlacementPolicySpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker_per_vessel: Option<DockerPerVesselPlacementPolicySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_sandbox_per_vessel: Option<CloudSandboxPerVesselPlacementPolicySpec>,
+}
+
+/// Checkout stays inside this input until the generated-table move (#3108).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSandboxPerVesselPlacementPolicySpec {
+    pub image: String,
+    pub size: crate::CloudSandboxSize,
+    pub checkout: CloudSandboxCheckout,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudSandboxCheckout {
+    CloneInVessel,
 }
 
 fn is_zero(value: &i32) -> bool {

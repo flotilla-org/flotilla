@@ -1300,3 +1300,128 @@ async fn operator_brief_survives_a_racing_nudge_until_delivery() {
     assert_eq!(records.len(), 4);
     assert!(records.iter().any(|message| message.spec.body.contains("New guidance")));
 }
+
+// Behaviour (#3587 layer 7): a send's awaiting-reply record is a stall when it supervises a
+// stalled crew, else the kind its expectation names; a send expecting nothing records nothing.
+#[test]
+fn awaiting_records_take_the_stall_or_the_expectations_kind() {
+    use flotilla_resources::MessageExpectation;
+    let outcome = MessageExpectation::Outcome {
+        condition: flotilla_protocol::Leaf {
+            address: flotilla_protocol::LeafAddress::Work { convoy: "c".into(), work: "work".into() },
+            field_path: ".crew.coder.phase".into(),
+            operator: flotilla_protocol::LeafOperator::Equal,
+            literal: "Done".into(),
+        },
+    };
+    assert_eq!(super::super::awaiting_kind(&MessageExpectation::None, Some("p/c/work/coder")), None);
+    assert_eq!(super::super::awaiting_kind(&MessageExpectation::Reply, Some("p/c/work/coder")), Some("stall"));
+    assert_eq!(super::super::awaiting_kind(&MessageExpectation::Reply, None), Some("reply"));
+    assert_eq!(super::super::awaiting_kind(&outcome, None), Some("outcome"));
+}
+
+// Resume names the environment's recorded loss even before the vessel status
+// catches up, including a session previously misclassified as failed.
+#[hegel::test]
+fn lost_environment_resume_reports_cause(tc: hegel::TestCase) {
+    use flotilla_resources::{
+        Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec, VesselPhase, VesselSpec, VesselStatus,
+    };
+    let failed_session = tc.draw(hegel::generators::booleans());
+    let provisioning_failed = tc.draw(hegel::generators::booleans());
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
+        let environments = backend.using::<Environment>("flotilla");
+        let env = environments
+            .create(
+                &InputMeta::builder().name("resume-env".into()).build(),
+                &EnvironmentSpec {
+                    cloud_sandbox: None,
+                    provider_address: None,
+                    docker: None,
+                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
+                },
+            )
+            .await
+            .expect("environment");
+        environments
+            .update_status(
+                "resume-env",
+                &env.metadata.resource_version,
+                &EnvironmentStatus {
+                    phase: if provisioning_failed { EnvironmentPhase::Failed } else { EnvironmentPhase::Lost },
+                    message: Some("cgroup_oom".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("lost environment");
+        let vessels = backend.using::<Vessel>("flotilla");
+        let vessel = vessels
+            .create(
+                &InputMeta::builder().name("crew-work".into()).build(),
+                &VesselSpec {
+                    convoy_ref: "crew".into(),
+                    vessel_name: "work".into(),
+                    placement_policy_ref: "policy".into(),
+                    adopted_checkout_refs: Default::default(),
+                },
+            )
+            .await
+            .expect("vessel");
+        vessels
+            .update_status(
+                "crew-work",
+                &vessel.metadata.resource_version,
+                &VesselStatus { phase: VesselPhase::Ready, environment_ref: Some("resume-env".into()), ..Default::default() },
+            )
+            .await
+            .expect("stale vessel");
+        let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+        let session = sessions.get("session").await.expect("session");
+        sessions
+            .update_status(
+                "session",
+                &session.metadata.resource_version,
+                &TerminalSessionStatus {
+                    phase: if failed_session { TerminalSessionPhase::Failed } else { TerminalSessionPhase::Lost },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session status");
+        let error = crew.resume("flotilla", "crew", "resume", Some("work"), Some("coder")).await.expect_err("lost backing");
+        assert!(error.contains("cgroup_oom"), "{error}");
+        if provisioning_failed {
+            assert!(error.contains("failed provisioning"), "{error}");
+        } else {
+            assert!(error.contains("lost, recoverable") && error.contains("#2872"), "{error}");
+            assert!(!error.contains("failed provisioning"), "{error}");
+        }
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+// A terminal failure with no evidence of provisioning failure must not be
+// described as failed provisioning (glue: refusal text from session status).
+#[tokio::test]
+async fn failed_session_resume_does_not_invent_provisioning_failure() {
+    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Interrupted).await;
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let session = sessions.get("session").await.expect("session");
+    sessions
+        .update_status(
+            "session",
+            &session.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Failed,
+                message: Some("agent launch rejected".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("failed session");
+    let error = crew.resume("flotilla", "crew", "resume", Some("work"), Some("coder")).await.expect_err("failed session");
+    assert!(error.contains("agent launch rejected"), "{error}");
+    assert!(!error.contains("failed provisioning"), "{error}");
+}
