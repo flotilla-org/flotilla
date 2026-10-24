@@ -245,13 +245,18 @@ where
                 placements.apply(&id, edge, &world, at)?;
             }
             if let Some(cause) = failed {
-                let resource = placements.get(&id).ok_or(EngineError::Unknown)?;
+                let resource = placements
+                    .get(&id)
+                    .ok_or_else(|| EngineError::Failed(format!("vessel `{name}` is missing after recording its attempt")))?;
                 // Only exhaustion admits GiveUp. A retryable attempt with budget left stays Requested.
                 if matches!(judge::<VesselKind>(resource.state(), Ending::Unknown), Judgement::Exhausted { .. }) {
                     placements.apply(&id, GiveUp { cause: cause.clone() }.into(), &world, at)?;
                 }
             }
-            placements.get(&id).cloned().ok_or(EngineError::Unknown)
+            placements
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| EngineError::Failed(format!("vessel `{name}` is missing after applying its lifecycle step")))
         })
     }
 }
