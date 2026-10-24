@@ -48,6 +48,8 @@ Convoys assumed that their vessels were co-located and fixed. Many writers could
 
   ADR 0064 seats: fan-out adds a seat under an existing one (`AddSeat`, names never reused) and `Resupervise` is the only edge that changes `supervised_by`; admission refuses unknown owners, unknown parents and cycles. Seat retirement is not yet modelled.
 
+  a retired seat's name is reserved for the rest of its generation; Rollover clears retired seats, so a later generation may reuse the name, and the live record never accumulates seat history.
+
   ADR 0064 Convoy records: a change-request observation finds its submission through a full index on the submission address (one lookup per event); there is no partial index on open convoys.
 
   ADR 0064 promise labels: a promise's label is stored per convoy and is the name crews and views use; kinds stay declarations.

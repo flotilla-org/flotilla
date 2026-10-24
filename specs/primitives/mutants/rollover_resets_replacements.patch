@@ -1,0 +1,11 @@
+--- a/machines/convoy.qnt
++++ b/machines/convoy.qnt
+@@ -143,7 +143,7 @@
+     val live = w.seats.keys().exclude(w.retiredSeats)
+     { ...w,
+       spec: { ...w.spec, duties: holdingDuties(w).mapBy(d => w.spec.duties.get(d)) },
+-      seats: live.mapBy(s => { ...w.seats.get(s), parent: match w.seats.get(s).parent {
++      seats: live.mapBy(s => { ...w.seats.get(s), replacements: 0, parent: match w.seats.get(s).parent {
+         | Root => Root
+         | Under(q) => if (live.contains(q)) Under(q) else Root
+       } }),
