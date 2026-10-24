@@ -201,3 +201,21 @@ fn previous_database_and_create_event_decode_with_growth_defaults() {
     let loaded = read.load::<Resource<Convoy>>(id).unwrap().unwrap();
     assert_eq!(loaded.value.spec(), &spec);
 }
+
+#[test]
+fn failed_old_shape_upgrade_rolls_back_eligible_columns() {
+    // Keep a second connection alive so the database survives Store::open's
+    // failed, owning connection and can be inspected after its transaction drops.
+    let uri = "file:seat_growth_failed_upgrade?mode=memory&cache=shared";
+    let conn = rusqlite::Connection::open(uri).unwrap();
+    let store = Store::open(conn, "home", convoy_registry().unwrap()).unwrap();
+    let observer = store.into_connection();
+    observer.execute_batch("DROP VIEW convoy_view; DROP VIEW convoy_seats_view; ALTER TABLE convoy DROP COLUMN promise_floor; ALTER TABLE convoy DROP COLUMN priority;").unwrap();
+    let definition =
+        || observer.query_row("SELECT sql FROM sqlite_master WHERE name = 'convoy'", [], |row| row.get::<_, String>(0)).unwrap();
+    let before = definition();
+    assert!(!before.contains("promise_floor"));
+    let result = Store::open(rusqlite::Connection::open(uri).unwrap(), "home", convoy_registry().unwrap());
+    assert!(matches!(result, Err(flotilla_schema_sqlite::StoreError::KindTableDrift { table, .. }) if table == "convoy"));
+    assert_eq!(definition(), before, "the attempted ADD COLUMN must roll back on unrelated drift");
+}
