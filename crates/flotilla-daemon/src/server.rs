@@ -54,7 +54,7 @@ use self::{
 };
 use crate::{
     peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, SshTransport, SshTransportPaths},
-    startup::phase,
+    startup::{phase, result_phase, retry_phase},
     DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH,
 };
 
@@ -486,9 +486,24 @@ impl DaemonServer {
         socket_discovery_path: PathBuf,
         idle_timeout: Duration,
     ) -> Result<Self, String> {
+        result_phase(
+            "initialize_server",
+            Self::initialize_with_socket_discovery_path(repo_paths, config, discovery, socket_path, socket_discovery_path, idle_timeout),
+        )
+        .await
+    }
+
+    async fn initialize_with_socket_discovery_path(
+        repo_paths: Vec<PathBuf>,
+        config: Arc<ConfigStore>,
+        discovery: DiscoveryRuntime,
+        socket_path: PathBuf,
+        socket_discovery_path: PathBuf,
+        idle_timeout: Duration,
+    ) -> Result<Self, String> {
         let daemon_config = config.load_daemon_config()?;
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
-        let (resource_backend, store_metrics) = phase("open_resource_backend", build_embedded_resource_backend(&config)).await?;
+        let (resource_backend, store_metrics) = retry_phase("open_resource_backend", || build_embedded_resource_backend(&config)).await?;
         let load_metrics = Arc::new(http::metrics::LoadMetrics::new(store_metrics));
         let daemon = phase(
             "initialize_in_process_daemon",

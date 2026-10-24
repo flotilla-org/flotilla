@@ -81,7 +81,12 @@ use self::tasks::{
 };
 use self::terminal::TerminalControllerRuntime;
 use crate::server::environment_sockets::EnvironmentSocketService;
-use crate::{blob_store::TieredBlobStore, resource_manifest::manifest_root_name, startup::phase, supervisor::ControllerSupervision};
+use crate::{
+    blob_store::TieredBlobStore,
+    resource_manifest::manifest_root_name,
+    startup::{phase, result_phase, retry_phase},
+    supervisor::ControllerSupervision,
+};
 pub(crate) use tasks::manifest_reconciler_enabled;
 pub use tasks::spawn_pending_supervisor_turn_task;
 #[cfg(test)]
@@ -141,10 +146,19 @@ impl DaemonRuntime {
         config: Arc<ConfigStore>,
         daemon_socket_path: Option<PathBuf>,
     ) -> Result<Self, String> {
-        phase("initialize_runtime", Self::start_with_options(daemon, config, daemon_socket_path, RuntimeOptions::default())).await
+        Self::start_with_options(daemon, config, daemon_socket_path, RuntimeOptions::default()).await
     }
 
     pub async fn start_with_options(
+        daemon: Arc<InProcessDaemon>,
+        config: Arc<ConfigStore>,
+        daemon_socket_path: Option<PathBuf>,
+        options: RuntimeOptions,
+    ) -> Result<Self, String> {
+        result_phase("initialize_runtime", Self::initialize_with_options(daemon, config, daemon_socket_path, options)).await
+    }
+
+    async fn initialize_with_options(
         daemon: Arc<InProcessDaemon>,
         config: Arc<ConfigStore>,
         daemon_socket_path: Option<PathBuf>,
@@ -160,7 +174,7 @@ impl DaemonRuntime {
         // engine and its store; refused without `[dummy_fleet]`. Absent, nothing changes.
         let mut provisioning_lifecycles = None;
         if daemon_config.primitives()?.is_some() {
-            phase("open_message_primitives", open_message_primitives(&daemon, &config)).await?;
+            result_phase("open_message_primitives", open_message_primitives(&daemon, &config)).await?;
             provisioning_lifecycles = Some(open_provisioning_lifecycles(&daemon).await?);
         }
         let manifests = daemon_config.manifests;
@@ -193,8 +207,8 @@ impl DaemonRuntime {
                 }
             }
         }
-        let local_registry = phase("probe_local_provider_registry", probe_local_provider_registry(&daemon, &config)).await?;
-        let profile = build_local_profile(&daemon, &local_registry).await?;
+        let local_registry = retry_phase("probe_local_provider_registry", || probe_local_provider_registry(&daemon, &config)).await?;
+        let profile = retry_phase("build_local_profile", || build_local_profile(&daemon, &local_registry)).await?;
         let host_direct_environment_name = host_direct_environment_name(&profile.host_id);
         let mut archive_roots = vec![CheckoutArchiveRoot {
             env_ref: host_direct_environment_name.clone(),
@@ -228,10 +242,11 @@ impl DaemonRuntime {
         }
         let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::clone(&daemon.discovery_runtime().env)));
         let health = DaemonHealthIdentity {
-            generation: phase("read_observed_generation", daemon.observed_resource_backend().using::<Checkout>(&options.namespace).list())
-                .await
-                .map_err(|error| error.to_string())?
-                .generation,
+            generation: retry_phase("read_observed_generation", || async {
+                daemon.observed_resource_backend().using::<Checkout>(&options.namespace).list().await
+            })
+            .await?
+            .generation,
             version: env!("CARGO_PKG_VERSION").to_string(),
             started_at: Utc::now(),
         };
@@ -245,19 +260,17 @@ impl DaemonRuntime {
             .with_blob_store(Arc::clone(&blob_store));
         runtime_health.host_observations.record_provider_advertisements(profile.environment_providers.clone()).await;
 
-        phase(
-            "quarantine_undecodable_stored_objects",
-            flotilla_store::quarantine_undecodable_stored_objects(&daemon.resource_backend(), &options.namespace),
-        )
+        retry_phase("quarantine_undecodable_stored_objects", || async {
+            flotilla_store::quarantine_undecodable_stored_objects(&daemon.resource_backend(), &options.namespace).await
+        })
         .await
         .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
-        phase("register_startup_resources", register_startup_resources(&daemon, &options.namespace, &profile)).await?;
+        retry_phase("register_startup_resources", || register_startup_resources(&daemon, &options.namespace, &profile)).await?;
         // Stdlib image layers are this release's data (ADR 0062). A failure
         // keeps the previous definitions and must not stop the daemon.
-        match phase(
-            "apply_stdlib_image_layers",
-            crate::stdlib_image_layers::apply_release_stdlib(&daemon.resource_backend(), &options.namespace),
-        )
+        match retry_phase("apply_stdlib_image_layers", || async {
+            crate::stdlib_image_layers::apply_release_stdlib(&daemon.resource_backend(), &options.namespace).await
+        })
         .await
         {
             Ok(application) if application.applied.is_empty() && application.deleted.is_empty() => {}
@@ -270,12 +283,15 @@ impl DaemonRuntime {
             .filter(|(_, provider)| provider.local_image_cache().is_some())
             .filter_map(|(_, provider)| local_registry.environment_providers.instance_name(provider).map(String::from))
             .collect::<BTreeSet<_>>();
-        flotilla_provisioning::image_inventory::prune_unregistered_caches(
-            &daemon.resource_backend(),
-            &options.namespace,
-            &profile.host_id,
-            &registered_image_caches,
-        )
+        retry_phase("prune_unregistered_image_caches", || async {
+            flotilla_provisioning::image_inventory::prune_unregistered_caches(
+                &daemon.resource_backend(),
+                &options.namespace,
+                &profile.host_id,
+                &registered_image_caches,
+            )
+            .await
+        })
         .await?;
         // #3792: agentless hosts run each vessel through its own drydock agent,
         // whose guest forward carries crews to a per-vessel environment socket.
@@ -292,19 +308,17 @@ impl DaemonRuntime {
         });
         let mut registered_ssh_profiles = Vec::new();
         for ssh in ssh_profiles {
-            if let Err(error) = phase(
-                "register_agentless_ssh_resources",
-                register_agentless_ssh_resources(&daemon.resource_backend(), &options.namespace, &profile.host_id, &ssh),
-            )
+            if let Err(error) = retry_phase("register_agentless_ssh_resources", || async {
+                register_agentless_ssh_resources(&daemon.resource_backend(), &options.namespace, &profile.host_id, &ssh).await
+            })
             .await
             {
                 warn!(host = %ssh.provisioning.host_id, %error, "failed to register agentless SSH host; continuing startup");
                 continue;
             }
-            if let Err(error) = phase(
-                "apply_agentless_ssh_observation",
-                apply_agentless_ssh_observation(&daemon, &options.namespace, &ssh, Some(&credential_store), agentless_vessels.as_deref()),
-            )
+            if let Err(error) = retry_phase("apply_agentless_ssh_observation", || {
+                apply_agentless_ssh_observation(&daemon, &options.namespace, &ssh, Some(&credential_store), agentless_vessels.as_deref())
+            })
             .await
             {
                 warn!(host = %ssh.provisioning.host_id, %error, "failed to observe agentless SSH host; continuing startup");
@@ -312,10 +326,9 @@ impl DaemonRuntime {
             registered_ssh_profiles.push(ssh);
         }
         let ssh_profiles = registered_ssh_profiles;
-        phase(
-            "publish_local_host_heartbeat",
-            apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health),
-        )
+        retry_phase("publish_local_host_heartbeat", || {
+            apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health)
+        })
         .await?;
 
         let mut tasks = vec![
@@ -419,12 +432,12 @@ impl DaemonRuntime {
             .filter(|declared| manifest_reconciler_enabled(&declared.reconciler_root, &profile.host_id))
             .map(|declared| manifest_root_name(&declared.reconciler_root, &declared.dir, &declared.source));
         let roots = daemon.resource_backend().using::<ManifestRoot>(&options.namespace);
-        for root in phase("list_manifest_roots", roots.list()).await.map_err(|error| error.to_string())?.items {
+        for root in retry_phase("list_manifest_roots", || roots.list()).await?.items {
             if root.metadata.name.starts_with("manifest-")
                 && root.spec.host == profile.host_id
                 && desired_manifest_root.as_deref() != Some(root.metadata.name.as_str())
             {
-                phase("delete_stale_manifest_root", roots.delete(&root.metadata.name)).await.map_err(|error| error.to_string())?;
+                retry_phase("delete_stale_manifest_root", || roots.delete(&root.metadata.name)).await?;
             }
         }
         let charter_daemon = Arc::clone(&daemon);
@@ -1179,13 +1192,16 @@ async fn open_message_primitives(daemon: &Arc<InProcessDaemon>, config: &ConfigS
             .map_err(|error| format!("open decided store {}: {error}", path.display()))?,
     );
     daemon.install_decided_store(Arc::clone(&service))?;
-    let primitives = tokio::task::spawn_blocking({
+    let primitives = retry_phase("restore_message_primitives", || async {
         let backend = daemon.resource_backend();
         let clock = daemon.clock_for_scenarios();
-        move || flotilla_core::primitives::MessagePrimitives::open(&home, service, backend, clock)
+        let home = home.clone();
+        let service = Arc::clone(&service);
+        tokio::task::spawn_blocking(move || flotilla_core::primitives::MessagePrimitives::open(&home, service, backend, clock))
+            .await
+            .map_err(|error| error.to_string())?
     })
-    .await
-    .map_err(|error| error.to_string())??;
+    .await?;
     daemon.install_message_primitives(Arc::new(primitives))
 }
 
