@@ -324,11 +324,15 @@ impl Promise {
 
 impl ConvoySpec {
     /// A promise's row, by its id.
+    /// Positions belong to this snapshot; never cache one across edges or rollover.
+    /// Consumers retain PromiseId and resolve it against the current spec.
     pub fn promise(&self, id: PromiseId) -> Option<(Position, &Promise)> {
         self.promises.iter().find(|row| row.record.id == id).map(|row| (row.position, &row.record))
     }
 
     /// A seat's row, by its name.
+    /// Positions belong to this snapshot; rollover compacts them. Consumers
+    /// retain SeatName and resolve it again instead of caching a Position.
     pub fn seat(&self, name: &SeatName) -> Option<(Position, &Seat)> {
         self.seats.iter().find(|row| row.record.role == name.role && row.record.seat == name.seat).map(|row| (row.position, &row.record))
     }
