@@ -27,7 +27,6 @@ use std::{
 
 use flotilla_engine_store::StoreLog;
 use flotilla_provisioning::stored::{
-    self,
     checkout::{CheckoutKind, CheckoutRequest, Source},
     clone::{CloneKind, CloneRequest},
     environment::{EnvironmentKind, EnvironmentRequest, Recipe},
@@ -238,8 +237,10 @@ where
     type Subject = Stored<K>;
 
     fn create(_: &Value) -> Stored<K> {
+        // Only the kind under test: every probe replays its path into a fresh store, and the
+        // other provisioning kinds' tables and views would only lengthen each store's creation.
         let mut registry = KindRegistry::new();
-        stored::register(&mut registry).expect("registry");
+        registry.register::<Resource<Machine<K>>>().expect("registry");
         let connection = rusqlite::Connection::open_in_memory().expect("memory");
         let store = Arc::new(Mutex::new(Store::open(connection, HOME, registry).expect("store")));
         let mut home = Home::<Machine<K>, StoreLog>::with_log(HOME, StoreLog::new(store.clone())).expect("valid declaration");

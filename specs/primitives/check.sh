@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # Fast safety, full-graph conformance and generated ITF replay against
-# flotilla-state-machines, plus Message race replay through InboxBackend.
-# Generated files stay beneath build/.
+# flotilla-state-machines, then the store-backed suites (store-conformance.sh).
+# Generated files stay beneath build/, or in $QUINT_RUN_DIR when it is set.
+# Usage: check.sh [--skip-store]; --skip-store leaves the store-backed suites to
+# store-conformance.sh, which CI runs as its own step (#3778).
 set -euo pipefail
+store=yes
+case "${1:-}" in
+  --skip-store) store=no ;;
+  "") ;;
+  *) echo "usage: check.sh [--skip-store]" >&2; exit 2 ;;
+esac
 # Expanded typed compositions exceed the JVM's default parser stack.
 export JVM_ARGS="${JVM_ARGS:--Xmx3g -Xss16m}"
 cd "$(dirname "$0")"
@@ -13,7 +21,16 @@ jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
 [ -r "$jar" ] || { echo "missing readable Apalache jar: $jar; install Apalache or set APALACHE_JAR" >&2; exit 2; }
 mkdir -p build
 quint test tests/stream_properties.qnt --backend typescript
-run=$(mktemp -d "$PWD/build/fast.XXXXXX")
+if [ -n "${QUINT_RUN_DIR:-}" ]; then
+  # A fresh directory only: stale graphs or traces would stand in for a missing export.
+  if [ -e "$QUINT_RUN_DIR" ] && [ -n "$(ls -A "$QUINT_RUN_DIR")" ]; then
+    echo "QUINT_RUN_DIR $QUINT_RUN_DIR is not empty; name a new or empty directory" >&2; exit 2
+  fi
+  mkdir -p "$QUINT_RUN_DIR"
+  run=$(cd "$QUINT_RUN_DIR" && pwd)
+else
+  run=$(mktemp -d "$PWD/build/fast.XXXXXX")
+fi
 for scenario in agent_activity convoy_deliver ensure_bind inbox_delivery message_race controller_delivery machine_edges admission_placement reply_exchange; do
   # Assignment coverage is mandatory even for branches unreachable at depth one.
   # Simulation/typecheck alone can silently lose an unassigned world variable.
@@ -38,19 +55,11 @@ python3 conformance/test_dump2json.py
 # Workspace CI runs the crate's fmt, Clippy and unit tests; these two need Quint's output.
 QUINT_TRACE_DIR="$run" QUINT_GRAPH_DIR="$run/graphs" cargo test -p flotilla-state-machines --locked \
   --test conformance --test quint_replay -- --ignored --nocapture 2>&1 | tee "$run/engine.log"
-# The provisioning lifecycle kinds (#3629) run the lifecycle graph through the decided store.
-QUINT_GRAPH_DIR="$run/graphs" cargo test -p flotilla-provisioning --locked \
-  --test lifecycle_conformance -- --ignored --nocapture 2>&1 | tee "$run/provisioning.log"
-QUINT_TRACE_DIR="$run" cargo test -p flotilla-schema-sqlite --locked \
-  --test quint_replay -- --ignored --nocapture 2>&1 | tee "$run/follower.log"
-# The crew kinds (#3629): the placement composition and Ensure through the decided store.
-QUINT_GRAPH_DIR="$run/graphs" cargo test -p flotilla-engine-store --locked \
-  --test crew_conformance -- --ignored --nocapture 2>&1 | tee "$run/crew.log"
-# Backends share the trace mapping but replay only the Message race; full-graph
-# conformance remains with the engine above.
-QUINT_TRACE_DIR="$run" cargo test -p flotilla-inbox --locked \
-  --test contract message_race_traces -- --ignored --nocapture 2>&1 | tee "$run/inbox.log"
 ./mutants/check.sh
 
 python3 ./runner-contract-test.py
 printf 'Fast-tier artifacts: %s\n' "$run"
+# The store-backed suites read the graphs and traces above.
+if [ "$store" = yes ]; then
+  ./store-conformance.sh "$run"
+fi
