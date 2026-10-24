@@ -163,11 +163,12 @@ where
                         let digest = match reading.lifecycle {
                             Some(LifecycleReading::Ready { identity }) => identity,
                             Some(reading) => {
-                                return Ok(EnvironmentPrepared::Waiting(format!(
-                                    "ImageBuild {name} {}: {}",
-                                    reading.label(),
-                                    reading.reason().unwrap_or_default(),
-                                )))
+                                let reason = reading
+                                    .reason()
+                                    .filter(|reason| !reason.is_empty())
+                                    .map(|reason| format!(": {reason}"))
+                                    .unwrap_or_default();
+                                return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} {}{reason}", reading.label())));
                             }
                             None => match (status.phase, &status.digest) {
                                 (ImageBuildPhase::Built, Some(digest)) => digest.clone(),

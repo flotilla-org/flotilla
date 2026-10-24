@@ -121,6 +121,8 @@ pub struct ConvoyCreateAdmission<'a> {
 pub struct ConvoyAdmission {
     backend: ResourceBackend,
     observed_backend: ResourceBackend,
+    #[builder(default = Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))]
+    lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     observed_checkout_reconciliation: Arc<Mutex<()>>,
     config: Arc<ConfigStore>,
     discovery: Arc<DiscoveryRuntime>,
@@ -162,6 +164,7 @@ struct AdmissionReadContext<'a> {
 /// External observations and actions available during planning. No admission
 /// owner, mutation store, identity guard or pending-start registry is exposed.
 struct AdmissionRuntime<'a> {
+    lifecycle_reads: &'a Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     config: &'a ConfigStore,
     discovery: &'a DiscoveryRuntime,
     environment_manager: &'a dyn Environments,
@@ -207,6 +210,7 @@ impl ConvoyAdmission {
             occupancy: BTreeMap::new(),
             placed_here: Default::default(),
             runtime: AdmissionRuntime {
+                lifecycle_reads: &self.lifecycle_reads,
                 config: &self.config,
                 discovery: &self.discovery,
                 environment_manager: self.environment_manager.as_ref(),
@@ -2834,6 +2838,7 @@ impl AdmissionReadContext<'_> {
                         policy.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
                         &kind.spec.realisation,
                         composed.map(|images| images.values().map(|image| image.identity.as_str()).collect::<BTreeSet<_>>()),
+                        Arc::clone(self.runtime.lifecycle_reads),
                     )
                     .await?;
                     candidates.push(KindCandidate { kind, placement, free_slots, vessel_cap, host_ready, sleeping_until, image_cost });
@@ -5068,6 +5073,7 @@ async fn image_placement_cost(
     provider_instance: Option<&str>,
     realisation: &flotilla_resources::FulfilmentRealisation,
     composed: Option<BTreeSet<&str>>,
+    lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
 ) -> Result<flotilla_resources::ImageAcquisitionCost, String> {
     use flotilla_resources::{
         DockerImageSource, FleetDesignation, FulfilmentRealisation, ImageAcquisitionCost, ImageBuildPhase, FLEET_DESIGNATION_NAME,
@@ -5094,8 +5100,17 @@ async fn image_placement_cost(
             let digest = match (&architecture, host) {
                 (Some(architecture), Some(host)) => {
                     let name = crate::image_build::expected_build_name(identity, architecture, image_cache.as_ref(), &host.metadata.name);
-                    match flotilla_store::read_image_build(backend, namespace, &name).await {
-                        Ok(build) => build.status.filter(|status| status.phase == ImageBuildPhase::Built).and_then(|status| status.digest),
+                    match flotilla_store::read_image_build_with_lifecycle(backend, namespace, &name, Arc::clone(&lifecycle_reads)).await {
+                        Ok(reading) => match reading.lifecycle {
+                            Some(flotilla_protocol::LifecycleReading::Ready { identity }) => Some(identity),
+                            Some(_) => None,
+                            None => reading
+                                .build
+                                .object
+                                .status
+                                .filter(|status| status.phase == ImageBuildPhase::Built)
+                                .and_then(|status| status.digest),
+                        },
                         Err(ResourceError::NotFound { .. }) => None,
                         Err(error) => return Err(error.to_string()),
                     }
@@ -5849,6 +5864,7 @@ mod tests {
                 labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
                 &realisation,
                 None,
+                Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
             )
             .await
             .expect("cost");
@@ -5901,8 +5917,17 @@ mod tests {
         let identity = flotilla_resources::image_identity(&layers);
         let name = flotilla_resources::image_build_name(&identity, "amd64", &ImageDelivery::Local, "host");
         let realisation = flotilla_resources::FulfilmentRealisation::DockerPerVessel { image: None };
-        let cost =
-            || image_placement_cost(&backend, "test", Some(&host), Some("cache"), &realisation, Some(BTreeSet::from([identity.as_str()])));
+        let cost = || {
+            image_placement_cost(
+                &backend,
+                "test",
+                Some(&host),
+                Some("cache"),
+                &realisation,
+                Some(BTreeSet::from([identity.as_str()])),
+                Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+            )
+        };
         assert_eq!(cost().await.expect("cost"), ImageAcquisitionCost::Build, "no build yet");
         let builds = backend.using::<ImageBuild>("test");
         let spec = flotilla_resources::ImageBuildSpec::builder()
@@ -5929,9 +5954,99 @@ mod tests {
         status.capabilities.insert(flotilla_resources::IMAGE_DIGESTS_CAPABILITY.into(), serde_json::json!({"cache": [local_id, manifest]}));
         hosts.update_status("host", &host.metadata.resource_version, &status).await.expect("pulled inventory");
         let host = hosts.get("host").await.expect("host");
-        let held =
-            image_placement_cost(&backend, "test", Some(&host), Some("cache"), &realisation, Some(BTreeSet::from([identity.as_str()])));
+        let held = image_placement_cost(
+            &backend,
+            "test",
+            Some(&host),
+            Some("cache"),
+            &realisation,
+            Some(BTreeSet::from([identity.as_str()])),
+            Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        );
         assert_eq!(held.await.expect("cost"), ImageAcquisitionCost::Held);
+
+        // Engine decisions replace stale Built/digest evidence without a status copy.
+        // The finite paths cover retrying, readiness, all endings and a read failure.
+        use flotilla_provisioning::engine::{
+            image_build::ImageBuildBinding,
+            reads::{LifecycleReadPort, StoreReads},
+            Binding, LifecycleHome, Lifecycles, Step,
+        };
+        use flotilla_provisioning::stored::image_build::ImageBuildKind;
+        use flotilla_resources::lifecycle_reads::{LateLifecycleReads, LifecycleReads};
+        use flotilla_schema::Timestamp;
+        use flotilla_state_machines::{Cause, CauseCategory, Outcome};
+        for ending in ["released", "lost", "gave_up"] {
+            let mut registry = flotilla_schema::KindRegistry::new();
+            flotilla_provisioning::stored::register(&mut registry).expect("registry");
+            let store = Arc::new(std::sync::Mutex::new(
+                flotilla_schema_sqlite::Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry)
+                    .expect("store"),
+            ));
+            let engine: LifecycleHome<ImageBuildKind, _> = LifecycleHome::new(
+                "home",
+                flotilla_state_machines::Home::with_log("home", flotilla_engine_store::StoreLog::new(Arc::clone(&store))).expect("home"),
+            );
+            let old_build = builds.get(&name).await.expect("old build");
+            engine.request(&name, ImageBuildBinding::request(&old_build, "home").expect("request"), Timestamp(1)).expect("requested");
+            let reads = Arc::new(LateLifecycleReads::default());
+            let cost = || {
+                image_placement_cost(
+                    &backend,
+                    "test",
+                    Some(&host),
+                    Some("cache"),
+                    &realisation,
+                    Some(BTreeSet::from([identity.as_str()])),
+                    reads.clone() as Arc<dyn LifecycleReads>,
+                )
+            };
+            assert_eq!(cost().await.expect("before installation"), ImageAcquisitionCost::Held);
+            reads.install(Arc::new(LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), "home".into()))).expect("install");
+            for _ in 0..2 {
+                assert_eq!(cost().await.expect("Requested"), ImageAcquisitionCost::Build);
+            }
+            engine
+                .step(
+                    &name,
+                    &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "offline"), retryable: true }),
+                    Timestamp(1_000_000),
+                )
+                .expect("retrying");
+            assert_eq!(cost().await.expect("Retrying"), ImageAcquisitionCost::Build);
+            if ending == "gave_up" {
+                engine
+                    .step(
+                        &name,
+                        &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Refused, "probe 失敗"), retryable: false }),
+                        Timestamp(2_000_000),
+                    )
+                    .expect("gave up");
+            } else {
+                let digest = format!("registry.test/crew@sha256:{}", "3".repeat(64));
+                engine.step(&name, &Step::Realised { identity: digest }, Timestamp(2_000_000)).expect("ready");
+                for _ in 0..2 {
+                    assert_eq!(
+                        cost().await.expect("Ready"),
+                        ImageAcquisitionCost::RegistryPull,
+                        "the engine digest is absent from the inventory even though the stale digest is held"
+                    );
+                }
+                let edge = if ending == "released" { Step::Released } else { Step::Vanished };
+                engine.step(&name, &edge, Timestamp(3_000_000)).expect("ended");
+            }
+            for _ in 0..2 {
+                assert_eq!(cost().await.expect("ended"), ImageAcquisitionCost::Build);
+            }
+            assert_eq!(builds.get(&name).await.expect("unchanged").status, old_build.status);
+            assert!(std::thread::spawn(move || {
+                let _guard = store.lock().expect("healthy store");
+                panic!("injected store lock failure");
+            })
+            .join()
+            .is_err());
+            assert!(cost().await.expect_err("checked read failure").contains("poisoned"));
+        }
     }
 
     #[test]

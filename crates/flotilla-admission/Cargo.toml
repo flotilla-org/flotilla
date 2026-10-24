@@ -37,6 +37,12 @@ sha2 = { workspace = true }
 
 
 [dev-dependencies]
+flotilla-provisioning = { path = "../flotilla-provisioning" }
+flotilla-engine-store = { path = "../flotilla-engine-store" }
+flotilla-schema = { path = "../flotilla-schema" }
+flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
+flotilla-state-machines = { path = "../flotilla-state-machines" }
+rusqlite = { version = "0.37", features = ["bundled"] }
 flotilla-orchestration-testkit = { path = "../flotilla-orchestration-testkit" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 indexmap = { workspace = true }

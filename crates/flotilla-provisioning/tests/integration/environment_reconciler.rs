@@ -943,7 +943,7 @@ async fn composed_environment_reads_builds_without_a_status_copy() {
                     let outcome = reconciler.reconcile(&environment, &prepared, chrono::Utc::now());
                     if give_up {
                         assert!(matches!(outcome.patch, Some(EnvironmentStatusPatch::WaitForImageBuild { message })
-                            if message == format!("ImageBuild {name} GaveUp: {reason}")));
+                            if message == if reason.is_empty() { format!("ImageBuild {name} GaveUp") } else { format!("ImageBuild {name} GaveUp: {reason}") }));
                         assert!(runtime.provisioned.lock().expect("log").is_empty());
                     } else {
                         let policy = if registry {

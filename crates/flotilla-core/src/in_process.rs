@@ -1257,6 +1257,7 @@ impl InProcessDaemon {
                 .local_environment_id(local_environment_id.clone())
                 .build(),
         );
+        let lifecycle_reads = Arc::new(flotilla_resources::lifecycle_reads::LateLifecycleReads::default());
         let daemon = Arc::new_cyclic(|self_weak| Self {
             dispatch_board_cache: dispatch_board::DispatchBoardCache::default(),
             repos: Arc::clone(&repos),
@@ -1288,6 +1289,7 @@ impl InProcessDaemon {
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             self_weak: self_weak.clone(),
             admission: ConvoyAdmission::builder()
+                .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
                 .backend(resource_backend.clone())
                 .observed_backend(observed_resource_backend.clone())
                 .observed_checkout_reconciliation(Arc::clone(&observed_checkout_reconciliation))
@@ -1324,7 +1326,7 @@ impl InProcessDaemon {
             regard_lifecycle: Arc::clone(&regard_lifecycle),
             decided_store: Default::default(),
             change_stream_rounds: Default::default(),
-            lifecycle_reads: Default::default(),
+            lifecycle_reads: Arc::clone(&lifecycle_reads),
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),

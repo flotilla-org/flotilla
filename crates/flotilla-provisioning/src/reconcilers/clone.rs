@@ -16,6 +16,7 @@ const CLONE_BACKOFF: flotilla_resources::RetryBackoff =
 
 #[async_trait]
 pub trait CloneRuntime: Send + Sync {
+    /// Repeated requests for the same repository and target recover a clone whose report was not recorded.
     async fn clone_and_inspect(&self, repo_url: &str, target_path: &str) -> Result<Option<String>, String>;
     async fn inspect_existing(&self, target_path: &str) -> Result<Option<String>, String>;
     async fn clone_and_inspect_in(&self, _env_ref: &str, repo_url: &str, target_path: &str) -> Result<Option<String>, String> {
@@ -109,6 +110,7 @@ where
         let reading = match self.reading(obj) {
             Ok(reading) => reading,
             Err(error) => {
+                // The runtime recovers an existing target when its prior report was not recorded.
                 let mut outcome = ReconcileOutcome::new(None);
                 outcome.events.push(ObjectEvent::for_object(obj, "LifecycleReadFailed", error));
                 outcome.requeue_after = Some(Duration::from_secs(30));
@@ -158,6 +160,7 @@ where
             }
             Ok(Some(_)) => None,
             Ok(None) => obj.status.as_ref()?.retry.as_ref().map(|retry| retry.disposition.clone()),
+            // Let prepare return the read failure to the controller's error and backoff handling.
             Err(_) => None,
         }
     }
