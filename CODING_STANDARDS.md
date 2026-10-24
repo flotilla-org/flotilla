@@ -8,6 +8,7 @@ Use these standards for judgement calls during implementation and review. Mechan
 - **Enums over bools**: Prefer enum variants for state (e.g. `BindingModeId`, `TableIntent`, `LifecycleAuthority`).
 - **Imports**: std first, external crates, then `use crate::...`.
 - **Adding dependencies is fine** when they solve a real problem — don't reinvent the wheel.
+- **Comments**: A comment states an invariant or a reason the code cannot show. It never restates what the code says, and it carries no provenance: issue numbers, ruling names, "added for" and change history belong in the PR, the issue or an ADR. A module or machine header says in a few lines what it is for, without listing its features. This applies to Quint specs as much as to Rust: a spec is only useful if it is concise enough to read.
 - **`expect` over `unwrap`**: Prefer `.expect("reason")` over `.unwrap()` — it avoids having to reason about whether each `unwrap` is safe.
 - **Data-touching design and review**: use the `production-shape` skill, with scales from [WORKLOAD.md](WORKLOAD.md) and any `WORKLOAD.md` nearer the code.
 - **Correctness first**: Always favour correct solutions over "pragmatic" shortcuts. Get the architecture right rather than patching around structural problems.
