@@ -401,6 +401,16 @@ with kind discovery falls back to probing its own registered kinds in the
 default `flotilla` namespace when reading an older daemon, which did not expose
 namespace discovery.
 
+The candidate also rehearses lifecycle and Message imports into temporary engine
+stores. When the candidate host's `daemon.toml` contains `[primitives]`, every
+rehearsal refusal fails validation except an observed Checkout: it has no engine
+request and deliberately never imports. The exemption list matches the kind and
+complete refusal reason; new refusal classes fail closed. With the switch absent,
+rehearsals only report. A missing FleetDesignation is reported once per namespace
+with Messages, rather than once per Message. Vessel imports follow the Q6 lease
+mapping; their refusals are not exempt. `--host` changes the inventory source,
+while the enforcing switch still comes from the candidate's local config directory.
+
 Pulls are operator initiated and never move a fleet-wide desired-state pin:
 
 ```sh
