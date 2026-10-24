@@ -5,7 +5,7 @@
 //! [`MessageLog`] adds Message admission, assigned inside the create's
 //! transaction. Receipts are served as a [`ReceiptLog`] from `Read::about`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use flotilla_schema::{Cbor, Event, Identity, Kind, KindRegistry, KindSpec, Labelled, Origin, RegistryError, StateData, Timestamp};
 use flotilla_schema_sqlite::{AboutCursor, Read, Stamp, Store, StoreError};
@@ -82,6 +82,20 @@ fn refused(error: impl std::error::Error + Send + Sync + 'static) -> LogError {
     LogError::new(error)
 }
 
+// A panicking write drops rusqlite's rollback-on-drop transaction and its
+// Pending overlay (IDs and watermarks). Shared caches contain only committed
+// IDs; a partially promoted commit leaves valid entries or cache misses. Reads
+// cache only committed IDs, and identity removal only invalidates cache entries.
+// No resource state is cached in Store, so there is nothing to rebuild here.
+// Recover as the provisioning and Ensure home wrappers do above this log.
+fn lock_store(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
+    store.lock().unwrap_or_else(|poisoned| {
+        let store = poisoned.into_inner();
+        tracing::warn!(home = store.home(), "recovering poisoned decided-store lock");
+        store
+    })
+}
+
 /// One home's engine log over a shared [`Store`]. Every kind the store
 /// registers is written through the same handle, so a consumer's `Receive`
 /// and the Message it names commit to one store and home.
@@ -95,7 +109,7 @@ pub struct StoreLog {
 impl StoreLog {
     /// A log homed at the store's own home, accepting AgentSession receipts.
     pub fn new(store: Arc<Mutex<Store>>) -> Self {
-        let home = store.lock().expect("store writer").home().to_owned();
+        let home = lock_store(&store).home().to_owned();
         Self { store, home, receipts: ReceiptLog::new() }
     }
 
@@ -145,7 +159,7 @@ where
 {
     let home = log.home().to_owned();
     let stored = {
-        let mut store = log.store().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut store = lock_store(log.store());
         let mut read = store.read().map_err(|error| error.to_string())?;
         let mut stored = Vec::new();
         let mut after = None;
@@ -271,7 +285,7 @@ where
 {
     fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<M>, reads: &[InputRead]) -> Result<Version, LogError> {
         let origin = Origin::new(writer, at).with_payload(&reads.to_vec()).map_err(refused)?;
-        let mut store = self.store.lock().expect("store writer");
+        let mut store = lock_store(&self.store);
         let mut write = store.write().map_err(refused)?;
         let stamp = write.insert(resource.name(), resource, &origin).map_err(refused)?;
         write.commit().map_err(refused)?;
@@ -292,7 +306,7 @@ where
         let master = |name: &str| Identity { kind: Resource::<Message>::CODE, name: name.to_owned(), home: self.home.clone() };
         let edge = next.stored_edge_about(previous, event, master).map_err(refused)?;
         let edge = writes.iter().try_fold(edge, |edge, write| write.store(edge)).map_err(refused)?;
-        let mut store = self.store.lock().expect("store writer");
+        let mut store = lock_store(&self.store);
         let mut write = store.write().map_err(refused)?;
         let id =
             write.resolve(Resource::<M>::CODE, next.name(), &self.home).map_err(refused)?.ok_or_else(|| LogError::new("not stored"))?;
@@ -340,7 +354,7 @@ impl Log<Message> for MessageLog {
         reads: &[InputRead],
     ) -> Result<Resource<Message>, LogError> {
         let origin = Origin::new(writer, at).with_payload(&reads.to_vec()).map_err(refused)?;
-        let mut store = self.inner.store.lock().expect("store writer");
+        let mut store = lock_store(&self.inner.store);
         let mut write = store.write().map_err(refused)?;
         let mut spec = resource.spec().clone();
         spec.admitted_seq = write.last_sequence(&self.inner.home).map_err(refused)? + 1;
