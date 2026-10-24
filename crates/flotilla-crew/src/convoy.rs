@@ -147,7 +147,10 @@ impl ConvoyReconciler {
             // A convoy whose snapshot record is missing is left out, and `count`
             // falls back to its pins and convoy-wide decision.
             .filter_map(|(convoy, template)| {
-                let template = templates.get(template.as_str())?;
+                let Some(template) = templates.get(template.as_str()) else {
+                tracing::warn!(%convoy, %template, "workflow snapshot missing; counting the convoy's pins and convoy-wide decision instead");
+                return None;
+            };
                 Some((convoy, template.spec.vessels.iter().map(|vessel| vessel.name.clone()).collect()))
             })
             .collect();

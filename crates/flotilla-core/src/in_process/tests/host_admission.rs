@@ -1048,3 +1048,66 @@ async fn capped_agentless_host_refuses_a_convoy_with_more_vessels_than_its_cap()
         .expect_err("two vessels cannot fit a cap of one");
     assert!(refused.contains("convoy needs 2 vessels here, more than the host's cap of 1"), "{refused}");
 }
+
+// #3793: admission prepares outside its guard, so two concurrent admissions
+// can both pick the one free slot on a host. Both are admitted; the gate lets
+// the older provision and holds the newer until that slot frees, so the cap
+// holds.
+#[tokio::test]
+async fn concurrent_admissions_onto_one_free_slot_provision_in_admission_order() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = agentless_owner(&backend, &temp).await;
+    agentless_host(&backend, "b1", Some(1)).await;
+    let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
+    let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
+    // Both placements are decided before either convoy exists.
+    let mut decisions = Vec::new();
+    for _ in 0..2 {
+        let (placement, _) = daemon
+            .resolve_capability_placement("flotilla", "project", &[], &workflow, &BTreeSet::new(), &unpinned)
+            .await
+            .expect("placement");
+        let selected = placement.selected.expect("unpinned placement");
+        decisions.push(PlacementDecision {
+            minimal_alternatives: Vec::new(),
+            escalation_reason: None,
+            policy_name: selected.metadata.name.clone(),
+            target_host: placement_target_host(&backend, "flotilla", &selected).await.expect("target host"),
+            refused_candidates: Vec::new(),
+            viable_not_selected: Vec::new(),
+            allocation: placement.allocation,
+        });
+    }
+    assert!(decisions.iter().all(|decision| decision.target_host.reference.as_str() == "b1"), "both raced onto b1");
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    for (index, decision) in decisions.into_iter().enumerate() {
+        let name = format!("convoy-{index}");
+        let convoy =
+            convoys.create(&test_meta(&name), &ConvoySpec::builder().workflow_ref("missing".to_string()).build()).await.expect("convoy");
+        convoys
+            .update_status(
+                &name,
+                &convoy.metadata.resource_version,
+                &ConvoyStatus { placement_decision: Some(decision), ..Default::default() },
+            )
+            .await
+            .expect("admitted placement");
+    }
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>("flotilla"))
+        .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
+        .with_convoys(backend.including_replicas::<ResourceConvoy>("flotilla"))
+        .with_federated_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
+    let mut waits = Vec::new();
+    for name in ["convoy-0", "convoy-1"] {
+        let convoy = convoys.get(name).await.expect("convoy");
+        let prepared = flotilla_store::controller::Reconciler::prepare(&reconciler, &convoy).await.expect("prepare");
+        let outcome = flotilla_store::controller::Reconciler::reconcile(&reconciler, &convoy, &prepared, Utc::now());
+        waits.push(matches!(
+            outcome.patch,
+            Some(flotilla_resources::ConvoyStatusPatch::SetStalled { condition: Some(condition) })
+                if condition.cause == Some(flotilla_resources::StallCause::Capacity) && condition.evidence.contains("no free vessel slots")
+        ));
+    }
+    assert_eq!(waits, [false, true], "the older admission provisions; the newer waits for the slot");
+}
