@@ -58,9 +58,7 @@ pub struct CrewTurnIntent {
     pub delivery_condition: Option<Leaf>,
     #[builder(default)]
     pub expectation: flotilla_resources::MessageExpectation,
-    /// The stalled crew's role address, when this turn is a stall's
-    /// supervision: the sender's awaiting-reply record is then a stall about
-    /// that seat (#3587 layer 7).
+    /// The stalled crew role or canonical convoy address this supervision is about.
     pub stall_of: Option<String>,
 }
 

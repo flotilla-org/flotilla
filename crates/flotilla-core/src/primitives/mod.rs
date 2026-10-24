@@ -498,7 +498,7 @@ impl MessagePrimitives {
         };
         let recipient = conversion.inbox(&intent.receiver)?;
         let message = MessageRef::new(Address::message(&recipient, name).map_err(|error| error.to_string())?.as_str(), home);
-        let subject = about.map(|about| conversion.inbox(about)).transpose()?;
+        let subject = about.map(|about| conversion.stall_subject(about)).transpose()?;
         // The predecessor whose record this send's record replaces, wherever it is homed.
         let superseded = match &intent.supersedes {
             Some(older) => {
@@ -578,11 +578,9 @@ impl MessagePrimitives {
         .map_err(|error| error.to_string())?
     }
 
-    /// Withdraws this home's open stall records about `seats`, crew role
-    /// addresses the old stall status shows not stalled (#3730 review). Each
-    /// seat's records are about its role's address, which another seat of
-    /// the same role shares; `stalled`'s keeps its records. With no open
-    /// stall here it reads nothing.
+    /// Withdraws this home's open stall records about crew role or convoy
+    /// subjects no longer stalled. Subjects shared with `stalled` keep
+    /// their records. With no open stall here it reads nothing.
     pub async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: Option<&str>, reason: &str) -> Result<Vec<String>, String> {
         if seats.is_empty() || !self.awaiting.any_open_stall() {
             return Ok(Vec::new());
@@ -590,10 +588,10 @@ impl MessagePrimitives {
         let roles = self.roles(namespace).await?;
         let records = self.records(namespace).await.map_err(|error| error.to_string())?;
         let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
-        let kept = stalled.map(|seat| conversion.inbox(seat)).transpose()?;
+        let kept = stalled.map(|seat| conversion.stall_subject(seat)).transpose()?;
         let mut subjects = Vec::new();
         for seat in seats {
-            let subject = conversion.inbox(seat)?;
+            let subject = conversion.stall_subject(seat)?;
             if Some(&subject) != kept.as_ref() && !subjects.contains(&subject) {
                 subjects.push(subject);
             }

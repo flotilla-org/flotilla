@@ -13,7 +13,7 @@
 //! inbox at this home, a local input ([`AwaitingReplies::landed`]), and
 //! expired once the deadline passes with no reply present
 //! ([`AwaitingReplies::expire_due`]). A stall is an open record of kind
-//! [`STALL`] about the stalled seat; "stalled" is the indexed read of open
+//! [`STALL`] about the stalled seat or convoy; "stalled" is the indexed read of open
 //! stall records by subject ([`AwaitingReplies::open_about`]).
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -32,7 +32,7 @@ use flotilla_state_machines::{
     Home, Ref, Resource, WriteError,
 };
 
-/// The record kind of a stall: a Reply-expectation message about the seat.
+/// The record kind of a stall: a Reply-expectation message about a seat or convoy.
 pub const STALL: &str = flotilla_resources::STALL_KIND;
 
 /// The most records one indexed read returns.
@@ -217,7 +217,7 @@ impl AwaitingReplies {
 
     /// Withdraws the open stall records homed here about any of `subjects`,
     /// but `keep` (#3730 review): a stall that has ended in the old stall
-    /// status, or one that a newer stall about the same seat replaced, waits
+    /// status, or one that a newer stall about the same subject replaced, waits
     /// no longer. Each sender withdraws its own record. Returns the records
     /// withdrawn; one that fails does not stop the others.
     pub fn end_stalls(&self, subjects: &[Address], keep: Option<&str>, reason: &str, now: Timestamp) -> Result<Vec<String>, String> {

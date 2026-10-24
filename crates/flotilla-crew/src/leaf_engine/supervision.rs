@@ -238,22 +238,12 @@ impl super::LeafSubscriptionTable {
                 .subject_revision(stalled.began_at.timestamp_micros().to_string())
                 .sender(sender.to_string())
                 .relation(flotilla_resources::MessageRelation::Supervisor)
-                .expectation(flotilla_resources::MessageExpectation::Reply)
+                .expectation(super::stalls::supervision_expectation(rung))
                 .references(vec![flotilla_resources::MessageReference::ControlRecord {
                     resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", namespace, &convoy.metadata.name),
                     revision: convoy.metadata.resource_version.clone(),
                 }])
-                // An operator-rung stall has no engine record until #3457 (#3587 ruling 6353447431).
-                .maybe_stall_of(super::stalls::stalled_source_actor(stalled).filter(|_| rung != StallRung::Operator).map(
-                    |(vessel, role)| {
-                        super::stalls::crew_role_address(
-                            convoy.spec.project_ref.as_deref().unwrap_or(namespace),
-                            &convoy.metadata.name,
-                            vessel,
-                            role,
-                        )
-                    },
-                ))
+                .maybe_stall_of((rung != StallRung::Operator).then(|| super::stalls::stall_subject(namespace, convoy, stalled)))
                 .build();
             let actuator = self.inner.turn_delivery.lock().await.clone();
             let admission = match actuator.deliver(&intent).await {

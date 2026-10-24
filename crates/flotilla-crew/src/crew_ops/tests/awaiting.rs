@@ -146,14 +146,15 @@ async fn a_failed_first_record_write_is_written_by_the_repeat() {
     assert_eq!(records[0].1, "reply");
 }
 
-// Behaviour (#3730 review, a stall cleared without a reply): the stall reconciler ends the stall
-// records of every seat its convoy's stored stall status does not show stalled.
+// Operator stalls have no engine records: cleanup includes both the convoy and its crew.
 #[tokio::test]
-async fn the_stall_reconciler_ends_records_of_seats_not_stalled() {
+async fn the_stall_reconciler_ends_records_of_subjects_not_stalled() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let messages = RecordingMessages::new(backend, 0);
     let (crew, _backend, _probe, _config) = fixture_with_message_path(flotilla_resources::CrewWorkPhase::Working, wired(&messages)).await;
     crew.reconcile_crew_stalls_once("flotilla").await.expect("one pass");
-    let ended = messages.ended.lock().expect("ended").clone();
-    assert_eq!(ended, vec![(vec!["flotilla/crew/work/coder".to_owned()], None)], "the convoy's one seat, none stalled");
+    assert_eq!(
+        messages.ended.lock().expect("ended").as_slice(),
+        &[(vec!["flotilla/crew/work/coder".to_owned(), "project:flotilla/convoy:crew".to_owned()], None)]
+    );
 }
