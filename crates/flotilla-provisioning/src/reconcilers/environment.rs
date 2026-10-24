@@ -234,6 +234,7 @@ where
         if matches!(prepared, EnvironmentPrepared::Foreign) {
             return ReconcileOutcome::new(None);
         }
+        // The current judgement gates publication: provider work may have finished after this lifecycle ended.
         let reading = match self.reading(obj) {
             Ok(reading) => reading,
             Err(error) => {
