@@ -591,6 +591,7 @@ fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
                 allocation: None,
             },
             free_slots: Some(1),
+            vessel_cap: None,
             host_ready: true,
             image_cost: ImageAcquisitionCost::Held,
             sleeping_until: None,

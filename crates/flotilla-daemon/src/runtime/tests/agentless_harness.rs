@@ -308,6 +308,7 @@ async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool
         env_bag: bag.clone(),
         runner: Arc::clone(&runner),
         host_environment,
+        max_vessels: None,
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
     };
     register_agentless_ssh_resources(&backend, NAMESPACE, &local_host_id, &profile).await.expect("register agentless resources");

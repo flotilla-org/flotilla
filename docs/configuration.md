@@ -185,6 +185,44 @@ composed `PATH` and supply variables again as its first step, so the harness
 sees the composed environment. Removing that profile run needs a cleat launch
 without a login shell (#3761).
 
+#### Vessel cap
+
+An agentless host without a cap takes only convoys that pin its placement
+(`--fulfilment host-direct-<host-id>`). Declare how many vessels it can hold and
+it takes ordinary, unpinned placement within that cap (#3793):
+
+```toml
+[hosts.b1]
+hostname = "b1.example"
+user = "flotilla"
+agentless_ssh = true
+max_vessels = 1
+```
+
+The owning daemon is the only daemon that places on its agentless hosts, and it
+counts their vessels. A vessel holds its slot from its convoy's admission until
+its teardown finishes, so a crash mid-teardown does not free the slot early.
+Every vessel a convoy's workflow places on the host counts, created or not, and
+a host is refused for a convoy that would hold more vessels there than its cap.
+If a convoy's frozen workflow snapshot record is missing, its vessels are
+counted from its placement pins and convoy-wide decision instead, which can
+undercount a convoy with several vessels. The owning daemon logs a warning
+naming the convoy when that happens.
+Among otherwise equal hosts, placement prefers the one with the most free
+slots; a host with none is chosen only when no host has room. A convoy admitted
+to a full host waits before provisioning, with "no free vessel slots" in
+`convoy explain`, and starts in admission order once a vessel on that host
+finishes teardown. The order is strict: an older convoy waiting for two slots
+holds back a newer one-vessel convoy even while one slot is free, so a large
+convoy is never starved by smaller ones. `convoy explain` and `fulfilment list` show each capped
+host's free slots as `<free> of <cap>`. The cap counts vessels only: memory
+and CPU are not considered.
+
+The cap is read when a convoy is admitted. Lowering `max_vessels` later does
+not move convoys already admitted to the host: one that now needs more slots
+than the new cap stays in its capacity wait until it is abandoned or the cap
+is raised.
+
 The admission free-space floor below is checked against the SSH host's
 `~/dev/flotilla-repos` checkout volume using its remote `df` result.
 

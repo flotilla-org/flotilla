@@ -54,6 +54,8 @@ pub struct DirectEnvironmentState {
     /// The host's declared supplies, which its SSH runner composes into every
     /// command and a session launch composes into the harness environment.
     pub host_environment: HostEnvironment,
+    /// An agentless SSH host's declared vessel cap (#3793).
+    pub max_vessels: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -114,6 +116,7 @@ impl EnvironmentManager {
                 registry: None,
                 ssh_destination: None,
                 host_environment: HostEnvironment::default(),
+                max_vessels: None,
             }),
         );
 
@@ -160,6 +163,7 @@ impl EnvironmentManager {
                     registry: None,
                     ssh_destination: None,
                     host_environment: HostEnvironment::default(),
+                    max_vessels: None,
                 }));
                 Ok(())
             }
@@ -242,6 +246,17 @@ impl EnvironmentManager {
         match managed.get_mut(env_id) {
             Some(ManagedEnvironmentKind::Direct(state)) => {
                 state.host_environment = host_environment;
+                Ok(())
+            }
+            _ => Err(format!("direct environment not found: {env_id}")),
+        }
+    }
+
+    pub fn set_direct_environment_max_vessels(&self, env_id: &EnvironmentId, max_vessels: Option<u32>) -> Result<(), String> {
+        let mut managed = self.managed.lock().expect("environment manager lock poisoned");
+        match managed.get_mut(env_id) {
+            Some(ManagedEnvironmentKind::Direct(state)) => {
+                state.max_vessels = max_vessels;
                 Ok(())
             }
             _ => Err(format!("direct environment not found: {env_id}")),

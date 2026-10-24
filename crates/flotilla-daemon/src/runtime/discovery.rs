@@ -64,6 +64,8 @@ pub(super) struct AgentlessSshProfile {
     pub(super) runner: Arc<dyn CommandRunner>,
     /// The host's declared supplies (#3722).
     pub(super) host_environment: HostEnvironment,
+    /// The vessels this host declares it can hold (#3793).
+    pub(super) max_vessels: Option<u32>,
     pub(super) fulfilment_facts: Arc<RwLock<BTreeMap<String, FulfilmentFacts>>>,
 }
 
@@ -133,6 +135,7 @@ pub(super) async fn discover_agentless_ssh_profile(
         env_bag: direct.env_bag,
         runner: direct.runner,
         host_environment: direct.host_environment,
+        max_vessels: direct.max_vessels,
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
     })
 }
@@ -151,6 +154,7 @@ pub(super) async fn register_agentless_ssh_resources(
     let mut spec = HostSpec {
         display_name: provisioning.display_name.clone(),
         connection: HostConnection::AgentlessSsh { owning_daemon: owner_host_id.to_string(), destination: profile.destination.clone() },
+        max_vessels: profile.max_vessels,
         ..HostSpec::default()
     };
     match hosts.get(&provisioning.host_id).await {
@@ -261,7 +265,7 @@ pub(super) async fn apply_agentless_ssh_observation(
         ready &= cli_available;
         conditions.extend(reach_conditions);
     }
-    let fulfilment_facts = if probe_succeeded {
+    let mut fulfilment_facts = if probe_succeeded {
         let observed = ssh.fulfilment_facts.read().await.clone();
         if observed.is_empty() {
             host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default()
@@ -271,6 +275,17 @@ pub(super) async fn apply_agentless_ssh_observation(
     } else {
         BTreeMap::new()
     };
+    // The owning daemon is the only placer here, so it alone counts the
+    // vessels held against the host's cap (#3793).
+    if let Some(cap) = ssh.max_vessels {
+        let occupancy = flotilla_admission::support::host_occupancy(&daemon.resource_backend(), namespace, &profile.host_id).await?;
+        let probed = ssh.fulfilment_facts.read().await;
+        for (kind, facts) in fulfilment_facts.iter_mut() {
+            // A probe that found the kind's terminal pool missing keeps it full.
+            let pool_missing = probed.get(kind).is_some_and(|probed| probed.free_vessel_slots == Some(0));
+            facts.free_vessel_slots = Some(if pool_missing { 0 } else { occupancy.free_slots(cap) });
+        }
+    }
     let providers = match daemon.environment_registry_for_environment(&ssh.environment_id) {
         Some(registry) => observe_provider_advertisements(&registry).await,
         None => profile

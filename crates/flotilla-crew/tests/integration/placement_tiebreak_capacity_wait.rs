@@ -57,6 +57,7 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
                 host_ready: true,
                 sleeping_until: None,
                 free_vessel_slots: Some(0),
+                max_vessels: None,
                 reserved_for_platform: false,
                 minimal: true,
                 available: false,

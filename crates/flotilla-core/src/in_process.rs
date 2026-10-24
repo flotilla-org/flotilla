@@ -414,6 +414,7 @@ async fn register_static_ssh_direct_environment(
     environment: &StaticEnvironmentConfig,
     host_direct: bool,
     multiplex: bool,
+    max_vessels: Option<u32>,
 ) -> Result<(), String> {
     let fallback_env_id = static_ssh_environment_id(config_key);
     let destination = flotilla_config::ssh_destination(&environment.hostname, environment.user.as_deref());
@@ -448,6 +449,7 @@ async fn register_static_ssh_direct_environment(
     if host_direct {
         environment_manager.set_direct_environment_ssh_destination(&env_id, destination)?;
     }
+    environment_manager.set_direct_environment_max_vessels(&env_id, max_vessels)?;
     Ok(())
 }
 
@@ -479,7 +481,8 @@ async fn register_static_ssh_direct_environments(
     };
 
     for (config_key, environment) in &daemon_config.environments {
-        if let Err(err) = register_static_ssh_direct_environment(environment_manager, discovery, config_key, environment, false, true).await
+        if let Err(err) =
+            register_static_ssh_direct_environment(environment_manager, discovery, config_key, environment, false, true, None).await
         {
             warn!(
                 environment = %config_key,
@@ -506,6 +509,7 @@ async fn register_static_ssh_direct_environments(
                     &environment,
                     true,
                     hosts.resolved_ssh_multiplex(label),
+                    remote.max_vessels,
                 )
                 .await
                 {
