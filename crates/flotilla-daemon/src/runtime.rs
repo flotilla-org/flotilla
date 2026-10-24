@@ -936,10 +936,12 @@ fn spawn_controller_loops(
                 let additional_host_refs = state.agentless_host_refs();
                 let state = Arc::clone(&state);
                 let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.terminal_sessions));
+                let reads = state.daemon.lifecycle_reads();
                 (
                     vec![],
                     Engine::<_, TerminalSessionBinding>::new(
                         TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
+                            .with_lifecycle_reads(reads)
                             .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
                             .with_additional_host_refs(additional_host_refs)
                             .with_federated_convoys(&backend, &namespace_string),
