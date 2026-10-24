@@ -1417,7 +1417,7 @@ impl Vcs for FlotillaVcs {
             return Err(format!("continuation branch {branch} does not exist on origin"));
         }
         if intent == LocalCloneIntent::NewBranch && remote_branch_exists {
-            return Err(format!("checkout branch {branch} already exists on remote; choose a fresh branch name"));
+            source_backend.verify_remote_adoption(branch, base_ref).await?;
         }
         let staging = format!("{target}.flotilla-clone-partial");
         remove_worktree_path(&*self.runner, &staging).await?;
@@ -1439,7 +1439,7 @@ impl Vcs for FlotillaVcs {
             // Import only freshly fetched origin refs, without a second network fetch.
             local.run(&["fetch", "--no-tags", "--", source, "+refs/remotes/origin/*:refs/remotes/origin/*"]).await?;
             let continuation_base = format!("origin/{branch}");
-            let inherited = remote_branch_exists && intent != LocalCloneIntent::NewBranch;
+            let inherited = remote_branch_exists;
             let base = if inherited { continuation_base.as_str() } else { base_ref.unwrap_or("origin/HEAD") };
             let base = base.strip_prefix("refs/heads/").unwrap_or(base);
             let remote_base = format!("refs/remotes/origin/{base}");
@@ -1533,18 +1533,15 @@ impl Vcs for FlotillaVcs {
                 provenance: CheckoutBranchProvenance::PreExisting,
             });
         }
-        if branch != "HEAD" {
-            let advertised = GitCliBackend::new(Path::new("/"), &*self.runner).remote_heads(url, &format!("refs/heads/{branch}")).await?;
-            if !advertised.trim().is_empty() {
-                return Err(format!("checkout branch {branch} already exists on remote; choose a fresh branch name"));
-            }
-        }
         let staging = format!("{target}.flotilla-clone-partial");
         remove_worktree_path(&*self.runner, &staging).await?;
         let clone_ref = base_ref.unwrap_or(branch);
         let prepare = async {
             GitCliBackend::new(Path::new("/"), &*self.runner).clone_repo(url, &staging, (clone_ref != "HEAD").then_some(clone_ref)).await?;
             let staging_backend = GitCliBackend::checkout_root(Path::new(&staging), &*self.runner);
+            if branch != "HEAD" && staging_backend.ref_exists(&format!("refs/remotes/origin/{branch}")).await {
+                staging_backend.verify_remote_adoption(branch, base_ref).await?;
+            }
             if clone_ref != branch {
                 let remote_ref = format!("refs/remotes/origin/{branch}");
                 let track = format!("origin/{branch}");
@@ -1663,7 +1660,7 @@ impl Vcs for FlotillaVcs {
     }
 }
 
-async fn cleanup_clone_path(runner: &dyn CommandRunner, path: &str, error: String) -> String {
+pub(crate) async fn cleanup_clone_path(runner: &dyn CommandRunner, path: &str, error: String) -> String {
     match remove_worktree_path(runner, path).await {
         Ok(()) => error,
         Err(cleanup_error) => format!("{error}; additionally failed to remove partial checkout: {cleanup_error}"),
@@ -1777,6 +1774,22 @@ impl<'a> GitCliBackend<'a> {
             base.to_string()
         };
         self.resolve_ref(&reference).await.map(|commit| commit.trim().to_string())
+    }
+
+    /// A pre-existing remote ref is reusable only when all its commits are
+    /// reachable from the freshly verified checkout base. Never claim ownership.
+    pub(crate) async fn verify_remote_adoption(&self, branch: &str, base_ref: Option<&str>) -> Result<(), String> {
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        let base = base_ref.ok_or_else(|| existing_checkout_branch_error(branch, Some(&remote_ref)))?;
+        let base = self.adoption_base(branch, base, true).await?;
+        let count = self.run(&["rev-list", "--count", &format!("{base}..{remote_ref}")]).await?;
+        let count = count.trim().parse::<usize>().map_err(|_| format!("invalid commit count for {remote_ref}: {count}"))?;
+        if count != 0 {
+            return Err(format!(
+                "remote branch {branch} ({remote_ref}) has {count} commits beyond base {base}; preserve its work before reusing it"
+            ));
+        }
+        Ok(())
     }
 
     async fn verified_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, String> {
@@ -2059,7 +2072,7 @@ impl VcsBackend for GitCliBackend<'_> {
                 .await
                 .map_err(|error| format!("inspect remote convoy branch {branch}: {error}"))?;
             if !advertised.trim().is_empty() {
-                return Err(format!("checkout branch {branch} already exists on remote; choose a fresh branch name"));
+                self.fetch("origin", &format!("+{remote_head}:{remote_ref}")).await?;
             }
         }
         let remote_exists = self.ref_exists(&remote_ref).await;
@@ -2075,10 +2088,8 @@ impl VcsBackend for GitCliBackend<'_> {
             if has_origin && !self.remote_heads("origin", &local_ref).await?.trim().is_empty() {
                 self.fetch("origin", &format!("+{local_ref}:{remote_ref}")).await?;
             }
-            if self.ref_exists(&remote_ref).await && !self.verified_ancestor(&remote_ref, &base).await? {
-                return Err(format!(
-                    "remote branch {branch} has commits beyond base {base}; preserve its work before reusing the local branch"
-                ));
+            if self.ref_exists(&remote_ref).await {
+                self.verify_remote_adoption(branch, Some(&base)).await?;
             }
             // Git refuses physical holders without --force; adoption never
             // moves the branch and never claims ownership of a pre-existing ref.
@@ -2094,7 +2105,15 @@ impl VcsBackend for GitCliBackend<'_> {
             });
         }
         if remote_exists {
-            return Err(existing_checkout_branch_error(branch, Some(&remote_ref)));
+            if !has_origin {
+                return Err(existing_checkout_branch_error(branch, Some(&remote_ref)));
+            }
+            self.verify_remote_adoption(branch, base_ref).await?;
+            self.run(&["worktree", "add", "--lock", "--reason", registration_reason, "-b", branch, target, &remote_ref]).await?;
+            return Ok(CheckoutMaterialisation {
+                commit: Some(GitCliBackend::checkout_root(Path::new(target), self.runner).head_commit_text().await?.trim().to_string()),
+                provenance: CheckoutBranchProvenance::PreExisting,
+            });
         }
         let provenance = if !local_exists && !remote_exists && base_ref.is_some() {
             CheckoutBranchProvenance::CreatedForConvoy
@@ -2885,7 +2904,8 @@ mod tests {
             .await
             .err()
             .expect("remote branch conflict");
-        assert!(conflict.contains("already exists on remote"));
+        assert!(conflict.contains("commits beyond base"), "{conflict}");
+        assert!(conflict.contains("refs/remotes/origin/crew"), "{conflict}");
         assert!(!refused.exists());
     }
 
@@ -3086,6 +3106,92 @@ mod tests {
                         GitCliBackend::new(root, &*runner).ref_exists("refs/heads/governor").await,
                         "adopted or refused branches retain ownership"
                     );
+                }
+            }
+        }
+    }
+
+    // #3815: every materialisation path adopts remote-only branches with zero
+    // commits beyond base, preserving their tip and ownership; advanced refs refuse.
+    #[tokio::test]
+    async fn remote_only_leftover_materialisation_contract() {
+        // Exhaustive small scenario matrix: all strategies, zero/one/two unique
+        // commits, and a branch behind base. Real Git is the boundary under test.
+        for path in ["worktree", "local", "reference", "fresh"] {
+            for ahead in 0..=2 {
+                for behind in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let remote = dir.path().join("remote.git");
+                    let source = dir.path().join("source");
+                    git(dir.path(), &["init", "--bare", "-b", "main", remote.to_str().unwrap()]);
+                    git(dir.path(), &["clone", remote.to_str().unwrap(), source.to_str().unwrap()]);
+                    let commit = |message: &str| {
+                        git(
+                            &source,
+                            &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", message],
+                        )
+                    };
+                    commit("initial");
+                    git(&source, &["branch", "governor"]);
+                    if behind {
+                        commit("new base");
+                    }
+                    git(&source, &["push", "origin", "main"]);
+                    git(&source, &["switch", "governor"]);
+                    for _ in 0..ahead {
+                        commit("unique work");
+                    }
+                    git(&source, &["push", "origin", "governor"]);
+                    let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
+                    let cli = GitCliBackend::new(&source, &*runner);
+                    let tip = cli.resolve_ref("governor").await.unwrap().trim().to_string();
+                    git(&source, &["switch", "main"]);
+                    git(&source, &["branch", "-D", "governor"]);
+                    git(&source, &["update-ref", "-d", "refs/remotes/origin/governor"]);
+                    let vcs = if path == "reference" {
+                        FlotillaVcs::new(
+                            ExecutionEnvironmentPath::new(&source),
+                            runner.clone(),
+                            GitCheckoutStrategy::ReferenceClone(ReferenceCloneStrategy::new(
+                                runner.clone(),
+                                ExecutionEnvironmentPath::new(source.join(".git")),
+                            )),
+                        )
+                    } else {
+                        test_fl(&source, runner.clone(), true)
+                    };
+                    let target = dir.path().join("checkout");
+                    let target = target.to_str().unwrap();
+                    let result: Result<CheckoutMaterialisation, String> = match path {
+                        "local" => vcs
+                            .materialise_local_clone(LocalCloneRequest {
+                                source: source.to_str().unwrap(),
+                                url: remote.to_str().unwrap(),
+                                branch: "governor",
+                                base_ref: Some("main"),
+                                target,
+                                intent: LocalCloneIntent::NewBranch,
+                            })
+                            .await
+                            .map(|(result, _)| result),
+                        "fresh" => vcs.materialise_fresh_clone(remote.to_str().unwrap(), "governor", Some("main"), target).await,
+                        _ => vcs.materialise_checkout("governor", Some("main"), target, "managed").await.map_err(|e| e.to_string()),
+                    };
+                    if ahead == 0 {
+                        let result = result.unwrap_or_else(|e| panic!("{path}: {e}"));
+                        assert_eq!(result.commit.as_deref(), Some(tip.as_str()), "{path}: keep remote tip");
+                        assert_eq!(result.provenance, CheckoutBranchProvenance::PreExisting, "{path}");
+                        assert_eq!(
+                            GitCliBackend::checkout_root(Path::new(target), &*runner).current_branch().await.unwrap().trim(),
+                            "governor"
+                        );
+                    } else {
+                        let error = result.err().expect("advanced branch must refuse");
+                        assert!(error.contains(&format!("{ahead} commits beyond base")), "{path}: {error}");
+                        assert!(error.contains("refs/remotes/origin/governor"), "{path}: {error}");
+                        assert!(!Path::new(target).exists(), "{path}: refusal leaves no checkout");
+                        assert!(!Path::new(&format!("{target}.flotilla-clone-partial")).exists(), "{path}: refusal cleans staging");
+                    }
                 }
             }
         }

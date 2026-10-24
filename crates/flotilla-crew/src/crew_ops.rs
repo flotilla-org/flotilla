@@ -1855,6 +1855,22 @@ impl CrewService {
                     continue;
                 }
             };
+            let base_ref = match &checkout.spec {
+                flotilla_resources::CheckoutSpec::Worktree(spec) => spec.base_ref.as_deref(),
+                flotilla_resources::CheckoutSpec::FreshClone(spec) => spec.base_ref.as_deref(),
+                flotilla_resources::CheckoutSpec::Observed(_) => None,
+            };
+            // An untouched checkout has no branch work to archive. If the base
+            // cannot be verified, retain the best-effort push to preserve work.
+            if matches!(vcs.commits_beyond_base(base_ref).await, Ok((_, 0))) {
+                outcomes.push(
+                    CheckoutArchiveOutcome::builder()
+                        .checkout(checkout.metadata.name)
+                        .status(CheckoutArchiveStatus::NothingToArchive)
+                        .build(),
+                );
+                continue;
+            }
             let output = vcs.push_current_branch("origin").await;
             let outcome = match output {
                 Ok(output) if output.success() => {
