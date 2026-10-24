@@ -197,6 +197,7 @@ mod tests {
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
             allocation: None,
+            provider_workspace_root: None,
         }
     }
 

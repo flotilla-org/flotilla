@@ -89,6 +89,8 @@ pub(super) struct AttachResolver<'a> {
     pub(super) namespace: &'a std::sync::RwLock<String>,
     /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4).
     pub(super) lifecycle_reads: &'a dyn flotilla_projections::ports::LifecycleReads,
+    /// Sessions on agentless hosts attach through their vessel's agent (#3792).
+    pub(super) agentless_vessels: Option<Arc<dyn super::AgentlessVesselAccess>>,
 }
 
 impl<'a> AttachResolver<'a> {
@@ -648,6 +650,15 @@ impl<'a> AttachResolver<'a> {
                 _ => None,
             })
         {
+            // #3792: a session in a vessel attaches through the vessel's agent,
+            // as a Docker vessel's does; the owning daemon resolves it.
+            if let Some(access) = &self.agentless_vessels {
+                let target = terminal_session_attach_target_with_stale_status(session)?;
+                if let Some(attach) = access.attach(&session.spec, target.session_id, seat).await {
+                    let (socket, name) = attach?;
+                    return Ok((cleat_socket_attach_plan(&socket, &name, seat), self.host_name.clone()));
+                }
+            }
             let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
             let attach_args = self.terminal_pool_attach_args(reads, session, &environment, &cwd, seat).await?;
             let plan = agentless_ssh_attach_plan(destination, &host_environment, attach_args);

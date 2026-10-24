@@ -12,7 +12,10 @@ use crate::{
     rename_command_timeout, ChannelLabel, CommandOutput, CommandRunner, FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
 
-const REMOTE_WRITABLE_BASE_SCRIPT: &str = "if [ -n \"${XDG_RUNTIME_DIR:-}\" ] \
+/// Resolves the remote user's writable flotilla base, as `writable_*_base`
+/// report it. Shared with agents on the same hosts (#3792), so one host keeps
+/// one answer whichever path runs the command.
+pub const REMOTE_WRITABLE_BASE_SCRIPT: &str = "if [ -n \"${XDG_RUNTIME_DIR:-}\" ] \
                                                && [ -d \"$XDG_RUNTIME_DIR\" ] \
                                                && [ -w \"$XDG_RUNTIME_DIR\" ] \
                                                && mkdir -p \"$XDG_RUNTIME_DIR/flotilla\"; then \

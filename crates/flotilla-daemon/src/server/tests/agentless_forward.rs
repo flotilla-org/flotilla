@@ -1,24 +1,22 @@
-//! #3618 acceptance through a real `DaemonServer`: an agentless host's crews
-//! reach the controller only through the forwarded environment socket.
+//! #3618 and #3792 acceptance through a real `DaemonServer`: an agentless
+//! host's crews reach the controller only through their vessel agent's guest
+//! forward to a per-vessel environment socket.
 //!
-//! The ssh client is the injected collaborator. `ProxySsh` honours the
-//! `-R remote:local` it is given by binding `remote` and relaying each
-//! connection to `local`, exactly the bytes ssh would carry. The "host" runner
-//! is this machine's process runner, so remote paths are local temp paths.
+//! The vessel agent is the injected collaborator. `GuestForward` serves the
+//! guest path and relays each connection to the host endpoint, exactly the
+//! bytes the agent carries over its link (drydock's own forward is covered by
+//! flotilla-environment's agent tests).
 
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::Arc,
 };
 
-use async_trait::async_trait;
-use flotilla_discovery_api::{EnvironmentAssertion, EnvironmentBag};
 use flotilla_protocol::{
     AgentEventType, AgentHarness, AgentHookEvent, AgentHookTerminalRef, AttachableId, Command, CommandAction, CommandValue,
     CrewCommandContext, DaemonEvent, EnvironmentId, Message, NodeId, Request, Response, ResponseResult, PROTOCOL_VERSION,
 };
-use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandProcess, CommandRunner, ProcessCommandRunner};
 use flotilla_resources::Convoy;
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{unix_message_session, MessageSession};
@@ -26,110 +24,53 @@ use tokio::{net::UnixListener, task::JoinHandle};
 
 use super::super::DaemonServer;
 use super::{ok_response, place_crew, read_session_message, test_config_store, PlacedCrew};
-use crate::runtime::agentless_reach::{AgentlessReach, CliSource, ForwardTiming, ReachTarget};
+use crate::server::environment_sockets::EnvironmentSocketService;
 use flotilla_discovery_testkit::fake_discovery;
 
-/// Where the fake ssh relays: the endpoint it was asked to forward, or (the
-/// mutation) the controller's main socket.
+/// Where the vessel's daemon forward leads: the per-vessel environment socket
+/// the controller registered, or (the mutation) the controller's main socket.
 #[derive(Clone)]
 enum Relay {
     AsRequested,
     MainSocket(PathBuf),
 }
 
-struct ProxySsh {
-    relay: Relay,
-    spawns: StdMutex<Vec<Vec<String>>>,
-}
+/// Stands in for the vessel agent's guest forward.
+struct GuestForward(JoinHandle<()>);
 
-struct ProxyProcess {
-    task: Option<JoinHandle<()>>,
-    listener_path: PathBuf,
-}
-
-#[async_trait]
-impl CommandProcess for ProxyProcess {
-    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
-        use std::os::unix::process::ExitStatusExt;
-        Ok(self.task.as_ref().is_none_or(JoinHandle::is_finished).then(|| std::process::ExitStatus::from_raw(255 << 8)))
-    }
-
-    async fn kill(&mut self) -> Result<(), String> {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-        let _ = std::fs::remove_file(&self.listener_path);
-        Ok(())
-    }
-
-    async fn wait(&mut self) -> Result<std::process::ExitStatus, String> {
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-        use std::os::unix::process::ExitStatusExt;
-        Ok(std::process::ExitStatus::from_raw(255 << 8))
-    }
-}
-
-impl Drop for ProxyProcess {
-    fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
-}
-
-#[async_trait]
-impl CommandRunner for ProxySsh {
-    async fn run(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-        Err(format!("unexpected controller command {cmd}"))
-    }
-
-    async fn run_output(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
-        Err(format!("unexpected controller command {cmd}"))
-    }
-
-    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
-        false
-    }
-
-    async fn spawn_long_lived(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        _cwd: &Path,
-        _label: &ChannelLabel,
-    ) -> Result<Box<dyn CommandProcess>, String> {
-        assert_eq!(cmd, "ssh");
-        self.spawns.lock().expect("spawns").push(args.iter().map(|arg| arg.to_string()).collect());
-        let spec = args[args.iter().position(|arg| *arg == "-R").ok_or("no reverse forward")? + 1];
-        let (remote, local) = spec.split_once(':').ok_or("malformed forward")?;
-        let local = match &self.relay {
-            Relay::AsRequested => PathBuf::from(local),
-            Relay::MainSocket(main) => main.clone(),
-        };
-        let listener = UnixListener::bind(remote).map_err(|error| format!("bind {remote}: {error}"))?;
-        let task = tokio::spawn(async move {
+impl GuestForward {
+    fn serve(guest: &Path, host: PathBuf) -> Self {
+        let listener = UnixListener::bind(guest).expect("bind guest forward");
+        Self(tokio::spawn(async move {
             while let Ok((mut inbound, _)) = listener.accept().await {
-                let local = local.clone();
+                let host = host.clone();
                 tokio::spawn(async move {
-                    if let Ok(mut outbound) = tokio::net::UnixStream::connect(&local).await {
+                    if let Ok(mut outbound) = tokio::net::UnixStream::connect(&host).await {
                         let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
                     }
                 });
             }
-        });
-        Ok(Box::new(ProxyProcess { task: Some(task), listener_path: PathBuf::from(remote) }))
+        }))
     }
 }
+
+impl Drop for GuestForward {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+const VESSEL: &str = "demo-work";
 
 struct Fixture {
     server_task: JoinHandle<Result<(), String>>,
     shutdown: tokio::sync::watch::Sender<bool>,
     daemon: Arc<flotilla_core::in_process::InProcessDaemon>,
-    reach: AgentlessReach,
-    target: ReachTarget,
+    service: EnvironmentSocketService,
     environment: String,
+    /// The crews' `FLOTILLA_DAEMON_SOCKET` on the host.
+    guest: PathBuf,
+    forward: GuestForward,
     _tmp: tempfile::TempDir,
     _sockets: TestSocketDir,
     _home: TestSocketDir,
@@ -154,25 +95,20 @@ impl Fixture {
         }
         // The fixture's crews run in the daemon's own environment so the
         // artifact dispatcher can read their files through a real runner, as it
-        // reads an agentless host's files through its SSH runner.
+        // reads an agentless crew's files through its vessel's agent.
         let environment = daemon.local_environment_id().to_string();
         for crew in crews {
             place_crew(&daemon, &environment, PlacedCrew { ..*crew }).await;
         }
         let home = TestSocketDir::new();
-        let own_cli = home.path().join("controller-flotilla");
-        std::fs::write(&own_cli, "#!/bin/sh\n").expect("controller cli");
-        let ssh = Arc::new(ProxySsh { relay: relay(&socket_path), spawns: StdMutex::new(Vec::new()) });
-        let reach = AgentlessReach::new(ssh, service, CliSource::new(Ok(own_cli), "test-generation"), ForwardTiming::default());
-        let target = ReachTarget {
-            environment: EnvironmentId::new(environment.clone()),
-            destination: "crew@b1".into(),
-            remote: Arc::new(ProcessCommandRunner),
-            env_bag: EnvironmentBag::new()
-                .with(EnvironmentAssertion::env_var("HOME", home.path().to_string_lossy()))
-                .with(EnvironmentAssertion::env_var("XDG_RUNTIME_DIR", home.path().join("run").to_string_lossy())),
+        let endpoint = service.prepare_vessel_forwarded(EnvironmentId::new(environment.clone()), VESSEL).await.expect("vessel socket");
+        let target = match relay(&socket_path) {
+            Relay::AsRequested => endpoint.as_path().to_path_buf(),
+            Relay::MainSocket(main) => main,
         };
-        Self { server_task, shutdown, daemon, reach, target, environment, _tmp: tmp, _sockets: sockets, _home: home }
+        let guest = home.path().join("flotilla.sock");
+        let forward = GuestForward::serve(&guest, target);
+        Self { server_task, shutdown, daemon, service, environment, guest, forward, _tmp: tmp, _sockets: sockets, _home: home }
     }
 
     /// The crew side: what `flotilla` on the host does with `FLOTILLA_DAEMON_SOCKET`.
@@ -199,7 +135,8 @@ impl Fixture {
     }
 
     async fn stop(self) {
-        self.reach.retire(&self.target.environment).await.expect("retire forward");
+        drop(self.forward);
+        self.service.remove_vessel(&EnvironmentId::new(self.environment.clone()), VESSEL).await.expect("retire vessel socket");
         self.shutdown.send(true).expect("shutdown");
         self.server_task.await.expect("server task").expect("server stops");
     }
@@ -275,13 +212,10 @@ async fn non_crew_requests_refused(fixture: &Fixture, socket: &Path) -> Result<(
 #[tokio::test]
 async fn single_crew_acts_through_the_forward() {
     let fixture = Fixture::new(|_| Relay::AsRequested, &[OWN]).await;
-    let paths = fixture.reach.prepare_session(&fixture.target).await.expect("forward up");
-    assert!(paths.remote_socket.exists(), "the reverse listener exists on the host");
-    assert!(paths.cli_directory.join("flotilla").exists(), "the controller's CLI was delivered");
 
     // No claims at all: the single placed crew is the caller, even though the
-    // kernel peer of the environment socket is the controller's own ssh client.
-    let session = fixture.connect(&paths.remote_socket, &[]).await;
+    // kernel peer of the vessel socket is the controller's own agent client.
+    let session = fixture.connect(&fixture.guest, &[]).await;
     let hook = AgentHookEvent::builder()
         .attachable_id(AttachableId::new("forged"))
         .harness(AgentHarness::ClaudeCode)
@@ -310,7 +244,7 @@ async fn single_crew_acts_through_the_forward() {
     let artifacts = fixture.daemon.resource_backend().using::<flotilla_resources::Artifact>("flotilla").list().await.expect("artifacts");
     assert!(artifacts.items.iter().any(|artifact| artifact.spec.convoy == OWN.convoy && artifact.spec.kind == "review-round"));
 
-    non_crew_requests_refused(&fixture, &paths.remote_socket).await.expect("not crew-scoped requests are refused");
+    non_crew_requests_refused(&fixture, &fixture.guest).await.expect("not crew-scoped requests are refused");
     drop(session);
     fixture.stop().await;
 }
@@ -321,14 +255,13 @@ async fn single_crew_acts_through_the_forward() {
 #[tokio::test]
 async fn two_crews_on_one_host_are_distinguished_by_in_band_claims() {
     let fixture = Fixture::new(|_| Relay::AsRequested, &[OWN, SECOND]).await;
-    let paths = fixture.reach.prepare_session(&fixture.target).await.expect("forward up");
 
-    let anonymous = fixture.connect(&paths.remote_socket, &[]).await;
+    let anonymous = fixture.connect(&fixture.guest, &[]).await;
     assert!(refusal(request(&anonymous, 1, Request::ArtifactList { convoy: None, kind: None, subject: None }).await)
         .starts_with("CallerIdentityAmbiguous:"));
 
-    let own = fixture.connect(&paths.remote_socket, &[("FLOTILLA_CREW_ID", OWN.crew), ("FLOTILLA_CONVOY", OWN.convoy)]).await;
-    let second = fixture.connect(&paths.remote_socket, &[("FLOTILLA_TERMINAL_SESSION", SECOND.session)]).await;
+    let own = fixture.connect(&fixture.guest, &[("FLOTILLA_CREW_ID", OWN.crew), ("FLOTILLA_CONVOY", OWN.convoy)]).await;
+    let second = fixture.connect(&fixture.guest, &[("FLOTILLA_TERMINAL_SESSION", SECOND.session)]).await;
     promise(&own, 2, "from-own").await;
     promise(&second, 3, "from-second").await;
     assert!(promised(&fixture.daemon, OWN.convoy, "from-own").await);
@@ -337,7 +270,7 @@ async fn two_crews_on_one_host_are_distinguished_by_in_band_claims() {
     assert!(!promised(&fixture.daemon, SECOND.convoy, "from-own").await);
 
     for claims in [[("FLOTILLA_CREW_ID", "foreign-crew")], [("FLOTILLA_CONVOY", "foreign-convoy")]] {
-        let foreign = fixture.connect(&paths.remote_socket, &claims).await;
+        let foreign = fixture.connect(&fixture.guest, &claims).await;
         assert!(refusal(request(&foreign, 4, Request::ArtifactList { convoy: None, kind: None, subject: None }).await)
             .starts_with("CallerIdentityMismatch:"));
     }
@@ -347,12 +280,11 @@ async fn two_crews_on_one_host_are_distinguished_by_in_band_claims() {
 }
 
 // #3618 mutation check: routing the forward to the main socket instead of the
-// environment socket makes the "not crew-scoped is refused" scenario fail.
+// vessel's environment socket makes the "not crew-scoped is refused" scenario fail.
 #[tokio::test]
 async fn forward_to_the_main_socket_fails_the_refusal_scenario() {
     let fixture = Fixture::new(|main| Relay::MainSocket(main.to_path_buf()), &[OWN]).await;
-    let paths = fixture.reach.prepare_session(&fixture.target).await.expect("forward up");
-    let error = non_crew_requests_refused(&fixture, &paths.remote_socket).await.expect_err("main socket admits GetStatus");
+    let error = non_crew_requests_refused(&fixture, &fixture.guest).await.expect_err("main socket admits GetStatus");
     assert!(error.contains("request 1 was not refused"), "{error}");
     fixture.stop().await;
 }

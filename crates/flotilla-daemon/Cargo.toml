@@ -92,6 +92,8 @@ drydock-protocol.workspace = true
 libc = { workspace = true }
 
 [dev-dependencies]
+drydock-agent.workspace = true
+drydock-transport.workspace = true
 flotilla-forge-github = { path = "../flotilla-forge-github" }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
 rigging-replay-testkit = { workspace = true }
