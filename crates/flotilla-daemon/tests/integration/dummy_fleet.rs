@@ -141,6 +141,16 @@ impl DummyDaemon {
             )
             .await
             .expect("dummy placement policy");
+        backend
+            .clone()
+            .using::<flotilla_resources::FulfilmentKind>(NAMESPACE)
+            .create(
+                &InputMeta::builder().name(DUMMY_PLACEMENT_POLICY.into()).build(),
+                &flotilla_resources::FulfilmentKindSpec::from_policy(&catalog::placement_policy(&host.metadata.name), "linux")
+                    .expect("dummy fulfilment"),
+            )
+            .await
+            .expect("dummy fulfilment kind");
         for mix in CrewMix::ALL {
             backend
                 .clone()
@@ -552,4 +562,191 @@ async fn on_the_engine_a_stalled_coder_resumes_and_delivers() {
     fleet.wait_for_phase("engine-resume-proof", ConvoyPhase::Landed).await;
     let engine = primitives.convoys().get(&convoy.metadata.name).expect("engine Convoy after resume");
     assert!(matches!(engine.state(), ConvoyState::Delivered { .. }), "the engine convoy delivers: {engine:?}");
+}
+
+// A lone coder delivers its engine Convoy after realising the engine's vessel,
+// environment, checkout and terminal-session records through the daemon runtime.
+#[tokio::test(start_paused = true)]
+async fn on_the_engine_a_lone_coder_realises_its_resources_and_delivers() {
+    use flotilla_provisioning::stored::{checkout, environment, terminal_session};
+    use flotilla_state_machines::{
+        machines::{convoy::ConvoyState, lifecycle::LifecycleState, vessel::Vessel},
+        Resource,
+    };
+
+    let fleet = DummyDaemon::start_on_primitives(SCENARIO_AGENT, "").await;
+    fleet.dispatch("engine-lone-proof", CrewMix::Coder).await;
+    let convoy = fleet.wait_for_phase("engine-lone-proof", ConvoyPhase::Landed).await;
+    let engine = fleet.daemon.message_primitives().expect("engine path").convoys().get(&convoy.metadata.name).expect("engine Convoy");
+    assert!(matches!(engine.state(), ConvoyState::Delivered { .. }), "the engine convoy delivers: {engine:?}");
+    let service = fleet.daemon.decided_store().expect("decided store");
+    service
+        .with_store(|store| {
+            let home = store.home().to_string();
+            let mut read = store.read()?;
+            macro_rules! realised {
+                ($kind:ty) => {{
+                    let page = read.scan::<Resource<$kind>>(&home, None, 64)?;
+                    assert!(!page.ids.is_empty(), "missing {} engine records", stringify!($kind));
+                    for id in page.ids {
+                        let record = read.load::<Resource<$kind>>(id)?.expect("engine record").value;
+                        assert!(
+                            matches!(record.state(), LifecycleState::Realised { .. } | LifecycleState::Gone),
+                            "unrealised engine record: {record:?}"
+                        );
+                    }
+                }};
+            }
+            realised!(environment::Environment);
+            realised!(checkout::Checkout);
+            realised!(terminal_session::TerminalSession);
+            assert!(!read.scan::<Resource<Vessel>>(&home, None, 64)?.ids.is_empty(), "the engine holds the placement vessel");
+            Ok(())
+        })
+        .expect("read engine provisioning records");
+}
+
+// An environment that cannot realise must record its failure in the engine
+// and launch no engine TerminalSession; an old-store Failed phase alone is insufficient.
+#[tokio::test(start_paused = true)]
+async fn on_the_engine_an_unrealised_environment_records_failure_without_a_terminal() {
+    use flotilla_provisioning::stored::{environment::Environment, terminal_session::TerminalSession};
+    use flotilla_state_machines::{machines::lifecycle::LifecycleState, Resource};
+
+    let fleet = DummyDaemon::start_on_primitives(SCENARIO_AGENT, "failure_rate = 1.0\n").await;
+    fleet.dispatch("engine-environment-failure", CrewMix::Coder).await;
+    let convoy = fleet.wait_for_phase("engine-environment-failure", ConvoyPhase::Failed).await;
+    let engine = fleet.daemon.message_primitives().expect("engine path").convoys().get(&convoy.metadata.name).expect("engine Convoy");
+    assert!(!engine.spec().promises.is_empty(), "the engine retains the unmet convoy obligations");
+    fleet
+        .daemon
+        .decided_store()
+        .expect("decided store")
+        .with_store(|store| {
+            let home = store.home().to_string();
+            let mut read = store.read()?;
+            let environments = read.scan::<Resource<Environment>>(&home, None, 64)?;
+            assert!(!environments.ids.is_empty(), "the engine records the failed environment");
+            let mut failed = 0;
+            for id in environments.ids {
+                let record = read.load::<Resource<Environment>>(id)?.expect("environment").value;
+                if record.spec().holder.is_some() {
+                    assert!(matches!(record.state(), LifecycleState::GaveUp { .. }), "engine failure: {record:?}");
+                    failed += 1;
+                }
+            }
+            assert_eq!(failed, 1, "one vessel environment failed");
+            assert!(read.scan::<Resource<TerminalSession>>(&home, None, 64)?.ids.is_empty(), "no engine terminal launches");
+            Ok(())
+        })
+        .expect("read engine terminals");
+}
+
+// A standing Ensure binds an admitted engine convoy. Abandoning that convoy
+// must let the same Ensure bind a fresh generation without losing its history.
+#[tokio::test(start_paused = true)]
+#[ignore = "engine Convoy admission explicitly skips standing convoys pending seat growth/import; awaiting owner ruling"]
+async fn on_the_engine_a_standing_ensure_readmits_after_abandon() {
+    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec};
+    use flotilla_schema::Intern;
+    use flotilla_state_machines::{
+        machines::ensure::{Ensure, EnsureState},
+        Resource,
+    };
+
+    let fleet = DummyDaemon::start_on_primitives(SCENARIO_AGENT, "").await;
+    let workflows = fleet.backend().using::<WorkflowTemplate>(NAMESPACE);
+    let mut standing = CrewMix::Coder.workflow(LONG_RUNNER_TURNS);
+    standing.exit = None;
+    workflows.create(&InputMeta::builder().name("engine-standing-workflow".into()).build(), &standing).await.expect("standing workflow");
+    let forge = catalog::forge(&fleet.fleet.config().forge_service_url);
+    let repository = catalog::repository(&forge).expect("repository");
+    let projects = fleet.backend().using::<flotilla_resources::Project>(NAMESPACE);
+    let project = projects.get("fleet").await.expect("project");
+    let mut project_spec = project.spec;
+    project_spec.repositories = vec![flotilla_resources::ProjectRepositorySpec::builder().repo(repository.key()).build()];
+    projects
+        .update(&InputMeta::builder().name("fleet".into()).build(), &project.metadata.resource_version, &project_spec)
+        .await
+        .expect("project membership");
+    fleet
+        .backend()
+        .using::<ConvoyEnsure>(NAMESPACE)
+        .create(
+            &InputMeta::builder()
+                .name("engine-standing".into())
+                .annotations(std::collections::BTreeMap::from([(
+                    flotilla_charter::ops_entry::SOURCE_COMMIT_ANNOTATION.into(),
+                    "fixture".into(),
+                )]))
+                .build(),
+            &ConvoyEnsureSpec::builder()
+                .project_ref("fleet".into())
+                .role("governor".into())
+                .workflow_ref("engine-standing-workflow".into())
+                .placement_policy(DUMMY_PLACEMENT_POLICY.into())
+                .repositories(vec![repository.key()])
+                .build(),
+        )
+        .await
+        .expect("standing ensure");
+    let service = fleet.daemon.decided_store().expect("decided store");
+    let bound = || {
+        service
+            .with_store(|store| {
+                let home = store.home().to_string();
+                let mut read = store.read()?;
+                let Some(id) = read.resolve(<Resource<Ensure> as flotilla_schema::Kind>::CODE, "engine-standing", &home)? else {
+                    return Ok(None);
+                };
+                Ok(read.load::<Resource<Ensure>>(id)?.and_then(|loaded| match loaded.value.state() {
+                    EnsureState::Fulfilled { bound, .. } => Some(bound.clone()),
+                    _ => None,
+                }))
+            })
+            .expect("read engine Ensure")
+    };
+    let first = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(bound) = bound() {
+                break bound;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    let first = match first {
+        Ok(first) => first,
+        Err(error) => panic!(
+            "engine Ensure binds its first convoy: {error}; {:?}",
+            fleet.backend().using::<ConvoyEnsure>(NAMESPACE).get("engine-standing").await.map(|ensure| ensure.status)
+        ),
+    };
+    let name = first.as_str();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while fleet.daemon.message_primitives().expect("engine path").convoys().get(name).is_none() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the bound convoy is admitted on the engine");
+    let abandoned = fleet
+        .execute_as_operator(CommandAction::ConvoyAbandon {
+            namespace: Some(NAMESPACE.into()),
+            name: name.into(),
+            reason: "exercise standing re-admission".into(),
+        })
+        .await;
+    assert!(!matches!(abandoned, CommandValue::Error { .. }), "{abandoned:?}");
+    let second = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(next) = bound().filter(|next| next != &first) {
+                break next;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("engine Ensure binds a fresh convoy after abandon");
+    assert_ne!(first, second);
 }
