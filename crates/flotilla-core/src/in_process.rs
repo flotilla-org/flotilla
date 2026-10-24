@@ -5507,8 +5507,8 @@ impl InProcessDaemon {
 
     pub async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String> {
         let namespace = requested_namespace.map(ToOwned::to_owned).unwrap_or(self.provisioning_namespace().await);
-        let mut explanation = self.read_projections().explain_convoy(&namespace, name).await?;
-        match self.convoy_dispatch_scores(&namespace, &explanation.convoy).await {
+        let (mut explanation, convoy) = self.read_projections().explain_convoy_with_resource(&namespace, name).await?;
+        match self.convoy_dispatch_scores(&namespace, &convoy).await {
             Ok(scores) => explanation.dispatch_scores = scores,
             Err(error) => explanation.dispatch_score_error = Some(error),
         }
@@ -5518,15 +5518,9 @@ impl InProcessDaemon {
     async fn convoy_dispatch_scores(
         &self,
         namespace: &str,
-        name: &str,
+        convoy: &ResourceObject<ResourceConvoy>,
     ) -> Result<BTreeMap<String, flotilla_protocol::DispatchScore>, String> {
         use flotilla_admission::dispatch_missions::{issue_from_convoy, MissionBoard, MissionOccupancy};
-        let convoy = self
-            .resource_backend
-            .query_declared::<ResourceConvoy>(namespace, &flotilla_store::StoreQuery::names([name.to_string()], true))
-            .await
-            .map_err(|e| e.to_string())?;
-        let convoy = &convoy.items.first().ok_or("convoy disappeared")?.object;
         let Some(project_name) = &convoy.spec.project_ref else {
             return Ok(BTreeMap::new());
         };

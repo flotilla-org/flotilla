@@ -6,7 +6,7 @@ use std::time::Duration;
 use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
-use flotilla_resources::{Convoy as ResourceConvoy, ConvoySpec, Project, ProjectSpec};
+use flotilla_resources::{Convoy as ResourceConvoy, ConvoySpec, InputMeta, Project, ProjectSpec, PROJECT_LABEL, ROLE_LABEL};
 use flotilla_store::ResourceBackend;
 
 use super::support::{test_meta, SuspendedBoardProvider};
@@ -170,7 +170,10 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
     backend
         .using::<ResourceConvoy>("flotilla")
         .create(
-            &test_meta("explained"),
+            &InputMeta::builder()
+                .name("convoy-explained".into())
+                .labels(std::collections::BTreeMap::from([(ROLE_LABEL.into(), "explained".into()), (PROJECT_LABEL.into(), "large".into())]))
+                .build(),
             &ConvoySpec::builder()
                 .workflow_ref("workflow".into())
                 .project_ref("large".into())
@@ -189,15 +192,19 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
         )
         .await
         .expect("explained convoy");
-    let explanation = tokio::time::timeout(Duration::from_secs(1), daemon.explain_convoy_internal(Some("flotilla"), "explained"))
-        .await
-        .expect("explain stays local")
-        .expect("explanation");
-    assert_eq!(explanation.dispatch_score_error, None);
-    let score = &explanation.dispatch_scores["https://github.com/org/large#0"];
-    assert_eq!(score.attributes.priority, flotilla_protocol::Priority::Urgent);
-    assert_eq!(score.attribute_sources["priority"], "ticket_label");
-    assert_eq!(f64::from(score.attributes.weight), 2.0);
-    assert_eq!(score.mission_active_crews, 1);
-    assert_eq!(score.project_active_crews, 401);
+    // A live convoy's score is independent of whether its address is a record name, role or qualified role.
+    for address in ["convoy-explained", "explained", "explained@large"] {
+        let explanation = tokio::time::timeout(Duration::from_secs(1), daemon.explain_convoy_internal(Some("flotilla"), address))
+            .await
+            .expect("explain stays local")
+            .expect("explanation");
+        assert_eq!(explanation.convoy, address);
+        assert_eq!(explanation.dispatch_score_error, None);
+        let score = &explanation.dispatch_scores["https://github.com/org/large#0"];
+        assert_eq!(score.attributes.priority, flotilla_protocol::Priority::Urgent);
+        assert_eq!(score.attribute_sources["priority"], "ticket_label");
+        assert_eq!(f64::from(score.attributes.weight), 2.0);
+        assert_eq!(score.mission_active_crews, 1);
+        assert_eq!(score.project_active_crews, 401);
+    }
 }
