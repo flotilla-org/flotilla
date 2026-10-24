@@ -28,7 +28,7 @@ use flotilla_resources::{
     ManifestRoot, ObjectEvent, PlacementPolicy, Project, ReadResourceObject, Repository, Resource, ResourceError, ResourceObject,
     ResourceProvenance, WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE,
 };
-use flotilla_store::{apply_status_patch as apply_resource_status_patch, EventRecorder, ResourceBackend};
+use flotilla_store::{apply_status_patch as apply_resource_status_patch, EventRecorder, ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -199,7 +199,7 @@ impl EnsurePass<'_> {
                         .resource_backend
                         .query_declared::<ManifestRoot>(
                             namespace,
-                            &flotilla_store::StoreQuery {
+                            &StoreQuery {
                                 fields: BTreeMap::from([("spec.host".into(), root.clone())]),
                                 include_replicas: true,
                                 ..Default::default()
@@ -218,8 +218,10 @@ impl EnsurePass<'_> {
         // merged object as local, including when all its sources are replicas.
         let sources = self
             .resource_backend
-            .query_declared::<ConvoyEnsure>(namespace, &flotilla_store::StoreQuery::names([ensure.metadata.name.clone()], true))
+            .query_declared::<ConvoyEnsure>(namespace, &StoreQuery::names([ensure.metadata.name.clone()], true))
             .await?;
+        // Replication preserves each origin's creation_timestamp; it never
+        // substitutes the replica's arrival time. Reapplications create later sources.
         let first = sources.items.into_iter().filter(|source| source.object.metadata.deletion_timestamp.is_none()).min_by_key(|source| {
             let origin = match &source.provenance {
                 ResourceProvenance::Local => &local_root,
@@ -430,7 +432,7 @@ impl EnsurePass<'_> {
     async fn ensured_convoy_generations(&self, namespace: &str, name: &str) -> Result<Vec<ResourceObject<ResourceConvoy>>, String> {
         self.resource_backend
             .using::<ResourceConvoy>(namespace)
-            .query_declared(&flotilla_store::StoreQuery {
+            .query_declared(&StoreQuery {
                 fields: BTreeMap::from([(format!("metadata.annotations.\"{ENSURED_FROM_ANNOTATION}\""), name.into())]),
                 ..Default::default()
             })
