@@ -6,18 +6,23 @@ Both launches used `CliAgentAdapter::prepare_with_environment` and `launch`,
 through `crates/flotilla-agent/examples/stage_codex_crew.rs`. The staged roots
 were `/tmp/codex-3823-before` and `/tmp/codex-3823-after`.
 
-## Acceptance gap
+## Revised acceptance
 
-The original duplicate delivery reproduces, but the reported **Hooks need
-review** prompt does not. Both the unrestricted baseline and a separate
-baseline with `fulfilment_grants = Some(empty)` start without hook review.
-Codex discovery reports 14 enabled, trusted hooks on the unpatched baseline.
-The captures are real observations, and do not claim to show the requested
-before-fix review prompt. The operator authorized opening the PR with this
-limitation after one further same-home relaunch check. That check also did not
-reproduce hook review before or after the fix. The fresh-crew check on feta
-after the roll remains the operator acceptance step, tracked in
-[follow-up #3827](https://github.com/flotilla-org/flotilla/issues/3827).
+The operator confirmed that the fleet already carries the earlier trust fix,
+which explains why the unpatched launches no longer show **Hooks need review**.
+The before-fix prompt capture is no longer required. Acceptance is a real
+unpatched launch showing duplicate hook definitions or firing, followed by a
+real patched launch showing one definition and one firing per occurrence,
+with all seven hooks trusted.
+
+The recorded runs meet that revised acceptance: native discovery reports
+14 enabled, trusted hooks before and seven after; the sink records duplicate
+firing before and once-per-occurrence firing after. Fresh and same-home
+exit/relaunch runs both show the same delivery difference. Both composers
+become ready, with no hook-review prompt.
+
+The fresh-crew check on feta after the roll remains the operator step, tracked
+in [follow-up #3827](https://github.com/flotilla-org/flotilla/issues/3827).
 
 ## Exact conditions tried
 
