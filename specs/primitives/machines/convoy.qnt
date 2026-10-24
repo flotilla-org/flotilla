@@ -98,6 +98,7 @@ module convoy {
     | Open(w) => w | Delivered(w) => w | Abandoned(a) => a.work
   }
   pure def open(p: PromiseRecord): bool = p.state == Pending or p.state == Submitted
+  pure def openPromises(w: Work): Set[PromiseId] = w.promises.keys().filter(p => open(w.promises.get(p)))
   // Retraction authority follows the source; an operator may retract anything.
   // A crew-declared promise is its owner's alone before any submission, and
   // its owner's supervisor's after.
@@ -128,23 +129,20 @@ module convoy {
     | _ => false
   }
   pure def holdingDuties(w: Work): Set[DutyId] = w.spec.duties.keys().filter(d => lifetime(w.spec.duties.get(d)) and not(w.retired.contains(d)))
-  // What a seat still holds: its open promises and its duties that have not ended.
-  pure def seatPromises(w: Work, seat: Seat): Set[PromiseId] =
-    w.promises.keys().filter(p => w.promises.get(p).owner == seat and open(w.promises.get(p)))
   pure def liveDuty(w: Work, d: DutyId): bool = match w.spec.duties.get(d).scope {
     | Lifetime => not(w.retired.contains(d))
-    | WhileOpen(ps) => ps.exists(p => w.promises.keys().contains(p) and open(w.promises.get(p)))
+    | WhileOpen(ps) => ps.exists(p => openPromises(w).contains(p))
   }
+  // What a seat still holds: its open promises and its duties that have not ended.
+  pure def seatPromises(w: Work, seat: Seat): Set[PromiseId] = openPromises(w).filter(p => w.promises.get(p).owner == seat)
   pure def seatDuties(w: Work, seat: Seat): Set[DutyId] =
     w.spec.duties.keys().filter(d => w.spec.duties.get(d).owner == seat and liveDuty(w, d))
-  pure def retiredSeat(w: Work, seat: Seat): bool = w.retiredSeats.contains(seat)
   // The next generation: the seats not retired, each at the root where its
   // parent retired; the holding duties; and no promises, their ids left below the floor.
   pure def nextGeneration(w: Work): Work = {
     val live = w.seats.keys().exclude(w.retiredSeats)
-    val standing = holdingDuties(w)
     { ...w,
-      spec: { ...w.spec, duties: standing.mapBy(d => w.spec.duties.get(d)) },
+      spec: { ...w.spec, duties: holdingDuties(w).mapBy(d => w.spec.duties.get(d)) },
       seats: live.mapBy(s => { ...w.seats.get(s), parent: match w.seats.get(s).parent {
         | Root => Root
         | Under(q) => if (live.contains(q)) Under(q) else Root
@@ -153,6 +151,7 @@ module convoy {
       promiseFloor: w.promises.keys().fold(w.promiseFloor, (m, p) => if (p + 1 > m) p + 1 else m) }
   }
   pure def withPromise(w: Work, id: PromiseId, p: PromiseRecord): Next = Moved(Open({ ...w, promises: w.promises.put(id, p) }))
+  pure def withSeat(w: Work, seat: Seat, r: SeatRecord): Next = Moved(Open({ ...w, seats: w.seats.put(seat, r) }))
   // Refusal order for a promise: unknown, then settled, then the edge's rule.
   pure def onOpen(w: Work, id: PromiseId, rule: PromiseRecord => Next): Next =
     if (not(w.promises.keys().contains(id))) Refused(UnknownPromise)
@@ -162,7 +161,7 @@ module convoy {
     | Open(w) => match e {
       | Declare(d) => if (w.promises.keys().contains(d.promise) or d.promise < w.promiseFloor) Refused(PromiseExists)
           else if (not(w.seats.keys().contains(d.owner))) Refused(UnknownSeat)
-          else if (retiredSeat(w, d.owner)) Refused(SeatRetired)
+          else if (w.retiredSeats.contains(d.owner)) Refused(SeatRetired)
           else withPromise(w, d.promise, { promise: d.definition, source: Crew, owner: d.owner, state: Pending, submissions: [] })
       | Submit(a) => onOpen(w, a.promise, p =>
           if (a.by != p.owner) Refused(NotOwner)
@@ -184,7 +183,7 @@ module convoy {
       | Reassign(a) => onOpen(w, a.promise, p =>
           if (not(mayReassign(p, a.by, a.authority))) Refused(Unauthorised)
           else if (not(w.seats.keys().contains(a.to))) Refused(UnknownSeat)
-          else if (retiredSeat(w, a.to)) Refused(SeatRetired)
+          else if (w.retiredSeats.contains(a.to)) Refused(SeatRetired)
           else withPromise(w, a.promise, { ...p, owner: a.to }))
       | RetireDuty(a) => if (not(a.authorised)) Refused(Unauthorised)
           else if (not(holdingDuties(w).contains(a.duty))) Refused(UnknownDuty)
@@ -192,32 +191,30 @@ module convoy {
       | AddSeat(a) => if (not(a.authorised)) Refused(Unauthorised)
           else if (w.seats.keys().contains(a.seat)) Refused(SeatExists)
           else if (not(w.seats.keys().contains(a.parent))) Refused(UnknownSeat)
-          else if (retiredSeat(w, a.parent)) Refused(SeatRetired)
+          else if (w.retiredSeats.contains(a.parent)) Refused(SeatRetired)
           else if (w.seats.keys().size() >= SEAT_LIMIT) Refused(SeatsFull)
-          else Moved(Open({ ...w, seats: w.seats.put(a.seat, { parent: Under(a.parent), supervisedBy: a.supervisedBy, replacements: 0 }) }))
+          else withSeat(w, a.seat, { parent: Under(a.parent), supervisedBy: a.supervisedBy, replacements: 0 })
       // A retired seat may still be resupervised: that changes no ownership.
       | Resupervise(a) => if (not(a.authorised)) Refused(Unauthorised)
           else if (not(w.seats.keys().contains(a.seat))) Refused(UnknownSeat)
-          else Moved(Open({ ...w, seats: w.seats.put(a.seat, { ...w.seats.get(a.seat), supervisedBy: a.supervisedBy }) }))
+          else withSeat(w, a.seat, { ...w.seats.get(a.seat), supervisedBy: a.supervisedBy })
       | RetireSeat(a) => if (not(a.authorised)) Refused(Unauthorised)
           else if (not(w.seats.keys().contains(a.seat))) Refused(UnknownSeat)
-          else if (retiredSeat(w, a.seat)) Refused(SeatRetired)
+          else if (w.retiredSeats.contains(a.seat)) Refused(SeatRetired)
           else if (seatPromises(w, a.seat).size() > 0) Refused(PromisesOutstanding(seatPromises(w, a.seat)))
           else if (seatDuties(w, a.seat).size() > 0) Refused(DutyHolds(seatDuties(w, a.seat)))
           else Moved(Open({ ...w, retiredSeats: w.retiredSeats.union(Set(a.seat)) }))
       // Only a standing convoy rolls over: the next generation needs an
       // obligation, as admission does, and carries no promise over.
-      | Rollover(a) => val outstanding = w.promises.keys().filter(p => open(w.promises.get(p)))
-          if (not(a.authorised)) Refused(Unauthorised)
+      | Rollover(a) => if (not(a.authorised)) Refused(Unauthorised)
           else if (holdingDuties(w).size() == 0) Refused(NoObligations)
-          else if (outstanding.size() > 0) Refused(PromisesOutstanding(outstanding))
+          else if (openPromises(w).size() > 0) Refused(PromisesOutstanding(openPromises(w)))
           else Moved(Open(nextGeneration(w)))
       | ReplaceSeat(seat) => if (not(w.seats.keys().contains(seat))) Refused(UnknownSeat)
-          else if (retiredSeat(w, seat)) Refused(SeatRetired)
+          else if (w.retiredSeats.contains(seat)) Refused(SeatRetired)
           else if (w.seats.get(seat).replacements >= REPLACEMENT_LIMIT) Refused(ReplacementsExhausted)
-          else Moved(Open({ ...w, seats: w.seats.set(seat, { ...w.seats.get(seat), replacements: w.seats.get(seat).replacements + 1 }) }))
-      | Deliver => val outstanding = w.promises.keys().filter(p => open(w.promises.get(p)))
-          if (outstanding.size() > 0) Refused(PromisesOutstanding(outstanding))
+          else withSeat(w, seat, { ...w.seats.get(seat), replacements: w.seats.get(seat).replacements + 1 })
+      | Deliver => if (openPromises(w).size() > 0) Refused(PromisesOutstanding(openPromises(w)))
           else if (holdingDuties(w).size() > 0) Refused(DutyHolds(holdingDuties(w)))
           else Moved(Delivered(w))
       | Abandon(a) => if (not(a.authorised) or a.reason == "") Refused(Unauthorised)

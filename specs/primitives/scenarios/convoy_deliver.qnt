@@ -71,7 +71,7 @@ module convoy_deliver {
   val everyConvoyObliged = everyState(s => C::work(s).promises.keys().size() > 0 or C::work(s).spec.duties.keys().exists(d => C::lifetime(C::work(s).spec.duties.get(d))))
   // Delivered: no promise open, and no lifetime duty holding.
   val deliveredSettled = everyState(s => match s {
-    | Delivered(w) => w.promises.keys().forall(p => not(C::open(w.promises.get(p)))) and C::holdingDuties(w).size() == 0
+    | Delivered(w) => C::openPromises(w).size() == 0 and C::holdingDuties(w).size() == 0
     | _ => true
   })
   // Finality is checked through the rule interface: an operator, who may
@@ -130,7 +130,7 @@ module convoy_deliver {
   temporal liveness = Set(1).forall(id => weakFair(deliverReady(id), view) implies always(
     (match C::convoys.get(id) {
       | Present(s) => match s {
-          | Open(w) => w.promises.keys().forall(p => not(C::open(w.promises.get(p)))) and C::holdingDuties(w).size() == 0
+          | Open(w) => C::openPromises(w).size() == 0 and C::holdingDuties(w).size() == 0
           | _ => false
         }
       | Absent => false

@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -156,7 +156,7 @@
+@@ -155,7 +155,7 @@
    // Refusal order for a promise: unknown, then settled, then the edge's rule.
    pure def onOpen(w: Work, id: PromiseId, rule: PromiseRecord => Next): Next =
      if (not(w.promises.keys().contains(id))) Refused(UnknownPromise)

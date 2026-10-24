@@ -1,10 +1,10 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -214,7 +214,6 @@
+@@ -212,7 +212,6 @@
            else Moved(Open(nextGeneration(w)))
        | ReplaceSeat(seat) => if (not(w.seats.keys().contains(seat))) Refused(UnknownSeat)
-           else if (retiredSeat(w, seat)) Refused(SeatRetired)
+           else if (w.retiredSeats.contains(seat)) Refused(SeatRetired)
 -          else if (w.seats.get(seat).replacements >= REPLACEMENT_LIMIT) Refused(ReplacementsExhausted)
-           else Moved(Open({ ...w, seats: w.seats.set(seat, { ...w.seats.get(seat), replacements: w.seats.get(seat).replacements + 1 }) }))
-       | Deliver => val outstanding = w.promises.keys().filter(p => open(w.promises.get(p)))
-           if (outstanding.size() > 0) Refused(PromisesOutstanding(outstanding))
+           else withSeat(w, seat, { ...w.seats.get(seat), replacements: w.seats.get(seat).replacements + 1 })
+       | Deliver => if (openPromises(w).size() > 0) Refused(PromisesOutstanding(openPromises(w)))
+           else if (holdingDuties(w).size() > 0) Refused(DutyHolds(holdingDuties(w)))
