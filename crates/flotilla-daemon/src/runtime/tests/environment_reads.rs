@@ -104,11 +104,6 @@ async fn daemon_reads_environment_readiness_and_identity_without_a_copy() {
             last_environment = Some(environment);
         }
     }
-    assert!(std::thread::spawn(move || {
-        let _guard = store.lock().expect("healthy");
-        panic!("injected read failure");
-    })
-    .join()
-    .is_err());
+    flotilla_store_testkit::poison_mutex(store);
     assert!(environment_readiness(&daemon, &last_environment.expect("scenario")).await.err().expect("read error").contains("poisoned"));
 }

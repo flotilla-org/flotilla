@@ -49,12 +49,7 @@ async fn operator_reads_a_ready_clone_without_a_status_copy() {
     };
     assert_eq!(operator.reconcile_now(NAMESPACE, "clone", "source").await.expect("reconciled"), "Clone/source is already ready");
     assert!(clones.get("source").await.expect("old clone").status.is_none());
-    assert!(std::thread::spawn(move || {
-        let _guard = store.lock().expect("healthy store");
-        panic!("injected store lock failure");
-    })
-    .join()
-    .is_err());
+    flotilla_store_testkit::poison_mutex(store);
     assert!(operator.reconcile_now(NAMESPACE, "clone", "source").await.expect_err("read error").contains("poisoned"));
     assert!(clones.get("source").await.expect("old clone").status.is_none());
 }

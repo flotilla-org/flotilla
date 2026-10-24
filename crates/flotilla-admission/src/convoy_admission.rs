@@ -6039,12 +6039,7 @@ mod tests {
                 assert_eq!(cost().await.expect("ended"), ImageAcquisitionCost::Build);
             }
             assert_eq!(builds.get(&name).await.expect("unchanged").status, old_build.status);
-            assert!(std::thread::spawn(move || {
-                let _guard = store.lock().expect("healthy store");
-                panic!("injected store lock failure");
-            })
-            .join()
-            .is_err());
+            flotilla_store_testkit::poison_mutex(store);
             assert!(cost().await.expect_err("checked read failure").contains("poisoned"));
         }
     }

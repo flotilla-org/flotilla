@@ -1118,12 +1118,7 @@ fn image_build_health_reads_the_engine_without_copying_status() {
             }
             assert_eq!(build.status.as_ref().expect("status").phase, ImageBuildPhase::Built);
         }
-        assert!(std::thread::spawn(move || {
-            let _guard = store.lock().expect("healthy");
-            panic!("injected read failure");
-        })
-        .join()
-        .is_err());
+        flotilla_store_testkit::poison_mutex(store);
         let condition = image_build_failure_condition(&build, &reads).expect("read diagnostic");
         assert_eq!(condition.reason, "LifecycleReadFailed");
         assert!(condition.message.contains("poisoned"));

@@ -257,12 +257,7 @@ mod tests {
                     assert_eq!(inspector.verify_backing_dead(&convoy).await.is_ok(), !matches!(ending, "ready" | "lost"));
                 }
                 assert_eq!(envs.get("env").await.expect("old environment").status, Some(old_status));
-                assert!(std::thread::spawn(move || {
-                    let _guard = store.lock().expect("healthy");
-                    panic!("injected read failure");
-                })
-                .join()
-                .is_err());
+                flotilla_store_testkit::poison_mutex(store);
                 assert!(inspector.verify_backing_dead(&convoy).await.expect_err("read error").contains("poisoned"));
             }
         }

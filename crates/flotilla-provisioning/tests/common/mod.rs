@@ -564,12 +564,4 @@ pub fn engine_clones() -> EngineClones {
     }
 }
 
-/// Fault injection at the decided store's synchronization boundary.
-pub fn poison_store(store: Arc<std::sync::Mutex<flotilla_schema_sqlite::Store>>) {
-    assert!(std::thread::spawn(move || {
-        let _guard = store.lock().expect("healthy store");
-        panic!("injected store lock failure");
-    })
-    .join()
-    .is_err());
-}
+pub use flotilla_store_testkit::poison_mutex as poison_store;

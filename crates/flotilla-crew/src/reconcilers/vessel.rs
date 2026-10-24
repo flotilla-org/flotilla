@@ -2484,12 +2484,7 @@ mod tests {
                     }
                 }
                 assert_eq!(envs.get("env").await.expect("old environment").status, Some(old_status));
-                assert!(std::thread::spawn(move || {
-                    let _guard = store.lock().expect("healthy");
-                    panic!("injected read failure");
-                })
-                .join()
-                .is_err());
+                flotilla_store_testkit::poison_mutex(store);
                 assert!(reconciler.prepare(&vessel).await.expect_err("read error").to_string().contains("poisoned"));
             }
         }
