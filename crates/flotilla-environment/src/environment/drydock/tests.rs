@@ -107,14 +107,20 @@ pub(super) fn spec() -> flotilla_resources::EnvironmentSpec {
 // does not execute tools: in that state assert the production refusal, then
 // prepare its explicit fixture tools through the same Rust host API. Flotilla's
 // production prepare always uses build_tools_digest and has no override seam.
-async fn fixture_prepared(host: &HostFixture, provider: &DrydockEnvironmentProvider) -> PreparedEnvironment {
+async fn fixture_prepared(_: &HostFixture, provider: &DrydockEnvironmentProvider) -> PreparedEnvironment {
+    fixture_prepared_spec(provider, spec()).await
+}
+pub(super) async fn fixture_prepared_spec(
+    provider: &DrydockEnvironmentProvider,
+    input: flotilla_resources::EnvironmentSpec,
+) -> PreparedEnvironment {
     if ::drydock::launch::build_tools_digest().is_ok() {
-        return provider.prepare(&spec(), &Default::default()).await.unwrap();
+        return provider.prepare(&input, &Default::default()).await.unwrap();
     }
-    assert!(provider.prepare(&spec(), &Default::default()).await.err().expect("unpublished tools refuse").contains("tools image"));
-    let spec = spec().cloud_sandbox.unwrap();
-    let prepared = host
-        .client
+    assert!(provider.prepare(&input, &Default::default()).await.err().expect("unpublished tools refuse").contains("tools image"));
+    let spec = input.cloud_sandbox.unwrap();
+    let prepared = provider
+        .api
         .prepare(
             "reference",
             &wire::PrepareRequest {
@@ -185,7 +191,7 @@ async fn reference_lifecycle_through_environment_provider() {
     assert!(provider.list_backings().await.unwrap().is_empty());
 }
 // The Drydock checker invokes adapter lifecycle methods via an injected HTTP
-// executor. Streams retain the real host and preparation uses the published pin.
+// executor. Streams retain the real host; preparation follows the main reference fixture.
 #[tokio::test]
 async fn reference_passes_drydock_conformance() {
     let host = HostFixture::start().await;

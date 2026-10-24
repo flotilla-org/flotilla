@@ -28,8 +28,11 @@ host binaries and missing/rejected credentials remain advertised as not-ready.
 Settings are module-owned and passed through unchanged. No Daytona credential
 enters the vessel or its stored Environment record.
 
-Preparation uses `drydock::launch::build_tools_digest()` from the published
-Drydock pin `7f14b46c`. The reference suite takes this production digest path.
+Production preparation uses `drydock::launch::build_tools_digest()` from the
+workspace's Drydock pin. The reference suite follows that path when the pin's
+tools image is published. For an unpublished pin, it verifies production refusal
+then prepares explicit reference-only tools through the real host API, matching
+main's fixture behavior; production has no digest override.
 
 The base crew image must contain the required agent harnesses, Git, `tar`, `sh`,
 `awk`, and GNU coreutils (`du`, `df`, `stat`, `mktemp`), and support the module's SSH recipe. Opt-in lab forwarding also requires

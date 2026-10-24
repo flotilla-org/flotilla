@@ -28,7 +28,7 @@ impl HttpClient for AdapterHttp {
                             memory_bytes: body.size.memory_bytes,
                             disk_bytes: body.size.disk_bytes,
                         };
-                        let prepared = self.provider.prepare(&input, &Default::default()).await?;
+                        let prepared = tests::fixture_prepared_spec(&self.provider, input).await;
                         let wire = prepared.get::<Prepared>(&self.provider.owner)?.prepared.clone();
                         self.prepared.lock().await.insert(wire.id.clone(), prepared);
                         response = Some((200, serde_json::to_value(wire).unwrap()));
