@@ -682,7 +682,7 @@ mod tests {
     // HTTP audit (#1512): inventory/resource validation speaks the owned daemon
     // API over a local Unix socket. The socket integration tests below exercise
     // its actual server; no external-service stand-in or recorded replay applies.
-    use std::{path::Path, sync::Arc, time::Duration};
+    use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
     use flotilla_config::ConfigStore;
     use flotilla_daemon::server::DaemonServer;
@@ -698,6 +698,105 @@ mod tests {
         validate_path, validate_project_ops, VALIDATION_INSPECTION_HOST,
     };
 
+    fn import_gate_inventory(case: &str) -> BTreeMap<String, Vec<Value>> {
+        let document = |kind, name, spec, status| {
+            serde_json::json!({
+                "apiVersion":"flotilla.work/v1", "kind":kind,
+                "metadata":{"name":name,"namespace":"flotilla","resourceVersion":"1","creationTimestamp":"2026-10-19T00:00:00Z"},
+                "spec":spec,"status":status
+            })
+        };
+        let checkout = document(
+            "Checkout",
+            "observed",
+            serde_json::json!({
+                "kind":"observed","ref":"main","path":"/repo","repo_ref":"repo","host_ref":"host","is_main":true
+            }),
+            serde_json::json!({"phase":"Ready"}),
+        );
+        let terminal = document(
+            "TerminalSession",
+            "missing-identity",
+            serde_json::json!({
+                "env_ref":"env","role":"tool","source":{"kind":"tool","command":"true"},"cwd":"/repo","pool":"cleat"
+            }),
+            serde_json::json!({"phase":"Running"}),
+        );
+        let message = document(
+            "Message",
+            "message",
+            serde_json::json!({
+                "sender":"principal:alice","receiver":"flotilla/demo/work/coder","relation":"system","body":"hello"
+            }),
+            serde_json::json!({"phase":"accepted","since":"2026-10-19T00:00:00Z","acceptedSequence":1}),
+        );
+        let designation = document("FleetDesignation", "fleet", serde_json::json!({"project":"fleet"}), Value::Null);
+        BTreeMap::from([
+            ("checkouts".into(), if case == "observed-checkout" { vec![checkout] } else { vec![] }),
+            ("terminalsessions".into(), if case == "missing-identity" { vec![terminal] } else { vec![] }),
+            (
+                "messages".into(),
+                if matches!(case, "message-refusal" | "missing-designation") { vec![message.clone(), message] } else { vec![] },
+            ),
+            ("fleetdesignations".into(), if case == "message-refusal" { vec![designation] } else { vec![] }),
+        ])
+    }
+
+    // Stand-in for the resource HTTP process boundary. The inventory determines
+    // the expected requests; shutdown verifies all collections were fetched.
+    async fn serve_import_inventory(
+        socket: &std::path::Path,
+        inventory: BTreeMap<String, Vec<Value>>,
+    ) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::UnixListener,
+        };
+        let listener = UnixListener::bind(socket).unwrap();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let kinds: Vec<_> = inventory.keys().cloned().collect();
+        let namespaces: BTreeMap<_, _> = kinds.iter().map(|kind| (kind.clone(), vec!["flotilla"])).collect();
+        let mut responses =
+            BTreeMap::from([("/apis/flotilla.work/v1".to_string(), serde_json::json!({"kinds":kinds,"namespaces":namespaces}))]);
+        for (kind, items) in inventory {
+            responses.insert(format!("/apis/flotilla.work/v1/namespaces/flotilla/{kind}"), serde_json::json!({"items":items}));
+        }
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = tokio::select! {
+                    _ = &mut stopped => {
+                        assert!(responses.is_empty(), "unfetched collections: {:?}", responses.keys());
+                        return;
+                    }
+                    connection = listener.accept() => connection.unwrap(),
+                };
+                let mut request = Vec::new();
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with("GET "));
+                let path = request.split_whitespace().nth(1).unwrap().split('?').next().unwrap();
+                let body = responses.remove(path).unwrap_or_else(|| panic!("unexpected or duplicate request {path}"));
+                let body = body.to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        (stop, task)
+    }
+
     // Contract #3760: candidate config switches the gate, observed checkouts are
     // exempt, and every other refusal fails. Exhaust the finite on/off × store
     // matrix, including empty stores, duplicate Messages and a missing designation.
@@ -705,84 +804,18 @@ mod tests {
     // temporary-store restoration use the real rehearsal implementations.
     #[tokio::test]
     async fn candidate_import_gate_matrix() {
-        use tokio::{
-            io::{AsyncReadExt, AsyncWriteExt},
-            net::UnixListener,
-        };
         rigging_tls::install_default_provider();
         for enabled in [false, true] {
             for case in ["empty", "observed-checkout", "missing-identity", "message-refusal", "missing-designation"] {
                 let config_dir = tempfile::tempdir().unwrap();
                 std::fs::write(config_dir.path().join("daemon.toml"), if enabled { "[primitives]\n" } else { "" }).unwrap();
                 let config = ConfigStore::with_base(config_dir.path().to_path_buf()).load_daemon_config().unwrap();
-                let document = |kind, name, spec, status| {
-                    serde_json::json!({
-                        "apiVersion":"flotilla.work/v1", "kind":kind,
-                        "metadata":{"name":name,"namespace":"flotilla","resourceVersion":"1","creationTimestamp":"2026-10-19T00:00:00Z"},
-                        "spec":spec,"status":status
-                    })
-                };
-                let checkout = document(
-                    "Checkout",
-                    "observed",
-                    serde_json::json!({
-                        "kind":"observed","ref":"main","path":"/repo","repo_ref":"repo","host_ref":"host","is_main":true
-                    }),
-                    serde_json::json!({"phase":"Ready"}),
-                );
-                let terminal = document(
-                    "TerminalSession",
-                    "missing-identity",
-                    serde_json::json!({
-                        "env_ref":"env","role":"tool","source":{"kind":"tool","command":"true"},"cwd":"/repo","pool":"cleat"
-                    }),
-                    serde_json::json!({"phase":"Running"}),
-                );
-                let message = document(
-                    "Message",
-                    "message",
-                    serde_json::json!({
-                        "sender":"principal:alice","receiver":"flotilla/demo/work/coder","relation":"system","body":"hello"
-                    }),
-                    serde_json::json!({"phase":"accepted","since":"2026-10-19T00:00:00Z","acceptedSequence":1}),
-                );
-                let designation = document("FleetDesignation", "fleet", serde_json::json!({"project":"fleet"}), Value::Null);
                 let socket_dir = TestSocketDir::new();
                 let socket = socket_dir.socket_path("import-gate.sock");
-                let listener = UnixListener::bind(&socket).unwrap();
-                let server = tokio::spawn(async move {
-                    for _ in 0..5 {
-                        let (mut stream, _) = listener.accept().await.unwrap();
-                        let mut request = Vec::new();
-                        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                            let mut buffer = [0; 4096];
-                            let count = stream.read(&mut buffer).await.unwrap();
-                            assert!(count > 0);
-                            request.extend_from_slice(&buffer[..count]);
-                        }
-                        let request = String::from_utf8(request).unwrap();
-                        let path = request.split_whitespace().nth(1).unwrap();
-                        assert!(request.starts_with("GET "));
-                        let body = if path == "/apis/flotilla.work/v1" {
-                            serde_json::json!({"kinds":["checkouts","terminalsessions","messages","fleetdesignations"],
-                                "namespaces":{"checkouts":["flotilla"],"terminalsessions":["flotilla"],"messages":["flotilla"],"fleetdesignations":["flotilla"]}})
-                        } else if path.contains("/checkouts") {
-                            serde_json::json!({"items": if case == "observed-checkout" { vec![checkout.clone()] } else { vec![] }})
-                        } else if path.contains("/terminalsessions") {
-                            serde_json::json!({"items": if case == "missing-identity" { vec![terminal.clone()] } else { vec![] }})
-                        } else if path.contains("/messages") {
-                            serde_json::json!({"items": if matches!(case, "message-refusal" | "missing-designation") { vec![message.clone(),message.clone()] } else { vec![] }})
-                        } else if path.contains("/fleetdesignations") {
-                            serde_json::json!({"items": if case == "message-refusal" { vec![designation.clone()] } else { vec![] }})
-                        } else {
-                            panic!("unexpected request {path}");
-                        };
-                        let body = body.to_string();
-                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
-                    }
-                });
+                let (stop, server) = serve_import_inventory(&socket, import_gate_inventory(case)).await;
                 let probes = super::ValidationOptions { require_import: config.primitives.is_some(), ..Default::default() };
                 let result = super::validate_daemon_with_options(&socket, Some(&[]), None, &probes).await;
+                let _ = stop.send(());
                 tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
                 assert_eq!(
                     result.is_err(),

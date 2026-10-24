@@ -58,9 +58,17 @@ impl Documents {
         let mut report = ImportReport::default();
         let messages = self.decoded::<Message>("messages", &mut report);
         if messages.is_empty() {
+            // The supporting records below are dependencies of Message conversion,
+            // so this rehearsal does not inspect them without a decoded Message.
+            // General stored-record validation still checks their decodability.
             return report;
         }
         let designation = self.decoded::<FleetDesignation>("fleetdesignations", &mut report).into_iter().next();
+        if designation.is_none() && self.0.get("fleetdesignations").is_some_and(|records| !records.is_empty()) {
+            // The present designation already has a named decode refusal. Do not
+            // also describe it as missing for every Message that depends on it.
+            return report;
+        }
         let Some(Ok(roles)) = designation.map(|(designation, _)| FleetRoles::declared(&designation.spec.project)) else {
             let reason = "no FleetDesignation names the project the fleet roles live under".to_owned();
             report.refused.push(ImportRefusal { record: "FleetDesignation".into(), reason });
@@ -139,6 +147,25 @@ mod tests {
         let report = documents.rehearse("flotilla");
         assert_eq!(report.refused.len(), 1);
         assert_eq!(report.refused[0].record, "broken");
+        assert!(report.refused[0].reason.contains("does not decode"));
+    }
+
+    // Review #3821: an existing but undecodable designation produces its decode
+    // refusal once, without an additional missing-designation diagnostic.
+    #[test]
+    fn undecodable_designation_has_one_refusal() {
+        let mut documents = Documents::default();
+        documents.0.insert(
+            "messages".into(),
+            vec![
+                message("one", "system:turn-rules", "flotilla/demo/work/coder", "accepted", Value::Null),
+                message("two", "system:turn-rules", "flotilla/demo/work/coder", "accepted", Value::Null),
+            ],
+        );
+        documents.0.insert("fleetdesignations".into(), vec![serde_json::json!({"metadata":{"name":"fleet"},"spec":7})]);
+        let report = documents.rehearse("flotilla");
+        assert_eq!(report.refused.len(), 1, "{report:?}");
+        assert_eq!(report.refused[0].record, "fleet");
         assert!(report.refused[0].reason.contains("does not decode"));
     }
 

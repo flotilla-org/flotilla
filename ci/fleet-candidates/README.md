@@ -410,6 +410,8 @@ rehearsals only report. A missing FleetDesignation is reported once per namespac
 with Messages, rather than once per Message. Vessel imports follow the Q6 lease
 mapping; their refusals are not exempt. `--host` changes the inventory source,
 while the enforcing switch still comes from the candidate's local config directory.
+A malformed `daemon.toml` is a fatal validation error; it cannot silently disable
+the gate.
 
 Pulls are operator initiated and never move a fleet-wide desired-state pin:
 
