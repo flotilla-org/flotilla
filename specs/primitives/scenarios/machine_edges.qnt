@@ -15,13 +15,13 @@ module machine_edges {
     nondet matches = Set(false, true).oneOf()
     nondet transport = Set("turn", "notify", "mute").oneOf()
     nondet cause = Set("failure", "other").oneOf()
-    nondet outcome = Set(L::Succeeded).union(Set(true, false).map(r => L::Failed({ retryable: r, cause: "failure" }))).oneOf()
+    nondet outcome = Set(L::Succeeded).union(Set(true, false).map(r => L::AttemptFailed({ retryable: r, cause: "failure" }))).oneOf()
     any {
       all { L::request(1), A::unchanged, keepWorld },
       all { A::request(1), L::unchanged, keepWorld },
       all { L::realise(1, seen, matches), A::unchanged, keepWorld },
       all { L::release(1, seen), A::unchanged, keepWorld },
-      all { L::vanish(1, seen), A::unchanged, keepWorld },
+      all { L::vanish(1, seen, L::Lost), A::unchanged, keepWorld },
       all { attempt(outcome), A::unchanged },
       all { L::giveUp(1, cause), A::unchanged, keepWorld },
       all { A::attach(1, seen), L::unchanged, keepWorld },
@@ -44,7 +44,7 @@ module machine_edges {
   val gaveUpOnExhaustion = match L::resources.get(1) {
     | Present(s) => match s {
         | GaveUp(c) => tries.length() > 0 and (match tries[tries.length() - 1] {
-            | Failed(f) => f.cause == c and (not(f.retryable) or lastTwoFailed(tries))
+            | AttemptFailed(f) => f.cause == c and (not(f.retryable) or lastTwoFailed(tries))
             | Succeeded => false
           })
         | _ => true

@@ -4,8 +4,8 @@
            | Requested(_) => if (o.present and o.matches) Moved(Realised(o.identity)) else Refused(MissingEvidence)
            | _ => Refused(WrongState)
          }
--      | Release(o) => if (o.teardownComplete) Moved(Gone) else Refused(MissingEvidence)
-+      | Release(o) => if (o.teardownComplete and (match s { | Requested(_) => false | _ => true })) Moved(Gone) else Refused(MissingEvidence)
+-      | Release(o) => if (o.teardownComplete) Moved(Gone(Released)) else Refused(MissingEvidence)
++      | Release(o) => if (o.teardownComplete and (match s { | Requested(_) => false | _ => true })) Moved(Gone(Released)) else Refused(MissingEvidence)
        | Vanish(o) => match s {
-           | Realised(_) => if (o.absent) Moved(Gone) else Refused(MissingEvidence)
+           | Realised(_) => if (o.absent) Moved(Gone(Vanished({ cause: o.cause }))) else Refused(MissingEvidence)
            | _ => Refused(WrongState)

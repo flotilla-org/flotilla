@@ -2,36 +2,38 @@
 module lifecycle {
   // Policy bound in the model; backoff timing is outside this machine.
   pure val MAX_FAILURES = 2
-  type AttemptOutcome = Succeeded | Failed({ retryable: bool, cause: str })
+  type AttemptOutcome = Succeeded | AttemptFailed({ retryable: bool, cause: str })
   // Requested carries its attempts. A lifecycle has no Resume, so its one
   // window is the whole history.
-  type State = Requested(List[AttemptOutcome]) | Realised(str) | Gone | GaveUp(str)
+  type VanishCause = Lost | Failed(str)
+  type Ending = Released | Vanished({ cause: VanishCause })
+  type State = Requested(List[AttemptOutcome]) | Realised(str) | Gone(Ending) | GaveUp(str)
   type Event = Realise({ present: bool, matches: bool, identity: str })
-    | Release({ teardownComplete: bool }) | Vanish({ absent: bool })
+    | Release({ teardownComplete: bool }) | Vanish({ absent: bool, cause: VanishCause })
     | Attempted(AttemptOutcome) | GiveUp({ cause: str })
   type Refusal = Ended | WrongState | MissingEvidence
   type Next = Moved(State) | Refused(Refusal)
-  pure def failed(o: AttemptOutcome): bool = match o { | Failed(_) => true | Succeeded => false }
+  pure def failed(o: AttemptOutcome): bool = match o { | AttemptFailed(_) => true | Succeeded => false }
   // Ensure's exhaustion rule: only the failures after the latest success
   // count, and a failure that is not retryable exhausts at once.
   pure def failureCount(h: List[AttemptOutcome]): int = h.indices().filter(i =>
     failed(h[i]) and not(h.indices().exists(j => j > i and not(failed(h[j]))))).size()
   pure def exhausted(h: List[AttemptOutcome]): bool = failureCount(h) >= MAX_FAILURES or
-    (h.length() > 0 and (match h[h.length() - 1] { | Failed(f) => not(f.retryable) | _ => false }))
+    (h.length() > 0 and (match h[h.length() - 1] { | AttemptFailed(f) => not(f.retryable) | _ => false }))
   // The cause of the last attempt, when it failed.
   pure def lastCauseIs(h: List[AttemptOutcome], cause: str): bool =
-    h.length() > 0 and (match h[h.length() - 1] { | Failed(f) => f.cause == cause | _ => false })
+    h.length() > 0 and (match h[h.length() - 1] { | AttemptFailed(f) => f.cause == cause | _ => false })
   pure def step(s: State, e: Event): Next = match s {
-    | Gone => Refused(Ended)
+    | Gone(_) => Refused(Ended)
     | GaveUp(_) => Refused(Ended)
     | _ => match e {
       | Realise(o) => match s {
           | Requested(_) => if (o.present and o.matches) Moved(Realised(o.identity)) else Refused(MissingEvidence)
           | _ => Refused(WrongState)
         }
-      | Release(o) => if (o.teardownComplete) Moved(Gone) else Refused(MissingEvidence)
+      | Release(o) => if (o.teardownComplete) Moved(Gone(Released)) else Refused(MissingEvidence)
       | Vanish(o) => match s {
-          | Realised(_) => if (o.absent) Moved(Gone) else Refused(MissingEvidence)
+          | Realised(_) => if (o.absent) Moved(Gone(Vanished({ cause: o.cause }))) else Refused(MissingEvidence)
           | _ => Refused(WrongState)
         }
       | Attempted(o) => match s {
@@ -47,16 +49,16 @@ module lifecycle {
   pure def live(s: Slot): bool = match s {
     | Present(a) => match a { | Requested(_) => true | Realised(_) => true | _ => false } | _ => false
   }
-  pure def gone(s: Slot): bool = s == Present(Gone)
+  pure def gone(s: Slot): bool = match s { | Present(a) => match a { | Gone(_) => true | _ => false } | _ => false }
   pure def realised(s: Slot): bool = match s { | Present(a) => match a { | Realised(_) => true | _ => false } | _ => false }
 
   pure def terminalRefuses(s: State): bool = {
     val probes = Set(
       Realise({ present: true, matches: true, identity: "model" }),
-      Release({ teardownComplete: true }), Vanish({ absent: true }),
-      Attempted(Failed({ retryable: false, cause: "failure" })), GiveUp({ cause: "failure" }))
+      Release({ teardownComplete: true }), Vanish({ absent: true, cause: Lost }),
+      Attempted(AttemptFailed({ retryable: false, cause: "failure" })), GiveUp({ cause: "failure" }))
     match s {
-      | Gone => probes.forall(e => not(moved(step(s, e))))
+      | Gone(_) => probes.forall(e => not(moved(step(s, e))))
       | GaveUp(_) => probes.forall(e => not(moved(step(s, e))))
       | _ => true
     }
@@ -80,7 +82,7 @@ module lifecycle {
   }
   action realise(id: int, present: bool, matches: bool): bool = fire(id, Realise({ present: present, matches: matches, identity: "model" }))
   action release(id: int, complete: bool): bool = fire(id, Release({ teardownComplete: complete }))
-  action vanish(id: int, absent: bool): bool = fire(id, Vanish({ absent: absent }))
+  action vanish(id: int, absent: bool, cause: VanishCause): bool = fire(id, Vanish({ absent: absent, cause: cause }))
   action attempt(id: int, outcome: AttemptOutcome): bool = fire(id, Attempted(outcome))
   action giveUp(id: int, cause: str): bool = fire(id, GiveUp({ cause: cause }))
   // The attempts a Requested resource has made; none in any other state.
