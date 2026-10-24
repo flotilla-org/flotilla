@@ -758,7 +758,6 @@ impl Kind for Project {
     type Value = ();
 }
 
-/// What convoy admission and gates read.
 /// Configured machine constants, never stored per convoy.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -778,12 +777,14 @@ impl Default for Limits {
         Self { seats: 64, replacements: 3 }
     }
 }
+/// Recorded world input supplying the configured convoy limits.
 pub struct ConvoyLimits;
 impl Kind for ConvoyLimits {
     const NAME: &'static str = "convoy-limits";
     type Value = Limits;
 }
 
+/// What convoy admission and gates read.
 pub trait ConvoyWorld: Source<Authorisation> + Source<Durable> + Source<Project> + Source<ConvoyLimits> {}
 impl<T: Source<Authorisation> + Source<Durable> + Source<Project> + Source<ConvoyLimits> + ?Sized> ConvoyWorld for T {}
 
@@ -803,7 +804,7 @@ impl Source<ConvoyLimits> for MemoryConvoyWorld {
 }
 impl MemoryConvoyWorld {
     pub fn with_limits(mut self, seats: usize, replacements: u32) -> Self {
-        self.limits.put(&Ref::new("configured"), Limits { seats, replacements });
+        self.limits.put(&Limits::reference(), Limits { seats, replacements });
         self
     }
 
@@ -1013,6 +1014,7 @@ impl Machine for Convoy {
             return Err(ConvoyRefusal::SeatCycle);
         }
         let limits = Limits::read(admission.read(&Limits::reference()));
+        // Admission already includes every incoming seat.
         if seats.len() > limits.seats {
             return Err(ConvoyRefusal::SeatsFull);
         }
@@ -1028,6 +1030,7 @@ impl Machine for Convoy {
         };
         for mut seat in request.seats {
             seat.retired = false;
+            seat.replacements = 0;
             spec.seats.append(0, seat).expect("a request holds fewer than 2^32 seats");
         }
         for (id, promise) in request.promises {
@@ -1205,6 +1208,7 @@ fn gate_add_seat(h: &mut Handle<'_, Convoy>, add: &AddSeat) -> Result<(), Convoy
         return Err(ConvoyRefusal::SeatRetired);
     }
     let limit = Limits::read(h.read(&Limits::reference())).seats;
+    // Unlike admission, the incoming seat is not in the table yet.
     if h.spec().seats.len() + 1 > limit {
         return Err(ConvoyRefusal::SeatsFull);
     }

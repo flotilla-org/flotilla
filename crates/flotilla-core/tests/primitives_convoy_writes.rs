@@ -533,4 +533,8 @@ async fn invalid_standing_identity_refuses_admission_and_reads_without_legacy_fa
     assert!(fixture.engine.admit(&old).await.is_err());
     assert!(fixture.engine.promises(&old, None).is_err());
     assert!(fixture.convoys.get("invalid-standing").is_none());
+    let path: flotilla_resources::convoy::engine::EngineConvoyPath = Default::default();
+    assert!(path.set(Arc::new(fixture.engine)).is_ok());
+    let Err(error) = flotilla_resources::convoy::engine::viewed(&path, &old) else { panic!("public read must return the error") };
+    assert!(error.contains("no recorded ensure role"), "{error}");
 }

@@ -442,3 +442,14 @@ fn previous_seat_and_convoy_records_decode_with_growth_defaults() {
     let decoded: ConvoySpec = serde_json::from_value(previous).expect("N→N+1 convoy spec");
     assert_eq!(decoded.promise_floor, 0);
 }
+
+#[test]
+fn admission_starts_fresh_seat_lifetimes() {
+    let mut req = request(&[(0, PromiseSource::Template)]);
+    for seat in &mut req.seats {
+        seat.retired = true;
+        seat.replacements = u32::MAX;
+    }
+    let home = convoy(req);
+    assert!(home.get("c").unwrap().spec().seats.iter().all(|r| !r.record.retired && r.record.replacements == 0));
+}
