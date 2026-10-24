@@ -1417,6 +1417,8 @@ impl Vcs for FlotillaVcs {
             return Err(format!("continuation branch {branch} does not exist on origin"));
         }
         if intent == LocalCloneIntent::NewBranch && remote_branch_exists {
+            // The forced fetch above supplies both this existence check and the
+            // verified ref. Keep the source lock through the staging ref import.
             source_backend.verify_remote_adoption(branch, base_ref).await?;
         }
         let staging = format!("{target}.flotilla-clone-partial");
@@ -1537,10 +1539,10 @@ impl Vcs for FlotillaVcs {
         remove_worktree_path(&*self.runner, &staging).await?;
         let clone_ref = base_ref.unwrap_or(branch);
         let prepare = async {
-            // Adoption below requires every remote head from the clone. If this
-            // becomes single-branch/shallow, fetch the requested branch explicitly.
             GitCliBackend::new(Path::new("/"), &*self.runner).clone_repo(url, &staging, (clone_ref != "HEAD").then_some(clone_ref)).await?;
             let staging_backend = GitCliBackend::checkout_root(Path::new(&staging), &*self.runner);
+            // This check relies on cloning all remote heads. If cloning becomes
+            // single-branch/shallow, fetch the requested branch explicitly first.
             if branch != "HEAD" && staging_backend.ref_exists(&format!("refs/remotes/origin/{branch}")).await {
                 staging_backend.verify_remote_adoption(branch, base_ref).await?;
             }

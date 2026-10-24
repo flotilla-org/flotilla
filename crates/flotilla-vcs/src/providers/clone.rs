@@ -104,8 +104,6 @@ impl ReferenceCloneStrategy {
             return Err(existing_checkout_branch_error(branch, None));
         }
         let base = base_ref.ok_or_else(|| format!("branch {branch} does not exist and no base ref was supplied"))?;
-        // Adoption inspects origin refs from this clone: keep all remote heads
-        // available (no --single-branch or implicit single-branch shallow clone).
         self.runner
             .run(
                 "git",
@@ -116,6 +114,8 @@ impl ReferenceCloneStrategy {
             .await?;
         let backend = GitCliBackend::checkout_root(target_path, &*self.runner);
         let remote_ref = format!("refs/remotes/origin/{branch}");
+        // This check relies on cloning all remote heads. If cloning becomes
+        // single-branch/shallow, fetch the requested branch explicitly first.
         let adopted = backend.ref_exists(&remote_ref).await;
         let prepare = async {
             if adopted {
