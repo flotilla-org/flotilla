@@ -43,6 +43,15 @@ const ROOT_UTILITY_SELECTION: &str = concat!(
     "[ -x \"$chmod\" ] || chmod=/usr/bin/chmod;\n",
 );
 
+/// Image trees root startup gives the crew user recursively: the agent replaces
+/// its binary under `/opt/drydock` by rename and pushes tools into `/opt/flotilla`.
+/// A recursive chown would cross into anything mounted inside them, failing on a
+/// read-only mount and re-owning host files through a read-write one, so
+/// provisioning refuses mounts at, above or below these trees. Mounted material
+/// (skills under `/run/flotilla`, sockets, homes) has its ownership set host-side.
+#[cfg(unix)]
+const CREW_OWNED_TREES: [&str; 2] = ["/opt/drydock", "/opt/flotilla"];
+
 /// The `PATH` Docker gives a container whose image does not set one.
 #[cfg(any(unix, test))]
 const DOCKER_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -258,6 +267,12 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
                     || Path::new("/run/drydock").starts_with(mount.environment_path.as_path())
             }) {
                 return Err("/run/drydock is reserved for this vessel's agent".into());
+            }
+            let mounted_assets = tools.iter().flat_map(|tool| &tool.assets).map(|asset| asset.environment_path.as_path());
+            for target in mounts.iter().map(|mount| mount.environment_path.as_path()).chain(mounted_assets) {
+                if let Some(tree) = CREW_OWNED_TREES.iter().find(|tree| target.starts_with(tree) || Path::new(tree).starts_with(target)) {
+                    return Err(format!("mount target {} overlaps {tree}, which vessel startup gives to the crew user", target.display()));
+                }
             }
             mounts.push(ProvisionedMount::new(directory.join("guest"), "/run/drydock", ProvisionedMountMode::Rw));
             let handle = self
@@ -1282,14 +1297,17 @@ impl DockerEnvironmentProviderInner {
         // to discard any previously planted binaries.
         // Select utilities only from absolute system paths, supporting split-/usr
         // images as well as /bin utilities and merged-/usr images.
+        // Only CREW_OWNED_TREES are chowned, and provisioning keeps mounts out
+        // of them. Nothing under /run/flotilla is crew-written in a Docker
+        // vessel: it holds only host-owned mounts such as read-only skills.
         let root_script = format!(
-            "{ROOT_UTILITY_SELECTION}{}",
+            "{ROOT_UTILITY_SELECTION}{}\"$chown\" -R \"$1\" {}",
             concat!(
-                "\"$mkdir\" -p /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin /opt/flotilla/crew-bin /run/flotilla && ",
+                "\"$mkdir\" -p /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin /opt/flotilla/crew-bin && ",
                 "\"$chown\" 0:0 /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && ",
                 "\"$chmod\" go-w /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin && ",
-                "\"$chown\" -R \"$1\" /opt/drydock /opt/flotilla /run/flotilla",
-            )
+            ),
+            CREW_OWNED_TREES.join(" "),
         );
         let root_path = format!("PATH={DOCKER_DEFAULT_PATH}");
         let user = host_user();
@@ -1420,6 +1438,7 @@ impl DockerEnvironmentProviderInner {
 #[cfg(all(test, unix))]
 mod agent_contract_tests {
     use super::super::{agent::tests::MemoryAgent, contract_tests::LocalImageTags};
+    use super::super::{EnvironmentTool, EnvironmentToolAsset};
     use super::*;
     use flotilla_provider_runtime::CommandOutput;
     use std::sync::{
@@ -1439,6 +1458,9 @@ mod agent_contract_tests {
         mounts: Mutex<Vec<ProvisionedMount>>,
         calls: Mutex<Vec<Vec<String>>>,
         tags: LocalImageTags,
+        // Mounts the vessel requests ahead of the agent's own /run/drydock.
+        requested: Vec<ProvisionedMount>,
+        root_script: Mutex<Option<String>>,
     }
     #[async_trait]
     impl CommandRunner for Engine {
@@ -1458,11 +1480,12 @@ mod agent_contract_tests {
                     assert!(!args.iter().any(|arg| arg.contains("/opt/drydock/drydock-agent")));
                     let metadata = args.iter().find_map(|arg| arg.strip_prefix("flotilla.provisioned_mounts=")).unwrap();
                     let mounts: Vec<ProvisionedMount> = serde_json::from_str(metadata).unwrap();
-                    assert_eq!(mounts.len(), 1, "CLI layer must not be a bind mount");
-                    assert_eq!(mounts[0].environment_path.as_path(), Path::new("/run/drydock"));
-                    assert_eq!(mounts[0].mode, ProvisionedMountMode::Rw);
+                    let (agent, requested) = mounts.split_last().unwrap();
+                    assert_eq!(requested, self.requested.as_slice(), "CLI layer must not be a bind mount");
+                    assert_eq!(agent.environment_path.as_path(), Path::new("/run/drydock"));
+                    assert_eq!(agent.mode, ProvisionedMountMode::Rw);
                     assert_eq!(
-                        std::fs::read_dir(mounts[0].host_path.as_path()).unwrap().count(),
+                        std::fs::read_dir(agent.host_path.as_path()).unwrap().count(),
                         0,
                         "the mounted dir contains no host control sockets"
                     );
@@ -1477,6 +1500,7 @@ mod agent_contract_tests {
                     assert_eq!(*path, format!("PATH={DOCKER_DEFAULT_PATH}"));
                     assert!(script.contains("/opt/drydock"));
                     assert!(script.contains("/opt/flotilla"));
+                    *self.root_script.lock().unwrap() = Some(script.to_string());
                     Ok(String::new())
                 }
                 ["exec", BACKING, "/opt/drydock/drydock-agent", "--supervise", "--socket", "/run/drydock/agent.sock"] => Ok(String::new()),
@@ -1600,7 +1624,6 @@ mod agent_contract_tests {
     // The fake checks preparation, fixed alongside startup and per-vessel mounts.
     #[tokio::test]
     async fn prepares_starts_waits_for_hello_pushes_layer_and_readopts() {
-        use super::super::{EnvironmentTool, EnvironmentToolAsset};
         let root = tempfile::tempdir().unwrap();
         let assets = tempfile::tempdir().unwrap();
         let source = assets.path().join("source");
@@ -1639,6 +1662,84 @@ mod agent_contract_tests {
         handle.destroy().await.unwrap();
         assert!(!engine.created.load(Ordering::SeqCst));
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0, "destroy must remove the per-vessel runtime directory");
+    }
+
+    async fn provision_with(engine: &Arc<Engine>, root: &Path, tools: Vec<EnvironmentTool>) -> Result<EnvironmentHandle, String> {
+        let executable = root.join("agent");
+        std::fs::write(&executable, b"agent").unwrap();
+        let memory = MemoryAgent::new(true);
+        let provider = DockerEnvironmentProvider::new(engine.clone())
+            .with_agent_settings(DockerAgentSettings { runtime_root: root.join("runtime"), executable })
+            .with_agent_connector(Arc::new(move |_| memory.clone()));
+        let spec = super::super::legacy_environment_spec(&flotilla_protocol::EnvironmentSpec {
+            image: flotilla_protocol::ImageSource::Registry(BASE.into()),
+            token_env_vars: Vec::new(),
+        })
+        .unwrap();
+        let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
+        let opts = ProvisionOpts { tools, provisioned_mounts: engine.requested.clone(), ..Default::default() };
+        provider.provision(EnvironmentId::new("test"), &prepared, opts).await
+    }
+
+    fn overlaps(a: &Path, b: &Path) -> bool {
+        a.starts_with(b) || b.starts_with(a)
+    }
+
+    // Canary r842: a read-only skills mount under /run/flotilla failed
+    // `chown -R`. Startup must never chown at, above or below any path the
+    // container mounts, so read-only mounts succeed and host files stay owned.
+    #[tokio::test]
+    async fn root_startup_never_chowns_a_mounted_path() {
+        let root = tempfile::tempdir().unwrap();
+        let requested = vec![
+            ProvisionedMount::new(root.path().join("skills"), "/run/flotilla/skills", ProvisionedMountMode::Ro),
+            ProvisionedMount::new(root.path().join("data"), "/run/flotilla/data", ProvisionedMountMode::Rw),
+            ProvisionedMount::new(root.path().join("codex"), "/tmp/flotilla-codex", ProvisionedMountMode::Rw),
+            ProvisionedMount::new(root.path().join("cleat"), "/var/lib/flotilla/cleat", ProvisionedMountMode::Rw),
+            ProvisionedMount::new(root.path().join("sibling"), "/opt/flotilla-cache", ProvisionedMountMode::Rw),
+        ];
+        let engine = Arc::new(Engine { requested, ..Default::default() });
+        provision_with(&engine, root.path(), Vec::new()).await.unwrap();
+        let script = engine.root_script.lock().unwrap().clone().expect("startup ran the root script");
+        let recursive = script.rsplit("\"$chown\" -R \"$1\" ").next().unwrap().split_whitespace().map(Path::new).collect::<Vec<_>>();
+        for mount in engine.mounts.lock().unwrap().iter() {
+            for target in &recursive {
+                assert!(
+                    !overlaps(target, mount.environment_path.as_path()),
+                    "chown -R {} crosses mount {}",
+                    target.display(),
+                    mount.environment_path
+                );
+            }
+        }
+        assert_eq!(recursive, CREW_OWNED_TREES.map(Path::new));
+    }
+
+    // Mounts and mounted tool assets inside, at or above a crew-owned tree are
+    // refused before any container exists; sibling names are not overlaps.
+    #[tokio::test]
+    async fn provisioning_refuses_mounts_overlapping_crew_owned_trees() {
+        for target in ["/opt/flotilla/cache", "/opt/flotilla", "/opt/drydock/bin", "/opt"] {
+            let root = tempfile::tempdir().unwrap();
+            let requested = vec![ProvisionedMount::new(root.path().join("m"), target, ProvisionedMountMode::Ro)];
+            let engine = Arc::new(Engine { requested, ..Default::default() });
+            let error = provision_with(&engine, root.path(), Vec::new()).await.err().expect("overlapping mount refused");
+            assert!(error.contains("vessel startup gives to the crew user"), "{error}");
+            assert!(!engine.created.load(Ordering::SeqCst));
+        }
+        for (kind, access) in [
+            (EnvironmentToolAssetKind::Directory, EnvironmentToolAssetAccess::SharedWritable),
+            (EnvironmentToolAssetKind::UnixSocket, EnvironmentToolAssetAccess::ReadOnly),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let state = "/opt/flotilla/state";
+            let tools =
+                vec![EnvironmentTool::new("state", state).with_asset(EnvironmentToolAsset::new(root.path(), state, kind, access, "state"))];
+            let engine = Arc::new(Engine::default());
+            let error = provision_with(&engine, root.path(), tools).await.err().expect("mounted asset refused");
+            assert!(error.contains("vessel startup gives to the crew user"), "{error}");
+            assert!(!engine.created.load(Ordering::SeqCst));
+        }
     }
 }
 
