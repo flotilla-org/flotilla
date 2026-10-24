@@ -34,6 +34,12 @@ uuid = { workspace = true, features = ["v4"] }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+flotilla-provisioning = { path = "../flotilla-provisioning" }
+flotilla-engine-store = { path = "../flotilla-engine-store" }
+flotilla-schema = { path = "../flotilla-schema" }
+flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
+flotilla-state-machines = { path = "../flotilla-state-machines" }
+rusqlite = { version = "0.37", features = ["bundled"] }
 flotilla-agent-connector = { path = "../flotilla-agent-connector" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-forge-github = { path = "../flotilla-forge-github" }

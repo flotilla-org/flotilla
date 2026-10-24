@@ -962,6 +962,7 @@ fn spawn_controller_loops(
                     VesselReconciler::secondary_watches(),
                     Engine::<_, VesselBinding>::new(
                         VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
+                            .with_lifecycle_reads(state.daemon.lifecycle_reads())
                             .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None }))
                             .with_federated_dependencies(&backend, CanonicalHostId::resolved(local_host_ref))
                             .with_additional_host_refs(additional_host_refs),
