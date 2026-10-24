@@ -6,6 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_environment::environment::runner::CONTAINED_CODEX_AUTH_FILE;
 use flotilla_environment::environment::runner::CONTAINED_CODEX_HOME;
 use flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE;
 use flotilla_environment::environment::ProvisionedMount;
@@ -41,7 +42,7 @@ const CONTAINER_SKILLS_SOURCE: &str = "/run/flotilla/skills";
 pub const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
 /// The one credential file inside a crew's `CODEX_HOME`. Everything else under
 /// that directory is per-crew scratch Codex may write freely.
-const CODEX_AUTH_FILE: &str = "auth.json";
+const CODEX_AUTH_FILE: &str = CONTAINED_CODEX_AUTH_FILE;
 /// Codex must never rewrite the delivered credential: a crew's copy is a
 /// read-only snapshot of the central login, kept fresh by the host refresher.
 const CODEX_AUTH_MODE: u32 = 0o400;

@@ -22,6 +22,20 @@ use flotilla_provider_runtime::FLOTILLA_HELPER_SCRIPT;
 /// material mounts and post-create runner writes can share one path contract.
 pub const CONTAINED_WRITABLE_CONFIG_BASE: &str = "/tmp/flotilla-config";
 pub const CONTAINED_CODEX_HOME: &str = "/tmp/flotilla-codex";
+/// Credential delivery and capture share this filename contract.
+pub const CONTAINED_CODEX_AUTH_FILE: &str = "auth.json";
+
+/// Archive patterns derived from the contained credential delivery locations.
+/// The config delivery tree is private regardless of credential kind. Codex
+/// mixes login with session scratch, including per-crew homes, so exclude its
+/// login at every depth while retaining sessions. GNU tar strips leading '/'.
+#[cfg(unix)]
+pub(crate) fn contained_credential_exclusions() -> [String; 2] {
+    [
+        CONTAINED_WRITABLE_CONFIG_BASE.trim_start_matches('/').to_string(),
+        format!("{}/*{CONTAINED_CODEX_AUTH_FILE}", CONTAINED_CODEX_HOME.trim_start_matches('/')),
+    ]
+}
 
 /// A `CommandRunner` decorator that executes all commands inside a Docker container
 /// via `docker exec`. Absolute working directories are forwarded as `-w`; relative
