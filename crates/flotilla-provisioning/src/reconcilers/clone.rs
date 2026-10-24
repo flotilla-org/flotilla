@@ -3,6 +3,8 @@ pub mod runtime;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use flotilla_protocol::LifecycleReading;
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{Clone, ClonePhase, CloneStatusPatch, ObjectEvent, Repository, ResourceError, ResourceObject};
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler},
@@ -27,11 +29,28 @@ pub trait CloneRuntime: Send + Sync {
 pub struct CloneReconciler<R> {
     runtime: Arc<R>,
     repositories: TypedResolver<Repository>,
+    lifecycle_reads: Arc<dyn LifecycleReads>,
 }
 
 impl<R> CloneReconciler<R> {
     pub fn new(runtime: Arc<R>, repositories: TypedResolver<Repository>) -> Self {
-        Self { runtime, repositories }
+        Self { runtime, repositories, lifecycle_reads: Arc::new(NoLifecycleReads) }
+    }
+
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
+        self.lifecycle_reads = reads;
+        self
+    }
+
+    fn reading(&self, obj: &ResourceObject<Clone>) -> Option<LifecycleReading> {
+        self.lifecycle_reads.reading(ProvisioningKind::Clone, &obj.metadata.name, None)
+    }
+
+    fn provisioning(&self, obj: &ResourceObject<Clone>) -> bool {
+        match self.reading(obj) {
+            Some(reading) => matches!(reading, LifecycleReading::InProgress | LifecycleReading::Retrying { .. }),
+            None => matches!(obj.status.as_ref().map(|status| status.phase).unwrap_or_default(), ClonePhase::Pending | ClonePhase::Cloning),
+        }
     }
 }
 
@@ -65,8 +84,7 @@ where
         if obj.metadata.name != expected_name {
             return Ok(ClonePrepared::Failed(format!("clone name mismatch: expected {expected_name}")));
         }
-        let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(ClonePhase::Pending);
-        if !matches!(phase, ClonePhase::Pending | ClonePhase::Cloning) {
+        if !self.provisioning(obj) {
             return Ok(ClonePrepared::None);
         }
 
@@ -87,8 +105,7 @@ where
         prepared: &Self::Prepared,
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
-        let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(ClonePhase::Pending);
-        let patch = if matches!(phase, ClonePhase::Pending | ClonePhase::Cloning) {
+        let patch = if self.provisioning(obj) {
             match prepared {
                 ClonePrepared::Ready { default_branch } => Some(CloneStatusPatch::MarkReady { default_branch: default_branch.clone() }),
                 ClonePrepared::Retrying(message) => Some(CloneStatusPatch::MarkRetrying { message: message.clone() }),
@@ -104,8 +121,11 @@ where
             outcome.events.push(ObjectEvent::for_object(obj, "CloneFailed", message.clone()));
         }
         if matches!(prepared, ClonePrepared::Retrying(_)) {
-            let next_attempt =
-                obj.status.as_ref().and_then(|status| status.retry.as_ref()).map_or(1, |retry| retry.attempts.saturating_add(1));
+            let next_attempt = match self.reading(obj) {
+                Some(LifecycleReading::Retrying { failures, .. }) => failures.saturating_add(1),
+                Some(_) => 1,
+                None => obj.status.as_ref().and_then(|status| status.retry.as_ref()).map_or(1, |retry| retry.attempts.saturating_add(1)),
+            };
             outcome.requeue_after = Some(CLONE_BACKOFF.delay(next_attempt));
         }
         outcome
@@ -120,6 +140,14 @@ where
     }
 
     fn retry_disposition(&self, obj: &ResourceObject<Self::Resource>) -> Option<flotilla_resources::ControllerRetryDisposition> {
-        obj.status.as_ref()?.retry.as_ref().map(|retry| retry.disposition.clone())
+        use flotilla_resources::ControllerRetryDisposition;
+        match self.reading(obj) {
+            Some(LifecycleReading::Retrying { next, .. }) => Some(ControllerRetryDisposition::Retryable { next_attempt_at: next }),
+            Some(LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause }) => {
+                Some(ControllerRetryDisposition::Terminal { needs: cause })
+            }
+            Some(_) => None,
+            None => obj.status.as_ref()?.retry.as_ref().map(|retry| retry.disposition.clone()),
+        }
     }
 }

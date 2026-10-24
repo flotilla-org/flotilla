@@ -185,7 +185,7 @@ async fn the_engine_gives_a_clone_up_and_never_reconciles_it_again() {
 
     let prepared = engine.inner().prepared.load(Ordering::SeqCst);
     let outcome = reconcile(&engine, &mut obj).await;
-    assert_eq!(outcome.patch, None, "the copy already holds");
+    assert_eq!(outcome.patch, None, "ended clones emit no copy");
     assert_eq!(engine.inner().prepared.load(Ordering::SeqCst), prepared, "an ended resource is not reconciled again");
 }
 
@@ -522,9 +522,8 @@ async fn image_build_failures_follow_the_build_policy() {
     assert_eq!(home.get("image-a").expect("held").state(), &LifecycleState::Realised { identity: "sha256:beef".into() });
 }
 
-// Behaviour (#3729 review): when the controller's old-status write fails after the engine took a
-// step, the next reconcile's report is a new try made by the old reconciler's prepare, so the
-// engine counts it once more; the copy then brings the old status level with the engine.
+// When a status write fails after an engine step, the next report is a new attempt.
+// The engine counts each attempt once without relying on a copied status.
 #[tokio::test]
 async fn a_lost_status_write_leaves_the_engine_counting_each_try_once() {
     let home = lifecycles::<CloneBinding>();

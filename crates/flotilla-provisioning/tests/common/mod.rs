@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{collections::BTreeMap, future::Future, time::Duration};
+use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
@@ -537,4 +537,22 @@ pub fn cr_name(service: &str, scope: &str, number: u64) -> String {
         &flotilla_resources::address::stored_change_request_address(service, scope, number, &[]).expect("change request address"),
     )
     .expect("record name")
+}
+
+/// A real decided store and its resource-facing read port; no status copy is applied.
+pub fn engine_clones() -> (
+    Arc<dyn flotilla_provisioning::engine::Lifecycles<flotilla_provisioning::stored::clone::CloneKind>>,
+    Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+) {
+    use flotilla_provisioning::engine::{
+        reads::{LifecycleReadPort, StoreReads},
+        LifecycleHome,
+    };
+    let mut registry = flotilla_schema::KindRegistry::new();
+    flotilla_provisioning::stored::register(&mut registry).expect("registry");
+    let store = Arc::new(std::sync::Mutex::new(
+        flotilla_schema_sqlite::Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry).expect("store"),
+    ));
+    let home = flotilla_state_machines::Home::with_log("home", flotilla_engine_store::StoreLog::new(Arc::clone(&store))).expect("home");
+    (Arc::new(LifecycleHome::new("home", home)), Arc::new(LifecycleReadPort::new(StoreReads::new(store), "home".into())))
 }

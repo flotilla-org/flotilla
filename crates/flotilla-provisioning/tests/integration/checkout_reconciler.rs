@@ -1824,3 +1824,112 @@ async fn orphaned_checkout_finalizer_records_preserved_path_and_finishes() {
     assert!(events.items.iter().any(|event| event.spec.reason == "OrphanedCheckoutPreserved" && event.spec.message.contains(path)));
     assert!(matches!(runtime.removals.lock().expect("removals").as_slice(), [CheckoutRemoval::OrphanedWorktree { .. }]));
 }
+
+// Checkout dependencies follow the engine while old clone phases and messages stay stale.
+// All old phases are crossed with readiness, retries and each terminal judgement.
+#[tokio::test]
+async fn checkout_reads_clone_dependencies_without_a_status_copy() {
+    use flotilla_provisioning::engine::{clone::CloneBinding, Binding, Step};
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::{Cause, CauseCategory, Outcome};
+    for old_phase in [ClonePhase::Pending, ClonePhase::Cloning, ClonePhase::Ready, ClonePhase::Failed] {
+        for ending in ["ready", "lost", "released", "gave_up"] {
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let clones = backend.clone().using::<Clone>(NAMESPACE);
+            let mut clone = clones
+                .create(
+                    &meta("source"),
+                    &CloneSpec {
+                        repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                        url: REPO_URL.into(),
+                        env_ref: "env".into(),
+                        path: "/repo".into(),
+                    },
+                )
+                .await
+                .expect("clone");
+            clone = clones
+                .update_status(
+                    "source",
+                    &clone.metadata.resource_version,
+                    &CloneStatus {
+                        phase: old_phase,
+                        message: Some("stale failure".into()),
+                        failure_policy: Some(flotilla_resources::CloneFailurePolicy::Terminal),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("stale status");
+            let checkout = backend
+                .clone()
+                .using::<Checkout>(NAMESPACE)
+                .create(
+                    &meta("checkout"),
+                    &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                        repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                        env_ref: "env".into(),
+                        r#ref: "feature".into(),
+                        base_ref: None,
+                        target_path: "/work".into(),
+                        clone_ref: "source".into(),
+                    }),
+                )
+                .await
+                .expect("checkout");
+            let (home, reads) = common::engine_clones();
+            home.request("source", CloneBinding::request(&clone, "home").expect("request"), Timestamp(1)).expect("requested");
+            let reconciler = CheckoutReconciler::new(
+                Arc::new(RecordingCheckoutRuntime { allow_creation: true, ..Default::default() }),
+                backend,
+                NAMESPACE,
+            )
+            .with_lifecycle_reads(reads);
+            assert!(matches!(reconciler.prepare(&checkout).await.expect("requested"), CheckoutPrepared::Waiting));
+            home.step(
+                "source",
+                &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "offline"), retryable: true }),
+                Timestamp(1_000_000),
+            )
+            .expect("retrying");
+            assert!(matches!(reconciler.prepare(&checkout).await.expect("retrying"), CheckoutPrepared::Waiting));
+            match ending {
+                "gave_up" => {
+                    home.step(
+                        "source",
+                        &Step::Attempted(Outcome::Failed {
+                            cause: Cause::new(CauseCategory::Misconfigured, "配置が無効"),
+                            retryable: false,
+                        }),
+                        Timestamp(2_000_000),
+                    )
+                    .expect("gave up");
+                }
+                "released" => {
+                    home.step("source", &Step::Released, Timestamp(2_000_000)).expect("released");
+                }
+                _ => {
+                    home.step("source", &Step::Realised { identity: "/repo".into() }, Timestamp(2_000_000)).expect("ready");
+                    if ending == "lost" {
+                        home.step("source", &Step::Vanished, Timestamp(3_000_000)).expect("lost");
+                    }
+                }
+            }
+            for _ in 0..2 {
+                let prepared = reconciler.prepare(&checkout).await.expect("dependency");
+                match ending {
+                    "ready" => assert!(matches!(prepared, CheckoutPrepared::Ready { .. })),
+                    _ => {
+                        let expected = match ending {
+                            "lost" => "observed absent",
+                            "released" => "released",
+                            _ => "配置が無効",
+                        };
+                        assert!(matches!(prepared, CheckoutPrepared::Failed(message) if message == expected));
+                    }
+                }
+            }
+            assert_eq!(clones.get("source").await.expect("old clone").status.expect("status").phase, old_phase);
+        }
+    }
+}

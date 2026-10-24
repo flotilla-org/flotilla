@@ -88,7 +88,13 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
             "clone" | "clones" => {
                 let clones = self.state.daemon.resource_backend().using::<Clone>(namespace);
                 let clone = clones.get(name).await.map_err(|error| error.to_string())?;
-                if clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Ready) {
+                let ready = match self.state.daemon.lifecycle_reads().reading(
+                    flotilla_resources::lifecycle_reads::ProvisioningKind::Clone, name, None,
+                ) {
+                    Some(reading) => matches!(reading, flotilla_protocol::LifecycleReading::Ready { .. }),
+                    None => clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Ready),
+                };
+                if ready {
                     return Ok(format!("Clone/{name} is already ready"));
                 }
                 flotilla_store::apply_status_patch(&clones, name, &flotilla_resources::CloneStatusPatch::MarkCloning)

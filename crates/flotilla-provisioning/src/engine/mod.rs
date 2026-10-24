@@ -249,7 +249,9 @@ pub trait Binding: Send + Sync + 'static {
 
     /// The old status the engine's `resource` implies, when `obj`'s status does not already say
     /// it: the one-way copy.
-    fn copy(obj: &ResourceObject<Self::Old>, resource: &Resource<Lifecycle<Self::Kind>>) -> Option<Patch<Self::Old>>;
+    fn copy(_obj: &ResourceObject<Self::Old>, _resource: &Resource<Lifecycle<Self::Kind>>) -> Option<Patch<Self::Old>> {
+        None
+    }
 }
 
 /// An old kind's status patch.

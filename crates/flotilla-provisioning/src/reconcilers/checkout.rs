@@ -7,7 +7,9 @@ use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY;
+use flotilla_protocol::LifecycleReading;
 use flotilla_resources::checkout_integration::{checkout_observation_lacks_convoy_association, convoy_change_request_id_for_checkout};
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{
     convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
     CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, Forge, IntegrationCondition,
@@ -164,6 +166,7 @@ pub struct CheckoutReconciler<R> {
     runtime: Arc<R>,
     checkouts: TypedResolver<Checkout>,
     clones: TypedResolver<Clone>,
+    lifecycle_reads: Arc<dyn LifecycleReads>,
     convoys: TypedResolver<Convoy>,
     forges: flotilla_store::DefinitionResolver<Forge>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
@@ -192,6 +195,7 @@ impl<R> CheckoutReconciler<R> {
             runtime,
             checkouts: backend.clone().using::<Checkout>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
+            lifecycle_reads: Arc::new(NoLifecycleReads),
             convoys: backend.clone().using::<Convoy>(namespace),
             forges: backend.definitions::<Forge>(namespace),
             federated_convoys: None,
@@ -202,6 +206,44 @@ impl<R> CheckoutReconciler<R> {
             background_removal_limit: DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
             validation_backoff: Default::default(),
         }
+    }
+
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
+        self.lifecycle_reads = reads;
+        self
+    }
+
+    async fn clone_dependency(
+        &self,
+        checkout: &ResourceObject<Checkout>,
+        clone: &ResourceObject<Clone>,
+    ) -> Result<Option<CheckoutPrepared>, ResourceError> {
+        if let Some(reading) = self.lifecycle_reads.reading(ProvisioningKind::Clone, &clone.metadata.name, None) {
+            // The engine owns the retry episode; an old controller retry must not survive it.
+            self.observe_clone_retry(checkout, None).await?;
+            return Ok(match reading {
+                LifecycleReading::Ready { .. } => None,
+                LifecycleReading::InProgress | LifecycleReading::Retrying { .. } => Some(CheckoutPrepared::Waiting),
+                other => Some(CheckoutPrepared::Failed(other.reason().unwrap_or_default())),
+            });
+        }
+        self.observe_clone_retry(checkout, clone.status.as_ref().and_then(|status| status.retry.clone())).await?;
+        let status = clone.status.as_ref();
+        Ok(match status.map(|status| status.phase) {
+            Some(ClonePhase::Ready) => None,
+            Some(ClonePhase::Failed) if status.and_then(|status| status.failure_policy) == Some(CloneFailurePolicy::Terminal) => {
+                Some(CheckoutPrepared::Failed(
+                    status
+                        .and_then(|status| status.message.clone())
+                        .unwrap_or_else(|| format!("clone {} failed validation", clone.metadata.name)),
+                ))
+            }
+            Some(ClonePhase::Failed) => Some(CheckoutPrepared::RetryClone {
+                clone_name: clone.metadata.name.clone(),
+                failed_at: status.and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp),
+            }),
+            _ => Some(CheckoutPrepared::Waiting),
+        })
     }
 
     /// Bound background task admission as well as the runtime's active removals.
@@ -499,21 +541,8 @@ where
                     }
                     Err(err) => return Err(err),
                 };
-                self.observe_clone_retry(obj, clone.status.as_ref().and_then(|status| status.retry.clone())).await?;
-                if clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
-                    if clone.status.as_ref().and_then(|status| status.failure_policy) == Some(CloneFailurePolicy::Terminal) {
-                        let message = clone
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.message.clone())
-                            .unwrap_or_else(|| format!("clone {} failed validation", clone.metadata.name));
-                        return Ok(CheckoutPrepared::Failed(message));
-                    }
-                    let failed_at = clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
-                    return Ok(CheckoutPrepared::RetryClone { clone_name: clone.metadata.name, failed_at });
-                }
-                if clone.status.as_ref().map(|status| status.phase) != Some(ClonePhase::Ready) {
-                    return Ok(CheckoutPrepared::Waiting);
+                if let Some(waiting) = self.clone_dependency(obj, &clone).await? {
+                    return Ok(waiting);
                 }
                 if clone.spec.env_ref != spec.env_ref {
                     return Ok(CheckoutPrepared::Failed("worktree clone env_ref mismatch".to_string()));
@@ -557,22 +586,8 @@ where
                     Err(ResourceError::NotFound { .. }) => return Ok(CheckoutPrepared::Waiting),
                     Err(error) => return Err(error),
                 };
-                self.observe_clone_retry(obj, clone.status.as_ref().and_then(|status| status.retry.clone())).await?;
-                if clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
-                    if clone.status.as_ref().and_then(|status| status.failure_policy) == Some(CloneFailurePolicy::Terminal) {
-                        return Ok(CheckoutPrepared::Failed(
-                            clone
-                                .status
-                                .as_ref()
-                                .and_then(|status| status.message.clone())
-                                .unwrap_or_else(|| format!("clone {clone_name} failed validation")),
-                        ));
-                    }
-                    let failed_at = clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
-                    return Ok(CheckoutPrepared::RetryClone { clone_name: clone.metadata.name, failed_at });
-                }
-                if clone.status.as_ref().map(|status| status.phase) != Some(ClonePhase::Ready) {
-                    return Ok(CheckoutPrepared::Waiting);
+                if let Some(waiting) = self.clone_dependency(obj, &clone).await? {
+                    return Ok(waiting);
                 }
                 if clone.spec.env_ref != spec.env_ref || clone.spec.repo_ref != spec.repo_ref {
                     return Ok(CheckoutPrepared::Failed("local clone source repo/env mismatch".into()));
