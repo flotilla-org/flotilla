@@ -43,7 +43,7 @@ async fn engine(daemon: &Arc<InProcessDaemon>, dir: &tempfile::TempDir) -> (Arc<
         .definitions::<FleetDesignation>(NS)
         .create(
             &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
-            &FleetDesignationSpec { project: "fleet".into(), image_cache: None },
+            &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
         )
         .await
         .expect("fleet designation");
@@ -203,7 +203,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     };
     let (home, sent) = homed(&engine_b, &request).expect("the message is created at the receiver's home");
     assert_eq!(home, home_b);
-    assert_eq!(sent.spec().sender.as_str(), "project:fleet/role:turn-rules");
+    assert_eq!(sent.spec().sender.as_str(), "fleet:lab/role:turn-rules");
     assert!(homed(&engine_a, &request).is_none(), "the sender's home authors nothing");
 
     // B delivers it to the crew's AgentSession, receipt first.
@@ -236,7 +236,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     assert!(!served.is_empty() && served.iter().all(|name| name == sent.name()), "the misses were read at B: {served:?}");
     let (reply_home, replied) = homed(&engine_a, &reply).expect("the reply is homed at X's home");
     assert_eq!(reply_home, home_a);
-    assert_eq!(replied.spec().inbox.as_str(), "project:fleet/role:turn-rules");
+    assert_eq!(replied.spec().inbox.as_str(), "fleet:lab/role:turn-rules");
     assert_eq!(replied.spec().in_reply_to.as_ref().map(|original| original.home.as_str()), Some(home_b.as_str()));
     assert_eq!(*replied.state(), MessageState::Pending, "nobody is bound to turn-rules yet");
     let read = engine_a.read_message(&request, Some(sent.spec().inbox.clone())).await.expect("routed read");

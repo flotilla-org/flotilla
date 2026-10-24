@@ -12,6 +12,10 @@ AgentSession its role binding names.
 
 ## Decision
 
+fleet-wide roles are addressed under the fleet's own name, `fleet:<fleet name>/role:<name>`; the fleet designation is an internal mapping to the Project that carries the fleet's charter and bindings, and never appears in an address.
+
+the fleet's name is declared on FleetDesignation (`spec.fleet`) and replicated to every host; fleet role addresses use it and nothing else.
+
 The fleet is a designated Project, reusing Project charters, role bindings,
 standing ensures, grants and issue sources. Its charter repository is today's
 project-map; renaming it is optional. Flotilla the product remains a separate,

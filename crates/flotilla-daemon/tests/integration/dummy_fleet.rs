@@ -96,7 +96,7 @@ impl DummyDaemon {
     async fn seed(&self) {
         let backend = self.backend();
         if self.daemon.message_primitives().is_some() {
-            // The fleet roles live under the designated project; tests keep `project:fleet`.
+            // Fleet identity and charter Project are declared independently.
             backend
                 .clone()
                 .using::<flotilla_resources::Project>(NAMESPACE)
@@ -115,7 +115,7 @@ impl DummyDaemon {
                 .definitions::<flotilla_resources::FleetDesignation>(NAMESPACE)
                 .create(
                     &InputMeta::builder().name(flotilla_resources::FLEET_DESIGNATION_NAME.to_string()).build(),
-                    &flotilla_resources::FleetDesignationSpec { project: "fleet".into(), image_cache: None },
+                    &flotilla_resources::FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
                 )
                 .await
                 .expect("fleet designation");

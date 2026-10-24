@@ -211,8 +211,8 @@ mod tests {
         let map = conversion(&roles);
         assert_eq!(map.inbox("flotilla/demo/work/coder").expect("convoy role").as_str(), "project:flotilla/convoy:demo/role:coder");
         assert_eq!(map.inbox("flotilla/gui-approver").expect("standing role").as_str(), "project:flotilla/role:gui-approver");
-        assert_eq!(map.sender("system:turn-rules").expect("fleet role").as_str(), "project:fleet/role:turn-rules");
-        assert_eq!(map.sender("system:hold").expect("held turns").as_str(), "project:fleet/role:turn-rules");
+        assert_eq!(map.sender("system:turn-rules").expect("fleet role").as_str(), "fleet:fleet/role:turn-rules");
+        assert_eq!(map.sender("system:hold").expect("held turns").as_str(), "fleet:fleet/role:turn-rules");
         assert!(map.sender("principal:alice").is_err());
         assert!(map.inbox("topic:flotilla/reviews").is_err());
         assert!(map.inbox("system:unknown").is_err());

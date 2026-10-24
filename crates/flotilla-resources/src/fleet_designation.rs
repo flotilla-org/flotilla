@@ -28,6 +28,10 @@ impl Resource for FleetDesignation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetDesignationSpec {
+    /// Fleet identity, independent of its charter Project.
+    /// ADR 0047: absence decodes for one roll; role resolution refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet: Option<String>,
     /// Project name in the designation's namespace.
     pub project: String,
     /// Optional shared OCI cache; ADR 0047 default may retire after one roll.

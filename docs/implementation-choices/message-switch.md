@@ -43,12 +43,16 @@ no new table, column or index.
 - **An unkeyed send** takes the digest of its sender, its home and its admission sequence.
 - **A dead letter** takes the digest of the message it reports.
 - **The fleet roles** (`turn-rules`, `nudge`, `stall-judge`, `capabilities`, `fleet-store`) are
-  roles of the project the `FleetDesignation` record names: `project:<designated>/role:<name>`.
+  addressed under the fleet identity declared in `FleetDesignation.spec.fleet`:
+  `fleet:<fleet name>/role:<name>` (owner carry in ADR 0066, #3822).
   - They are declared in code, each with a one-line purpose, and can be overridden
     (`FleetRoles::declare`).
   - A held turn sends as turn-rules; `system:hold` survives only in its de-duplication key.
-  - The designation is read from the record each time. Changing it changes these inbox addresses
-    and strands their pending messages (a known limit).
+  - The designation is read from the record each time. Changing its charter Project does not
+    change these addresses. Changing `spec.fleet` changes the fleet identity, changes the inbox
+    addresses and strands messages pending under the previous name.
+  - Missing or empty fleet names refuse resolution with a named reason; legacy designations
+    still decode. Nonempty names preserve their spelling, as other address natural keys do.
 
 ## The send path
 
@@ -131,7 +135,8 @@ the old store dead-letters only on an operator's batch failure.
   - an unmappable condition or reference.
 - **The rehearsal:** `flotilla resource validate --from-daemon` restores every import into a temporary
   store, reads each back and checks it. It prints counts by new state and each refusal; it does not
-  fail the roll while the switch is off in the live fleet.
+  fail the roll while the switch is off in the candidate configuration. A candidate with
+  `[primitives]` enabled fails validation on any rehearsal refusal (#3821).
 
 ## Known limits
 

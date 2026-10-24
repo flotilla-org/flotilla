@@ -390,8 +390,7 @@ impl MessagePrimitives {
         Ok(consumer)
     }
 
-    /// The fleet roles of `namespace`'s designated project, read from the
-    /// record each time: a changed designation changes these addresses.
+    /// The fleet roles of `namespace`, using the designation's fleet identity.
     pub async fn roles(&self, namespace: &str) -> Result<FleetRoles, String> {
         let roles = designated_fleet_roles(&self.backend, namespace)
             .await

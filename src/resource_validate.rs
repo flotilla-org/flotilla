@@ -724,7 +724,7 @@ mod tests {
             }),
             serde_json::json!({"phase":"Running"}),
         );
-        let message = document(
+        let mut message = document(
             "Message",
             "message",
             serde_json::json!({
@@ -732,15 +732,32 @@ mod tests {
             }),
             serde_json::json!({"phase":"accepted","since":"2026-10-19T00:00:00Z","acceptedSequence":1}),
         );
-        let designation = document("FleetDesignation", "fleet", serde_json::json!({"project":"fleet"}), Value::Null);
+        let mut designation =
+            document("FleetDesignation", "fleet", serde_json::json!({"fleet":"lab", "project":"project-map"}), Value::Null);
+        if matches!(case, "named-designation" | "unnamed-designation") {
+            message["spec"]["sender"] = serde_json::json!("system:nudge");
+            message["spec"]["receiver"] = serde_json::json!("system:turn-rules");
+        }
+        if case == "unnamed-designation" {
+            designation["spec"].as_object_mut().expect("designation spec").remove("fleet");
+        }
         BTreeMap::from([
             ("checkouts".into(), if case == "observed-checkout" { vec![checkout] } else { vec![] }),
             ("terminalsessions".into(), if case == "missing-identity" { vec![terminal] } else { vec![] }),
             (
                 "messages".into(),
-                if matches!(case, "message-refusal" | "missing-designation") { vec![message.clone(), message] } else { vec![] },
+                if matches!(case, "named-designation" | "unnamed-designation") {
+                    vec![message]
+                } else if matches!(case, "message-refusal" | "missing-designation") {
+                    vec![message.clone(), message]
+                } else {
+                    vec![]
+                },
             ),
-            ("fleetdesignations".into(), if case == "message-refusal" { vec![designation] } else { vec![] }),
+            (
+                "fleetdesignations".into(),
+                if matches!(case, "message-refusal" | "named-designation" | "unnamed-designation") { vec![designation] } else { vec![] },
+            ),
         ])
     }
 
@@ -802,13 +819,22 @@ mod tests {
     // Contract #3760: candidate config switches the gate, observed checkouts are
     // exempt, and every other refusal fails. Exhaust the finite on/off × store
     // matrix, including empty stores, duplicate Messages and a missing designation.
+    // Named fleet-role Messages pass; an unnamed designation fails only when the candidate enables primitives.
     // The HTTP stand-in is the resource-socket process boundary; mapping and
     // temporary-store restoration use the real rehearsal implementations.
     #[tokio::test]
     async fn candidate_import_gate_matrix() {
         rigging_tls::install_default_provider();
         for enabled in [false, true] {
-            for case in ["empty", "observed-checkout", "missing-identity", "message-refusal", "missing-designation"] {
+            for case in [
+                "empty",
+                "observed-checkout",
+                "missing-identity",
+                "message-refusal",
+                "missing-designation",
+                "named-designation",
+                "unnamed-designation",
+            ] {
                 let config_dir = tempfile::tempdir().unwrap();
                 std::fs::write(config_dir.path().join("daemon.toml"), if enabled { "[primitives]\n" } else { "" }).unwrap();
                 let config = ConfigStore::with_base(config_dir.path().to_path_buf()).load_daemon_config().unwrap();
@@ -821,7 +847,7 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
                 assert_eq!(
                     result.is_err(),
-                    enabled && !matches!(case, "empty" | "observed-checkout"),
+                    enabled && !matches!(case, "empty" | "observed-checkout" | "named-designation"),
                     "enabled={enabled}, case={case}: {result:?}"
                 );
             }

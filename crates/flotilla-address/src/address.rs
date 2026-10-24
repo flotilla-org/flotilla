@@ -49,6 +49,11 @@ impl Address {
         Self::root(Kind::Project, name)
     }
 
+    /// A fleet: `fleet:<name>`.
+    pub fn fleet(name: &str) -> Result<Self, Error> {
+        Self::root(Kind::Fleet, name)
+    }
+
     /// A convoy with no Project: `convoy:<name>`.
     pub fn convoy(name: &str) -> Result<Self, Error> {
         Self::root(Kind::Convoy, name)

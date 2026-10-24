@@ -1,8 +1,8 @@
 //! The Message import rehearsal (#3317): before a roll, every old Message the
 //! daemon holds is imported into a temporary engine store, checked against
 //! the machine, and reported as counts by new state and named refusals.
-//! The rehearsal reports; it does not fail validation while the switch is
-//! off in the live fleet.
+//! Refusals fail validation when the candidate enables primitives; otherwise
+//! the rehearsal reports without enforcing the import gate.
 
 use std::collections::BTreeMap;
 
@@ -69,10 +69,15 @@ impl Documents {
             // also describe it as missing for every Message that depends on it.
             return report;
         }
-        let Some(Ok(roles)) = designation.map(|(designation, _)| FleetRoles::declared(&designation.spec.project)) else {
-            let reason = "no FleetDesignation names the project the fleet roles live under".to_owned();
-            report.refused.push(ImportRefusal { record: "FleetDesignation".into(), reason });
-            return report;
+        let roles = designation
+            .ok_or_else(|| "no FleetDesignation names the fleet".to_owned())
+            .and_then(|(designation, _)| FleetRoles::from_designation(&designation.spec));
+        let roles = match roles {
+            Ok(roles) => roles,
+            Err(reason) => {
+                report.refused.push(ImportRefusal { record: "FleetDesignation".into(), reason });
+                return report;
+            }
         };
         let terminals = self.decoded::<TerminalSession>("terminalsessions", &mut report);
         let sessions = terminals
@@ -181,7 +186,7 @@ mod tests {
                 vec![serde_json::json!({
                     "apiVersion":"flotilla.work/v1", "kind":"FleetDesignation",
                     "metadata":{"name":"fleet","namespace":"flotilla","resourceVersion":"1","creationTimestamp":"2026-10-19T00:00:00Z"},
-                    "spec":{"project":"fleet"},
+                    "spec":{"fleet":"lab","project":"project-map"},
                 })],
             );
             documents
@@ -206,7 +211,7 @@ mod tests {
             vec![serde_json::json!({
                 "apiVersion": "flotilla.work/v1", "kind": "FleetDesignation",
                 "metadata": {"name": "fleet", "namespace": "flotilla", "resourceVersion": "1", "creationTimestamp": "2026-10-19T00:00:00Z"},
-                "spec": {"project": "fleet"},
+                "spec": {"fleet": "lab", "project": "project-map"},
             })],
         );
         documents.0.insert(
@@ -227,11 +232,22 @@ mod tests {
         assert_eq!(report.imported.get("pending"), Some(&1), "{report:?}");
         let refused: Vec<_> = report.refused.iter().map(|refusal| refusal.record.as_str()).collect();
         assert_eq!(refused, ["from-a-person", "orphan-reply"], "{report:?}");
+        // A designation prerequisite refusal must preserve earlier Message decode
+        // diagnostics, and report the missing identity once rather than per Message.
+        documents.0.get_mut("messages").expect("messages").push(serde_json::json!({"metadata":{"name":"broken"},"spec":7}));
+        documents.0.get_mut("fleetdesignations").expect("designation")[0]["spec"].as_object_mut().expect("spec").remove("fleet");
+        let unnamed = documents.rehearse("flotilla");
+        assert_eq!(unnamed.total(), 0);
+        assert_eq!(unnamed.refused.len(), 2);
+        assert_eq!(unnamed.refused[0].record, "broken");
+        assert_eq!(unnamed.refused[0].reason, "messages does not decode");
+        assert_eq!(unnamed.refused[1].record, "FleetDesignation");
+        assert!(unnamed.refused[1].reason.contains("FleetDesignation.spec.fleet is missing"));
         let mut none = Documents::default();
         none.0.insert("messages".into(), documents.0["messages"].clone());
         let missing = none.rehearse("flotilla");
-        assert_eq!(missing.refused.len(), 1, "missing designation is one prerequisite refusal");
-        assert_eq!(missing.refused[0].record, "FleetDesignation");
-        assert!(missing.refused[0].reason.contains("no FleetDesignation"));
+        assert_eq!(missing.refused.len(), 2, "one decode refusal and one prerequisite refusal");
+        assert_eq!(missing.refused[1].record, "FleetDesignation");
+        assert!(missing.refused[1].reason.contains("no FleetDesignation"));
     }
 }
