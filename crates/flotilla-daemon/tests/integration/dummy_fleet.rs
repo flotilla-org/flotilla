@@ -531,3 +531,25 @@ async fn on_the_engine_an_operator_ruling_is_refused_until_principals() {
     let resumed = fleet.execute_as_operator(supervise(&convoy, CrewSupervisionAction::Resume)).await;
     assert!(matches!(&resumed, CommandValue::Error { message } if message.contains("#3457")), "{resumed:?}");
 }
+
+// A supervisor must be able to resume a stalled engine convoy, after which its
+// change-request promise is kept and the engine Convoy is delivered.
+#[tokio::test(start_paused = true)]
+#[ignore = "operator resume is refused: principal:implicit needs the principals model (#3457); awaiting owner ruling"]
+async fn on_the_engine_a_stalled_coder_resumes_and_delivers() {
+    use flotilla_state_machines::machines::convoy::ConvoyState;
+
+    let fleet = DummyDaemon::start_on_primitives("stall_rate = 1.0\n", "").await;
+    fleet.dispatch("engine-resume-proof", CrewMix::Coder).await;
+    fleet.wait_for("engine-resume-proof", "stall accounting", |_| fleet.fleet.snapshot().crews_stalled > 0).await;
+    let convoy = fleet.wait_for_stall("engine-resume-proof").await;
+    let primitives = fleet.daemon.message_primitives().expect("engine path");
+    let engine = primitives.convoys().get(&convoy.metadata.name).expect("admitted engine Convoy");
+    assert!(matches!(engine.state(), ConvoyState::Open { .. }), "the stalled convoy remains open: {engine:?}");
+
+    let resumed = fleet.execute_as_operator(supervise(&convoy, CrewSupervisionAction::Resume)).await;
+    assert_eq!(resumed, CommandValue::Ok, "supervision must resume the engine crew");
+    fleet.wait_for_phase("engine-resume-proof", ConvoyPhase::Landed).await;
+    let engine = primitives.convoys().get(&convoy.metadata.name).expect("engine Convoy after resume");
+    assert!(matches!(engine.state(), ConvoyState::Delivered { .. }), "the engine convoy delivers: {engine:?}");
+}
