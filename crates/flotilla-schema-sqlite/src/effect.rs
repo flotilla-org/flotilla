@@ -303,6 +303,9 @@ impl KindSql {
                     ops.push(Op::Put { table, key: full, values });
                 }
                 Change::Remove { row, collection, key } => {
+                    // Replicates explicit replace_records compaction from a trusted
+                    // home log, applied in sequence under its version checks. This
+                    // is not a public delete command; History stays append-only.
                     let (parent, mut full) = self.row(row)?;
                     let table = self.child(parent, collection, &[TableRole::Child, TableRole::State, TableRole::Records])?;
                     full.extend(self.tables[table].own_key(key)?);

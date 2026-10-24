@@ -100,6 +100,17 @@ fn standing_rollover_keeps_identity_live_seats_and_standing_duties() {
     assert_eq!(held.spec().duties.keys().copied().collect::<Vec<_>>(), vec![DutyId(0)]);
     assert!(held.spec().promises.is_empty());
     assert_eq!(held.spec().promise_floor, 10);
+    // Reload every persisted collection immediately: no obsolete before rows
+    // may survive the replacement, even before another AddSeat reuses positions.
+    {
+        let mut database = store.lock().unwrap();
+        let mut read = database.read().unwrap();
+        let id = read.resolve(Resource::<Convoy>::CODE, name, "home").unwrap().unwrap();
+        let loaded = read.load::<Resource<Convoy>>(id).unwrap().unwrap();
+        assert_eq!(&loaded.value, held);
+        assert_eq!(loaded.value.spec().seats.len(), 2);
+        assert!(loaded.value.spec().promises.is_empty());
+    }
     assert!(matches!(
         home.apply(name, ReplaceSeat(a.clone()), &world, Timestamp(6)),
         Err(WriteError::Refused(ConvoyRefusal::ReplacementsExhausted))
