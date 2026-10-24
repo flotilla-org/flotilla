@@ -58,6 +58,8 @@ pub async fn read_image_build_with_lifecycle(
                 Some(LifecycleReading::Ready { .. }) => 3,
                 Some(LifecycleReading::InProgress) => 2,
                 Some(LifecycleReading::Retrying { .. }) => 1,
+                // None supplies a usable image or a pending attempt. They tie with legacy
+                // Failed; host and origin make that unusable choice deterministic.
                 Some(_) => 0,
                 None => match source.object.status.as_ref().map_or(ImageBuildPhase::Queued, |status| status.phase) {
                     ImageBuildPhase::Built => 3,
