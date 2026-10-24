@@ -25,8 +25,8 @@ use flotilla_resources::{
     api_version, Clock, ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition,
     ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch, ConvoyPhase,
     Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, Host as ResourceHost, InputMeta,
-    ObjectEvent, PlacementPolicy, Project, ReadResourceObject, Repository, Resource, ResourceError, ResourceObject, ResourceProvenance,
-    WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE,
+    ManifestRoot, ObjectEvent, PlacementPolicy, Project, ReadResourceObject, Repository, Resource, ResourceError, ResourceObject,
+    ResourceProvenance, WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE,
 };
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, EventRecorder, ResourceBackend};
 use sha2::{Digest, Sha256};
@@ -180,6 +180,56 @@ impl ConvoyEnsureReconciler for EnsureReconciler {
 }
 
 impl EnsurePass<'_> {
+    /// Definitions reads merge every host's copy, so local presence does not
+    /// establish home. ManifestRoots are home-bound; undeclared definitions
+    /// belong to their earliest creation, before later local reapplications.
+    async fn driverless_ensure_is_home(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<bool, ResourceError> {
+        if let Some(root) = ensure.metadata.annotations.get("flotilla.work/manifest-reconciler-root") {
+            return match self.resource_backend.including_replicas::<ManifestRoot>(namespace).get(root).await {
+                Ok(root) => Ok(matches!(root.provenance, ResourceProvenance::Local)),
+                Err(ResourceError::NotFound { .. }) => {
+                    // ADR 0047: previous-generation provenance named the host,
+                    // not the ManifestRoot. Match its source too, as manifest
+                    // resolution does; remove this fallback after one roll.
+                    let Some(source) = ensure.metadata.annotations.get("flotilla.work/manifest-source") else {
+                        // The declaration may not have replicated yet. Never adopt its ensure.
+                        return Ok(false);
+                    };
+                    let roots = self
+                        .resource_backend
+                        .query_declared::<ManifestRoot>(
+                            namespace,
+                            &flotilla_store::StoreQuery {
+                                fields: BTreeMap::from([("spec.host".into(), root.clone())]),
+                                include_replicas: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    let mut matching = roots.items.into_iter().filter(|root| root.object.spec.source == *source);
+                    let first = matching.next();
+                    Ok(matching.next().is_none() && first.is_some_and(|root| matches!(root.provenance, ResourceProvenance::Local)))
+                }
+                Err(error) => Err(error),
+            };
+        }
+        let local_root = self.resource_backend.local_root()?;
+        // Read raw sources: the definitions resolver intentionally reports a
+        // merged object as local, including when all its sources are replicas.
+        let sources = self
+            .resource_backend
+            .query_declared::<ConvoyEnsure>(namespace, &flotilla_store::StoreQuery::names([ensure.metadata.name.clone()], true))
+            .await?;
+        let first = sources.items.into_iter().filter(|source| source.object.metadata.deletion_timestamp.is_none()).min_by_key(|source| {
+            let origin = match &source.provenance {
+                ResourceProvenance::Local => &local_root,
+                ResourceProvenance::Replica { origin_root, .. } => origin_root,
+            };
+            (source.object.metadata.creation_timestamp, origin.clone())
+        });
+        Ok(first.is_some_and(|source| matches!(source.provenance, ResourceProvenance::Local)))
+    }
+
     pub async fn reconcile_convoy_ensures_once_with_backing_inspector(
         &self,
         namespace: &str,
@@ -192,7 +242,6 @@ impl EnsurePass<'_> {
             .lock()
             .await
             .retain(|(retry_namespace, retry_name), _| retry_namespace != namespace || ensure_names.contains(retry_name));
-        let local_projects = self.resource_backend.clone().using::<Project>(namespace);
         let mut changes = Vec::new();
         let mut errors = Vec::new();
         for ensure in ensures {
@@ -298,37 +347,26 @@ impl EnsurePass<'_> {
                 }
                 continue;
             } else {
-                match local_projects.get(&ensure.spec.project_ref).await {
+                match self.driverless_ensure_is_home(namespace, &ensure).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        debug!(ensure = %ensure.metadata.name, "skipping standing convoy ensure away from its definition home");
+                        continue;
+                    }
+                    Err(error) => {
+                        errors.push(format!("ConvoyEnsure/{}: could not resolve definition home: {error}", ensure.metadata.name));
+                        continue;
+                    }
+                }
+                match self.resource_backend.definitions::<Project>(namespace).get(&ensure.spec.project_ref).await {
                     Ok(project) if project.metadata.deletion_timestamp.is_none() => {}
                     Ok(_) | Err(ResourceError::NotFound { .. }) => {
-                        match self.resource_backend.clone().definitions::<Project>(namespace).get(&ensure.spec.project_ref).await {
-                            Ok(_) => {
-                                debug!(
-                                    ensure = %ensure.metadata.name,
-                                    project = %ensure.spec.project_ref,
-                                    "skipping standing convoy ensure away from its project home"
-                                );
-                                continue;
-                            }
-                            Err(ResourceError::NotFound { .. }) => {
-                                errors.push(format!(
-                                    "ConvoyEnsure/{}: parent Project/{} is absent",
-                                    ensure.metadata.name, ensure.spec.project_ref
-                                ));
-                                continue;
-                            }
-                            Err(error) => {
-                                errors.push(format!(
-                                    "ConvoyEnsure/{}: could not resolve Project/{} authority: {error}",
-                                    ensure.metadata.name, ensure.spec.project_ref
-                                ));
-                                continue;
-                            }
-                        }
+                        errors.push(format!("ConvoyEnsure/{}: parent Project/{} is absent", ensure.metadata.name, ensure.spec.project_ref));
+                        continue;
                     }
                     Err(error) => {
                         errors.push(format!(
-                            "ConvoyEnsure/{}: could not verify local Project/{} authority: {error}",
+                            "ConvoyEnsure/{}: could not resolve Project/{}: {error}",
                             ensure.metadata.name, ensure.spec.project_ref
                         ));
                         continue;
