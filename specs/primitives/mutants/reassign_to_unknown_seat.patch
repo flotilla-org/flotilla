@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -205,7 +205,6 @@
+@@ -183,7 +183,6 @@
            else withPromise(w, a.promise, { ...p, state: Retracted }))
        | Reassign(a) => onOpen(w, a.promise, p =>
            if (not(mayReassign(p, a.by, a.authority))) Refused(Unauthorised)

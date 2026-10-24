@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -176,7 +176,7 @@
+@@ -145,7 +145,7 @@
      val standing = holdingDuties(w)
      { ...w,
        spec: { ...w.spec, duties: standing.mapBy(d => w.spec.duties.get(d)) },

@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -254,7 +254,7 @@
+@@ -218,7 +218,7 @@
            else Moved(Open({ ...w, seats: w.seats.set(seat, { ...w.seats.get(seat), replacements: w.seats.get(seat).replacements + 1 }) }))
        | Deliver => val outstanding = w.promises.keys().filter(p => open(w.promises.get(p)))
            if (outstanding.size() > 0) Refused(PromisesOutstanding(outstanding))

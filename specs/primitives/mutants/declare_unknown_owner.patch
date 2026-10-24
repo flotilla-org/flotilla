@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -183,7 +183,6 @@
+@@ -161,7 +161,6 @@
    pure def step(s: State, e: Event): Next = match s {
      | Open(w) => match e {
        | Declare(d) => if (w.promises.keys().contains(d.promise) or d.promise < w.promiseFloor) Refused(PromiseExists)

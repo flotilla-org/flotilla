@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -182,7 +182,7 @@
+@@ -160,7 +160,7 @@
      else rule(w.promises.get(id))
    pure def step(s: State, e: Event): Next = match s {
      | Open(w) => match e {

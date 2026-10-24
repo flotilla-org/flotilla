@@ -1,41 +1,24 @@
 // Full-graph conformance harness for the Convoy machine: TLC enumerates every
-// reachable state, and each dumped state records one admission or one step
-// probe (from-state, event, result) for the Rust conformance test.
+// reachable state, each recording one admission or step probe (from-state,
+// event, result) for the Rust conformance test.
 //
-// Features are spread across requests rather than multiplied, which keeps the
-// graph near the Ensure harness's size. Requests admit promise 0 from a
-// template or dispatch (alone, beside a convoy-lifetime duty, or beside a duty
-// while it is open), or admit only a lifetime duty, which the crew's Declare
-// of promise 0 then joins; promise 1 is never known. Every admitted owner is
-// the seat "a", admitted at the root beside "b" under it; Reassign moves a
-// promise to "b", and an operator to the unknown "z". The deciding seat matters
-// only for the Owner authority class, so the other classes decide as "s", and
-// an empty reason is probed for the operator only. A crew-declared promise
-// takes up to two submissions (so resubmission and its stale evidence are
-// reached), others one; Submit leaves the domain at that bound. A quota
-// increase is probed only while the convoy holds no promise. The seat edges
-// that move (AddSeat of "c", Resupervise of "b") are probed only in a convoy
-// admitted for them, marked by an extra seat "y", where Declare is not
-// probed; their refusals are probed always, once each. One request names an
-// owner that is not a seat, and two admit seats in a cycle: a seat under
-// itself, and two seats under each other.
-//
-// Seat growth (#3587 seat-growth ruling): the cap is four seats. One request
-// admits five, and in the seat-probe convoy AddSeat of "d" beside "c" fills
-// the cap, so the second is refused SeatsFull. The edges that move (RetireSeat
-// of "a" or "b", an authorised Rollover) are probed only in a convoy admitted
-// for them with promise 0 and a lifetime duty, marked by an extra seat "g",
-// where neither Declare nor Submit is probed: its promise settles by verdict
-// or retraction. There "a" is refused while it holds the promise or the duty,
-// the convoy is refused while the promise is open, and a retired "b" is
-// refused SeatRetired as a Reassign target. Their refusals (unauthorised, an
-// unknown seat) are probed always, once each. Replacement (#3587 ruling Q7)
-// is limited to one per seat: in the same convoy ReplaceSeat of "a" moves,
-// is refused ReplacementsExhausted the second time, before or after a
-// rollover, and of a retired "b" is refused SeatRetired; of the unknown "z"
-// it is probed always. Declare to a retired seat,
-// AddSeat under one and Declare below the promise floor are left to
-// convoy_deliver's traces and mutants.
+// Event domain. Promises 0 and 1; promise 1 is never admitted, so it stays
+// unknown until declared. Seats "a" (root) and "b" (under "a") are admitted,
+// and "z" never is. Features are spread across requests rather than
+// multiplied, which keeps the graph near the Ensure harness's size: a request
+// admits promise 0 (template or dispatch) alone or beside a duty (lifetime or
+// while open), or only a lifetime duty, which the crew's Declare of promise 0
+// then joins. The deciding seat matters only to the Owner authority, so the
+// other classes decide as "s", and an empty reason is probed for the operator
+// only. A crew promise takes two submissions, which reaches resubmission and
+// stale evidence, and others one; Submit leaves the domain at that bound. The
+// quota increase is probed while no promise is held. The seat edges that move
+// are probed in convoys admitted for them, marked by an extra seat: "y" for
+// AddSeat ("c", then "d", which fills the cap of four) and Resupervise, with
+// no Declare; "g" for RetireSeat, Rollover and ReplaceSeat (one per seat),
+// where the promise settles by verdict or retraction. Their refusals are
+// probed in every convoy, once each. Declare to a retired seat, AddSeat under
+// one and Declare below the promise floor are left to convoy_deliver.
 module convoy_conformance {
   import convoy(IDS = Set(), SEAT_LIMIT = 4, REPLACEMENT_LIMIT = 1) as C from "../machines/convoy"
   type Probe = Admitted({ request: C::ConvoyRequest, result: C::Next })
@@ -59,12 +42,10 @@ module convoy_conformance {
     { ...request(Map(), lifetime, true), seats: seats.put("y", { parent: C::Root, supervisedBy: "op", replacements: 0 }) },
     { ...request(admitted(C::Template), Map(), true), seats: Set("c", "d", "e").fold(seats, (m, s) => m.put(s, { parent: C::Under("a"), supervisedBy: "a", replacements: 0 })) },
     { ...request(admitted(C::Template), lifetime, true), seats: seats.put("g", { parent: C::Root, supervisedBy: "op", replacements: 0 }) })
-  // The convoy admitted for the moving seat edges: its extra seat "y" marks it.
   pure def seatProbe(w: C::Work): bool = w.seats.keys().contains("y")
-  // The convoy admitted for seat growth: its extra seat "g" marks it.
   pure def growthProbe(w: C::Work): bool = w.seats.keys().contains("g")
-  // Quotas: an increase, a decrease and a changed class domain. Negative counts
-  // are omitted: Rust quota counts are unsigned, so InvalidQuota is unrepresentable.
+  // An increase, a decrease and a changed class domain. No negative count: Rust
+  // quota counts are unsigned, so InvalidQuota is unrepresentable there.
   pure val increase = Map(0 -> 2, 1 -> 1)
   pure val quotas = Set(Map(0 -> 0, 1 -> 1), Map(0 -> 1))
   pure val authorities = Set(C::Operator, C::ConvoySupervisor, C::Dispatcher, C::Owner, C::OwnerSupervisor)

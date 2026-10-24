@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -222,7 +222,6 @@
+@@ -191,7 +191,6 @@
            else Moved(Open({ ...w, retired: w.retired.union(Set(a.duty)) }))
        | AddSeat(a) => if (not(a.authorised)) Refused(Unauthorised)
            else if (w.seats.keys().contains(a.seat)) Refused(SeatExists)

@@ -1,7 +1,7 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -250,7 +250,6 @@
-       // allows that many replacements and refuses the next.
+@@ -214,7 +214,6 @@
+           else Moved(Open(nextGeneration(w)))
        | ReplaceSeat(seat) => if (not(w.seats.keys().contains(seat))) Refused(UnknownSeat)
            else if (retiredSeat(w, seat)) Refused(SeatRetired)
 -          else if (w.seats.get(seat).replacements >= REPLACEMENT_LIMIT) Refused(ReplacementsExhausted)

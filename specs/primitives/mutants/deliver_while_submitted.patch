@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -253,7 +253,7 @@
+@@ -217,7 +217,7 @@
            else if (w.seats.get(seat).replacements >= REPLACEMENT_LIMIT) Refused(ReplacementsExhausted)
            else Moved(Open({ ...w, seats: w.seats.set(seat, { ...w.seats.get(seat), replacements: w.seats.get(seat).replacements + 1 }) }))
        | Deliver => val outstanding = w.promises.keys().filter(p => open(w.promises.get(p)))

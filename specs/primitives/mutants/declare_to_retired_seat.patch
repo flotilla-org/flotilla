@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -184,7 +184,6 @@
+@@ -162,7 +162,6 @@
      | Open(w) => match e {
        | Declare(d) => if (w.promises.keys().contains(d.promise) or d.promise < w.promiseFloor) Refused(PromiseExists)
            else if (not(w.seats.keys().contains(d.owner))) Refused(UnknownSeat)

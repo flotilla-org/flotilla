@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -112,7 +112,6 @@
+@@ -87,7 +87,6 @@
      if (r.promises.keys().size() == 0 and not(r.duties.keys().exists(d => lifetime(r.duties.get(d))))) Refused(NoObligations)
      else if (not(r.projectKnown)) Refused(UnknownProject)
      else if (not(validQuota(r.quota))) Refused(InvalidQuota)
