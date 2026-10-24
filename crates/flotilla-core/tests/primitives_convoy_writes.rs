@@ -499,7 +499,25 @@ async fn standing_admission_and_rollover_use_the_ensure_role_identity() {
     assert_eq!(fixture.convoys.get(name).unwrap().spec().duties.len(), 1);
     let authority = Ref::new("ensure-governor");
     fixture.convoys.world(|world| world.authority.put(&authority, true));
+    let duties = fixture.convoys.get(name).unwrap().spec().duties.clone();
+    // Sorts before governor: rebuilding positional duty IDs would renumber them.
+    fixture
+        .convoys
+        .apply(
+            name,
+            flotilla_state_machines::machines::convoy::AddSeat {
+                seat: SeatName::new("aaa", ""),
+                parent: SeatName::new("governor", ""),
+                supervised_by: convoy_map::address(&old).unwrap(),
+                by: SeatName::new("governor", ""),
+                authority: authority.clone(),
+            },
+            Timestamp(8),
+        )
+        .unwrap();
+    assert_eq!(fixture.convoys.get(name).unwrap().spec().duties, duties);
     fixture.convoys.apply(name, Rollover { by: SeatName::new("governor", ""), authority }, Timestamp(9)).unwrap();
+    assert_eq!(fixture.convoys.get(name).unwrap().spec().duties, duties);
     assert!(fixture.engine.holds(&old));
     assert_eq!(fixture.convoys.get(name).unwrap().name(), name);
     assert!(fixture.engine.promises(&old, None).unwrap().is_some());

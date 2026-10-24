@@ -618,27 +618,13 @@ pub fn rehearse_all<'a>(
                 // ended ones: each consumed an id even though its work is finished.
                 let floor: u64 = generations.iter().filter_map(|c| c.status.as_ref().map(|s| map::declarations(c, s).len() as u64)).sum();
                 let mut spec = imported.resource.spec().clone();
-                let mut promises = Records::new();
-                let mut overflow = false;
-                for row in spec.promises.iter() {
-                    let mut promise = row.record.clone();
-                    match u32::try_from(u64::from(promise.id.0) + floor) {
-                        Ok(id) => promise.id = PromiseId(id),
-                        Err(_) => {
-                            overflow = true;
-                            break;
-                        }
+                spec.promises = match offset_promises(&spec.promises, floor) {
+                    Ok(promises) => promises,
+                    Err(reason) => {
+                        report.refused.push(ConvoyImportRefusal::Unmappable { convoy: current.metadata.name.clone(), reason });
+                        continue;
                     }
-                    promises.append(1, promise).expect("same number of promises");
-                }
-                if overflow {
-                    report.refused.push(ConvoyImportRefusal::Unmappable {
-                        convoy: current.metadata.name.clone(),
-                        reason: "folded generations exhaust promise ids".into(),
-                    });
-                    continue;
-                }
-                spec.promises = promises;
+                };
                 spec.promise_floor = floor;
                 imported.resource = Resource::stored(
                     imported.resource.name().to_owned(),
@@ -656,4 +642,18 @@ pub fn rehearse_all<'a>(
     }
     report.rehearsal = rehearse(&report.imported);
     report
+}
+
+/// Reserve the ids consumed by earlier generations without changing live promise order.
+fn offset_promises(source: &Records<Promise>, floor: u64) -> Result<Records<Promise>, String> {
+    let mut promises = Records::new();
+    for row in source.iter() {
+        let mut promise = row.record.clone();
+        promise.id = PromiseId(
+            u32::try_from(u64::from(promise.id.0).checked_add(floor).ok_or("folded generations exhaust promise ids")?)
+                .map_err(|_| "folded generations exhaust promise ids")?,
+        );
+        promises.append(1, promise).map_err(|_| "folded generations exhaust promise rows")?;
+    }
+    Ok(promises)
 }
