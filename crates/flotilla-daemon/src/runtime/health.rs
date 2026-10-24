@@ -40,30 +40,31 @@ use crate::{
 pub(super) fn image_build_failure_condition(
     build: &flotilla_resources::ResourceObject<flotilla_resources::ImageBuild>,
     lifecycles: &dyn flotilla_resources::lifecycle_reads::LifecycleReads,
-) -> Result<Option<HostCondition>, String> {
+) -> Option<HostCondition> {
     use flotilla_protocol::LifecycleReading;
     use flotilla_resources::lifecycle_reads::ProvisioningKind;
-    let reason = match lifecycles.try_reading(ProvisioningKind::ImageBuild, &build.metadata.name, None)? {
-        Some(LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause }) => Some(cause),
-        Some(_) => None,
-        None => build
-            .status
-            .as_ref()
-            .filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Failed)
-            .map(|status| status.failure.as_ref().map(|failure| failure.reason.clone()).unwrap_or_default()),
+    let (reason, message) = match lifecycles.try_reading(ProvisioningKind::ImageBuild, &build.metadata.name, None) {
+        // A failed read must remain visible without suppressing the other heartbeat observations.
+        Err(error) => ("LifecycleReadFailed", error),
+        Ok(Some(LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause })) => ("ImageBuildFailed", cause),
+        Ok(Some(_)) => return None,
+        Ok(None) => {
+            let status = build.status.as_ref().filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Failed)?;
+            ("ImageBuildFailed", status.failure.as_ref().map(|failure| failure.reason.clone()).unwrap_or_default())
+        }
     };
-    Ok(reason.map(|reason| {
+    Some(
         HostCondition::builder()
             .condition_type(format!("ImageBuild/{}", build.metadata.name))
             .value(ConditionValue::False)
-            .reason("ImageBuildFailed")
-            .message(reason)
+            .reason(reason)
+            .message(message)
             .observed_at(Utc::now())
             .blocks_readiness(false)
-            // A failed image build does not disable forge reads.
+            // A failed image build or read does not disable forge reads.
             .blocks_forge_observation(false)
-            .build()
-    }))
+            .build(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -477,13 +478,13 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
             let mut conditions = Vec::new();
             for build in &build_records.items {
                 if build.spec.current().is_some_and(|spec| spec.host_ref == local_host) {
-                    conditions.extend(image_build_failure_condition(build, lifecycles.as_ref())?);
+                    conditions.extend(image_build_failure_condition(build, lifecycles.as_ref()));
                 }
             }
-            Ok::<_, String>(conditions)
+            conditions
         })
         .await
-        .map_err(|error| error.to_string())??,
+        .map_err(|error| error.to_string())?,
     );
 
     conditions.extend(file_descriptor_pressure_condition());

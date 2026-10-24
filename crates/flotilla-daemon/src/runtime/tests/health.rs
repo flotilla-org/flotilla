@@ -1084,9 +1084,9 @@ fn image_build_health_reads_the_engine_without_copying_status() {
             }),
         };
         let legacy = flotilla_resources::lifecycle_reads::NoLifecycleReads;
-        assert_eq!(image_build_failure_condition(&build, &legacy).expect("off").expect("legacy failure").message, "stale");
+        assert_eq!(image_build_failure_condition(&build, &legacy).expect("legacy failure").message, "stale");
         engine.request("image", ImageBuildBinding::request(&build, "local").expect("request"), Timestamp(1)).expect("requested");
-        assert!(image_build_failure_condition(&build, &reads).expect("progress").is_none());
+        assert!(image_build_failure_condition(&build, &reads).is_none());
         engine
             .step(
                 "image",
@@ -1094,13 +1094,13 @@ fn image_build_health_reads_the_engine_without_copying_status() {
                 Timestamp(2),
             )
             .expect("retry");
-        assert!(image_build_failure_condition(&build, &reads).expect("retrying").is_none());
+        assert!(image_build_failure_condition(&build, &reads).is_none());
         if matches!(ending, "ready" | "released" | "lost") {
             engine.step("image", &Step::Realised { identity: "sha256:image".into() }, Timestamp(3)).expect("ready");
             if ending != "ready" {
                 engine.step("image", &if ending == "lost" { Step::Vanished } else { Step::Released }, Timestamp(4)).expect("ended");
             }
-            assert!(image_build_failure_condition(&build, &reads).expect("not failed").is_none());
+            assert!(image_build_failure_condition(&build, &reads).is_none());
         } else {
             build.status.as_mut().expect("status").phase = ImageBuildPhase::Built;
             engine
@@ -1111,7 +1111,7 @@ fn image_build_health_reads_the_engine_without_copying_status() {
                 )
                 .expect("gave up");
             for _ in 0..2 {
-                let condition = image_build_failure_condition(&build, &reads).expect("read").expect("engine failure");
+                let condition = image_build_failure_condition(&build, &reads).expect("engine failure");
                 assert_eq!(condition.message, ending);
                 assert!(!condition.blocks_readiness);
                 assert!(!condition.blocks_forge_observation);
@@ -1124,6 +1124,11 @@ fn image_build_health_reads_the_engine_without_copying_status() {
         })
         .join()
         .is_err());
-        assert!(image_build_failure_condition(&build, &reads).expect_err("read error").contains("poisoned"));
+        let condition = image_build_failure_condition(&build, &reads).expect("read diagnostic");
+        assert_eq!(condition.reason, "LifecycleReadFailed");
+        assert!(condition.message.contains("poisoned"));
+        assert_eq!(condition.value, flotilla_resources::ConditionValue::False);
+        assert!(!condition.blocks_readiness);
+        assert!(!condition.blocks_forge_observation);
     }
 }
