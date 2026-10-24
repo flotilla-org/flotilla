@@ -798,7 +798,7 @@ async fn delivery_batches_fifo_and_held_batches_resolve_without_retyping() {
 }
 
 // Definitely unsent input backs off between counted attempts and stops at
-// the durable budget; stopping retries does not stop attention observations.
+// the durable budget; sleeping retries do not spend terminal observations.
 #[tokio::test]
 async fn genuinely_unsent_batches_back_off_and_stop_after_three_attempts() {
     let (backend, inbox) = delivery_inbox().await;
@@ -813,7 +813,7 @@ async fn genuinely_unsent_batches_back_off_and_stop_after_three_attempts() {
         inbox.reconcile_delivery(&router(&transport), at(second)).await.expect("reconcile");
     }
     assert_eq!(transport.submissions.lock().expect("submissions").len(), 3);
-    assert_eq!(transport.observations.load(std::sync::atomic::Ordering::SeqCst), 6);
+    assert_eq!(transport.observations.load(std::sync::atomic::Ordering::SeqCst), 3);
     for message in backend.using::<Message>("flotilla").list().await.expect("messages").items {
         let retry = message.status.expect("status").retry.expect("retry");
         assert_eq!(retry.attempts, 3);
@@ -841,7 +841,7 @@ async fn genuinely_unsent_batches_back_off_and_stop_after_three_attempts() {
     inbox.reconcile_delivery(&router(&transport), at(504)).await.expect("later intent can proceed");
     assert_eq!(transport.submissions.lock().expect("submissions").len(), 4);
 
-    assert_eq!(transport.observations.load(std::sync::atomic::Ordering::SeqCst), 8, "held attention refreshes");
+    assert_eq!(transport.observations.load(std::sync::atomic::Ordering::SeqCst), 4, "held head does not spend terminal observations");
 }
 
 // #3455: a held batch of system turns does not hold an operator or supervisor
@@ -2952,6 +2952,7 @@ async fn legacy_project_role_reply_uses_recorded_incarnation() {
 // In-memory transport with a chosen name, standing in for a second agent
 // transport (such as the Codex app-server) beside keystroke.
 struct NamedTransport {
+    observations: std::sync::atomic::AtomicUsize,
     id: &'static str,
     outcome: TransportOutcome,
     submissions: std::sync::Mutex<Vec<String>>,
@@ -2962,6 +2963,7 @@ impl AgentTransport for NamedTransport {
         self.id.into()
     }
     async fn observe(&self, _: &DeliveryTarget, _: Option<&SubmissionRef>) -> Result<TransportObservation, String> {
+        self.observations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(TransportObservation { ready: true, ..Default::default() })
     }
     async fn submit(&self, delivery: &Delivery) -> TransportOutcome {
@@ -3001,7 +3003,7 @@ fn two_route_router(first: &Arc<NamedTransport>, keystroke: &Arc<NamedTransport>
 }
 
 fn named(id: &'static str, outcome: TransportOutcome) -> Arc<NamedTransport> {
-    Arc::new(NamedTransport { id, outcome, submissions: Default::default() })
+    Arc::new(NamedTransport { id, outcome, submissions: Default::default(), observations: Default::default() })
 }
 
 // Behaviour (#3545, ADR 0059 §4): with two transports registered for the
@@ -3175,6 +3177,11 @@ async fn every_held_delivery_immediately_raises_crew_attention() {
             Some(flotilla_protocol::CrewAttention::DeliveryUnconfirmed | flotilla_protocol::CrewAttention::ControllerFenceUnverifiable)
         ));
         assert_eq!(backend.using::<flotilla_resources::Demand>("flotilla").list().await.unwrap().items.len(), 1);
+        let held = flotilla_resources::HeldMessageBatch::collect(&backend.using::<Message>("flotilla").list().await.unwrap().items);
+        assert_eq!(held[0].prior_submission, !held[0].reason.contains("ControllerFenceUnverifiable"));
+        if held[0].prior_submission {
+            assert!(held[0].describe("flotilla").contains("confirm the message is not already in the conversation"));
+        }
         inbox.deliver_held_batch("message-0", "checked composer before disposition").await.unwrap();
         inbox.fail_batch("message-2", "operator disposed of held intent", at(21)).await.unwrap();
         inbox.reconcile_delivery(&router(&transport), at(22)).await.unwrap();
@@ -3313,10 +3320,20 @@ async fn operator_delivery_authorization_does_not_follow_a_replacement_session()
     let holder = terminals.get("terminal").await.unwrap();
     let mut status = holder.status.unwrap();
     status.session_id = Some("replacement".into());
+    status.crew.as_mut().unwrap().id = "replacement-crew".into();
+    status.degraded = None;
     terminals.update_status("terminal", &holder.metadata.resource_version, &status).await.unwrap();
     let accepts = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "receipt".into() });
     inbox.reconcile_delivery(&router(&accepts), at(30)).await.unwrap();
     assert!(accepts.submissions.lock().unwrap().is_empty(), "old authorization cannot type into a new child");
+    let held = flotilla_resources::HeldMessageBatch::collect(&messages.list().await.unwrap().items);
+    assert_eq!(held.len(), 1, "stale authorization remains listed for operators");
+    assert!(held[0].reason.contains("previous receiver activation"));
+    let terminal = terminals.get("terminal").await.unwrap();
+    assert!(flotilla_resources::crew_attention(terminal.status.as_ref(), at(30)).is_some());
+    for message in messages.list().await.unwrap().items {
+        assert!(message.status.unwrap().operator_delivery.is_none());
+    }
     inbox.deliver_held_batch("message-0", "inspected replacement").await.unwrap();
     inbox.reconcile_delivery(&router(&accepts), at(32)).await.unwrap();
     assert_eq!(accepts.submissions.lock().unwrap().len(), 1);
@@ -3385,10 +3402,23 @@ fn partial_operator_authorization_never_submits_a_batch_prefix(tc: hegel::TestCa
             let message = messages.get(&format!("message-{index}")).await.unwrap();
             assert_eq!(message.status.unwrap().operator_delivery.is_some(), index < completed);
         }
+        let terminals = backend.using::<flotilla_resources::TerminalSession>("flotilla");
+        let terminal = terminals.get("terminal").await.unwrap();
+        let mut status = terminal.status.unwrap();
+        status.degraded = None;
+        terminals.update_status("terminal", &terminal.metadata.resource_version, &status).await.unwrap();
+        for gate in backend.using::<flotilla_resources::Demand>("flotilla").list().await.unwrap().items {
+            backend.using::<flotilla_resources::Demand>("flotilla").delete(&gate.metadata.name).await.unwrap();
+        }
         let accepts = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "explicit send completed".into() });
         for second in [21, 30, 500] {
             inbox.reconcile_delivery(&router(&accepts), at(second)).await.unwrap();
             assert!(accepts.submissions.lock().unwrap().is_empty(), "partial authorization cannot submit a prefix");
+            let terminal = terminals.get("terminal").await.unwrap();
+            assert!(
+                flotilla_resources::crew_attention(terminal.status.as_ref(), at(second)).is_some(),
+                "partial authorization retains attention"
+            );
         }
         inbox.deliver_held_batch("message-0", "inspected batch").await.unwrap();
         inbox.reconcile_delivery(&router(&accepts), at(502)).await.unwrap();
@@ -3398,4 +3428,31 @@ fn partial_operator_authorization_never_submits_a_batch_prefix(tc: hegel::TestCa
             assert!(message.status.unwrap().resolved_receiver.unwrap().evidence.contains("inspected batch"));
         }
     });
+}
+
+// Persistent deployed-cleat refusals cannot cause screen capture, send or
+// replicated status churn every ten seconds forever.
+#[tokio::test]
+async fn persistent_controller_fence_rechecks_back_off() {
+    let (backend, inbox) = delivery_inbox().await;
+    let fence = named(
+        KEYSTROKE,
+        TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
+    );
+    let mut now = 20;
+    for delay in [10, 20, 40, 80, 160, 320, 640, 900, 900] {
+        inbox.reconcile_delivery(&router(&fence), at(now)).await.unwrap();
+        let message = backend.using::<Message>("flotilla").get("message-0").await.unwrap();
+        assert_eq!(message.status.unwrap().fence_recheck_at, Some(at(now + delay)));
+        let terminal = backend.using::<flotilla_resources::TerminalSession>("flotilla").get("terminal").await.unwrap();
+        assert_eq!(terminal.status.unwrap().degraded.unwrap().observed_at, at(now), "every new refusal refreshes crash-repair proof");
+        let count = fence.submissions.lock().unwrap().len();
+        let observations = fence.observations.load(std::sync::atomic::Ordering::SeqCst);
+        for second in [now + 1, now + delay - 1] {
+            inbox.reconcile_delivery(&router(&fence), at(second)).await.unwrap();
+        }
+        assert_eq!(fence.submissions.lock().unwrap().len(), count);
+        assert_eq!(fence.observations.load(std::sync::atomic::Ordering::SeqCst), observations, "backoff avoids screen observations too");
+        now += delay;
+    }
 }

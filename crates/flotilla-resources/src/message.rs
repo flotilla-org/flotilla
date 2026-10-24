@@ -373,6 +373,8 @@ pub struct HeldMessageBatch {
     /// Every member is a flotilla system turn, so an operator or supervisor
     /// message to the same receiver supersedes the whole batch.
     pub system_only: bool,
+    /// A previous attempt may already appear in the conversation.
+    pub prior_submission: bool,
 }
 
 impl HeldMessageBatch {
@@ -415,6 +417,7 @@ impl HeldMessageBatch {
                 reason: status.reason.clone().unwrap_or_else(|| "delivery held".into()),
                 members,
                 system_only,
+                prior_submission: status.submission.is_some() || !status.delivery_history.is_empty(),
             });
         }
         batches
@@ -428,13 +431,14 @@ impl HeldMessageBatch {
     /// One plain sentence naming the batch, why it is held and how to clear it.
     pub fn describe(&self, namespace: &str) -> String {
         format!(
-            "message batch `{}` is held for {} ({} message{}: {}): {}; verify the pane shows the agent composer first, then authorize same-session delivery with `flotilla resource deliver-message-batch {} --namespace {} --reason '<why>'`; dispose of it with `{}`",
+            "message batch `{}` is held for {} ({} message{}: {}): {}; {}, then authorize same-session delivery with `flotilla resource deliver-message-batch {} --namespace {} --reason '<why>'`; dispose of it with `{}`",
             self.batch,
             self.receiver,
             self.members.len(),
             if self.members.len() == 1 { "" } else { "s" },
             self.members.join(", "),
             self.reason,
+            if self.prior_submission { "confirm the message is not already in the conversation and verify the pane shows the agent composer" } else { "verify the pane shows the agent composer first" },
             self.members[0],
             namespace,
             self.clear_command(namespace)

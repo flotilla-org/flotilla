@@ -121,7 +121,7 @@ impl MessageInbox {
         }
         let mut messages = self.messages.query(&MessageQuery::active()).await?;
         if messages.is_empty() {
-            self.cleanup_delivery_gates(None, now).await?;
+            self.cleanup_delivery_gates(None).await?;
             tokio::time::timeout(TRANSPORT_CALL_BOUND, router.release_closed()).await.ok();
             return Ok(());
         }
@@ -275,7 +275,7 @@ impl MessageInbox {
         for (_, (holder, pending)) in groups {
             self.deliver_group(receivers, router, &holder, &pending, &messages, now).await?;
         }
-        self.cleanup_delivery_gates(Some(receivers), now).await?;
+        self.cleanup_delivery_gates(Some(receivers)).await?;
         tokio::time::timeout(TRANSPORT_CALL_BOUND, router.release_closed()).await.ok();
         Ok(())
     }
@@ -547,6 +547,25 @@ impl MessageInbox {
         if pending.is_empty() {
             return Ok(());
         }
+        // Authorization cannot migrate to another activation, including after
+        // its old submission was archived while waiting for readiness.
+        if let Some(request) = authorization {
+            let target = delivery_target(holder);
+            if target.session.as_ref() != Some(&request.session) || target.crew_id.as_ref() != Some(&request.crew_id) {
+                for message in pending {
+                    let mut status = status_for(message);
+                    status.operator_delivery = None;
+                    status.fence_recheck_at = None;
+                    let reason = "delivery held: operator authorization belongs to a previous receiver activation; inspect the current conversation before authorizing again";
+                    status.retry = Some(ControllerRetry::terminal(status.retry.as_ref(), now, reason));
+                    MessageStatusPatch::Wait { phase: MessagePhase::Deliverable, reason: reason.into(), at: now }.apply(&mut status);
+                    self.write(message, &status).await?;
+                }
+                let first = self.messages.get(&pending[0].metadata.name).await?;
+                self.signal(receivers, &first, now).await?;
+                return Ok(());
+            }
+        }
         // The session marker is persisted before the batch members. Repair a
         // partially written refusal before observing Working/receipt evidence:
         // this batch is known unsent, even if some members still have their old
@@ -615,7 +634,11 @@ impl MessageInbox {
                 }
             } else {
                 // A command interrupted between member writes authorizes no
-                // subset of the original batch. Wait for an explicit repair.
+                // subset of the original batch. Wait for an explicit repair,
+                // retaining attention even after the terminal marker was lost.
+                if let Some(held) = pending.iter().find(|message| HeldMessageBatch::is_held(message)) {
+                    self.signal(receivers, held, now).await?;
+                }
                 return Ok(());
             }
         }
@@ -630,6 +653,34 @@ impl MessageInbox {
                 self.wait(message, MessagePhase::Deliverable, "waiting for holder terminal startup", now).await?;
             }
             return Ok(());
+        }
+        if existing.is_none() {
+            // Preserve FIFO after a definitely-unsent batch exhausts its budget.
+            // A later message must not silently bypass the operator's held intent.
+            if let Some(held) = pending.iter().find(|message| {
+                message
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.retry.as_ref())
+                    .is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }))
+            }) {
+                self.signal(receivers, held, now).await?;
+            }
+            if pending.iter().any(|message| {
+                message.status.as_ref().and_then(|status| status.retry.as_ref()).is_some_and(|retry| match &retry.disposition {
+                    ControllerRetryDisposition::Retryable { next_attempt_at } => now < *next_attempt_at,
+                    ControllerRetryDisposition::Terminal { .. } => {
+                        let fence = message.status.as_ref().is_some_and(|status| status.fence_recheck_at.is_some())
+                            || holder.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
+                                condition.is_controller_fence_unverifiable()
+                                    && pending.iter().any(|member| condition.message_id.as_deref() == Some(member.metadata.name.as_str()))
+                            });
+                        !fence || message.status.as_ref().and_then(|status| status.fence_recheck_at).is_some_and(|due| now < due)
+                    }
+                })
+            }) {
+                return Ok(());
+            }
         }
         let target = delivery_target(holder);
         let existing_ref = existing.as_ref().map(submission_ref);
@@ -750,32 +801,6 @@ impl MessageInbox {
                 self.outcome(receivers, DeliveryAttempt { members: &members, holder, submission: &submission }, router, outcome, now)
                     .await?;
             }
-            return Ok(());
-        }
-        // Preserve FIFO after a definitely-unsent batch exhausts its budget.
-        // A later message must not silently bypass the operator's held intent.
-        if let Some(held) = pending.iter().find(|message| {
-            message
-                .status
-                .as_ref()
-                .and_then(|status| status.retry.as_ref())
-                .is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }))
-        }) {
-            self.signal(receivers, held, now).await?;
-        }
-        if pending.iter().any(|message| {
-            message.status.as_ref().and_then(|status| status.retry.as_ref()).is_some_and(|retry| match &retry.disposition {
-                ControllerRetryDisposition::Retryable { next_attempt_at } => now < *next_attempt_at,
-                ControllerRetryDisposition::Terminal { .. } => {
-                    let fence = message.status.as_ref().is_some_and(|status| status.fence_recheck_at.is_some())
-                        || holder.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
-                            condition.is_controller_fence_unverifiable()
-                                && pending.iter().any(|member| condition.message_id.as_deref() == Some(member.metadata.name.as_str()))
-                        });
-                    !fence || message.status.as_ref().and_then(|status| status.fence_recheck_at).is_some_and(|due| now < due)
-                }
-            })
-        }) {
             return Ok(());
         }
         if running_holder.is_none() || !observation.ready {
@@ -1046,10 +1071,29 @@ impl MessageInbox {
         // repaired at the start of deliver_group_traced without retyping input.
         // A receiver lost between result and snapshot is still a known-unsent
         // batch: park it durably; a future holder lookup can raise its gate.
+        let mut failures = 1;
         if let Some(holder) = self.resolve_receiver(receivers, first).await? {
+            let current = self.messages.get(&first.metadata.name).await?;
+            let submitted_at =
+                current.status.as_ref().and_then(|status| status.submission.as_ref()).map(|submission| submission.started_at);
             let already_recorded = holder.object.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
-                condition.is_controller_fence_unverifiable() && condition.message_id.as_deref() == Some(first.metadata.name.as_str())
+                condition.is_controller_fence_unverifiable()
+                    && condition.message_id.as_deref() == Some(first.metadata.name.as_str())
+                    && submitted_at.is_none_or(|at| at <= condition.observed_at)
             });
+            failures = holder
+                .object
+                .status
+                .as_ref()
+                .and_then(|status| status.degraded.as_ref())
+                .filter(|condition| condition.message_id.as_deref() == Some(first.metadata.name.as_str()))
+                .map_or(1, |condition| {
+                    if already_recorded {
+                        condition.consecutive_failures
+                    } else {
+                        condition.consecutive_failures.saturating_add(1)
+                    }
+                });
             if !already_recorded {
                 apply_status_patch(
                     &self.backend.using::<TerminalSession>(&self.namespace),
@@ -1071,7 +1115,7 @@ impl MessageInbox {
             let mut status = status_for(&current);
             status.retry = Some(ControllerRetry::terminal(status.retry.as_ref(), now, reason));
             status.submission = None;
-            status.fence_recheck_at = Some(now + CONTROLLER_FENCE_RECHECK_FOR);
+            status.fence_recheck_at = Some(now + crate::delivery_hold::controller_fence_recheck_delay(failures));
             status.failed_batch_members = members.iter().map(|message| message.metadata.name.clone()).collect();
             MessageStatusPatch::Wait { phase: MessagePhase::Deliverable, reason: reason.into(), at: now }.apply(&mut status);
             self.write(&current, &status).await?;
@@ -1192,7 +1236,7 @@ impl MessageInbox {
 
     // Repair a crash between terminal closure/receipt and gate deletion. Only
     // actual receiver gates are checked; historical Messages cause no deletes.
-    async fn cleanup_delivery_gates(&self, receivers: Option<&MessageReceiverSnapshot>, now: DateTime<Utc>) -> Result<(), ResourceError> {
+    async fn cleanup_delivery_gates(&self, receivers: Option<&MessageReceiverSnapshot>) -> Result<(), ResourceError> {
         let demands = self.backend.using::<Demand>(&self.namespace);
         let gates: Vec<_> = demands
             .list()
@@ -1252,7 +1296,7 @@ impl MessageInbox {
                 match terminals.get(&owner.name).await {
                     Ok(holder) => {
                         // The legacy queue shares this receiver gate and can still own it.
-                        if flotilla_resources::delivery_hold::legacy_delivery_gate_needed(&holder, now) {
+                        if flotilla_resources::delivery_hold::legacy_delivery_gate_needed(&holder) {
                             continue;
                         }
                         if let Some(id) = holder

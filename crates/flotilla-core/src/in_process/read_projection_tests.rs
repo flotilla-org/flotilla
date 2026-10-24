@@ -1803,6 +1803,7 @@ mod tests {
         assert!(held[0].system_only);
         let description = held[0].describe("flotilla");
         assert!(description.contains("flotilla resource deliver-message-batch held-0"));
+        assert!(description.contains("confirm the message is not already in the conversation"));
         assert!(description.starts_with("message batch `batch-held-0-0` is held for project/convoy/work/coder (2 messages: held-0, held-1): delivery held: held pending acceptance evidence"), "{description}");
         assert!(
             description.ends_with("dispose of it with `flotilla resource fail-message-batch held-0 --namespace flotilla --reason '<why>'`"),

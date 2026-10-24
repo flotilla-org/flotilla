@@ -513,7 +513,7 @@ where
                         condition.message_id.as_deref() == Some(message.id.as_str())
                             && ((condition.is_controller_fence_unverifiable()
                                 && self.clock.now().signed_duration_since(condition.observed_at)
-                                    < flotilla_resources::delivery_hold::CONTROLLER_FENCE_RECHECK_FOR)
+                                    < flotilla_resources::delivery_hold::controller_fence_recheck_delay(condition.consecutive_failures))
                                 || condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
                                 || condition.reason == TERMINAL_DELIVERY_EXPIRED_REASON
                                 || (condition.reason == TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
@@ -937,7 +937,7 @@ where
             }
             _ => Vec::new(),
         };
-        let delivery_failure_visible = flotilla_resources::delivery_hold::legacy_delivery_gate_needed(obj, now);
+        let delivery_failure_visible = flotilla_resources::delivery_hold::legacy_delivery_gate_needed(obj);
         if delivery_failure_visible
             && (consumed
                 || matches!(

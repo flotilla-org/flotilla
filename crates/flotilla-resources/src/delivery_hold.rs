@@ -12,6 +12,11 @@ pub const DELIVERY_MAX_ATTEMPTS: u32 = 3;
 pub const DELIVERY_WORKING_DEBOUNCE_FOR: chrono::Duration = crate::TerminalAttention::DEBOUNCE_FOR;
 /// Guarded retry cadence for a definitely-unsent, unverifiable controller fence.
 pub const CONTROLLER_FENCE_RECHECK_FOR: chrono::Duration = chrono::Duration::seconds(10);
+/// Persistent refusals back off to fifteen minutes instead of probing every ten seconds.
+pub fn controller_fence_recheck_delay(failures: u32) -> chrono::Duration {
+    (CONTROLLER_FENCE_RECHECK_FOR * (1_i32 << failures.saturating_sub(1).min(7))).min(chrono::Duration::minutes(15))
+}
+
 pub const DELIVERY_HOLD_FOR: chrono::Duration = chrono::Duration::minutes(5);
 
 pub fn delivery_retry_delay(failures: u32) -> Duration {
@@ -74,7 +79,7 @@ pub fn delivery_demand(session: &ResourceObject<TerminalSession>) -> (InputMeta,
 
 /// Whether the legacy representation still owns the receiver's operator gate.
 /// The cursor must identify the held head; stale degraded history cannot retain it.
-pub fn legacy_delivery_gate_needed(session: &ResourceObject<TerminalSession>, _now: DateTime<Utc>) -> bool {
+pub fn legacy_delivery_gate_needed(session: &ResourceObject<TerminalSession>) -> bool {
     let Some(status) = session.status.as_ref() else {
         return false;
     };
