@@ -13,6 +13,9 @@ use tokio::{io::AsyncWriteExt, sync::mpsc};
 
 const CADENCE: Duration = Duration::from_secs(5);
 const IO_DEADLINE: Duration = Duration::from_secs(15);
+// The producer waits 15 seconds for a frame. Allow another five seconds for the
+// routed request and response so its specific failure reaches the follower.
+const ROUTED_PULL_DEADLINE: Duration = Duration::from_secs(20);
 /// How long the router's change-stream body waits on a consumer that stopped reading.
 pub(super) const CONSUMER_DEADLINE: Duration = IO_DEADLINE;
 const QUEUED_FRAMES: usize = 2;
@@ -196,7 +199,7 @@ async fn routed_round(service: Arc<Service>, home: &str, router: &super::remote_
     let mut spool = tokio::fs::File::from_std(tempfile::tempfile().map_err(|e| e.to_string())?);
     loop {
         let command = Command::builder().node_id(NodeId::new(home)).action(CommandAction::QueryChangeStream { after, session }).build();
-        let value = tokio::time::timeout(IO_DEADLINE, router.dispatch_replication_query(command))
+        let value = tokio::time::timeout(ROUTED_PULL_DEADLINE, router.dispatch_replication_query(command))
             .await
             .map_err(|_| "routed stream timed out")??;
         let CommandValue::ChangeStreamFrame { session: next, frame } = value else {

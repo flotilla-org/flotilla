@@ -145,6 +145,27 @@ struct PendingRemoteStepBatch {
     completion: oneshot::Sender<Result<Vec<StepOutcome>, String>>,
 }
 
+/// Query acknowledgements belong to the dispatch future, including while sending.
+/// Most drops remove synchronously; contention defers only the lock acquisition.
+struct PendingQueryGuard {
+    pending: PendingRemoteCommandMap,
+    request_id: u64,
+}
+
+impl Drop for PendingQueryGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.try_lock() {
+            pending.remove(&self.request_id);
+        } else {
+            let pending = Arc::clone(&self.pending);
+            let request_id = self.request_id;
+            tokio::spawn(async move {
+                pending.lock().await.remove(&request_id);
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ActiveRemoteStepBatch {
     request_id: u64,
@@ -487,7 +508,10 @@ impl RemoteCommandRouter {
         if !matches!(command.action, CommandAction::QueryChangeStream { .. }) {
             return Err("replication query requires a change-stream action".into());
         }
-        self.dispatch_with_query_origin(command, None).await
+        match self.dispatch_with_query_origin(command, None).await? {
+            CommandValue::Error { message } => Err(message),
+            value => Ok(value),
+        }
     }
 
     /// Return the destination's acknowledgement for a remote command or query.
@@ -559,6 +583,8 @@ impl RemoteCommandRouter {
                 .build(),
         );
 
+        let _pending = PendingQueryGuard { pending: Arc::clone(&self.pending_remote_commands), request_id };
+
         let routed = RoutedPeerMessage::CommandRequest {
             trace_context: flotilla_tracing::inject(),
             request_id,
@@ -570,7 +596,6 @@ impl RemoteCommandRouter {
             session_id,
         };
         if let Err(err) = self.send_routed_to(&target_node_id, routed).await {
-            self.pending_remote_commands.lock().await.remove(&request_id);
             return Err(match existing_convoy_target {
                 Some(target) => {
                     format!("authority unreachable for {} at {}: {err}", crew_convoy.as_deref().unwrap_or("convoy"), target.home)
@@ -580,16 +605,11 @@ impl RemoteCommandRouter {
         }
 
         const REMOTE_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
-        let result = match tokio::time::timeout(REMOTE_QUERY_TIMEOUT, rx).await {
+        match tokio::time::timeout(REMOTE_QUERY_TIMEOUT, rx).await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(_)) => Err("remote query response channel closed".to_string()),
-            Err(_) => {
-                self.pending_remote_commands.lock().await.remove(&request_id);
-                Err(format!("timed out waiting for remote query result (command_id={command_id})"))
-            }
-        };
-
-        result
+            Err(_) => Err(format!("timed out waiting for remote query result (command_id={command_id})")),
+        }
     }
 
     async fn execute_projected_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
