@@ -262,6 +262,8 @@ followers run before the first registered kind is installed; until then both rou
 
 **Definitions.** A definition is homed at the ManifestRoot that declares it, and edited through git. Undeclared definitions are homed where they were created. Multi-writer merge metadata and field ownership are removed.
 
+ADR carry: a standing ConvoyEnsure is acted on by exactly one host — its declared driver when it names one, otherwise its definition home (the declaring ManifestRoot's host, or the creating host for an undeclared ensure).
+
 ### Not Kubernetes
 
 Flotilla resources will not be Kubernetes CRDs. Kubernetes, if used, is an environment provider. The following are dropped:

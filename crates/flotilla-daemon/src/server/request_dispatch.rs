@@ -173,10 +173,14 @@ impl<'a> RequestDispatcher<'a> {
             let namespace = self.daemon.provisioning_namespace().await;
             let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
             let session = service.caller_session(caller).await?;
+            // A crew's files are read where it runs: through its vessel's
+            // agent on an agentless host (#3792).
             let runner = self
                 .daemon
-                .command_runner_for_environment_ref(&session.spec.env_ref)
-                .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
+                .command_runner_for_session(&session.spec)
+                .await
+                .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?
+                .map_err(|error| format!("artifact environment {}: {error}", session.spec.env_ref))?;
             let source_path = absolute_crew_path(&source_path, &session.spec.cwd);
             let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
             runner.read_file_to(&source_path, temporary.path()).await?;
@@ -259,8 +263,10 @@ impl<'a> RequestDispatcher<'a> {
                 let session = service.caller_session(caller).await?;
                 let runner = self
                     .daemon
-                    .command_runner_for_environment_ref(&session.spec.env_ref)
-                    .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
+                    .command_runner_for_session(&session.spec)
+                    .await
+                    .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?
+                    .map_err(|error| format!("artifact environment {}: {error}", session.spec.env_ref))?;
                 (runner, absolute_crew_path(&destination_path, &session.spec.cwd))
             } else {
                 if !self.authenticated_user {

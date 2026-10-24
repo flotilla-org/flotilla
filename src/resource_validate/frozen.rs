@@ -25,12 +25,6 @@ use serde_json::Value;
 /// their commitment to abandon and freshly admit this generation after the roll.
 pub(super) const READMISSION_ANNOTATION: &str = "flotilla.work/pre-roll-re-admission";
 
-#[derive(Default)]
-pub(crate) struct ProbeOptions {
-    pub sources: Option<PathBuf>,
-    pub credential_tokens: BTreeMap<String, PathBuf>,
-}
-
 pub(super) trait Probes {
     async fn skills(
         &self,
@@ -41,7 +35,7 @@ pub(super) trait Probes {
 }
 
 pub(super) struct CandidateProbes<'a> {
-    pub options: &'a ProbeOptions,
+    pub options: &'a super::ValidationOptions,
     pub inventory: &'a [Value],
     pub runner: &'a dyn CommandRunner,
     pub provider: &'a dyn EnvironmentProvider,
@@ -1038,7 +1032,7 @@ mod tests {
             let held = if cached { local.clone() } else { format!("sha256:{}", "c".repeat(64)) };
             let held = if legacy_inventory { serde_json::json!([held]) } else { serde_json::json!({"cache-a":[held]}) };
             let inventory = vec![serde_json::json!({"kind":"Host", "status":{"capabilities":{IMAGE_DIGESTS_CAPABILITY:held}}}); duplicates];
-            let options = ProbeOptions::default();
+            let options = super::super::ValidationOptions::default();
             let runner = std::sync::Arc::new(RegistryRunner {
                 reference: registry.clone(),
                 available: published,
@@ -1076,7 +1070,7 @@ mod tests {
             flotilla_environment::environment::EnvironmentInput::Docker,
             runner.clone(),
         );
-        let options = ProbeOptions::default();
+        let options = super::super::ValidationOptions::default();
         let probes = CandidateProbes { options: &options, inventory: &[], runner: runner.as_ref(), provider: provider.as_ref() };
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
@@ -1101,7 +1095,7 @@ mod tests {
         decode::<ImageBuild>(&retired).expect("retired build decodes");
         let inventory =
             vec![serde_json::json!({"kind":"Host", "status":{"capabilities":{IMAGE_DIGESTS_CAPABILITY:{"cache-a":[]}}}}), retired];
-        let options = ProbeOptions::default();
+        let options = super::super::ValidationOptions::default();
         // Stands in for a registry process: a local ID never reaches it.
         let runner = std::sync::Arc::new(RegistryRunner {
             reference: "unused".into(),

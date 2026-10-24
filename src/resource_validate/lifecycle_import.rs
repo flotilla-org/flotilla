@@ -116,6 +116,14 @@ impl Documents {
     }
 }
 
+/// Deliberate non-import classes. Match both kind and complete reason so a new
+/// refusal (including a decode or store failure on a Checkout) fails closed.
+const EXEMPT_REFUSALS: &[(&str, &str)] = &[("Checkout", "an observed checkout is no engine request")];
+
+pub(super) fn exempt(refusal: &ImportRefusal) -> bool {
+    EXEMPT_REFUSALS.contains(&(refusal.kind, refusal.reason.as_str()))
+}
+
 /// One line of counts, then one line per named refusal.
 pub(super) fn print(namespace: &str, report: &ImportReport) {
     let total: usize = report.imported.values().sum();
@@ -135,6 +143,22 @@ pub(super) fn print(namespace: &str, report: &ImportReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Contract #3760: observed Checkout is the sole named exemption. Other
+    // kinds, decode failures, store failures and new reasons must fail closed.
+    #[test]
+    fn only_observed_checkout_refusals_are_exempt() {
+        for (kind, reason, expected) in [
+            ("Checkout", "an observed checkout is no engine request", true),
+            ("Clone", "an observed checkout is no engine request", false),
+            ("Checkout", "does not decode: invalid spec", false),
+            ("Checkout", "store refused restore", false),
+            ("Checkout", "read back differently", false),
+            ("Checkout", "new refusal", false),
+        ] {
+            assert_eq!(exempt(&ImportRefusal { kind, record: "record".into(), reason: reason.into() }), expected);
+        }
+    }
 
     fn document(kind: &str, name: &str, spec: Value, status: Value) -> Value {
         serde_json::json!({

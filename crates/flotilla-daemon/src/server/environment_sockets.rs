@@ -10,6 +10,32 @@ pub(crate) fn directory_name(id: &EnvironmentId) -> String {
     digest[..16].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// One socket's identity: an environment's own, or one of its vessels' on a
+/// host whose vessels share the environment (#3792). A vessel agent claims its
+/// host endpoint exclusively, so each vessel there needs a socket of its own;
+/// every one serves its environment.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SocketKey {
+    environment: EnvironmentId,
+    vessel: Option<String>,
+}
+
+impl SocketKey {
+    fn directory_name(&self) -> String {
+        match &self.vessel {
+            None => directory_name(&self.environment),
+            Some(vessel) => {
+                let mut digest = Sha256::new();
+                for part in [self.environment.as_str(), vessel] {
+                    digest.update((part.len() as u64).to_le_bytes());
+                    digest.update(part.as_bytes());
+                }
+                digest.finalize()[..16].iter().map(|byte| format!("{byte:02x}")).collect()
+            }
+        }
+    }
+}
+
 // Darwin's 104-byte sun_path includes the trailing NUL. Use the same bound
 // everywhere so a Linux-tested path is also safe on Darwin.
 const MAX_SOCKET_PATH_BYTES: usize = 103;
@@ -75,7 +101,7 @@ async fn socket_root(state_dir: &DaemonHostPath) -> Result<std::path::PathBuf, S
 }
 
 pub struct EnvironmentSocketRegistry {
-    sockets: HashMap<EnvironmentId, (Option<JoinHandle<()>>, DaemonHostPath)>,
+    sockets: HashMap<SocketKey, (Option<JoinHandle<()>>, DaemonHostPath)>,
 }
 
 impl Drop for EnvironmentSocketRegistry {
@@ -110,12 +136,21 @@ impl EnvironmentSocketRegistry {
         state_dir: &DaemonHostPath,
         spawn_accept_loop: impl FnOnce(UnixListener, EnvironmentId) -> JoinHandle<()>,
     ) -> Result<DaemonHostPath, String> {
-        if let Some((Some(handle), path)) = self.sockets.get(&id) {
+        self.add_keyed(SocketKey { environment: id, vessel: None }, state_dir, spawn_accept_loop).await
+    }
+
+    async fn add_keyed(
+        &mut self,
+        key: SocketKey,
+        state_dir: &DaemonHostPath,
+        spawn_accept_loop: impl FnOnce(UnixListener, EnvironmentId) -> JoinHandle<()>,
+    ) -> Result<DaemonHostPath, String> {
+        if let Some((Some(handle), path)) = self.sockets.get(&key) {
             if !handle.is_finished() {
                 return Ok(path.clone());
             }
         }
-        let directory_name = directory_name(&id);
+        let directory_name = key.directory_name();
         let directory = socket_root(state_dir).await?.join(directory_name);
         tokio::fs::DirBuilder::new()
             .recursive(true)
@@ -137,17 +172,26 @@ impl EnvironmentSocketRegistry {
         tokio::fs::set_permissions(socket_path.as_path(), std::fs::Permissions::from_mode(0o600))
             .await
             .map_err(|error| format!("protect environment socket: {error}"))?;
-        info!(%id, path = %socket_path, "environment socket listening");
+        info!(id = %key.environment, vessel = ?key.vessel, path = %socket_path, "environment socket listening");
 
-        let handle = spawn_accept_loop(listener, id.clone());
-        self.sockets.insert(id, (Some(handle), socket_path.clone()));
+        let handle = spawn_accept_loop(listener, key.environment.clone());
+        self.sockets.insert(key, (Some(handle), socket_path.clone()));
 
         Ok(socket_path)
     }
 
-    /// Remove an environment socket and clean up.
+    /// Remove an environment socket, and its vessels' sockets, and clean up.
     pub async fn remove(&mut self, id: &EnvironmentId) -> Result<(), String> {
-        if let Some((handle, path)) = self.sockets.get_mut(id) {
+        let vessels = self.sockets.keys().filter(|key| key.environment == *id && key.vessel.is_some()).cloned().collect::<Vec<_>>();
+        for key in vessels {
+            self.remove_keyed(&key).await?;
+        }
+        self.remove_keyed(&SocketKey { environment: id.clone(), vessel: None }).await
+    }
+
+    async fn remove_keyed(&mut self, key: &SocketKey) -> Result<(), String> {
+        let id = &key.environment;
+        if let Some((handle, path)) = self.sockets.get_mut(key) {
             // A failed unlink retains the path for retry, but never a serving
             // registration: add must rebind rather than return an aborted loop.
             if let Some(handle) = handle.take() {
@@ -165,8 +209,8 @@ impl EnvironmentSocketRegistry {
                     }
                 }
             }
-            self.sockets.remove(id);
-            info!(%id, "environment socket removed");
+            self.sockets.remove(key);
+            info!(%id, vessel = ?key.vessel, "environment socket removed");
         }
         Ok(())
     }
@@ -175,7 +219,7 @@ impl EnvironmentSocketRegistry {
     /// unlink/rmdir fails. Resource teardown uses `remove` to report and retry
     /// cleanup failures rather than treating them as successful deletion.
     pub async fn remove_all(&mut self) {
-        for (id, (handle, path)) in self.sockets.drain() {
+        for (key, (handle, path)) in self.sockets.drain() {
             if let Some(handle) = handle {
                 handle.abort();
             }
@@ -183,7 +227,7 @@ impl EnvironmentSocketRegistry {
             if let Some(parent) = path.as_path().parent() {
                 let _ = tokio::fs::remove_dir(parent).await;
             }
-            info!(%id, "environment socket removed");
+            info!(id = %key.environment, vessel = ?key.vessel, "environment socket removed");
         }
     }
 }
@@ -193,8 +237,9 @@ impl EnvironmentSocketRegistry {
 pub enum SocketReach {
     /// Bind-mounted into a container: the kernel peer is the crew's own process.
     Mounted,
-    /// Carried by an ssh reverse forward (agentless hosts): the kernel peer is
-    /// the controller's own ssh client, so its environment is no crew evidence.
+    /// Carried by a vessel agent's guest forward on an agentless host (#3792):
+    /// the kernel peer is the controller's own agent client, so its
+    /// environment is no crew evidence.
     Forwarded,
 }
 
@@ -223,22 +268,28 @@ impl EnvironmentSocketService {
     }
 
     pub(crate) async fn prepare(&self, id: EnvironmentId) -> Result<DaemonHostPath, String> {
-        self.prepare_reached(id, SocketReach::Mounted).await
+        self.prepare_reached(SocketKey { environment: id, vessel: None }, SocketReach::Mounted).await
     }
 
-    /// The socket an agentless host's ssh reverse forward carries.
-    pub(crate) async fn prepare_forwarded(&self, id: EnvironmentId) -> Result<DaemonHostPath, String> {
-        self.prepare_reached(id, SocketReach::Forwarded).await
+    /// The socket one vessel's agent forwards its crews to, on an agentless
+    /// host where vessels share their environment (#3792). It serves that
+    /// environment.
+    pub(crate) async fn prepare_vessel_forwarded(&self, id: EnvironmentId, vessel: &str) -> Result<DaemonHostPath, String> {
+        self.prepare_reached(SocketKey { environment: id, vessel: Some(vessel.to_string()) }, SocketReach::Forwarded).await
     }
 
-    async fn prepare_reached(&self, id: EnvironmentId, reach: SocketReach) -> Result<DaemonHostPath, String> {
+    async fn prepare_reached(&self, key: SocketKey, reach: SocketReach) -> Result<DaemonHostPath, String> {
         tokio::fs::create_dir_all(self.directory.as_path()).await.map_err(|error| error.to_string())?;
         let accept = &self.accept;
-        self.registry.lock().await.add(id, &self.directory, |listener, id| accept(listener, id, reach)).await
+        self.registry.lock().await.add_keyed(key, &self.directory, |listener, id| accept(listener, id, reach)).await
     }
 
     pub(crate) async fn remove(&self, id: &EnvironmentId) -> Result<(), String> {
         self.registry.lock().await.remove(id).await
+    }
+
+    pub(crate) async fn remove_vessel(&self, id: &EnvironmentId, vessel: &str) -> Result<(), String> {
+        self.registry.lock().await.remove_keyed(&SocketKey { environment: id.clone(), vessel: Some(vessel.to_string()) }).await
     }
 }
 

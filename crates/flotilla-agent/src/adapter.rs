@@ -1099,7 +1099,12 @@ async fn seed_codex_workspace_trust(
     let source = runner.ensure_file(&config.path, "").await?;
     let mut document = source.parse::<DocumentMut>().map_err(|error| format!("parse Codex config {}: {error}", config.path.display()))?;
     if contained {
-        crate::update_codex_hooks(&mut document, true, &config.path)?;
+        // Invocation overrides are the single owner of crew hooks. Remove the
+        // previous generation's home definitions so Codex does not discover
+        // and execute both layers (#3823). Preserve unrelated user hooks.
+        // Empty groups intentionally retain matcher indices for user trust;
+        // features.hooks stays enabled for hooks owned by other integrations.
+        crate::update_codex_hooks(&mut document, false, &config.path)?;
     }
     let projects = document
         .as_table_mut()
@@ -2714,7 +2719,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contained_codex_seeds_native_hooks_for_an_already_trusted_workspace() {
+    async fn contained_codex_uses_only_invocation_hooks_for_an_already_trusted_workspace() {
         let temp = tempfile::tempdir().expect("tempdir");
         let codex_home = temp.path().join("codex-home");
         let workspace = temp.path().join("workspace");
@@ -2750,8 +2755,73 @@ mod tests {
         let parsed = config.parse::<DocumentMut>().expect("parse updated Codex config");
         assert!(parsed.get("commit_attribution").is_none());
         assert!(parsed.get("notify").is_none());
-        assert!(parsed["hooks"]["Stop"].as_array().is_some());
+        assert!(parsed.get("hooks").is_none());
         assert_eq!(parsed["projects"][&canonical_workspace]["trust_level"].as_str(), Some("trusted"));
+    }
+
+    // #3823: the combined staged home and invocation must discover each crew
+    // hook once, with the trust record reported by real Codex 0.160.0.
+    // Configuration glue: exhaust fresh and previous-generation homes, including
+    // an unrelated hook, rather than generating subprocess or concurrency inputs.
+    #[tokio::test]
+    async fn contained_codex_combined_layers_define_each_trusted_hook_once() {
+        let recorded: serde_json::Value = serde_json::from_str(include_str!("fixtures/codex-3823/hooks-list.json")).unwrap();
+        let recorded_hooks = recorded["result"]["data"][0]["hooks"].as_array().unwrap();
+        assert_eq!(recorded_hooks.len(), 7);
+        for previous_generation in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let workspace = temp.path().join("workspace");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(workspace.join(".flotilla/briefs")).unwrap();
+            let config_path = home.join("config.toml");
+            let mut initial = "[hooks]\nStop = [{hooks=[{type=\"command\",command=\"custom\"}]}]\n".parse::<DocumentMut>().unwrap();
+            if previous_generation {
+                crate::update_codex_hooks(&mut initial, true, &config_path).unwrap();
+            }
+            std::fs::write(&config_path, initial.to_string()).unwrap();
+            let env = EnvironmentBag::new()
+                .with(EnvironmentAssertion::env_var("CODEX_HOME", home.display().to_string()))
+                .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
+            let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
+            let adapter = registry.get("codex").unwrap();
+            let session = vec![("FLOTILLA_ENVIRONMENT_ID".into(), "contained-codex".into())];
+            let brief = flotilla_resources::TerminalBrief {
+                path: ".flotilla/briefs/coder.md".into(),
+                content: String::new(),
+                artifact_digest: None,
+                copies: vec![],
+            };
+            adapter.prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &session).await.unwrap();
+            let plan = adapter
+                .launch(&AgentLaunchRequest { fulfilment_grants: None, role: "coder".into(), model: None, brief, environment: session })
+                .unwrap();
+            let config = std::fs::read_to_string(&config_path).unwrap();
+            assert!(config.contains("custom"), "preserve the user's hook");
+            // State keys and hashes come from discovery of the actual staged
+            // launch, not an overrides-only fixture. Windows changes only paths.
+            for hook in recorded_hooks {
+                assert_eq!(hook["trustStatus"], "trusted");
+                assert_eq!(hook["enabled"], true);
+                let command = hook["command"].as_str().unwrap();
+                assert!(!config.contains(command), "home duplicates {command}");
+                assert_eq!(plan.command.matches(command).count(), 1, "invocation defines {command} once");
+                let key = hook["key"].as_str().unwrap();
+                let key = if cfg!(windows) {
+                    key.replace("/<session-flags>/config.toml", r"C:\<session-flags>\config.toml")
+                } else {
+                    key.to_string()
+                };
+                let state_override = crate::codex_hook_overrides()
+                    .into_iter()
+                    .find(|entry| entry.starts_with("hooks.state="))
+                    .expect("invocation hook trust override");
+                assert!(plan.command.contains(&state_override), "launch includes trust records");
+                let state = state_override.parse::<DocumentMut>().unwrap();
+                assert_eq!(state["hooks"]["state"][&key]["trusted_hash"].as_str(), hook["currentHash"].as_str());
+                assert_eq!(state["hooks"]["state"][&key]["enabled"].as_bool(), Some(true));
+            }
+        }
     }
 
     // Issue #3724: hook trust dialogs and each review screen require operator input.

@@ -135,7 +135,8 @@ the old store dead-letters only on an operator's batch failure.
   - an unmappable condition or reference.
 - **The rehearsal:** `flotilla resource validate --from-daemon` restores every import into a temporary
   store, reads each back and checks it. It prints counts by new state and each refusal; it does not
-  fail the roll while the switch is off in the live fleet.
+  fail the roll while the switch is off in the candidate configuration. A candidate with
+  `[primitives]` enabled fails validation on any rehearsal refusal (#3821).
 
 ## Known limits
 

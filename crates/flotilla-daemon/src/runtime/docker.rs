@@ -738,10 +738,6 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         let provider = self.provider_for_environment(name).await?;
         let prepared = provider.prepare(spec, &Default::default()).await?;
         let handle = provider.provision(EnvironmentId::new(name), &prepared, Default::default()).await?;
-        // A re-provisioned agentless Environment may reach the daemon again (#3618).
-        if let Some(reach) = &self.state.agentless_reach {
-            reach.admit(&EnvironmentId::new(name)).await;
-        }
         let facts = EnvironmentProvisioning {
             backing_id: Some(handle.backing_id().to_string()),
             local_image_id: handle.local_image_id().map(str::to_owned),
@@ -813,9 +809,9 @@ impl EnvironmentRuntime for DockerControllerRuntime {
     }
 
     async fn cleanup(&self, environment_ref: &str) -> Result<(), String> {
-        // An agentless host's forward goes with its Environment (#3618).
-        if let Some(reach) = &self.state.agentless_reach {
-            reach.retire(&EnvironmentId::new(environment_ref)).await?;
+        // An agentless host's vessel agents go with its Environment (#3792).
+        if let (Some(vessels), Some(profile)) = (&self.state.agentless_vessels, self.state.agentless_ssh.get(environment_ref)) {
+            vessels.retire_environment(profile).await;
         }
         if let Some(sockets) = &self.state.environment_sockets {
             sockets.remove(&EnvironmentId::new(environment_ref)).await?;

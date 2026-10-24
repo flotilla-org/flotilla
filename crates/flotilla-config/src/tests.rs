@@ -353,6 +353,41 @@ fn hosts_without_supplies_parse_as_an_empty_list() {
     assert!(daemon.environments["box"].supplies.is_empty());
 }
 
+// #3792: the vessel agent's SSH recipe is explicit, never ambient SSH config.
+#[test]
+fn parse_agentless_host_vessel_agent_reach() {
+    let config: HostsConfig = toml::from_str(
+        r#"
+[hosts.b1]
+hostname = "b1"
+agentless_ssh = true
+[hosts.b1.vessel_agent]
+identity_file = "~/.ssh/flotilla-b1"
+host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleOnly"
+address = "b1.example"
+"#,
+    )
+    .expect("hosts config with a vessel agent reach");
+    assert_eq!(
+        config.hosts["b1"].vessel_agent,
+        Some(VesselAgentReachConfig {
+            identity_file: PathBuf::from("~/.ssh/flotilla-b1"),
+            host_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleOnly".into(),
+            address: Some("b1.example".into()),
+            port: 22,
+        })
+    );
+    // Hosts written before #3792 still parse, and take no vessels.
+    let previous: HostsConfig =
+        toml::from_str("[hosts.b1]\nhostname = \"b1.example\"\nagentless_ssh = true\n").expect("hosts config without an agent reach");
+    assert_eq!(previous.hosts["b1"].vessel_agent, None);
+    let error = toml::from_str::<HostsConfig>(
+        "[hosts.b1]\nhostname = \"b1\"\n[hosts.b1.vessel_agent]\nidentity_file = \"k\"\nhost_key = \"ssh-ed25519 AAAA\"\nknown_hosts = \"x\"\n",
+    )
+    .expect_err("unknown reach field");
+    assert!(error.to_string().contains("unknown field `known_hosts`"), "{error}");
+}
+
 // A supply holds directories and variables only; a script is refused.
 #[test]
 fn a_supply_with_anything_but_directories_and_variables_is_refused() {

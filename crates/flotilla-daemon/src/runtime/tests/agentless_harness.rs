@@ -14,8 +14,8 @@ use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 use flotilla_provider_runtime::host_environment::{HostEnvironment, HostSupply};
 use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 
-use super::agentless_reach::{AgentlessReach, CliSource, ForwardTiming};
-use crate::server::environment_sockets::{EnvironmentSocketRegistry, EnvironmentSocketService};
+use super::agentless_vessels::{VesselKey, VesselPaths};
+use super::vessel_support::{vessels_over, RunnerVesselAgents};
 
 const HOST_HOME: &str = "/home/crew";
 /// What `SshCommandRunner::writable_config_base` resolves on the host.
@@ -107,12 +107,6 @@ impl CommandRunner for FakeHost {
                 }
                 ok()
             }
-            // Remote forward socket preparation. `ListeningSsh` binds the
-            // forwarded socket for real, so its directory exists for real.
-            ("sh", ["-c", script, "sh", directory, _socket]) if script.contains("umask 077") => {
-                fs::create_dir_all(directory).map_err(|error| error.to_string())?;
-                ok()
-            }
             _ => Err(format!("unexpected host command {cmd} {args:?}")),
         }
     }
@@ -184,6 +178,7 @@ const HOST_HARNESS_FILES: &[(&str, &str)] = &[
 struct AgentlessLaunch {
     host: Arc<FakeHost>,
     env: TerminalEnvVars,
+    command: String,
 }
 
 impl AgentlessLaunch {
@@ -213,14 +208,12 @@ async fn try_launch_on_agentless_host(adapter: &str, grant_claude: bool) -> Resu
         .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
         .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"))
         .with(EnvironmentAssertion::binary("codex", "/usr/local/bin/codex"));
-    let temp = TempDir::new().expect("tempdir");
     let launched = launch_agentless(
         AgentlessHost {
             runner: host.clone(),
             bag,
             host_environment: HostEnvironment::default(),
             checkout: CHECKOUT.to_string(),
-            own_cli: temp.path().join("controller-bin/flotilla"),
             session_env: BTreeMap::new(),
         },
         adapter,
@@ -228,9 +221,9 @@ async fn try_launch_on_agentless_host(adapter: &str, grant_claude: bool) -> Resu
     )
     .await;
     match launched {
-        Ok(session) => Ok(AgentlessLaunch { host, env: session.env_vars }),
+        Ok(session) => Ok(AgentlessLaunch { host, env: session.env_vars, command: session.command }),
         Err(error) => {
-            assert_host_harness_untouched(&AgentlessLaunch { host, env: Vec::new() });
+            assert_host_harness_untouched(&AgentlessLaunch { host, env: Vec::new(), command: String::new() });
             Err(error)
         }
     }
@@ -244,8 +237,6 @@ struct AgentlessHost {
     bag: EnvironmentBag,
     host_environment: HostEnvironment,
     checkout: String,
-    /// The controller generation's CLI, delivered to the host.
-    own_cli: PathBuf,
     /// What the session spec declares, as credential delivery adds to it.
     session_env: BTreeMap<String, String>,
 }
@@ -282,7 +273,7 @@ async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool
         .await
         .expect("Claude credential declaration");
 
-    let AgentlessHost { runner, bag, host_environment, checkout, own_cli, session_env } = host;
+    let AgentlessHost { runner, bag, host_environment, checkout, session_env } = host;
     let environment_id = EnvironmentId::new(ENVIRONMENT);
     daemon
         .register_direct_environment_for_test(
@@ -300,7 +291,8 @@ async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool
         ProviderDescriptor::named(ProviderCategory::TerminalPool, "cleat"),
         Arc::clone(&pool) as Arc<dyn TerminalPool>,
     );
-    daemon.set_direct_environment_registry(&environment_id, Arc::new(registry)).expect("register agentless providers");
+    let registry = Arc::new(registry);
+    daemon.set_direct_environment_registry(&environment_id, Arc::clone(&registry)).expect("register agentless providers");
     let profile = AgentlessSshProfile {
         provisioning: LocalProvisioningProfile { host_direct_pool: "cleat".to_string(), ..manual_profile("b3", false) },
         environment_id: environment_id.clone(),
@@ -310,6 +302,7 @@ async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool
         host_environment,
         max_vessels: None,
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
+        vessel_agent: Err("the test's vessel agents run on the host runner".into()),
     };
     register_agentless_ssh_resources(&backend, NAMESPACE, &local_host_id, &profile).await.expect("register agentless resources");
     let credential_store = Arc::new(CredentialStore::new(
@@ -320,6 +313,8 @@ async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool
         Arc::clone(&runner),
         config.state_dir().as_path().to_path_buf(),
     ));
+    let agents = RunnerVesselAgents::new(Arc::clone(&runner), registry);
+    let vessel = VesselPaths::new(&profile.env_bag, &VesselKey::new(&environment_id, "demo-work")).expect("vessel paths");
     let state = Arc::new(
         ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -330,12 +325,10 @@ async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool
             format!("host-direct-{local_host_id}"),
         )
         .with_agentless_ssh(vec![profile])
-        .with_agentless_reach(Some(Arc::new(AgentlessReach::new(
-            Arc::new(ListeningSsh),
-            agentless_socket_service(temp.path()),
-            CliSource::new(Ok(own_cli), "gen-1"),
-            ForwardTiming::default(),
-        ))))
+        // #3792: the crew runs in its vessel's agent, which here runs its
+        // commands through the host runner, as the real agent runs them there.
+        .with_agentless_vessels(Some(vessels_over(agents.clone(), temp.path())))
+        .with_environment_tools(EnvironmentToolProvisioner::new(Vec::new()))
         .with_credential_store(credential_store)
         .with_agent_material(Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([] as [(&str, &str); 0]))))),
     );
@@ -373,20 +366,16 @@ async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool
         return Err(error);
     }
     let [launch] = ensured.as_slice() else { panic!("expected one launch, got {}", ensured.len()) };
+    // The vessel was prepared before its crew started: its layer pushed, its
+    // environment configured, and its daemon forward up at the socket the
+    // session names.
+    let prepared = agents.recorded(&vessel);
+    assert_eq!(prepared.tool_pushes, 1);
+    let socket = launch.env_vars.iter().find(|(name, _)| name == "FLOTILLA_DAEMON_SOCKET").map(|(_, value)| PathBuf::from(value));
+    assert_eq!(socket.as_ref(), Some(&vessel.daemon_socket()));
+    assert_eq!(prepared.environment.get("FLOTILLA_DAEMON_SOCKET").map(PathBuf::from), socket);
+    assert!(matches!(prepared.forwards.as_slice(), [(guest, _)] if *guest == vessel.daemon_socket()), "{:?}", prepared.forwards);
     Ok(LaunchedSession { env_vars: launch.env_vars.clone(), command: launch.command.clone() })
-}
-
-fn agentless_socket_service(state: &Path) -> EnvironmentSocketService {
-    EnvironmentSocketService::new(
-        Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
-        DaemonHostPath::new(state.join("env")),
-        |listener, _, _| {
-            tokio::spawn(async move {
-                let _listener = listener;
-                std::future::pending::<()>().await
-            })
-        },
-    )
 }
 
 /// No launch writes the host user's harness configuration; it reads as it did.
@@ -448,7 +437,14 @@ async fn agentless_codex_crew_starts_in_a_prepared_flotilla_home() {
     assert_eq!(launch.value("FLOTILLA_ENVIRONMENT_ID").as_deref(), Some(ENVIRONMENT));
     let Some(HostEntry::File(config)) = launch.host.entry(format!("{home}/config.toml")) else { panic!("no flotilla Codex config") };
     assert!(config.contains(&format!("[projects.\"{CHECKOUT}\"]\ntrust_level = \"trusted\"")), "trust for the checkout: {config}");
-    assert!(config.contains("command = \"flotilla hook codex stop\""), "contained Codex installs native hooks: {config}");
+    // #3823: contained crews own hooks only in invocation overrides. Check
+    // every subscription at the daemon launch boundary, without a home copy.
+    for event in ["session-start", "session-end", "user-prompt-submit", "pre-tool-use", "post-tool-use", "stop", "interrupt"] {
+        let command = format!("flotilla hook codex {event}");
+        assert!(!config.contains(&command), "home duplicates {command}: {config}");
+        assert_eq!(launch.command.matches(&command).count(), 1, "invocation defines {command} once");
+    }
+    assert!(launch.command.contains("hooks.state="), "invocation carries hook trust records");
     assert_eq!(launch.host.entry(format!("{home}/auth.json")), Some(HostEntry::Link(PathBuf::from("/home/crew/.codex/auth.json"))));
     assert_image_harness_environment(&launch);
     assert_host_harness_untouched(&launch);
@@ -573,8 +569,6 @@ async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
         "#!/bin/sh\n[ \"$1\" = -p ] && { printf ok; exit 0; }\n\
          { printf '%s\\n' \"$PATH\"; command -v gh; command -v flotilla; printf '%s\\n' \"${RUSTUP_HOME-unset}\"; } > \"$HOME/harness-report\"\n",
     );
-    let own_cli = remote.path().join("controller/bin/flotilla");
-    write_executable(&own_cli, "#!/bin/sh\necho generation-cli\n");
     let host_environment = HostEnvironment::new(vec![
         HostSupply {
             name: "rust".into(),
@@ -613,8 +607,13 @@ async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
         runner.run("sh", &["-c", "printf '%s' \"$PATH\""], Path::new("/"), &ChannelLabel::Default).await.expect("runner PATH");
     let session_env = BTreeMap::from([("PATH".to_string(), format!("{}:{runner_path}", wrapper_dir.display()))]);
 
+    // The vessel's generation layer holds the delivered CLI.
+    let vessel = VesselPaths::new(&bag, &VesselKey::new(&EnvironmentId::new(ENVIRONMENT), "demo-work")).expect("vessel paths");
+    let cli_dir = vessel.cli_directory();
+    write_executable(&cli_dir.join("flotilla"), "#!/bin/sh\necho generation-cli\n");
+
     let session = launch_agentless(
-        AgentlessHost { runner, bag, host_environment, checkout: checkout.display().to_string(), own_cli, session_env },
+        AgentlessHost { runner, bag, host_environment, checkout: checkout.display().to_string(), session_env },
         "claude-code",
         true,
     )
@@ -633,7 +632,7 @@ async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
     let report = fs::read_to_string(home.join("harness-report")).expect("harness report");
     let lines = report.lines().collect::<Vec<_>>();
     let home_text = home.display().to_string();
-    let cli_dir = home.join(".local/state/flotilla/agentless-cli/gen-1");
+    assert!(cli_dir.starts_with(home.join(".local/state/flotilla/vessels")), "{}", cli_dir.display());
     let expected_path = [
         cli_dir.display().to_string(),
         wrapper_dir.display().to_string(),
@@ -663,20 +662,12 @@ async fn a_supply_overriding_a_flotilla_variable_is_a_host_configuration_error()
         .with(EnvironmentAssertion::env_var("XDG_RUNTIME_DIR", runtime_dir.path().display().to_string()))
         .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
         .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"));
-    let temp = TempDir::new().expect("tempdir");
     // The harness environment flotilla gives every agentless session sets LANG.
     let host_environment =
         HostEnvironment::new(vec![HostSupply { name: "locale".into(), path: Vec::new(), env: vec![("LANG".into(), "C.UTF-8".into())] }])
             .expect("declared supply");
     let Err(error) = launch_agentless(
-        AgentlessHost {
-            runner: host.clone(),
-            bag,
-            host_environment,
-            checkout: CHECKOUT.to_string(),
-            own_cli: temp.path().join("controller-bin/flotilla"),
-            session_env: BTreeMap::new(),
-        },
+        AgentlessHost { runner: host.clone(), bag, host_environment, checkout: CHECKOUT.to_string(), session_env: BTreeMap::new() },
         "claude-code",
         true,
     )

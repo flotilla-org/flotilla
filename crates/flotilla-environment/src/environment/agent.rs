@@ -9,7 +9,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use drydock_agent::{Client, Configuration, Endpoint, Exec, ExecEvent};
+use drydock_agent::{Client, Configuration, Endpoint, Exec, ExecEvent, GuestForward};
+use drydock_protocol::Platform;
 use drydock_transport::{Limits, Transport};
 use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 use sha2::{Digest, Sha256};
@@ -19,6 +20,8 @@ use tokio::{
 };
 
 use super::{EnvironmentTool, VesselAgent};
+
+pub mod host;
 
 /// The actual process/transport seam. Tests use drydock's real Agent over duplex
 /// streams; Docker uses the private socket in its per-environment mounted dir.
@@ -62,6 +65,8 @@ impl AgentConnector for UnixAgentConnector {
                 let stream = UnixStream::connect(&self.socket).await?;
                 Transport::yamux(Box::new(stream), true, Limits::default()).await
             },
+            // TODO(#3773): choose the build from the vessel platform instead of the host.
+            &Platform::current(),
             executable,
             self.timeout,
         )
@@ -70,9 +75,10 @@ impl AgentConnector for UnixAgentConnector {
     }
 }
 
-/// Initial socket/hello failures are normal while Docker starts the detached
-/// supervisor. Drydock itself handles mismatches and post-upgrade reconnects.
-pub async fn connect_current<F, Fut>(mut open: F, executable: &[u8], timeout: Duration) -> io::Result<Client>
+/// Initial socket/hello failures are normal while a provider starts the
+/// detached supervisor. Drydock itself handles mismatches and post-upgrade
+/// reconnects. `platform` is the one the vessel's `executable` was built for.
+pub async fn connect_current<F, Fut>(mut open: F, platform: &Platform, executable: &[u8], timeout: Duration) -> io::Result<Client>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = io::Result<Transport>>,
@@ -87,8 +93,7 @@ where
         if remaining.is_zero() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, format!("agent hello: {last}")));
         }
-        // TODO(#3773): choose the build from the vessel platform instead of the host.
-        match Client::connect_current(&mut open, &drydock_protocol::Platform::current(), executable, remaining).await {
+        match Client::connect_current(&mut open, platform, executable, remaining).await {
             Ok(client) => return Ok(client),
             Err(error) => last = error.to_string(),
         }
@@ -100,6 +105,19 @@ struct Connection {
     client: Option<Arc<Client>>,
     configuration: Configuration,
     targets: BTreeMap<String, PathBuf>,
+    /// Host endpoints behind `configuration.forwards`, claimed again by every
+    /// new client before the configuration that names them is pushed.
+    guest_endpoints: BTreeMap<String, Endpoint>,
+}
+
+/// Where a vessel's writable state lives. A contained vessel owns its whole
+/// filesystem; an agent on a shared host resolves the same base the host's
+/// SSH runner does, so state written through either path stays in one place.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WritableBases {
+    #[default]
+    Contained,
+    Host,
 }
 
 /// One handle, one vessel. There is no interface taking a host destination from
@@ -110,6 +128,8 @@ pub struct AgentRunner {
     forwards: Mutex<BTreeMap<PathBuf, ForwardListener>>,
     host_directory: PathBuf,
     layer: Mutex<Option<PublishedLayer>>,
+    bases: WritableBases,
+    closed: std::sync::atomic::AtomicBool,
 }
 struct PublishedLayer {
     sources: String,
@@ -202,19 +222,37 @@ impl AgentRunner {
     pub fn new(connector: Arc<dyn AgentConnector>, host_directory: PathBuf) -> Self {
         Self {
             connector,
-            state: Mutex::new(Connection { client: None, configuration: Configuration::default(), targets: BTreeMap::new() }),
+            state: Mutex::new(Connection {
+                client: None,
+                configuration: Configuration::default(),
+                targets: BTreeMap::new(),
+                guest_endpoints: BTreeMap::new(),
+            }),
             forwards: Mutex::default(),
             host_directory,
             layer: Mutex::new(None),
+            bases: WritableBases::Contained,
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub fn with_writable_bases(mut self, bases: WritableBases) -> Self {
+        self.bases = bases;
+        self
     }
 
     async fn client(&self) -> Result<Arc<Client>, String> {
         let mut state = self.state.lock().await;
+        if self.is_closed() {
+            return Err("vessel agent handle is closed".into());
+        }
         if let Some(client) = &state.client {
             return Ok(client.clone());
         }
         let client = Arc::new(self.connector.connect().await?);
+        for (id, endpoint) in &state.guest_endpoints {
+            client.register_host_endpoint(id.clone(), endpoint.clone()).map_err(|e| format!("claim host endpoint {id}: {e}"))?;
+        }
         client.configure(state.configuration.clone()).await.map_err(|e| e.to_string())?;
         for (id, path) in &state.targets {
             client.add_host_forward(id.clone(), Endpoint::Unix(path.clone())).await.map_err(|e| e.to_string())?;
@@ -246,6 +284,68 @@ impl AgentRunner {
         client.configure(config.clone()).await.map_err(|e| e.to_string())?;
         state.configuration = config;
         Ok(())
+    }
+
+    /// A guest-side socket at `guest` whose connections reach the Unix socket
+    /// `host` on the controller. The agent listens; every stream is opened over this
+    /// handle's own link, so the forward serves nothing while no controller
+    /// is connected. It survives reconnects, and its endpoint stays claimed
+    /// by this vessel alone.
+    pub async fn add_guest_forward(&self, id: &str, guest: &Path, host: &Path) -> Result<(), String> {
+        let host = Endpoint::Unix(host.into());
+        if !guest.is_absolute() {
+            return Err("guest forward path must be absolute".into());
+        }
+        let client = self.client().await?;
+        let mut state = self.state.lock().await;
+        let forward = GuestForward { id: id.into(), unix: guest.into(), tcp: None };
+        match state.guest_endpoints.get(id) {
+            Some(existing) if *existing == host && state.configuration.forwards.contains(&forward) => return Ok(()),
+            Some(_) => return Err(format!("guest forward {id} already serves another endpoint")),
+            None => {}
+        }
+        // The cached client may have been replaced while this call waited.
+        let current = state.client.clone().unwrap_or(client);
+        current.register_host_endpoint(id.into(), host.clone()).map_err(|e| format!("claim host endpoint {id}: {e}"))?;
+        let mut config = state.configuration.clone();
+        config.forwards.retain(|existing| existing.id != id);
+        config.forwards.push(forward);
+        if let Err(error) = current.configure(config.clone()).await {
+            // Release the claim with the client: reconnecting re-claims only
+            // committed endpoints.
+            state.client = None;
+            return Err(error.to_string());
+        }
+        state.configuration = config;
+        state.guest_endpoints.insert(id.into(), host);
+        Ok(())
+    }
+
+    pub async fn remove_guest_forward(&self, id: &str) -> Result<(), String> {
+        let client = self.client().await?;
+        let mut state = self.state.lock().await;
+        if !state.guest_endpoints.contains_key(id) {
+            return Ok(());
+        }
+        let current = state.client.clone().unwrap_or(client);
+        current.remove_guest_forward(id).await.map_err(|e| e.to_string())?;
+        state.configuration.forwards.retain(|forward| forward.id != id);
+        state.guest_endpoints.remove(id);
+        Ok(())
+    }
+
+    /// Drop this handle's connection and its attach listeners for good.
+    /// Teardown calls this before stopping the agent: a closed handle never
+    /// connects again, so a caller still holding it cannot restart a retired
+    /// vessel's agent.
+    pub async fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.forwards.lock().await.clear();
+        self.state.lock().await.client = None;
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn bytes(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<(Vec<u8>, Vec<u8>, Option<i32>), String> {
@@ -354,6 +454,20 @@ impl AgentRunner {
         Ok(())
     }
 }
+impl AgentRunner {
+    async fn host_base(&self) -> Result<PathBuf, String> {
+        let base = self
+            .shell(flotilla_provider_runtime::ssh_runner::REMOTE_WRITABLE_BASE_SCRIPT, &[])
+            .await
+            .map_err(|error| format!("find writable directory on host: {error}"))?;
+        let base = base.trim();
+        if base.is_empty() {
+            return Err("find writable directory on host: probe returned an empty path".into());
+        }
+        Ok(base.into())
+    }
+}
+
 struct RemoteStaging {
     client: Arc<Client>,
     path: PathBuf,
@@ -553,12 +667,18 @@ impl CommandRunner for AgentRunner {
         self.run("sh", &words, cwd, label).await
     }
     async fn writable_scratch_base(&self, _: Option<&Path>, _: &Path) -> Result<PathBuf, String> {
+        if self.bases == WritableBases::Host {
+            return self.host_base().await;
+        }
         let base = self
             .shell("if [ -n \"${HOME:-}\" ] && [ -d \"$HOME\" ] && [ -w \"$HOME\" ]; then printf '%s' \"$HOME\"; else printf /tmp; fi", &[])
             .await?;
         Ok(Path::new(base.trim()).join("flotilla"))
     }
     async fn writable_config_base(&self, _: Option<&Path>, _: &Path) -> Result<PathBuf, String> {
+        if self.bases == WritableBases::Host {
+            return self.host_base().await;
+        }
         Ok(super::runner::CONTAINED_WRITABLE_CONFIG_BASE.into())
     }
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
