@@ -36,6 +36,36 @@ use crate::{
     supervisor::RestartBudgetExhausted,
 };
 
+/// An engine-held build's failure and cause come from the same judgement.
+pub(super) fn image_build_failure_condition(
+    build: &flotilla_resources::ResourceObject<flotilla_resources::ImageBuild>,
+    lifecycles: &dyn flotilla_resources::lifecycle_reads::LifecycleReads,
+) -> Result<Option<HostCondition>, String> {
+    use flotilla_protocol::LifecycleReading;
+    use flotilla_resources::lifecycle_reads::ProvisioningKind;
+    let reason = match lifecycles.try_reading(ProvisioningKind::ImageBuild, &build.metadata.name, None)? {
+        Some(LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause }) => Some(cause),
+        Some(_) => None,
+        None => build
+            .status
+            .as_ref()
+            .filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Failed)
+            .map(|status| status.failure.as_ref().map(|failure| failure.reason.clone()).unwrap_or_default()),
+    };
+    Ok(reason.map(|reason| {
+        HostCondition::builder()
+            .condition_type(format!("ImageBuild/{}", build.metadata.name))
+            .value(ConditionValue::False)
+            .reason("ImageBuildFailed")
+            .message(reason)
+            .observed_at(Utc::now())
+            .blocks_readiness(false)
+            // A failed image build does not disable forge reads.
+            .blocks_forge_observation(false)
+            .build()
+    }))
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct DaemonHealthIdentity {
     pub(super) generation: Option<String>,
@@ -440,28 +470,21 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
         );
     }
     let build_records = backend.using::<flotilla_resources::ImageBuild>(namespace).list().await.map_err(|error| error.to_string())?;
-    // Infrastructure failures retry in place; a Failed build is terminal
-    // until an operator deletes it. Retired records are ignored.
-    for build in &build_records.items {
-        if build.spec.current().is_some_and(|spec| spec.host_ref == profile.host_id)
-            && build.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ImageBuildPhase::Failed)
-        {
-            let reason =
-                build.status.as_ref().and_then(|status| status.failure.as_ref()).map(|failure| failure.reason.clone()).unwrap_or_default();
-            conditions.push(
-                HostCondition::builder()
-                    .condition_type(format!("ImageBuild/{}", build.metadata.name))
-                    .value(ConditionValue::False)
-                    .reason("ImageBuildFailed")
-                    .message(reason)
-                    .observed_at(Utc::now())
-                    .blocks_readiness(false)
-                    // A failed image build does not disable forge reads.
-                    .blocks_forge_observation(false)
-                    .build(),
-            );
-        }
-    }
+    let lifecycles = daemon.lifecycle_reads();
+    let local_host = profile.host_id.clone();
+    conditions.extend(
+        tokio::task::spawn_blocking(move || {
+            let mut conditions = Vec::new();
+            for build in &build_records.items {
+                if build.spec.current().is_some_and(|spec| spec.host_ref == local_host) {
+                    conditions.extend(image_build_failure_condition(build, lifecycles.as_ref())?);
+                }
+            }
+            Ok::<_, String>(conditions)
+        })
+        .await
+        .map_err(|error| error.to_string())??,
+    );
 
     conditions.extend(file_descriptor_pressure_condition());
     if let Some(condition) = daemon.cleat_build_skew_condition().await {

@@ -1028,3 +1028,102 @@ async fn heartbeat_publishes_store_read_retry_capability_shape() {
         assert!(metrics.values().all(|value| value.as_u64().is_some()), "counters and gauges must be unsigned integers");
     }
 }
+
+// Engine decisions determine heartbeat failures even when the old status disagrees.
+// The finite scenarios span success, retry, both Gone endings and empty/Unicode give-up causes.
+#[test]
+fn image_build_health_reads_the_engine_without_copying_status() {
+    use super::super::health::image_build_failure_condition;
+    use flotilla_provisioning::engine::{
+        image_build::ImageBuildBinding,
+        reads::{LifecycleReadPort, StoreReads},
+        Binding, LifecycleHome, Lifecycles, Step,
+    };
+    use flotilla_resources::{
+        ImageBuild, ImageBuildFailure, ImageBuildFailureClass, ImageBuildPhase, ImageBuildReservation, ImageBuildResourceSpec,
+        ImageBuildSpec, ImageBuildStatus, ImageDelivery, ObjectMeta, ResourceObject,
+    };
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::{Cause, CauseCategory, Outcome};
+    for ending in ["ready", "released", "lost", "", "失敗"] {
+        let mut registry = flotilla_schema::KindRegistry::new();
+        flotilla_provisioning::stored::register(&mut registry).expect("registry");
+        let store = Arc::new(StdMutex::new(
+            flotilla_schema_sqlite::Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "local", registry).expect("store"),
+        ));
+        let engine: LifecycleHome<flotilla_provisioning::stored::image_build::ImageBuildKind, _> = LifecycleHome::new(
+            "local",
+            flotilla_state_machines::Home::with_log("local", flotilla_engine_store::StoreLog::new(Arc::clone(&store))).expect("home"),
+        );
+        let reads = LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), "local".into());
+        let mut build = ResourceObject::<ImageBuild> {
+            metadata: ObjectMeta {
+                name: "image".into(),
+                namespace: NAMESPACE.into(),
+                resource_version: "1".into(),
+                labels: Default::default(),
+                annotations: Default::default(),
+                owner_references: vec![],
+                finalizers: vec![],
+                deletion_timestamp: None,
+                creation_timestamp: Utc::now(),
+                merge: None,
+            },
+            spec: ImageBuildResourceSpec::Current(Box::new(ImageBuildSpec {
+                identity: "sha256:composition".into(),
+                architecture: "amd64".into(),
+                layers: vec![],
+                host_ref: "local".into(),
+                delivery: ImageDelivery::Local,
+                reservation: ImageBuildReservation { cpu: 1, disk_bytes: 1 },
+            })),
+            status: Some(ImageBuildStatus {
+                phase: ImageBuildPhase::Failed,
+                failure: Some(ImageBuildFailure { class: ImageBuildFailureClass::Recipe, reason: "stale".into() }),
+                ..Default::default()
+            }),
+        };
+        let legacy = flotilla_resources::lifecycle_reads::NoLifecycleReads;
+        assert_eq!(image_build_failure_condition(&build, &legacy).expect("off").expect("legacy failure").message, "stale");
+        engine.request("image", ImageBuildBinding::request(&build, "local").expect("request"), Timestamp(1)).expect("requested");
+        assert!(image_build_failure_condition(&build, &reads).expect("progress").is_none());
+        engine
+            .step(
+                "image",
+                &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "retry"), retryable: true }),
+                Timestamp(2),
+            )
+            .expect("retry");
+        assert!(image_build_failure_condition(&build, &reads).expect("retrying").is_none());
+        if matches!(ending, "ready" | "released" | "lost") {
+            engine.step("image", &Step::Realised { identity: "sha256:image".into() }, Timestamp(3)).expect("ready");
+            if ending != "ready" {
+                engine.step("image", &if ending == "lost" { Step::Vanished } else { Step::Released }, Timestamp(4)).expect("ended");
+            }
+            assert!(image_build_failure_condition(&build, &reads).expect("not failed").is_none());
+        } else {
+            build.status.as_mut().expect("status").phase = ImageBuildPhase::Built;
+            engine
+                .step(
+                    "image",
+                    &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Refused, ending), retryable: false }),
+                    Timestamp(3),
+                )
+                .expect("gave up");
+            for _ in 0..2 {
+                let condition = image_build_failure_condition(&build, &reads).expect("read").expect("engine failure");
+                assert_eq!(condition.message, ending);
+                assert!(!condition.blocks_readiness);
+                assert!(!condition.blocks_forge_observation);
+            }
+            assert_eq!(build.status.as_ref().expect("status").phase, ImageBuildPhase::Built);
+        }
+        assert!(std::thread::spawn(move || {
+            let _guard = store.lock().expect("healthy");
+            panic!("injected read failure");
+        })
+        .join()
+        .is_err());
+        assert!(image_build_failure_condition(&build, &reads).expect_err("read error").contains("poisoned"));
+    }
+}
