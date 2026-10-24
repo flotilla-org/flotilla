@@ -493,7 +493,7 @@ impl CrewActions<'_> {
             let result = if self.crew.message_primitives().is_some() {
                 CommandValue::Error { message: "engine delivery does not hold submission batches".into() }
             } else {
-                match self.crew.message_inbox(namespace).await.deliver_held_batch(name, reason, self.clock.now()).await {
+                match self.crew.message_inbox(namespace).await.deliver_held_batch(name, reason).await {
                     Ok(()) => CommandValue::Ok,
                     Err(error) => CommandValue::Error { message: error.to_string() },
                 }

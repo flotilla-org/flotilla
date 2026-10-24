@@ -3625,10 +3625,11 @@ async fn unverifiable_controller_fence_is_named_and_rechecked_in_the_same_activa
             .observation_failed(AtomicBool::new(false))
             .build(),
     );
-    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla");
+    let now = Utc::now();
+    let clock = Arc::new(VirtualClock::new(now));
+    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla").with_clock(clock.clone());
     let prepared = reconciler.prepare(&session).await.expect("attempt");
     assert!(matches!(prepared, flotilla_crew::reconcilers::terminal_session::TerminalPrepared::ControllerFenceUnverifiable { .. }));
-    let now = Utc::now();
     let outcome = reconciler.reconcile(&session, &prepared, now);
     assert!(outcome.actuations.iter().any(|action| matches!(action, Actuation::CreateDemand { .. })), "operator gate is immediate");
     let mut status = session.status.clone().expect("status");
@@ -3636,7 +3637,8 @@ async fn unverifiable_controller_fence_is_named_and_rechecked_in_the_same_activa
     status.last_tool_activity_at = Some(now + chrono::Duration::seconds(1));
     assert_eq!(status.degraded.as_ref().expect("failure").reason, flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_REASON);
     let flagged = sessions.update_status("term-a", &session.metadata.resource_version, &status).await.expect("persist");
-    for seconds in [0, 1, 300, 3600] {
+    for seconds in [0, 1, 9] {
+        clock.set(now + chrono::Duration::seconds(seconds));
         let prepared = reconciler.prepare(&flagged).await.expect("observe fenced activation");
         let outcome = reconciler.reconcile(&flagged, &prepared, now + chrono::Duration::seconds(seconds));
         if let Some(patch) = outcome.patch {
@@ -3645,9 +3647,8 @@ async fn unverifiable_controller_fence_is_named_and_rechecked_in_the_same_activa
         assert!(status.delivered_message_id.is_none());
         assert_eq!(status.degraded.as_ref().expect("failure remains").reason, flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_REASON);
     }
-    let mut recheck = flagged.clone();
-    recheck.status.as_mut().unwrap().degraded.as_mut().unwrap().observed_at = Utc::now() - chrono::Duration::seconds(11);
-    let prepared = reconciler.prepare(&recheck).await.expect("recheck the same activation");
+    clock.set(now + flotilla_resources::delivery_hold::CONTROLLER_FENCE_RECHECK_FOR);
+    let prepared = reconciler.prepare(&flagged).await.expect("recheck the same activation");
     assert!(matches!(prepared, flotilla_crew::reconcilers::terminal_session::TerminalPrepared::ControllerFenceUnverifiable { .. }));
     assert_eq!(runtime.delivered.lock().expect("attempts").len(), 2);
 

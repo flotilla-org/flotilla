@@ -576,9 +576,9 @@ pub enum ResourceSubCommand {
     ReconcileNow(ResourceReconcileNowArgs),
     /// Replace the status subresource after typed validation
     PatchStatus(ResourceStatusPatchArgs),
-    /// Close a held or exhausted Message batch, preserving its submission audit.
     /// Authorize one more delivery attempt in the existing session (may repeat uncertain input)
     DeliverMessageBatch(MessageFailBatchArgs),
+    /// Close a held or exhausted Message batch, preserving its submission audit.
     FailMessageBatch(MessageFailBatchArgs),
     /// Get one resource by name
     Get(ResourceGetArgs),

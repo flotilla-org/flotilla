@@ -10,6 +10,8 @@ use crate::{api_version, DemandKind, DemandSpec, InputMeta, OwnerReference, Reso
 
 pub const DELIVERY_MAX_ATTEMPTS: u32 = 3;
 pub const DELIVERY_WORKING_DEBOUNCE_FOR: chrono::Duration = crate::TerminalAttention::DEBOUNCE_FOR;
+/// Guarded retry cadence for a definitely-unsent, unverifiable controller fence.
+pub const CONTROLLER_FENCE_RECHECK_FOR: chrono::Duration = chrono::Duration::seconds(10);
 pub const DELIVERY_HOLD_FOR: chrono::Duration = chrono::Duration::minutes(5);
 
 pub fn delivery_retry_delay(failures: u32) -> Duration {

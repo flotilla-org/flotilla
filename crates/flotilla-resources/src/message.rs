@@ -325,6 +325,11 @@ impl StatusPatch<MessageStatus> for MessageStatusPatch {
                 if status.submission.is_some() && status.resolved_receiver.is_none() && *phase == MessagePhase::Expired {
                     return;
                 }
+                // Terminal disposition revokes any queued operator attempt; the
+                // original submission remains available for audit.
+                if phase.is_terminal() {
+                    status.operator_delivery = None;
+                }
                 (*phase, Some(reason.clone()), *at)
             }
         };
@@ -419,7 +424,7 @@ impl HeldMessageBatch {
     /// One plain sentence naming the batch, why it is held and how to clear it.
     pub fn describe(&self, namespace: &str) -> String {
         format!(
-            "message batch `{}` is held for {} ({} message{}: {}): {}; authorize same-session delivery with `flotilla resource deliver-message-batch {} --namespace {} --reason '<why>'`; dispose of it with `{}`",
+            "message batch `{}` is held for {} ({} message{}: {}): {}; verify the pane shows the agent composer first, then authorize same-session delivery with `flotilla resource deliver-message-batch {} --namespace {} --reason '<why>'`; dispose of it with `{}`",
             self.batch,
             self.receiver,
             self.members.len(),

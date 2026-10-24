@@ -14,7 +14,7 @@ use crate::{
     apply_status_patch,
     delivery_hold::{
         delivery_acceptance_evidence, delivery_demand, delivery_demand_name, delivery_retry_backoff, delivery_retry_exhausted,
-        DELIVERY_HOLD_FOR, DELIVERY_HOLD_REASON_ANNOTATION, DELIVERY_MAX_ATTEMPTS,
+        CONTROLLER_FENCE_RECHECK_FOR, DELIVERY_HOLD_FOR, DELIVERY_HOLD_REASON_ANNOTATION, DELIVERY_MAX_ATTEMPTS,
     },
     message_expectation_open, message_supersedes,
     role_routing::topic_receiver_addresses,
@@ -83,7 +83,7 @@ impl MessageInbox {
                             status.submission.is_none() && status.fence_recheck_at.is_some() && HeldMessageBatch::is_held(message)
                         })
                         .map(|status| {
-                            status.fence_recheck_at.unwrap_or(now + chrono::Duration::seconds(10)).max(now + chrono::Duration::seconds(10))
+                            status.fence_recheck_at.unwrap_or(now + CONTROLLER_FENCE_RECHECK_FOR).max(now + CONTROLLER_FENCE_RECHECK_FOR)
                         }),
                     status.and_then(|status| status.retry.as_ref()).and_then(|retry| retry.next_attempt_at()).filter(|due| *due > now),
                     submission
@@ -282,7 +282,7 @@ impl MessageInbox {
 
     /// Authorize exactly one additional attempt, retaining the old uncertain write.
     /// The command never restarts a child or treats authorization as acceptance.
-    pub async fn deliver_held_batch(&self, name: &str, reason: &str, _now: DateTime<Utc>) -> Result<(), ResourceError> {
+    pub async fn deliver_held_batch(&self, name: &str, reason: &str) -> Result<(), ResourceError> {
         if reason.trim().is_empty() {
             return Err(ResourceError::invalid("operator delivery requires a reason"));
         }
@@ -1071,7 +1071,7 @@ impl MessageInbox {
             let mut status = status_for(&current);
             status.retry = Some(ControllerRetry::terminal(status.retry.as_ref(), now, reason));
             status.submission = None;
-            status.fence_recheck_at = Some(now + chrono::Duration::seconds(10));
+            status.fence_recheck_at = Some(now + CONTROLLER_FENCE_RECHECK_FOR);
             status.failed_batch_members = members.iter().map(|message| message.metadata.name.clone()).collect();
             MessageStatusPatch::Wait { phase: MessagePhase::Deliverable, reason: reason.into(), at: now }.apply(&mut status);
             self.write(&current, &status).await?;

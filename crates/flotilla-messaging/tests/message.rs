@@ -3175,7 +3175,13 @@ async fn every_held_delivery_immediately_raises_crew_attention() {
             Some(flotilla_protocol::CrewAttention::DeliveryUnconfirmed | flotilla_protocol::CrewAttention::ControllerFenceUnverifiable)
         ));
         assert_eq!(backend.using::<flotilla_resources::Demand>("flotilla").list().await.unwrap().items.len(), 1);
+        inbox.deliver_held_batch("message-0", "checked composer before disposition").await.unwrap();
         inbox.fail_batch("message-2", "operator disposed of held intent", at(21)).await.unwrap();
+        inbox.reconcile_delivery(&router(&transport), at(22)).await.unwrap();
+        for message in backend.using::<Message>("flotilla").list().await.unwrap().items {
+            assert!(message.status.unwrap().operator_delivery.is_none(), "disposition revokes authorization");
+        }
+        assert!(backend.using::<flotilla_resources::Demand>("flotilla").list().await.unwrap().items.is_empty());
         let terminal = backend.using::<flotilla_resources::TerminalSession>("flotilla").get("terminal").await.unwrap();
         assert!(terminal.status.unwrap().degraded.is_none(), "disposing of any member clears its held batch attention");
     }
@@ -3256,8 +3262,8 @@ async fn operator_delivery_of_held_batch_is_audited_and_never_automatically_repe
         let (backend, inbox) = delivery_inbox().await;
         let refused = named(KEYSTROKE, TransportOutcome::Unconfirmed { reason: "reply lost".into() });
         inbox.reconcile_delivery(&router(&refused), at(20)).await.unwrap();
-        assert!(inbox.deliver_held_batch("message-0", "", at(21)).await.is_err());
-        inbox.deliver_held_batch("message-0", "operator checked composer", at(21)).await.unwrap();
+        assert!(inbox.deliver_held_batch("message-0", "").await.is_err());
+        inbox.deliver_held_batch("message-0", "operator checked composer").await.unwrap();
         let transport = named(
             KEYSTROKE,
             if accepted {
@@ -3295,7 +3301,7 @@ async fn operator_delivery_authorization_does_not_follow_a_replacement_session()
         TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
     );
     inbox.reconcile_delivery(&router(&fence), at(20)).await.unwrap();
-    inbox.deliver_held_batch("message-0", "inspected original", at(21)).await.unwrap();
+    inbox.deliver_held_batch("message-0", "inspected original").await.unwrap();
     // Crash/readiness interleaving after authorization consumption but before I/O.
     let messages = backend.using::<Message>("flotilla");
     for message in messages.list().await.unwrap().items {
@@ -3311,7 +3317,7 @@ async fn operator_delivery_authorization_does_not_follow_a_replacement_session()
     let accepts = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "receipt".into() });
     inbox.reconcile_delivery(&router(&accepts), at(30)).await.unwrap();
     assert!(accepts.submissions.lock().unwrap().is_empty(), "old authorization cannot type into a new child");
-    inbox.deliver_held_batch("message-0", "inspected replacement", at(31)).await.unwrap();
+    inbox.deliver_held_batch("message-0", "inspected replacement").await.unwrap();
     inbox.reconcile_delivery(&router(&accepts), at(32)).await.unwrap();
     assert_eq!(accepts.submissions.lock().unwrap().len(), 1);
     let receipt = backend.using::<Message>("flotilla").get("message-0").await.unwrap().status.unwrap().resolved_receiver.unwrap();
@@ -3363,22 +3369,28 @@ fn partial_operator_authorization_never_submits_a_batch_prefix(tc: hegel::TestCa
         );
         inbox.reconcile_delivery(&router(&fence), at(20)).await.unwrap();
         let messages = backend.using::<Message>("flotilla");
-        for index in 0..completed {
+        // Interrupt the real command at each incomplete boundary: a member
+        // changed while the command was queued. Earlier member writes survive
+        // the error, just as they do after an interrupted storage operation.
+        let blocked = messages.get(&format!("message-{completed}")).await.unwrap();
+        let original_status = blocked.status.unwrap();
+        let mut changed_status = original_status.clone();
+        changed_status.submission = None;
+        changed_status.retry = None;
+        changed_status.failed_batch_members.clear();
+        let changed = messages.update_status(&blocked.metadata.name, &blocked.metadata.resource_version, &changed_status).await.unwrap();
+        assert!(inbox.deliver_held_batch("message-0", "inspected batch").await.is_err());
+        messages.update_status(&changed.metadata.name, &changed.metadata.resource_version, &original_status).await.unwrap();
+        for index in 0..3 {
             let message = messages.get(&format!("message-{index}")).await.unwrap();
-            let mut status = message.status.unwrap();
-            status.operator_delivery = Some(flotilla_resources::OperatorMessageDelivery {
-                reason: "inspected batch".into(),
-                session: "session".into(),
-                crew_id: "crew".into(),
-            });
-            messages.update_status(&message.metadata.name, &message.metadata.resource_version, &status).await.unwrap();
+            assert_eq!(message.status.unwrap().operator_delivery.is_some(), index < completed);
         }
         let accepts = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "explicit send completed".into() });
         for second in [21, 30, 500] {
             inbox.reconcile_delivery(&router(&accepts), at(second)).await.unwrap();
             assert!(accepts.submissions.lock().unwrap().is_empty(), "partial authorization cannot submit a prefix");
         }
-        inbox.deliver_held_batch("message-0", "inspected batch", at(501)).await.unwrap();
+        inbox.deliver_held_batch("message-0", "inspected batch").await.unwrap();
         inbox.reconcile_delivery(&router(&accepts), at(502)).await.unwrap();
         inbox.reconcile_delivery(&router(&accepts), at(503)).await.unwrap();
         assert_eq!(accepts.submissions.lock().unwrap().len(), 1, "repaired command delivers the complete batch once");
