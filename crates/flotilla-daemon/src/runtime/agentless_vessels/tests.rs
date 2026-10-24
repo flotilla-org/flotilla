@@ -180,6 +180,7 @@ fn host(runner: Arc<dyn CommandRunner>) -> Host {
         host_environment: Default::default(),
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::<String, FulfilmentFacts>::new())),
         vessel_agent: Err("vessel agents are reached directly in this test".into()),
+        max_vessels: None,
     };
     Host { _runtime: runtime, home, state, profile }
 }
