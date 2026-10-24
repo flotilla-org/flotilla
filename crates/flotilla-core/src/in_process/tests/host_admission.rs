@@ -892,6 +892,7 @@ async fn capped_agentless_hosts_spread_unpinned_convoys_and_queue_beyond_their_c
             refused_candidates: placement.refused_candidates,
             viable_not_selected: placement.viable_not_selected,
             allocation: placement.allocation,
+            provider_workspace_root: None,
         };
         let name = format!("convoy-{index}");
         let convoy =
@@ -1020,6 +1021,7 @@ async fn placement_prefers_the_capped_host_with_most_free_slots() {
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
             allocation: placement.allocation,
+            provider_workspace_root: None,
         };
         convoys
             .update_status(
@@ -1080,6 +1082,7 @@ async fn concurrent_admissions_onto_one_free_slot_provision_in_admission_order()
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
             allocation: placement.allocation,
+            provider_workspace_root: None,
         });
     }
     assert!(decisions.iter().all(|decision| decision.target_host.reference.as_str() == "b1"), "both raced onto b1");
