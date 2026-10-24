@@ -330,10 +330,20 @@ pub(crate) fn format_fulfilment_list_human(response: &FulfilmentListResponse) ->
             Cell::new(harnesses),
             Cell::new(kind.toolchains.iter().map(|(name, version)| format!("{name} {version}")).collect::<Vec<_>>().join(", ")),
             Cell::new(kind.gui_session_logged_in.map_or("-", |logged_in| if logged_in { "yes" } else { "no" })),
-            Cell::new(kind.free_vessel_slots.map_or_else(|| "unbounded".to_string(), |slots| slots.to_string())),
+            Cell::new(vessel_slots(kind.free_vessel_slots, kind.max_vessels)),
         ]);
     }
     format!("{table}\n")
+}
+
+/// Free vessel slots, with the host's declared cap when it has one (#3793).
+fn vessel_slots(free: Option<u32>, cap: Option<u32>) -> String {
+    match (free, cap) {
+        (Some(free), Some(cap)) => format!("{free} of {cap}"),
+        (None, Some(cap)) => format!("unknown of {cap}"),
+        (Some(free), None) => free.to_string(),
+        (None, None) => "unbounded".to_string(),
+    }
 }
 
 fn format_dispatch_score(score: &flotilla_protocol::DispatchScore) -> String {
@@ -981,7 +991,7 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                     candidate.cost_class,
                     candidate.host_ready,
                     candidate.sleeping_until.map_or_else(|| "none".to_string(), |until| until.to_rfc3339()),
-                    candidate.free_vessel_slots.map_or_else(|| "unbounded".to_string(), |slots| slots.to_string()),
+                    vessel_slots(candidate.free_vessel_slots, candidate.max_vessels),
                     candidate.reserved_for_platform,
                     candidate.minimal,
                     candidate.available,

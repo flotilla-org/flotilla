@@ -1,5 +1,5 @@
 //! Shared admission planning and resource helpers.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use chrono::DateTime;
@@ -11,7 +11,9 @@ use flotilla_resources::Checkout as ResourceCheckout;
 use flotilla_resources::CheckoutPhase as ResourceCheckoutPhase;
 use flotilla_resources::CheckoutSpec as ResourceCheckoutSpec;
 use flotilla_resources::CheckoutStatus as ResourceCheckoutStatus;
+use flotilla_resources::Convoy;
 use flotilla_resources::Host as ResourceHost;
+use flotilla_resources::HostOccupancy;
 use flotilla_resources::HostStatus as ResourceHostStatus;
 use flotilla_resources::InputMeta;
 use flotilla_resources::LifecycleAuthority;
@@ -27,10 +29,13 @@ use flotilla_resources::Resource;
 use flotilla_resources::ResourceError;
 use flotilla_resources::ResourceObject;
 use flotilla_resources::ResourceProvenance;
+use flotilla_resources::Vessel;
 use flotilla_resources::WorkflowTemplate;
 use flotilla_resources::WorkflowTemplateSpec;
 use flotilla_resources::CONVOY_LABEL;
+use flotilla_resources::{home_copies_first, pinned_workflow_ref};
 use flotilla_store::ResourceBackend;
+use flotilla_store::StoreQuery;
 use tracing::warn;
 
 pub fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTemplateSpec, String> {
@@ -282,12 +287,66 @@ pub fn check_placement_capacity(target_host: &PlacementTargetHost, capacity: Opt
 }
 
 /// Agentless SSH hosts run crews in an account the owning daemon does not
-/// control, so they take only convoys that name their placement deliberately.
-/// Capacity-aware selection may relax this once hosts advertise their limits.
+/// control, so an uncapped one takes only convoys that name its placement
+/// deliberately. A host that declares `max_vessels` takes unpinned convoys
+/// within that cap (#3793).
 pub const AGENTLESS_SSH_PIN_ONLY: &str = "agentless SSH host takes only convoys that pin its placement";
 
 pub fn is_agentless_ssh_host(host: &ResourceObject<ResourceHost>) -> bool {
     matches!(host.spec.connection, flotilla_resources::HostConnection::AgentlessSsh { .. })
+}
+
+/// The vessel cap an agentless SSH host declares; other hosts have none.
+pub fn agentless_vessel_cap(host: &ResourceObject<ResourceHost>) -> Option<u32> {
+    is_agentless_ssh_host(host).then_some(host.spec.max_vessels).flatten()
+}
+
+/// What each of `hosts` holds against its cap, read from every convoy and
+/// vessel the store sees, listed once for all of them. The owning daemon is
+/// the only placer on its agentless hosts, so its store holds every convoy
+/// admitted there.
+pub async fn host_occupancies(
+    backend: &ResourceBackend,
+    namespace: &str,
+    hosts: &BTreeSet<String>,
+) -> Result<BTreeMap<String, HostOccupancy>, String> {
+    if hosts.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let query = StoreQuery { include_replicas: true, ..Default::default() };
+    let convoys = home_copies_first(backend.query_declared::<Convoy>(namespace, &query).await.map_err(|error| error.to_string())?.items);
+    let vessels = home_copies_first(backend.query_declared::<Vessel>(namespace, &query).await.map_err(|error| error.to_string())?.items);
+    // A convoy not yet bootstrapped names its vessels only in its frozen
+    // workflow snapshot record.
+    let snapshots = convoys
+        .iter()
+        .filter(|convoy| hosts.iter().any(|host| HostOccupancy::needs_workflow_vessels(convoy, host)))
+        .map(|convoy| (convoy.metadata.name.clone(), pinned_workflow_ref(convoy).to_string()))
+        .collect::<BTreeMap<_, _>>();
+    let templates = backend
+        .definitions::<WorkflowTemplate>(namespace)
+        .list_names(snapshots.values().cloned())
+        .await
+        .map_err(|error| error.to_string())?;
+    let templates = templates.into_iter().map(|template| (template.metadata.name.clone(), template)).collect::<BTreeMap<_, _>>();
+    let workflow_vessels = snapshots
+        .into_iter()
+        // A convoy whose snapshot record is missing is left out, and `count`
+        // falls back to its pins and convoy-wide decision.
+        .filter_map(|(convoy, template)| {
+            let Some(template) = templates.get(template.as_str()) else {
+                warn!(%convoy, %template, "workflow snapshot missing; counting the convoy's pins and convoy-wide decision instead");
+                return None;
+            };
+            Some((convoy, template.spec.vessels.iter().map(|vessel| vessel.name.clone()).collect()))
+        })
+        .collect();
+    Ok(hosts.iter().map(|host| (host.clone(), HostOccupancy::count(host, &convoys, &vessels, &workflow_vessels))).collect())
+}
+
+pub async fn host_occupancy(backend: &ResourceBackend, namespace: &str, host: &str) -> Result<HostOccupancy, String> {
+    let mut occupancies = host_occupancies(backend, namespace, &BTreeSet::from([host.to_string()])).await?;
+    Ok(occupancies.remove(host).unwrap_or_default())
 }
 
 pub async fn policy_targets_agentless_ssh(backend: &ResourceBackend, namespace: &str, policy: &ResourceObject<PlacementPolicy>) -> bool {
@@ -305,7 +364,7 @@ pub async fn resolve_placement_provider(
     backend: &ResourceBackend,
     namespace: &str,
     policy: &mut ResourceObject<PlacementPolicy>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
     use flotilla_protocol::provider::ProviderAdvertisement;
     let target = placement_target_host(backend, namespace, policy).await?;
@@ -332,12 +391,21 @@ pub async fn resolve_placement_provider(
         if !selected.capabilities.workspace_root.to_string_lossy().starts_with('/') {
             return Err("cloud provider workspace root must be absolute".into());
         }
-        policy
-            .metadata
-            .labels
-            .insert("flotilla.work/provider-workspace-root".into(), selected.capabilities.workspace_root.to_string_lossy().into_owned());
+        return Ok(Some(selected.capabilities.workspace_root.to_string_lossy().into_owned()));
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Freeze only cloud guest roots in placement decisions, never metadata labels.
+pub async fn provider_workspace_root(
+    backend: &ResourceBackend,
+    namespace: &str,
+    policy: &ResourceObject<PlacementPolicy>,
+) -> Result<Option<String>, String> {
+    if policy.spec.cloud_sandbox_per_vessel.is_none() {
+        return Ok(None);
+    }
+    resolve_placement_provider(backend, namespace, &mut policy.clone()).await
 }
 
 pub async fn placement_actuator_host_ref(

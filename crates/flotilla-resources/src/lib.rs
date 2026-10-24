@@ -96,6 +96,7 @@ pub mod terminal_session;
 pub mod usage;
 #[doc(hidden)]
 pub mod vessel;
+mod vessel_occupancy;
 pub mod vessel_seats;
 mod watch;
 #[doc(hidden)]
@@ -154,7 +155,7 @@ pub use environment::{
     host_direct_environment_name, validate_environment_provider_address, CloudSandboxEnvironmentSpec, CloudSandboxSize,
     DockerEnvironmentSpec, Environment, EnvironmentMemoryPolicy, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
     EnvironmentProviderDescriptor, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, EnvironmentSurvivors,
-    HostDirectEnvironmentSpec, HOST_DIRECT_NAME_PREFIX,
+    HostDirectEnvironmentSpec, CLOUD_ADOPTION_RETRY_PREFIX, HOST_DIRECT_NAME_PREFIX,
 };
 pub use error::{FinalizerWaitReason, ResourceError};
 pub use event::{Event, EventRegarding, EventSpec, ObjectEvent, DEFAULT_EVENT_TTL_SECONDS};
@@ -243,6 +244,7 @@ pub use vessel::{
     vessel_resource_name, Vessel, VesselImage, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
+pub use vessel_occupancy::{home_copies_first, HostOccupancy};
 pub use watch::{ResourceList, ResourcePosition, ResourceTombstone, WatchEvent, WatchStart, WatchStream};
 
 #[doc(hidden)]

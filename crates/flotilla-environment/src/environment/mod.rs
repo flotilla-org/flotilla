@@ -382,6 +382,12 @@ pub trait EnvironmentProvider: Send + Sync {
 /// A handle to a single provisioned sandbox environment instance.
 #[async_trait]
 pub trait ProvisionedEnvironment: Send + Sync {
+    /// Setup rollback is permitted only for a backing created by this call.
+    /// Adoption failures preserve the backing for a later retry.
+    fn created_for_setup(&self) -> bool {
+        true
+    }
+
     /// Opaque identity interpreted only by this provider, independent of transport.
     fn backing_id(&self) -> &str;
     async fn observe(&self) -> ProviderObservation;
@@ -390,6 +396,11 @@ pub trait ProvisionedEnvironment: Send + Sync {
     /// this controlling host before returning Ready. Unknown fails closed.
     async fn detect_readiness(&self) -> ProviderReadiness {
         ProviderReadiness::default()
+    }
+
+    /// Advisory health information that does not prevent new sessions.
+    fn health_message(&self) -> Option<String> {
+        None
     }
 
     fn survivors(&self) -> Option<flotilla_resources::EnvironmentSurvivors> {

@@ -35,11 +35,12 @@ use tracing::{debug, warn};
 
 use crate::fulfilment_probe::{probe_kind, DetectionTarget};
 
-use super::agentless_reach::{AgentlessReach, ReachTarget};
+use super::agentless_vessels::AgentlessVessels;
 use super::seed::{
     empty_meta, ensure_default_policies, ensure_host_direct_environment_exists, kind_belongs_to_host, migrate_live_placement_policies,
 };
 use super::tasks::FULFILMENT_CHANGE_CHECK_INTERVAL;
+use flotilla_environment::environment::agent::host::SshAgentReach;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LocalProvisioningProfile {
@@ -64,7 +65,11 @@ pub(super) struct AgentlessSshProfile {
     pub(super) runner: Arc<dyn CommandRunner>,
     /// The host's declared supplies (#3722).
     pub(super) host_environment: HostEnvironment,
+    /// The vessels this host declares it can hold (#3793).
+    pub(super) max_vessels: Option<u32>,
     pub(super) fulfilment_facts: Arc<RwLock<BTreeMap<String, FulfilmentFacts>>>,
+    /// How its vessel agents are reached (#3792), or why they cannot be.
+    pub(super) vessel_agent: Result<SshAgentReach, String>,
 }
 
 pub(super) struct BagEnvVars<'a>(pub(super) &'a EnvironmentBag);
@@ -126,6 +131,8 @@ pub(super) async fn discover_agentless_ssh_profile(
     };
     daemon.set_direct_environment_registry(&environment_id, Arc::clone(&registry))?;
     let destination = direct.ssh_destination.ok_or_else(|| format!("SSH host {} has no destination", provisioning.host_id))?;
+    let controller_home = daemon.discovery_runtime().env.get("HOME");
+    let vessel_agent = vessel_agent_reach(config, &destination, &direct.env_bag, controller_home.as_deref());
     Ok(AgentlessSshProfile {
         provisioning,
         environment_id,
@@ -133,7 +140,49 @@ pub(super) async fn discover_agentless_ssh_profile(
         env_bag: direct.env_bag,
         runner: direct.runner,
         host_environment: direct.host_environment,
+        max_vessels: direct.max_vessels,
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
+        vessel_agent,
+    })
+}
+
+/// #3792: the explicit SSH recipe for the host's vessel agents, from its
+/// `hosts.toml` entry. Drydock's transport reads no ambient SSH configuration,
+/// so an entry without one cannot take vessels; the reason says what to set.
+pub(super) fn vessel_agent_reach(
+    config: &ConfigStore,
+    destination: &str,
+    bag: &EnvironmentBag,
+    controller_home: Option<&str>,
+) -> Result<SshAgentReach, String> {
+    let hosts = config.load_hosts().map_err(|error| format!("read hosts.toml for {destination}: {error}"))?;
+    let (label, host) = hosts
+        .hosts
+        .iter()
+        .find(|(_, host)| host.agentless_ssh && flotilla_config::ssh_destination(&host.hostname, host.user.as_deref()) == destination)
+        .ok_or_else(|| format!("no agentless hosts.toml entry reaches {destination}"))?;
+    let reach = host.vessel_agent.as_ref().ok_or_else(|| {
+        format!(
+            "hosts.toml [hosts.{label}.vessel_agent] is not set: name the identity_file and the pinned host_key flotilla reaches its vessel agents with"
+        )
+    })?;
+    let user = host
+        .user
+        .clone()
+        .filter(|user| !user.is_empty())
+        .or_else(|| bag.find_env_var("USER").map(str::to_string))
+        .ok_or_else(|| format!("hosts.toml [hosts.{label}] needs a user for its vessel agents"))?;
+    let identity_file = match (reach.identity_file.strip_prefix("~"), controller_home) {
+        (Ok(rest), Some(home)) => Path::new(home).join(rest),
+        (Ok(_), None) => return Err(format!("hosts.toml [hosts.{label}.vessel_agent] identity_file needs HOME to expand `~`")),
+        (Err(_), _) => reach.identity_file.clone(),
+    };
+    Ok(SshAgentReach {
+        address: reach.address.clone().unwrap_or_else(|| host.hostname.clone()),
+        port: reach.port,
+        user,
+        host_key: reach.host_key.clone(),
+        identity_file,
     })
 }
 
@@ -151,6 +200,7 @@ pub(super) async fn register_agentless_ssh_resources(
     let mut spec = HostSpec {
         display_name: provisioning.display_name.clone(),
         connection: HostConnection::AgentlessSsh { owning_daemon: owner_host_id.to_string(), destination: profile.destination.clone() },
+        max_vessels: profile.max_vessels,
         ..HostSpec::default()
     };
     match hosts.get(&provisioning.host_id).await {
@@ -196,7 +246,7 @@ pub(super) async fn apply_agentless_ssh_observation(
     namespace: &str,
     ssh: &AgentlessSshProfile,
     credential_store: Option<&CredentialStore>,
-    reach: Option<&AgentlessReach>,
+    vessels: Option<&AgentlessVessels>,
 ) -> Result<(), String> {
     let profile = &ssh.provisioning;
     let hosts = daemon.resource_backend().using::<Host>(namespace);
@@ -256,12 +306,12 @@ pub(super) async fn apply_agentless_ssh_observation(
         migrate_live_placement_policies(&daemon.resource_backend(), namespace, &profile.host_id, &platform).await?;
     }
     let mut ready = ready;
-    if let (true, Some(reach)) = (probe_succeeded, reach) {
-        let (reach_conditions, cli_available) = agentless_reach_conditions(reach, ssh).await;
-        ready &= cli_available;
-        conditions.extend(reach_conditions);
+    if probe_succeeded {
+        let (vessel_conditions, takes_vessels) = agentless_vessel_conditions(vessels, ssh).await;
+        ready &= takes_vessels;
+        conditions.extend(vessel_conditions);
     }
-    let fulfilment_facts = if probe_succeeded {
+    let mut fulfilment_facts = if probe_succeeded {
         let observed = ssh.fulfilment_facts.read().await.clone();
         if observed.is_empty() {
             host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default()
@@ -271,6 +321,17 @@ pub(super) async fn apply_agentless_ssh_observation(
     } else {
         BTreeMap::new()
     };
+    // The owning daemon is the only placer here, so it alone counts the
+    // vessels held against the host's cap (#3793).
+    if let Some(cap) = ssh.max_vessels {
+        let occupancy = flotilla_admission::support::host_occupancy(&daemon.resource_backend(), namespace, &profile.host_id).await?;
+        let probed = ssh.fulfilment_facts.read().await;
+        for (kind, facts) in fulfilment_facts.iter_mut() {
+            // A probe that found the kind's terminal pool missing keeps it full.
+            let pool_missing = probed.get(kind).is_some_and(|probed| probed.free_vessel_slots == Some(0));
+            facts.free_vessel_slots = Some(if pool_missing { 0 } else { occupancy.free_slots(cap) });
+        }
+    }
     let providers = match daemon.environment_registry_for_environment(&ssh.environment_id) {
         Some(registry) => observe_provider_advertisements(&registry).await,
         None => profile
@@ -312,45 +373,34 @@ pub(super) async fn apply_agentless_ssh_observation(
     Ok(())
 }
 
-/// #3618: a host whose platform has no CLI in the controller's generation is
-/// refused at placement, since its crews could neither hook nor settle. A down
-/// forward is diagnostic only: running crews keep working and it is re-dialled.
-pub(super) async fn agentless_reach_conditions(reach: &AgentlessReach, ssh: &AgentlessSshProfile) -> (Vec<HostCondition>, bool) {
-    let mut conditions = Vec::new();
-    // A platform probe that has never succeeded is diagnostic only: a transient
-    // ssh blip must not refuse placement. Launch re-checks before installing.
-    let (cli, blocks_readiness) = match reach.platform(&ReachTarget::from(ssh)).await {
-        Ok(platform) => (reach.cli().for_platform(&platform).map(|_| ()).map_err(|error| ("NoPlatformBuild", error)), true),
-        Err(error) => (Err(("PlatformUnknown", error)), false),
-    };
-    let cli_available = cli.is_ok() || !blocks_readiness;
-    if let Err((reason, message)) = cli {
-        conditions.push(
+/// #3792: a host this controller cannot run vessel agents on is refused at
+/// placement, since its crews could neither run nor reach the daemon: no
+/// agent reach, no runtime directory, or no tools for its platform. A
+/// platform probe that never succeeded (an SSH blip) is diagnostic only.
+pub(super) async fn agentless_vessel_conditions(
+    vessels: Option<&AgentlessVessels>,
+    ssh: &AgentlessSshProfile,
+) -> (Vec<HostCondition>, bool) {
+    // Without a crew socket server a launch is refused with that reason, as
+    // for contained vessels; the host's own observation is unaffected.
+    let Some(vessels) = vessels else { return (Vec::new(), true) };
+    let refusals = vessels.host_refusals(ssh).await;
+    let takes_vessels = !refusals.iter().any(|refusal| refusal.blocks_readiness);
+    let conditions = refusals
+        .into_iter()
+        .map(|refusal| {
             HostCondition::builder()
-                .condition_type("Tooling/FlotillaCli")
+                .condition_type(refusal.condition)
                 .value(ConditionValue::False)
-                .reason(reason)
-                .message(message)
+                .reason(refusal.reason)
+                .message(refusal.message)
                 .observed_at(Utc::now())
-                .blocks_readiness(blocks_readiness)
+                .blocks_readiness(refusal.blocks_readiness)
                 .blocks_forge_observation(false)
-                .build(),
-        );
-    }
-    if let Some(reason) = reach.health(&ssh.environment_id).await.and_then(|health| health.unreachable_reason()) {
-        conditions.push(
-            HostCondition::builder()
-                .condition_type("Transport/DaemonForward")
-                .value(ConditionValue::False)
-                .reason("ForwardDown")
-                .message(reason)
-                .observed_at(Utc::now())
-                .blocks_readiness(false)
-                .blocks_forge_observation(false)
-                .build(),
-        );
-    }
-    (conditions, cli_available)
+                .build()
+        })
+        .collect();
+    (conditions, takes_vessels)
 }
 
 impl LocalProvisioningProfile {

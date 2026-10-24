@@ -104,16 +104,53 @@ running `flotillad` there. Add the host to the owning daemon's
 hostname = "beaufort.example"
 user = "gui-session-user"
 agentless_ssh = true
+
+[hosts.beaufort.vessel_agent]
+identity_file = "~/.ssh/flotilla-beaufort"
+host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA..."
+# Optional: the address when `hostname` is an SSH config alias, and the port.
+# address = "beaufort.example"
+# port = 22
 ```
 
 The `user` is the SSH login account and the account in which the crew runs.
-The remote account needs a writable `HOME`, Git, and `cleat`
-plus the selected agent adapter. SSH access must work in batch mode. The
-owning daemon probes the host, publishes its stable Host identity and a
-`host-direct-<host-id>` PlacementPolicy, and provisions the checkout and
-terminal pool through its SSH connection. Agentless hosts are excluded from
-the daemon peer mesh and from contained placement. Attach opens the remote
-terminal pool through SSH. No container image is built or pulled.
+The remote account needs a writable `HOME`, a `XDG_RUNTIME_DIR` in its SSH
+login, Git, and the selected agent adapter. SSH access must work in batch
+mode. The owning daemon probes the host, publishes its stable Host identity and
+a `host-direct-<host-id>` PlacementPolicy, and provisions the checkout through
+its SSH connection. Agentless hosts are excluded from the daemon peer mesh and
+from contained placement. No container image is built or pulled.
+
+Each vessel on the host runs through its own drydock vessel agent, as a Docker
+vessel does (#3792). Flotilla still owns the host; the agent only carries the
+vessel's commands, files, forwards and tool layers:
+
+- The agent lives in a private directory under the login's
+  `$XDG_RUNTIME_DIR/flotilla/v/`. The owning daemon copies the agent from its
+  own generation through its SSH connection and starts it supervised, with
+  no root. After a reboot, or once the supervisor has died, the next connect
+  starts it again.
+- The daemon reaches the agent through drydock's SSH transport over a local
+  forward, so the host's sshd needs no configuration change. The transport
+  reads no ambient SSH configuration or agent: `vessel_agent` names the
+  private key file (`~` is the owning daemon's home) and pins the host's raw
+  public key (an `ssh-ed25519 AAAA...` line from the host's
+  `/etc/ssh/ssh_host_ed25519_key.pub`, not a fingerprint). A host without a
+  `vessel_agent` table is not ready for placement, with that reason.
+- The vessel's generation layer (the `flotilla` CLI and `cleat`) is pushed
+  to `${XDG_STATE_HOME:-~/.local/state}/flotilla/vessels/<vessel>/`, beside
+  its cleat state. These tools come from the owning daemon's generation, so
+  the host must share the owning daemon's platform.
+- The vessel's crews reach the owning daemon through `flotilla.sock` in the
+  agent's directory, which the agent forwards over the daemon's own
+  connection. Nothing forwards while the daemon is stopped.
+- Attach goes through the agent to the vessel's cleat.
+- Removing the vessel stops its agent and removes its directories; an
+  unreachable host does not block teardown, and a later pass retries.
+
+Checkouts and host probes (free space, platform, model facts) still run over
+the daemon's SSH connection. Only crew sessions run on an agentless host; a
+tool session, which names no vessel, is refused.
 
 A crew on an agentless host takes the same harness path as a Docker crew
 (#3655). Its session names its environment (`FLOTILLA_ENVIRONMENT_ID`), and its
@@ -165,17 +202,22 @@ format is shared with drydock's vessel agent (flotilla-org/drydock#55).
 
 `PATH` is composed in this order:
 
-1. flotilla's own directories: the delivered `flotilla` CLI and the credential
-   wrappers (the `gh` wrapper, for example);
-2. tools flotilla installs from its generation (#3655, not yet shipped);
+1. flotilla's own directories: the vessel's generation layer (`flotilla` and
+   `cleat`) and the credential wrappers (the `gh` wrapper, for example);
+2. tools flotilla installs from its generation (harnesses and skills, #3655,
+   not yet shipped);
 3. declared supplies, in declaration order;
 4. the fixed system tail, `/usr/local/bin:/usr/bin:/bin`.
 
+The vessel's agent runs every command with this composition (without the
+session's credential wrappers).
+
 Directories a login profile would have added are not on `PATH` unless
-declared, so everything a crew needs from the host (Git, `cleat`, the agent
-harness, `gh`, toolchains) must be in a supply or the system tail. Supply
+declared, so everything a crew needs from the host (Git, the agent harness,
+`gh`, toolchains) must be in a supply or the system tail. Supply
 variables are set as declared. A supply cannot set `PATH`, `HOME`, a `FLOTILLA_`
-variable, or any variable flotilla sets for a session (such as `LANG`); that is
+variable, or any variable flotilla sets for a session (such as `LANG`) or a
+vessel (such as `CLEAT_RUNTIME_DIR`); that is
 a configuration error reported for the host, and the host is not registered or
 the crew is not launched.
 
@@ -184,6 +226,44 @@ runs once inside a crew session before its command. The command sets the
 composed `PATH` and supply variables again as its first step, so the harness
 sees the composed environment. Removing that profile run needs a cleat launch
 without a login shell (#3761).
+
+#### Vessel cap
+
+An agentless host without a cap takes only convoys that pin its placement
+(`--fulfilment host-direct-<host-id>`). Declare how many vessels it can hold and
+it takes ordinary, unpinned placement within that cap (#3793):
+
+```toml
+[hosts.b1]
+hostname = "b1.example"
+user = "flotilla"
+agentless_ssh = true
+max_vessels = 1
+```
+
+The owning daemon is the only daemon that places on its agentless hosts, and it
+counts their vessels. A vessel holds its slot from its convoy's admission until
+its teardown finishes, so a crash mid-teardown does not free the slot early.
+Every vessel a convoy's workflow places on the host counts, created or not, and
+a host is refused for a convoy that would hold more vessels there than its cap.
+If a convoy's frozen workflow snapshot record is missing, its vessels are
+counted from its placement pins and convoy-wide decision instead, which can
+undercount a convoy with several vessels. The owning daemon logs a warning
+naming the convoy when that happens.
+Among otherwise equal hosts, placement prefers the one with the most free
+slots; a host with none is chosen only when no host has room. A convoy admitted
+to a full host waits before provisioning, with "no free vessel slots" in
+`convoy explain`, and starts in admission order once a vessel on that host
+finishes teardown. The order is strict: an older convoy waiting for two slots
+holds back a newer one-vessel convoy even while one slot is free, so a large
+convoy is never starved by smaller ones. `convoy explain` and `fulfilment list` show each capped
+host's free slots as `<free> of <cap>`. The cap counts vessels only: memory
+and CPU are not considered.
+
+The cap is read when a convoy is admitted. Lowering `max_vessels` later does
+not move convoys already admitted to the host: one that now needs more slots
+than the new cap stays in its capacity wait until it is abandoned or the cap
+is raised.
 
 The admission free-space floor below is checked against the SSH host's
 `~/dev/flotilla-repos` checkout volume using its remote `df` result.

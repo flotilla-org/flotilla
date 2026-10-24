@@ -333,9 +333,20 @@ impl AdmissionActions<'_> {
                 self.events.finish(id, empty_identity, CommandValue::Error { message });
                 return Ok(id);
             }
+            let provider_workspace_root = match placement.selected.as_ref() {
+                Some(selected) => match crate::support::provider_workspace_root(self.resource_backend, &namespace, selected).await {
+                    Ok(root) => root,
+                    Err(message) => {
+                        self.events.finish(id, empty_identity, CommandValue::Error { message });
+                        return Ok(id);
+                    }
+                },
+                None => None,
+            };
             let placement_decision = match placement.selected.as_ref() {
                 Some(selected) => match placement_target_host(self.resource_backend, &namespace, selected).await {
                     Ok(target_host) => Some(PlacementDecision {
+                        provider_workspace_root,
                         minimal_alternatives: Vec::new(),
                         escalation_reason: None,
                         policy_name: selected.metadata.name.clone(),

@@ -4222,6 +4222,7 @@ mod admission_tests {
         let alternatives = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
         let escalation = tc.draw(gs::booleans());
         let decision = PlacementDecision {
+            provider_workspace_root: None,
             policy_name: format!("policy-{identity}"),
             target_host: PlacementTargetHost {
                 reference: CanonicalHostId::resolved(format!("host-{identity}")),

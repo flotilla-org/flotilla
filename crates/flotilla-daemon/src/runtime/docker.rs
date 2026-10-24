@@ -640,8 +640,8 @@ impl DockerControllerRuntime {
                 .await);
             }
         };
-        if environment_spec.cloud_sandbox.is_some() {
-            if let Err(error) = verify_cloud_image_needs(spec, &handle, &bag).await {
+        if let Some(cloud) = &environment_spec.cloud_sandbox {
+            if let Err(error) = verify_cloud_image_needs(&cloud.probe_needs, &cloud.image, &handle, &bag).await {
                 return Err(discard_failed_environment(
                     &handle,
                     self.state.credential_store.as_deref(),
@@ -738,10 +738,6 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         let provider = self.provider_for_environment(name).await?;
         let prepared = provider.prepare(spec, &Default::default()).await?;
         let handle = provider.provision(EnvironmentId::new(name), &prepared, Default::default()).await?;
-        // A re-provisioned agentless Environment may reach the daemon again (#3618).
-        if let Some(reach) = &self.state.agentless_reach {
-            reach.admit(&EnvironmentId::new(name)).await;
-        }
         let facts = EnvironmentProvisioning {
             backing_id: Some(handle.backing_id().to_string()),
             local_image_id: handle.local_image_id().map(str::to_owned),
@@ -813,9 +809,9 @@ impl EnvironmentRuntime for DockerControllerRuntime {
     }
 
     async fn cleanup(&self, environment_ref: &str) -> Result<(), String> {
-        // An agentless host's forward goes with its Environment (#3618).
-        if let Some(reach) = &self.state.agentless_reach {
-            reach.retire(&EnvironmentId::new(environment_ref)).await?;
+        // An agentless host's vessel agents go with its Environment (#3792).
+        if let (Some(vessels), Some(profile)) = (&self.state.agentless_vessels, self.state.agentless_ssh.get(environment_ref)) {
+            vessels.retire_environment(profile).await;
         }
         if let Some(sockets) = &self.state.environment_sockets {
             sockets.remove(&EnvironmentId::new(environment_ref)).await?;
@@ -898,18 +894,12 @@ impl flotilla_provider_runtime::EnvVars for GuestProbeEnvironment<'_> {
         }
     }
 }
-async fn verify_cloud_image_needs(
-    spec: &flotilla_resources::DockerEnvironmentSpec,
+pub(super) async fn verify_cloud_image_needs(
+    needs: &BTreeSet<flotilla_resources::CapabilityNeed>,
+    image: &str,
     handle: &EnvironmentHandle,
     bag: &EnvironmentBag,
 ) -> Result<(), String> {
-    let needs: BTreeSet<flotilla_resources::CapabilityNeed> = spec
-        .env
-        .get("FLOTILLA_CLOUD_IMAGE_NEEDS")
-        .map(|value| serde_json::from_str(value))
-        .transpose()
-        .map_err(|_| "invalid cloud image probe needs")?
-        .unwrap_or_default();
     if needs.is_empty() {
         return Ok(());
     }
@@ -924,7 +914,7 @@ async fn verify_cloud_image_needs(
         pool: "cleat".into(),
         cost_class: Default::default(),
         grants: Default::default(),
-        realisation: flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { image: spec.image.clone() },
+        realisation: flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { image: image.to_owned() },
     };
     let facts = crate::fulfilment_probe::probe_kind(
         &kind,
@@ -999,6 +989,9 @@ pub(super) async fn discard_failed_environment(
     environment_ref: &str,
     error: String,
 ) -> String {
+    if !handle.created_for_setup() {
+        return format!("{} {error}", flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX);
+    }
     let mut cleanup_errors = Vec::new();
     if let Err(cleanup_error) = handle.destroy().await {
         cleanup_errors.push(format!("destroy rejected environment: {cleanup_error}"));

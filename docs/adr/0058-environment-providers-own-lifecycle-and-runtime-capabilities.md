@@ -131,6 +131,11 @@ Rules:
 
 ### Stored shape
 
+- the interim cloud-sandbox fields as approved here, with checkout strategy inside the cloud-sandbox policy input until #3108.
+- a provider's settings are declared fields of its request, never entries smuggled through the guest environment map.
+- **Owner ruling on #3765 (2026-10-23):** Environment specs carry no crew identity. Each member's crew material is prepared at member start, keyed by that member (#3785), rather than per harness kind at environment provisioning. Do not add declared/required adapter sets to the cloud spec; the existing `FLOTILLA_REQUIRED_AGENT_ADAPTERS` env control remains until #3785 retires it and is excluded from the decode shim.
+- Cloud placement facts are stored typed: `CloudSandboxEnvironmentSpec.probe_needs` and `PlacementDecision.provider_workspace_root`. The preceding generation's `FLOTILLA_CLOUD_IMAGE_NEEDS` is lifted on decode for one roll. The existing stored descriptor capabilities still require owner look-over; this ruling does not approve or reshape them.
+
 - **Docker's stored fields fold into the kind-neutral shape once,** when Environment moves to the generated tables (#3108), with the schema review.
 - **Until then, new kinds use additive fields only:** `spec.provider` (instance, two-level kind, class inputs), `status.backing_id`, and matching PlacementPolicy and FulfilmentKind variants. These are ADR 0047 defaults with no shim to remove.
 - **Target outline for the schema review:**

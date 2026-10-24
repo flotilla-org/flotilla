@@ -1353,3 +1353,66 @@ async fn docker_codex_home_is_a_rw_host_mount_and_is_not_pushed() {
     assert_eq!(tools[0].assets[0].access, flotilla_environment::environment::EnvironmentToolAssetAccess::ReadOnly);
     assert!(!registry.codex_home_is_shared("work", &mounts));
 }
+
+// #3765 S6: a missing guest harness must fail the actual cloud image probe,
+// even when no adapter was discovered. Empty needs require no guest command.
+#[tokio::test]
+async fn cloud_image_probe_refuses_missing_harness() {
+    let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+        id: EnvironmentId::new("cloud-probe"),
+        image: ImageId::new("cloud-image"),
+        runner: Arc::new(DiscoveryMockRunner::builder().on_run("mkdir", &["-p", "/tmp/flotilla/probe"], Ok(String::new())).build()),
+        env_vars: HashMap::new(),
+        destroyed: Arc::new(AtomicBool::new(false)),
+    });
+    let bag = EnvironmentBag::new();
+    assert!(super::super::docker::verify_cloud_image_needs(&BTreeSet::new(), "cloud-image", &handle, &bag).await.is_ok());
+    let needs = [flotilla_resources::CapabilityNeed::Harness { adapter: "missing-harness".into(), minimum_version: "1.0.0".into() }]
+        .into_iter()
+        .collect();
+    let error = super::super::docker::verify_cloud_image_needs(&needs, "cloud-image", &handle, &bag).await.unwrap_err();
+    assert!(error.contains("missing-harness"), "{error}");
+}
+
+// #3765 B1: post-provider credential/probe failures must preserve an adopted
+// backing too. The fake represents the remote environment destruction boundary.
+#[tokio::test]
+async fn controller_setup_rollback_preserves_adopted_backing() {
+    struct Adopted(TestInteriorEnvironment);
+    #[async_trait]
+    impl ProvisionedEnvironment for Adopted {
+        flotilla_discovery_testkit::injected_environment_handle!();
+        fn created_for_setup(&self) -> bool {
+            false
+        }
+        fn id(&self) -> &EnvironmentId {
+            &self.0.id
+        }
+        fn image(&self) -> &ImageId {
+            &self.0.image
+        }
+        async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+            self.0.observe().await
+        }
+        async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+            self.0.env_vars().await
+        }
+        fn runner(&self) -> Arc<dyn CommandRunner> {
+            self.0.runner()
+        }
+        async fn destroy(&self) -> Result<(), String> {
+            self.0.destroy().await
+        }
+    }
+    let destroyed = Arc::new(AtomicBool::new(false));
+    let handle: EnvironmentHandle = Arc::new(Adopted(TestInteriorEnvironment {
+        id: EnvironmentId::new("adopted"),
+        image: ImageId::new("cloud"),
+        runner: Arc::new(DiscoveryMockRunner::builder().build()),
+        env_vars: Default::default(),
+        destroyed: destroyed.clone(),
+    }));
+    let message = super::super::docker::discard_failed_environment(&handle, None, None, "adopted", "injected setup failure".into()).await;
+    assert!(message.contains("retained for retry"));
+    assert!(!destroyed.load(Ordering::SeqCst));
+}

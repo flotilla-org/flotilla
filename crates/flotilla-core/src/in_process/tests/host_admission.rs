@@ -381,6 +381,7 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
         .check_remote_placement_free_space_floor(
             "flotilla",
             Some(&PlacementDecision {
+                provider_workspace_root: None,
                 minimal_alternatives: Vec::new(),
                 escalation_reason: None,
                 policy_name: "self-targeted".to_string(),
@@ -482,6 +483,7 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
         .check_remote_placement_free_space_floor(
             "flotilla",
             Some(&PlacementDecision {
+                provider_workspace_root: None,
                 minimal_alternatives: Vec::new(),
                 escalation_reason: None,
                 policy_name: "self-targeted".to_string(),
@@ -621,6 +623,7 @@ async fn admitting_host_floor_gates_only_work_that_lands_on_it() {
     .await;
     let local = daemon.local_host_id().expect("host id").to_string();
     let decision = |host: &str| PlacementDecision {
+        provider_workspace_root: None,
         policy_name: format!("host-direct-{host}"),
         target_host: PlacementTargetHost { reference: flotilla_protocol::CanonicalHostId::resolved(host), display_name: host.into() },
         minimal_alternatives: Vec::new(),
@@ -765,4 +768,352 @@ async fn parallel_daemons_have_independent_free_space_probe_capacity() {
         assert!(all_started.is_ok(), "all nine independent probes must start (report_only={report_only}): {results:?}");
         assert!(results.iter().all(Result::is_ok), "{results:?}");
     }
+}
+
+/// An agentless SSH host, owned by `agentless-owner`, with its policy and
+/// host-direct kind, optionally declaring a vessel cap (#3793).
+async fn agentless_host(backend: &ResourceBackend, name: &str, max_vessels: Option<u32>) {
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let kind = format!("host-direct-{name}");
+    let host = hosts
+        .create(
+            &test_meta(name),
+            &HostSpec {
+                display_name: name.into(),
+                connection: flotilla_resources::HostConnection::AgentlessSsh {
+                    owning_daemon: "agentless-owner".into(),
+                    destination: format!("crew@{name}.example"),
+                },
+                max_vessels,
+                ..HostSpec::default()
+            },
+        )
+        .await
+        .expect("SSH host");
+    hosts
+        .update_status(
+            name,
+            &host.metadata.resource_version,
+            &HostStatus {
+                capabilities: [(
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                )]
+                .into_iter()
+                .collect(),
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                fulfilment_facts: BTreeMap::from([(kind.clone(), FulfilmentFacts { observed_at: Utc::now(), ..Default::default() })]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("SSH host facts");
+    placement_policy(backend, &kind, name).await;
+    backend
+        .clone()
+        .using::<FulfilmentKind>("flotilla")
+        .create(
+            &test_meta(&kind),
+            &FulfilmentKindSpec::builder()
+                .host_ref(name.to_string())
+                .pool("cleat".to_string())
+                .realisation(FulfilmentRealisation::HostDirect)
+                .build(),
+        )
+        .await
+        .expect("SSH host kind");
+}
+
+async fn agentless_owner(backend: &ResourceBackend, temp: &tempfile::TempDir) -> Arc<InProcessDaemon> {
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"agentless-owner\"\n").expect("daemon config");
+    InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("udder"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await
+}
+
+// #3793 acceptance: three agentless hosts that each declare `max_vessels = 1`
+// take unpinned convoys, one per host. A fourth waits with "no free vessel
+// slots", and only a finished teardown of a vessel on its host lets it start:
+// a vessel still tearing down keeps its slot.
+#[tokio::test]
+async fn capped_agentless_hosts_spread_unpinned_convoys_and_queue_beyond_their_cap() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = agentless_owner(&backend, &temp).await;
+    for name in ["b1", "b2", "b3"] {
+        agentless_host(&backend, name, Some(1)).await;
+    }
+    let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
+    let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let vessels = backend.clone().using::<flotilla_resources::Vessel>("flotilla");
+    let vessel_spec = |convoy: &str, policy: &str| flotilla_resources::VesselSpec {
+        convoy_ref: convoy.into(),
+        vessel_name: "work".into(),
+        placement_policy_ref: policy.into(),
+        adopted_checkout_refs: BTreeMap::new(),
+    };
+    let mut placed: Vec<(String, PlacementDecision)> = Vec::new();
+    for index in 0..4 {
+        if index == 3 {
+            // The first three provision: their vessels, not their admissions,
+            // now hold the slots.
+            for (name, decision) in &placed {
+                vessels
+                    .create(
+                        &InputMeta::builder()
+                            .name(format!("{name}-work"))
+                            .finalizers(vec!["flotilla.work/vessel-workspace-teardown".into()])
+                            .build(),
+                        &vessel_spec(name, &decision.policy_name),
+                    )
+                    .await
+                    .expect("provisioned vessel");
+            }
+        }
+        let (placement, _) = daemon
+            .resolve_capability_placement("flotilla", "project", &[], &workflow, &BTreeSet::new(), &unpinned)
+            .await
+            .expect("a capped agentless host takes an unpinned convoy");
+        let selected = placement.selected.expect("unpinned placement");
+        // Admission records the decision on the convoy it creates.
+        let decision = PlacementDecision {
+            minimal_alternatives: Vec::new(),
+            escalation_reason: None,
+            policy_name: selected.metadata.name.clone(),
+            target_host: placement_target_host(&backend, "flotilla", &selected).await.expect("target host"),
+            refused_candidates: placement.refused_candidates,
+            viable_not_selected: placement.viable_not_selected,
+            allocation: placement.allocation,
+            provider_workspace_root: None,
+        };
+        let name = format!("convoy-{index}");
+        let convoy =
+            convoys.create(&test_meta(&name), &ConvoySpec::builder().workflow_ref("missing".to_string()).build()).await.expect("convoy");
+        convoys
+            .update_status(
+                &name,
+                &convoy.metadata.resource_version,
+                &ConvoyStatus { placement_decision: Some(decision.clone()), ..Default::default() },
+            )
+            .await
+            .expect("admitted placement");
+        placed.push((name, decision));
+    }
+    let hosts = placed.iter().map(|(_, decision)| decision.target_host.reference.to_string()).collect::<Vec<_>>();
+    assert_eq!(hosts[..3].iter().collect::<BTreeSet<_>>().len(), 3, "the first three spread over three hosts: {hosts:?}");
+    let allocation = placed[3].1.allocation.as_ref().expect("fourth allocation");
+    let chosen = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind).expect("chosen candidate");
+    assert_eq!((chosen.free_vessel_slots, chosen.max_vessels, chosen.available), (Some(0), Some(1), false), "{allocation:?}");
+
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>("flotilla"))
+        .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
+        .with_convoys(backend.including_replicas::<ResourceConvoy>("flotilla"))
+        .with_federated_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
+    let capacity_stall = |outcome: flotilla_store::controller::ReconcileOutcome<ResourceConvoy>| match outcome.patch {
+        Some(flotilla_resources::ConvoyStatusPatch::SetStalled { condition: Some(condition) })
+            if condition.cause == Some(flotilla_resources::StallCause::Capacity) =>
+        {
+            Some(condition.evidence)
+        }
+        _ => None,
+    };
+    let gate = |name: String| {
+        let reconciler = &reconciler;
+        let convoys = convoys.clone();
+        async move {
+            let convoy = convoys.get(&name).await.expect("convoy");
+            let prepared = flotilla_store::controller::Reconciler::prepare(reconciler, &convoy).await.expect("prepare");
+            capacity_stall(flotilla_store::controller::Reconciler::reconcile(reconciler, &convoy, &prepared, Utc::now()))
+        }
+    };
+    for (name, _) in &placed[..3] {
+        assert_eq!(gate(name.clone()).await, None, "{name} holds its host's slot");
+    }
+    let waiting = gate(placed[3].0.clone()).await.expect("the fourth convoy waits");
+    assert!(waiting.contains("no free vessel slots"), "{waiting}");
+
+    // Tear down the convoy on the fourth's host: its vessel holds the slot
+    // until its teardown finishes.
+    let (holder, _) = placed[..3].iter().find(|(_, decision)| decision.target_host == placed[3].1.target_host).expect("holder");
+    let vessel_spec = vessel_spec(holder, &placed[3].1.policy_name);
+    let holder_convoy = convoys.get(holder).await.expect("holder");
+    let mut landed = holder_convoy.status.clone().expect("holder status");
+    landed.phase = ConvoyPhase::Landed;
+    convoys.update_status(holder, &holder_convoy.metadata.resource_version, &landed).await.expect("holder landed");
+    vessels.delete(&format!("{holder}-work")).await.expect("start teardown");
+    assert!(
+        vessels.get(&format!("{holder}-work")).await.expect("vessel tearing down").metadata.deletion_timestamp.is_some(),
+        "the finalizer holds the vessel mid-teardown"
+    );
+    assert!(gate(placed[3].0.clone()).await.is_some(), "a vessel mid-teardown still holds its slot");
+
+    let tearing = vessels.get(&format!("{holder}-work")).await.expect("vessel tearing down");
+    vessels
+        .update(
+            &InputMeta::from(&tearing.metadata).without_finalizer("flotilla.work/vessel-workspace-teardown"),
+            &tearing.metadata.resource_version,
+            &vessel_spec,
+        )
+        .await
+        .expect("teardown finished");
+    let gone = vessels.get(&format!("{holder}-work")).await;
+    assert!(gone.is_err(), "the vessel is gone once its finalizer is released: {gone:?}");
+    assert_eq!(gate(placed[3].0.clone()).await, None, "a finished teardown admits the waiting convoy");
+}
+
+// #3793: a host without `max_vessels` keeps the pin-only rule, even beside a
+// capped host that takes the unpinned convoy.
+#[tokio::test]
+async fn uncapped_agentless_host_still_refuses_unpinned_convoys() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = agentless_owner(&backend, &temp).await;
+    agentless_host(&backend, "b1", Some(1)).await;
+    agentless_host(&backend, "b9", None).await;
+    let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
+    let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
+    let (placement, _) = daemon
+        .resolve_capability_placement("flotilla", "project", &[], &workflow, &BTreeSet::new(), &unpinned)
+        .await
+        .expect("the capped host takes the convoy");
+    assert_eq!(placement.selected.expect("placement").metadata.name, "host-direct-b1");
+    let refusal = placement.refused_candidates.iter().find(|refusal| refusal.policy_name == "host-direct-b9").expect("b9 refused");
+    assert_eq!(refusal.reason, "agentless SSH host takes only convoys that pin its placement");
+}
+
+// #3793: among otherwise equal hosts, placement prefers the one with the most
+// free slots, so two convoys on two hosts of cap 2 land one on each.
+#[tokio::test]
+async fn placement_prefers_the_capped_host_with_most_free_slots() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = agentless_owner(&backend, &temp).await;
+    agentless_host(&backend, "b1", Some(2)).await;
+    agentless_host(&backend, "b2", Some(2)).await;
+    let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
+    let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let mut hosts = Vec::new();
+    for index in 0..2 {
+        let (placement, _) = daemon
+            .resolve_capability_placement("flotilla", "project", &[], &workflow, &BTreeSet::new(), &unpinned)
+            .await
+            .expect("placement");
+        let selected = placement.selected.expect("unpinned placement");
+        let target_host = placement_target_host(&backend, "flotilla", &selected).await.expect("target host");
+        hosts.push(target_host.reference.to_string());
+        let name = format!("convoy-{index}");
+        let convoy =
+            convoys.create(&test_meta(&name), &ConvoySpec::builder().workflow_ref("missing".to_string()).build()).await.expect("convoy");
+        let decision = PlacementDecision {
+            minimal_alternatives: Vec::new(),
+            escalation_reason: None,
+            policy_name: selected.metadata.name.clone(),
+            target_host,
+            refused_candidates: Vec::new(),
+            viable_not_selected: Vec::new(),
+            allocation: placement.allocation,
+            provider_workspace_root: None,
+        };
+        convoys
+            .update_status(
+                &name,
+                &convoy.metadata.resource_version,
+                &ConvoyStatus { placement_decision: Some(decision), ..Default::default() },
+            )
+            .await
+            .expect("admitted placement");
+    }
+    assert_eq!(hosts, ["b1", "b2"], "the second convoy goes to the host with more free slots");
+}
+
+// #3793: a convoy waits until all its vessels on a host fit, so a host whose
+// cap is smaller than the vessels it would hold is refused rather than left
+// to wait forever.
+#[tokio::test]
+async fn capped_agentless_host_refuses_a_convoy_with_more_vessels_than_its_cap() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = agentless_owner(&backend, &temp).await;
+    agentless_host(&backend, "b1", Some(1)).await;
+    let vessel = |name: &str| flotilla_resources::VesselRequirement::builder().name(name.to_string()).crew(Vec::new()).build();
+    let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("first"), vessel("second")]).build();
+    let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
+    let refused = daemon
+        .resolve_capability_placement("flotilla", "project", &[], &workflow, &BTreeSet::new(), &unpinned)
+        .await
+        .expect_err("two vessels cannot fit a cap of one");
+    assert!(refused.contains("convoy needs 2 vessels here, more than the host's cap of 1"), "{refused}");
+}
+
+// #3793: admission prepares outside its guard, so two concurrent admissions
+// can both pick the one free slot on a host. Both are admitted; the gate lets
+// the older provision and holds the newer until that slot frees, so the cap
+// holds.
+#[tokio::test]
+async fn concurrent_admissions_onto_one_free_slot_provision_in_admission_order() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = agentless_owner(&backend, &temp).await;
+    agentless_host(&backend, "b1", Some(1)).await;
+    let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
+    let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
+    // Both placements are decided before either convoy exists.
+    let mut decisions = Vec::new();
+    for _ in 0..2 {
+        let (placement, _) = daemon
+            .resolve_capability_placement("flotilla", "project", &[], &workflow, &BTreeSet::new(), &unpinned)
+            .await
+            .expect("placement");
+        let selected = placement.selected.expect("unpinned placement");
+        decisions.push(PlacementDecision {
+            minimal_alternatives: Vec::new(),
+            escalation_reason: None,
+            policy_name: selected.metadata.name.clone(),
+            target_host: placement_target_host(&backend, "flotilla", &selected).await.expect("target host"),
+            refused_candidates: Vec::new(),
+            viable_not_selected: Vec::new(),
+            allocation: placement.allocation,
+            provider_workspace_root: None,
+        });
+    }
+    assert!(decisions.iter().all(|decision| decision.target_host.reference.as_str() == "b1"), "both raced onto b1");
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    for (index, decision) in decisions.into_iter().enumerate() {
+        let name = format!("convoy-{index}");
+        let convoy =
+            convoys.create(&test_meta(&name), &ConvoySpec::builder().workflow_ref("missing".to_string()).build()).await.expect("convoy");
+        convoys
+            .update_status(
+                &name,
+                &convoy.metadata.resource_version,
+                &ConvoyStatus { placement_decision: Some(decision), ..Default::default() },
+            )
+            .await
+            .expect("admitted placement");
+    }
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>("flotilla"))
+        .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
+        .with_convoys(backend.including_replicas::<ResourceConvoy>("flotilla"))
+        .with_federated_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
+    let mut waits = Vec::new();
+    for name in ["convoy-0", "convoy-1"] {
+        let convoy = convoys.get(name).await.expect("convoy");
+        let prepared = flotilla_store::controller::Reconciler::prepare(&reconciler, &convoy).await.expect("prepare");
+        let outcome = flotilla_store::controller::Reconciler::reconcile(&reconciler, &convoy, &prepared, Utc::now());
+        waits.push(matches!(
+            outcome.patch,
+            Some(flotilla_resources::ConvoyStatusPatch::SetStalled { condition: Some(condition) })
+                if condition.cause == Some(flotilla_resources::StallCause::Capacity) && condition.evidence.contains("no free vessel slots")
+        ));
+    }
+    assert_eq!(waits, [false, true], "the older admission provisions; the newer waits for the slot");
 }

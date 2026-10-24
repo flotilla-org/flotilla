@@ -42,6 +42,8 @@ pub struct ConvoyReconciler {
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
     forges: Option<DefinitionResolver<Forge>>,
     hosts: Option<ReplicaReadResolver<Host>>,
+    /// Every convoy, to count an agentless host's vessels against its cap.
+    convoys: Option<ReplicaReadResolver<Convoy>>,
     change_request_stale_after: std::time::Duration,
     landing_evidence_stale_after: std::time::Duration,
     clock: Arc<dyn Clock>,
@@ -87,6 +89,7 @@ impl ConvoyReconciler {
             change_requests: None,
             forges: None,
             hosts: None,
+            convoys: None,
             change_request_stale_after: std::time::Duration::from_secs(180),
             landing_evidence_stale_after: std::time::Duration::from_secs(30),
             clock: Arc::new(SystemClock),
@@ -115,6 +118,43 @@ impl ConvoyReconciler {
     pub fn with_hosts(mut self, hosts: ReplicaReadResolver<Host>) -> Self {
         self.hosts = Some(hosts);
         self
+    }
+
+    pub fn with_convoys(mut self, convoys: ReplicaReadResolver<Convoy>) -> Self {
+        self.convoys = Some(convoys);
+        self
+    }
+
+    /// What `host` holds against its vessel cap, or None without the
+    /// convoy and vessel reads to count it.
+    async fn vessel_occupancy(&self, host: &str) -> Result<Option<HostOccupancy>, ResourceError> {
+        let (Some(convoys), Some(vessels)) = (&self.convoys, &self.federated_vessels) else {
+            return Ok(None);
+        };
+        let convoys = home_copies_first(convoys.list().await?.items);
+        let vessels = home_copies_first(vessels.list().await?.items);
+        // A convoy not yet bootstrapped names its vessels only in its frozen
+        // workflow snapshot record.
+        let snapshots = convoys
+            .iter()
+            .filter(|convoy| HostOccupancy::needs_workflow_vessels(convoy, host))
+            .map(|convoy| (convoy.metadata.name.clone(), pinned_workflow_ref(convoy).to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let templates = if snapshots.is_empty() { Vec::new() } else { self.templates.list_names(snapshots.values().cloned()).await? };
+        let templates = templates.into_iter().map(|template| (template.metadata.name.clone(), template)).collect::<BTreeMap<_, _>>();
+        let workflow_vessels = snapshots
+            .into_iter()
+            // A convoy whose snapshot record is missing is left out, and `count`
+            // falls back to its pins and convoy-wide decision.
+            .filter_map(|(convoy, template)| {
+                let Some(template) = templates.get(template.as_str()) else {
+                tracing::warn!(%convoy, %template, "workflow snapshot missing; counting the convoy's pins and convoy-wide decision instead");
+                return None;
+            };
+                Some((convoy, template.spec.vessels.iter().map(|vessel| vessel.name.clone()).collect()))
+            })
+            .collect();
+        Ok(Some(HostOccupancy::count(host, &convoys, &vessels, &workflow_vessels)))
     }
 
     pub fn with_federated_vessels(mut self, vessels: ReplicaReadResolver<Vessel>) -> Self {
@@ -323,12 +363,16 @@ impl Reconciler for ConvoyReconciler {
                                 break;
                             }
                         };
-                        let host = canonical.and_then(|id| {
+                        let host = canonical.as_ref().and_then(|id| {
                             available_hosts
                                 .items
                                 .iter()
                                 .find(|host| host.object.metadata.name == id.as_str())
                                 .map(|host| host.object.clone())
+                        });
+                        let vessel_cap = host.as_ref().and_then(|host| match host.spec.connection {
+                            HostConnection::AgentlessSsh { .. } => host.spec.max_vessels,
+                            HostConnection::Daemon => None,
                         });
                         let status = host.and_then(|host| host.status).map(|mut status| {
                             status.apply_heartbeat_readiness(self.clock.now());
@@ -340,13 +384,30 @@ impl Reconciler for ConvoyReconciler {
                             .as_ref()
                             .and_then(|status| status.fulfilment_facts.get(&selected.kind))
                             .and_then(|facts| facts.free_vessel_slots);
-                        if status.as_ref().is_none_or(|status| !status.ready) || sleeping || slots == Some(0) {
+                        // A capped agentless host admits convoys in admission
+                        // order while its live vessels leave room (#3793).
+                        let full = match (vessel_cap, canonical.as_ref()) {
+                            (Some(cap), Some(host)) => match self.vessel_occupancy(host.as_str()).await {
+                                Ok(Some(occupancy)) => !occupancy.admits(&obj.metadata.name, cap),
+                                Ok(None) => slots == Some(0),
+                                // An unreadable count waits rather than failing the pass.
+                                Err(error) => {
+                                    wait = Some(format!(
+                                        "capacity for fulfilment `{}` on host `{}` is unavailable: cannot count its vessels: {error}",
+                                        selected.kind, selected.host
+                                    ));
+                                    break;
+                                }
+                            },
+                            _ => slots == Some(0),
+                        };
+                        if status.as_ref().is_none_or(|status| !status.ready) || sleeping || full {
                             wait = Some(format!(
                                 "capacity for fulfilment `{}` on host `{}` is unavailable{}{}",
                                 selected.kind,
                                 selected.host,
                                 if sleeping { " (sleeping)" } else { "" },
-                                if slots == Some(0) { " (no free vessel slots)" } else { "" }
+                                if full { " (no free vessel slots)" } else { "" }
                             ));
                             break;
                         }
