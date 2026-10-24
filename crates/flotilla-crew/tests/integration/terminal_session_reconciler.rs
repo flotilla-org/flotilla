@@ -3779,3 +3779,112 @@ fn environment_loss_preserves_recoverable_work(tc: hegel::TestCase) {
         }
     });
 }
+
+// Terminal launch and owner-loss decisions use the engine without copying Environment status.
+// Enumerate all old phases, both ready-flag values, success, both Gone endings and empty/Unicode failures.
+#[tokio::test]
+async fn terminal_reads_its_environment_without_a_status_copy() {
+    use flotilla_provisioning::engine::{
+        environment::EnvironmentBinding,
+        reads::{LifecycleReadPort, StoreReads},
+        Binding, LifecycleHome, Lifecycles, Step,
+    };
+    use flotilla_resources::{Environment, EnvironmentPhase};
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::{Cause, CauseCategory, Outcome};
+    for old_phase in [
+        EnvironmentPhase::Pending,
+        EnvironmentPhase::Provisioning,
+        EnvironmentPhase::Ready,
+        EnvironmentPhase::Failed,
+        EnvironmentPhase::Lost,
+    ] {
+        for ready in [false, true] {
+            for ending in ["ready", "released", "lost", "", "失敗"] {
+                let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+                create_ready_environment(&backend, "env").await;
+                let envs = backend.using::<Environment>("flotilla");
+                let mut environment = envs.get("env").await.expect("environment");
+                let old_status = EnvironmentStatus { phase: old_phase, ready, message: Some("stale".into()), ..Default::default() };
+                environment = envs.update_status("env", &environment.metadata.resource_version, &old_status).await.expect("old status");
+                let session = backend
+                    .using::<TerminalSession>("flotilla")
+                    .create(
+                        &meta("terminal"),
+                        &TerminalSessionSpec {
+                            env_ref: "env".into(),
+                            role: "coder".into(),
+                            source: flotilla_resources::TerminalSessionSource::Tool { command: "test".into() },
+                            cwd: "/workspace".into(),
+                            env: Default::default(),
+                            pool: "cleat".into(),
+                        },
+                    )
+                    .await
+                    .expect("session");
+                let mut registry = flotilla_schema::KindRegistry::new();
+                flotilla_provisioning::stored::register(&mut registry).expect("registry");
+                let store = Arc::new(Mutex::new(
+                    flotilla_schema_sqlite::Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry)
+                        .expect("store"),
+                ));
+                let engine: LifecycleHome<flotilla_provisioning::stored::environment::EnvironmentKind, _> = LifecycleHome::new(
+                    "home",
+                    flotilla_state_machines::Home::with_log("home", flotilla_engine_store::StoreLog::new(Arc::clone(&store)))
+                        .expect("home"),
+                );
+                let reads = Arc::new(LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), "home".into()));
+                // Existing fake stands at the terminal-process boundary; stores and engine reads are real.
+                let reconciler =
+                    TerminalSessionReconciler::new(Arc::new(FailingTerminalRuntime), backend, "flotilla").with_lifecycle_reads(reads);
+                engine
+                    .request("env", EnvironmentBinding::request(&environment, "home").expect("request"), Timestamp(1))
+                    .expect("requested");
+                let prepared = reconciler.prepare(&session).await.expect("progress");
+                assert!(reconciler.reconcile(&session, &prepared, Utc::now()).patch.is_none());
+                engine
+                    .step(
+                        "env",
+                        &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "retry"), retryable: true }),
+                        Timestamp(2),
+                    )
+                    .expect("retry");
+                let prepared = reconciler.prepare(&session).await.expect("retrying");
+                assert!(reconciler.reconcile(&session, &prepared, Utc::now()).patch.is_none());
+                if matches!(ending, "ready" | "released" | "lost") {
+                    engine.step("env", &Step::Realised { identity: "/workspace".into() }, Timestamp(3)).expect("ready");
+                    if ending != "ready" {
+                        engine.step("env", &if ending == "lost" { Step::Vanished } else { Step::Released }, Timestamp(4)).expect("ended");
+                    }
+                } else {
+                    engine
+                        .step(
+                            "env",
+                            &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, ending), retryable: false }),
+                            Timestamp(3),
+                        )
+                        .expect("gave up");
+                }
+                for _ in 0..2 {
+                    let prepared = reconciler.prepare(&session).await.expect("prepare");
+                    match (ending, reconciler.reconcile(&session, &prepared, Utc::now()).patch) {
+                        ("ready", Some(TerminalSessionStatusPatch::MarkFailed { message, .. })) => assert_eq!(message, "boom"),
+                        ("lost", Some(TerminalSessionStatusPatch::MarkLost { reason, .. })) => {
+                            assert_eq!(reason, "environment env observed absent")
+                        }
+                        ("released", Some(TerminalSessionStatusPatch::MarkLost { reason, .. })) => {
+                            assert_eq!(reason, "environment env released")
+                        }
+                        (_, Some(TerminalSessionStatusPatch::MarkFailed { message, .. })) => {
+                            assert_eq!(message, "owning environment or convoy reached a terminal phase")
+                        }
+                        other => panic!("unexpected terminal outcome {other:?}"),
+                    }
+                }
+                assert_eq!(envs.get("env").await.expect("old environment").status, Some(old_status));
+                flotilla_store_testkit::poison_mutex(store);
+                assert!(reconciler.prepare(&session).await.err().expect("read error").to_string().contains("poisoned"));
+            }
+        }
+    }
+}

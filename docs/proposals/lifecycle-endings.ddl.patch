@@ -1,0 +1,402 @@
+--- a/crates/flotilla-provisioning/tests/snapshots/provisioning.sql
++++ b/crates/flotilla-provisioning/tests/snapshots/provisioning.sql
+@@ -59,6 +59,9 @@
+   "identity" TEXT,
+   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
+   "cause_detail" TEXT,
++  "ending" TEXT CHECK ("ending" IN ('rl', 'vn')),
++  "ending_cause" TEXT CHECK ("ending_cause" IN ('lo', 'fa')),
++  "ending_cause_reason" TEXT,
+   CHECK (CASE WHEN "source" = 'wt'
+       THEN "source_url" IS NULL
+       END),
+@@ -78,6 +81,9 @@
+       AND "identity" IS NULL
+       AND "cause_category" IS NULL
+       AND "cause_detail" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
+       END),
+   CHECK (CASE WHEN "state" = 'rl'
+       THEN "identity" IS NOT NULL
+@@ -88,9 +94,13 @@
+       AND "last_failure_retryable" IS NULL
+       AND "cause_category" IS NULL
+       AND "cause_detail" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
+       END),
+   CHECK (CASE WHEN "state" = 'go'
+-      THEN "failures" IS NULL
++      THEN "ending" IS NOT NULL
++      AND "failures" IS NULL
+       AND "last_failure_at" IS NULL
+       AND "last_failure_cause_category" IS NULL
+       AND "last_failure_cause_detail" IS NULL
+@@ -108,6 +118,16 @@
+       AND "last_failure_cause_detail" IS NULL
+       AND "last_failure_retryable" IS NULL
+       AND "identity" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
++      END),
++  CHECK (CASE WHEN "ending" = 'rl'
++      THEN "ending_cause" IS NULL AND "ending_cause_reason" IS NULL
++      WHEN "ending" = 'vn' THEN "ending_cause" IS NOT NULL
++      END),
++  CHECK (CASE WHEN "ending_cause" = 'lo' THEN "ending_cause_reason" IS NULL
++      WHEN "ending_cause" = 'fa' THEN "ending_cause_reason" IS NOT NULL
+       END)
+ ) STRICT;
+ CREATE INDEX "checkout_by_clone" ON "checkout" ("clone") WHERE "clone" IS NOT NULL;
+@@ -160,7 +180,10 @@
+   "checkout"."last_failure_retryable",
+   "checkout"."identity",
+   (SELECT "name" FROM "codes" WHERE "kind" = 'ck' AND "field" = 'cause_category' AND "code" = "checkout"."cause_category") AS "cause_category",
+-  "checkout"."cause_detail"
++  "checkout"."cause_detail",
++  (SELECT "name" FROM "codes" WHERE "kind" = 'ck' AND "field" = 'ending' AND "code" = "checkout"."ending") AS "ending",
++  (SELECT "name" FROM "codes" WHERE "kind" = 'ck' AND "field" = 'ending_cause' AND "code" = "checkout"."ending_cause") AS "ending_cause",
++  "checkout"."ending_cause_reason"
+ FROM "checkout";
+ CREATE TABLE "clone" (
+   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+@@ -179,6 +202,9 @@
+   "identity" TEXT,
+   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
+   "cause_detail" TEXT,
++  "ending" TEXT CHECK ("ending" IN ('rl', 'vn')),
++  "ending_cause" TEXT CHECK ("ending_cause" IN ('lo', 'fa')),
++  "ending_cause_reason" TEXT,
+   CHECK (CASE WHEN "last_failure_at" IS NOT NULL
+       THEN "last_failure_cause_category" IS NOT NULL
+       AND "last_failure_cause_detail" IS NOT NULL
+@@ -192,6 +218,9 @@
+       AND "identity" IS NULL
+       AND "cause_category" IS NULL
+       AND "cause_detail" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
+       END),
+   CHECK (CASE WHEN "state" = 'rl'
+       THEN "identity" IS NOT NULL
+@@ -202,9 +231,13 @@
+       AND "last_failure_retryable" IS NULL
+       AND "cause_category" IS NULL
+       AND "cause_detail" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
+       END),
+   CHECK (CASE WHEN "state" = 'go'
+-      THEN "failures" IS NULL
++      THEN "ending" IS NOT NULL
++      AND "failures" IS NULL
+       AND "last_failure_at" IS NULL
+       AND "last_failure_cause_category" IS NULL
+       AND "last_failure_cause_detail" IS NULL
+@@ -222,6 +255,16 @@
+       AND "last_failure_cause_detail" IS NULL
+       AND "last_failure_retryable" IS NULL
+       AND "identity" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
++      END),
++  CHECK (CASE WHEN "ending" = 'rl'
++      THEN "ending_cause" IS NULL AND "ending_cause_reason" IS NULL
++      WHEN "ending" = 'vn' THEN "ending_cause" IS NOT NULL
++      END),
++  CHECK (CASE WHEN "ending_cause" = 'lo' THEN "ending_cause_reason" IS NULL
++      WHEN "ending_cause" = 'fa' THEN "ending_cause_reason" IS NOT NULL
+       END)
+ ) STRICT;
+ CREATE INDEX "clone_by_environment" ON "clone" ("environment", "repository");
+@@ -265,7 +308,10 @@
+   "clone"."last_failure_retryable",
+   "clone"."identity",
+   (SELECT "name" FROM "codes" WHERE "kind" = 'cl' AND "field" = 'cause_category' AND "code" = "clone"."cause_category") AS "cause_category",
+-  "clone"."cause_detail"
++  "clone"."cause_detail",
++  (SELECT "name" FROM "codes" WHERE "kind" = 'cl' AND "field" = 'ending' AND "code" = "clone"."ending") AS "ending",
++  (SELECT "name" FROM "codes" WHERE "kind" = 'cl' AND "field" = 'ending_cause' AND "code" = "clone"."ending_cause") AS "ending_cause",
++  "clone"."ending_cause_reason"
+ FROM "clone";
+ CREATE TABLE "environment" (
+   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+@@ -284,6 +330,9 @@
+   "identity" TEXT,
+   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
+   "cause_detail" TEXT,
++  "ending" TEXT CHECK ("ending" IN ('rl', 'vn')),
++  "ending_cause" TEXT CHECK ("ending_cause" IN ('lo', 'fa')),
++  "ending_cause_reason" TEXT,
+   CHECK (CASE WHEN "last_failure_at" IS NOT NULL
+       THEN "last_failure_cause_category" IS NOT NULL
+       AND "last_failure_cause_detail" IS NOT NULL
+@@ -297,6 +346,9 @@
+       AND "identity" IS NULL
+       AND "cause_category" IS NULL
+       AND "cause_detail" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
+       END),
+   CHECK (CASE WHEN "state" = 'rl'
+       THEN "identity" IS NOT NULL
+@@ -307,9 +359,13 @@
+       AND "last_failure_retryable" IS NULL
+       AND "cause_category" IS NULL
+       AND "cause_detail" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
+       END),
+   CHECK (CASE WHEN "state" = 'go'
+-      THEN "failures" IS NULL
++      THEN "ending" IS NOT NULL
++      AND "failures" IS NULL
+       AND "last_failure_at" IS NULL
+       AND "last_failure_cause_category" IS NULL
+       AND "last_failure_cause_detail" IS NULL
+@@ -327,6 +383,16 @@
+       AND "last_failure_cause_detail" IS NULL
+       AND "last_failure_retryable" IS NULL
+       AND "identity" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
++      END),
++  CHECK (CASE WHEN "ending" = 'rl'
++      THEN "ending_cause" IS NULL AND "ending_cause_reason" IS NULL
++      WHEN "ending" = 'vn' THEN "ending_cause" IS NOT NULL
++      END),
++  CHECK (CASE WHEN "ending_cause" = 'lo' THEN "ending_cause_reason" IS NULL
++      WHEN "ending_cause" = 'fa' THEN "ending_cause_reason" IS NOT NULL
+       END)
+ ) STRICT;
+ CREATE INDEX "environment_by_holder" ON "environment" ("holder") WHERE "holder" IS NOT NULL;
+@@ -372,7 +438,10 @@
+   "environment"."last_failure_retryable",
+   "environment"."identity",
+   (SELECT "name" FROM "codes" WHERE "kind" = 'ev' AND "field" = 'cause_category' AND "code" = "environment"."cause_category") AS "cause_category",
+-  "environment"."cause_detail"
++  "environment"."cause_detail",
++  (SELECT "name" FROM "codes" WHERE "kind" = 'ev' AND "field" = 'ending' AND "code" = "environment"."ending") AS "ending",
++  (SELECT "name" FROM "codes" WHERE "kind" = 'ev' AND "field" = 'ending_cause' AND "code" = "environment"."ending_cause") AS "ending_cause",
++  "environment"."ending_cause_reason"
+ FROM "environment";
+ CREATE TABLE "image_build" (
+   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+@@ -394,6 +463,9 @@
+   "identity" TEXT,
+   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
+   "cause_detail" TEXT,
++  "ending" TEXT CHECK ("ending" IN ('rl', 'vn')),
++  "ending_cause" TEXT CHECK ("ending_cause" IN ('lo', 'fa')),
++  "ending_cause_reason" TEXT,
+   CHECK (CASE WHEN "delivery" = 'rg'
+       THEN "delivery_repository" IS NOT NULL
+       END),
+@@ -413,6 +485,9 @@
+       AND "identity" IS NULL
+       AND "cause_category" IS NULL
+       AND "cause_detail" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
+       END),
+   CHECK (CASE WHEN "state" = 'rl'
+       THEN "identity" IS NOT NULL
+@@ -423,9 +498,13 @@
+       AND "last_failure_retryable" IS NULL
+       AND "cause_category" IS NULL
+       AND "cause_detail" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
+       END),
+   CHECK (CASE WHEN "state" = 'go'
+-      THEN "failures" IS NULL
++      THEN "ending" IS NOT NULL
++      AND "failures" IS NULL
+       AND "last_failure_at" IS NULL
+       AND "last_failure_cause_category" IS NULL
+       AND "last_failure_cause_detail" IS NULL
+@@ -443,6 +522,16 @@
+       AND "last_failure_cause_detail" IS NULL
+       AND "last_failure_retryable" IS NULL
+       AND "identity" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
++      END),
++  CHECK (CASE WHEN "ending" = 'rl'
++      THEN "ending_cause" IS NULL AND "ending_cause_reason" IS NULL
++      WHEN "ending" = 'vn' THEN "ending_cause" IS NOT NULL
++      END),
++  CHECK (CASE WHEN "ending_cause" = 'lo' THEN "ending_cause_reason" IS NULL
++      WHEN "ending_cause" = 'fa' THEN "ending_cause_reason" IS NOT NULL
+       END)
+ ) STRICT;
+ CREATE INDEX "image_build_by_composition" ON "image_build" ("composition");
+@@ -493,7 +582,10 @@
+   "image_build"."last_failure_retryable",
+   "image_build"."identity",
+   (SELECT "name" FROM "codes" WHERE "kind" = 'ib' AND "field" = 'cause_category' AND "code" = "image_build"."cause_category") AS "cause_category",
+-  "image_build"."cause_detail"
++  "image_build"."cause_detail",
++  (SELECT "name" FROM "codes" WHERE "kind" = 'ib' AND "field" = 'ending' AND "code" = "image_build"."ending") AS "ending",
++  (SELECT "name" FROM "codes" WHERE "kind" = 'ib' AND "field" = 'ending_cause' AND "code" = "image_build"."ending_cause") AS "ending_cause",
++  "image_build"."ending_cause_reason"
+ FROM "image_build";
+ CREATE VIEW "log_view" AS SELECT
+   (SELECT "s" FROM "strings" WHERE "id" = "l"."home") AS "home",
+@@ -514,3 +606,7 @@
+ FROM "log" AS "l" LEFT JOIN "resource_identity" AS "i" ON "i"."id" = "l"."resource";
+ CREATE VIEW stream_watermark_view AS SELECT (SELECT s FROM strings WHERE id = home) AS home, home_seq, applied_through FROM stream_watermark;
+ CREATE VIEW stream_history_view AS SELECT (SELECT s FROM strings WHERE id = home) AS home, home_seq FROM stream_history;
++INSERT INTO codes (kind, field, code, name) VALUES ('ck', 'ending', 'rl', 'Released'), ('ck', 'ending', 'vn', 'Vanished'), ('ck', 'ending_cause', 'lo', 'Lost'), ('ck', 'ending_cause', 'fa', 'Failed');
++INSERT INTO codes (kind, field, code, name) VALUES ('cl', 'ending', 'rl', 'Released'), ('cl', 'ending', 'vn', 'Vanished'), ('cl', 'ending_cause', 'lo', 'Lost'), ('cl', 'ending_cause', 'fa', 'Failed');
++INSERT INTO codes (kind, field, code, name) VALUES ('ev', 'ending', 'rl', 'Released'), ('ev', 'ending', 'vn', 'Vanished'), ('ev', 'ending_cause', 'lo', 'Lost'), ('ev', 'ending_cause', 'fa', 'Failed');
++INSERT INTO codes (kind, field, code, name) VALUES ('ib', 'ending', 'rl', 'Released'), ('ib', 'ending', 'vn', 'Vanished'), ('ib', 'ending_cause', 'lo', 'Lost'), ('ib', 'ending_cause', 'fa', 'Failed');
+--- a/crates/flotilla-provisioning/tests/snapshots/crew.sql
++++ b/crates/flotilla-provisioning/tests/snapshots/crew.sql
+@@ -162,6 +162,9 @@
+   "identity" TEXT,
+   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
+   "cause_detail" TEXT,
++  "ending" TEXT CHECK ("ending" IN ('rl', 'vn')),
++  "ending_cause" TEXT CHECK ("ending_cause" IN ('lo', 'fa')),
++  "ending_cause_reason" TEXT,
+   CHECK (CASE WHEN "source" = 'tl'
+       THEN "source_command" IS NOT NULL
+       AND "source_capability" IS NULL
+@@ -187,6 +190,9 @@
+       AND "identity" IS NULL
+       AND "cause_category" IS NULL
+       AND "cause_detail" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
+       END),
+   CHECK (CASE WHEN "state" = 'rl'
+       THEN "identity" IS NOT NULL
+@@ -197,9 +203,13 @@
+       AND "last_failure_retryable" IS NULL
+       AND "cause_category" IS NULL
+       AND "cause_detail" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
+       END),
+   CHECK (CASE WHEN "state" = 'go'
+-      THEN "failures" IS NULL
++      THEN "ending" IS NOT NULL
++      AND "failures" IS NULL
+       AND "last_failure_at" IS NULL
+       AND "last_failure_cause_category" IS NULL
+       AND "last_failure_cause_detail" IS NULL
+@@ -217,6 +227,16 @@
+       AND "last_failure_cause_detail" IS NULL
+       AND "last_failure_retryable" IS NULL
+       AND "identity" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
++      END),
++  CHECK (CASE WHEN "ending" = 'rl'
++      THEN "ending_cause" IS NULL AND "ending_cause_reason" IS NULL
++      WHEN "ending" = 'vn' THEN "ending_cause" IS NOT NULL
++      END),
++  CHECK (CASE WHEN "ending_cause" = 'lo' THEN "ending_cause_reason" IS NULL
++      WHEN "ending_cause" = 'fa' THEN "ending_cause_reason" IS NOT NULL
+       END)
+ ) STRICT;
+ CREATE TABLE "terminal_session_env" (
+@@ -277,7 +297,10 @@
+   "terminal_session"."last_failure_retryable",
+   "terminal_session"."identity",
+   (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'cause_category' AND "code" = "terminal_session"."cause_category") AS "cause_category",
+-  "terminal_session"."cause_detail"
++  "terminal_session"."cause_detail",
++  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'ending' AND "code" = "terminal_session"."ending") AS "ending",
++  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'ending_cause' AND "code" = "terminal_session"."ending_cause") AS "ending_cause",
++  "terminal_session"."ending_cause_reason"
+ FROM "terminal_session";
+ CREATE VIEW "terminal_session_env_view" AS SELECT
+   "terminal_session_env"."terminal_session",
+@@ -301,6 +324,9 @@
+   "identity" TEXT,
+   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
+   "cause_detail" TEXT,
++  "ending" TEXT CHECK ("ending" IN ('rl', 'vn')),
++  "ending_cause" TEXT CHECK ("ending_cause" IN ('lo', 'fa')),
++  "ending_cause_reason" TEXT,
+   CHECK (CASE WHEN "last_failure_at" IS NOT NULL
+       THEN "last_failure_cause_category" IS NOT NULL
+       AND "last_failure_cause_detail" IS NOT NULL
+@@ -314,6 +340,9 @@
+       AND "identity" IS NULL
+       AND "cause_category" IS NULL
+       AND "cause_detail" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
+       END),
+   CHECK (CASE WHEN "state" = 'rl'
+       THEN "identity" IS NOT NULL
+@@ -324,9 +353,13 @@
+       AND "last_failure_retryable" IS NULL
+       AND "cause_category" IS NULL
+       AND "cause_detail" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
+       END),
+   CHECK (CASE WHEN "state" = 'go'
+-      THEN "failures" IS NULL
++      THEN "ending" IS NOT NULL
++      AND "failures" IS NULL
+       AND "last_failure_at" IS NULL
+       AND "last_failure_cause_category" IS NULL
+       AND "last_failure_cause_detail" IS NULL
+@@ -344,6 +377,16 @@
+       AND "last_failure_cause_detail" IS NULL
+       AND "last_failure_retryable" IS NULL
+       AND "identity" IS NULL
++      AND "ending" IS NULL
++      AND "ending_cause" IS NULL
++      AND "ending_cause_reason" IS NULL
++      END),
++  CHECK (CASE WHEN "ending" = 'rl'
++      THEN "ending_cause" IS NULL AND "ending_cause_reason" IS NULL
++      WHEN "ending" = 'vn' THEN "ending_cause" IS NOT NULL
++      END),
++  CHECK (CASE WHEN "ending_cause" = 'lo' THEN "ending_cause_reason" IS NULL
++      WHEN "ending_cause" = 'fa' THEN "ending_cause_reason" IS NOT NULL
+       END)
+ ) STRICT;
+ CREATE TABLE "vessel_shape" (
+@@ -395,7 +438,10 @@
+   "vessel"."last_failure_retryable",
+   "vessel"."identity",
+   (SELECT "name" FROM "codes" WHERE "kind" = 've' AND "field" = 'cause_category' AND "code" = "vessel"."cause_category") AS "cause_category",
+-  "vessel"."cause_detail"
++  "vessel"."cause_detail",
++  (SELECT "name" FROM "codes" WHERE "kind" = 've' AND "field" = 'ending' AND "code" = "vessel"."ending") AS "ending",
++  (SELECT "name" FROM "codes" WHERE "kind" = 've' AND "field" = 'ending_cause' AND "code" = "vessel"."ending_cause") AS "ending_cause",
++  "vessel"."ending_cause_reason"
+ FROM "vessel";
+ CREATE VIEW "vessel_shape_view" AS SELECT
+   "vessel_shape"."vessel",
+@@ -421,3 +467,5 @@
+ FROM "log" AS "l" LEFT JOIN "resource_identity" AS "i" ON "i"."id" = "l"."resource";
+ CREATE VIEW stream_watermark_view AS SELECT (SELECT s FROM strings WHERE id = home) AS home, home_seq, applied_through FROM stream_watermark;
+ CREATE VIEW stream_history_view AS SELECT (SELECT s FROM strings WHERE id = home) AS home, home_seq FROM stream_history;
++INSERT INTO codes (kind, field, code, name) VALUES ('ts', 'ending', 'rl', 'Released'), ('ts', 'ending', 'vn', 'Vanished'), ('ts', 'ending_cause', 'lo', 'Lost'), ('ts', 'ending_cause', 'fa', 'Failed');
++INSERT INTO codes (kind, field, code, name) VALUES ('ve', 'ending', 'rl', 'Released'), ('ve', 'ending', 'vn', 'Vanished'), ('ve', 'ending_cause', 'lo', 'Lost'), ('ve', 'ending_cause', 'fa', 'Failed');

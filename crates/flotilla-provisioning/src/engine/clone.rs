@@ -2,10 +2,10 @@
 
 use flotilla_resources::{Clone as OldClone, ClonePhase, CloneStatusPatch, ResourceObject};
 use flotilla_schema::Ref;
-use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Outcome, Resource};
+use flotilla_state_machines::{Cause, CauseCategory, Outcome};
 
 use super::{Binding, Step};
-use crate::stored::clone::{Clone, CloneKind, CloneRequest};
+use crate::stored::clone::{CloneKind, CloneRequest};
 
 pub struct CloneBinding;
 
@@ -39,28 +39,6 @@ impl Binding for CloneBinding {
             CloneStatusPatch::MarkFailed { message, .. } => {
                 vec![Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Misconfigured, message), retryable: false })]
             }
-        }
-    }
-
-    fn copy(obj: &ResourceObject<OldClone>, resource: &Resource<Clone>) -> Option<CloneStatusPatch> {
-        let status = obj.status.as_ref();
-        match (resource.state(), phase(obj)) {
-            (LifecycleState::Requested { .. }, ClonePhase::Pending | ClonePhase::Cloning) => None,
-            (LifecycleState::Requested { last_failure, .. }, _) => Some(match last_failure {
-                Some(failure) => CloneStatusPatch::MarkRetrying { message: failure.cause.detail.clone() },
-                None => CloneStatusPatch::MarkCloning,
-            }),
-            (LifecycleState::Realised { .. }, ClonePhase::Ready) => None,
-            (LifecycleState::Realised { .. }, _) => {
-                Some(CloneStatusPatch::MarkReady { default_branch: status.and_then(|status| status.default_branch.clone()) })
-            }
-            (LifecycleState::GaveUp { .. }, ClonePhase::Failed) if status.is_some_and(|status| status.failure_policy.is_some()) => None,
-            (LifecycleState::GaveUp { cause }, _) => Some(CloneStatusPatch::MarkFailed {
-                message: cause.detail.clone(),
-                failed_at: resource.since().to_datetime().unwrap_or_default(),
-            }),
-            // A clone is released only as its object is deleted: nothing to copy.
-            (LifecycleState::Gone, _) => None,
         }
     }
 }

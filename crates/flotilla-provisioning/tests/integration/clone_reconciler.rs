@@ -206,3 +206,106 @@ async fn transient_clone_failure_remains_retryable_and_converges() {
         Some(flotilla_resources::CloneStatusPatch::MarkReady { default_branch }) if default_branch.as_deref() == Some("main")
     ));
 }
+
+// The engine decides whether cloning is still needed even when every old phase disagrees.
+// The finite matrix covers all old phases, duplicate reads and all engine ending judgements.
+#[tokio::test]
+async fn clone_reconciliation_reads_the_engine_without_a_status_copy() {
+    use flotilla_provisioning::engine::{clone::CloneBinding, Binding, Step};
+    use flotilla_resources::{ClonePhase, CloneStatus, ControllerRetryDisposition};
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::{Cause, CauseCategory, Outcome};
+    for old_phase in [ClonePhase::Pending, ClonePhase::Cloning, ClonePhase::Ready, ClonePhase::Failed] {
+        for ending in ["ready", "lost", "released", "gave_up"] {
+            let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+            let spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
+            flotilla_store::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &spec.key(), &spec)
+                .await
+                .expect("repository");
+            let env_ref = "env";
+            let name = format!("clone-{}", spec.clone_key(env_ref).expect("key"));
+            let mut clone = backend
+                .clone()
+                .using::<flotilla_resources::Clone>("flotilla")
+                .create(
+                    &meta(&name),
+                    &CloneSpec {
+                        repo_ref: spec.key(),
+                        url: "https://github.com/flotilla-org/flotilla".into(),
+                        env_ref: env_ref.into(),
+                        path: "/repo".into(),
+                    },
+                )
+                .await
+                .expect("clone");
+            clone.status = Some(CloneStatus { phase: old_phase, ..Default::default() });
+            let common::EngineClones { home, reads, store } = common::engine_clones();
+            home.request(&name, CloneBinding::request(&clone, "home").expect("request"), Timestamp(1)).expect("requested");
+            let reconciler = CloneReconciler::new(Arc::new(FailingCloneRuntime), backend.using("flotilla")).with_lifecycle_reads(reads);
+            let prepared = reconciler.prepare(&clone).await.expect("prepare requested");
+            assert!(
+                matches!(
+                    reconciler.reconcile(&clone, &prepared, chrono::Utc::now()).patch,
+                    Some(flotilla_resources::CloneStatusPatch::MarkRetrying { .. })
+                ),
+                "engine Requested wins over {old_phase:?}"
+            );
+            for attempt in 1..=2 {
+                home.step(
+                    &name,
+                    &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "offline"), retryable: true }),
+                    Timestamp(attempt * 1_000_000),
+                )
+                .expect("failure");
+            }
+            assert_eq!(
+                reconciler.retry_disposition(&clone),
+                Some(ControllerRetryDisposition::Retryable { next_attempt_at: Timestamp(62_000_000).to_datetime().expect("time") })
+            );
+            let prepared = reconciler.prepare(&clone).await.expect("prepare retrying");
+            assert_eq!(
+                reconciler.reconcile(&clone, &prepared, chrono::Utc::now()).requeue_after,
+                Some(std::time::Duration::from_secs(120)),
+                "the engine tally sets the next delay"
+            );
+            match ending {
+                "gave_up" => {
+                    home.step(
+                        &name,
+                        &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Misconfigured, ""), retryable: false }),
+                        Timestamp(3_000_000),
+                    )
+                    .expect("gave up");
+                }
+                "released" => {
+                    home.step(&name, &Step::Released, Timestamp(3_000_000)).expect("released");
+                }
+                _ => {
+                    home.step(&name, &Step::Realised { identity: "/repo".into() }, Timestamp(3_000_000)).expect("ready");
+                    if ending == "lost" {
+                        home.step(&name, &Step::Vanished, Timestamp(4_000_000)).expect("lost");
+                    }
+                }
+            }
+            assert!(CloneBinding::copy(&clone, &home.get(&name).expect("held")).is_none());
+            for _ in 0..2 {
+                let prepared = reconciler.prepare(&clone).await.expect("prepare ended or ready");
+                assert!(
+                    reconciler.reconcile(&clone, &prepared, chrono::Utc::now()).patch.is_none(),
+                    "{ending} suppresses cloning over {old_phase:?}"
+                );
+            }
+            assert_eq!(clone.status.as_ref().expect("unchanged").phase, old_phase);
+            common::poison_store(store);
+            assert!(reconciler.prepare(&clone).await.err().expect("read error").to_string().contains("poisoned"));
+            assert!(
+                reconciler.retry_disposition(&clone).is_none(),
+                "prepare must surface the error instead of parking on old retry status"
+            );
+            let prepared = flotilla_provisioning::reconcilers::clone::ClonePrepared::Retrying("new report".into());
+            let failed_read = reconciler.reconcile(&clone, &prepared, chrono::Utc::now());
+            assert!(failed_read.patch.is_none());
+            assert!(failed_read.events.iter().any(|event| event.reason == "LifecycleReadFailed" && event.message.contains("poisoned")));
+        }
+    }
+}

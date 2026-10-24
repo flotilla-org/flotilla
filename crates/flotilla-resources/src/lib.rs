@@ -68,6 +68,7 @@ mod issue;
 pub mod labels;
 mod landing_gate;
 mod leaf;
+pub mod lifecycle_reads;
 mod manifest_root;
 #[doc(hidden)]
 pub mod message;

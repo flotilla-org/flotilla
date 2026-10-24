@@ -8,10 +8,11 @@ use std::{
 };
 
 use flotilla_environment::environment::EnvironmentHandle;
-use flotilla_protocol::{CanonicalHostId, EnvironmentId};
+use flotilla_protocol::{CanonicalHostId, EnvironmentId, LifecycleReading};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provisioning::engine::environment::EnvironmentBinding;
+use flotilla_resources::lifecycle_reads::ProvisioningKind;
 use flotilla_resources::{
     Checkout, Environment, EnvironmentPhase, EnvironmentStatusPatch, ResourceError, ResourceObject, Vessel, VesselStatusPatch,
 };
@@ -50,6 +51,38 @@ pub(super) struct ActiveProvisionedEnvironment {
     pub(super) handle: EnvironmentHandle,
 }
 
+pub(super) enum EnvironmentReadiness {
+    Ready { identity: Option<String> },
+    NotReady,
+}
+
+impl EnvironmentReadiness {
+    pub(super) fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+}
+
+pub(super) async fn environment_readiness(
+    daemon: &flotilla_core::in_process::InProcessDaemon,
+    environment: &ResourceObject<Environment>,
+) -> Result<EnvironmentReadiness, String> {
+    let reads = daemon.lifecycle_reads();
+    let name = environment.metadata.name.clone();
+    let reading = tokio::task::spawn_blocking(move || reads.try_reading(ProvisioningKind::Environment, &name, None))
+        .await
+        .map_err(|error| format!("read Environment lifecycle: {error}"))??;
+    Ok(match reading {
+        Some(LifecycleReading::Ready { identity }) => EnvironmentReadiness::Ready { identity: Some(identity) },
+        Some(_) => EnvironmentReadiness::NotReady,
+        None => match environment.status.as_ref() {
+            Some(status) if status.phase == EnvironmentPhase::Ready => {
+                EnvironmentReadiness::Ready { identity: status.docker_container_id.clone() }
+            }
+            _ => EnvironmentReadiness::NotReady,
+        },
+    })
+}
+
 pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRuntimeState>, namespace: &str) -> Result<(), String> {
     let candidates = state
         .daemon
@@ -65,7 +98,7 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     for environment in candidates {
         if environment.spec.cloud_sandbox.is_some() {
             if environment.spec.provider_address.as_ref().is_some_and(|address| state.environment_providers.get(address).is_ok())
-                && environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Ready)
+                && environment_readiness(&state.daemon, &environment).await?.is_ready()
             {
                 let state = Arc::clone(state);
                 let namespace = namespace.to_owned();
@@ -89,8 +122,10 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
         let Ok(canonical) = canonical_runtime_host_id(&state.daemon, namespace, &local_host_id, &spec.host_ref).await else {
             continue;
         };
-        if canonical == local_host_id && environment.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Ready) {
-            environments.push(environment);
+        if canonical == local_host_id {
+            if let EnvironmentReadiness::Ready { identity } = environment_readiness(&state.daemon, &environment).await? {
+                environments.push((environment, identity));
+            }
         }
     }
     use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
@@ -115,7 +150,7 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     }
     let mut inventories = HashMap::new();
     let mut reconciliations = Vec::new();
-    for environment in environments {
+    for (environment, container_id) in environments {
         let instance = state
             .provider_address(
                 &environment.metadata.name,
@@ -137,7 +172,6 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
             inventories.insert(instance.clone(), handles);
         }
         let env_id = EnvironmentId::new(environment.metadata.name.clone());
-        let container_id = environment.status.as_ref().and_then(|status| status.docker_container_id.clone());
         let handles = inventories.get_mut(&instance).expect("provider inventory loaded");
         // Preceding-generation records stored a Docker transport name. Accept
         // that alias during adoption; new provisioning stores the opaque ID.

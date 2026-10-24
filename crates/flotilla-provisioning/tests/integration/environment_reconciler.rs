@@ -785,3 +785,288 @@ async fn unrecorded_cloud_adoption_failure_requeues() {
     reconciler.reconcile(&healthy, &healthy_prepared, chrono::Utc::now());
     assert_eq!(reconciler.reconcile(&object, &prepared, chrono::Utc::now()).requeue_after, Some(std::time::Duration::from_secs(5)));
 }
+
+// A composed environment reads build readiness, digest and failure from one engine reading,
+// including a replica origin. All old phases, both delivery modes and successful or failed attempts
+// are enumerated; the old statuses deliberately keep a wrong digest and stale message.
+#[tokio::test]
+async fn composed_environment_reads_builds_without_a_status_copy() {
+    use flotilla_provisioning::{
+        engine::{
+            image_build::ImageBuildBinding,
+            reads::{LifecycleReadPort, StoreReads},
+            Binding, LifecycleHome, Lifecycles, Step,
+        },
+        stored::image_build::ImageBuildKind,
+    };
+    use flotilla_resources::{ImageBuild, ImageBuildPhase, ImageBuildStatus, ImageDelivery};
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::{Cause, CauseCategory, Outcome};
+    for replica in [false, true] {
+        for registry in [false, true] {
+            for old_phase in [ImageBuildPhase::Queued, ImageBuildPhase::Building, ImageBuildPhase::Built, ImageBuildPhase::Failed] {
+                for give_up in [false, true] {
+                    let delivery =
+                        if registry { ImageDelivery::Registry { repository: "registry.test/crew".into() } } else { ImageDelivery::Local };
+                    let (name, spec) = composed_build(delivery);
+                    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())
+                        .with_local_root(flotilla_protocol::NodeId::new("root-a"));
+                    let source = if replica {
+                        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())
+                            .with_local_root(flotilla_protocol::NodeId::new("root-b"))
+                    } else {
+                        backend.clone()
+                    };
+                    let builds = source.clone().using::<ImageBuild>("flotilla");
+                    let build = builds.create(&InputMeta::builder().name(name.clone()).build(), &spec.clone().into()).await.expect("build");
+                    let build = builds
+                        .update_status(
+                            &name,
+                            &build.metadata.resource_version,
+                            &ImageBuildStatus {
+                                phase: old_phase,
+                                digest: Some("wrong old digest".into()),
+                                failure: Some(flotilla_resources::ImageBuildFailure {
+                                    class: flotilla_resources::ImageBuildFailureClass::Recipe,
+                                    reason: "old stale cause".into(),
+                                }),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("stale status");
+                    if replica {
+                        backend
+                            .replica_writer::<ImageBuild>(flotilla_protocol::NodeId::new("root-b"), "flotilla")
+                            .replace(&builds.list().await.expect("source"), chrono::Utc::now())
+                            .await
+                            .expect("replica");
+                    }
+                    let home = if replica { "root-b" } else { "root-a" };
+                    let mut kinds = flotilla_schema::KindRegistry::new();
+                    flotilla_provisioning::stored::register(&mut kinds).expect("registry");
+                    let store = Arc::new(Mutex::new(
+                        flotilla_schema_sqlite::Store::open(rusqlite::Connection::open_in_memory().expect("memory"), home, kinds)
+                            .expect("store"),
+                    ));
+                    let engine: LifecycleHome<ImageBuildKind, _> = LifecycleHome::new(
+                        home,
+                        flotilla_state_machines::Home::with_log(home, flotilla_engine_store::StoreLog::new(Arc::clone(&store)))
+                            .expect("home"),
+                    );
+                    engine.request(&name, ImageBuildBinding::request(&build, home).expect("request"), Timestamp(1)).expect("requested");
+                    let reads = Arc::new(LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), "root-a".into()));
+                    let environment = backend
+                        .clone()
+                        .using::<Environment>("flotilla")
+                        .create(
+                            &InputMeta::builder().name("env-composed".into()).build(),
+                            &EnvironmentSpec {
+                                provider_address: None,
+                                host_direct: None,
+                                cloud_sandbox: None,
+                                docker: Some(DockerEnvironmentSpec {
+                                    image_build_ref: Some(name.clone()),
+                                    image: "never fall back".into(),
+                                    host_ref: "host-a".into(),
+                                    memory_policy: Default::default(),
+                                    pull_policy: Default::default(),
+                                    mounts: vec![],
+                                    env: Default::default(),
+                                    declared_agent_adapters: Default::default(),
+                                    required_agent_adapters: Default::default(),
+                                }),
+                            },
+                        )
+                        .await
+                        .expect("environment");
+                    let runtime = Arc::new(ProvisioningDockerRuntime::default());
+                    let reconciler =
+                        EnvironmentReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla").with_lifecycle_reads(reads);
+                    for transient in [false, true] {
+                        if transient {
+                            engine
+                                .step(
+                                    &name,
+                                    &Step::Attempted(Outcome::Failed {
+                                        cause: Cause::new(CauseCategory::Transient, "offline"),
+                                        retryable: true,
+                                    }),
+                                    Timestamp(1_000_000),
+                                )
+                                .expect("retrying");
+                        }
+                        let prepared = reconciler.prepare(&environment).await.expect("prepare pending");
+                        let outcome = reconciler.reconcile(&environment, &prepared, chrono::Utc::now());
+                        assert!(matches!(outcome.patch, Some(EnvironmentStatusPatch::WaitForImageBuild { .. })));
+                        assert!(runtime.provisioned.lock().expect("log").is_empty());
+                    }
+                    let digest = if registry {
+                        format!("registry.test/crew@sha256:{}", "e".repeat(64))
+                    } else {
+                        format!("sha256:{}", "e".repeat(64))
+                    };
+                    let reason = if old_phase == ImageBuildPhase::Queued { "" } else { "probe 失敗" };
+                    if give_up {
+                        engine
+                            .step(
+                                &name,
+                                &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Refused, reason), retryable: false }),
+                                Timestamp(2_000_000),
+                            )
+                            .expect("gave up");
+                    } else {
+                        engine.step(&name, &Step::Realised { identity: digest.clone() }, Timestamp(2_000_000)).expect("ready");
+                        if replica && registry {
+                            let mut distractor = spec;
+                            distractor.host_ref = "zeta".into();
+                            let local = backend.clone().using::<ImageBuild>("flotilla");
+                            let created = local
+                                .create(&InputMeta::builder().name(name.clone()).build(), &distractor.into())
+                                .await
+                                .expect("local copy");
+                            local
+                                .update_status(
+                                    &name,
+                                    &created.metadata.resource_version,
+                                    &ImageBuildStatus {
+                                        phase: ImageBuildPhase::Built,
+                                        digest: Some("other builder digest".into()),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                                .expect("other builder status");
+                        }
+                    }
+                    let prepared = reconciler.prepare(&environment).await.expect("prepare settled");
+                    let outcome = reconciler.reconcile(&environment, &prepared, chrono::Utc::now());
+                    if give_up {
+                        assert!(matches!(outcome.patch, Some(EnvironmentStatusPatch::WaitForImageBuild { message })
+                            if message == if reason.is_empty() { format!("ImageBuild {name} GaveUp") } else { format!("ImageBuild {name} GaveUp: {reason}") }));
+                        assert!(runtime.provisioned.lock().expect("log").is_empty());
+                    } else {
+                        let policy = if registry {
+                            flotilla_resources::DockerImagePullPolicy::IfNotPresent
+                        } else {
+                            flotilla_resources::DockerImagePullPolicy::Never
+                        };
+                        assert_eq!(*runtime.provisioned.lock().expect("log"), vec![(digest, policy)]);
+                    }
+                    let old = builds.get(&name).await.expect("unchanged source").status.expect("old status");
+                    assert_eq!(old.phase, old_phase);
+                    assert_eq!(old.digest.as_deref(), Some("wrong old digest"));
+                    crate::common::poison_store(store);
+                    assert!(reconciler.prepare(&environment).await.err().expect("read error").to_string().contains("poisoned"));
+                }
+            }
+        }
+    }
+}
+
+// Provisioning and retry decisions follow the engine while the old phase stays unchanged.
+// Enumerate every old phase against success, both Gone endings and empty/Unicode give-up causes.
+#[tokio::test]
+async fn environment_reconciliation_reads_its_engine_without_a_status_copy() {
+    use flotilla_provisioning::engine::{
+        environment::EnvironmentBinding,
+        reads::{LifecycleReadPort, StoreReads},
+        Binding, LifecycleHome, Lifecycles, Step,
+    };
+    use flotilla_resources::ControllerRetryDisposition;
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::{Cause, CauseCategory, Outcome};
+    let teardown_error = ResourceError::other("disk");
+    let teardown_message = format!("environment teardown failed: {teardown_error}");
+    for old_phase in [
+        EnvironmentPhase::Pending,
+        EnvironmentPhase::Provisioning,
+        EnvironmentPhase::Ready,
+        EnvironmentPhase::Failed,
+        EnvironmentPhase::Lost,
+    ] {
+        for ending in ["ready", "released", "lost", "", "失敗", teardown_message.as_str()] {
+            let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+            let environments = backend.using::<Environment>("flotilla");
+            let mut obj = environments
+                .create(
+                    &InputMeta::builder().name("env".into()).build(),
+                    &EnvironmentSpec {
+                        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("environment");
+            let old_status = EnvironmentStatus {
+                phase: old_phase,
+                ready: old_phase == EnvironmentPhase::Ready,
+                message: Some(teardown_message.clone()),
+                ..Default::default()
+            };
+            obj = environments.update_status("env", &obj.metadata.resource_version, &old_status).await.expect("old status");
+            let mut registry = flotilla_schema::KindRegistry::new();
+            flotilla_provisioning::stored::register(&mut registry).expect("registry");
+            let store = Arc::new(Mutex::new(
+                flotilla_schema_sqlite::Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry)
+                    .expect("store"),
+            ));
+            let engine: LifecycleHome<flotilla_provisioning::stored::environment::EnvironmentKind, _> = LifecycleHome::new(
+                "home",
+                flotilla_state_machines::Home::with_log("home", flotilla_engine_store::StoreLog::new(Arc::clone(&store))).expect("home"),
+            );
+            let reads = Arc::new(LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), "home".into()));
+            let reconciler =
+                EnvironmentReconciler::new(Arc::new(FailingEnvironmentRuntime), backend, "flotilla").with_lifecycle_reads(reads);
+            engine.request("env", EnvironmentBinding::request(&obj, "home").expect("request"), Timestamp(1)).expect("requested");
+            let prepared = reconciler.prepare(&obj).await.expect("provisioning");
+            assert!(matches!(
+                reconciler.reconcile(&obj, &prepared, chrono::Utc::now()).patch,
+                Some(EnvironmentStatusPatch::MarkFailed { .. })
+            ));
+            engine
+                .step(
+                    "env",
+                    &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "retry"), retryable: true }),
+                    Timestamp(2),
+                )
+                .expect("retrying");
+            assert!(
+                matches!(reconciler.retry_disposition(&obj), Some(ControllerRetryDisposition::Retryable {next_attempt_at}) if next_attempt_at > chrono::DateTime::UNIX_EPOCH)
+            );
+            if matches!(ending, "ready" | "released" | "lost") {
+                engine.step("env", &Step::Realised { identity: "/work".into() }, Timestamp(3)).expect("ready");
+                if ending != "ready" {
+                    engine.step("env", &if ending == "lost" { Step::Vanished } else { Step::Released }, Timestamp(4)).expect("ended");
+                }
+                assert!(reconciler.retry_disposition(&obj).is_none());
+            } else {
+                engine
+                    .step(
+                        "env",
+                        &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, ending), retryable: false }),
+                        Timestamp(3),
+                    )
+                    .expect("gave up");
+                assert_eq!(reconciler.retry_disposition(&obj), Some(ControllerRetryDisposition::Terminal { needs: ending.into() }));
+            }
+            // Teardown deduplicates against the engine cause, never a matching stale old failure.
+            assert_eq!(reconciler.finalizer_error_patch(&obj, &teardown_error).is_none(), ending == teardown_message);
+            for _ in 0..2 {
+                let prepared = reconciler.prepare(&obj).await.expect("settled");
+                assert!(reconciler.reconcile(&obj, &prepared, chrono::Utc::now()).patch.is_none());
+                let stale_report = flotilla_provisioning::reconcilers::environment::EnvironmentPrepared::Failed("discard me".into());
+                assert!(reconciler.reconcile(&obj, &stale_report, chrono::Utc::now()).patch.is_none());
+            }
+            assert_eq!(environments.get("env").await.expect("old record").status, Some(old_status));
+            crate::common::poison_store(store);
+            assert!(reconciler.prepare(&obj).await.err().expect("read error").to_string().contains("poisoned"));
+            assert!(reconciler.retry_disposition(&obj).is_none());
+            let outcome =
+                reconciler.reconcile(&obj, &flotilla_provisioning::reconcilers::environment::EnvironmentPrepared::None, chrono::Utc::now());
+            assert!(outcome.patch.is_none());
+            assert!(outcome.requeue_after.is_some());
+            assert!(outcome.events.iter().any(|event| event.reason == "LifecycleReadFailed"));
+        }
+    }
+}

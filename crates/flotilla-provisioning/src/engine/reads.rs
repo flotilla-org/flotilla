@@ -157,6 +157,56 @@ pub struct StoreReads {
     store: Arc<Mutex<Store>>,
 }
 
+/// Resource-facing lifecycle readings backed by the engine's keyed read port.
+pub struct LifecycleReadPort {
+    reads: StoreReads,
+    home: String,
+}
+
+impl LifecycleReadPort {
+    pub fn new(reads: StoreReads, home: String) -> Self {
+        Self { reads, home }
+    }
+}
+
+impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
+    fn reading(
+        &self,
+        kind: flotilla_resources::lifecycle_reads::ProvisioningKind,
+        name: &str,
+        origin: Option<&str>,
+    ) -> Option<flotilla_protocol::LifecycleReading> {
+        match self.try_reading(kind, name, origin) {
+            Ok(reading) => reading,
+            Err(error) => {
+                tracing::warn!(?kind, resource = name, %error, "engine reading failed");
+                None
+            }
+        }
+    }
+
+    fn try_reading(
+        &self,
+        kind: flotilla_resources::lifecycle_reads::ProvisioningKind,
+        name: &str,
+        origin: Option<&str>,
+    ) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
+        use flotilla_resources::lifecycle_reads::ProvisioningKind;
+        let home = origin.unwrap_or(&self.home);
+        let judgement = match kind {
+            ProvisioningKind::Environment => self.reads.environment(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::ImageBuild => self.reads.image_build(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::Clone => self.reads.repository_clone(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::Checkout => self.reads.checkout(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::TerminalSession => self.reads.terminal_session(name, home).map(|view| view.map(|view| view.judgement)),
+            ProvisioningKind::Vessel => self.reads.vessel(name, home).map(|view| view.map(|view| view.judgement)),
+        };
+        judgement
+            .map(|judgement| judgement.map(|judgement| judgement.reading()))
+            .map_err(|error| format!("engine {kind:?}/{name}: {error}"))
+    }
+}
+
 /// One page of a declared index, at most this many resources: a provider's live environments
 /// are the largest set read, about 100 at the ceiling.
 const PAGE: u32 = 256;
