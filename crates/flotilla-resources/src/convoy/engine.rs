@@ -180,6 +180,31 @@ fn with_promises(convoy: &ResourceObject<Convoy>, promises: OldPromises) -> Reso
     viewed
 }
 
+/// Stable engine identity of a standing role; independent of its old generation record.
+pub fn standing_name(project: &str, role: &str) -> Result<String, String> {
+    flotilla_address::Address::project(project)
+        .and_then(|project| project.child(flotilla_address::Kind::Convoy, role))
+        .map(|address| address.to_string())
+        .map_err(|error| error.to_string())
+}
+
+/// Finite convoys keep their old name. Standing convoys use their ensure's
+/// frozen role and project, including old generations admitted before spec.role.
+pub fn engine_name(convoy: &ResourceObject<Convoy>) -> Result<String, String> {
+    if !super::reconcile::is_ensured(convoy) {
+        return Ok(convoy.metadata.name.clone());
+    }
+    let role = convoy
+        .status
+        .as_ref()
+        .and_then(|status| status.ensure_admission.as_ref())
+        .map(|ensure| ensure.role.as_str())
+        .filter(|role| !role.is_empty())
+        .or_else(|| (!convoy.spec.role.is_empty()).then_some(convoy.spec.role.as_str()))
+        .ok_or_else(|| format!("standing convoy `{}` has no recorded ensure role", convoy.metadata.name))?;
+    standing_name(convoy.spec.project_ref.as_deref().unwrap_or(&convoy.metadata.namespace), role)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;

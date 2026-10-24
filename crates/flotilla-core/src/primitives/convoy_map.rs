@@ -31,13 +31,17 @@ use chrono::{DateTime, Utc};
 use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_resources::{
     address::{artifact_address, record_name, submission_subject_text},
+    convoy::reconcile::is_ensured,
     promises::{self as old, PromiseKind as OldKind, PromiseSource as OldSource, PromiseState as OldState},
     Convoy as OldConvoy, ConvoyStatus, ForgeSpec, ResourceObject, SupervisionTarget,
 };
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     kinds::{stock, Catalog},
-    machines::convoy::{AdmittedPromise, Convoy, ConvoyRequest, Priority, Progress, Promise, PromiseId, PromiseSource, Seat, SeatName},
+    machines::convoy::{
+        AdmittedPromise, Convoy, ConvoyRequest, Duty, DutyId, DutyScope, Priority, Progress, Promise, PromiseId, PromiseSource, Seat,
+        SeatName, Terms,
+    },
     Resource,
 };
 
@@ -216,8 +220,13 @@ pub fn project(convoy: &ResourceObject<OldConvoy>) -> Result<Address, String> {
     Address::project(project).map_err(|error| format!("convoy `{}` project `{project}`: {error}", convoy.metadata.name))
 }
 
+pub use flotilla_resources::convoy::engine::engine_name;
+
 /// The convoy's address: under its project when it names one.
 pub fn address(convoy: &ResourceObject<OldConvoy>) -> Result<Address, String> {
+    if is_ensured(convoy) {
+        return engine_name(convoy)?.parse().map_err(|error: flotilla_address::Error| error.to_string());
+    }
     let name = &convoy.metadata.name;
     let address = match convoy.spec.project_ref.as_deref() {
         Some(project) => Address::project(project).and_then(|project| project.child(AddressKind::Convoy, name)),
@@ -335,14 +344,21 @@ pub fn request(convoy: &ResourceObject<OldConvoy>) -> Result<ConvoyRequest, Stri
     }
     let seats = crews
         .seats()
-        .map(|(_, seat)| Seat { role: seat.role.clone(), seat: seat.seat.clone(), parent: None, supervised_by: supervised_by.clone() })
+        .map(|(_, seat)| Seat {
+            retired: false,
+            replacements: 0,
+            role: seat.role.clone(),
+            seat: seat.seat.clone(),
+            parent: None,
+            supervised_by: supervised_by.clone(),
+        })
         .collect();
     let used: BTreeSet<&str> = promises.values().map(|promise: &AdmittedPromise| promise.kind.as_str()).collect();
     let kinds = Catalog::resolve(&stock(), &[]).and_then(|catalog| catalog.freeze(used)).map_err(|error| error.to_string())?;
     Ok(ConvoyRequest {
         project: project(convoy)?,
         promises,
-        duties: BTreeMap::new(),
+        duties: standing_duties(convoy, &crews)?,
         seats,
         quota: BTreeMap::new(),
         priority: Priority(0),
@@ -477,4 +493,30 @@ pub fn undecided(status: &ConvoyStatus) -> Result<(), String> {
         return Err("a crew has finished, handed back, failed or stalled".into());
     }
     Ok(())
+}
+
+/// The enduring obligation for each standing agent seat, excluding tool seats.
+pub fn standing_duties(convoy: &ResourceObject<OldConvoy>, crews: &Crews) -> Result<BTreeMap<DutyId, Duty>, String> {
+    if !is_ensured(convoy) {
+        return Ok(BTreeMap::new());
+    }
+    let agents: BTreeSet<_> = convoy
+        .status
+        .iter()
+        .flat_map(|s| &s.workflow_snapshot)
+        .flat_map(|s| &s.vessels)
+        .flat_map(|v| {
+            v.crew.iter().filter(|c| matches!(c.source, flotilla_resources::CrewSource::Agent { .. })).map(|c| crews.seat(&v.name, &c.role))
+        })
+        .collect();
+    agents
+        .into_iter()
+        .enumerate()
+        .map(|(i, owner)| {
+            Ok((
+                DutyId(u32::try_from(i).map_err(|_| "too many duties")?),
+                Duty { owner, scope: DutyScope::Lifetime, terms: Terms::default() },
+            ))
+        })
+        .collect()
 }

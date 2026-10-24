@@ -477,3 +477,30 @@ fn a_partial_edit_reports_what_applied() {
 fn tokio_block<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(future)
 }
+
+#[tokio::test]
+async fn standing_admission_and_rollover_use_the_ensure_role_identity() {
+    use flotilla_resources::{Selector, ENSURED_FROM_ANNOTATION};
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::{machines::convoy::Rollover, Ref};
+    let fixture = fixture();
+    let governor = CrewSpec::builder()
+        .role("governor".to_string())
+        .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
+        .build();
+    let mut old = old_convoy(&fixture.backend, "old-generation-id", bootstrapped(vec![("work", vec![governor])])).await;
+    old.spec.role = "governor".into();
+    old.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "ensure-governor".into());
+    let name = "project:fleet/convoy:governor";
+    assert_eq!(convoy_map::engine_name(&old).unwrap(), name);
+    assert_eq!(convoy_map::address(&old).unwrap().as_str(), name);
+    assert_eq!(fixture.engine.admit(&old).await.unwrap(), Admission::Held);
+    assert!(fixture.convoys.get("old-generation-id").is_none());
+    assert_eq!(fixture.convoys.get(name).unwrap().spec().duties.len(), 1);
+    let authority = Ref::new("ensure-governor");
+    fixture.convoys.world(|world| world.authority.put(&authority, true));
+    fixture.convoys.apply(name, Rollover { by: SeatName::new("governor", ""), authority }, Timestamp(9)).unwrap();
+    assert!(fixture.engine.holds(&old));
+    assert_eq!(fixture.convoys.get(name).unwrap().name(), name);
+    assert!(fixture.engine.promises(&old, None).unwrap().is_some());
+}

@@ -5,10 +5,10 @@ Kind tables only; the shared tables are in `convoy.sql`.
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
 | `awaiting_reply` | root | 12 | – | – | `open_by_sender` (sender), `open_by_subject` (subject), `by_message` (message), `deadline` (deadline) |
-| `convoy` | root | 8 | – | `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_quota` (state data), `convoy_retired` (state data) | `open_by_project` (project) |
+| `convoy` | root | 9 | – | `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_quota` (state data), `convoy_retired` (state data) | `open_by_project` (project) |
 | `convoy_duties` | child | 6 | 1: `scope` 1 | `convoy_duties_scope_promises` (child) | – |
 | `convoy_duties_scope_promises` | child | 3 | – | – | – |
-| `convoy_seats` | records | 8 | – | – | – |
+| `convoy_seats` | records | 10 | – | – | – |
 | `convoy_promises` | records | 12 | – | `convoy_promises_submissions` (records) | `by_label` (unique convoy, label) |
 | `convoy_promises_submissions` | records | 8 | – | – | `by_address` (address) |
 | `convoy_quota` | state data | 3 | – | – | – |

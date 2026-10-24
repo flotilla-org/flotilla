@@ -691,6 +691,8 @@ fn convoy_request(state: &Value) -> ConvoyRequest {
     let mut seats: Vec<convoy::Seat> = text_keyed(&work["seats"])
         .into_iter()
         .map(|(name, record)| convoy::Seat {
+            retired: false,
+            replacements: small(&record["replacements"]),
             role: name.into(),
             seat: String::new(),
             parent: (tag(&record["parent"]) == "Under").then(|| seat(payload(&record["parent"]))),
@@ -747,7 +749,7 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
             None => constant("Root"),
             Some(parent) => variant("Under", seat_text(parent)),
         };
-        (seat_text(&row.record.name()), json!({ "parent": parent, "supervisedBy": row.record.supervised_by.name() }))
+        (seat_text(&row.record.name()), json!({ "parent": parent, "supervisedBy": row.record.supervised_by.name(), "replacements": int(row.record.replacements.into()) }))
     }));
     let duties = spec.duties.iter().map(|(id, duty)| {
         let scope = match &duty.scope {
@@ -763,6 +765,8 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
         "spec": { "project": spec.project.name(), "duties": map_of(duties), "priority": int(spec.priority.0.into()) },
         "promises": map_of(promises),
         "seats": seats,
+        "retiredSeats": set_of(spec.seats.iter().filter(|r| r.record.retired).map(|r| json!(r.record.role))),
+        "promiseFloor": int(spec.promise_floor.try_into().expect("model floor")),
         "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
         "quota": quota_value(state.quota()),
     });
@@ -780,7 +784,7 @@ fn check_convoys(home: &Home<Convoy>, state: &Value, step: &Step) {
 /// The convoy world: the authorised edges read `authorised`, and the one
 /// submitted reference reads `durable`.
 fn convoy_world(authorised: bool, durable: bool) -> MemoryConvoyWorld {
-    let mut world = MemoryConvoyWorld::default();
+    let mut world = MemoryConvoyWorld::default().with_limits(3, 1);
     world.authority.put(&owner(), authorised);
     world.durable.put(&Ref::new(reference().as_str()), durable);
     world
@@ -799,7 +803,7 @@ fn admit(home: &mut Home<Convoy>, step: &Step, id: i64, tally: &mut Tally) {
     let model = slot_at(step.after, "::convoys", id).expect("admitted convoy");
     let request = convoy_request(model);
     // The model admitted it, so its project was known.
-    let world = MemoryConvoyWorld::default().with_project(&request.project);
+    let world = MemoryConvoyWorld::default().with_limits(3, 1).with_project(&request.project);
     create(home, &id.to_string(), request, &world, step, tally);
 }
 
@@ -954,6 +958,17 @@ fn convoy_deliver(trace: &Trace, tally: &mut Tally) {
                 };
                 accept(&mut home, &name, edge, &world, now, &step, tally);
             }
+            "retireSeat" => accept(
+                &mut home,
+                &name,
+                convoy::RetireSeat { seat: picked_seat(), by: by(), authority: owner() },
+                &world,
+                now,
+                &step,
+                tally,
+            ),
+            "rollover" => accept(&mut home, &name, convoy::Rollover { by: by(), authority: owner() }, &world, now, &step, tally),
+            "replaceSeat" => accept(&mut home, &name, convoy::ReplaceSeat(SeatName::new("a", "")), &world, now, &step, tally),
             "deliver" => accept(&mut home, &name, convoy::Deliver, &world, now, &step, tally),
             "abandon" => {
                 let edge = convoy::Abandon { by: by(), reason: reason(), authority: owner() };

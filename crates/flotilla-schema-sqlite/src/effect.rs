@@ -121,7 +121,8 @@ impl TableSql {
     /// Values for the data columns in `range` of the row, from `named`: every name must be one of
     /// those columns, and a column not named is null.
     fn values(&self, range: std::ops::Range<usize>, named: &Named) -> Result<Vec<Value>, StoreError> {
-        let mut values = vec![Value::Null; range.len()];
+        let mut values: Vec<Value> =
+            self.data()[range.clone()].iter().map(|column| column.previous_generation_default().map_or(Value::Null, Value::Int)).collect();
         for (name, value) in named {
             let current = self.current(name);
             let at = self.data()[range.clone()]
@@ -245,7 +246,13 @@ impl KindSql {
             }
             return Ok(vec![Op::DeleteResource]);
         }
-        let mut root = create.then(|| vec![Value::Null; self.tables[0].data().len()]);
+        let mut root = create.then(|| {
+            self.tables[0]
+                .data()
+                .iter()
+                .map(|column| column.previous_generation_default().map_or(Value::Null, Value::Int))
+                .collect::<Vec<_>>()
+        });
         let mut ops = Vec::with_capacity(effect.changes.len() + 1);
         for change in &effect.changes {
             match change {
@@ -297,7 +304,7 @@ impl KindSql {
                 }
                 Change::Remove { row, collection, key } => {
                     let (parent, mut full) = self.row(row)?;
-                    let table = self.child(parent, collection, &[TableRole::Child, TableRole::State])?;
+                    let table = self.child(parent, collection, &[TableRole::Child, TableRole::State, TableRole::Records])?;
                     full.extend(self.tables[table].own_key(key)?);
                     ops.push(Op::Delete { table, key: full });
                 }

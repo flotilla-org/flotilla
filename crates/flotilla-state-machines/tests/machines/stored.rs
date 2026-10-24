@@ -76,7 +76,14 @@ fn convoy_request() -> ConvoyRequest {
         project: project(),
         promises: [(PromiseId(0), promise())].into(),
         duties: [(DutyId(0), Duty { owner: SeatName::new("coder", ""), scope: DutyScope::Lifetime, terms: Terms::default() })].into(),
-        seats: vec![Seat { role: "coder".into(), seat: String::new(), parent: None, supervised_by: project() }],
+        seats: vec![Seat {
+            retired: false,
+            replacements: 0,
+            role: "coder".into(),
+            seat: String::new(),
+            parent: None,
+            supervised_by: project(),
+        }],
         quota: [(VesselClass::new("standard"), 2)].into(),
         priority: Priority(4),
         kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
@@ -364,9 +371,24 @@ fn convoy_and_awaiting_reply_round_trip() {
         )
         .expect("room");
     let mut seats = Records::new();
-    seats.append(1, Seat { role: "lead".into(), seat: String::new(), parent: None, supervised_by: project() }).expect("room");
     seats
-        .append(1, Seat { role: "coder".into(), seat: "a".into(), parent: Some(seat("lead", "")), supervised_by: project() })
+        .append(
+            1,
+            Seat { retired: false, replacements: 0, role: "lead".into(), seat: String::new(), parent: None, supervised_by: project() },
+        )
+        .expect("room");
+    seats
+        .append(
+            1,
+            Seat {
+                retired: false,
+                replacements: 0,
+                role: "coder".into(),
+                seat: "a".into(),
+                parent: Some(seat("lead", "")),
+                supervised_by: project(),
+            },
+        )
         .expect("room");
     let duties = [
         (DutyId(0), Duty { owner: seat("lead", ""), scope: DutyScope::Lifetime, terms: Terms { heartbeat: Some(60), ..Terms::default() } }),
@@ -381,8 +403,15 @@ fn convoy_and_awaiting_reply_round_trip() {
     ]
     .into();
     let kinds = PromiseKinds { kinds: [("pr".to_owned(), PromiseKind::default())].into() };
-    let spec =
-        ConvoySpec { project: project(), priority: Priority(3), kinds: Frozen::new(kinds).expect("frozen"), duties, seats, promises };
+    let spec = ConvoySpec {
+        promise_floor: 0,
+        project: project(),
+        priority: Priority(3),
+        kinds: Frozen::new(kinds).expect("frozen"),
+        duties,
+        seats,
+        promises,
+    };
     let state = State::new(
         ConvoyState::Abandoned {
             quota: [(VesselClass::new("standard"), 2)].into(),

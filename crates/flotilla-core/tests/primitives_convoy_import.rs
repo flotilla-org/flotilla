@@ -199,6 +199,7 @@ fn a_standing_convoy_waits_for_the_ruling_then_holds_lifetime_duties() {
     let tool = CrewSpec::builder().role("shell".to_string()).source(CrewSource::Tool { command: "sh".into() }).build();
     let mut standing = convoy("governor", ConvoyPhase::Active, vec![agent("governor", false), tool]);
     standing.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "governor".into());
+    standing.spec.role = "governor".into();
     assert_eq!(import_convoy(&standing, HOME, &[], &WORLD), Err(ConvoyImportRefusal::StandingAwaitsRuling { convoy: "governor".into() }));
     let convoy = imported(import_convoy(&standing, HOME, &[], &World { standing_ruled: true }));
     let duties: Vec<_> = convoy.resource.spec().duties.values().map(|duty| (duty.owner.clone(), duty.scope.clone())).collect();
@@ -355,4 +356,28 @@ fn several_convoys_rehearse_at_one_home() {
         })
         .collect();
     assert_eq!(rehearse(&convoys), Vec::new());
+}
+
+// Seat growth folds old per-generation records into one stable engine identity.
+#[test]
+fn standing_generations_fold_into_one_stable_convoy() {
+    use flotilla_core::primitives::convoy_import::rehearse_all;
+    let mut old = convoy("governor-1", ConvoyPhase::Landed, vec![agent("governor", true)]);
+    let mut live = convoy("governor-2", ConvoyPhase::Active, vec![agent("governor", true)]);
+    for (generation, record) in [(1, &mut old), (2, &mut live)] {
+        record.spec.role = "governor".into();
+        record.spec.generation = generation;
+        record.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "ensure-governor".into());
+    }
+    let report = rehearse_all([&live, &old], HOME, &[], &World { standing_ruled: true });
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
+    assert!(report.rehearsal.is_empty(), "{:?}", report.rehearsal);
+    assert_eq!(report.imported.len(), 1);
+    assert_eq!(report.folded_generations, 1);
+    let imported = &report.imported[0];
+    assert_eq!(imported.resource.name(), "project:fleet/convoy:governor");
+    assert_eq!(imported.history.previous_generations, vec!["governor-1"]);
+    assert_eq!(imported.resource.spec().seats.len(), 1);
+    assert_eq!(imported.resource.spec().promise_floor, 1);
+    assert_eq!(imported.resource.spec().promises.iter().next().unwrap().record.id.0, 1);
 }

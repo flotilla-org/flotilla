@@ -99,6 +99,7 @@ CREATE TABLE "convoy" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
   "project" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "promise_floor" INTEGER NOT NULL DEFAULT 0,
   "priority" INTEGER NOT NULL,
   "kinds" BLOB NOT NULL REFERENCES "objects" ("hash"),
   "state" TEXT NOT NULL CHECK ("state" IN ('ab', 'de', 'op')),
@@ -140,6 +141,8 @@ CREATE TABLE "convoy_seats" (
   "parent_role" INTEGER REFERENCES "strings" ("id"),
   "parent_seat" INTEGER REFERENCES "strings" ("id"),
   "supervised_by" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "retired" INTEGER NOT NULL CHECK ("retired" IN (0, 1)) DEFAULT 0,
+  "replacements" INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY ("convoy", "pos"),
   FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE,
   CHECK (CASE WHEN "parent_role" IS NOT NULL
@@ -212,8 +215,11 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'log:edge', 'ra', 'Readmit'),
   ('cv', 'log:edge', 'rd', 'RetireDuty'),
   ('cv', 'log:edge', 'rj', 'Reject'),
+  ('cv', 'log:edge', 'ro', 'Rollover'),
+  ('cv', 'log:edge', 'rp', 'ReplaceSeat'),
   ('cv', 'log:edge', 'rs', 'Reassign'),
   ('cv', 'log:edge', 'rt', 'Retract'),
+  ('cv', 'log:edge', 'sr', 'RetireSeat'),
   ('cv', 'log:edge', 'su', 'Submit'),
   ('cv', 'log:edge', 'sv', 'Resupervise'),
   ('cv', 'log:label', 'ab', 'Abandoned'),
@@ -223,6 +229,7 @@ CREATE VIEW "convoy_view" AS SELECT
   "convoy"."id",
   "convoy"."version",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy"."project") AS "project",
+  "convoy"."promise_floor",
   "convoy"."priority",
   "convoy"."kinds",
   (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'state' AND "code" = "convoy"."state") AS "state",
@@ -250,7 +257,9 @@ CREATE VIEW "convoy_seats_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."seat") AS "seat",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."parent_role") AS "parent_role",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."parent_seat") AS "parent_seat",
-  (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."supervised_by") AS "supervised_by"
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."supervised_by") AS "supervised_by",
+  "convoy_seats"."retired",
+  "convoy_seats"."replacements"
 FROM "convoy_seats";
 CREATE VIEW "convoy_promises_view" AS SELECT
   "convoy_promises"."convoy",

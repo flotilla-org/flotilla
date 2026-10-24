@@ -14,10 +14,11 @@
 //! in force and the retired duties), as the layer 3 look-over approved
 //! (#3627). Records change only through edges: an effect writes them as
 //! [`ConvoyWrite`]s, which the home applies once the log takes the edge and a
-//! store log writes as the edge's rows. Rows are never removed, so a promise
-//! id or a seat name is never reused, and rejected submissions stay. The
-//! project, priority, frozen promise kinds and duties never change after
-//! admission.
+//! store log writes as the edge's rows. Within a generation, promise ids and
+//! seat names stay reserved. Rollover compacts the live generation, leaving
+//! history in the log: promise ids remain below the floor, live seats keep
+//! their replacement counts, and only standing duties carry over. The
+//! project, priority and frozen promise kinds never change after admission.
 //!
 //! No role name, vessel class or promise kind appears here: a seat's role, a
 //! quota's vessel class and a promise's kind are interned text, and the kinds'
@@ -108,6 +109,11 @@ pub struct Seat {
     #[store(flatten)]
     pub parent: Option<SeatName>,
     pub supervised_by: Address,
+    // ADR 0047 N→N+1: old seats had neither field. Remove these decode defaults one roll after seat growth lands.
+    #[serde(default)]
+    pub retired: bool,
+    #[serde(default)]
+    pub replacements: u32,
 }
 
 impl Seat {
@@ -153,7 +159,7 @@ pub enum Progress {
 /// convoys: SQLite's partial-index predicate reads only the indexed table's
 /// columns, and the convoy's label is on its root row. A lookup joins the root
 /// to keep Open convoys.
-#[derive(Clone, Debug, PartialEq, Eq, Stored)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[store(index(name = "by_address", eq(address)))]
 pub struct Submission {
     pub address: Address,
@@ -169,7 +175,7 @@ pub struct Submission {
 /// id; a `Reassign` changes only `owner`. `label` is the name crews and views
 /// use (`template/pr`, `l2-quint`): per-convoy instance data like a seat name,
 /// unique within the convoy (#3587 layer 6 labels ruling).
-#[derive(Clone, Debug, PartialEq, Eq, Stored)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[store(index(name = "by_label", eq(label), unique))]
 pub struct Promise {
     pub id: PromiseId,
@@ -246,11 +252,14 @@ pub struct PromiseKind {
 /// What admission fixes, and the records edges change. It declares the
 /// stored Convoy (kind code `cv`), indexed for a project's open convoys.
 /// Seats and promises are records in admission order, so a row's position is
-/// fixed for the convoy's life.
-#[derive(Clone, Debug, PartialEq, Eq, Stored)]
+/// fixed within its generation; rollover starts compact record tables.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[store(kind = "Convoy", code = "cv", state = ConvoyState, index(name = "open_by_project", eq(project), when(state in [Open])))]
 pub struct ConvoySpec {
     pub project: Address,
+    // ADR 0047 N→N+1: remove this decode default one roll after seat growth lands.
+    #[serde(default)]
+    pub promise_floor: u64,
     pub priority: Priority,
     #[store(frozen)]
     pub kinds: Frozen<PromiseKinds>,
@@ -467,6 +476,25 @@ pub struct Resupervise {
     pub authority: Ref<Authorisation>,
 }
 
+/// Retires an unoccupied seat, reserving its name until rollover.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetireSeat {
+    pub seat: SeatName,
+    pub by: SeatName,
+    pub authority: Ref<Authorisation>,
+}
+
+/// The standing convoy starts a compact live generation under the same identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rollover {
+    pub by: SeatName,
+    pub authority: Ref<Authorisation>,
+}
+
+/// Records permission for one replacement before the caller requests its vessel.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaceSeat(pub SeatName);
+
 /// Nothing is Pending or Submitted and no lifetime duty holds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deliver;
@@ -522,6 +550,9 @@ edges! {
         RetireDuty(RetireDuty) = "rd",
         AddSeat(AddSeat) = "as",
         Resupervise(Resupervise) = "sv",
+        RetireSeat(RetireSeat) = "sr",
+        Rollover(Rollover) = "ro",
+        ReplaceSeat(ReplaceSeat) = "rp",
         Deliver(Deliver) = "de",
         Abandon(Abandon) = "ab",
         Readmit(Readmit) = "ra",
@@ -538,18 +569,59 @@ pub enum ConvoyWrite {
     Owner { promise: Position, owner: SeatName },
     Seat(Seat),
     Supervisor { seat: Position, supervised_by: Address },
+    Retired { seat: Position },
+    Replaced { seat: Position, count: u32 },
+    GenerationSeats { before: Records<Seat>, after: Records<Seat> },
+    GenerationPromises { before: Records<Promise> },
+    GenerationDuties { before: BTreeMap<DutyId, Duty>, after: BTreeMap<DutyId, Duty> },
+    PromiseFloor(u64),
 }
 
 impl RecordWrite<ConvoySpec> for ConvoyWrite {
     fn field(&self) -> &'static str {
         match self {
-            ConvoyWrite::Seat(_) | ConvoyWrite::Supervisor { .. } => "seats",
+            ConvoyWrite::Seat(_) | ConvoyWrite::Supervisor { .. } | ConvoyWrite::Retired { .. } | ConvoyWrite::Replaced { .. } => "seats",
+            ConvoyWrite::GenerationSeats { .. } => "seats",
+            ConvoyWrite::GenerationDuties { .. } => "duties",
+            ConvoyWrite::PromiseFloor(_) => "promise_floor",
             _ => "promises",
         }
     }
 
     fn apply(&self, spec: &mut ConvoySpec, version: u64) -> Result<(), RecordsFull> {
         match self {
+            ConvoyWrite::Retired { seat } => {
+                if let Some(row) = spec.seats.get_mut(*seat) {
+                    row.retired = true;
+                }
+                Ok(())
+            }
+            ConvoyWrite::Replaced { seat, count } => {
+                if let Some(row) = spec.seats.get_mut(*seat) {
+                    row.replacements = *count;
+                }
+                Ok(())
+            }
+            ConvoyWrite::GenerationSeats { after, .. } => {
+                let mut seats = Records::new();
+                for row in after.iter() {
+                    seats.append(version, row.record.clone())?;
+                }
+                spec.seats = seats;
+                Ok(())
+            }
+            ConvoyWrite::GenerationPromises { .. } => {
+                spec.promises = Records::new();
+                Ok(())
+            }
+            ConvoyWrite::GenerationDuties { after, .. } => {
+                spec.duties.clone_from(after);
+                Ok(())
+            }
+            ConvoyWrite::PromiseFloor(floor) => {
+                spec.promise_floor = *floor;
+                Ok(())
+            }
             ConvoyWrite::Promise(promise) => spec.promises.append(version, promise.clone()).map(drop),
             ConvoyWrite::Seat(seat) => spec.seats.append(version, seat.clone()).map(drop),
             ConvoyWrite::Submission { promise, submission } => match spec.promises.get_mut(*promise) {
@@ -585,6 +657,19 @@ const SEATS: RecordsOf<Resource<Convoy>, Seat> = RecordsOf::new("seats");
 impl StoredWrite<Resource<Convoy>> for ConvoyWrite {
     fn store(&self, edge: StoredEdge<Resource<Convoy>>) -> Result<StoredEdge<Resource<Convoy>>, EdgeError> {
         match self {
+            ConvoyWrite::Retired { seat } => edge.set_in(SEATS, *seat, Seat::RETIRED, &true),
+            ConvoyWrite::Replaced { seat, count } => edge.set_in(SEATS, *seat, Seat::REPLACEMENTS, count),
+            ConvoyWrite::GenerationSeats { before, after } => edge.replace_records(SEATS, before, after),
+            ConvoyWrite::GenerationPromises { before } => edge.replace_records(PROMISES, before, &Records::new()),
+            ConvoyWrite::GenerationDuties { before, after } => edge.replace_children("duties", before, after),
+            ConvoyWrite::PromiseFloor(floor) => edge.set(
+                flotilla_schema::ColumnOf::new(
+                    "promise_floor",
+                    0,
+                    <flotilla_schema::adapt::AsColumns as flotilla_schema::adapt::Adapter<u64>>::encode,
+                ),
+                floor,
+            ),
             ConvoyWrite::Promise(promise) => edge.append(PROMISES, promise),
             ConvoyWrite::Seat(seat) => edge.append(SEATS, seat),
             ConvoyWrite::Submission { promise, submission } => edge.append_in(PROMISES, *promise, Promise::SUBMISSIONS, submission),
@@ -623,6 +708,9 @@ pub enum ConvoyRefusal {
     DutyHolds(BTreeSet<DutyId>),
     UnknownSeat,
     SeatExists,
+    SeatRetired,
+    SeatsFull,
+    ReplacementsExhausted,
     /// Admission's seats are not a tree: a seat is above itself.
     SeatCycle,
 }
@@ -667,8 +755,25 @@ impl Kind for Project {
 }
 
 /// What convoy admission and gates read.
-pub trait ConvoyWorld: Source<Authorisation> + Source<Durable> + Source<Project> {}
-impl<T: Source<Authorisation> + Source<Durable> + Source<Project> + ?Sized> ConvoyWorld for T {}
+/// Configured machine constants, never stored per convoy.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub seats: usize,
+    pub replacements: u32,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self { seats: 64, replacements: 3 }
+    }
+}
+pub struct ConvoyLimits;
+impl Kind for ConvoyLimits {
+    const NAME: &'static str = "convoy-limits";
+    type Value = Limits;
+}
+
+pub trait ConvoyWorld: Source<Authorisation> + Source<Durable> + Source<Project> + Source<ConvoyLimits> {}
+impl<T: Source<Authorisation> + Source<Durable> + Source<Project> + Source<ConvoyLimits> + ?Sized> ConvoyWorld for T {}
 
 /// An in-memory convoy world, for tests, replay and conformance.
 #[derive(Default)]
@@ -676,9 +781,20 @@ pub struct MemoryConvoyWorld {
     pub authority: Table<Authorisation>,
     pub durable: Table<Durable>,
     pub projects: Table<Project>,
+    pub limits: Table<ConvoyLimits>,
 }
 
+impl Source<ConvoyLimits> for MemoryConvoyWorld {
+    fn lookup(&self, reference: &Ref<ConvoyLimits>) -> Option<(Version, &Limits)> {
+        self.limits.lookup(reference)
+    }
+}
 impl MemoryConvoyWorld {
+    pub fn with_limits(mut self, seats: usize, replacements: u32) -> Self {
+        self.limits.put(&Ref::new("configured"), Limits { seats, replacements });
+        self
+    }
+
     /// Makes `project` exist.
     pub fn with_project(mut self, project: &Address) -> Self {
         self.projects.put(&Ref::new(project.as_str()), ());
@@ -709,6 +825,9 @@ pub struct Convoy;
 
 impl Machine for Convoy {
     const NAME: &'static str = "Convoy";
+    // ADR 0047 N→N+1: remove one roll after seat growth lands.
+    const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] =
+        &[("", "promise_floor", 0), ("seats", "retired", 0), ("seats", "replacements", 0)];
     type Request = ConvoyRequest;
     type Spec = ConvoySpec;
     type State = ConvoyState;
@@ -798,6 +917,41 @@ impl Machine for Convoy {
                     .effect(resupervise),
             )
             .edge(
+                EdgeDef::<Self, RetireSeat>::new()
+                    .from([Open])
+                    .to([Open])
+                    .writes(["seats"])
+                    .gate("authorised, known, live, with no open promises or live duties", gate_retire_seat)
+                    .effect(|h, state, retire| {
+                        if let Some((seat, _)) = h.spec().seat(&retire.seat) {
+                            h.write(ConvoyWrite::Retired { seat });
+                        }
+                        state
+                    }),
+            )
+            .edge(
+                EdgeDef::<Self, ReplaceSeat>::new()
+                    .from([Open])
+                    .to([Open])
+                    .writes(["seats"])
+                    .gate("a live seat below its replacement limit", gate_replace_seat)
+                    .effect(|h, state, replace| {
+                        if let Some((seat, row)) = h.spec().seat(&replace.0) {
+                            h.write(ConvoyWrite::Replaced { seat, count: row.replacements + 1 });
+                        }
+                        state
+                    }),
+            )
+            .edge(
+                EdgeDef::<Self, Rollover>::new()
+                    .from([Open])
+                    .to([Open])
+                    .writes(["seats", "promises", "duties", "promise_floor"])
+                    .changes(["retired"])
+                    .gate("authorised standing convoy with no open promises", gate_rollover)
+                    .effect(rollover),
+            )
+            .edge(
                 EdgeDef::<Self, Deliver>::new()
                     .from([Open])
                     .to([Delivered])
@@ -846,16 +1000,22 @@ impl Machine for Convoy {
         if !acyclic(&request.seats) {
             return Err(ConvoyRefusal::SeatCycle);
         }
+        let limits = admission.read(&Ref::<ConvoyLimits>::new("configured")).copied().unwrap_or_default();
+        if seats.len() > limits.seats {
+            return Err(ConvoyRefusal::SeatsFull);
+        }
         let now = admission.now();
         let mut spec = ConvoySpec {
             project: request.project,
+            promise_floor: 0,
             priority: request.priority,
             kinds: request.kinds,
             duties: request.duties,
             seats: Records::new(),
             promises: Records::new(),
         };
-        for seat in request.seats {
+        for mut seat in request.seats {
+            seat.retired = false;
             spec.seats.append(0, seat).expect("a request holds fewer than 2^32 seats");
         }
         for (id, promise) in request.promises {
@@ -943,11 +1103,12 @@ fn may_reassign(promise: &Promise, by: &SeatName, authority: Authority) -> bool 
 // The kind is opaque here, as in the spec: the write path declares only a
 // kind the convoy froze (`crate::kinds`).
 fn gate_declare(h: &mut Handle<'_, Convoy>, declare: &Declare) -> Result<(), ConvoyRefusal> {
-    if h.spec().promise(declare.promise).is_some() {
+    if u64::from(declare.promise.0) < h.spec().promise_floor || h.spec().promise(declare.promise).is_some() {
         return Err(ConvoyRefusal::PromiseExists);
     }
-    if h.spec().seat(&declare.owner).is_none() {
-        return Err(ConvoyRefusal::UnknownSeat);
+    let (_, owner) = h.spec().seat(&declare.owner).ok_or(ConvoyRefusal::UnknownSeat)?;
+    if owner.retired {
+        return Err(ConvoyRefusal::SeatRetired);
     }
     Ok(())
 }
@@ -1003,8 +1164,9 @@ fn gate_reassign(h: &mut Handle<'_, Convoy>, reassign: &Reassign) -> Result<(), 
     if !may_reassign(open_promise(h, reassign.promise)?, &reassign.by, reassign.authority) {
         return Err(ConvoyRefusal::Unauthorised);
     }
-    if h.spec().seat(&reassign.to).is_none() {
-        return Err(ConvoyRefusal::UnknownSeat);
+    let (_, owner) = h.spec().seat(&reassign.to).ok_or(ConvoyRefusal::UnknownSeat)?;
+    if owner.retired {
+        return Err(ConvoyRefusal::SeatRetired);
     }
     Ok(())
 }
@@ -1026,8 +1188,13 @@ fn gate_add_seat(h: &mut Handle<'_, Convoy>, add: &AddSeat) -> Result<(), Convoy
     if h.spec().seat(&add.seat).is_some() {
         return Err(ConvoyRefusal::SeatExists);
     }
-    if h.spec().seat(&add.parent).is_none() {
-        return Err(ConvoyRefusal::UnknownSeat);
+    let (_, parent) = h.spec().seat(&add.parent).ok_or(ConvoyRefusal::UnknownSeat)?;
+    if parent.retired {
+        return Err(ConvoyRefusal::SeatRetired);
+    }
+    let limit = h.read(&Ref::<ConvoyLimits>::new("configured")).copied().unwrap_or_default().seats;
+    if h.spec().seats.len() + 1 > limit {
+        return Err(ConvoyRefusal::SeatsFull);
     }
     Ok(())
 }
@@ -1134,6 +1301,8 @@ fn add_seat(h: &mut Handle<'_, Convoy>, state: ConvoyState, add: &AddSeat) -> Co
         seat: add.seat.seat.clone(),
         parent: Some(add.parent.clone()),
         supervised_by: add.supervised_by.clone(),
+        retired: false,
+        replacements: 0,
     };
     h.write(ConvoyWrite::Seat(seat));
     state
@@ -1176,6 +1345,92 @@ fn abandon(_: &mut Handle<'_, Convoy>, state: ConvoyState, abandon: &Abandon) ->
 fn readmit(_: &mut Handle<'_, Convoy>, state: ConvoyState, readmit: &Readmit) -> ConvoyState {
     match state {
         ConvoyState::Open { retired, .. } => ConvoyState::Open { quota: readmit.quota.clone(), retired },
+        other => other,
+    }
+}
+
+fn gate_retire_seat(h: &mut Handle<'_, Convoy>, retire: &RetireSeat) -> Result<(), ConvoyRefusal> {
+    if !authorised(h, &retire.authority) {
+        return Err(ConvoyRefusal::Unauthorised);
+    }
+    let (_, seat) = h.spec().seat(&retire.seat).ok_or(ConvoyRefusal::UnknownSeat)?;
+    if seat.retired {
+        return Err(ConvoyRefusal::SeatRetired);
+    }
+    let outstanding: BTreeSet<_> =
+        h.spec().promises.iter().filter(|r| r.record.owner == retire.seat && r.record.open()).map(|r| r.record.id).collect();
+    if !outstanding.is_empty() {
+        return Err(ConvoyRefusal::PromisesOutstanding(outstanding));
+    }
+    let duties: BTreeSet<_> = h
+        .spec()
+        .duties
+        .iter()
+        .filter(|(id, d)| {
+            d.owner == retire.seat
+                && match &d.scope {
+                    DutyScope::Lifetime => !h.state().retired().contains(id),
+                    DutyScope::WhileOpen { promises } => promises.iter().any(|p| h.spec().promise(*p).is_some_and(|(_, p)| p.open())),
+                }
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    if !duties.is_empty() {
+        return Err(ConvoyRefusal::DutyHolds(duties));
+    }
+    Ok(())
+}
+
+fn gate_replace_seat(h: &mut Handle<'_, Convoy>, replace: &ReplaceSeat) -> Result<(), ConvoyRefusal> {
+    let (_, seat) = h.spec().seat(&replace.0).ok_or(ConvoyRefusal::UnknownSeat)?;
+    if seat.retired {
+        return Err(ConvoyRefusal::SeatRetired);
+    }
+    let count = seat.replacements;
+    let limit = h.read(&Ref::<ConvoyLimits>::new("configured")).copied().unwrap_or_default().replacements;
+    if count >= limit {
+        return Err(ConvoyRefusal::ReplacementsExhausted);
+    }
+    Ok(())
+}
+
+fn gate_rollover(h: &mut Handle<'_, Convoy>, rollover: &Rollover) -> Result<(), ConvoyRefusal> {
+    if !authorised(h, &rollover.authority) {
+        return Err(ConvoyRefusal::Unauthorised);
+    }
+    if h.spec().holding(h.state().retired()).is_empty() {
+        return Err(ConvoyRefusal::NoObligations);
+    }
+    let outstanding = h.spec().outstanding();
+    if !outstanding.is_empty() {
+        return Err(ConvoyRefusal::PromisesOutstanding(outstanding));
+    }
+    Ok(())
+}
+
+fn rollover(h: &mut Handle<'_, Convoy>, state: ConvoyState, _: &Rollover) -> ConvoyState {
+    let before = h.spec().clone();
+    let mut after = before.clone();
+    after.promise_floor =
+        before.promises.iter().map(|r| u64::from(r.record.id.0) + 1).max().unwrap_or(before.promise_floor).max(before.promise_floor);
+    let live: BTreeSet<_> = before.seats.iter().filter(|r| !r.record.retired).map(|r| r.record.name()).collect();
+    after.seats = Records::new();
+    for row in before.seats.iter().filter(|r| !r.record.retired) {
+        let mut seat = row.record.clone();
+        if seat.parent.as_ref().is_some_and(|p| !live.contains(p)) {
+            seat.parent = None;
+        }
+        after.seats.append(0, seat).expect("rollover only drops seats");
+    }
+    let holding = before.holding(state.retired());
+    after.duties.retain(|id, _| holding.contains(id));
+    after.promises = Records::new();
+    h.write(ConvoyWrite::GenerationSeats { before: before.seats, after: after.seats });
+    h.write(ConvoyWrite::GenerationPromises { before: before.promises });
+    h.write(ConvoyWrite::GenerationDuties { before: before.duties, after: after.duties });
+    h.write(ConvoyWrite::PromiseFloor(after.promise_floor));
+    match state {
+        ConvoyState::Open { quota, .. } => ConvoyState::Open { quota, retired: BTreeSet::new() },
         other => other,
     }
 }

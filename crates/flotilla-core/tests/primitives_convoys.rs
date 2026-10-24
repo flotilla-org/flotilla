@@ -34,7 +34,14 @@ fn request() -> ConvoyRequest {
         )]
         .into(),
         duties: Default::default(),
-        seats: vec![Seat { role: "coder".into(), seat: String::new(), parent: None, supervised_by: address("supervisor") }],
+        seats: vec![Seat {
+            retired: false,
+            replacements: 0,
+            role: "coder".into(),
+            seat: String::new(),
+            parent: None,
+            supervised_by: address("supervisor"),
+        }],
         quota: [(VesselClass::new("standard"), 1)].into(),
         priority: Priority(1),
         kinds: Catalog::resolve(&stock(), &[]).expect("stock").freeze(["pr"]).expect("freeze"),

@@ -193,6 +193,14 @@ pub struct ColumnDef {
 }
 
 impl ColumnDef {
+    /// An explicit ADR 0047 additive default, restricted to integer/bool columns.
+    pub fn previous_generation_default(&self) -> Option<i64> {
+        if !matches!(self.ty, ColumnType::Integer | ColumnType::Bool) {
+            return None;
+        }
+        self.properties.get("previous_generation_default").and_then(serde_json::Value::as_i64)
+    }
+
     pub fn new(name: impl Into<String>, ty: ColumnType, nullable: bool) -> Self {
         Self { name: name.into(), ty, nullable, categories: Vec::new(), reference: None, properties: Default::default() }
     }

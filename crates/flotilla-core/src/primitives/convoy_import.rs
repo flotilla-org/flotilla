@@ -83,6 +83,9 @@ impl std::fmt::Display for ConvoyImportRefusal {
 /// The old claim fields the engine has no column for, kept as history.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimHistory {
+    // ADR 0047 N→N+1: remove this default one roll after seat growth lands.
+    #[serde(default)]
+    pub previous_generations: Vec<String>,
     pub crews: Vec<CrewClaim>,
     /// The old `landing_entry`, as the old status encodes it (JSON text).
     pub landing_entry: Option<String>,
@@ -135,7 +138,7 @@ pub trait ConvoyImportWorld {
     /// Whether standing convoys may be imported: the seat-growth item on
     /// #3587 is ruled.
     fn standing_ruled(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -249,14 +252,24 @@ pub fn import_convoy(
     let mut seats = Records::new();
     for (_, seat) in crews.seats() {
         seats
-            .append(1, Seat { role: seat.role.clone(), seat: seat.seat.clone(), parent: None, supervised_by: supervised_by.clone() })
+            .append(
+                1,
+                Seat {
+                    retired: false,
+                    replacements: 0,
+                    role: seat.role.clone(),
+                    seat: seat.seat.clone(),
+                    parent: None,
+                    supervised_by: supervised_by.clone(),
+                },
+            )
             .map_err(|_| refuse("more seats than a record table".into()))?;
     }
     let used: BTreeSet<&str> = promises.iter().map(|row| row.record.kind.as_str()).collect();
     let kinds = Catalog::resolve(&stock(), &[]).and_then(|catalog| catalog.freeze(used)).map_err(|error| refuse(error.to_string()))?;
-    let spec = ConvoySpec { project, priority: Priority(0), kinds, duties, seats, promises };
+    let spec = ConvoySpec { promise_floor: 0, project, priority: Priority(0), kinds, duties, seats, promises };
     let state = StoredState::<Convoy>::new(ConvoyState::Open { quota: BTreeMap::new(), retired: BTreeSet::new() }, since);
-    let resource = Resource::stored(name.clone(), spec, state, Version(1));
+    let resource = Resource::stored(map::engine_name(convoy).map_err(refuse)?, spec, state, Version(1));
     check(&resource).map_err(refuse)?;
 
     // History the old status cannot encode refuses the import: it is never
@@ -280,7 +293,7 @@ pub fn import_convoy(
         }
     }
     let landing_entry = status.landing_entry.as_ref().map(|entry| encode("the landing entry", serde_json::to_string(entry))).transpose()?;
-    let history = ClaimHistory { crews: claims, landing_entry };
+    let history = ClaimHistory { previous_generations: Vec::new(), crews: claims, landing_entry };
 
     let (stall, unrecorded_stall) = match status.stalled.as_ref() {
         None => (None, None),
@@ -548,6 +561,7 @@ pub struct RehearsalReport {
     pub stays_old: Vec<(String, String)>,
     pub refused: Vec<ConvoyImportRefusal>,
     pub rehearsal: Vec<RehearsalRefusal>,
+    pub folded_generations: usize,
 }
 
 /// Imports and rehearses every old convoy of one home.
@@ -558,10 +572,67 @@ pub fn rehearse_all<'a>(
     world: &dyn ConvoyImportWorld,
 ) -> RehearsalReport {
     let mut report = RehearsalReport::default();
+    let mut standing: BTreeMap<String, Vec<&ResourceObject<OldConvoy>>> = BTreeMap::new();
+    let mut finite = Vec::new();
     for convoy in convoys {
+        if is_ensured(convoy) {
+            match map::engine_name(convoy) {
+                Ok(name) => standing.entry(name).or_default().push(convoy),
+                Err(reason) => report.refused.push(ConvoyImportRefusal::Unmappable { convoy: convoy.metadata.name.clone(), reason }),
+            }
+        } else {
+            finite.push(convoy);
+        }
+    }
+    for convoy in finite {
         match import_convoy(convoy, home, forges, world) {
             Ok(ImportOutcome::Imported(imported)) => report.imported.push(*imported),
             Ok(ImportOutcome::StaysOld(reason)) => report.stays_old.push((convoy.metadata.name.clone(), reason)),
+            Err(refusal) => report.refused.push(refusal),
+        }
+    }
+    for (_, mut generations) in standing {
+        generations.sort_by_key(|c| (c.spec.generation, c.metadata.creation_timestamp, c.metadata.name.clone()));
+        let Some(current) = generations.pop() else { continue };
+        match import_convoy(current, home, forges, world) {
+            Ok(ImportOutcome::Imported(mut imported)) => {
+                // Old generations remain in the old archive. Only their identities go
+                // into the creation's history, never into the live convoy's seats.
+                let floor: u64 = generations.iter().filter_map(|c| c.status.as_ref().map(|s| map::declarations(c, s).len() as u64)).sum();
+                let mut spec = imported.resource.spec().clone();
+                let mut promises = Records::new();
+                let mut overflow = false;
+                for row in spec.promises.iter() {
+                    let mut promise = row.record.clone();
+                    match u32::try_from(u64::from(promise.id.0) + floor) {
+                        Ok(id) => promise.id = PromiseId(id),
+                        Err(_) => {
+                            overflow = true;
+                            break;
+                        }
+                    }
+                    promises.append(1, promise).expect("same number of promises");
+                }
+                if overflow {
+                    report.refused.push(ConvoyImportRefusal::Unmappable {
+                        convoy: current.metadata.name.clone(),
+                        reason: "folded generations exhaust promise ids".into(),
+                    });
+                    continue;
+                }
+                spec.promises = promises;
+                spec.promise_floor = floor;
+                imported.resource = Resource::stored(
+                    imported.resource.name().to_owned(),
+                    spec,
+                    imported.resource.stored_state().clone(),
+                    imported.resource.version(),
+                );
+                imported.history.previous_generations = generations.iter().map(|c| c.metadata.name.clone()).collect();
+                report.folded_generations += generations.len();
+                report.imported.push(*imported);
+            }
+            Ok(ImportOutcome::StaysOld(reason)) => report.stays_old.push((current.metadata.name.clone(), reason)),
             Err(refusal) => report.refused.push(refusal),
         }
     }

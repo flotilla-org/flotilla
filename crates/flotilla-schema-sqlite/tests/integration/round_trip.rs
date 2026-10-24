@@ -150,7 +150,7 @@ where
     let mut reached = BTreeSet::new();
     for index in 0..<Resource<M>>::COVERING {
         let resource = Resource::<M>::generate(tc, Pick::Cover(index));
-        for lead in 0..8 {
+        for lead in 0..16 {
             if let Some((edge, _)) = Fixture::edge(&resource, tc, Pick::Cover(lead)) {
                 let edge = edge.into_parts().event.edge;
                 let kind = EdgeKind::<M>::ALL.iter().find(|kind| kind.code() == edge).expect("a declared kind");

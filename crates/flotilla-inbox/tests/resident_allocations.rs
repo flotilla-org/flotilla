@@ -165,7 +165,14 @@ fn calibrate() {
                     )]
                     .into(),
                     duties: [(DutyId(0), Duty { owner, scope: DutyScope::Lifetime, terms: Terms::default() })].into(),
-                    seats: vec![Seat { role: "coder".into(), seat: String::new(), parent: None, supervised_by: inbox() }],
+                    seats: vec![Seat {
+                        retired: false,
+                        replacements: 0,
+                        role: "coder".into(),
+                        seat: String::new(),
+                        parent: None,
+                        supervised_by: inbox(),
+                    }],
                     quota: [(VesselClass::new("standard"), 2)].into(),
                     priority: Priority(1),
                     kinds: flotilla_schema::Frozen::new(PromiseKinds::default()).unwrap(),
