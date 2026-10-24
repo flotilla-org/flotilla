@@ -119,3 +119,20 @@ environment, and untouched host harness configuration remain in place.
 
 After that update, `cargo test -p flotilla-daemon --locked` passed all enabled
 unit, integration, scenario, load-contract and doctest targets locally.
+
+## Recording maintenance and masking audit
+
+These recordings describe the pinned `codex-cli 0.160.0` runtime. The Python
+recorder is an opt-in tool, not an authenticated CI dependency. Before changing
+the supported Codex runtime or hook-key/hash contract, re-run real staged-home
+launches and native discovery with the examples, and re-record the fixture.
+A passing replay test alone does not establish compatibility with a new runtime.
+
+Audited all 13 evidence/fixture files against current injected credential and
+Codex auth-token values: no matches. Native payload paths all belong to the
+controlled `/tmp/codex-3823-before/` and `/tmp/codex-3823-after/` probe roots.
+Those deliberately chosen paths are preserved because source paths form part of
+Codex's trust identity and the exact launch conditions are evidence. They do not
+name a production host or a personal checkout. No `auth.json`, credential values,
+or raw environment dump is included; `launch.json` contains only the adapter's
+noncredential launch plan.
