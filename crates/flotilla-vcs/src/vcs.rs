@@ -1537,6 +1537,8 @@ impl Vcs for FlotillaVcs {
         remove_worktree_path(&*self.runner, &staging).await?;
         let clone_ref = base_ref.unwrap_or(branch);
         let prepare = async {
+            // Adoption below requires every remote head from the clone. If this
+            // becomes single-branch/shallow, fetch the requested branch explicitly.
             GitCliBackend::new(Path::new("/"), &*self.runner).clone_repo(url, &staging, (clone_ref != "HEAD").then_some(clone_ref)).await?;
             let staging_backend = GitCliBackend::checkout_root(Path::new(&staging), &*self.runner);
             if branch != "HEAD" && staging_backend.ref_exists(&format!("refs/remotes/origin/{branch}")).await {
@@ -3820,6 +3822,61 @@ mod tests {
             .is_err());
         assert!(!target.join(".git").exists(), "failed adoption must leave the target untouched");
         assert_eq!(provider.current_branch().await.expect("parent branch").trim(), "main");
+    }
+
+    // A failure after checkout creation must remove the incomplete reference
+    // clone, including failures reading HEAD or recording bootstrap ownership.
+    #[tokio::test]
+    async fn reference_clone_materialisation_cleans_finalisation_failures() {
+        // Git process boundary: fail each finalisation command; all other Git
+        // and filesystem operations run against a real local remote.
+        struct FailFinalisation(&'static str);
+        #[async_trait]
+        impl CommandRunner for FailFinalisation {
+            async fn run(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &flotilla_provider_runtime::ChannelLabel,
+            ) -> Result<String, String> {
+                if cmd == "git"
+                    && ((self.0 == "head" && args.ends_with(&["rev-parse", "HEAD"]))
+                        || (self.0 == "bootstrap" && args.contains(&"update-ref")))
+                {
+                    return Err(format!("injected {} failure", self.0));
+                }
+                flotilla_provider_runtime::ProcessCommandRunner.run(cmd, args, cwd, label).await
+            }
+            async fn run_output(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &flotilla_provider_runtime::ChannelLabel,
+            ) -> Result<CommandOutput, String> {
+                flotilla_provider_runtime::ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+            }
+            async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+                flotilla_provider_runtime::ProcessCommandRunner.exists(cmd, args).await
+            }
+        }
+        for step in ["head", "bootstrap"] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source");
+            let remote = dir.path().join("remote.git");
+            let target = dir.path().join("checkout");
+            git(dir.path(), &["init", "--bare", "-b", "main", remote.to_str().unwrap()]);
+            git(dir.path(), &["clone", remote.to_str().unwrap(), source.to_str().unwrap()]);
+            git(&source, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "base"]);
+            git(&source, &["push", "origin", "main"]);
+            let strategy =
+                ReferenceCloneStrategy::new(Arc::new(FailFinalisation(step)), ExecutionEnvironmentPath::new(source.join(".git")));
+            let error =
+                strategy.materialise_checkout("crew", Some("main"), target.to_str().unwrap()).await.err().expect("injected failure");
+            assert!(error.contains(&format!("injected {step} failure")), "{error}");
+            assert!(!target.exists(), "{step}: incomplete checkout must be cleaned");
+        }
     }
 
     #[tokio::test]

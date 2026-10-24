@@ -104,6 +104,8 @@ impl ReferenceCloneStrategy {
             return Err(existing_checkout_branch_error(branch, None));
         }
         let base = base_ref.ok_or_else(|| format!("branch {branch} does not exist and no base ref was supplied"))?;
+        // Adoption inspects origin refs from this clone: keep all remote heads
+        // available (no --single-branch or implicit single-branch shallow clone).
         self.runner
             .run(
                 "git",
@@ -123,23 +125,24 @@ impl ReferenceCloneStrategy {
             self.runner
                 .run("git", &["-C", target, "checkout", "-b", branch, &base], std::path::Path::new("/"), &ChannelLabel::Default)
                 .await?;
-            Ok::<(), String>(())
+            let commit = backend.head_commit_text().await?.trim().to_string();
+            if !adopted {
+                self.runner
+                    .run(
+                        "git",
+                        &["-C", target, "update-ref", &format!("refs/flotilla/bootstrap/{branch}"), &commit],
+                        std::path::Path::new("/"),
+                        &ChannelLabel::Default,
+                    )
+                    .await?;
+            }
+            Ok::<String, String>(commit)
         }
         .await;
-        if let Err(error) = prepare {
-            return Err(crate::vcs::cleanup_clone_path(&*self.runner, target, error).await);
-        }
-        let commit = backend.head_commit_text().await?.trim().to_string();
-        if !adopted {
-            self.runner
-                .run(
-                    "git",
-                    &["-C", target, "update-ref", &format!("refs/flotilla/bootstrap/{branch}"), &commit],
-                    std::path::Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
-        }
+        let commit = match prepare {
+            Ok(commit) => commit,
+            Err(error) => return Err(crate::vcs::cleanup_clone_path(&*self.runner, target, error).await),
+        };
         Ok(CheckoutMaterialisation {
             commit: Some(commit),
             provenance: if adopted { CheckoutBranchProvenance::PreExisting } else { CheckoutBranchProvenance::CreatedForConvoy },

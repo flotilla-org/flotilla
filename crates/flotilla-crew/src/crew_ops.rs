@@ -1858,6 +1858,7 @@ impl CrewService {
             let base_ref = match &checkout.spec {
                 flotilla_resources::CheckoutSpec::Worktree(spec) => spec.base_ref.as_deref(),
                 flotilla_resources::CheckoutSpec::FreshClone(spec) => spec.base_ref.as_deref(),
+                // Observed checkouts declare no base; VCS resolves origin/HEAD.
                 flotilla_resources::CheckoutSpec::Observed(_) => None,
             };
             // An untouched checkout has no branch work to archive. If the base
