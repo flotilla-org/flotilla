@@ -35,25 +35,46 @@ fn home(item: &Value) -> String {
 }
 
 impl Documents {
-    fn decoded<R: Resource>(&self, kind: &str) -> Vec<(ResourceObject<R>, String)> {
-        self.0.get(kind).into_iter().flatten().filter_map(|item| decode::<R>(item).map(|object| (object, home(item)))).collect()
+    fn decoded<R: Resource>(&self, kind: &str, report: &mut ImportReport) -> Vec<(ResourceObject<R>, String)> {
+        self.0
+            .get(kind)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| match decode::<R>(item) {
+                Some(object) => Some((object, home(item))),
+                None => {
+                    report.refused.push(ImportRefusal {
+                        record: item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>").into(),
+                        reason: format!("{kind} does not decode"),
+                    });
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Imports every Message of this namespace into a temporary store.
     pub(super) fn rehearse(&self, namespace: &str) -> ImportReport {
         let mut report = ImportReport::default();
-        let messages = self.decoded::<Message>("messages");
+        let messages = self.decoded::<Message>("messages", &mut report);
         if messages.is_empty() {
+            // The supporting records below are dependencies of Message conversion,
+            // so this rehearsal does not inspect them without a decoded Message.
+            // General stored-record validation still checks their decodability.
             return report;
         }
-        let designation = self.decoded::<FleetDesignation>("fleetdesignations").into_iter().next();
+        let designation = self.decoded::<FleetDesignation>("fleetdesignations", &mut report).into_iter().next();
+        if designation.is_none() && self.0.get("fleetdesignations").is_some_and(|records| !records.is_empty()) {
+            // The present designation already has a named decode refusal. Do not
+            // also describe it as missing for every Message that depends on it.
+            return report;
+        }
         let Some(Ok(roles)) = designation.map(|(designation, _)| FleetRoles::declared(&designation.spec.project)) else {
             let reason = "no FleetDesignation names the project the fleet roles live under".to_owned();
-            report.refused =
-                messages.iter().map(|(record, _)| ImportRefusal { record: record.metadata.name.clone(), reason: reason.clone() }).collect();
+            report.refused.push(ImportRefusal { record: "FleetDesignation".into(), reason });
             return report;
         };
-        let terminals = self.decoded::<TerminalSession>("terminalsessions");
+        let terminals = self.decoded::<TerminalSession>("terminalsessions", &mut report);
         let sessions = terminals
             .iter()
             .filter_map(|(terminal, home)| {
@@ -63,11 +84,11 @@ impl Documents {
             .collect();
         let records = OldStoreRecords::from_records(
             namespace,
-            self.decoded::<Forge>("forges").into_iter().map(|(forge, _)| forge.spec).collect(),
-            self.decoded::<Convoy>("convoys").into_iter().map(|(convoy, _)| convoy).collect(),
+            self.decoded::<Forge>("forges", &mut report).into_iter().map(|(forge, _)| forge.spec).collect(),
+            self.decoded::<Convoy>("convoys", &mut report).into_iter().map(|(convoy, _)| convoy).collect(),
             terminals.into_iter().map(|(terminal, _)| terminal).collect(),
-            self.decoded::<Artifact>("artifacts").into_iter().map(|(artifact, _)| artifact).collect(),
-            self.decoded::<Repository>("repositories").into_iter().map(|(repository, _)| repository).collect(),
+            self.decoded::<Artifact>("artifacts", &mut report).into_iter().map(|(artifact, _)| artifact).collect(),
+            self.decoded::<Repository>("repositories", &mut report).into_iter().map(|(repository, _)| repository).collect(),
         );
         let conversion = Conversion { roles: &roles, forges: &records.forges, records: &records };
         let world = ReadRecords {
@@ -117,6 +138,64 @@ mod tests {
         })
     }
 
+    // Contract #3760: an undecodable Message is a refusal even when there is
+    // nothing decoded to import; it must never disappear from the report.
+    #[test]
+    fn undecodable_message_is_refused() {
+        let mut documents = Documents::default();
+        documents.0.insert("messages".into(), vec![serde_json::json!({"metadata":{"name":"broken"},"spec":7})]);
+        let report = documents.rehearse("flotilla");
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(report.refused[0].record, "broken");
+        assert!(report.refused[0].reason.contains("does not decode"));
+    }
+
+    // Review #3821: an existing but undecodable designation produces its decode
+    // refusal once, without an additional missing-designation diagnostic.
+    #[test]
+    fn undecodable_designation_has_one_refusal() {
+        let mut documents = Documents::default();
+        documents.0.insert(
+            "messages".into(),
+            vec![
+                message("one", "system:turn-rules", "flotilla/demo/work/coder", "accepted", Value::Null),
+                message("two", "system:turn-rules", "flotilla/demo/work/coder", "accepted", Value::Null),
+            ],
+        );
+        documents.0.insert("fleetdesignations".into(), vec![serde_json::json!({"metadata":{"name":"fleet"},"spec":7})]);
+        let report = documents.rehearse("flotilla");
+        assert_eq!(report.refused.len(), 1, "{report:?}");
+        assert_eq!(report.refused[0].record, "fleet");
+        assert!(report.refused[0].reason.contains("does not decode"));
+    }
+
+    // Contract #3760: with a decoded Message, every undecodable supporting
+    // record is a named refusal even if that Message does not reference it.
+    // Exhaust the finite set of supporting kinds; no transport is involved.
+    #[test]
+    fn undecodable_supporting_records_are_refused_beside_a_good_message() {
+        for kind in ["forges", "convoys", "artifacts", "repositories", "terminalsessions"] {
+            let mut documents = Documents::default();
+            documents.0.insert(
+                "fleetdesignations".into(),
+                vec![serde_json::json!({
+                    "apiVersion":"flotilla.work/v1", "kind":"FleetDesignation",
+                    "metadata":{"name":"fleet","namespace":"flotilla","resourceVersion":"1","creationTimestamp":"2026-10-19T00:00:00Z"},
+                    "spec":{"project":"fleet"},
+                })],
+            );
+            documents
+                .0
+                .insert("messages".into(), vec![message("good", "system:turn-rules", "flotilla/demo/work/coder", "accepted", Value::Null)]);
+            documents.0.insert(kind.into(), vec![serde_json::json!({"metadata":{"name":"broken"},"spec":7})]);
+            let report = documents.rehearse("flotilla");
+            assert_eq!(report.total(), 1, "the good Message still imports: {kind}: {report:?}");
+            assert_eq!(report.refused.len(), 1, "{kind}: {report:?}");
+            assert_eq!(report.refused[0].record, "broken");
+            assert_eq!(report.refused[0].reason, format!("{kind} does not decode"));
+        }
+    }
+
     // Behaviour: the rehearsal imports the daemon's Messages into a temporary
     // store, counts them by new state, and names each refusal.
     #[test]
@@ -150,6 +229,9 @@ mod tests {
         assert_eq!(refused, ["from-a-person", "orphan-reply"], "{report:?}");
         let mut none = Documents::default();
         none.0.insert("messages".into(), documents.0["messages"].clone());
-        assert_eq!(none.rehearse("flotilla").refused.len(), 3, "no designation refuses every record by name");
+        let missing = none.rehearse("flotilla");
+        assert_eq!(missing.refused.len(), 1, "missing designation is one prerequisite refusal");
+        assert_eq!(missing.refused[0].record, "FleetDesignation");
+        assert!(missing.refused[0].reason.contains("no FleetDesignation"));
     }
 }
