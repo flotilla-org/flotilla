@@ -16,6 +16,12 @@ existing Attempted and GiveUp gates. Placement returns the lease for either
 terminal lifecycle state. The Vessel composition now accepts those two events;
 it still derives placement occupancy from the lifecycle's liveness.
 
+Attempted and GiveUp are separate durable writes. If persisting GiveUp fails,
+the binding recognises the matching exhausted attempt on its next retry and
+finishes GiveUp without appending another Attempted edge. The stored tally and
+cause make this recovery possible after restart. GiveUp errors propagate; an
+attempt with retry budget left stays Requested without attempting GiveUp.
+
 Quint constructors share a namespace. The attempt outcome is renamed
 `AttemptFailed` to leave `Failed(str)` available for the disappearance cause.
 This is a spec spelling change; the existing Rust `Outcome::Failed` stays as it

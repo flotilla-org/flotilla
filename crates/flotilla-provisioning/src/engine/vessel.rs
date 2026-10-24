@@ -31,14 +31,18 @@ use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyId, Priority, VesselClass},
-        lifecycle::{Attempted, GiveUp, Lifecycle, LifecycleEdge, LifecycleRefusal, LifecycleState, Realise, Release, Vanish},
+        lifecycle::{Attempted, GiveUp, Lifecycle, LifecycleEdge, LifecycleState, Realise, Release, Vanish},
         vessel::{live_leases, Vessel, VesselKind, VesselSpec},
     },
     placement::{Host, LedgerError, PlacementError, Placements, Units, VesselId},
-    Cause, CauseCategory, Home, Log, Outcome, Ref, Resource, WriteError,
+    Cause, CauseCategory, Home, Log, Outcome, Ref, Resource,
 };
 
-use super::{evidence, Binding, EngineError, Lifecycles, Step};
+use super::{
+    evidence,
+    reads::{judge, Ending, Judgement},
+    Binding, EngineError, Lifecycles, Step,
+};
 
 /// The one class every pinned lease takes: the engine judges no class until a capacity model is
 /// available.
@@ -225,14 +229,27 @@ where
         let world = evidence(name, step);
         self.with_placements(|placements| {
             let id = VesselId::new(name);
-            placements.apply(&id, edge, &world, at)?;
-            if let Step::Attempted(Outcome::Failed { cause, .. }) = step {
-                match placements.apply(&id, GiveUp { cause: cause.clone() }.into(), &world, at) {
-                    Ok(_) | Err(PlacementError::Write(WriteError::Refused(LifecycleRefusal::MissingEvidence))) => {}
-                    Err(error) => return Err(error.into()),
+            let failed = match step {
+                Step::Attempted(Outcome::Failed { cause, .. }) => Some(cause),
+                _ => None,
+            };
+            // An exhausted attempt can be durable even when its subsequent GiveUp write failed.
+            // Resume that write instead of tallying the same failure again, including after restart.
+            let pending = placements.get(&id).is_some_and(|resource| {
+                matches!(judge::<VesselKind>(resource.state(), Ending::Unknown), Judgement::Exhausted { last }
+                    if failed == Some(&last))
+            });
+            if !pending {
+                placements.apply(&id, edge, &world, at)?;
+            }
+            if let Some(cause) = failed {
+                let resource = placements.get(&id).ok_or(EngineError::Unknown)?;
+                // Only exhaustion admits GiveUp. A retryable attempt with budget left stays Requested.
+                if matches!(judge::<VesselKind>(resource.state(), Ending::Unknown), Judgement::Exhausted { .. }) {
+                    placements.apply(&id, GiveUp { cause: cause.clone() }.into(), &world, at)?;
                 }
             }
-            Ok(placements.get(&id).expect("stepped vessel").clone())
+            placements.get(&id).cloned().ok_or(EngineError::Unknown)
         })
     }
 }

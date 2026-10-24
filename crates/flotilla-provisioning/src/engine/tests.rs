@@ -961,13 +961,24 @@ async fn a_vessel_failing_before_ready_returns_its_lease_and_an_unpinned_one_sta
     );
     let mut obj = vessel_object();
     reconcile(&engine, &mut obj).await;
-    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(failed));
+    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(failed.clone()));
     let state = home.get("convoy-a-implement").expect("failed vessel");
     assert_eq!(state.state().cause().map(|cause| cause.detail.as_str()), Some("placement policy docker not found"));
     assert!(matches!(state.state(), LifecycleState::GaveUp { .. }));
     home.with_placements(|placements| {
         assert!(placements.ledger().vessel(&flotilla_state_machines::placement::VesselId::new("convoy-a-implement")).is_none());
     });
+
+    // Matching terminal status produces no copy, and repeated reconciles do not act or write again.
+    let version = state.version();
+    let decision = super::decide::<VesselBinding>(home.as_ref(), &obj, None, Utc::now());
+    assert!(decision.ended);
+    assert!(decision.patch.is_none());
+    for _ in 0..3 {
+        assert!(reconcile(&engine, &mut obj).await.patch.is_none());
+        assert_eq!(home.get("convoy-a-implement").expect("ended vessel").version(), version);
+        assert_eq!(engine.inner().prepared.load(Ordering::SeqCst), 2);
+    }
 
     let unpinned =
         Engine::<_, VesselBinding>::new(Scripted::<flotilla_resources::Vessel>::new([Some(provisioning(None))]), Some(home.clone()));
@@ -1106,4 +1117,87 @@ async fn a_readiness_the_engine_does_not_take_is_not_written() {
     assert_eq!(status.phase, VesselPhase::Lost);
     let lost = VesselStatusPatch::MarkLost { message: "gone".into() };
     assert_eq!(decide::<VesselBinding>(home.as_ref(), &obj, Some(lost), Utc::now()).patch, None, "already Lost: nothing to write");
+}
+// A failed GiveUp write can be retried without another Attempted edge or an extra failure tally.
+// The generated sequences span repeated log failures, restart between writes, both pre-ready
+// failure patches, and empty, ASCII and Unicode causes. Independent resources and concurrent
+// writers are outside this adapter's single locked placement home.
+#[hegel::test]
+fn a_vessel_finishes_a_durable_failed_attempt_after_log_errors(tc: hegel::TestCase) {
+    use flotilla_resources::{Vessel as OldVessel, VesselStatusPatch};
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::{
+        machines::vessel::Vessel, placement::VesselId, EdgeEventOf, InputRead, Log, LogError, MemoryLog, Resource, StoredState, Version,
+    };
+    use hegel::generators as gs;
+
+    use super::vessel::{PlacementLifecycles, VesselBinding};
+
+    // This log injects a durable-storage failure before GiveUp commits; all other writes use MemoryLog.
+    struct GiveUpFailures {
+        inner: MemoryLog<Vessel>,
+        remaining: Arc<AtomicUsize>,
+    }
+    impl Log<Vessel> for GiveUpFailures {
+        fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<Vessel>, reads: &[InputRead]) -> Result<Version, LogError> {
+            self.inner.create(writer, at, resource, reads)
+        }
+
+        fn edge(
+            &mut self,
+            previous: &StoredState<Vessel>,
+            next: &Resource<Vessel>,
+            event: &EdgeEventOf<Vessel>,
+        ) -> Result<Version, LogError> {
+            if matches!(next.state(), LifecycleState::GaveUp { .. })
+                && self.remaining.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+            {
+                return Err(LogError::new("injected GiveUp persistence failure"));
+            }
+            self.inner.edge(previous, next, event)
+        }
+    }
+
+    let failures = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+    let restart = tc.draw(gs::booleans());
+    let lost = tc.draw(gs::booleans());
+    let messages = ["", "backing disappeared", "provider refused: accès refusé"];
+    let message = messages[tc.draw(gs::integers::<usize>().min_value(0).max_value(messages.len() - 1))];
+    let remaining = Arc::new(AtomicUsize::new(failures));
+    let new_home = || {
+        Home::<Vessel, _>::with_log(HOME, GiveUpFailures { inner: MemoryLog::new(), remaining: Arc::clone(&remaining) })
+            .expect("declaration")
+    };
+    let mut lifecycles = PlacementLifecycles::new(HOME, new_home()).expect("placements");
+    let mut obj: ResourceObject<OldVessel> = vessel_object();
+    provisioning(Some("feta")).apply(obj.status.get_or_insert_with(Default::default));
+    let name = &obj.metadata.name;
+    lifecycles.request(name, VesselBinding::request(&obj, HOME).expect("request"), Timestamp(1)).expect("placed");
+    let patch = if lost {
+        VesselStatusPatch::MarkLost { message: message.into() }
+    } else {
+        VesselStatusPatch::MarkFailed { message: message.into() }
+    };
+    let steps = VesselBinding::steps(&obj, &patch);
+    assert_eq!(steps.len(), 1);
+    let mut attempted_version = None;
+    for n in 0..failures {
+        let error = lifecycles.step(name, &steps[0], Timestamp(2 + n as i64)).expect_err("GiveUp log failure propagates");
+        assert!(error.to_string().contains("injected GiveUp persistence failure"));
+        let resource = lifecycles.get(name).expect("durable attempt");
+        assert!(matches!(resource.state(), LifecycleState::Requested { failures: 1, last_failure: Some(last) }
+            if last.cause.detail == message && !last.retryable));
+        let version = *attempted_version.get_or_insert(resource.version());
+        assert_eq!(resource.version(), version, "retry must not append another Attempted");
+        lifecycles.with_placements(|placements| assert!(placements.ledger().vessel(&VesselId::new(name)).is_some()));
+        if restart {
+            let mut home = new_home();
+            home.restore(resource).expect("restore durable state");
+            lifecycles = PlacementLifecycles::new(HOME, home).expect("restore lease");
+        }
+    }
+    let ended = lifecycles.step(name, &steps[0], Timestamp(10)).expect("GiveUp retry succeeds");
+    assert_eq!(ended.version().0, attempted_version.expect("durable attempt").0 + 1, "only GiveUp is appended");
+    assert!(matches!(ended.state(), LifecycleState::GaveUp { cause } if cause.detail == message));
+    lifecycles.with_placements(|placements| assert!(placements.ledger().vessel(&VesselId::new(name)).is_none()));
 }
