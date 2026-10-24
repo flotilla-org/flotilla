@@ -822,7 +822,8 @@ pub trait OperatorReconciler: Send + Sync {
 #[async_trait]
 impl StandingConvoyBackingInspector for InProcessDaemon {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
-        flotilla_admission::convoy_ensure::ResourceStandingConvoyBackingInspector { resource_backend: self.resource_backend.clone() }
+        flotilla_admission::convoy_ensure::ResourceStandingConvoyBackingInspector::new(self.resource_backend.clone())
+            .with_lifecycle_reads(self.lifecycle_reads())
             .verify_backing_dead(convoy)
             .await
     }
