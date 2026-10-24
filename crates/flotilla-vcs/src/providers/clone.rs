@@ -90,7 +90,6 @@ impl ReferenceCloneStrategy {
 
         let remote_url = self.remote_url().await?;
         let local_ref = format!("refs/heads/{branch}");
-        let remote_ref = format!("refs/remotes/origin/{branch}");
         let local_exists = self
             .runner
             .run(
@@ -101,24 +100,8 @@ impl ReferenceCloneStrategy {
             )
             .await
             .is_ok();
-        let remote_exists = self
-            .runner
-            .run(
-                "git",
-                &["--git-dir", reference_dir, "show-ref", "--verify", "--quiet", &remote_ref],
-                std::path::Path::new("/"),
-                &ChannelLabel::Default,
-            )
-            .await
-            .is_ok();
         if local_exists {
             return Err(existing_checkout_branch_error(branch, None));
-        }
-        if remote_exists {
-            return Err(existing_checkout_branch_error(branch, Some(&remote_ref)));
-        }
-        if !GitCliBackend::new(std::path::Path::new("/"), &*self.runner).remote_heads(&remote_url, &local_ref).await?.trim().is_empty() {
-            return Err(format!("checkout branch {branch} already exists on remote; choose a fresh branch name"));
         }
         let base = base_ref.ok_or_else(|| format!("branch {branch} does not exist and no base ref was supplied"))?;
         self.runner
@@ -129,25 +112,41 @@ impl ReferenceCloneStrategy {
                 &ChannelLabel::Default,
             )
             .await?;
-        self.runner
-            .run(
-                "git",
-                &["-C", target, "checkout", "-b", branch, &format!("origin/{base}")],
-                std::path::Path::new("/"),
-                &ChannelLabel::Default,
-            )
-            .await?;
         let backend = GitCliBackend::checkout_root(target_path, &*self.runner);
-        let commit = backend.head_commit_text().await?.trim().to_string();
-        self.runner
-            .run(
-                "git",
-                &["-C", target, "update-ref", &format!("refs/flotilla/bootstrap/{branch}"), &commit],
-                std::path::Path::new("/"),
-                &ChannelLabel::Default,
-            )
-            .await?;
-        Ok(CheckoutMaterialisation { commit: Some(commit), provenance: CheckoutBranchProvenance::CreatedForConvoy })
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        // This check relies on cloning all remote heads. If cloning becomes
+        // single-branch/shallow, fetch the requested branch explicitly first.
+        let adopted = backend.ref_exists(&remote_ref).await;
+        let prepare = async {
+            if adopted {
+                backend.verify_remote_adoption(branch, Some(base)).await?;
+            }
+            let base = if adopted { remote_ref.clone() } else { format!("origin/{base}") };
+            self.runner
+                .run("git", &["-C", target, "checkout", "-b", branch, &base], std::path::Path::new("/"), &ChannelLabel::Default)
+                .await?;
+            let commit = backend.head_commit_text().await?.trim().to_string();
+            if !adopted {
+                self.runner
+                    .run(
+                        "git",
+                        &["-C", target, "update-ref", &format!("refs/flotilla/bootstrap/{branch}"), &commit],
+                        std::path::Path::new("/"),
+                        &ChannelLabel::Default,
+                    )
+                    .await?;
+            }
+            Ok::<String, String>(commit)
+        }
+        .await;
+        let commit = match prepare {
+            Ok(commit) => commit,
+            Err(error) => return Err(crate::vcs::cleanup_clone_path(&*self.runner, target, error).await),
+        };
+        Ok(CheckoutMaterialisation {
+            commit: Some(commit),
+            provenance: if adopted { CheckoutBranchProvenance::PreExisting } else { CheckoutBranchProvenance::CreatedForConvoy },
+        })
     }
 
     pub(crate) async fn validate_target(
