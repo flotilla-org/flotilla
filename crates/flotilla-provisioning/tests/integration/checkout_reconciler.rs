@@ -1937,12 +1937,17 @@ async fn checkout_reserves_branches_from_sibling_engine_phases() {
         target_path: "/work".into(),
         clone_ref: "source".into(),
     });
-    let mut sibling = records.create(&meta("sibling"), &spec).await.expect("sibling");
+    let convoy_meta = |name| {
+        let mut metadata = meta(name);
+        metadata.labels.insert(CONVOY_LABEL.into(), "crew".into());
+        metadata
+    };
+    let mut sibling = records.create(&convoy_meta("sibling"), &spec).await.expect("sibling");
     sibling = records
         .update_status("sibling", &sibling.metadata.resource_version, &CheckoutStatus { phase: CheckoutPhase::Gone, ..Default::default() })
         .await
         .expect("stale status");
-    let checkout = records.create(&meta("checkout"), &spec).await.expect("checkout");
+    let checkout = records.create(&convoy_meta("checkout"), &spec).await.expect("checkout");
     let fixture = LifecycleFixture::<CheckoutBinding>::new(false);
     fixture.request(&checkout);
     fixture.request(&sibling);
