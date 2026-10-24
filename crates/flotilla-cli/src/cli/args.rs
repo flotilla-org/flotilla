@@ -732,7 +732,7 @@ pub struct ResourceApplyArgs {
 pub struct MessageFailBatchArgs {
     /// A member of the held batch
     pub name: String,
-    /// Operator explanation retained in every member's status
+    /// Operator explanation retained in every member's status; do not include secrets
     #[arg(long)]
     pub reason: String,
     #[arg(long, default_value = "flotilla")]

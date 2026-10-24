@@ -206,11 +206,14 @@ pub struct ResolvedMessageReceiver {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct MessageStatus {
     /// Explicit operator authorization, pinned to the receiver that was inspected.
+    // Compatibility default for pre-#3799 records; removable one roll after #3799.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_delivery: Option<OperatorMessageDelivery>,
+    // Compatibility default for pre-#3799 records; removable one roll after #3799.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fence_recheck_at: Option<DateTime<Utc>>,
     /// Preserve possibly-written submissions when an operator authorizes another attempt.
+    // Compatibility default for pre-#3799 records; removable one roll after #3799.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub delivery_history: Vec<MessageSubmission>,
@@ -259,6 +262,7 @@ impl Default for MessageStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct MessageSubmission {
+    // Compatibility default for pre-#3799 records; removable one roll after #3799.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_reason: Option<String>,
     pub batch_id: String,
