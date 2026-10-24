@@ -30,10 +30,14 @@ use flotilla_state_machines::{
 
 const HOME: &str = "home";
 
-fn store() -> StoreLog {
+/// A fresh store holding only `M`'s stored kind: every probe replays its path into its own store,
+/// so the schema each one creates is the one the machine under test needs.
+fn store<M: Machine>() -> StoreLog
+where
+    Resource<M>: Kind,
+{
     let mut registry = KindRegistry::new();
-    registry.register::<Resource<Vessel>>().expect("vessel");
-    registry.register::<Resource<Ensure>>().expect("ensure");
+    registry.register::<Resource<M>>().expect("stored kind");
     let connection = rusqlite::Connection::open_in_memory().expect("memory");
     StoreLog::new(Arc::new(Mutex::new(Store::open(connection, HOME, registry).expect("store"))))
 }
@@ -60,7 +64,7 @@ struct StoreLogs;
 impl VesselLogs for StoreLogs {
     type Log = StoreLog;
     fn log() -> StoreLog {
-        store()
+        store::<Vessel>()
     }
     fn check(home: &Home<Vessel, StoreLog>) {
         stored_as_held(home);
@@ -70,7 +74,7 @@ impl VesselLogs for StoreLogs {
 impl EnsureLogs for StoreLogs {
     type Log = StoreLog;
     fn log() -> StoreLog {
-        store()
+        store::<Ensure>()
     }
     fn history(home: &Home<Ensure, StoreLog>, name: &str) -> Vec<EnsureEdge> {
         stored_as_held(home);
