@@ -10,11 +10,16 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import threading
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path, help="absolute staged probe root")
-    root = parser.parse_args().root
+    parser.add_argument("--timeout", type=float, default=30, help="total app-server timeout in seconds (default: 30)")
+    options = parser.parse_args()
+    if not 0 < options.timeout < float("inf"):
+        parser.error("--timeout must be finite and positive")
+    root = options.root
     plan = json.loads((root / "launch.json").read_text())
     args = shlex.split(plan["command"])
     overrides = []
@@ -33,6 +38,17 @@ def main():
             text=True,
         )
 
+        timed_out = threading.Event()
+
+        def expire():
+            timed_out.set()
+            server.kill()
+
+        # Bound the whole protocol exchange, including blocking pipe reads.
+        watchdog = threading.Timer(options.timeout, expire)
+        watchdog.daemon = True
+        watchdog.start()
+
         def send(message):
             server.stdin.write(json.dumps(message) + "\n")
             server.stdin.flush()
@@ -44,6 +60,8 @@ def main():
                     if "error" in message:
                         raise RuntimeError(message["error"])
                     return message
+            if timed_out.is_set():
+                raise TimeoutError(f"Codex app-server timed out after {options.timeout} seconds")
             raise RuntimeError("Codex app-server exited before responding")
 
         try:
@@ -61,6 +79,7 @@ def main():
             (root / "hooks-list.json").write_text(json.dumps(result, indent=2))
             print(json.dumps(result, indent=2))
         finally:
+            watchdog.cancel()
             server.terminate()
             server.wait(timeout=10)
 

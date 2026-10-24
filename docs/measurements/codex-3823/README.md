@@ -90,6 +90,10 @@ Capture the rendered grid with `cleat capture`. Separately record discovery:
 python3 crates/flotilla-agent/examples/record_codex_hooks.py /tmp/codex-3823-probe
 ```
 
+The recorder bounds the whole app-server exchange to 30 seconds by default;
+use `--timeout <seconds>` to override it. A timeout kills the server and writes
+no discovery fixture.
+
 That script uses the staged home and all `-c` arguments from the actual launch
 plan. Only the TUI-specific flags and prompt are replaced by `app-server`.
 It does not replace the real TUI or tool-turn check.
