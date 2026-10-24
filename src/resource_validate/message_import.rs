@@ -47,11 +47,18 @@ impl Documents {
             return report;
         }
         let designation = self.decoded::<FleetDesignation>("fleetdesignations").into_iter().next();
-        let Some(Ok(roles)) = designation.map(|(designation, _)| FleetRoles::declared(&designation.spec.project)) else {
-            let reason = "no FleetDesignation names the project the fleet roles live under".to_owned();
-            report.refused =
-                messages.iter().map(|(record, _)| ImportRefusal { record: record.metadata.name.clone(), reason: reason.clone() }).collect();
-            return report;
+        let roles = designation
+            .ok_or_else(|| "no FleetDesignation names the fleet".to_owned())
+            .and_then(|(designation, _)| FleetRoles::from_designation(&designation.spec));
+        let roles = match roles {
+            Ok(roles) => roles,
+            Err(reason) => {
+                report.refused = messages
+                    .iter()
+                    .map(|(record, _)| ImportRefusal { record: record.metadata.name.clone(), reason: reason.clone() })
+                    .collect();
+                return report;
+            }
         };
         let terminals = self.decoded::<TerminalSession>("terminalsessions");
         let sessions = terminals
@@ -127,7 +134,7 @@ mod tests {
             vec![serde_json::json!({
                 "apiVersion": "flotilla.work/v1", "kind": "FleetDesignation",
                 "metadata": {"name": "fleet", "namespace": "flotilla", "resourceVersion": "1", "creationTimestamp": "2026-10-19T00:00:00Z"},
-                "spec": {"project": "fleet"},
+                "spec": {"fleet": "lab", "project": "project-map"},
             })],
         );
         documents.0.insert(
@@ -148,6 +155,12 @@ mod tests {
         assert_eq!(report.imported.get("pending"), Some(&1), "{report:?}");
         let refused: Vec<_> = report.refused.iter().map(|refusal| refusal.record.as_str()).collect();
         assert_eq!(refused, ["from-a-person", "orphan-reply"], "{report:?}");
+        // Old stored designations decode, but the rehearsal names the missing identity.
+        documents.0.get_mut("fleetdesignations").expect("designation")[0]["spec"].as_object_mut().expect("spec").remove("fleet");
+        let unnamed = documents.rehearse("flotilla");
+        assert_eq!(unnamed.total(), 0);
+        assert_eq!(unnamed.refused.len(), 3);
+        assert!(unnamed.refused.iter().all(|refusal| refusal.reason.contains("FleetDesignation.spec.fleet is missing")));
         let mut none = Documents::default();
         none.0.insert("messages".into(), documents.0["messages"].clone());
         assert_eq!(none.rehearse("flotilla").refused.len(), 3, "no designation refuses every record by name");

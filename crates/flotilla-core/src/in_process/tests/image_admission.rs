@@ -296,6 +296,7 @@ async fn registry_delivery_uses_the_deterministic_builder() {
         .apply(
             &test_meta(FLEET_DESIGNATION_NAME),
             &FleetDesignationSpec {
+                fleet: None,
                 project: "flotilla".into(),
                 image_cache: Some(ImageCacheBinding {
                     repository: "registry.test/flotilla/crew-images".into(),

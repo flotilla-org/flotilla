@@ -77,7 +77,10 @@ mod tests {
         projects.apply(&InputMeta::builder().name("fleet".into()).build(), &fleet).await.expect("fleet");
         backend
             .definitions::<FleetDesignation>("test")
-            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec { project: "fleet".into(), image_cache: None })
+            .apply(
+                &InputMeta::builder().name("fleet".into()).build(),
+                &FleetDesignationSpec { fleet: None, project: "fleet".into(), image_cache: None },
+            )
             .await
             .expect("designation");
         let mut child = ProjectSpec::builder().display_name("Child".into()).build();

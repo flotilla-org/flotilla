@@ -1156,7 +1156,7 @@ mod tests {
                 let _ = backend.definitions::<Project>("flotilla").create(&meta, &spec).await;
             }
             if stored_fleet && !stored.is_empty() {
-                let spec = flotilla_resources::FleetDesignationSpec { project: stored[0].0.clone(), image_cache: None };
+                let spec = flotilla_resources::FleetDesignationSpec { fleet: None, project: stored[0].0.clone(), image_cache: None };
                 let meta = flotilla_resources::InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build();
                 let _ = backend.definitions::<FleetDesignation>("flotilla").create(&meta, &spec).await;
             }

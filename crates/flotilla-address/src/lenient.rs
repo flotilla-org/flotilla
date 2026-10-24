@@ -15,7 +15,7 @@ use crate::{
 ///   host and the repository in any case: `forge:github/repo:Org%2fRepo/cr:7`;
 /// - URLs of a repository, change request, issue or commit:
 ///   `https://github.com/org/repo/pull/7`, `git@host:org/repo.git`;
-/// - short forms: `convoy/<name>`, `project/<name>`, `usage/<provider>/<account>`,
+/// - short forms: `convoy/<name>`, `project/<name>`, `fleet/<name>`, `usage/<provider>/<account>`,
 ///   `cr|issue/<forge id or host>/<owner>/<repo>/<number>` and
 ///   `artifact/<convoy>/<role>/<kind>/<subject>`.
 ///
@@ -110,6 +110,7 @@ fn resolve_short(input: &str, forges: &dyn ForgeLookup) -> Result<Address, Error
     let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
     match parts.as_slice() {
         ["project", name] => Address::project(name),
+        ["fleet", name] => Address::fleet(name),
         ["convoy", name] => Address::convoy(name),
         ["usage", provider, account] => Address::usage(provider, account),
         [kind @ ("cr" | "issue"), service, owner, repo, number] => {

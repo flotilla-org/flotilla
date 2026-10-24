@@ -46,7 +46,7 @@ fn segment_value(tc: &hegel::TestCase, kind: Kind) -> String {
 /// one. Covers every kind, the root convoy, nested project/convoy/role and
 /// repositories on both forge kinds.
 fn address(tc: &hegel::TestCase) -> Address {
-    let roots = [Kind::Project, Kind::Convoy, Kind::Forge, Kind::Usage, Kind::Host, Kind::Account];
+    let roots = [Kind::Fleet, Kind::Project, Kind::Convoy, Kind::Forge, Kind::Usage, Kind::Host, Kind::Account];
     let root = roots[draw_index(tc, roots.len())];
     let mut address = match root {
         Kind::Forge => {
@@ -563,4 +563,34 @@ mod shape {
         assert!("message:x".parse::<Address>().is_err());
         assert!(message.child(Kind::Message, "y").is_err());
     }
+}
+
+// Fleet roles and their messages preserve arbitrary nonempty names, reserved
+// bytes and Unicode through canonical print/parse and lenient escape spelling.
+#[hegel::test]
+fn fleet_roles_and_messages_round_trip(tc: hegel::TestCase) {
+    let fleet = value(&tc, 1);
+    let role = value(&tc, 1);
+    let id = value(&tc, 1);
+    let inbox = Address::fleet(&fleet).expect("fleet").child(Kind::Role, &role).expect("role");
+    for address in [inbox.clone(), Address::message(&inbox, &id).expect("message")] {
+        assert_eq!(address.get(Kind::Fleet), Some(fleet.as_str()));
+        assert_eq!(address.to_string().parse::<Address>().expect("canonical"), address);
+        let lenient = address.to_string().replace("%2F", "%2f").replace("%3A", "%3a");
+        assert_eq!(resolve(&format!(" {lenient} "), &BuiltinForges).expect("lenient"), address);
+    }
+}
+
+// Fleet is a root whose only direct child is a role; empty names are refused.
+#[test]
+fn fleet_shape_and_short_input() {
+    assert_eq!(resolve("fleet/lab", &BuiltinForges).expect("short").as_str(), "fleet:lab");
+    assert_eq!(
+        resolve(" fleet:La%2fb/role:op%3aer/message:x%2fy ", &BuiltinForges).expect("lenient message").as_str(),
+        "fleet:La%2Fb/role:op%3Aer/message:x%2Fy",
+    );
+    for invalid in ["fleet:", "fleet:lab/role:", "project:p/fleet:lab", "fleet:lab/convoy:c", "fleet:lab/message:m", "role:operator"] {
+        assert!(invalid.parse::<Address>().is_err(), "{invalid}");
+    }
+    assert_eq!(record_name(&Address::fleet("lab").expect("fleet")), None);
 }

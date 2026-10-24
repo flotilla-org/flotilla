@@ -89,7 +89,9 @@ forge:github/repo:flotilla-org%2Fflotilla/commit:<sha>      a commit (the full 4
 
 `message` is a kind that sits under an inbox address: `<inbox address>/message:<id>`. A message sent with a de-duplication key takes the digest of its inbox, sender and key as its id, so a repeated key names the same message; an imported message keeps its earlier record name.
 
-Fleet-wide roles are roles of the fleet's designated project (`FleetDesignation`): `project:<designated project>/role:<name>`. There is no root `role:` segment. Changing the designation changes these addresses.
+fleet-wide roles are addressed under the fleet's own name, `fleet:<fleet name>/role:<name>`; the fleet designation is an internal mapping to the Project that carries the fleet's charter and bindings, and never appears in an address.
+
+the fleet's name is declared on FleetDesignation (`spec.fleet`) and replicated to every host; fleet role addresses use it and nothing else.
 
 - **A reference is an address plus a revision.** This replaces `MessageReference` and its two spellings of a CR.
 - **A condition (Leaf)** is an address, a field path, an operator and a literal. Field-path segments and literals use JSON string quoting when they contain anything other than a bare word. The printer always produces the canonical form, so print-then-parse returns exactly what went in.

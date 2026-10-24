@@ -366,6 +366,7 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
             .create(
                 &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
                 &FleetDesignationSpec {
+                    fleet: None,
                     project: "fleet".into(),
                     image_cache: Some(ImageCacheBinding {
                         repository: repository.into(),

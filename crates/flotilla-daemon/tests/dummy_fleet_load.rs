@@ -170,7 +170,7 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, adm
 
 async fn seed(backend: &ResourceBackend, forge_service_url: &str, primitives: bool) {
     if primitives {
-        // The engine path's fleet roles live under the designated project.
+        // The engine path resolves fleet roles from the replicated fleet identity.
         backend
             .clone()
             .using::<Project>(NAMESPACE)
@@ -189,7 +189,7 @@ async fn seed(backend: &ResourceBackend, forge_service_url: &str, primitives: bo
             .definitions::<FleetDesignation>(NAMESPACE)
             .create(
                 &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
-                &FleetDesignationSpec { project: "fleet".into(), image_cache: None },
+                &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
             )
             .await
             .expect("fleet designation");

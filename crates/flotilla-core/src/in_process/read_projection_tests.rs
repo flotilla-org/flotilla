@@ -1949,7 +1949,10 @@ mod project_hierarchy_projection_tests {
         }
         backend
             .definitions::<FleetDesignation>("flotilla")
-            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec { project: "root".into(), image_cache: None })
+            .apply(
+                &InputMeta::builder().name("fleet".into()).build(),
+                &FleetDesignationSpec { fleet: None, project: "root".into(), image_cache: None },
+            )
             .await
             .expect("fleet");
         let response = ReadProjections::list_projects(&backend, "flotilla", chrono::Utc::now()).await.expect("list");

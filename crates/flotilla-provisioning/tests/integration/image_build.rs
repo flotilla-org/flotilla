@@ -336,6 +336,7 @@ fn concurrent_demand_executes_one_build_per_identity(tc: hegel::TestCase) {
                 .create(
                     &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
                     &FleetDesignationSpec {
+                        fleet: None,
                         project: "fleet".into(),
                         image_cache: Some(ImageCacheBinding {
                             repository: REPOSITORY.into(),

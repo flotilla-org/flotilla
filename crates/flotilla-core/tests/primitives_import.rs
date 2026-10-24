@@ -340,3 +340,48 @@ fn stored_record_corpus_imports_with_no_refusals() {
     assert!(refused.is_empty(), "corpus refusals: {refused:?}");
     assert_eq!(results.len(), records.len());
 }
+
+// A Message import rehearsal reads the replicated fleet identity and restores
+// fleet-role senders and inboxes under fleet:, independently of the charter Project.
+#[tokio::test]
+async fn named_designation_imports_fleet_role_messages() {
+    use flotilla_core::primitives::{import::rehearse, roles::designated_fleet_roles};
+    use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec};
+    use flotilla_store::ResourceBackend;
+    use flotilla_store_memory::InMemoryBackend;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend
+        .definitions::<Project>("flotilla")
+        .apply(
+            &InputMeta::builder().name("project-map".into()).build(),
+            &ProjectSpec::builder().display_name("Charter".into()).default_workflow_ref("w".into()).repositories(Vec::new()).build(),
+        )
+        .await
+        .expect("charter Project");
+    backend
+        .definitions::<FleetDesignation>("flotilla")
+        .apply(
+            &InputMeta::builder().name("fleet".into()).build(),
+            &FleetDesignationSpec { fleet: Some("lab".into()), project: "project-map".into(), image_cache: None },
+        )
+        .await
+        .expect("designation");
+    let records = [
+        record("to-crew", spec(RECEIVER, "system:nudge", MessageExpectation::None), status(MessagePhase::Accepted, Some(1), None)),
+        record("to-fleet", spec("system:nudge", RECEIVER, MessageExpectation::None), status(MessagePhase::Accepted, Some(2), None)),
+    ];
+    let roles = designated_fleet_roles(&backend, "flotilla").await.expect("fleet roles");
+    let conversion = Conversion { roles: &roles, forges: &[], records: &NoRecords };
+    let world = world(&records);
+    let imported = import_all(records.iter().map(|record| OldMessage { record, home: HOME.into() }), &conversion, &world)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("all messages import");
+    assert_eq!(imported.len(), 2);
+    let to_crew = imported.iter().find(|item| item.record == "to-crew").expect("crew message");
+    assert_eq!(to_crew.resource.spec().sender.as_str(), "fleet:lab/role:nudge");
+    let to_fleet = imported.iter().find(|item| item.record == "to-fleet").expect("fleet message");
+    assert_eq!(to_fleet.resource.spec().inbox.as_str(), "fleet:lab/role:nudge");
+    assert_eq!(to_fleet.resource.name(), "fleet:lab/role:nudge/message:to-fleet");
+    assert!(rehearse(&imported).is_empty(), "all imported records restore into the engine store");
+}

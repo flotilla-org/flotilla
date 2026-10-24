@@ -119,7 +119,7 @@ async fn designation_and_parent_federate() {
         .definitions::<FleetDesignation>("flotilla")
         .apply(
             &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
-            &FleetDesignationSpec { project: "root".into(), image_cache: None },
+            &FleetDesignationSpec { fleet: None, project: "root".into(), image_cache: None },
         )
         .await
         .expect("designation");
@@ -197,7 +197,7 @@ async fn designation_and_parent_writes_share_admission() {
         projects.apply(&a, &project(None)).await.expect("a");
         projects.apply(&b, &project(None)).await.expect("b");
         let a_spec = project(Some("b"));
-        let fleet_spec = FleetDesignationSpec { project: "a".into(), image_cache: None };
+        let fleet_spec = FleetDesignationSpec { fleet: None, project: "a".into(), image_cache: None };
         let (parent, designation) = tokio::join!(projects.apply(&a, &a_spec), fleets.apply(&fleet, &fleet_spec));
         assert_ne!(parent.is_ok(), designation.is_ok(), "one incompatible write must be refused");
         ProjectHierarchy::load(&backend, "flotilla").await.expect("valid hierarchy after race");
@@ -260,7 +260,7 @@ async fn designation_reassignment_and_deletion() {
         let fleets = backend.definitions::<FleetDesignation>("test");
         let meta = InputMeta::builder().name("fleet".into()).build();
         for root in ["old", "new"] {
-            fleets.apply(&meta, &FleetDesignationSpec { project: root.into(), image_cache: None }).await.unwrap();
+            fleets.apply(&meta, &FleetDesignationSpec { fleet: None, project: root.into(), image_cache: None }).await.unwrap();
             assert_eq!(ProjectHierarchy::load(&backend, "test").await.unwrap().ancestors("child").unwrap(), [root]);
             assert!(projects.delete(root).await.is_err());
         }
@@ -329,7 +329,10 @@ async fn inspection_warns_about_undeclared_fleet_project() {
     source.definitions::<Project>("bootstrap").apply(&InputMeta::builder().name("root".into()).build(), &project(None)).await.unwrap();
     source
         .definitions::<FleetDesignation>("bootstrap")
-        .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec { project: "root".into(), image_cache: None })
+        .apply(
+            &InputMeta::builder().name("fleet".into()).build(),
+            &FleetDesignationSpec { fleet: None, project: "root".into(), image_cache: None },
+        )
         .await
         .unwrap();
     let target = ResourceBackend::new(InMemoryBackend::default());

@@ -50,7 +50,8 @@ pub fn record_name(address: &Address) -> Option<String> {
             Some(format!("usage-{}", &digest[..54]))
         }
         Kind::Project | Kind::Convoy | Kind::Host => Some(address.name().to_string()),
-        Kind::Provider
+        Kind::Fleet
+        | Kind::Provider
         | Kind::Vessel
         | Kind::Role
         | Kind::Message

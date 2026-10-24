@@ -11,6 +11,8 @@ use crate::Error;
 pub enum Kind {
     /// A flotilla Project: `project:flotilla`.
     Project,
+    /// A fleet, independent of its charter Project.
+    Fleet,
     /// A host place that advertises provider instances.
     Host,
     /// An instance under a host or provider account.
@@ -19,7 +21,7 @@ pub enum Kind {
     Convoy,
     /// A convoy's vessel.
     Vessel,
-    /// A standing role under a project, or a convoy role.
+    /// A standing role under a fleet or project, or a convoy role.
     Role,
     /// An artifact slot under its producing role; always followed by `of:`.
     Artifact,
@@ -46,10 +48,11 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 17] = [
+    pub const ALL: [Kind; 18] = [
         Kind::Host,
         Kind::Provider,
         Kind::Project,
+        Kind::Fleet,
         Kind::Convoy,
         Kind::Vessel,
         Kind::Role,
@@ -72,6 +75,7 @@ impl Kind {
             Kind::Host => "host",
             Kind::Provider => "provider",
             Kind::Project => "project",
+            Kind::Fleet => "fleet",
             Kind::Convoy => "convoy",
             Kind::Vessel => "vessel",
             Kind::Role => "role",
@@ -93,12 +97,12 @@ impl Kind {
     /// an address when `parent` is `None`. This is the whole shape grammar.
     pub fn may_follow(self, parent: Option<Kind>) -> bool {
         match self {
-            Kind::Project | Kind::Forge | Kind::Usage | Kind::Host => parent.is_none(),
+            Kind::Fleet | Kind::Project | Kind::Forge | Kind::Usage | Kind::Host => parent.is_none(),
             // A convoy without a Project is valid today (`ConvoySpec.project_ref`
             // is optional); a convoy with one sits under it.
             Kind::Convoy => matches!(parent, None | Some(Kind::Project)),
             Kind::Vessel => parent == Some(Kind::Convoy),
-            Kind::Role => matches!(parent, Some(Kind::Project | Kind::Convoy)),
+            Kind::Role => matches!(parent, Some(Kind::Fleet | Kind::Project | Kind::Convoy)),
             Kind::Artifact => parent == Some(Kind::Role),
             // A message sits under its inbox, which is always a role.
             Kind::Message => parent == Some(Kind::Role),

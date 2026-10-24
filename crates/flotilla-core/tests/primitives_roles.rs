@@ -36,7 +36,7 @@ async fn primitives(dir: &tempfile::TempDir) -> MessagePrimitives {
         .definitions::<FleetDesignation>(NAMESPACE)
         .create(
             &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
-            &FleetDesignationSpec { project: "fleet".into(), image_cache: None },
+            &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
         )
         .await
         .expect("designation");
@@ -61,7 +61,7 @@ fn engine_message(primitives: &MessagePrimitives, record: &str) -> flotilla_stat
 }
 
 // Behaviour: each `system:` producer sends as its declared fleet role under
-// the designated project, and a held turn sends as turn-rules; `system:hold`
+// the fleet name, and a held turn sends as turn-rules; `system:hold`
 // survives only in its de-duplication key (the record name).
 #[tokio::test]
 async fn system_producers_send_as_their_fleet_roles() {
@@ -72,14 +72,14 @@ async fn system_producers_send_as_their_fleet_roles() {
         let record = flotilla_resources::message_record_name(CREW, &sender, role);
         primitives.admit(NAMESPACE, &record, &intent(&sender, CREW)).await.expect("admitted");
         let message = engine_message(&primitives, &record);
-        assert_eq!(message.spec().sender.as_str(), format!("project:fleet/role:{role}"));
+        assert_eq!(message.spec().sender.as_str(), format!("fleet:lab/role:{role}"));
         assert_eq!(message.spec().inbox.as_str(), "project:flotilla/convoy:demo/role:coder");
         assert_eq!(message.name(), format!("project:flotilla/convoy:demo/role:coder/message:{record}"));
     }
     // The held turn's name keys on `system:hold`; it sends as turn-rules.
     let held = flotilla_resources::message_record_name("system:hold", "system:turn-rules", "hold:demo:work:coder:rule:1");
     primitives.admit(NAMESPACE, &held, &intent("system:turn-rules", CREW)).await.expect("held turn");
-    assert_eq!(engine_message(&primitives, &held).spec().sender.as_str(), "project:fleet/role:turn-rules");
+    assert_eq!(engine_message(&primitives, &held).spec().sender.as_str(), "fleet:lab/role:turn-rules");
     // A repeated key is the same message: nothing more is admitted.
     let count = primitives.messages().expect("messages").len();
     primitives.admit(NAMESPACE, &held, &intent("system:turn-rules", CREW)).await.expect("repeat");
@@ -103,13 +103,13 @@ async fn a_reply_to_a_fleet_role_reaches_its_inbox() {
     reply.in_reply_to = Some(original.clone());
     primitives.admit(NAMESPACE, &reply_name, &reply).await.expect("reply");
     let stored = engine_message(&primitives, &reply_name);
-    assert_eq!(stored.spec().inbox.as_str(), "project:fleet/role:nudge");
+    assert_eq!(stored.spec().inbox.as_str(), "fleet:lab/role:nudge");
     assert_eq!(stored.spec().sender.as_str(), "project:flotilla/convoy:demo/role:coder");
     let (original_id, home) = primitives.locate(&original).expect("locate").expect("original");
     let in_reply_to = stored.spec().in_reply_to.as_ref().expect("names the original");
     assert_eq!((in_reply_to.name.as_str(), in_reply_to.home.as_str()), (original_id.as_str(), home.as_str()));
     assert_eq!(*stored.state(), MessageState::Pending);
-    let inbox: flotilla_address::Address = "project:fleet/role:nudge".parse().expect("inbox");
+    let inbox: flotilla_address::Address = "fleet:lab/role:nudge".parse().expect("inbox");
     let consumer = primitives.register("fleet-nudge-handler", flotilla_schema::Timestamp(1)).await.expect("consumer");
     primitives.inbox().bind(inbox.clone(), consumer.clone()).await.expect("bind a handler later");
     let pending: Vec<_> = futures::TryStreamExt::try_collect(
@@ -353,4 +353,43 @@ async fn a_sender_with_no_inbox_records_nothing() {
     judged.expectation = flotilla_resources::MessageExpectation::Reply;
     let name = flotilla_resources::message_record_name("fleet/governor", "system:stall-judge", "stall-1");
     assert!(primitives.await_reply(NAMESPACE, &name, &judged, "home-a", "reply", None).await.expect("the judge's record"));
+}
+
+// The replicated designation alone supplies the fleet name. Changing its
+// charter Project preserves addresses; old unnamed records decode but refuse
+// resolution rather than silently using the Project name.
+#[tokio::test]
+async fn fleet_identity_is_independent_of_the_designated_project() {
+    use flotilla_core::primitives::roles::designated_fleet_roles;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    for project in ["project-map", "renamed-charter"] {
+        backend
+            .definitions::<Project>(NAMESPACE)
+            .apply(
+                &InputMeta::builder().name(project.into()).build(),
+                &ProjectSpec::builder().display_name(project.into()).default_workflow_ref("w".into()).repositories(Vec::new()).build(),
+            )
+            .await
+            .expect("charter Project");
+    }
+    let designations = backend.definitions::<FleetDesignation>(NAMESPACE);
+    let meta = InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build();
+    let mut spec: FleetDesignationSpec = serde_json::from_value(serde_json::json!({"project": "project-map"})).expect("old shape decodes");
+    designations.apply(&meta, &spec).await.expect("old designation");
+    let error = designated_fleet_roles(&backend, NAMESPACE).await.expect_err("no fallback");
+    assert!(error.to_string().contains("FleetDesignation.spec.fleet is missing"), "{error}");
+    for name in ["", "   "] {
+        spec.fleet = Some(name.into());
+        designations.apply(&meta, &spec).await.expect("empty name stored");
+        let error = designated_fleet_roles(&backend, NAMESPACE).await.expect_err("empty name refused");
+        assert!(error.to_string().contains("nonempty fleet"), "{error}");
+    }
+    spec.fleet = Some("lab".into());
+    for project in ["project-map", "renamed-charter"] {
+        spec.project = project.into();
+        designations.apply(&meta, &spec).await.expect("designation");
+        let roles = designated_fleet_roles(&backend, NAMESPACE).await.expect("named fleet");
+        assert_eq!(roles.address("nudge").expect("role").as_str(), "fleet:lab/role:nudge");
+        assert_eq!(roles.fleet().as_str(), "fleet:lab");
+    }
 }
