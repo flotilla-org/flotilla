@@ -42,12 +42,12 @@ impl<R> CloneReconciler<R> {
         self
     }
 
-    fn reading(&self, obj: &ResourceObject<Clone>) -> Option<LifecycleReading> {
-        self.lifecycle_reads.reading(ProvisioningKind::Clone, &obj.metadata.name, None)
+    fn reading(&self, obj: &ResourceObject<Clone>) -> Result<Option<LifecycleReading>, String> {
+        self.lifecycle_reads.try_reading(ProvisioningKind::Clone, &obj.metadata.name, None)
     }
 
-    fn provisioning(&self, obj: &ResourceObject<Clone>) -> bool {
-        match self.reading(obj) {
+    fn provisioning(obj: &ResourceObject<Clone>, reading: Option<&LifecycleReading>) -> bool {
+        match reading {
             Some(reading) => matches!(reading, LifecycleReading::InProgress | LifecycleReading::Retrying { .. }),
             None => matches!(obj.status.as_ref().map(|status| status.phase).unwrap_or_default(), ClonePhase::Pending | ClonePhase::Cloning),
         }
@@ -69,6 +69,7 @@ where
     type Prepared = ClonePrepared;
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        let reading = self.reading(obj).map_err(ResourceError::other)?;
         let repository = match self.repositories.get(&obj.spec.repo_ref.to_string()).await {
             Ok(repository) => repository,
             Err(ResourceError::NotFound { .. }) => return Ok(ClonePrepared::Failed(format!("repository {} not found", obj.spec.repo_ref))),
@@ -84,7 +85,7 @@ where
         if obj.metadata.name != expected_name {
             return Ok(ClonePrepared::Failed(format!("clone name mismatch: expected {expected_name}")));
         }
-        if !self.provisioning(obj) {
+        if !Self::provisioning(obj, reading.as_ref()) {
             return Ok(ClonePrepared::None);
         }
 
@@ -105,7 +106,16 @@ where
         prepared: &Self::Prepared,
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
-        let patch = if self.provisioning(obj) {
+        let reading = match self.reading(obj) {
+            Ok(reading) => reading,
+            Err(error) => {
+                let mut outcome = ReconcileOutcome::new(None);
+                outcome.events.push(ObjectEvent::for_object(obj, "LifecycleReadFailed", error));
+                outcome.requeue_after = Some(Duration::from_secs(30));
+                return outcome;
+            }
+        };
+        let patch = if Self::provisioning(obj, reading.as_ref()) {
             match prepared {
                 ClonePrepared::Ready { default_branch } => Some(CloneStatusPatch::MarkReady { default_branch: default_branch.clone() }),
                 ClonePrepared::Retrying(message) => Some(CloneStatusPatch::MarkRetrying { message: message.clone() }),
@@ -121,7 +131,7 @@ where
             outcome.events.push(ObjectEvent::for_object(obj, "CloneFailed", message.clone()));
         }
         if matches!(prepared, ClonePrepared::Retrying(_)) {
-            let next_attempt = match self.reading(obj) {
+            let next_attempt = match reading {
                 Some(LifecycleReading::Retrying { failures, .. }) => failures.saturating_add(1),
                 Some(_) => 1,
                 None => obj.status.as_ref().and_then(|status| status.retry.as_ref()).map_or(1, |retry| retry.attempts.saturating_add(1)),
@@ -142,12 +152,13 @@ where
     fn retry_disposition(&self, obj: &ResourceObject<Self::Resource>) -> Option<flotilla_resources::ControllerRetryDisposition> {
         use flotilla_resources::ControllerRetryDisposition;
         match self.reading(obj) {
-            Some(LifecycleReading::Retrying { next, .. }) => Some(ControllerRetryDisposition::Retryable { next_attempt_at: next }),
-            Some(LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause }) => {
+            Ok(Some(LifecycleReading::Retrying { next, .. })) => Some(ControllerRetryDisposition::Retryable { next_attempt_at: next }),
+            Ok(Some(LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause })) => {
                 Some(ControllerRetryDisposition::Terminal { needs: cause })
             }
-            Some(_) => None,
-            None => obj.status.as_ref()?.retry.as_ref().map(|retry| retry.disposition.clone()),
+            Ok(Some(_)) => None,
+            Ok(None) => obj.status.as_ref()?.retry.as_ref().map(|retry| retry.disposition.clone()),
+            Err(_) => None,
         }
     }
 }

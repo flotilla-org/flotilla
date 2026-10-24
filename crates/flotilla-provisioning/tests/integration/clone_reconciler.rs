@@ -239,7 +239,7 @@ async fn clone_reconciliation_reads_the_engine_without_a_status_copy() {
                 .await
                 .expect("clone");
             clone.status = Some(CloneStatus { phase: old_phase, ..Default::default() });
-            let (home, reads) = common::engine_clones();
+            let common::EngineClones { home, reads, store } = common::engine_clones();
             home.request(&name, CloneBinding::request(&clone, "home").expect("request"), Timestamp(1)).expect("requested");
             let reconciler = CloneReconciler::new(Arc::new(FailingCloneRuntime), backend.using("flotilla")).with_lifecycle_reads(reads);
             let prepared = reconciler.prepare(&clone).await.expect("prepare requested");
@@ -296,6 +296,16 @@ async fn clone_reconciliation_reads_the_engine_without_a_status_copy() {
                 );
             }
             assert_eq!(clone.status.as_ref().expect("unchanged").phase, old_phase);
+            common::poison_store(store);
+            assert!(reconciler.prepare(&clone).await.err().expect("read error").to_string().contains("poisoned"));
+            assert!(
+                reconciler.retry_disposition(&clone).is_none(),
+                "prepare must surface the error instead of parking on old retry status"
+            );
+            let prepared = flotilla_provisioning::reconcilers::clone::ClonePrepared::Retrying("new report".into());
+            let failed_read = reconciler.reconcile(&clone, &prepared, chrono::Utc::now());
+            assert!(failed_read.patch.is_none());
+            assert!(failed_read.events.iter().any(|event| event.reason == "LifecycleReadFailed" && event.message.contains("poisoned")));
         }
     }
 }

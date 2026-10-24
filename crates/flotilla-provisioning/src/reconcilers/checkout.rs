@@ -218,7 +218,9 @@ impl<R> CheckoutReconciler<R> {
         checkout: &ResourceObject<Checkout>,
         clone: &ResourceObject<Clone>,
     ) -> Result<Option<CheckoutPrepared>, ResourceError> {
-        if let Some(reading) = self.lifecycle_reads.reading(ProvisioningKind::Clone, &clone.metadata.name, None) {
+        if let Some(reading) =
+            self.lifecycle_reads.try_reading(ProvisioningKind::Clone, &clone.metadata.name, None).map_err(ResourceError::other)?
+        {
             // The engine owns the retry episode; an old controller retry must not survive it.
             self.observe_clone_retry(checkout, None).await?;
             return Ok(match reading {

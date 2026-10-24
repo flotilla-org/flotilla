@@ -37,7 +37,9 @@ async fn operator_reads_a_ready_clone_without_a_status_copy() {
         "local",
         flotilla_state_machines::Home::with_log("local", flotilla_engine_store::StoreLog::new(Arc::clone(&store))).expect("home"),
     );
-    daemon.install_lifecycle_reads(Arc::new(LifecycleReadPort::new(StoreReads::new(store), "local".into()))).expect("read port");
+    daemon
+        .install_lifecycle_reads(Arc::new(LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), "local".into())))
+        .expect("read port");
     engine.request("source", CloneBinding::request(&clone, engine.home()).expect("request"), Timestamp(1)).expect("requested");
     engine.step("source", &Step::Realised { identity: "/repo".into() }, Timestamp(2)).expect("ready");
     let operator = super::super::ports::RuntimeOperatorReconciler {
@@ -46,5 +48,13 @@ async fn operator_reads_a_ready_clone_without_a_status_copy() {
         local_root: "local".into(),
     };
     assert_eq!(operator.reconcile_now(NAMESPACE, "clone", "source").await.expect("reconciled"), "Clone/source is already ready");
+    assert!(clones.get("source").await.expect("old clone").status.is_none());
+    assert!(std::thread::spawn(move || {
+        let _guard = store.lock().expect("healthy store");
+        panic!("injected store lock failure");
+    })
+    .join()
+    .is_err());
+    assert!(operator.reconcile_now(NAMESPACE, "clone", "source").await.expect_err("read error").contains("poisoned"));
     assert!(clones.get("source").await.expect("old clone").status.is_none());
 }

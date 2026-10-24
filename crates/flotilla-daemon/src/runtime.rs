@@ -869,12 +869,14 @@ fn spawn_controller_loops(
             move |backend: ResourceBackend, namespace_string: String| {
                 let local_host_ref = state.local_host_ref.clone();
                 let additional_host_refs = state.agentless_host_refs();
+                let lifecycle_reads = state.daemon.lifecycle_reads();
                 let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.environments));
                 let state = Arc::clone(&state);
                 (
                     vec![],
                     Engine::<_, EnvironmentBinding>::new(
                         EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, &namespace_string)
+                            .with_lifecycle_reads(lifecycle_reads)
                             .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
                             .with_additional_host_refs(additional_host_refs),
                         lifecycles,

@@ -1877,7 +1877,7 @@ async fn checkout_reads_clone_dependencies_without_a_status_copy() {
                 )
                 .await
                 .expect("checkout");
-            let (home, reads) = common::engine_clones();
+            let common::EngineClones { home, reads, store } = common::engine_clones();
             home.request("source", CloneBinding::request(&clone, "home").expect("request"), Timestamp(1)).expect("requested");
             let reconciler = CheckoutReconciler::new(
                 Arc::new(RecordingCheckoutRuntime { allow_creation: true, ..Default::default() }),
@@ -1930,6 +1930,8 @@ async fn checkout_reads_clone_dependencies_without_a_status_copy() {
                 }
             }
             assert_eq!(clones.get("source").await.expect("old clone").status.expect("status").phase, old_phase);
+            common::poison_store(store);
+            assert!(reconciler.prepare(&checkout).await.err().expect("read error").to_string().contains("poisoned"));
         }
     }
 }

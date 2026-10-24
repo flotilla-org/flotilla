@@ -176,6 +176,21 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
         name: &str,
         origin: Option<&str>,
     ) -> Option<flotilla_protocol::LifecycleReading> {
+        match self.try_reading(kind, name, origin) {
+            Ok(reading) => reading,
+            Err(error) => {
+                tracing::warn!(?kind, resource = name, %error, "engine reading failed");
+                None
+            }
+        }
+    }
+
+    fn try_reading(
+        &self,
+        kind: flotilla_resources::lifecycle_reads::ProvisioningKind,
+        name: &str,
+        origin: Option<&str>,
+    ) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
         use flotilla_resources::lifecycle_reads::ProvisioningKind;
         let home = origin.unwrap_or(&self.home);
         let judgement = match kind {
@@ -186,13 +201,9 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
             ProvisioningKind::TerminalSession => self.reads.terminal_session(name, home).map(|view| view.map(|view| view.judgement)),
             ProvisioningKind::Vessel => self.reads.vessel(name, home).map(|view| view.map(|view| view.judgement)),
         };
-        match judgement {
-            Ok(judgement) => judgement.map(|judgement| judgement.reading()),
-            Err(error) => {
-                tracing::warn!(?kind, resource = name, %error, "engine reading failed; the consumer reads the old status");
-                None
-            }
-        }
+        judgement
+            .map(|judgement| judgement.map(|judgement| judgement.reading()))
+            .map_err(|error| format!("engine {kind:?}/{name}: {error}"))
     }
 }
 

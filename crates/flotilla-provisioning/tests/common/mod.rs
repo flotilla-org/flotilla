@@ -539,11 +539,14 @@ pub fn cr_name(service: &str, scope: &str, number: u64) -> String {
     .expect("record name")
 }
 
+pub struct EngineClones {
+    pub home: Arc<dyn flotilla_provisioning::engine::Lifecycles<flotilla_provisioning::stored::clone::CloneKind>>,
+    pub reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+    pub store: Arc<std::sync::Mutex<flotilla_schema_sqlite::Store>>,
+}
+
 /// A real decided store and its resource-facing read port; no status copy is applied.
-pub fn engine_clones() -> (
-    Arc<dyn flotilla_provisioning::engine::Lifecycles<flotilla_provisioning::stored::clone::CloneKind>>,
-    Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
-) {
+pub fn engine_clones() -> EngineClones {
     use flotilla_provisioning::engine::{
         reads::{LifecycleReadPort, StoreReads},
         LifecycleHome,
@@ -554,5 +557,19 @@ pub fn engine_clones() -> (
         flotilla_schema_sqlite::Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry).expect("store"),
     ));
     let home = flotilla_state_machines::Home::with_log("home", flotilla_engine_store::StoreLog::new(Arc::clone(&store))).expect("home");
-    (Arc::new(LifecycleHome::new("home", home)), Arc::new(LifecycleReadPort::new(StoreReads::new(store), "home".into())))
+    EngineClones {
+        home: Arc::new(LifecycleHome::new("home", home)),
+        reads: Arc::new(LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), "home".into())),
+        store,
+    }
+}
+
+/// Fault injection at the decided store's synchronization boundary.
+pub fn poison_store(store: Arc<std::sync::Mutex<flotilla_schema_sqlite::Store>>) {
+    assert!(std::thread::spawn(move || {
+        let _guard = store.lock().expect("healthy store");
+        panic!("injected store lock failure");
+    })
+    .join()
+    .is_err());
 }

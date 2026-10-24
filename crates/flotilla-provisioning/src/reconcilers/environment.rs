@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits};
+use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading};
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
 use flotilla_resources::{
     Checkout, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentStatusPatch, Host, ImageBuildPhase, ImageDelivery,
     ResourceError, ResourceObject,
@@ -33,6 +34,7 @@ pub struct EnvironmentReconciler<R> {
     runtime: Arc<R>,
     hosts: TypedResolver<Host>,
     backend: ResourceBackend,
+    lifecycle_reads: Arc<dyn LifecycleReads>,
     namespace: String,
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
@@ -45,11 +47,17 @@ impl<R> EnvironmentReconciler<R> {
             runtime,
             hosts: backend.using::<Host>(namespace),
             backend,
+            lifecycle_reads: Arc::new(NoLifecycleReads),
             namespace: namespace.into(),
             local_host_ref: None,
             additional_host_refs: Default::default(),
             adoption_retries: Default::default(),
         }
+    }
+
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
+        self.lifecycle_reads = reads;
+        self
     }
 
     pub fn with_local_host_ref(mut self, local_host_ref: CanonicalHostId) -> Self {
@@ -119,7 +127,14 @@ where
                     if let Some(name) = &original.image_build_ref {
                         // The composed image is the per-identity build's digest.
                         // Never fall back to another image: wait with the reason.
-                        let build = match flotilla_store::read_image_build(&self.backend, &self.namespace, name).await {
+                        let reading = match flotilla_store::read_image_build_with_lifecycle(
+                            &self.backend,
+                            &self.namespace,
+                            name,
+                            Arc::clone(&self.lifecycle_reads),
+                        )
+                        .await
+                        {
                             Ok(build) => build,
                             Err(ResourceError::NotFound { .. }) => {
                                 // A previous-generation per-stage build can never
@@ -143,13 +158,24 @@ where
                             }
                             Err(error) => return Err(error),
                         };
+                        let build = reading.build.object;
                         let status = build.status.clone().unwrap_or_default();
-                        let digest = match (status.phase, &status.digest) {
-                            (ImageBuildPhase::Built, Some(digest)) => digest.clone(),
-                            (phase, _) => {
-                                let reason = status.failure.as_ref().map(|failure| format!(": {}", failure.reason)).unwrap_or_default();
-                                return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} {phase:?}{reason}")));
+                        let digest = match reading.lifecycle {
+                            Some(LifecycleReading::Ready { identity }) => identity,
+                            Some(reading) => {
+                                return Ok(EnvironmentPrepared::Waiting(format!(
+                                    "ImageBuild {name} {}: {}",
+                                    reading.label(),
+                                    reading.reason().unwrap_or_default(),
+                                )))
                             }
+                            None => match (status.phase, &status.digest) {
+                                (ImageBuildPhase::Built, Some(digest)) => digest.clone(),
+                                (phase, _) => {
+                                    let reason = status.failure.as_ref().map(|failure| format!(": {}", failure.reason)).unwrap_or_default();
+                                    return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} {phase:?}{reason}")));
+                                }
+                            },
                         };
                         spec.image = digest;
                         // A local build exists only on its builder. A registry

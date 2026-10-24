@@ -144,11 +144,19 @@ impl Aggregator {
                             )
                             .on_host(host.clone())
                         };
-                        let reading = self.lifecycle_reads.reading(
+                        let reading = self.lifecycle_reads.try_reading(
                             ProvisioningKind::Clone,
                             &spec.clone_ref,
                             engine_origin(&clone.provenance).as_deref(),
                         );
+                        let reading = match reading {
+                            Ok(reading) => reading,
+                            Err(error) => {
+                                result.state = result.state.max(ReadinessState::Blocked);
+                                result.blockers.push(ReadinessBlocker { resource: clone_ref(), phase: "Unknown".into(), reason: error });
+                                continue;
+                            }
+                        };
                         if let Some(reading) = reading {
                             if let Some((state, phase, reason)) = reading_blocker(&reading, "clone is not ready") {
                                 result.state = result.state.max(state);

@@ -16,9 +16,21 @@ pub enum ProvisioningKind {
 
 /// Lifecycle judgements served by keyed reads of the decided store, judged at read time.
 pub trait LifecycleReads: Send + Sync {
+    /// Compatibility adapter for readers that still have a status copy. Readers without a copy
+    /// use `try_reading` so a read failure cannot select stale status.
     /// The reading of `name` homed at `origin` (a replica's origin root; `None` for this home), or
     /// `None` when the engine holds no such resource: the switch is off, or it was written before.
     fn reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Option<flotilla_protocol::LifecycleReading>;
+
+    /// A read failure is distinct from an unheld resource and must not select legacy status.
+    fn try_reading(
+        &self,
+        kind: ProvisioningKind,
+        name: &str,
+        origin: Option<&str>,
+    ) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
+        Ok(self.reading(kind, name, origin))
+    }
 }
 
 /// No engine: every view reads the old status.
@@ -46,5 +58,14 @@ impl LateLifecycleReads {
 impl LifecycleReads for LateLifecycleReads {
     fn reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Option<flotilla_protocol::LifecycleReading> {
         self.installed.get()?.reading(kind, name, origin)
+    }
+
+    fn try_reading(
+        &self,
+        kind: ProvisioningKind,
+        name: &str,
+        origin: Option<&str>,
+    ) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
+        self.installed.get().map_or(Ok(None), |reads| reads.try_reading(kind, name, origin))
     }
 }
