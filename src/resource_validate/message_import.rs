@@ -169,6 +169,33 @@ mod tests {
         assert!(report.refused[0].reason.contains("does not decode"));
     }
 
+    // Contract #3760: with a decoded Message, every undecodable supporting
+    // record is a named refusal even if that Message does not reference it.
+    // Exhaust the finite set of supporting kinds; no transport is involved.
+    #[test]
+    fn undecodable_supporting_records_are_refused_beside_a_good_message() {
+        for kind in ["forges", "convoys", "artifacts", "repositories", "terminalsessions"] {
+            let mut documents = Documents::default();
+            documents.0.insert(
+                "fleetdesignations".into(),
+                vec![serde_json::json!({
+                    "apiVersion":"flotilla.work/v1", "kind":"FleetDesignation",
+                    "metadata":{"name":"fleet","namespace":"flotilla","resourceVersion":"1","creationTimestamp":"2026-10-19T00:00:00Z"},
+                    "spec":{"project":"fleet"},
+                })],
+            );
+            documents
+                .0
+                .insert("messages".into(), vec![message("good", "system:turn-rules", "flotilla/demo/work/coder", "accepted", Value::Null)]);
+            documents.0.insert(kind.into(), vec![serde_json::json!({"metadata":{"name":"broken"},"spec":7})]);
+            let report = documents.rehearse("flotilla");
+            assert_eq!(report.total(), 1, "the good Message still imports: {kind}: {report:?}");
+            assert_eq!(report.refused.len(), 1, "{kind}: {report:?}");
+            assert_eq!(report.refused[0].record, "broken");
+            assert_eq!(report.refused[0].reason, format!("{kind} does not decode"));
+        }
+    }
+
     // Behaviour: the rehearsal imports the daemon's Messages into a temporary
     // store, counts them by new state, and names each refusal.
     #[test]
