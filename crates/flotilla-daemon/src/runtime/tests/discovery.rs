@@ -120,12 +120,8 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
     let local_host_id = daemon.local_host_id().expect("local host ID").to_string();
     let host_id = "ssh-test-host";
     let environment_id = EnvironmentId::new(format!("host-direct-{host_id}"));
-    // #3618: the session's crews reach the daemon through a forward to a short
-    // runtime directory, with the controller's CLI delivered beside it.
+    // #3792: vessel agents live in a short runtime directory.
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
-    let own_cli = temp.path().join("controller-bin/flotilla");
-    fs::create_dir_all(own_cli.parent().expect("cli dir")).expect("cli dir");
-    fs::write(&own_cli, "#!/bin/sh\n").expect("controller cli");
     let commands = Arc::new(StdMutex::new(Vec::new()));
     let runner: Arc<dyn CommandRunner> = Arc::new(SshProvisioningRecordingRunner { commands: Arc::clone(&commands) });
     daemon
@@ -174,6 +170,7 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         host_environment: Default::default(),
         max_vessels: Some(2),
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
+        vessel_agent: Err("the test's vessel agents run on the host runner".into()),
     };
     register_agentless_ssh_resources(&daemon.resource_backend(), NAMESPACE, &local_host_id, &profile)
         .await
@@ -227,12 +224,11 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
             format!("host-direct-{local_host_id}"),
         )
         .with_agentless_ssh(vec![profile])
-        .with_agentless_reach(Some(Arc::new(AgentlessReach::new(
-            Arc::new(ListeningSsh),
-            test_socket_service(temp.path()),
-            CliSource::new(Ok(own_cli.clone()), "gen-1"),
-            ForwardTiming::default(),
-        )))),
+        .with_agentless_vessels(Some(vessels_over(
+            RunnerVesselAgents::new(Arc::new(ProcessCommandRunner), Arc::new(ProviderRegistry::new())),
+            temp.path(),
+        )))
+        .with_environment_tools(EnvironmentToolProvisioner::new(Vec::new())),
     );
     // The SSH host's host-direct Environment resolves to the provider in the
     // SSH environment's registry, not the owner's.
@@ -292,8 +288,14 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         .await
         .expect("worktree over SSH runner");
     assert!(worktree_path.join(".git").exists());
+    {
+        let commands = commands.lock().expect("command log");
+        assert!(commands.iter().any(|command| command == "git"));
+    }
+    // #3792: only crew sessions run on an agentless host, each in its
+    // vessel's agent; a tool session names no vessel and is refused.
     let terminal = TerminalControllerRuntime { state: Arc::clone(&state) };
-    terminal
+    let error = terminal
         .ensure_session(
             "ssh-crew",
             &flotilla_resources::TerminalSessionSpec::builder()
@@ -306,49 +308,23 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
             &[],
         )
         .await
-        .expect("crew terminal pool provisioned through the SSH environment");
-    {
-        let ensured = pool.ensured.lock().await;
-        assert_eq!(ensured.len(), 1);
-        assert_eq!(ensured[0].cwd.as_path(), worktree_path.as_path());
-        let env = |name: &str| ensured[0].env_vars.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
-        let socket = env("FLOTILLA_DAEMON_SOCKET").expect("forwarded daemon socket");
-        assert!(socket.starts_with(&runtime_dir.path().display().to_string()), "{socket}");
-        assert_eq!(env("FLOTILLA_ENVIRONMENT_ID").as_deref(), Some(environment_id.as_str()));
-        let path = env("PATH").expect("PATH");
-        let cli_directory = path.split(':').next().expect("CLI directory");
-        assert!(Path::new(cli_directory).join("flotilla").is_file(), "CLI delivered to {cli_directory}");
-        let commands = commands.lock().expect("command log");
-        assert!(commands.iter().any(|command| command == "git"));
-        assert!(commands.iter().any(|command| command == "mv"));
-    }
+        .expect_err("a tool session on an agentless host has no vessel");
+    assert!(error.contains("runs only crew sessions"), "{error}");
+    assert!(pool.ensured.lock().await.is_empty());
     environments.cleanup(environment_id.as_str()).await.expect("host-direct Environment is released on the SSH host");
 }
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 
-use super::agentless_reach::{AgentlessReach, CliSource, ForwardTiming, HostPlatform};
-use crate::server::environment_sockets::{EnvironmentSocketRegistry, EnvironmentSocketService};
+use super::agentless_vessels::{AgentlessVessels, HostPlatform, SshVesselAgents};
+use super::vessel_support::{vessels_over, RunnerVesselAgents};
 
-/// A real environment-socket service whose accept loop holds connections open.
-fn test_socket_service(state: &Path) -> EnvironmentSocketService {
-    EnvironmentSocketService::new(
-        Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
-        DaemonHostPath::new(state.join("env")),
-        |listener, _, _| {
-            tokio::spawn(async move {
-                let _listener = listener;
-                std::future::pending::<()>().await
-            })
-        },
-    )
-}
-
-// #3618: a host whose platform has no flotilla CLI in the controller's
-// generation is refused at placement with the reason; a host on the
-// controller's own platform is served by the controller's CLI.
+// #3792: a host this controller cannot run vessel agents on is refused at
+// placement with the reason: no agent reach, no runtime directory, a platform
+// whose tools this generation lacks, or no agent build. A platform never
+// probed successfully (an SSH blip) is diagnostic only.
 #[tokio::test]
-async fn agentless_host_without_a_platform_cli_is_refused_at_placement() {
+async fn agentless_host_without_vessel_agents_is_refused_at_placement() {
     let controller = HostPlatform::controller();
     let controller_uname = format!(
         "{} {}\n",
@@ -356,41 +332,79 @@ async fn agentless_host_without_a_platform_cli_is_refused_at_placement() {
         if controller.os == "macos" && controller.arch == "aarch64" { "arm64" } else { controller.arch.as_str() }
     );
     let state = TempDir::new().expect("state");
-    let sockets = test_socket_service(state.path());
-    let reach = AgentlessReach::new(
-        Arc::new(ProcessCommandRunner),
-        sockets,
-        CliSource::new(Ok(state.path().join("bin/flotilla")), "gen-1"),
-        ForwardTiming::default(),
+    let build = state.path().join("drydock-agent");
+    fs::write(&build, b"agent").expect("agent build");
+    let found = build.clone();
+    let vessels = AgentlessVessels::new(
+        Arc::new(SshVesselAgents::with_agent_build(Box::new(move |_| Ok(found.clone())))),
+        vessel_support::held_socket_service(state.path()),
+        state.path().join("vessels"),
     );
-    let profile = |uname: &str| AgentlessSshProfile {
-        provisioning: manual_profile("b1", false),
-        environment_id: EnvironmentId::new("host-direct-b1"),
-        destination: "crew@b1".into(),
-        env_bag: EnvironmentBag::new(),
-        runner: Arc::new(DiscoveryMockRunner::builder().on_run("uname", &["-s", "-m"], Ok(uname.into())).build()),
+    let reach = flotilla_environment::environment::agent::host::SshAgentReach {
+        address: "b1.example".into(),
+        port: 22,
+        user: "crew".into(),
+        host_key: "ssh-ed25519 AAAA".into(),
+        identity_file: state.path().join("key"),
+    };
+    let profile = |id: &str, uname: Option<&str>, runtime: bool, reach: Result<_, String>| AgentlessSshProfile {
+        provisioning: manual_profile(id, false),
+        environment_id: EnvironmentId::new(format!("host-direct-{id}")),
+        destination: format!("crew@{id}"),
+        env_bag: if runtime {
+            EnvironmentBag::new().with(EnvironmentAssertion::env_var("XDG_RUNTIME_DIR", "/run/user/1000"))
+        } else {
+            EnvironmentBag::new()
+        }
+        .with(EnvironmentAssertion::env_var("HOME", "/home/crew")),
+        runner: Arc::new(match uname {
+            Some(uname) => DiscoveryMockRunner::builder().on_run("uname", &["-s", "-m"], Ok(uname.into())).build(),
+            None => DiscoveryMockRunner::builder().build(),
+        }),
         host_environment: Default::default(),
         max_vessels: None,
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
+        vessel_agent: reach,
     };
     let now = chrono::Utc::now();
+    let refused = |conditions: Vec<flotilla_resources::HostCondition>, ready: bool| {
+        let status = flotilla_resources::HostStatus { ready, heartbeat_at: Some(now), conditions, ..Default::default() };
+        flotilla_admission::support::unready_placement_refusal("host-direct-b1", "b1", Some(&status), now)
+    };
 
-    let (conditions, cli_available) = super::discovery::agentless_reach_conditions(&reach, &profile("Linux riscv64\n")).await;
-    assert!(!cli_available);
-    let status = flotilla_resources::HostStatus { ready: cli_available, heartbeat_at: Some(now), conditions, ..Default::default() };
-    let refusal = flotilla_admission::support::unready_placement_refusal("host-direct-b1", "b1", Some(&status), now).expect("refused");
+    let (conditions, ready) =
+        super::discovery::agentless_vessel_conditions(Some(&vessels), &profile("b1", Some(&controller_uname), true, Ok(reach.clone())))
+            .await;
+    assert!(ready, "{conditions:?}");
+    assert!(conditions.is_empty());
+
+    let (conditions, ready) =
+        super::discovery::agentless_vessel_conditions(Some(&vessels), &profile("b2", Some("Linux riscv64\n"), true, Ok(reach.clone())))
+            .await;
+    assert!(!ready);
+    let refusal = refused(conditions, ready).expect("refused");
     assert!(refusal.contains("NoPlatformBuild") && refusal.contains("linux-riscv64"), "{refusal}");
 
-    let (conditions, cli_available) = super::discovery::agentless_reach_conditions(&reach, &profile(&controller_uname)).await;
-    assert!(cli_available, "{conditions:?}");
-    assert!(conditions.is_empty(), "no forward has been dialled, so none is reported down");
+    let missing = Err("hosts.toml [hosts.b3.vessel_agent] is not set".to_string());
+    let (conditions, ready) =
+        super::discovery::agentless_vessel_conditions(Some(&vessels), &profile("b3", Some(&controller_uname), false, missing)).await;
+    assert!(!ready);
+    let reasons = conditions.iter().map(|condition| condition.reason.clone()).collect::<Vec<_>>();
+    assert_eq!(reasons, ["MissingReach", "NoRuntimeDirectory"]);
+    assert!(refused(conditions, ready).expect("refused").contains("vessel_agent"));
 
-    // Review #3621: a platform never probed successfully (an ssh blip) is
-    // diagnostic and does not refuse placement.
-    let mut blip = profile("unused");
-    blip.environment_id = EnvironmentId::new("host-direct-b2");
-    blip.runner = Arc::new(DiscoveryMockRunner::builder().build());
-    let (conditions, cli_available) = super::discovery::agentless_reach_conditions(&reach, &blip).await;
-    assert!(cli_available);
+    let (conditions, ready) =
+        super::discovery::agentless_vessel_conditions(Some(&vessels), &profile("b4", None, true, Ok(reach.clone()))).await;
+    assert!(ready);
     assert!(matches!(conditions.as_slice(), [condition] if condition.reason == "PlatformUnknown" && !condition.blocks_readiness()));
+
+    let no_build = AgentlessVessels::new(
+        Arc::new(SshVesselAgents::with_agent_build(Box::new(|_| Err("install drydock-agent beside flotillad".into())))),
+        vessel_support::held_socket_service(state.path()),
+        state.path().join("vessels"),
+    );
+    let (conditions, ready) =
+        super::discovery::agentless_vessel_conditions(Some(&no_build), &profile("b5", Some(&controller_uname), true, Ok(reach))).await;
+    assert!(!ready);
+    assert!(matches!(conditions.as_slice(), [condition] if condition.reason == "NoAgentBuild"), "{conditions:?}");
 }

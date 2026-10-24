@@ -772,6 +772,8 @@ pub struct InProcessDaemon {
     fleet: FleetService,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
     operator_reconciler: RwLock<Option<Arc<dyn OperatorReconciler>>>,
+    /// Sessions on agentless hosts run in their vessels' agents (#3792).
+    agentless_vessels: std::sync::RwLock<Option<Arc<dyn AgentlessVesselAccess>>>,
     /// Process-lifetime host discovery, independent of tracked-root membership.
     /// Heartbeats publish these observations into Host status.
     local_provider_statuses: Vec<HostProviderStatus>,
@@ -817,6 +819,23 @@ impl ConvoyEnsureAdmission for InProcessDaemon {
 #[async_trait]
 pub trait OperatorReconciler: Send + Sync {
     async fn reconcile_now(&self, namespace: &str, kind: &str, name: &str) -> Result<String, String>;
+}
+
+/// #3792: a session on an agentless host runs in its vessel's drydock agent,
+/// which the daemon runtime owns. Its files and its attach go through that
+/// agent; each method answers `None` for a session elsewhere.
+#[async_trait]
+pub trait AgentlessVesselAccess: Send + Sync {
+    /// The runner for commands and files in the session's vessel.
+    async fn runner(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Option<Result<Arc<dyn CommandRunner>, String>>;
+    /// Attach to the session's cleat through its vessel's agent: a local
+    /// socket forwarded to the vessel's cleat, and the session's name there.
+    async fn attach(
+        &self,
+        spec: &flotilla_resources::TerminalSessionSpec,
+        session_id: &str,
+        seat: AttachMode,
+    ) -> Option<Result<(std::path::PathBuf, String), String>>;
 }
 
 #[async_trait]
@@ -1338,6 +1357,7 @@ impl InProcessDaemon {
             ),
             repository_inspector: RwLock::new(None),
             operator_reconciler: RwLock::new(None),
+            agentless_vessels: std::sync::RwLock::new(None),
             local_provider_statuses,
             local_placement_provider_statuses: RwLock::new(Vec::new()),
         });
@@ -1516,6 +1536,27 @@ impl InProcessDaemon {
 
     pub async fn set_operator_reconciler(&self, reconciler: Arc<dyn OperatorReconciler>) {
         *self.operator_reconciler.write().await = Some(reconciler);
+    }
+
+    pub fn set_agentless_vessel_access(&self, access: Arc<dyn AgentlessVesselAccess>) {
+        *self.agentless_vessels.write().expect("agentless vessels lock poisoned") = Some(access);
+    }
+
+    /// The runner for a session's files: its vessel's agent on an agentless
+    /// host (#3792), otherwise its environment's runner. `None` when neither
+    /// is known; an error when the vessel's agent cannot be reached.
+    pub async fn command_runner_for_session(
+        &self,
+        spec: &flotilla_resources::TerminalSessionSpec,
+    ) -> Option<Result<Arc<dyn CommandRunner>, String>> {
+        let access = self.agentless_vessels.read().expect("agentless vessels lock poisoned").clone();
+        if let Some(runner) = match access {
+            Some(access) => access.runner(spec).await,
+            None => None,
+        } {
+            return Some(runner);
+        }
+        self.command_runner_for_environment_ref(&spec.env_ref).map(Ok)
     }
 
     pub async fn set_work_credential_reconciler(&self, reconciler: Arc<dyn WorkCredentialReconciler>) {
@@ -4707,6 +4748,7 @@ impl InProcessDaemon {
             host_name: &self.host_name,
             namespace: &self.provisioning_namespace,
             lifecycle_reads: self.lifecycle_reads.as_ref(),
+            agentless_vessels: self.agentless_vessels.read().expect("agentless vessels lock poisoned").clone(),
         }
     }
 

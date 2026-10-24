@@ -62,61 +62,6 @@ impl CommandRunner for SshProvisioningRecordingRunner {
     }
 }
 
-/// Stands in for the controller's `ssh -R`: it binds the requested remote
-/// listener (a local path here, as the SSH host is this machine) and holds it
-/// until killed. The forwarded bytes themselves are covered by server tests.
-#[derive(Default)]
-pub(super) struct ListeningSsh;
-
-struct ListeningForward(Option<tokio::net::UnixListener>, PathBuf);
-
-#[async_trait]
-impl flotilla_provider_runtime::CommandProcess for ListeningForward {
-    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
-        use std::os::unix::process::ExitStatusExt;
-        Ok(self.0.is_none().then(|| std::process::ExitStatus::from_raw(0)))
-    }
-
-    async fn kill(&mut self) -> Result<(), String> {
-        self.0 = None;
-        let _ = std::fs::remove_file(&self.1);
-        Ok(())
-    }
-
-    async fn wait(&mut self) -> Result<std::process::ExitStatus, String> {
-        use std::os::unix::process::ExitStatusExt;
-        Ok(std::process::ExitStatus::from_raw(0))
-    }
-}
-
-#[async_trait]
-impl CommandRunner for ListeningSsh {
-    async fn run(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-        Err(format!("unexpected controller command {cmd}"))
-    }
-
-    async fn run_output(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
-        Err(format!("unexpected controller command {cmd}"))
-    }
-
-    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
-        false
-    }
-
-    async fn spawn_long_lived(
-        &self,
-        _cmd: &str,
-        args: &[&str],
-        _cwd: &Path,
-        _label: &ChannelLabel,
-    ) -> Result<Box<dyn flotilla_provider_runtime::CommandProcess>, String> {
-        let spec = args[args.iter().position(|arg| *arg == "-R").ok_or("no reverse forward")? + 1];
-        let remote = PathBuf::from(spec.split_once(':').ok_or("malformed forward")?.0);
-        let listener = tokio::net::UnixListener::bind(&remote).map_err(|error| error.to_string())?;
-        Ok(Box::new(ListeningForward(Some(listener), remote)))
-    }
-}
-
 pub(super) struct CredentialInteriorRunner(pub(super) DiscoveryMockRunner, pub(super) Option<Arc<AtomicBool>>);
 
 #[derive(Default)]
