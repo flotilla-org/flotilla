@@ -66,6 +66,7 @@ pub mod host;
 mod issue;
 #[doc(hidden)]
 pub mod labels;
+pub mod lifecycle_reads;
 mod landing_gate;
 mod leaf;
 mod manifest_root;
