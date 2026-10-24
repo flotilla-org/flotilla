@@ -325,12 +325,9 @@ use super::vessel_support::{vessels_over, RunnerVesselAgents};
 // probed successfully (an SSH blip) is diagnostic only.
 #[tokio::test]
 async fn agentless_host_without_vessel_agents_is_refused_at_placement() {
-    let controller = HostPlatform::controller();
-    let controller_uname = format!(
-        "{} {}\n",
-        if controller.os == "macos" { "Darwin" } else { "Linux" },
-        if controller.os == "macos" && controller.arch == "aarch64" { "arm64" } else { controller.arch.as_str() }
-    );
+    let system = if cfg!(target_os = "macos") { "Darwin" } else { "Linux" };
+    assert_eq!(HostPlatform::from_uname(system, std::env::consts::ARCH), HostPlatform::controller());
+    let controller_uname = format!("{system} {}\n", std::env::consts::ARCH);
     let state = TempDir::new().expect("state");
     let build = state.path().join("drydock-agent");
     fs::write(&build, b"agent").expect("agent build");

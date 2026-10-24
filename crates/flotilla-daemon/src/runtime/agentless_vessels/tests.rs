@@ -31,6 +31,8 @@ const ENVIRONMENT: &str = "host-direct-b1";
 struct LocalAgents {
     agents: StdMutex<HashMap<PathBuf, tokio::task::JoinHandle<()>>>,
     opened: AtomicUsize,
+    /// Every handle opened, to check what teardown and failures close.
+    handles: StdMutex<Vec<Arc<AgentRunner>>>,
 }
 
 impl Drop for LocalAgents {
@@ -103,6 +105,7 @@ impl VesselAgents for LocalAgents {
         self.serve(&paths.agent);
         let connector = LocalConnector(paths.agent.join("agent.sock"));
         let agent = Arc::new(AgentRunner::new(Arc::new(connector), local.into()).with_writable_bases(WritableBases::Host));
+        self.handles.lock().expect("handles").push(Arc::clone(&agent));
         Ok(Arc::new(AgentVessel { agent, host: Arc::clone(&profile.runner) }))
     }
     async fn probe(
@@ -182,7 +185,15 @@ fn host(runner: Arc<dyn CommandRunner>) -> Host {
 }
 
 async fn access(vessels: &AgentlessVessels, host: &Host, vessel: &str) -> Result<Arc<VesselAccess>, String> {
-    let tools = EnvironmentToolProvisioner::new(Vec::new());
+    access_with(vessels, host, vessel, EnvironmentToolProvisioner::new(Vec::new())).await
+}
+
+async fn access_with(
+    vessels: &AgentlessVessels,
+    host: &Host,
+    vessel: &str,
+    tools: EnvironmentToolProvisioner,
+) -> Result<Arc<VesselAccess>, String> {
     let discovery = flotilla_discovery_testkit::fake_discovery(false);
     let config = ConfigStore::with_base(host.state.path().join("config"));
     vessels.access(&VesselPreparation { tools: &tools, discovery: &discovery, config: &config }, &host.profile, vessel).await
@@ -457,4 +468,84 @@ async fn a_replicated_session_keeps_its_vessel_live() {
     let live = live_vessels(&actuator, "flotilla", ENVIRONMENT).await.expect("live vessels");
     assert_eq!(live, BTreeSet::from(["convoy-9-work".to_string()]));
     assert!(live_vessels(&actuator, "flotilla", "host-direct-b2").await.expect("live vessels").is_empty());
+}
+
+/// A generation layer whose sources are missing.
+struct MissingLayer;
+
+#[async_trait]
+impl crate::environment_tools::EnvironmentToolFactory for MissingLayer {
+    fn provider_kinds(&self) -> &[crate::environment_tools::EnvironmentToolProviderKind] {
+        &[AGENTLESS_SSH_PROVIDER_KIND]
+    }
+    async fn prepare(
+        &self,
+        _environment_name: &str,
+        _context: &dyn EnvironmentToolContext,
+    ) -> Result<flotilla_environment::environment::EnvironmentTool, String> {
+        Err("publish fleet tools: cleat release lacks xterm-ghostty terminfo".into())
+    }
+}
+
+// Review #3808: a preparation that fails after the agent opened closes that
+// handle at once, so nothing of it lingers beside the next attempt, which
+// opens afresh and succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_preparation_closes_its_handle() {
+    let host = host(Arc::new(ProcessCommandRunner));
+    let agents = Arc::new(LocalAgents::default());
+    let (sockets, _received) = recording_sockets(host.state.path());
+    let vessels = AgentlessVessels::new(agents.clone(), sockets, host.state.path().join("vessels"));
+    let error = access_with(&vessels, &host, "convoy-1-work", EnvironmentToolProvisioner::new(vec![Arc::new(MissingLayer)]))
+        .await
+        .err()
+        .expect("missing layer");
+    assert!(error.contains("xterm-ghostty"), "{error}");
+    let first = agents.handles.lock().unwrap()[0].clone();
+    assert!(first.is_closed(), "the failed attempt's handle is closed");
+    access(&vessels, &host, "convoy-1-work").await.expect("the retry prepares the vessel");
+    let handles = agents.handles.lock().unwrap().clone();
+    assert_eq!(handles.len(), 2);
+    assert!(!handles[1].is_closed());
+}
+
+/// The host, except that its vessel markers cannot be listed.
+struct MarkersUnlisted;
+
+#[async_trait]
+impl CommandRunner for MarkersUnlisted {
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+        if args.contains(&"flotilla-vessel-markers") {
+            return Err("ssh: connection reset".into());
+        }
+        ProcessCommandRunner.run(cmd, args, cwd, label).await
+    }
+    async fn run_output(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+        ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+    }
+    async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+        ProcessCommandRunner.exists(cmd, args).await
+    }
+}
+
+// Review #3808: a failed marker listing still retires the vessels this
+// controller prepared; only the marker-discovered ones wait for the next pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_marker_listing_still_retires_known_vessels() {
+    let mut host = host(Arc::new(ProcessCommandRunner));
+    let agents = Arc::new(LocalAgents::default());
+    let (sockets, _received) = recording_sockets(host.state.path());
+    let vessels = AgentlessVessels::new(agents, sockets, host.state.path().join("vessels"));
+    let gone = access(&vessels, &host, "convoy-1-work").await.expect("vessel");
+    host.profile.runner = Arc::new(MarkersUnlisted);
+    let error = vessels.retire_absent(&host.profile, &BTreeSet::new()).await.expect_err("markers unlisted");
+    assert!(error.contains("connection reset"), "{error}");
+    assert!(!gone.paths.agent.exists() && !gone.paths.state.exists(), "the known vessel is retired");
+    assert!(access(&vessels, &host, "convoy-1-work").await.is_err());
 }

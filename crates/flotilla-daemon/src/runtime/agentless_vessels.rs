@@ -167,40 +167,20 @@ pub(super) fn state_root(bag: &EnvironmentBag) -> Result<PathBuf, String> {
     Ok(state.join("flotilla/vessels"))
 }
 
-/// Operating system and architecture, normalised as Rust names them.
+/// A host's operating system and architecture, as drydock names them: one
+/// normalisation of `uname` output ([`platform_from_uname`]) serves both the
+/// comparison with the controller and the choice of agent build.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct HostPlatform {
-    pub(super) os: String,
-    pub(super) arch: String,
-    system: String,
-    machine: String,
-}
+pub(super) struct HostPlatform(drydock_protocol::Platform);
 
 impl HostPlatform {
     pub(super) fn controller() -> Self {
-        Self::from_uname(
-            match std::env::consts::OS {
-                "macos" => "Darwin",
-                "linux" => "Linux",
-                other => other,
-            },
-            std::env::consts::ARCH,
-        )
+        Self(drydock_protocol::Platform::current())
     }
 
     /// From `uname -s` and `uname -m`.
     pub(super) fn from_uname(system: &str, machine: &str) -> Self {
-        let os = match system.trim() {
-            "Linux" => "linux".to_string(),
-            "Darwin" => "macos".to_string(),
-            other => other.to_ascii_lowercase(),
-        };
-        let arch = match machine.trim() {
-            "amd64" | "x86_64" => "x86_64".to_string(),
-            "arm64" | "aarch64" => "aarch64".to_string(),
-            other => other.to_ascii_lowercase(),
-        };
-        Self { os, arch, system: system.trim().to_string(), machine: machine.trim().to_string() }
+        Self(platform_from_uname(system, machine))
     }
 
     pub(super) async fn probe(runner: &dyn CommandRunner) -> Result<Self, String> {
@@ -216,15 +196,15 @@ impl HostPlatform {
         }
     }
 
-    /// Drydock's name for this platform, which selects the agent build.
+    /// The platform that selects the agent build.
     pub(super) fn drydock(&self) -> drydock_protocol::Platform {
-        platform_from_uname(&self.system, &self.machine)
+        self.0.clone()
     }
 }
 
 impl std::fmt::Display for HostPlatform {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-{}", self.os, self.arch)
+        write!(f, "{}-{}", self.0.os, self.0.architecture)
     }
 }
 
@@ -605,10 +585,32 @@ impl AgentlessVessels {
         let paths = VesselPaths::new(&profile.env_bag, &key)?;
         let local = self.local_directory(&key)?;
         let handle = self.agents.open(profile, &paths, &local).await?;
+        // A failed preparation closes its handle at once: its listeners and
+        // connection never linger beside the next attempt's.
+        match self.prepare_opened(preparation, profile, &key, &paths, &handle).await {
+            Ok(registry) => {
+                info!(environment = %key.environment, vessel = %key.vessel, agent = %paths.agent.display(), "vessel agent ready");
+                Ok(VesselAccess { key, paths, handle, registry })
+            }
+            Err(error) => {
+                handle.close().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn prepare_opened(
+        &self,
+        preparation: &VesselPreparation<'_>,
+        profile: &AgentlessSshProfile,
+        key: &VesselKey,
+        paths: &VesselPaths,
+        handle: &Arc<dyn VesselHandle>,
+    ) -> Result<Arc<ProviderRegistry>, String> {
         let agent = handle.agent();
         agent.ready().await.map_err(|error| format!("vessel agent for {}: {error}", key.vessel))?;
         let runner = handle.runner();
-        let marker = serde_json::to_string(&key).map_err(|error| error.to_string())?;
+        let marker = serde_json::to_string(key).map_err(|error| error.to_string())?;
         for directory in [&paths.agent, &paths.state] {
             runner.write_file(&directory.join(MARKER), &marker).await.map_err(|error| format!("mark vessel directory: {error}"))?;
         }
@@ -620,7 +622,7 @@ impl AgentlessVessels {
         let context = LayerContext { prefix: paths.state.clone() };
         let tools = preparation.tools.prepare(AGENTLESS_SSH_PROVIDER_KIND, &key.environment, &context).await?;
         agent.push_tools(&tools).await.map_err(|error| format!("push vessel tools: {error}"))?;
-        let environment = vessel_environment(profile, &paths)?;
+        let environment = vessel_environment(profile, paths)?;
         handle.configure_environment(environment.clone()).await.map_err(|error| format!("configure vessel environment: {error}"))?;
         let socket = self.sockets.prepare_vessel_forwarded(profile.environment_id.clone(), &key.vessel).await?;
         handle.forward_daemon(&paths.daemon_socket(), socket.as_path()).await.map_err(|error| format!("forward daemon socket: {error}"))?;
@@ -629,9 +631,7 @@ impl AgentlessVessels {
             key.environment,
             key.directory()
         )));
-        let registry = self.agents.probe(preparation.discovery, &discovery, profile, handle.as_ref(), &environment).await?;
-        info!(environment = %key.environment, vessel = %key.vessel, agent = %paths.agent.display(), "vessel agent ready");
-        Ok(VesselAccess { key, paths, handle, registry })
+        self.agents.probe(preparation.discovery, &discovery, profile, handle.as_ref(), &environment).await
     }
 
     /// Owner-only, as drydock requires of attach forward listeners.
@@ -686,7 +686,7 @@ impl AgentlessVessels {
     pub(super) async fn retire_absent(&self, profile: &AgentlessSshProfile, live: &BTreeSet<String>) -> Result<(), String> {
         let environment = profile.environment_id.to_string();
         self.retired.lock().await.retain(|key| key.environment != environment || !live.contains(&key.vessel));
-        let mut absent = self
+        let known = self
             .vessels
             .lock()
             .await
@@ -694,14 +694,19 @@ impl AgentlessVessels {
             .filter(|key| key.environment == environment && !live.contains(&key.vessel))
             .map(|key| key.vessel.clone())
             .collect::<BTreeSet<_>>();
-        absent.extend(
-            self.marked(profile)
-                .await?
-                .into_iter()
-                .filter(|key| key.environment == environment && !live.contains(&key.vessel))
-                .map(|key| key.vessel),
-        );
-        for vessel in absent {
+        // Vessels this controller prepared are retired even when the host's
+        // markers cannot be listed; the next pass retries the listing.
+        for vessel in &known {
+            self.retire(profile, vessel).await;
+        }
+        let marked = self
+            .marked(profile)
+            .await?
+            .into_iter()
+            .filter(|key| key.environment == environment && !live.contains(&key.vessel) && !known.contains(&key.vessel))
+            .map(|key| key.vessel)
+            .collect::<BTreeSet<_>>();
+        for vessel in marked {
             self.retire(profile, &vessel).await;
         }
         Ok(())
@@ -718,6 +723,13 @@ impl AgentlessVessels {
     }
 
     /// Vessels with a marker under the host's vessel roots.
+    ///
+    /// The sweep assumes this controller is the host's one owning daemon, as
+    /// its Host's `AgentlessSsh { owning_daemon }` connection declares: a
+    /// marker for this environment whose vessel this controller's store does
+    /// not hold is retired. Two daemons configured with the same agentless
+    /// host would retire each other's vessels; registering one host from two
+    /// daemons is already unsupported.
     async fn marked(&self, profile: &AgentlessSshProfile) -> Result<Vec<VesselKey>, String> {
         let mut roots = Vec::new();
         for root in [agent_root(&profile.env_bag), state_root(&profile.env_bag)].into_iter().flatten() {
