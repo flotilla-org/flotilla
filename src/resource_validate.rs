@@ -50,6 +50,8 @@ pub(crate) struct ValidationOptions {
     pub credential_tokens: BTreeMap<String, PathBuf>,
 }
 
+// Candidate validation, including import enforcement, requires the Unix resource
+// socket; non-Unix callers receive this unsupported-operation error.
 #[cfg(not(unix))]
 pub async fn validate_daemon(_socket: &Path, _local_roots: Option<&[PathBuf]>, _skill_catalog: Option<&Path>) -> Result<usize> {
     Err(eyre!("daemon resource-socket validation is only supported on Unix"))
