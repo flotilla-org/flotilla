@@ -613,94 +613,127 @@ async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
     ));
 }
 
+// Terminal convoy ownership still fails live or lost sessions, even with lost backing.
 #[tokio::test]
 async fn failed_convoy_terminal_stops_without_probing_its_gone_environment_runtime() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-failed-convoy").await;
-    let convoy =
-        create_convoy_with_single_task(&backend, "flotilla", "failed-convoy", "work", "https://github.com/flotilla-org/flotilla", "main")
-            .await;
-    let convoys = backend.clone().using::<Convoy>("flotilla");
-    let mut convoy_status = convoy.status.expect("convoy status");
-    convoy_status.phase = ConvoyPhase::Failed;
-    convoys.update_status("failed-convoy", &convoy.metadata.resource_version, &convoy_status).await.expect("fail convoy");
+    for phase in [TerminalSessionPhase::Starting, TerminalSessionPhase::Running, TerminalSessionPhase::Lost] {
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        create_ready_environment(&backend, "env-failed-convoy").await;
+        let convoy = create_convoy_with_single_task(
+            &backend,
+            "flotilla",
+            "failed-convoy",
+            "work",
+            "https://github.com/flotilla-org/flotilla",
+            "main",
+        )
+        .await;
+        let convoys = backend.clone().using::<Convoy>("flotilla");
+        let mut convoy_status = convoy.status.expect("convoy status");
+        convoy_status.phase = ConvoyPhase::Failed;
+        convoys.update_status("failed-convoy", &convoy.metadata.resource_version, &convoy_status).await.expect("fail convoy");
 
-    let sessions = backend.clone().using::<TerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &InputMeta::builder()
-                .name("terminal-failed-convoy-work-coder".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "failed-convoy".to_string())]))
-                .build(),
-            &TerminalSessionSpec {
-                env_ref: "env-failed-convoy".to_string(),
-                role: "coder".to_string(),
-                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            },
+        flotilla_store::apply_status_patch(
+            &backend.clone().using::<flotilla_resources::Environment>("flotilla"),
+            "env-failed-convoy",
+            &EnvironmentStatusPatch::MarkLost { message: "cgroup_oom".into() },
         )
         .await
-        .expect("create terminal");
-    let mut running = TerminalSessionStatus::default();
-    TerminalSessionStatusPatch::MarkRunning {
-        configured_limits: None,
-        session_id: "cleat-failed-convoy".to_string(),
-        pid: None,
-        started_at: Utc::now(),
-        crew: None,
-        launch_command: "cargo test".to_string(),
-        delivered_message_id: None,
+        .expect("lost backing");
+        let sessions = backend.clone().using::<TerminalSession>("flotilla");
+        let session = sessions
+            .create(
+                &InputMeta::builder()
+                    .name("terminal-failed-convoy-work-coder".to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "failed-convoy".to_string())]))
+                    .build(),
+                &TerminalSessionSpec {
+                    env_ref: "env-failed-convoy".to_string(),
+                    role: "coder".to_string(),
+                    source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                    cwd: "/workspace".to_string(),
+                    env: Default::default(),
+                    pool: "cleat".to_string(),
+                },
+            )
+            .await
+            .expect("create terminal");
+        let mut running = TerminalSessionStatus::default();
+        TerminalSessionStatusPatch::MarkRunning {
+            configured_limits: None,
+            session_id: "cleat-failed-convoy".to_string(),
+            pid: None,
+            started_at: Utc::now(),
+            crew: None,
+            launch_command: "cargo test".to_string(),
+            delivered_message_id: None,
+        }
+        .apply(&mut running);
+        running.phase = phase;
+        let session = sessions
+            .update_status(&session.metadata.name, &session.metadata.resource_version, &running)
+            .await
+            .expect("mark terminal running");
+        let runtime = Arc::new(UnavailableRunningRuntime::default());
+        let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+
+        let prepared = reconciler.prepare(&session).await.expect("terminal owner state");
+        let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
+
+        assert!(matches!(outcome.patch, Some(TerminalSessionStatusPatch::MarkFailed { .. })));
+        assert!(matches!(outcome.actuations.as_slice(), [Actuation::DeleteDemand { .. }]));
+        assert_eq!(runtime.probes.load(Ordering::SeqCst), 0, "terminal owner state must short-circuit the unavailable runtime");
     }
-    .apply(&mut running);
-    let session =
-        sessions.update_status(&session.metadata.name, &session.metadata.resource_version, &running).await.expect("mark terminal running");
-    let runtime = Arc::new(UnavailableRunningRuntime::default());
-    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
-
-    let prepared = reconciler.prepare(&session).await.expect("terminal owner state");
-    let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
-
-    assert!(matches!(outcome.patch, Some(TerminalSessionStatusPatch::MarkFailed { .. })));
-    assert!(matches!(outcome.actuations.as_slice(), [Actuation::DeleteDemand { .. }]));
-    assert_eq!(runtime.probes.load(Ordering::SeqCst), 0, "terminal owner state must short-circuit the unavailable runtime");
 }
 
+// Failed provisioning still fails sessions in every live/recoverable phase.
 #[tokio::test]
 async fn failed_environment_terminal_stops_without_probing_its_runtime() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-failed").await;
-    let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
-    let environment = environments.get("env-failed").await.expect("environment");
-    let mut environment_status = environment.status.expect("environment status");
-    EnvironmentStatusPatch::MarkFailed { message: "container is permanently gone".to_string() }.apply(&mut environment_status);
-    environments.update_status("env-failed", &environment.metadata.resource_version, &environment_status).await.expect("fail environment");
+    for phase in [TerminalSessionPhase::Starting, TerminalSessionPhase::Running, TerminalSessionPhase::Lost] {
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        create_ready_environment(&backend, "env-failed").await;
+        let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
+        let environment = environments.get("env-failed").await.expect("environment");
+        let mut environment_status = environment.status.expect("environment status");
+        EnvironmentStatusPatch::MarkFailed { message: "container is permanently gone".to_string() }.apply(&mut environment_status);
+        environments
+            .update_status("env-failed", &environment.metadata.resource_version, &environment_status)
+            .await
+            .expect("fail environment");
 
-    let sessions = backend.clone().using::<TerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &meta("terminal-failed-environment"),
-            &TerminalSessionSpec {
-                env_ref: "env-failed".to_string(),
-                role: "coder".to_string(),
-                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            },
-        )
-        .await
-        .expect("create terminal");
-    let runtime = Arc::new(UnavailableRunningRuntime::default());
-    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+        let sessions = backend.clone().using::<TerminalSession>("flotilla");
+        let session = sessions
+            .create(
+                &meta("terminal-failed-environment"),
+                &TerminalSessionSpec {
+                    env_ref: "env-failed".to_string(),
+                    role: "coder".to_string(),
+                    source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                    cwd: "/workspace".to_string(),
+                    env: Default::default(),
+                    pool: "cleat".to_string(),
+                },
+            )
+            .await
+            .expect("create terminal");
+        let session = sessions
+            .update_status(
+                &session.metadata.name,
+                &session.metadata.resource_version,
+                &TerminalSessionStatus { phase, ..Default::default() },
+            )
+            .await
+            .expect("session phase");
+        let runtime = Arc::new(UnavailableRunningRuntime::default());
+        let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
 
-    let prepared = reconciler.prepare(&session).await.expect("terminal environment state");
-    let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
+        let prepared = reconciler.prepare(&session).await.expect("terminal environment state");
+        let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
 
-    assert!(matches!(outcome.patch, Some(TerminalSessionStatusPatch::MarkFailed { .. })));
-    assert!(matches!(outcome.actuations.as_slice(), [Actuation::DeleteDemand { .. }]));
-    assert_eq!(runtime.probes.load(Ordering::SeqCst), 0, "terminal environment state must short-circuit the unavailable runtime");
+        assert!(matches!(outcome.patch, Some(TerminalSessionStatusPatch::MarkFailed { .. })));
+        assert!(matches!(outcome.actuations.as_slice(), [Actuation::DeleteDemand { .. }]));
+        assert_eq!(runtime.probes.load(Ordering::SeqCst), 0, "terminal environment state must short-circuit the unavailable runtime");
+    }
 }
 
 #[derive(Default)]
@@ -3607,4 +3640,142 @@ async fn unverifiable_controller_fence_is_named_and_requires_a_new_activation() 
     assert_eq!(runtime.delivered.lock().expect("attempts").len(), 1);
     TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
     assert!(status.degraded.is_none(), "resume starts a new activation");
+}
+
+// Environment loss interrupts work regardless of reconciliation order. Repeated
+// passes beyond the process recovery delay must never touch the dead runtime.
+#[hegel::test]
+fn environment_loss_preserves_recoverable_work(tc: hegel::TestCase) {
+    use flotilla_crew::reconcilers::vessel::VesselReconciler;
+    use flotilla_resources::{CrewSource, CrewWorkPhase, CrewWorkState, Environment, VesselPhase, VesselStatus, WorkPhase};
+    // Cover both interleavings and duplicate passes, including the recovery boundary.
+    let session_first = tc.draw(hegel::generators::booleans());
+    let passes = tc.draw(hegel::generators::integers::<usize>().min_value(2).max_value(4));
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        create_ready_environment(&backend, "loss-env").await;
+        let convoy =
+            create_convoy_with_single_task(&backend, "flotilla", "loss", "work", "https://github.com/flotilla-org/flotilla", "main").await;
+        let convoys = backend.clone().using::<Convoy>("flotilla");
+        let mut status = convoy.status.expect("status");
+        status.phase = ConvoyPhase::Active;
+        status.observed_workflow_ref = Some("wf".into());
+        status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0].source =
+            CrewSource::Agent { selector: flotilla_resources::Selector::for_capability("coding"), prompt: None, brief_template: None };
+        status
+            .crew_work
+            .insert("work".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]));
+        status.work.insert("work".into(), common::work_state().phase(WorkPhase::Running).call());
+        convoys.update_status("loss", &convoy.metadata.resource_version, &status).await.expect("running convoy");
+        let vessels = backend.clone().using::<Vessel>("flotilla");
+        let vessel = vessels
+            .create(
+                &InputMeta::builder().name("loss-work".into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), "loss".into())])).build(),
+                &VesselSpec {
+                    convoy_ref: "loss".into(),
+                    vessel_name: "work".into(),
+                    placement_policy_ref: "unused".into(),
+                    adopted_checkout_refs: Default::default(),
+                },
+            )
+            .await
+            .expect("vessel");
+        vessels
+            .update_status(
+                "loss-work",
+                &vessel.metadata.resource_version,
+                &VesselStatus {
+                    phase: VesselPhase::Ready,
+                    environment_ref: Some("loss-env".into()),
+                    terminal_session_refs: vec!["loss-session".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ready vessel");
+        let sessions = backend.clone().using::<TerminalSession>("flotilla");
+        let session = sessions
+            .create(
+                &InputMeta::builder().name("loss-session".into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), "loss".into())])).build(),
+                &TerminalSessionSpec {
+                    env_ref: "loss-env".into(),
+                    role: "coder".into(),
+                    source: flotilla_resources::TerminalSessionSource::Agent {
+                        selector: flotilla_resources::Selector::for_capability("coding"),
+                        brief: flotilla_resources::TerminalBrief {
+                            path: "brief.md".into(),
+                            content: "work".into(),
+                            artifact_digest: None,
+                            copies: vec![],
+                        },
+                        context: Box::new(flotilla_resources::TerminalCrewContext {
+                            namespace: "flotilla".into(),
+                            convoy: "loss".into(),
+                            vessel_ref: "loss-work".into(),
+                        }),
+                        message: None,
+                    },
+                    cwd: "/workspace".into(),
+                    env: Default::default(),
+                    pool: "cleat".into(),
+                },
+            )
+            .await
+            .expect("session");
+        let mut running = TerminalSessionStatus::default();
+        TerminalSessionStatusPatch::MarkRunning {
+            configured_limits: None,
+            session_id: "live".into(),
+            pid: None,
+            started_at: Utc::now(),
+            crew: None,
+            launch_command: "test".into(),
+            delivered_message_id: None,
+        }
+        .apply(&mut running);
+        sessions.update_status("loss-session", &session.metadata.resource_version, &running).await.expect("running");
+        let environments = backend.clone().using::<Environment>("flotilla");
+        flotilla_store::apply_status_patch(&environments, "loss-env", &EnvironmentStatusPatch::MarkLost { message: "cgroup_oom".into() })
+            .await
+            .expect("loss");
+        let runtime = Arc::new(UnavailableRunningRuntime::default());
+        let session_reconciler = TerminalSessionReconciler::new(runtime.clone(), backend.clone(), "flotilla");
+        let vessel_reconciler = VesselReconciler::new(backend.clone(), "flotilla");
+        let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>("flotilla"))
+            .with_vessels(vessels.clone())
+            .with_terminal_sessions(sessions.clone());
+        for pass in 0..passes {
+            let now = Utc::now() + chrono::Duration::seconds(10 * pass as i64);
+            for session_turn in [session_first, !session_first] {
+                if session_turn {
+                    let obj = sessions.get("loss-session").await.expect("session");
+                    let prepared = session_reconciler.prepare(&obj).await.expect("prepare session");
+                    if let Some(patch) = session_reconciler.reconcile(&obj, &prepared, now).patch {
+                        flotilla_store::apply_status_patch(&sessions, "loss-session", &patch).await.expect("session patch");
+                    }
+                    let status = sessions.get("loss-session").await.unwrap().status.unwrap();
+                    assert_eq!(status.phase, TerminalSessionPhase::Lost);
+                    assert_eq!(status.message.as_deref(), Some("cgroup_oom"));
+                    assert_eq!(runtime.probes.load(Ordering::SeqCst), 0);
+                } else {
+                    let obj = vessels.get("loss-work").await.expect("vessel");
+                    let prepared = vessel_reconciler.prepare(&obj).await.expect("prepare vessel");
+                    if let Some(patch) = vessel_reconciler.reconcile(&obj, &prepared, now).patch {
+                        flotilla_store::apply_status_patch(&vessels, "loss-work", &patch).await.expect("vessel patch");
+                    }
+                    assert_eq!(vessels.get("loss-work").await.unwrap().status.unwrap().phase, VesselPhase::Lost);
+                }
+            }
+            let convoys = backend.clone().using::<Convoy>("flotilla");
+            let obj = convoys.get("loss").await.expect("convoy");
+            let prepared = convoy_reconciler.prepare(&obj).await.expect("prepare convoy");
+            if let Some(patch) = convoy_reconciler.reconcile(&obj, &prepared, now).patch {
+                flotilla_store::apply_status_patch(&convoys, "loss", &patch).await.expect("convoy patch");
+            }
+            let status = convoys.get("loss").await.unwrap().status.unwrap();
+            assert!(!status.phase.is_terminal());
+            assert_eq!(status.work["work"].phase, WorkPhase::Interrupted);
+            assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Interrupted);
+        }
+    });
 }

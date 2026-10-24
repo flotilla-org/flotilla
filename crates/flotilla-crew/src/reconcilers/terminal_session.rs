@@ -356,6 +356,7 @@ pub enum TerminalPrepared {
     DaemonReach(Option<String>),
     OwnerMissing,
     OwnerTerminal,
+    EnvironmentLost(String),
     Failed(String),
 }
 
@@ -413,13 +414,21 @@ where
             }
             Err(err) => return Err(err),
         };
-        if environment.status.as_ref().is_some_and(|status| matches!(status.phase, EnvironmentPhase::Failed | EnvironmentPhase::Lost)) {
+        if environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Failed) {
             return Ok(TerminalPrepared::OwnerTerminal);
         }
         match self.session_owner_state(obj).await? {
             TerminalOwnerState::Gone => return Ok(TerminalPrepared::OwnerMissing),
             TerminalOwnerState::Terminal => return Ok(TerminalPrepared::OwnerTerminal),
             TerminalOwnerState::Active => {}
+        }
+
+        // Backing loss is recoverable work interruption, not provisioning failure.
+        // Keep it distinct from process loss: never probe or relaunch in a dead environment.
+        if let Some(status) = environment.status.as_ref().filter(|status| status.phase == EnvironmentPhase::Lost) {
+            return Ok(TerminalPrepared::EnvironmentLost(
+                status.message.clone().unwrap_or_else(|| format!("environment {} disappeared", environment.metadata.name)),
+            ));
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
@@ -701,19 +710,23 @@ where
             condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
                 && now.signed_duration_since(condition.observed_at) >= DELIVERY_HOLD_FOR
         });
-        let patch = match phase {
-            TerminalSessionPhase::Running if consumed => Some(TerminalSessionStatusPatch::MarkMessageDelivered {
+        let patch = match (phase, prepared) {
+            (
+                TerminalSessionPhase::Starting | TerminalSessionPhase::Running | TerminalSessionPhase::Lost,
+                TerminalPrepared::OwnerTerminal,
+            ) => Some(TerminalSessionStatusPatch::MarkFailed {
+                message: "owning environment or convoy reached a terminal phase".to_string(),
+                stopped_at: Some(now),
+            }),
+            (TerminalSessionPhase::Starting | TerminalSessionPhase::Running, TerminalPrepared::EnvironmentLost(reason)) => {
+                Some(TerminalSessionStatusPatch::MarkLost { reason: reason.clone(), lost_at: now })
+            }
+            (TerminalSessionPhase::Running, _) if consumed => Some(TerminalSessionStatusPatch::MarkMessageDelivered {
                 message_id: held.and_then(|condition| condition.message_id.clone()).expect("held delivery message"),
             }),
-            TerminalSessionPhase::Running if expired => Some(TerminalSessionStatusPatch::MarkDeliveryExpired),
-            _ if matches!(prepared, TerminalPrepared::ReceiptsRetired) => Some(TerminalSessionStatusPatch::ClearRetiredLaunches),
-            TerminalSessionPhase::Starting | TerminalSessionPhase::Running if matches!(prepared, TerminalPrepared::OwnerTerminal) => {
-                Some(TerminalSessionStatusPatch::MarkFailed {
-                    message: "owning environment or convoy reached a terminal phase".to_string(),
-                    stopped_at: Some(now),
-                })
-            }
-            TerminalSessionPhase::Starting => match prepared {
+            (TerminalSessionPhase::Running, _) if expired => Some(TerminalSessionStatusPatch::MarkDeliveryExpired),
+            (_, TerminalPrepared::ReceiptsRetired) => Some(TerminalSessionStatusPatch::ClearRetiredLaunches),
+            (TerminalSessionPhase::Starting, _) => match prepared {
                 TerminalPrepared::Running(state) => Some(TerminalSessionStatusPatch::MarkRunning {
                     configured_limits: state.configured_limits.clone(),
                     session_id: state.session_id.clone(),
@@ -749,9 +762,10 @@ where
                 | TerminalPrepared::AttentionStale
                 | TerminalPrepared::DaemonReach(_)
                 | TerminalPrepared::OwnerMissing
-                | TerminalPrepared::OwnerTerminal => None,
+                | TerminalPrepared::OwnerTerminal
+                | TerminalPrepared::EnvironmentLost(_) => None,
             },
-            TerminalSessionPhase::Running if matches!(prepared, TerminalPrepared::Stopped | TerminalPrepared::AgentExited(_)) => {
+            (TerminalSessionPhase::Running, _) if matches!(prepared, TerminalPrepared::Stopped | TerminalPrepared::AgentExited(_)) => {
                 Some(TerminalSessionStatusPatch::MarkStopped {
                     stopped_at: now,
                     inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
@@ -763,7 +777,7 @@ where
                         .then(|| "agent process exited; resume relaunches it in the existing checkout".to_string()),
                 })
             }
-            TerminalSessionPhase::Running => match prepared {
+            (TerminalSessionPhase::Running, _) => match prepared {
                 TerminalPrepared::Lost(reason) => Some(TerminalSessionStatusPatch::MarkLost { reason: reason.clone(), lost_at: now }),
                 TerminalPrepared::CleatEndpoint(endpoint) => {
                     Some(TerminalSessionStatusPatch::ObserveCleatEndpoint { endpoint: endpoint.clone() })
@@ -878,7 +892,7 @@ where
                 }),
                 _ => None,
             },
-            TerminalSessionPhase::Lost => match prepared {
+            (TerminalSessionPhase::Lost, _) => match prepared {
                 TerminalPrepared::Failed(message) => {
                     Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })
                 }
@@ -886,7 +900,7 @@ where
                 TerminalPrepared::RecoverLost => Some(TerminalSessionStatusPatch::MarkStarting),
                 _ => None,
             },
-            TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed => None,
+            (TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed, _) => None,
         }
         .or_else(|| {
             obj.status
@@ -901,7 +915,7 @@ where
             TerminalPrepared::Stopped | TerminalPrepared::AgentExited(_) | TerminalPrepared::OwnerTerminal => {
                 vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
             }
-            TerminalPrepared::Lost(_) | TerminalPrepared::AttentionStale => {
+            TerminalPrepared::Lost(_) | TerminalPrepared::EnvironmentLost(_) | TerminalPrepared::AttentionStale => {
                 vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
             }
             _ if matches!(phase, TerminalSessionPhase::Lost | TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed) => {
@@ -918,6 +932,7 @@ where
                         | TerminalPrepared::Stopped
                         | TerminalPrepared::AgentExited(_)
                         | TerminalPrepared::Lost(_)
+                        | TerminalPrepared::EnvironmentLost(_)
                         | TerminalPrepared::OwnerTerminal
                         | TerminalPrepared::Failed(_)
                 )
