@@ -317,7 +317,8 @@ jobs:
           prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
           add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          shared-key: "test"
+          # Bumped when the build profile changes: an exact key hit never saves.
+          shared-key: "test-v2"
       # The action verifies the release checksum.
       - uses: taiki-e/install-action@v2
         with:
