@@ -13,9 +13,34 @@ review** prompt does not. Both the unrestricted baseline and a separate
 baseline with `fulfilment_grants = Some(empty)` start without hook review.
 Codex discovery reports 14 enabled, trusted hooks on the unpatched baseline.
 The captures are real observations, and do not claim to show the requested
-before-fix review prompt. No PR was opened because that explicit prerequisite
-has not been met. Reproduction guidance or a revised acceptance decision is
-needed to finish delivery.
+before-fix review prompt. The operator authorized opening the PR with this
+limitation after one further same-home relaunch check. That check also did not
+reproduce hook review before or after the fix. The fresh-crew check on feta
+after the roll remains the operator acceptance step.
+
+## Exact conditions tried
+
+Every launch used the installed 0.160.0 binary, adapter-generated command,
+`--no-daemon`, no explicit model, the same controlled tool brief, and the seven
+`-c hooks.<Event>` definitions plus `notify=[]`, `features.hooks=true`, and all
+seven enabled/trusted `hooks.state` records keyed to
+`/<session-flags>/config.toml:<event>:0:0`. The hook command was unchanged;
+PATH selected a recording stand-in for `flotilla`.
+
+| Launch | Home | Command mode | Hook review |
+| --- | --- | --- | --- |
+| Before, fresh | `/tmp/codex-3823-before/home`; adapter installs seven home hooks and seven matching home trust records | `--dangerously-bypass-approvals-and-sandbox` | Absent |
+| Before, fresh restricted | `/tmp/codex-3823-before-restricted/home`; same home hook/trust installation | Empty fulfilment grants; bypass flag absent | Absent (later tool sandbox failed and asked for execution approval) |
+| After, fresh | `/tmp/codex-3823-after/home`; adapter writes workspace trust, no home hook definitions | `--dangerously-bypass-approvals-and-sandbox` | Absent |
+| Before, exit/relaunch | Reuse `/tmp/codex-3823-before/home` after `/quit`, without restaging or modifying config/trust/auth | Identical saved command and launch environment | Absent |
+| After, exit/relaunch | Reuse `/tmp/codex-3823-after/home` after `/quit`, without restaging or modifying config/trust/auth | Identical saved command and launch environment | Absent |
+
+Both relaunches completed the same `printf hook-probe-3823` tool turn and
+returned to the composer. The baseline still delivered each event twice;
+the fixed relaunch delivered each once. See [before relaunch](before-relaunch.txt),
+[after relaunch](after-relaunch.txt), and the adjacent `*-relaunch-events.jsonl`.
+The fixed same-home relaunch starts a new conversation; it does not use
+`codex resume`, because the requested check was the same launch command.
 
 ## Captures and native hook evidence
 
