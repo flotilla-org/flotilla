@@ -191,6 +191,13 @@ pub(super) fn upload<'a>(
 
 #[async_trait]
 pub(super) trait Guest: Send + Sync {
+    async fn configure_lab(&self, _: Option<(String, u16)>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn closed(&self) -> bool {
+        false
+    }
+
     fn runner(&self) -> Arc<dyn CommandRunner>;
     async fn configure(&self, environment: BTreeMap<String, String>) -> Result<(), String>;
     async fn deliver(&self, asset: EnvironmentToolAsset) -> Result<(), String>;
@@ -227,24 +234,28 @@ impl Connector for SshConnector {
 }
 #[async_trait]
 impl Guest for Connection {
+    async fn closed(&self) -> bool {
+        use futures::FutureExt;
+        self.forwards.session.closed().now_or_never().is_some()
+    }
+
     fn runner(&self) -> Arc<dyn CommandRunner> {
         Arc::new(AgentRunner(self.agent.clone()))
     }
-    async fn configure(&self, mut environment: BTreeMap<String, String>) -> Result<(), String> {
-        let lab_forward = environment.remove("FLOTILLA_DRYDOCK_LAB_FORWARD").is_some_and(|value| value == "1");
-        self.agent.configure(drydock_agent::Configuration { environment, ..Default::default() }).await.map_err(error)?;
-        if !lab_forward {
+    async fn configure(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
+        self.agent.configure(drydock_agent::Configuration { environment, ..Default::default() }).await.map_err(error)
+    }
+    async fn configure_lab(&self, reach: Option<(String, u16)>) -> Result<(), String> {
+        let Some((hostname, port)) = reach else {
             return Ok(());
-        }
+        };
         let mut lab_configured = self.lab_configured.lock().await;
         if *lab_configured {
             return Ok(());
         }
         // Interim lab reach uses the very same pinned SSH connection. TLS stays
         // end-to-end to the lab service; the guest receives no reach credential.
-        self.forwards
-            .forward(Path::new("/run/drydock/flotilla-forgejo.sock"), Destination::Tcp("forgejo.lab.flotilla.work".into(), 443))
-            .await?;
+        self.forwards.forward(Path::new("/run/drydock/flotilla-forgejo.sock"), Destination::Tcp(hostname, port)).await?;
         let runner = self.runner();
         runner
             .run(

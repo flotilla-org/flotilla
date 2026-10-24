@@ -640,8 +640,8 @@ impl DockerControllerRuntime {
                 .await);
             }
         };
-        if environment_spec.cloud_sandbox.is_some() {
-            if let Err(error) = verify_cloud_image_needs(spec, &handle, &bag).await {
+        if let Some(cloud) = &environment_spec.cloud_sandbox {
+            if let Err(error) = verify_cloud_image_needs(&cloud.probe_needs, &cloud.image, &handle, &bag).await {
                 return Err(discard_failed_environment(
                     &handle,
                     self.state.credential_store.as_deref(),
@@ -898,18 +898,12 @@ impl flotilla_provider_runtime::EnvVars for GuestProbeEnvironment<'_> {
         }
     }
 }
-async fn verify_cloud_image_needs(
-    spec: &flotilla_resources::DockerEnvironmentSpec,
+pub(super) async fn verify_cloud_image_needs(
+    needs: &BTreeSet<flotilla_resources::CapabilityNeed>,
+    image: &str,
     handle: &EnvironmentHandle,
     bag: &EnvironmentBag,
 ) -> Result<(), String> {
-    let needs: BTreeSet<flotilla_resources::CapabilityNeed> = spec
-        .env
-        .get("FLOTILLA_CLOUD_IMAGE_NEEDS")
-        .map(|value| serde_json::from_str(value))
-        .transpose()
-        .map_err(|_| "invalid cloud image probe needs")?
-        .unwrap_or_default();
     if needs.is_empty() {
         return Ok(());
     }
@@ -924,7 +918,7 @@ async fn verify_cloud_image_needs(
         pool: "cleat".into(),
         cost_class: Default::default(),
         grants: Default::default(),
-        realisation: flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { image: spec.image.clone() },
+        realisation: flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { image: image.to_owned() },
     };
     let facts = crate::fulfilment_probe::probe_kind(
         &kind,
@@ -999,6 +993,9 @@ pub(super) async fn discard_failed_environment(
     environment_ref: &str,
     error: String,
 ) -> String {
+    if !handle.created_for_setup() {
+        return format!("{} {error}", flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX);
+    }
     let mut cleanup_errors = Vec::new();
     if let Err(cleanup_error) = handle.destroy().await {
         cleanup_errors.push(format!("destroy rejected environment: {cleanup_error}"));

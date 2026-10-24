@@ -1,0 +1,7 @@
+{
+  "apiVersion": "flotilla.work/v1", "kind": "Convoy",
+  "spec": {"workflow_ref":"cloud-fixture","role":"coder","generation":1,"inputs":{},"repositories":[],"issues":[],"subjects":[],"promises":[]},
+  "status": {"phase":"Active","placement_decision":{
+    "policy_name":"cloud","target_host":{"ref":"controller-id","display_name":"controller"},"provider_workspace_root":"/workspace"
+  }}
+}

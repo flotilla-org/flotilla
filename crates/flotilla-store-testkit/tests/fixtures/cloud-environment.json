@@ -1,0 +1,35 @@
+{
+  "apiVersion": "flotilla.work/v1",
+  "kind": "Environment",
+  "spec": {
+    "provider_address": "account:daytona/provider:daytona",
+    "cloud_sandbox": {
+      "image": "example.invalid/crew@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size": {"cpus": 2, "memory_bytes": 4294967296, "disk_bytes": 21474836480},
+      "probe_needs": ["toolchain:rust", "harness:codex>=0.160.0"],
+      "env": {"LANG": "C.UTF-8"}
+    }
+  },
+  "status": {
+    "phase": "Ready",
+    "ready": true,
+    "backing_id": "opaque-cloud-backing",
+    "image_ref": "example.invalid/crew@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "provider_descriptor": {
+      "instance": "daytona",
+      "kind": {"class": "cloud_sandbox", "implementation": "daytona"},
+      "image_digest": "example.invalid/crew@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "host_version": "1", "module_version": "1",
+      "capabilities": {
+        "material_modes": ["frozen", "pushed"],
+        "checkout_strategies": ["clone_in_vessel"],
+        "workspace_root": "/workspace",
+        "reference_root": null,
+        "suspend_resume": false, "export": false,
+        "egress_route": "open", "egress_enforcement": "advisory",
+        "fallback_runner": false, "receives_host_tools": true, "per_vessel": true
+      }
+    },
+    "survivors": {"host_checkpoint": "/state/drydock-keys/fixture/checkpoint.tar"}
+  }
+}

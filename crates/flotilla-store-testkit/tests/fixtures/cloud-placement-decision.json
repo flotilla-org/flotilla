@@ -1,0 +1,5 @@
+{
+  "policy_name": "cloud",
+  "target_host": {"ref": "controller-id", "display_name": "controller"},
+  "provider_workspace_root": "/workspace"
+}

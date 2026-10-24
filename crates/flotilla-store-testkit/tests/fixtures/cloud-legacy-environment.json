@@ -1,0 +1,17 @@
+{
+  "apiVersion": "flotilla.work/v1", "kind": "Environment",
+  "spec": {
+    "provider_address": "account:daytona/provider:daytona",
+    "cloud_sandbox": {
+      "image": "example.invalid/crew@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size": {"cpus": 2, "memory_bytes": 4294967296, "disk_bytes": 21474836480},
+      "env": {
+        "LANG": "C.UTF-8",
+        "FLOTILLA_REQUIRED_AGENT_ADAPTERS": "[\"codex\"]",
+        "FLOTILLA_CLOUD_IMAGE_NEEDS": "[\"toolchain:rust\",\"harness:codex>=0.160.0\"]",
+        "FLOTILLA_DRYDOCK_LAB_FORWARD": "1"
+      }
+    }
+  },
+  "status": {"phase": "Ready", "ready": true, "backing_id": "legacy-cloud-backing"}
+}

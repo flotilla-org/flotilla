@@ -28,18 +28,23 @@ host binaries and missing/rejected credentials remain advertised as not-ready.
 Settings are module-owned and passed through unchanged. No Daytona credential
 enters the vessel or its stored Environment record.
 
-Preparation uses only `drydock::launch::build_tools_digest()`. At the initial
-pinned revision, `crates/drydock/tools-image.txt` is `unpublished`; preparation
-therefore refuses until the dependency is updated to a published Drydock pin,
-or the operator supplies Drydock's documented `DRYDOCK_TOOLS_IMAGE` override
-when building Flotilla and its companions. Flotilla never selects
-a substitute tools image. Reference-module tests explicitly assert this refusal
-and use reference fixture tools for the remaining lifecycle/conformance checks.
+Production preparation uses `drydock::launch::build_tools_digest()` from the
+workspace's Drydock pin. The reference suite follows that path when the pin's
+tools image is published. For an unpublished pin, it verifies production refusal
+then prepares explicit reference-only tools through the real host API, matching
+main's fixture behavior; production has no digest override.
 
 The base crew image must contain the required agent harnesses, Git, `tar`, `sh`,
-and support the module's SSH recipe. Opt-in lab forwarding also requires
-`socat`. Set `FLOTILLA_DRYDOCK_LAB_FORWARD=1` in the cloud policy's `env`
-for convoys that need the lab service. Interim lab forwarding binds
+`awk`, and GNU coreutils (`du`, `df`, `stat`, `mktemp`), and support the module's SSH recipe. Opt-in lab forwarding also requires
+`socat`. Configure lab reach in host-local `drydock.toml`:
+
+```toml
+[flotilla.provider.daytona.lab_reach]
+hostname = "forgejo.lab.flotilla.work"
+port = 443
+```
+
+These controller settings never enter the guest environment. Interim lab forwarding binds
 loopback port 443 and writes `/etc/hosts`, so this slice requires root in the
 vessel. Drydock appends and starts its agent; Flotilla delivers its CLI, cleat,
 initial agent material and per-crew forge/model credentials through that agent.
@@ -61,7 +66,7 @@ cloud_sandbox_per_vessel:
     memory_bytes: 4294967296
     disk_bytes: 21474836480
   checkout: clone_in_vessel
-  env: { FLOTILLA_DRYDOCK_LAB_FORWARD: "1" }
+  env: {}
 ```
 
 Admission resolves a unique controlling Host from its provider advertisements.
@@ -96,12 +101,17 @@ ADR 0044's amendment, and is replaced by #3312.
 A lifetime cap maps to `Gone`, and hence lost work, rather than a resumable stop.
 Unknown observations stay unknown. Event cursors resume after disconnect;
 incomplete snapshots never imply absence. Restart adoption re-enters idempotent
-provisioning to restore tools, credential staging and forwards together.
+provisioning to restore tools, credential staging and forwards together. Adoption
+has a 120-second budget to allow the 60-second SSH/agent connection and setup.
 
 The protocol currently offers no promise that Daytona storage outlives its cap,
-so survivors use a controller checkpoint. It is refreshed every 30 seconds and
+so survivors use a controller checkpoint. The first checkpoint runs in the
+background after setup, outside the adoption path; it is then refreshed every 30 seconds and
 includes the checkout, agent homes and cleat state. Status stores only its
-reference. Failed refreshes retain the previous complete archive; destruction
+reference. Build outputs and caches are excluded; apparent input size and the
+exact staged archive size are checked before streaming. Failed refreshes retain
+the previous complete archive and report stale health in Environment status
+without clearing readiness or preventing new terminal sessions. Destruction
 keeps that archive for the convoy's continue/abandon decision and removes its
 SSH keys. The archive is capped at 512 MiB, lives in a validated 0700 directory
 with 0600 permissions, and includes staged credentials. Until #3744 adds managed

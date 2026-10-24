@@ -1326,7 +1326,8 @@ async fn compose_drydock(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("read drydock provider configuration: {error}")),
     };
-    let configuration = drydock::config::Config::parse(&text)?;
+    let (provider_text, lab_reach) = flotilla_config::drydock::split_configuration(&text)?;
+    let configuration = drydock::config::Config::parse(&provider_text)?;
     if configuration.provider.is_empty() {
         return Ok(());
     }
@@ -1377,7 +1378,8 @@ async fn compose_drydock(
                 provider.module,
                 config.state_dir().as_path().join("drydock-keys"),
             )
-            .with_host(host.clone()),
+            .with_host(host.clone())
+            .with_lab_reach(lab_reach.get(&name).map(|reach| (reach.hostname.clone(), reach.port))),
         );
         adapter.detect_readiness().await;
         registry.environment_providers.insert(

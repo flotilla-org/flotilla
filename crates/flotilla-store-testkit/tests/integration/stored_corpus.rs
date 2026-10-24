@@ -191,3 +191,59 @@ fn previous_generation_crew_claims_decode_without_ledger_digest() {
     assert!(state.decision_ledger_digest.is_none());
     assert!(state.superseded_claims[0].decision_ledger_digest.is_none());
 }
+
+// #3765: additive fixed fixtures supplement, never regenerate, the deployed
+// corpus. Stored descriptors make these protocol types subject to ADR 0047.
+#[test]
+fn cloud_stored_shapes_remain_decodable() {
+    for fixture in [include_str!("../fixtures/cloud-vessel-placement.json"), include_str!("../fixtures/cloud-convoy-placement.json")] {
+        let document: Value = serde_json::from_str(fixture).unwrap();
+        decode_stored_resource_document(&document).expect("embedded cloud placement decision");
+    }
+    let document: Value = serde_json::from_str(include_str!("../fixtures/cloud-environment.json")).unwrap();
+    decode_stored_resource_document(&document).expect("cloud Environment spec and status");
+    let spec: flotilla_resources::EnvironmentSpec = serde_json::from_value(document["spec"].clone()).unwrap();
+    assert_eq!(serde_json::to_value(&spec).unwrap()["cloud_sandbox"], document["spec"]["cloud_sandbox"]);
+    let status: flotilla_resources::EnvironmentStatus = serde_json::from_value(document["status"].clone()).unwrap();
+    assert_eq!(serde_json::to_value(status).unwrap()["provider_descriptor"], document["status"]["provider_descriptor"]);
+    let placement: Value = serde_json::from_str(include_str!("../fixtures/cloud-placement-decision.json")).unwrap();
+    let decision: flotilla_protocol::PlacementDecision = serde_json::from_value(placement.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decision).unwrap(), placement);
+    // Prior-generation input omits every new field and still decodes.
+    let mut old = document["spec"].clone();
+    old["cloud_sandbox"].as_object_mut().unwrap().remove("probe_needs");
+    let old: flotilla_resources::EnvironmentSpec = serde_json::from_value(old).unwrap();
+    assert!(old.cloud_sandbox.unwrap().probe_needs.is_empty());
+}
+
+// #3777 review 2 / ADR 0047: previous-generation cloud control entries retain
+// probe verification after decode; adapter controls stay in env until #3785.
+// The new fixed fixture supplements the unchanged deployed corpus.
+#[test]
+fn legacy_cloud_controls_lift_into_declared_fields() {
+    let document: Value = serde_json::from_str(include_str!("../fixtures/cloud-legacy-environment.json")).unwrap();
+    decode_stored_resource_document(&document).unwrap();
+    let spec: flotilla_resources::EnvironmentSpec = serde_json::from_value(document["spec"].clone()).unwrap();
+    let cloud = spec.cloud_sandbox.unwrap();
+    assert_eq!(cloud.env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], r#"["codex"]"#);
+    assert_eq!(cloud.probe_needs.len(), 2);
+    let encoded = serde_json::to_value(cloud).unwrap();
+    assert_eq!(encoded["env"], serde_json::json!({"LANG":"C.UTF-8", "FLOTILLA_REQUIRED_AGENT_ADAPTERS": "[\"codex\"]"}));
+    // Explicit typed fields, including an empty set, take precedence over old
+    // controls in a mixed record. Malformed retired controls cannot bypass checks.
+    let mut mixed = document["spec"].clone();
+    mixed["cloud_sandbox"]["probe_needs"] = serde_json::json!([]);
+    let spec: flotilla_resources::EnvironmentSpec = serde_json::from_value(mixed).unwrap();
+    let cloud = spec.cloud_sandbox.unwrap();
+    assert!(cloud.probe_needs.is_empty());
+    assert_eq!(cloud.env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], r#"["codex"]"#);
+    let mut invalid = document["spec"].clone();
+    invalid["cloud_sandbox"]["env"]["FLOTILLA_CLOUD_IMAGE_NEEDS"] = serde_json::json!("invalid JSON");
+    assert!(serde_json::from_value::<flotilla_resources::EnvironmentSpec>(invalid).is_err());
+    // Adapter syntax remains the provisioning consumer's concern, as on main;
+    // the cloud decode shim must neither parse nor remove this env entry.
+    let mut adapter_control = document["spec"].clone();
+    adapter_control["cloud_sandbox"]["env"]["FLOTILLA_REQUIRED_AGENT_ADAPTERS"] = serde_json::json!("opaque adapter control");
+    let decoded: flotilla_resources::EnvironmentSpec = serde_json::from_value(adapter_control).unwrap();
+    assert_eq!(decoded.cloud_sandbox.unwrap().env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], "opaque adapter control");
+}
