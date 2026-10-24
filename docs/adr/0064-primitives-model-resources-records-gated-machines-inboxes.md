@@ -48,6 +48,8 @@ Convoys assumed that their vessels were co-located and fixed. Many writers could
 
   ADR 0064 seats: fan-out adds a seat under an existing one (`AddSeat`, names never reused) and `Resupervise` is the only edge that changes `supervised_by`; admission refuses unknown owners, unknown parents and cycles. Seat retirement is not yet modelled.
 
+  a retired seat's name is reserved for the rest of its generation; Rollover clears retired seats, so a later generation may reuse the name, and the live record never accumulates seat history.
+
   ADR 0064 Convoy records: a change-request observation finds its submission through a full index on the submission address (one lookup per event); there is no partial index on open convoys.
 - **A judgement** is computed and never stored. Examples are ready, stalled, landing, kept, retry count, next attempt, stale and drift. Each judgement is a declared function with declared inputs, and it returns a value and the moment it could next change. The same function gates edges and renders listings, so the two cannot disagree.
 - **No host writes another home's resource.** It sends a message to that home, or it publishes a record of its own that the home observes.
