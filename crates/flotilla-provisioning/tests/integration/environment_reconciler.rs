@@ -963,3 +963,110 @@ async fn composed_environment_reads_builds_without_a_status_copy() {
         }
     }
 }
+
+// Provisioning and retry decisions follow the engine while the old phase stays unchanged.
+// Enumerate every old phase against success, both Gone endings and empty/Unicode give-up causes.
+#[tokio::test]
+async fn environment_reconciliation_reads_its_engine_without_a_status_copy() {
+    use flotilla_provisioning::engine::{
+        environment::EnvironmentBinding,
+        reads::{LifecycleReadPort, StoreReads},
+        Binding, LifecycleHome, Lifecycles, Step,
+    };
+    use flotilla_resources::ControllerRetryDisposition;
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::{Cause, CauseCategory, Outcome};
+    let teardown_error = ResourceError::other("disk");
+    let teardown_message = format!("environment teardown failed: {teardown_error}");
+    for old_phase in [
+        EnvironmentPhase::Pending,
+        EnvironmentPhase::Provisioning,
+        EnvironmentPhase::Ready,
+        EnvironmentPhase::Failed,
+        EnvironmentPhase::Lost,
+    ] {
+        for ending in ["ready", "released", "lost", "", "失敗", teardown_message.as_str()] {
+            let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+            let environments = backend.using::<Environment>("flotilla");
+            let mut obj = environments
+                .create(
+                    &InputMeta::builder().name("env".into()).build(),
+                    &EnvironmentSpec {
+                        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("environment");
+            let old_status = EnvironmentStatus {
+                phase: old_phase,
+                ready: old_phase == EnvironmentPhase::Ready,
+                message: Some(teardown_message.clone()),
+                ..Default::default()
+            };
+            obj = environments.update_status("env", &obj.metadata.resource_version, &old_status).await.expect("old status");
+            let mut registry = flotilla_schema::KindRegistry::new();
+            flotilla_provisioning::stored::register(&mut registry).expect("registry");
+            let store = Arc::new(Mutex::new(
+                flotilla_schema_sqlite::Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry)
+                    .expect("store"),
+            ));
+            let engine: LifecycleHome<flotilla_provisioning::stored::environment::EnvironmentKind, _> = LifecycleHome::new(
+                "home",
+                flotilla_state_machines::Home::with_log("home", flotilla_engine_store::StoreLog::new(Arc::clone(&store))).expect("home"),
+            );
+            let reads = Arc::new(LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), "home".into()));
+            let reconciler =
+                EnvironmentReconciler::new(Arc::new(FailingEnvironmentRuntime), backend, "flotilla").with_lifecycle_reads(reads);
+            engine.request("env", EnvironmentBinding::request(&obj, "home").expect("request"), Timestamp(1)).expect("requested");
+            let prepared = reconciler.prepare(&obj).await.expect("provisioning");
+            assert!(matches!(
+                reconciler.reconcile(&obj, &prepared, chrono::Utc::now()).patch,
+                Some(EnvironmentStatusPatch::MarkFailed { .. })
+            ));
+            engine
+                .step(
+                    "env",
+                    &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "retry"), retryable: true }),
+                    Timestamp(2),
+                )
+                .expect("retrying");
+            assert!(
+                matches!(reconciler.retry_disposition(&obj), Some(ControllerRetryDisposition::Retryable {next_attempt_at}) if next_attempt_at > chrono::DateTime::UNIX_EPOCH)
+            );
+            if matches!(ending, "ready" | "released" | "lost") {
+                engine.step("env", &Step::Realised { identity: "/work".into() }, Timestamp(3)).expect("ready");
+                if ending != "ready" {
+                    engine.step("env", &if ending == "lost" { Step::Vanished } else { Step::Released }, Timestamp(4)).expect("ended");
+                }
+                assert!(reconciler.retry_disposition(&obj).is_none());
+            } else {
+                engine
+                    .step(
+                        "env",
+                        &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, ending), retryable: false }),
+                        Timestamp(3),
+                    )
+                    .expect("gave up");
+                assert_eq!(reconciler.retry_disposition(&obj), Some(ControllerRetryDisposition::Terminal { needs: ending.into() }));
+            }
+            // Teardown deduplicates against the engine cause, never a matching stale old failure.
+            assert_eq!(reconciler.finalizer_error_patch(&obj, &teardown_error).is_none(), ending == teardown_message);
+            for _ in 0..2 {
+                let prepared = reconciler.prepare(&obj).await.expect("settled");
+                assert!(reconciler.reconcile(&obj, &prepared, chrono::Utc::now()).patch.is_none());
+                let stale_report = flotilla_provisioning::reconcilers::environment::EnvironmentPrepared::Failed("discard me".into());
+                assert!(reconciler.reconcile(&obj, &stale_report, chrono::Utc::now()).patch.is_none());
+            }
+            assert_eq!(environments.get("env").await.expect("old record").status, Some(old_status));
+            crate::common::poison_store(store);
+            assert!(reconciler.prepare(&obj).await.err().expect("read error").to_string().contains("poisoned"));
+            assert!(reconciler.retry_disposition(&obj).is_none());
+            let outcome =
+                reconciler.reconcile(&obj, &flotilla_provisioning::reconcilers::environment::EnvironmentPrepared::None, chrono::Utc::now());
+            assert!(outcome.patch.is_none());
+            assert!(outcome.requeue_after.is_some());
+            assert!(outcome.events.iter().any(|event| event.reason == "LifecycleReadFailed"));
+        }
+    }
+}
