@@ -600,6 +600,8 @@ pub fn rehearse_all<'a>(
             ))
         });
         let Some(current) = generations.pop() else { continue };
+        // No status means a fresh, not-ended generation. import_convoy leaves an
+        // unbootstrapped latest generation on the old path for admission at bootstrap.
         let ended = |c: &ResourceObject<OldConvoy>| {
             c.status.as_ref().is_some_and(|s| matches!(s.phase, ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Abandoned))
         };

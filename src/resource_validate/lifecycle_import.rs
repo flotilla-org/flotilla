@@ -81,6 +81,11 @@ impl Documents {
             let convoy_home = vessel.metadata.annotations.get(flotilla_resources::ACTUATOR_SOURCE_ROOT_ANNOTATION).unwrap_or(home);
             if let Some(stable) = aliases.get(&(convoy_home.clone(), vessel.spec.convoy_ref.clone())) {
                 vessel.spec.convoy_ref.clone_from(stable);
+            } else {
+                report.notes.push(format!(
+                    "Vessel `{}` records convoy `{}` from home `{convoy_home}`, which is not listed or has no mappable identity: left unchanged",
+                    vessel.metadata.name, vessel.spec.convoy_ref
+                ));
             }
         }
         rehearse_vessels(&records, &mut report);
@@ -266,7 +271,24 @@ mod tests {
                 serde_json::json!({"convoy_ref": "governor-2"}),
             )],
         );
+        // An archived earlier generation still maps to the stable identity.
+        documents.0.get_mut("convoys").unwrap()[0]["status"]["phase"] = serde_json::json!("Landed");
+        documents.0.insert(
+            "vessels".into(),
+            vec![document(
+                "Vessel",
+                "unlisted-vessel",
+                serde_json::json!({"convoy_ref": "missing-convoy", "vessel_name": "work", "placement_policy_ref": "p"}),
+                Value::Null,
+            )],
+        );
         let report = documents.rehearse();
+        assert!(
+            report.notes.iter().any(|note| note.contains("Vessel `unlisted-vessel`")
+                && note.contains("missing-convoy")
+                && note.contains("left unchanged")),
+            "{report:?}"
+        );
         assert!(report.refused.is_empty(), "{report:?}");
         assert_eq!(report.imported.get(&("Ensure", "fulfilled")), Some(&1));
         assert!(
