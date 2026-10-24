@@ -326,4 +326,13 @@ fn a_vessel_written_through_the_binding_reads_by_its_old_name() {
     let view = reads.vessel(&obj.metadata.name, HOME).expect("read").expect("read by the old record's name");
     assert_eq!(view.name, obj.metadata.name);
     assert_eq!(view.judgement, Judgement::InProgress);
+
+    // Failure before readiness is read from the engine, even when no old-status patch is applied.
+    let failure = VesselStatusPatch::MarkFailed { message: "provider refused provisioning".into() };
+    let decision = decide::<VesselBinding>(vessels.as_ref(), &obj, Some(failure), chrono::Utc::now());
+    assert!(decision.ended);
+    let view = reads.vessel(&obj.metadata.name, HOME).expect("read").expect("ended vessel");
+    assert!(matches!(view.judgement, Judgement::GaveUp { ref cause } if cause.detail == "provider refused provisioning"));
+    assert_eq!(obj.status.as_ref().expect("provisioning").phase, flotilla_resources::VesselPhase::Provisioning);
+    assert_eq!(obj.status.as_ref().expect("provisioning").message, None);
 }

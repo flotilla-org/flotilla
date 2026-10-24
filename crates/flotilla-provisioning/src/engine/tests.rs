@@ -946,7 +946,7 @@ async fn a_vessel_lease_is_granted_on_its_pinned_host_and_ends_gone() {
     home.with_placements(|placements| assert!(placements.ledger().vessel(&VesselId::new(name)).is_none(), "the lease is freed"));
 }
 
-// Behaviour (#3629 Q3, Q6): a vessel that fails before it is ready returns its lease and ends Gone;
+// A vessel that fails before readiness returns its lease and retains the failure cause;
 // one with no pinned host yet is no engine request, and the old path keeps it.
 #[tokio::test]
 async fn a_vessel_failing_before_ready_returns_its_lease_and_an_unpinned_one_stays_old() {
@@ -962,7 +962,12 @@ async fn a_vessel_failing_before_ready_returns_its_lease_and_an_unpinned_one_sta
     let mut obj = vessel_object();
     reconcile(&engine, &mut obj).await;
     assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(failed));
-    assert_eq!(home.get("convoy-a-implement").map(|vessel| vessel.state().clone()), Some(LifecycleState::Gone));
+    let state = home.get("convoy-a-implement").expect("failed vessel");
+    assert_eq!(state.state().cause().map(|cause| cause.detail.as_str()), Some("placement policy docker not found"));
+    assert!(matches!(state.state(), LifecycleState::GaveUp { .. }));
+    home.with_placements(|placements| {
+        assert!(placements.ledger().vessel(&flotilla_state_machines::placement::VesselId::new("convoy-a-implement")).is_none());
+    });
 
     let unpinned =
         Engine::<_, VesselBinding>::new(Scripted::<flotilla_resources::Vessel>::new([Some(provisioning(None))]), Some(home.clone()));
