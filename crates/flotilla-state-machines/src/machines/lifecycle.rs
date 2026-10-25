@@ -18,6 +18,8 @@
 //! columns, `#[store(state)] State<LifecycleState>` and the edge log) is
 //! declared by whoever owns its request, with a kind code of its own.
 
+pub mod schema_review;
+
 use std::marker::PhantomData;
 
 use flotilla_schema::EdgeEvent;
