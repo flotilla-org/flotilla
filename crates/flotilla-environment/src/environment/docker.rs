@@ -748,6 +748,9 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
     fn agent(&self) -> Option<Arc<dyn super::VesselAgent>> {
         self.agent.clone()
     }
+    fn terminal_route(&self) -> Option<&dyn super::ProviderTerminalRoute> {
+        Some(self)
+    }
     fn fallback_runner(&self) -> Option<Arc<dyn CommandRunner>> {
         Some(Arc::new(DockerEnvironmentRunner::new(self.container_name.clone(), self.inner.runner.clone())))
     }
@@ -772,6 +775,41 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
 
     async fn destroy(&self) -> Result<(), String> {
         self.inner.destroy(&self.backing_id).await
+    }
+}
+
+impl super::ProviderTerminalRoute for DockerProvisionedEnvironment {
+    fn terminal_runner(&self) -> Arc<dyn CommandRunner> {
+        // Immutable runtime identity, never a container name that can be reused.
+        Arc::new(DockerEnvironmentRunner::new(self.backing_id.clone(), self.inner.runner.clone()))
+    }
+
+    fn attach_plan(
+        &self,
+        endpoint: &flotilla_protocol::result_set::CleatEndpoint,
+        client: &Path,
+        seat: flotilla_protocol::commands::AttachMode,
+    ) -> Result<flotilla_protocol::ResolvedAttachPlan, String> {
+        use flotilla_protocol::{arg::Arg, commands::AttachMode, ResolvedAttachPlan};
+        let socket = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
+        let mut args = vec![
+            Arg::Literal("docker".into()),
+            Arg::Literal("exec".into()),
+            Arg::Literal("-it".into()),
+            Arg::Quoted(self.backing_id.clone()),
+            Arg::Quoted(client.to_string_lossy().into_owned()),
+            Arg::Literal("attach".into()),
+            Arg::Literal("--socket".into()),
+            Arg::Quoted(socket.to_string_lossy().into_owned()),
+            Arg::Literal("--no-create".into()),
+        ];
+        match seat {
+            AttachMode::Default => {}
+            AttachMode::Strict => args.push(Arg::Literal("--strict".into())),
+            AttachMode::PreferTake | AttachMode::Take => args.push(Arg::Literal("--take".into())),
+        }
+        args.push(Arg::Quoted(endpoint.session.clone()));
+        Ok(ResolvedAttachPlan::command(args))
     }
 }
 
@@ -1909,7 +1947,11 @@ mod adoption_tests {
                     .unwrap()
                     .iter()
                     .map(|(id, guest)| {
-                        let mounts = vec![ProvisionedMount::new(guest, "/run/drydock", ProvisionedMountMode::Rw)];
+                        let mounts = if guest.as_os_str().is_empty() {
+                            vec![]
+                        } else {
+                            vec![ProvisionedMount::new(guest, "/run/drydock", ProvisionedMountMode::Rw)]
+                        };
                         format!("{id} {id}\t{id}\tbase\t{}", serde_json::to_string(&mounts).unwrap())
                     })
                     .collect::<Vec<_>>()
@@ -1965,6 +2007,8 @@ mod adoption_tests {
             std::fs::create_dir_all(directory.join("host")).unwrap();
             engine.rows.lock().unwrap().push((id.into(), directory.join("guest")));
         }
+        // Recorded and inspected mounts both omit the agent on this older backing.
+        engine.rows.lock().unwrap().push(("pre-agent".into(), PathBuf::new()));
         let provider = DockerEnvironmentProvider::new(engine.clone()).with_agent_connector(Arc::new(move |socket| {
             if socket == bad {
                 Arc::new(Unreachable)
@@ -1973,8 +2017,13 @@ mod adoption_tests {
             }
         }));
         let handles = provider.list().await.unwrap();
-        assert_eq!(handles.len(), 2);
+        assert_eq!(handles.len(), 3);
         assert!(handles.iter().find(|h| h.id().as_str() == "bad").unwrap().agent().is_none());
+        let old = handles.iter().find(|h| h.id().as_str() == "pre-agent").unwrap();
+        assert!(old.agent().is_none());
+        assert!(old.provisioned_mounts().is_empty());
+        assert!(old.terminal_route().is_some());
+        assert!(handles.iter().find(|h| h.id().as_str() == "bad").unwrap().terminal_route().is_some());
         let healthy = handles.iter().find(|h| h.id().as_str() == "healthy").unwrap();
         assert!(healthy.agent().is_some());
         let starts = engine.starts.load(Ordering::SeqCst);
