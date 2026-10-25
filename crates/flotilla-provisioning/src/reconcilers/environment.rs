@@ -191,9 +191,7 @@ where
                     Err(EnvironmentProvisionError::RetryAdoption(message)) => {
                         Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: {message}")))
                     }
-                    Err(error) if error.to_string().starts_with("waiting on build:") => {
-                        Ok(EnvironmentPrepared::Waiting(error.to_string()))
-                    }
+                    Err(error) if error.to_string().starts_with("waiting on build:") => Ok(EnvironmentPrepared::Waiting(error.to_string())),
                     Err(error) => Ok(EnvironmentPrepared::Failed(error.to_string())),
                 }
             } else {
