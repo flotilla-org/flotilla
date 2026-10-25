@@ -161,21 +161,122 @@ fn default_runtime_roots_follow_injected_environment() {
     }
 }
 
-// A contained roll invokes the generation-delivered binary via its runner;
-// handover failure is actionable and never causes a kill/relaunch command.
-#[tokio::test]
-async fn contained_roll_hands_over_without_killing_sessions() {
-    for name in ["success", "warning"] {
-        let runner = Arc::new(MockRunner::with_outputs(vec![Ok(recorded(name))]));
-        let report =
-            drain("host".into(), "new-gen".into(), Path::new("/incoming/bin/cleat"), &[target(runner.clone(), "default", true)], vec![])
-                .await;
-        assert_eq!(report.failed(), name == "warning");
-        assert_eq!(report.attempts.len(), 1);
-        assert_eq!(runner.calls()[0].0, "/opt/flotilla/bin/cleat");
-        assert_eq!(&runner.calls()[0].1[4..], ["server", "handover", "--json"]);
-        assert_eq!(runner.remaining(), 0);
+#[cfg(target_os = "linux")]
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../ci/fleet-candidates/fixtures/guest_tools.rs"));
+
+#[cfg(target_os = "linux")]
+fn refresh_guest_catalog(release: &Path) {
+    use sha2::{Digest, Sha256};
+    let path = release.join("share/flotilla/guest-tools/catalog.json");
+    let guest = release.join("share/flotilla/guest-tools/linux-amd64");
+    let mut catalog: Value = serde_json::from_slice(&std::fs::read(&path).expect("catalog")).expect("catalog JSON");
+    for file in catalog["platforms"]["linux/amd64"]["files"].as_array_mut().expect("guest files") {
+        let bytes = std::fs::read(guest.join(file["path"].as_str().expect("file path"))).expect("guest bytes");
+        file["sha256"] = format!("{:x}", Sha256::digest(&bytes)).into();
+        file["size_bytes"] = bytes.len().into();
     }
+    std::fs::write(path, serde_json::to_vec(&catalog).expect("updated catalog")).expect("catalog");
+}
+
+#[cfg(target_os = "linux")]
+fn incoming_fixture() -> (tempfile::TempDir, PathBuf) {
+    use std::process::Command;
+    let directory = tempfile::tempdir().expect("fixture");
+    let release = directory.path().join("release");
+    write_guest_fixture(&release);
+    let guest = release.join("share/flotilla/guest-tools/linux-amd64");
+    let incoming = guest.join("bin/cleat");
+    let library = guest.join("lib/libghostty-vt.so.0");
+    std::fs::create_dir_all(incoming.parent().expect("bin")).expect("bin");
+    std::fs::create_dir_all(library.parent().expect("lib")).expect("lib");
+    let source = directory.path().join("library.c");
+    std::fs::write(&source, "const char *generation(void) { return \"incoming\"; }\n").expect("library source");
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wl,-soname,libghostty-vt.so.0"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .status()
+        .expect("C compiler")
+        .success());
+    let source = directory.path().join("cleat.c");
+    std::fs::write(&source, format!("#include <stdio.h>\n#include <string.h>\nextern const char *generation(void);\nint main(int argc, char **argv) {{ if (strcmp(generation(), \"incoming\")) return 1; if (argc > 5 && !strcmp(argv[4], \"no-daemon\")) {{ if (!strcmp(argv[5], \"daemons\")) {{ puts(\"[]\"); return 0; }} fputs(\"connect daemon: No such file or directory\\n\", stderr); return 1; }} puts({}); return 0; }}\n", serde_json::to_string(&recorded("success").stdout).expect("C string"))).expect("executable source");
+    assert!(Command::new("cc")
+        .arg(&source)
+        .arg("-L")
+        .arg(library.parent().expect("lib"))
+        .args(["-l:libghostty-vt.so.0", "-Wl,-rpath,$ORIGIN/../lib", "-o"])
+        .arg(&incoming)
+        .status()
+        .expect("C compiler")
+        .success());
+    refresh_guest_catalog(&release);
+    // Distinct controller bytes ensure contained delivery selects the guest build.
+    let controller = release.join("bin/cleat");
+    std::fs::create_dir_all(controller.parent().expect("controller bin")).expect("controller bin");
+    std::fs::create_dir_all(release.join("lib")).expect("controller lib");
+    std::fs::copy(&incoming, &controller).expect("controller executable");
+    let mut controller_bytes = std::fs::read(&controller).expect("controller bytes");
+    controller_bytes.extend_from_slice(b"controller-only");
+    std::fs::write(&controller, controller_bytes).expect("distinct controller");
+    std::fs::copy(library, release.join("lib/libghostty-vt.so.0")).expect("controller library");
+    (directory, controller)
+}
+
+// All layouts execute the incoming generation with its loader-relative library.
+// The process boundary fixture refuses a missing library and records the actual executable.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn contained_roll_uses_incoming_payload_and_relative_library() {
+    use flotilla_provider_runtime::ProcessCommandRunner;
+    for (contained, old_binary) in [(true, "/usr/local/bin/cleat"), (true, "/opt/flotilla/bin/cleat"), (false, "cleat")] {
+        let (directory, incoming) = incoming_fixture();
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var("PATH", "/usr/bin:/bin"));
+        let mut target = target(ControlledTerminalEnvironment::from_bag(&bag).runner(Arc::new(ProcessCommandRunner)), "default", contained);
+        target.runtime_root = directory.path().join("persistent cleat");
+        target.binary = old_binary.into();
+        for _ in 0..2 {
+            let report = drain("host".into(), "new-gen".into(), &incoming, std::slice::from_ref(&target), vec![]).await;
+            assert!(!report.failed(), "{report:?}");
+            assert!(report.attempts[0].report.as_ref().expect("report").changed);
+            if contained {
+                let payload = target.runtime_root.join(".fleet-bin/new-gen");
+                assert_eq!(
+                    std::fs::read(payload.join("bin/cleat")).expect("delivered executable"),
+                    std::fs::read(directory.path().join("release/share/flotilla/guest-tools/linux-amd64/bin/cleat"))
+                        .expect("incoming guest")
+                );
+                assert_eq!(
+                    std::fs::read(payload.join("lib/libghostty-vt.so.0")).expect("delivered library"),
+                    std::fs::read(directory.path().join("release/share/flotilla/guest-tools/linux-amd64/lib/libghostty-vt.so.0"))
+                        .expect("incoming guest library")
+                );
+            }
+        }
+    }
+}
+
+// A legacy target with no live daemon uses its staged incoming executable for
+// read-only discovery even when the registered old executable no longer exists.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn contained_legacy_without_live_daemon_is_informational() {
+    use flotilla_provider_runtime::ProcessCommandRunner;
+    let (directory, incoming) = incoming_fixture();
+    let bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var("PATH", "/usr/bin:/bin"));
+    let mut target = target(ControlledTerminalEnvironment::from_bag(&bag).runner(Arc::new(ProcessCommandRunner)), "no-daemon", true);
+    target.runtime_root = directory.path().join("legacy runtime");
+    target.binary = directory.path().join("missing-legacy-tool/bin/cleat").display().to_string();
+    let report = drain("host".into(), "generation".into(), &incoming, std::slice::from_ref(&target), vec![]).await;
+    assert!(!report.failed(), "{report:?}");
+    assert!(assess_drain(&report).actionable.is_empty());
+    assert_eq!(report.information.len(), 1);
+    assert!(report.information[0].contains("no running host cleat daemon"));
+    assert!(!report.attempts[0].success, "retain the actual failed handover exit");
+    assert!(report.attempts[0].stderr.starts_with("connect daemon:"));
+    let entries =
+        std::fs::read_dir(&target.runtime_root).expect("runtime root").map(|entry| entry.expect("entry").file_name()).collect::<Vec<_>>();
+    assert_eq!(entries, [std::ffi::OsString::from(".fleet-bin")], "no daemon directory or socket may be created");
 }
 
 // Failed per-session handovers preserve diagnostics and become build skew,
@@ -199,7 +300,7 @@ async fn partial_handover_results_are_actionable_without_session_destruction() {
             exit_code: Some(if successful { 0 } else { 1 }),
         })]));
         let report =
-            drain("host".into(), "new-gen".into(), Path::new("/incoming/bin/cleat"), &[target(runner.clone(), "default", true)], vec![])
+            drain("host".into(), "new-gen".into(), Path::new("/incoming/bin/cleat"), &[target(runner.clone(), "default", false)], vec![])
                 .await;
         assert!(report.failed());
         assert_eq!(report.attempts[0].stdout, stdout);
@@ -224,7 +325,7 @@ async fn duplicate_handover_warnings_are_reported_once() {
     let stdout = value.to_string();
     let runner =
         Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput { stdout: stdout.clone(), stderr: String::new(), exit_code: Some(0) })]));
-    let report = drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), &[target(runner, "default", true)], vec![]).await;
+    let report = drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), &[target(runner, "default", false)], vec![]).await;
     let error = report.attempts[0].error.as_ref().unwrap();
     assert_eq!(error.matches("forwarder retained").count(), 1);
     assert_eq!(error.matches("distinct warning").count(), 1);
@@ -621,4 +722,108 @@ async fn discovered_roll_targets_start_replacements_with_a_controlled_environmen
             ]
         )]
     );
+}
+
+// Streaming is the true process boundary: fail after writing a partial library,
+// while letting ordinary commands and the independent environment execute.
+#[cfg(target_os = "linux")]
+struct InterruptedDelivery(std::sync::atomic::AtomicBool);
+
+#[cfg(target_os = "linux")]
+#[async_trait::async_trait]
+impl CommandRunner for InterruptedDelivery {
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+        flotilla_provider_runtime::ProcessCommandRunner.run(cmd, args, cwd, label).await
+    }
+
+    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+        flotilla_provider_runtime::ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+    }
+
+    async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+        flotilla_provider_runtime::ProcessCommandRunner.exists(cmd, args).await
+    }
+
+    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        use std::sync::atomic::Ordering;
+        if args.last().is_some_and(|path| path.ends_with("libghostty-vt.so.0")) && self.0.swap(false, Ordering::SeqCst) {
+            flotilla_provider_runtime::ProcessCommandRunner.run_with_input(cmd, args, cwd, label, &input[..1]).await?;
+            return Err("interrupted library stream".into());
+        }
+        flotilla_provider_runtime::ProcessCommandRunner.run_with_input(cmd, args, cwd, label, input).await
+    }
+}
+
+// Failed delivery never publishes partial files or changes an older generation.
+// Independent targets still run; only a verified retry clears current failure.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn interrupted_delivery_retains_old_payload_and_diagnostics_until_verified_retry() {
+    use flotilla_provider_runtime::ProcessCommandRunner;
+    let (directory, incoming) = incoming_fixture();
+    let mut first = target(Arc::new(ProcessCommandRunner), "default", true);
+    first.runtime_root = directory.path().join("first");
+    let baseline = drain("host".into(), "old".into(), &incoming, std::slice::from_ref(&first), vec![]).await;
+    assert!(!baseline.failed(), "{baseline:?}");
+    let old = first.runtime_root.join(".fleet-bin/old/bin/cleat");
+    let old_bytes = std::fs::read(&old).expect("old executable");
+    first.runner = Arc::new(InterruptedDelivery(std::sync::atomic::AtomicBool::new(true)));
+    let mut second = first.clone();
+    second.environment = "independent".into();
+    second.runtime_root = directory.path().join("second");
+    second.runner = Arc::new(ProcessCommandRunner);
+    let mut failed = drain("host".into(), "new".into(), &incoming, &[first.clone(), second], vec![]).await;
+    assert!(failed.failed());
+    assert!(failed.attempts[0].error.as_ref().expect("failure").contains("interrupted library stream"));
+    assert!(failed.attempts[1].success);
+    assert!(!first.runtime_root.join(".fleet-bin/new").exists());
+    assert_eq!(std::fs::read(&old).expect("old still usable"), old_bytes);
+    persist(&mut failed, &directory.path().join("diagnostics")).await;
+    let historical = failed.diagnostics_path.clone().expect("failed diagnostics");
+    let mut retry = drain("host".into(), "new".into(), &incoming, std::slice::from_ref(&first), vec![]).await;
+    assert!(!retry.failed(), "{retry:?}");
+    assert!(assess_drain(&retry).actionable.is_empty());
+    persist(&mut retry, &directory.path().join("diagnostics")).await;
+    let previous: RollReport = serde_json::from_slice(&std::fs::read(historical).expect("retained history")).expect("report");
+    assert!(previous.failed());
+    assert_ne!(previous.diagnostics_path, retry.diagnostics_path);
+    let delivered = first.runtime_root.join(".fleet-bin/new/bin/cleat");
+    let metadata = std::fs::metadata(&delivered).expect("published executable");
+    first.runner = Arc::new(InterruptedDelivery(std::sync::atomic::AtomicBool::new(true)));
+    let again = drain("host".into(), "new".into(), &incoming, std::slice::from_ref(&first), vec![]).await;
+    assert!(!again.failed(), "same-generation retry must not stream again: {again:?}");
+    assert_eq!(std::fs::metadata(&delivered).expect("same executable").modified().expect("mtime"), metadata.modified().expect("mtime"));
+    first.runner = Arc::new(ProcessCommandRunner);
+    let (left, right) =
+        tokio::join!(incoming_for_target(&first, "concurrent", &incoming), incoming_for_target(&first, "concurrent", &incoming));
+    assert_eq!(left.expect("first publisher"), right.expect("concurrent publisher"));
+    let original = std::fs::read(&delivered).expect("published bytes");
+    let mut different = original.clone();
+    different.extend_from_slice(b"# different verified release\n");
+    let guest = contained_incoming(&incoming).expect("verified guest");
+    std::fs::write(&guest.cleat, different).expect("different incoming guest bytes");
+    refresh_guest_catalog(incoming.parent().and_then(Path::parent).expect("release"));
+    let collision = drain("host".into(), "new".into(), &incoming, std::slice::from_ref(&first), vec![]).await;
+    assert!(collision.failed(), "same-generation different content must not replace the payload");
+    assert_eq!(std::fs::read(&delivered).expect("unchanged generation"), original);
+    std::fs::remove_file(&guest.library).expect("remove incoming library");
+    let missing = drain("host".into(), "later".into(), &incoming, std::slice::from_ref(&first), vec![]).await;
+    assert!(missing.failed());
+    assert!(!first.runtime_root.join(".fleet-bin/later").exists());
+    assert_eq!(std::fs::read(old).expect("old preserved"), old_bytes);
+}
+
+// A generation is a single validated path component; invalid identifiers never
+// reach the environment runner or create a selectable payload.
+#[tokio::test]
+async fn invalid_generation_is_rejected_before_delivery() {
+    for generation in ["", ".", "..", "../escape", "a/b", "a@1", "line\nbreak"] {
+        let runner = Arc::new(MockRunner::with_outputs(vec![]));
+        let report =
+            drain("host".into(), generation.into(), Path::new("/incoming/bin/cleat"), &[target(runner.clone(), "default", true)], vec![])
+                .await;
+        assert!(report.failed());
+        assert!(report.attempts.is_empty());
+        assert!(runner.calls().is_empty());
+    }
 }

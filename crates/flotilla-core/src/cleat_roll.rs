@@ -139,6 +139,95 @@ async fn command(target: &CleatTarget, binary: &str, verb: &[&str], timeout: Dur
         .map_err(|_| format!("cleat command timed out after {} seconds", timeout.as_secs()))?
 }
 
+async fn delivery_command(target: &CleatTarget, script: &str, args: Vec<&str>) -> Result<String, String> {
+    let mut words = vec!["-c", script, "flotilla-cleat-delivery"];
+    words.extend(args);
+    target.runner.run_with_timeout("sh", &words, Path::new("/"), &ChannelLabel::Default, Duration::from_secs(30)).await
+}
+
+struct IncomingTools {
+    cleat: PathBuf,
+    library: PathBuf,
+}
+
+#[cfg(unix)]
+fn contained_incoming(incoming: &Path) -> Result<IncomingTools, String> {
+    let release = incoming.parent().and_then(Path::parent).ok_or("incoming cleat has no release root")?;
+    flotilla_environment::guest_tools::GuestTools::resolve(release, &flotilla_environment::guest_tools::linux_amd64())
+        .map(|tools| IncomingTools { cleat: tools.cleat(), library: tools.library() })
+}
+
+#[cfg(not(unix))]
+fn contained_incoming(_incoming: &Path) -> Result<IncomingTools, String> {
+    Err("contained Cleat delivery requires a supported guest-tool controller".into())
+}
+
+// Host-local tools already reside in the verified installed release, including
+// its loader-relative library. Contained environments need a private payload
+// reachable through their runner, independent of their original tool mounts.
+async fn incoming_for_target(target: &CleatTarget, generation: &str, incoming: &Path) -> Result<PathBuf, String> {
+    if !target.contained {
+        return Ok(incoming.to_path_buf());
+    }
+    if !target.runtime_root.is_absolute() {
+        return Err("cleat runtime root must be absolute".into());
+    }
+    let tools = contained_incoming(incoming)?;
+    let mut files = Vec::new();
+    for (name, source) in [("bin/cleat", tools.cleat.as_path()), ("lib/libghostty-vt.so.0", tools.library.as_path())] {
+        let bytes = tokio::fs::read(source).await.map_err(|error| format!("read incoming {}: {error}", source.display()))?;
+        if bytes.is_empty() {
+            return Err(format!("incoming {} is empty", source.display()));
+        }
+        files.push((name, bytes));
+    }
+    use sha2::{Digest, Sha256};
+    let manifest = files.iter().map(|(name, bytes)| format!("{:x}  {name}", Sha256::digest(bytes))).collect::<Vec<_>>().join("\n");
+    let parent = target.runtime_root.join(".fleet-bin");
+    let destination = parent.join(generation);
+    let temporary = parent.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+    let destination_str = destination.to_str().ok_or("cleat payload path is not UTF-8")?;
+    let temporary_str = temporary.to_str().ok_or("cleat staging path is not UTF-8")?;
+    // A same-generation directory is immutable: reuse only verified content.
+    // An interrupted copy is never published under the generation name.
+    const VERIFY: &str = "set -eu; cd \"$1\"; test -x bin/cleat; test \"$(sha256sum bin/cleat lib/libghostty-vt.so.0)\" = \"$2\"; bin/cleat version --json >/dev/null";
+    if delivery_command(target, VERIFY, vec![destination_str, &manifest]).await.is_ok() {
+        return Ok(destination.join("bin/cleat"));
+    }
+    let result = async {
+        delivery_command(target, "set -eu; umask 077; mkdir -p \"$1/bin\" \"$1/lib\"", vec![temporary_str]).await?;
+        for (name, bytes) in &files {
+            let path = temporary.join(name);
+            let path = path.to_str().ok_or("cleat staging file is not UTF-8")?;
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                target.runner.run_with_input(
+                    "sh",
+                    &["-c", "set -eu; cat > \"$1\"", "flotilla-cleat-copy", path],
+                    Path::new("/"),
+                    &ChannelLabel::Default,
+                    bytes,
+                ),
+            )
+            .await
+            .map_err(|_| "cleat delivery timed out".to_string())??;
+        }
+        delivery_command(target, "set -eu; chmod 755 \"$1/bin/cleat\"; chmod 644 \"$1/lib/libghostty-vt.so.0\"", vec![temporary_str])
+            .await?;
+        delivery_command(target, VERIFY, vec![temporary_str, &manifest]).await?;
+        // -T refuses to move a concurrent publisher's directory inside another
+        // payload. A losing publisher may reuse only identical complete bytes.
+        let published = delivery_command(target, "set -eu; mv -T \"$1\" \"$2\"", vec![temporary_str, destination_str]).await;
+        if published.is_err() {
+            delivery_command(target, VERIFY, vec![destination_str, &manifest]).await?;
+        }
+        Ok(destination.join("bin/cleat"))
+    }
+    .await;
+    let _ = delivery_command(target, "rm -rf -- \"$1\"", vec![temporary_str]).await;
+    result.map_err(|error: String| format!("deliver incoming cleat: {error}"))
+}
+
 /// Transfer live descriptors to the installed generation. Failure leaves old
 /// sessions alive and becomes actionable CleatBuildSkew; never request drops.
 pub async fn drain(host: String, generation: String, incoming: &Path, targets: &[CleatTarget], errors: Vec<String>) -> RollReport {
@@ -148,10 +237,13 @@ pub async fn drain(host: String, generation: String, incoming: &Path, targets: &
         return report;
     }
     for target in targets {
-        let incoming = if target.contained { Path::new("/opt/flotilla/bin/cleat") } else { incoming };
-        let output = match incoming.to_str() {
-            Some(binary) => command(target, binary, &["server", "handover", "--json"], Duration::from_secs(30)).await,
-            None => Err("installed cleat path is not UTF-8".into()),
+        let selected_incoming = incoming_for_target(target, &report.generation, incoming).await;
+        let output = match &selected_incoming {
+            Ok(incoming) => match incoming.to_str() {
+                Some(binary) => command(target, binary, &["server", "handover", "--json"], Duration::from_secs(30)).await,
+                None => Err("installed cleat path is not UTF-8".into()),
+            },
+            Err(error) => Err(error.clone()),
         };
         let (stdout, stderr, success, mut error) = match output {
             Ok(output) => {
@@ -219,7 +311,10 @@ pub async fn drain(host: String, generation: String, incoming: &Path, targets: &
             && stderr.starts_with("connect daemon:")
             && (stderr.contains("No such file or directory") || stderr.contains("Connection refused"))
         {
-            let listing = parsed(command(target, &target.binary, &["daemons", "--json"], Duration::from_secs(5)).await);
+            let listing = match selected_incoming.as_ref().ok().and_then(|path| path.to_str()) {
+                Some(binary) => parsed(command(target, binary, &["daemons", "--json"], Duration::from_secs(5)).await),
+                None => None,
+            };
             if let Some(daemons) = listing.as_ref().and_then(Value::as_array) {
                 let live: Vec<_> = daemons
                     .iter()

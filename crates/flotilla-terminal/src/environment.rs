@@ -135,6 +135,11 @@ impl CommandRunner for ControlledCommandRunner {
         self.inner.run_output("/usr/bin/env", &args.iter().map(String::as_str).collect::<Vec<_>>(), cwd, label).await
     }
 
+    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        let args = self.arguments(cmd, args);
+        self.inner.run_with_input("/usr/bin/env", &args.iter().map(String::as_str).collect::<Vec<_>>(), cwd, label, input).await
+    }
+
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
         self.run_output(cmd, args, Path::new("/"), &ChannelLabel::Default).await.is_ok_and(|output| output.success())
     }
