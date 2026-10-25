@@ -769,7 +769,7 @@ pub struct InProcessDaemon {
     /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
     checkout_namespace_changes: tokio::sync::watch::Sender<()>,
-    fleet: FleetService,
+    fleet: Arc<FleetService>,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
     operator_reconciler: RwLock<Option<Arc<dyn OperatorReconciler>>>,
     /// Sessions on agentless hosts run in their vessels' agents (#3792).
@@ -1350,11 +1350,11 @@ impl InProcessDaemon {
             aggregator_projection_state: aggregator_projection_state.clone(),
             image_layer_refresh: Default::default(),
             provisioning_namespace: Arc::clone(&provisioning_namespace),
-            fleet: FleetService::new(
+            fleet: Arc::new(FleetService::new(
                 aggregator_projection_state.clone(),
                 host_name.clone(),
                 Some(CanonicalHostId::resolved(environment_manager.local_host_id().as_str())),
-            ),
+            )),
             repository_inspector: RwLock::new(None),
             operator_reconciler: RwLock::new(None),
             agentless_vessels: std::sync::RwLock::new(None),
@@ -2159,6 +2159,20 @@ impl InProcessDaemon {
         if slot.is_some() {
             return Err("decided store is already open".into());
         }
+        let fleet = Arc::clone(&self.fleet);
+        let node = self.node_id.clone();
+        service.observe_serving(Arc::new(move |result| {
+            use flotilla_projections::fleet::ChangeStreamUpdate;
+            let update = match result {
+                Ok(round) if round.snapshot => ChangeStreamUpdate::Healthy(round.watermark),
+                Ok(round) => ChangeStreamUpdate::Progress(round.watermark),
+                Err(error @ flotilla_schema_sqlite::StoreError::ResourceLimit { .. }) => {
+                    ChangeStreamUpdate::Failure { watermark: None, message: error.to_string() }
+                }
+                Err(_) => return,
+            };
+            fleet.report_change_stream(&node, update);
+        }))?;
         *slot = Some(service);
         Ok(())
     }
@@ -2530,6 +2544,10 @@ impl InProcessDaemon {
                 self.event_sink.emit(e);
             })
             .await;
+    }
+
+    pub fn report_change_stream(&self, peer: &NodeId, update: flotilla_projections::fleet::ChangeStreamUpdate) {
+        self.fleet.report_change_stream(peer, update);
     }
 
     pub async fn begin_peer_resource_replication(&self, peer: &NodeId) {

@@ -9,10 +9,10 @@ use flotilla_schema::{Event, Identity, Timestamp, LOG_LIMITS};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
-use crate::{Snapshot, Store, StoreError, MAX_PAGE};
+use crate::{Snapshot, Store, StoreError, StreamResourceLimit, MAX_PAGE};
 
 /// Local gate input. Missing metadata means zero/epoch, never proof of freshness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +29,10 @@ impl Watermark {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
 pub enum Frame {
+    /// Producer failure, preserved across transports without committing a round.
+    Failure {
+        message: String,
+    },
     Read {
         home: String,
         value: Option<Snapshot>,
@@ -77,15 +81,25 @@ pub fn serve(
     source: &mut Store,
     after: Option<u64>,
     now: Timestamp,
-    mut send: impl FnMut(&[u8]) -> Result<(), StoreError>,
+    send: impl FnMut(&[u8]) -> Result<(), StoreError>,
 ) -> Result<u64, StoreError> {
+    serve_round(source, after, now, send).map(|round| round.watermark)
+}
+
+fn serve_round(
+    source: &mut Store,
+    after: Option<u64>,
+    now: Timestamp,
+    mut send: impl FnMut(&[u8]) -> Result<(), StoreError>,
+) -> Result<ServedRound, StoreError> {
     let home = source.home().to_owned();
     let kinds: Vec<_> = source.kinds().iter().map(|set| set.code).collect();
     let mut read = source.read()?;
     let floor = read.resume_floor(&home)?;
     let last = read.last_sequence(&home)?;
     let emit = |frame: Frame, send: &mut dyn FnMut(&[u8]) -> Result<(), StoreError>| send(&frame.encode()?);
-    let mut cursor = match after.filter(|seq| *seq >= floor && *seq <= last) {
+    let after = after.filter(|seq| *seq >= floor && *seq <= last);
+    let mut cursor = match after {
         Some(cursor) => cursor,
         None => {
             emit(Frame::Begin { home: home.clone(), home_seq: last }, &mut send)?;
@@ -123,7 +137,7 @@ pub fn serve(
         }
     }
     emit(Frame::Keepalive { home, watermark: Watermark { home_seq: cursor, applied_through: now } }, &mut send)?;
-    Ok(cursor)
+    Ok(ServedRound { watermark: cursor, snapshot: after.is_none() })
 }
 
 /// Ordinary resources take one frame. Append-only resources can outgrow the wire bound;
@@ -136,12 +150,32 @@ fn send_resource(snapshot: Snapshot, send: &mut dyn FnMut(&[u8]) -> Result<(), S
         Err(error) => return Err(StoreError::Stream(error.to_string())),
     }
     let Frame::Resource(snapshot) = frame else { unreachable!() };
-    let tables = snapshot.rows.tables.len();
+    // Preflight exceptional resources before emitting any chunks. Two passes bound
+    // retained encoding memory to one row, while ordinary resources encode once.
+    let mut bytes = 0usize;
+    resource_chunks(&snapshot, &mut |chunk| {
+        bytes = bytes.saturating_add(chunk.len());
+        if bytes > MAX_RESOURCE_ASSEMBLY_BYTES {
+            return Err(resource_limit(&snapshot, StreamResourceLimit::Assembly { bytes, limit: MAX_RESOURCE_ASSEMBLY_BYTES }));
+        }
+        Ok(())
+    })?;
+    resource_chunks(&snapshot, send)
+}
+
+fn resource_limit(snapshot: &Snapshot, reason: StreamResourceLimit) -> StoreError {
+    StoreError::ResourceLimit {
+        identity: Identity { kind: snapshot.kind, name: snapshot.name.clone(), home: snapshot.home.clone() },
+        reason,
+    }
+}
+
+fn resource_chunks(snapshot: &Snapshot, send: &mut dyn FnMut(&[u8]) -> Result<(), StoreError>) -> Result<(), StoreError> {
     let total: usize = snapshot.rows.tables.iter().map(Vec::len).sum();
     let mut sent = 0;
-    for (table, rows) in snapshot.rows.tables.into_iter().enumerate() {
+    for (table, rows) in snapshot.rows.tables.iter().enumerate() {
         for row in rows {
-            let mut chunk = flotilla_schema::Rows::with_tables(tables);
+            let mut chunk = flotilla_schema::Rows::with_tables(snapshot.rows.tables.len());
             for value in row.key.iter().chain(&row.values) {
                 if let flotilla_schema::Value::Object(hash) = value {
                     if let Some(bytes) = snapshot.rows.objects.get(hash) {
@@ -149,7 +183,7 @@ fn send_resource(snapshot: Snapshot, send: &mut dyn FnMut(&[u8]) -> Result<(), S
                     }
                 }
             }
-            chunk.tables[table].push(row);
+            chunk.tables[table].push(row.clone());
             sent += 1;
             let value = Snapshot {
                 kind: snapshot.kind,
@@ -158,7 +192,14 @@ fn send_resource(snapshot: Snapshot, send: &mut dyn FnMut(&[u8]) -> Result<(), S
                 version: snapshot.version,
                 rows: chunk,
             };
-            send(&Frame::ResourceChunk { value, last: sent == total }.encode()?)?;
+            let bytes = FRAMING.encode(&Frame::ResourceChunk { value, last: sent == total }).map_err(|error| {
+                if matches!(error.kind(), flotilla_cbor::ErrorKind::MessageLimit | flotilla_cbor::ErrorKind::ElementLimit) {
+                    resource_limit(snapshot, StreamResourceLimit::Row { limit: FRAMING.limits.max_message })
+                } else {
+                    StoreError::Stream(error.to_string())
+                }
+            })?;
+            send(&bytes)?;
         }
     }
     Ok(())
@@ -186,6 +227,7 @@ impl<'a> Follower<'a> {
         let mut cursor = write.stream_watermark(home)?;
         deliver(&mut |bytes| {
             match Frame::decode(bytes)? {
+                Frame::Failure { message } => return Err(StoreError::Stream(message)),
                 Frame::Begin { home: from, home_seq } if from == home && snapshot.is_none() => {
                     write.reset_replica(home)?;
                     snapshot = Some(home_seq);
@@ -265,7 +307,8 @@ pub struct ReadResult {
 }
 
 impl flotilla_cbor::Message for Frame {
-    const TYPES: &'static [&'static str] = &["Read", "Begin", "Resource", "ResourceChunk", "Tombstone", "End", "Change", "Keepalive"];
+    const TYPES: &'static [&'static str] =
+        &["Failure", "Read", "Begin", "Resource", "ResourceChunk", "Tombstone", "End", "Change", "Keepalive"];
 }
 
 /// Bounded exceptional resource assembly, well above WORKLOAD.md's 100 KiB convoy width.
@@ -294,8 +337,21 @@ pub struct Service {
     store: std::sync::Arc<Mutex<Store>>,
     source: Source,
     watermarks: Watermarks,
+    serve_observer: OnceLock<Arc<ServeObserver>>,
 }
+/// A completed serving round. Tail success does not prove snapshot servability.
+pub struct ServedRound {
+    pub watermark: u64,
+    pub snapshot: bool,
+}
+
+/// Synchronous observation after a serving attempt; callbacks must not block.
+pub type ServeObserver = dyn Fn(&Result<ServedRound, StoreError>) + Send + Sync;
+
 impl Service {
+    pub fn observe_serving(&self, observer: Arc<ServeObserver>) -> Result<(), String> {
+        self.serve_observer.set(observer).map_err(|_| "stream observer already installed".into())
+    }
     /// Gates read committed progress independently of database writers and network delivery.
     pub fn watermark(&self, home: &str) -> Result<Watermark, StoreError> {
         Ok(watermark(&self.watermarks, home))
@@ -328,7 +384,7 @@ impl Service {
         let source = Source { path: path.to_owned(), home: home.to_owned(), kinds: kinds.clone() };
         let store = Store::open(conn, home, kinds)?;
         let watermarks = store.watermarks();
-        Ok(Self { store: std::sync::Arc::new(Mutex::new(store)), source, watermarks })
+        Ok(Self { store: std::sync::Arc::new(Mutex::new(store)), source, watermarks, serve_observer: OnceLock::new() })
     }
     pub fn serve(&self, after: Option<u64>, now: Timestamp, sink: impl FnMut(&[u8]) -> Result<(), StoreError>) -> Result<u64, StoreError> {
         // Wait for any writer currently holding the mutex before taking the read snapshot;
@@ -336,7 +392,11 @@ impl Service {
         // before delivery: a slow peer holds only this round's read-only connection.
         self.with_store(|_| Ok(()))?;
         let mut reader = Store::open_reader(&self.source.path, &self.source.home, self.source.kinds.clone())?;
-        serve(&mut reader, after, now, sink)
+        let result = serve_round(&mut reader, after, now, sink);
+        if let Some(observer) = self.serve_observer.get() {
+            observer(&result);
+        }
+        result.map(|round| round.watermark)
     }
     pub fn query(&self, kind: flotilla_schema::KindCode, name: &str, now: Timestamp) -> Result<Vec<u8>, StoreError> {
         let mut store = Store::open_reader(&self.source.path, &self.source.home, self.source.kinds.clone())?;
@@ -378,6 +438,33 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("byte-string-limit"));
         assert_eq!(sent, 0);
+    }
+
+    // An unservable resource is rejected before chunk delivery, naming its identity.
+    // Exercise both a single wide row and many individually encodable rows.
+    #[test]
+    fn sender_refuses_unservable_resources_before_delivery() {
+        for (rows, width) in [(1, 17), (65, 1)] {
+            let mut value = snapshot(Value::Text("root".into()));
+            value.rows.tables.push(
+                (0..rows)
+                    .map(|key| Row {
+                        key: vec![Value::Int(key)],
+                        values: (0..width).map(|_| Value::Text("x".repeat(1024 * 1024))).collect(),
+                    })
+                    .collect(),
+            );
+            let mut sent = 0;
+            let error = send_resource(value, &mut |_| {
+                sent += 1;
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("home/test/resource"), "{error}");
+            assert!(matches!(error, StoreError::ResourceLimit { reason: StreamResourceLimit::Row { .. }, .. }) == (rows == 1));
+            assert!(matches!(error, StoreError::ResourceLimit { .. }));
+            assert_eq!(sent, 0);
+        }
     }
 
     // A peer cannot grow an unfinished resource indefinitely. Crossing the byte budget

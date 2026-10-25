@@ -2024,6 +2024,7 @@ mod tests {
             })),
             CommandValue::ProjectList(Box::new(crate::ProjectListResponse { projects: vec![] })),
             CommandValue::HostStatus(Box::new(HostStatusResponse {
+                change_stream: None,
                 environment_id: EnvironmentId::host(HostId::new("desktop-host")),
                 host_name: crate::HostName::new("desktop"),
                 node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
@@ -2088,6 +2089,7 @@ mod tests {
                     .staleness(FleetStaleness::Local)
                     .build()],
                 replicas: vec![FleetReplicaStatus {
+                    change_stream: None,
                     host: crate::HostName::new("feta"),
                     reachable: false,
                     last_sync: None,

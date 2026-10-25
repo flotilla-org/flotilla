@@ -74,10 +74,21 @@ pub async fn replicated_host_reports(
     }
     reports
 }
+pub enum ChangeStreamUpdate {
+    /// A source tail advanced, but does not prove its full snapshot is servable.
+    Progress(u64),
+    Healthy(u64),
+    Failure {
+        watermark: Option<u64>,
+        message: String,
+    },
+}
+
 pub struct FleetService {
     aggregator_projection_state: AggregatorProjectionState,
     host_name: HostName,
     canonical_local_host_id: Option<CanonicalHostId>,
+    change_streams: std::sync::RwLock<HashMap<NodeId, flotilla_protocol::ChangeStreamStatus>>,
     resource_replication_failures: RwLock<HashMap<NodeId, BTreeMap<String, String>>>,
 }
 
@@ -87,11 +98,50 @@ impl FleetService {
         host_name: HostName,
         canonical_local_host_id: Option<CanonicalHostId>,
     ) -> Self {
-        Self { aggregator_projection_state, host_name, canonical_local_host_id, resource_replication_failures: RwLock::new(HashMap::new()) }
+        Self {
+            change_streams: Default::default(),
+            aggregator_projection_state,
+            host_name,
+            canonical_local_host_id,
+            resource_replication_failures: RwLock::new(HashMap::new()),
+        }
     }
 
     pub async fn replication_failures(&self) -> HashMap<NodeId, BTreeMap<String, String>> {
-        self.resource_replication_failures.read().await.clone()
+        let mut failures = self.resource_replication_failures.read().await.clone();
+        for (peer, state) in self.change_streams() {
+            if let Some(error) = state.last_error {
+                failures.entry(peer).or_default().insert(
+                    "change-stream".into(),
+                    format!("watermark {}, {} consecutive failures: {error}", state.watermark, state.consecutive_failures),
+                );
+            }
+        }
+        failures
+    }
+
+    pub fn change_streams(&self) -> HashMap<NodeId, flotilla_protocol::ChangeStreamStatus> {
+        self.change_streams.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    pub fn report_change_stream(&self, peer: &NodeId, update: ChangeStreamUpdate) {
+        let mut streams = self.change_streams.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = streams.entry(peer.clone()).or_default();
+        match update {
+            ChangeStreamUpdate::Progress(watermark) => state.watermark = watermark,
+            ChangeStreamUpdate::Healthy(watermark) => {
+                state.watermark = watermark;
+                state.last_error = None;
+                state.consecutive_failures = 0;
+            }
+            ChangeStreamUpdate::Failure { watermark, message } => {
+                if let Some(watermark) = watermark {
+                    state.watermark = watermark;
+                }
+                state.last_error = Some(message);
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            }
+        }
     }
 
     pub async fn begin_peer_resource_replication(&self, peer: &NodeId) {

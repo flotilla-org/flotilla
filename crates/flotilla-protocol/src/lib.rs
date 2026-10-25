@@ -299,15 +299,15 @@ pub use provider_data::{
     Workspace,
 };
 pub use query::{
-    BlobSyncStatus, CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse,
-    CrewProject, CrewProjectRepository, CrewStallRow, CrewStallsResponse, DeclarationAttentionKind, DeclarationAttentionRow,
-    DiscoveryEntry, DispatchBoardDependency, DispatchBoardIssue, DispatchBoardPullRequest, DispatchBoardRepository, DispatchBoardResponse,
-    DispatchQueueResponse, DispatchQueueRow, DispatchReadyKey, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse,
-    FleetListRow, FleetObservationAgreement, FleetReplicaStatus, FleetStaleness, FleetSurfaceCounts, FulfilmentHarness,
-    FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse,
-    PeerReconnectStatus, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProjectRepositoryRole, ProviderHealthMap,
-    ProviderInfo, RepoProvidersResponse, RepoSummary, SleepInhibitionHealth, StallRung, StatusResponse, TopologyResponse, TopologyRoute,
-    UnmetRequirementInfo,
+    BlobSyncStatus, ChangeStreamStatus, CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext,
+    CrewListMember, CrewListResponse, CrewProject, CrewProjectRepository, CrewStallRow, CrewStallsResponse, DeclarationAttentionKind,
+    DeclarationAttentionRow, DiscoveryEntry, DispatchBoardDependency, DispatchBoardIssue, DispatchBoardPullRequest,
+    DispatchBoardRepository, DispatchBoardResponse, DispatchQueueResponse, DispatchQueueRow, DispatchReadyKey, FleetHealthResponse,
+    FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaStatus, FleetStaleness,
+    FleetSurfaceCounts, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListEntry, HostListResponse,
+    HostProvidersResponse, HostStatusResponse, PeerReconnectStatus, ProjectListEntry, ProjectListRepository, ProjectListResponse,
+    ProjectRepositoryRole, ProviderHealthMap, ProviderInfo, RepoProvidersResponse, RepoSummary, SleepInhibitionHealth, StallRung,
+    StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
 };
 pub use repository::{RepositoryRelation, RepositoryUpstream};
 pub use resource_ref::ResourceRef;

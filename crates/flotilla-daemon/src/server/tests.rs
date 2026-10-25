@@ -6904,7 +6904,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     let mut kinds = KindRegistry::new();
     kinds.register::<RoutedStreamSample>().unwrap();
     let source = Arc::new(Service::open(&dir.path().join("source.db"), "home", kinds.clone()).unwrap());
-    let target = Arc::new(Service::open(&dir.path().join("target.db"), "local", kinds).unwrap());
+    let target = Arc::new(Service::open(&dir.path().join("target.db"), "local", kinds.clone()).unwrap());
     home.install_decided_store(Arc::clone(&source)).unwrap();
     let seed = |name: &str| {
         source
@@ -7041,6 +7041,124 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     writer.await.unwrap();
     assert_eq!(error, "routed frame timed out");
     assert_eq!(target.watermark("home").unwrap().home_seq, 22);
+    // A growing resource can exceed snapshot assembly while each update and tail
+    // remains bounded. A fresh follower exposes the identity and committed zero,
+    // while the home latches the same failure even after serving a healthy tail.
+    let resource = source
+        .with_store(|store| {
+            let mut write = store.write()?;
+            let stamp = write.insert(
+                "large",
+                &RoutedStreamSample { value: "large".into(), tags: Vec::new() },
+                &Origin::new("writer", Timestamp(2)),
+            )?;
+            write.commit()?;
+            Ok(stamp.id)
+        })
+        .unwrap();
+    for _ in 0..65 {
+        source
+            .with_store(|store| {
+                let mut write = store.write()?;
+                let current = write.load::<RoutedStreamSample>(resource)?.unwrap();
+                let mut tags = current.value.tags.clone();
+                tags.push("x".repeat(1024 * 1024));
+                write.update(&current, &RoutedStreamSample { value: "large".into(), tags }, &Origin::new("writer", Timestamp(2)))?;
+                write.commit()
+            })
+            .unwrap();
+    }
+    let fresh = Arc::new(Service::open(&dir.path().join("fresh.db"), "local", kinds).unwrap());
+    local.install_decided_store(Arc::clone(&fresh)).unwrap();
+    let following =
+        tokio_util::task::AbortOnDropHandle::new(super::change_stream::follow(Arc::clone(&local), "home".into(), None, router.clone()));
+    let failure = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(replica) = local
+                .fleet_list_internal()
+                .await
+                .unwrap()
+                .replicas
+                .into_iter()
+                .find(|replica| replica.change_stream.as_ref().is_some_and(|state| state.last_error.is_some()))
+            {
+                break replica;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    following.abort();
+    let state = failure.change_stream.unwrap();
+    assert!(!failure.reachable);
+    assert_eq!(state.watermark, 0);
+    assert_eq!(state.consecutive_failures, 1);
+    assert!(state.last_error.unwrap().contains("home/rs/large"));
+    assert!(failure.message.unwrap().contains("home/rs/large"));
+    assert!(!fresh.has_watermark("home"));
+
+    super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
+    assert_eq!(target.watermark("home").unwrap().home_seq, 88);
+    let hosts = home.list_hosts_internal().await.unwrap();
+    let environment = &hosts.hosts.iter().find(|host| host.is_local).unwrap().environment_id.clone().unwrap();
+    let status = home.get_host_status_internal(environment).await.unwrap();
+    let state = status.change_stream.unwrap();
+    assert_eq!(state.watermark, 88);
+    assert!(state.last_error.unwrap().contains("home/rs/large"), "tail success cannot clear a snapshot refusal");
+
+    // HTTP must carry the producer's reason as a frame, rather than replacing it
+    // with a generic truncated-body error; the receiver rolls back that failure.
+    let first = home.next_change_stream_frame("http-health", None, None).await.unwrap();
+    let CommandValue::ChangeStreamFrame { session, .. } = first else { panic!("first frame") };
+    let frames = super::change_stream::body(Arc::clone(&home), "http-health".into(), session);
+    tokio::pin!(frames);
+    let mut error = None;
+    while let Some(bytes) = futures::StreamExt::next(&mut frames).await {
+        if let flotilla_schema_sqlite::stream::Frame::Failure { message } =
+            flotilla_schema_sqlite::stream::Frame::decode(&bytes.unwrap()).unwrap()
+        {
+            error = Some(message);
+        }
+    }
+    assert!(error.unwrap().contains("home/rs/large"));
+
+    // Removing the unservable resource allows a full round to commit and clears
+    // both source and follower errors rather than leaving a permanent alarm.
+    source
+        .with_store(|store| {
+            let mut write = store.write()?;
+            let current = write.load::<RoutedStreamSample>(resource)?.unwrap();
+            write.delete::<RoutedStreamSample>(current.stamp(), &Origin::new("writer", Timestamp(3)))?;
+            write.commit()
+        })
+        .unwrap();
+    let following =
+        tokio_util::task::AbortOnDropHandle::new(super::change_stream::follow(Arc::clone(&local), "home".into(), None, router.clone()));
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if fresh.has_watermark("home")
+                && local
+                    .fleet_list_internal()
+                    .await
+                    .unwrap()
+                    .replicas
+                    .iter()
+                    .all(|replica| replica.change_stream.as_ref().is_none_or(|state| state.last_error.is_none()))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    following.abort();
+    assert_eq!(fresh.watermark("home").unwrap().home_seq, 89);
+    let state = home.get_host_status_internal(environment).await.unwrap().change_stream.unwrap();
+    assert_eq!(state.watermark, 89);
+    assert_eq!(state.consecutive_failures, 0);
+    assert!(state.last_error.is_none());
     remote.abort();
 }
 

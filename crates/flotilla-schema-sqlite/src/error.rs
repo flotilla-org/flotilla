@@ -1,9 +1,11 @@
-use flotilla_schema::{Code, DecodeError, EncodeError, EventError, Hash, KindCode, RegistryError, Value};
+use flotilla_schema::{Code, DecodeError, EncodeError, EventError, Hash, Identity, KindCode, RegistryError, Value};
 
 use crate::store::ResourceId;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("change stream resource {}/{}/{}: {reason}", .identity.home, .identity.kind, .identity.name)]
+    ResourceLimit { identity: Identity, reason: StreamResourceLimit },
     #[error("change stream: {0}")]
     Stream(String),
     /// The new store's pre-domain baseline has no migration path; reject it at open.
@@ -128,4 +130,13 @@ pub enum Malformed {
     /// Above `i64::MAX`, or 0, which no write takes (sequences start at 1).
     #[error("home sequence {home_seq} cannot be stored")]
     Sequence { home_seq: u64 },
+}
+
+/// Why a snapshot resource cannot be delivered within the stream's bounds.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StreamResourceLimit {
+    #[error("single row exceeds frame limit ({limit} bytes)")]
+    Row { limit: usize },
+    #[error("resource exceeds assembly limit ({bytes} bytes, limit {limit})")]
+    Assembly { bytes: usize, limit: usize },
 }

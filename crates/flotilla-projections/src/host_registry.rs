@@ -874,6 +874,7 @@ fn build_host_status(
         summary.as_ref().and_then(|summary| summary.host_name.clone()).unwrap_or_else(|| HostName::new(node.display_name.clone()));
 
     HostStatusResponse {
+        change_stream: None,
         environment_id: environment_id.clone(),
         host_name,
         node,
