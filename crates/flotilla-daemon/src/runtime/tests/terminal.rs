@@ -540,10 +540,7 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
     .await;
     let failure = runtime.observe_failure(session_name, &spec).await.expect("observe auth failure").expect("fatal auth failure");
     assert!(failure.contains("token_expired"));
-    assert!(
-        failure.contains(&central.display().to_string()),
-        "a static credential names the central login an operator must re-authenticate: {failure}"
-    );
+    assert!(failure.contains("selected credential"), "the refusal must not guess which account supplied the credential: {failure}");
     material
         .prepare("replacement-environment", &BTreeSet::from(["codex".to_string()]), &BTreeMap::new())
         .await

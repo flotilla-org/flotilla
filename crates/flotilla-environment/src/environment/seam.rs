@@ -63,6 +63,9 @@ impl ProviderObservation {
 }
 
 /// Read-only tool detection, separate from required lifecycle operations.
+/// Providers isolate HOME, harness and XDG configuration/cache/state, clear
+/// ambient authentication, and clean observation state after cancellation.
+/// `scratch` identifies the caller workspace, never the harness home or CWD.
 #[async_trait]
 pub trait EnvironmentDetection: Send + Sync {
     async fn detect(

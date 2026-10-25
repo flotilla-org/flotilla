@@ -297,6 +297,9 @@ pub(crate) mod test_support {
     #[async_trait]
     impl CommandRunner for GatedCredentialPreflight {
         async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            if cmd == "sh" && args == ["-c", "command -v claude"] {
+                return Ok("/tools/claude".into());
+            }
             if cmd == "git" && args == ["--version"] {
                 return Ok("git version 2.43.0".into());
             }

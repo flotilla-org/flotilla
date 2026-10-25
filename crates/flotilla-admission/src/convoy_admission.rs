@@ -2485,7 +2485,7 @@ impl AdmissionReadContext<'_> {
 
     async fn compose_placement_needs(
         &self,
-        namespace: &str,
+        _namespace: &str,
         project: &ProjectSpec,
         issues: &[ConvoyIssue],
         intent: &flotilla_protocol::ConvoyStartIntent,
@@ -2499,14 +2499,6 @@ impl AdmissionReadContext<'_> {
         for value in &intent.needs {
             common.insert(parse_ad_hoc_capability_need(value)?);
         }
-        let hosts = self
-            .backend
-            .query_declared::<ResourceHost>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
-            .await
-            .map_err(|error| error.to_string())?;
-        // Only a refusal diagnostic needs the FulfilmentKind inventory; read it
-        // at most once per composition rather than once per crew member.
-        let fulfilment_kinds = tokio::sync::OnceCell::new();
         let mut union = BTreeSet::new();
         for vessel in &mut workflow.vessels {
             let mut vessel_needs = BTreeSet::new();
@@ -2525,39 +2517,9 @@ impl AdmissionReadContext<'_> {
                         crew.needs
                             .insert(CapabilityNeed::Harness { adapter: requirement.adapter.clone(), minimum_version: minimum.to_string() });
                     }
-                    if let (Some(adapter), Some(model)) = (&selector.adapter, &selector.model) {
-                        // Only an explicit rejection refuses. Model acceptance is often
-                        // unobservable (credential-less probe containers, harnesses with
-                        // no model probe), and unknown must not read as "rejected".
-                        let observed_harnesses = hosts
-                            .items
-                            .iter()
-                            .flat_map(|host| host.object.status.as_ref().into_iter())
-                            .flat_map(|status| status.fulfilment_facts.values())
-                            .filter_map(|facts| facts.harnesses.get(adapter))
-                            .collect::<Vec<_>>();
-                        let rejected_everywhere = !observed_harnesses.is_empty()
-                            && observed_harnesses.iter().all(|harness| harness.models.get(model).is_some_and(|model| !model.usable));
-                        // An observed version is evidence that the model works with that
-                        // version, never a minimum: host installs auto-update ahead of
-                        // pinned image layers. A model adds a version need only through a
-                        // declared fact (see `minimum_harness_version`).
-                        if rejected_everywhere {
-                            return Err(format!("no observed {adapter} harness accepts model {model}"));
-                        } else if observed_harnesses.is_empty() {
-                            let kinds = fulfilment_kinds
-                                .get_or_try_init(|| async { self.backend.including_replicas::<FulfilmentKind>(namespace).list().await })
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            let names = kinds.items.iter().map(|kind| kind.object.metadata.name.as_str()).collect::<Vec<_>>();
-                            if !names.is_empty() {
-                                return Err(format!(
-                                    "facts not yet observed for kind {} (needed for {adapter} model {model})",
-                                    names.join(", kind ")
-                                ));
-                            }
-                        }
-                    }
+                    // Account/model entitlement is unknown. Host login probes,
+                    // including persisted results, cannot authorize or refuse
+                    // work using the credential selected by its actual grant.
                 }
                 vessel_needs.extend(crew.needs.iter().cloned());
             }

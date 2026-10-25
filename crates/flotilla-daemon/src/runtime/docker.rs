@@ -891,11 +891,7 @@ impl EnvironmentRuntime for DockerControllerRuntime {
 struct GuestProbeEnvironment<'a>(&'a EnvironmentBag);
 impl flotilla_provider_runtime::EnvVars for GuestProbeEnvironment<'_> {
     fn get(&self, key: &str) -> Option<String> {
-        if key == "FLOTILLA_PROBE_MODELS" {
-            Some(String::new())
-        } else {
-            self.0.find_env_var(key).map(str::to_owned)
-        }
+        self.0.find_env_var(key).map(str::to_owned)
     }
 }
 pub(super) async fn verify_cloud_image_needs(

@@ -2816,7 +2816,7 @@ async fn ad_hoc_matrix_need_is_refused_before_placement() {
 }
 
 #[tokio::test]
-async fn model_selector_admission_names_unobserved_kind_facts() {
+async fn unknown_model_entitlement_still_requires_a_scoped_credential() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
@@ -2838,7 +2838,7 @@ async fn model_selector_admission_names_unobserved_kind_facts() {
     })
     .await;
     assert!(
-        matches!(&result, CommandValue::Error { message } if message.contains("facts not yet observed for kind") && message.contains("host-direct-model-unknown")),
+        matches!(&result, CommandValue::Error { message } if message.contains("requires") && message.contains("CredentialGrant")),
         "{result:?}"
     );
 }
@@ -3443,7 +3443,7 @@ async fn codex_admission_refuses_old_host_and_explains_version_gap() {
 }
 
 #[tokio::test]
-async fn requested_model_selects_host_direct_without_an_observed_version_floor() {
+async fn requested_model_ignores_legacy_account_evidence_and_uses_only_selected_grants() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
@@ -3514,6 +3514,17 @@ async fn requested_model_selects_host_direct_without_an_observed_version_floor()
     status.capabilities.insert(HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["claude-max"]));
     hosts.update_status("direct-model", &host.metadata.resource_version, &status).await.expect("publish model facts");
 
+    // A fresh query must not turn persisted account-bound request results
+    // into current entitlement, even before the first new observation.
+    let query = daemon
+        .execute_query(Command::builder().action(CommandAction::QueryFulfilmentList {}).build(), uuid::Uuid::new_v4())
+        .await
+        .expect("fulfilment query");
+    let CommandValue::FulfilmentList(list) = query else { panic!("fulfilment list") };
+    let direct = list.kinds.iter().find(|kind| kind.name == "host-direct-model").expect("observed direct kind");
+    assert_eq!(direct.harnesses["claude-code"].version, "2.1.300");
+    assert!(list.kinds.iter().flat_map(|kind| kind.harnesses.values()).all(|harness| harness.models.is_empty()));
+
     let result = start_capability_convoy(&daemon, "model-driven", |intent| {
         intent.agent_overrides.push(flotilla_protocol::AgentOverride {
             capability: "code".to_string(),
@@ -3528,8 +3539,9 @@ async fn requested_model_selects_host_direct_without_an_observed_version_floor()
     let snapshot = backend.definitions::<WorkflowTemplate>("flotilla").get(snapshot_name).await.expect("workflow snapshot");
     let status = admitted.status.expect("admitted status");
     assert_eq!(status.placement_decision.expect("placement").policy_name, "host-direct-model");
+    assert_eq!(snapshot.spec.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
     let needs = &snapshot.spec.vessels[0].crew[0].needs;
-    // #3202: the observed 2.1.300 is evidence the model works, never a floor.
+    // A previous account request is no evidence about this credential or its harness floor.
     assert!(!needs
         .iter()
         .any(|need| matches!(need, flotilla_resources::CapabilityNeed::Harness { adapter, .. } if adapter == "claude-code")));
@@ -3547,7 +3559,7 @@ async fn requested_model_selects_host_direct_without_an_observed_version_floor()
     };
     assert!(!explanation.role_needs.values().flatten().any(|need| need.starts_with("harness:claude-code")));
     assert_eq!(explanation.vessel_placements["work"].policy_name, "host-direct-model");
-    let refused = start_capability_convoy(&daemon, "model-unavailable", |intent| {
+    let formerly_refused = start_capability_convoy(&daemon, "model-unavailable", |intent| {
         intent.agent_overrides.push(flotilla_protocol::AgentOverride {
             capability: "code".to_string(),
             adapter: "claude-code".to_string(),
@@ -3556,7 +3568,8 @@ async fn requested_model_selects_host_direct_without_an_observed_version_floor()
     })
     .await;
     assert!(
-        matches!(refused, CommandValue::Error { message } if message.contains("no observed claude-code harness accepts model unavailable"))
+        matches!(formerly_refused, CommandValue::ConvoyStarted { .. }),
+        "stale account refusal cannot reject selected credential: {formerly_refused:?}"
     );
     // A model the harness has no fact about is unknown, not rejected: admit
     // without a version floor.
@@ -3569,8 +3582,7 @@ async fn requested_model_selects_host_direct_without_an_observed_version_floor()
     })
     .await;
     assert!(!matches!(admitted, CommandValue::Error { .. }), "unknown model acceptance must not refuse: {admitted:?}");
-    // Refuse only when every observed harness explicitly rejects: one rejection
-    // plus one unknown verdict admits.
+    // Mixed legacy evidence also leaves entitlement unknown.
     let admitted = start_capability_convoy(&daemon, "model-mixed", |intent| {
         intent.agent_overrides.push(flotilla_protocol::AgentOverride {
             capability: "code".to_string(),

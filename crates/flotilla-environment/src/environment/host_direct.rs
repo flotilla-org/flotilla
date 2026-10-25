@@ -166,7 +166,7 @@ impl super::EnvironmentDetection for HostDirectEnvironmentProvider {
         if image.is_some() {
             return Err("host-direct detection does not accept an image".into());
         }
-        self.runner.run_output(binary, args, scratch, &flotilla_provider_runtime::ChannelLabel::Default).await
+        super::detection::host_detection(self.runner.clone(), binary, args, scratch).await
     }
 }
 

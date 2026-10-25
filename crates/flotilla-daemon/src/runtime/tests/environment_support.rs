@@ -117,6 +117,10 @@ impl CommandRunner for CredentialInteriorRunner {
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+        if cmd == "sh" && args == ["-c", "command -v claude"] {
+            let available = self.0.exists("claude", &[]).await;
+            return Ok(CommandOutput { stdout: "/tools/claude".into(), stderr: String::new(), exit_code: Some(i32::from(!available)) });
+        }
         self.0.run_output(cmd, args, cwd, label).await
     }
 

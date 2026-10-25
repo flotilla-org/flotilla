@@ -844,12 +844,30 @@ impl AgentAdapter for CliAgentAdapter {
     }
 
     fn classify_exit_failure(&self, exit_code: i32, screen: &str) -> Option<String> {
-        if !matches!(self.flavor, AdapterFlavor::Codex { .. }) || exit_code != 2 {
+        if exit_code == 0 {
             return None;
         }
-        // Capture is the current terminal screen and can include output from before the exit.
-        let diagnostic = screen.lines().map(str::trim).find(|line| line.starts_with("error:"))?;
-        Some(format!("Codex launch usage error (exit 2): {diagnostic}"))
+        match self.flavor {
+            AdapterFlavor::ClaudeCode { .. } if exit_code == 1 => match screen.trim() {
+                "Not logged in · Please run /login" => {
+                    Some("Claude authentication refused at launch: not logged in; check the selected credential".into())
+                }
+                "Login expired · Please run /login" => {
+                    Some("Claude authentication refused at launch: login expired; check the selected credential".into())
+                }
+                _ => None,
+            },
+            AdapterFlavor::Codex { .. } if exit_code == 2 => {
+                // Only a standalone observed CLI usage diagnostic is conclusive.
+                // Scrollback, user prompts, and quoted diagnostics are ambiguous.
+                let diagnostic = screen.trim();
+                (diagnostic == "error: unexpected argument '--no-daemon' found")
+                    .then(|| format!("Codex launch usage error (exit 2): {diagnostic}"))
+            }
+            AdapterFlavor::Codex { .. } if exit_code == 1 => codex_auth_failure(screen)
+                .map(|reason| format!("Codex authentication refused at launch: {reason}; check the selected credential")),
+            _ => None,
+        }
     }
 
     fn classify_screen_failure(&self, screen: &str) -> Option<&'static str> {
@@ -1073,13 +1091,13 @@ fn codex_screen_needs_input(screen: &str) -> bool {
 }
 
 fn codex_auth_failure(screen: &str) -> Option<&'static str> {
-    let normalized = screen.to_ascii_lowercase();
-    if normalized.contains("token_expired") {
-        Some("token_expired")
-    } else if normalized.contains("access token could not be refreshed") {
-        Some("access token could not be refreshed")
-    } else {
-        None
+    match screen.trim() {
+        "codex_apps: HTTP 401 TOKEN_EXPIRED"
+        | "codex_apps failed: HTTP 401 token_expired\nYour access token could not be refreshed. Please log out and sign in again." => {
+            Some("token_expired")
+        }
+        "Your access token could not be refreshed. Please log out and sign in again." => Some("access token could not be refreshed"),
+        _ => None,
     }
 }
 
@@ -1387,6 +1405,41 @@ mod tests {
             assert!(screen.is_empty() || message.contains(screen));
         }
         assert!(registry.get("claude-code").expect("claude").classify_exit_failure(code, screen).is_none());
+    }
+
+    // Existing observed standalone authentication diagnostics are conclusive
+    // only on nonzero exit. User/quoted/stale/ambiguous output stays resumable.
+    #[hegel::test]
+    fn launch_refusals_require_standalone_observed_diagnostics(tc: hegel::TestCase) {
+        let registry = discovered_registry();
+        let adapter_index = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(1));
+        let (id, diagnostic) = [
+            ("claude-code", "Not logged in · Please run /login"),
+            ("codex", "Your access token could not be refreshed. Please log out and sign in again."),
+        ][adapter_index];
+        let adapter = registry.get(id).expect("adapter");
+        // Generate all relevant provenance shapes, including empty, quoted,
+        // fenced, composer, earlier screen content, and a later live prompt.
+        let shape = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(6));
+        let screen = match shape {
+            0 => diagnostic.into(),
+            1 => format!("> {diagnostic}"),
+            2 => format!("```\n{diagnostic}\n```"),
+            3 => format!("› {diagnostic}"),
+            4 => format!("User asked about this error\n{diagnostic}"),
+            5 => format!("{diagnostic}\n❯ Ready"),
+            _ => String::new(),
+        };
+        let code = tc.draw(hegel::generators::integers::<i32>().min_value(0).max_value(1));
+        let result = adapter.classify_exit_failure(code, &screen);
+        assert_eq!(result.is_some(), shape == 0 && code != 0);
+        if let Some(message) = result {
+            assert!(message.len() < 160);
+            assert!(!message.contains("fake-secret"));
+        }
+        assert!(adapter.classify_exit_failure(1, "Login expired for fake-secret · Please run /login").is_none());
+        assert!(adapter.classify_exit_failure(1, "error: unknown model fake-secret").is_none());
+        assert!(adapter.classify_exit_failure(130, diagnostic).is_none(), "an interrupted process plus stale auth text is ambiguous");
     }
 
     #[test]

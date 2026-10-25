@@ -271,7 +271,8 @@ async fn codex_adapter_floor_is_composed_without_a_model() {
 }
 
 /// Compose the needs of a one-crew workflow whose selector names `claude-code`
-/// and `opus`, on hosts that each observe the given `(version, opus usable)`.
+/// and `opus`, on hosts carrying historical request-based `(version, usable)`
+/// observations. These facts do not identify the selected credential.
 async fn compose_claude_opus_needs(observations: &[(&str, bool)]) -> Result<BTreeSet<CapabilityNeed>, String> {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"model-floor-test\"\n").expect("daemon config");
@@ -305,7 +306,8 @@ async fn compose_claude_opus_needs(observations: &[(&str, bool)]) -> Result<BTre
             flotilla_resources::HostStatus { fulfilment_facts: BTreeMap::from([("kind".to_string(), facts)]), ..Default::default() };
         hosts.update_status(&name, &host.metadata.resource_version, &status).await.unwrap();
     }
-    let project = ProjectSpec::builder().display_name("Example".into()).default_workflow_ref("work".into()).build();
+    let mut project = ProjectSpec::builder().display_name("Example".into()).default_workflow_ref("work".into()).build();
+    project.role_needs.insert("coder".into(), BTreeSet::from([CapabilityNeed::Platform("linux".into())]));
     let mut workflow = WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder()
             .name("work".into())
@@ -327,10 +329,10 @@ async fn compose_claude_opus_needs(observations: &[(&str, bool)]) -> Result<BTre
     daemon.admission.compose_convoy_needs("flotilla", &project, &[], &intent, &mut workflow).await
 }
 
-// #3202: a newer harness observed with the model usable is evidence, not a
-// floor; a pinned image layer older than every host install must still admit.
+// A successful request under an old account neither proves current entitlement
+// nor creates a harness compatibility floor from that host's observed version.
 #[tokio::test]
-async fn observed_newer_harness_with_usable_model_adds_no_version_floor() {
+async fn probe_model_success_never_adds_observed_version_floor() {
     let needs = compose_claude_opus_needs(&[("2.1.295", true), ("2.1.301", true)]).await.expect("admitted");
     let observed = ["2.1.295", "2.1.301"];
     assert!(
@@ -342,13 +344,46 @@ async fn observed_newer_harness_with_usable_model_adds_no_version_floor() {
     );
 }
 
+// Old request refusals cannot reject a new credential. Ordinary platform needs
+// remain authoritative even when every stored request result is negative.
 #[tokio::test]
-async fn model_rejected_on_every_observed_harness_still_refuses() {
-    let error = compose_claude_opus_needs(&[("2.1.295", false), ("2.1.301", false)]).await.expect_err("refused");
-    assert_eq!(error, "no observed claude-code harness accepts model opus");
+async fn stale_negative_probe_results_do_not_refuse_unknown_entitlement() {
+    let unknown = compose_claude_opus_needs(&[]).await.expect("unknown entitlement permits composition");
+    let negative = compose_claude_opus_needs(&[("2.1.295", false), ("2.1.301", false)])
+        .await
+        .expect("old account refusals are not admission evidence");
+    assert_eq!(unknown, BTreeSet::from([CapabilityNeed::Platform("linux".into())]));
+    assert_eq!(negative, unknown);
+}
+
+// Adding successful, refused, mixed or duplicate historical requests cannot
+// change the needs composed for an unknown-entitlement launch.
+#[hegel::test]
+fn probe_model_evidence_does_not_change_composed_needs(tc: hegel::TestCase) {
+    // Covers zero through four hosts, both verdicts, and repeated versions.
+    let count = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(4));
+    let observations = (0..count)
+        .map(|_| {
+            let version = ["2.1.0", "2.1.295", "2.1.301"][tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2))];
+            (version, tc.draw(hegel::generators::booleans()))
+        })
+        .collect::<Vec<_>>();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let unknown = compose_claude_opus_needs(&[]).await.expect("unknown entitlement");
+        assert_eq!(unknown, BTreeSet::from([CapabilityNeed::Platform("linux".into())]));
+        for end in 1..=observations.len() {
+            let observed = compose_claude_opus_needs(&observations[..end]).await.expect("historical requests must not refuse composition");
+            assert_eq!(observed, unknown);
+        }
+    });
 }
 
 #[tokio::test]
-async fn model_usable_on_one_observed_harness_is_not_rejected_everywhere() {
-    compose_claude_opus_needs(&[("2.1.295", true), ("2.1.301", false)]).await.expect("admitted");
+async fn mixed_probe_model_results_preserve_unknown_entitlement_needs() {
+    let unknown = compose_claude_opus_needs(&[]).await.expect("unknown entitlement");
+    let mixed = compose_claude_opus_needs(&[("2.1.295", true), ("2.1.301", false)])
+        .await
+        .expect("mixed historical requests must not refuse composition");
+    assert_eq!(mixed, unknown);
 }

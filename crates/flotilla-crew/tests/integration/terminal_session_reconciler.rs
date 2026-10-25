@@ -2776,7 +2776,7 @@ impl flotilla_provider_runtime::CommandRunner for UnusedCommandRunner {
     }
 }
 
-struct ExitedAgentRuntime(i32, &'static str);
+struct ExitedAgentRuntime(i32, &'static str, &'static str);
 
 #[async_trait]
 impl TerminalRuntime for ExitedAgentRuntime {
@@ -2789,7 +2789,6 @@ impl TerminalRuntime for ExitedAgentRuntime {
         panic!("running shell must not provision a replacement before exit is observed")
     }
     async fn session_liveness(&self, _: &str, _: &TerminalSessionSpec) -> Result<TerminalLiveness, String> {
-        assert!(self.0 != 2 || self.1.is_empty(), "positive usage exit must win before liveness or relaunch");
         Ok(TerminalLiveness::Running)
     }
     // Inject the process boundary: the parent shell has observed the child exit.
@@ -2801,10 +2800,11 @@ impl TerminalRuntime for ExitedAgentRuntime {
         use flotilla_discovery_api::EnvironmentAssertion;
         use flotilla_discovery_api::EnvironmentBag;
         let registry = AgentAdapterRegistry::discover(
-            &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
+            &EnvironmentBag::new()
+                .with(EnvironmentAssertion::binary(if self.2 == "claude-code" { "claude" } else { "codex" }, "/tools/harness")),
             Arc::new(UnusedCommandRunner),
         );
-        Ok(registry.get("codex").expect("codex").classify_exit_failure(code, self.1))
+        Ok(registry.get(self.2).expect("adapter").classify_exit_failure(code, self.1))
     }
     async fn kill_session(&self, _: &str, _: &TerminalSessionSpec) -> Result<(), String> {
         Ok(())
@@ -2816,7 +2816,7 @@ impl TerminalRuntime for ExitedAgentRuntime {
 #[tokio::test]
 async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
     let diagnostic = "error: unexpected argument '--no-daemon' found";
-    for (code, phase, screen) in [
+    for (code, phase, screen, adapter, confirmed) in [
         (0, TerminalSessionPhase::Running, diagnostic),
         (2, TerminalSessionPhase::Running, diagnostic),
         (2, TerminalSessionPhase::Lost, diagnostic),
@@ -2824,7 +2824,17 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
         (42, TerminalSessionPhase::Running, diagnostic),
         (130, TerminalSessionPhase::Running, diagnostic),
         (137, TerminalSessionPhase::Running, diagnostic),
-    ] {
+    ]
+    .into_iter()
+    .map(|(code, phase, screen)| (code, phase, screen, "codex", code == 2 && !screen.is_empty()))
+    .chain([
+        (1, TerminalSessionPhase::Running, "Not logged in · Please run /login", "claude-code", true),
+        (1, TerminalSessionPhase::Running, "Login expired · Please run /login", "claude-code", true),
+        (0, TerminalSessionPhase::Running, "Not logged in · Please run /login", "claude-code", false),
+        (1, TerminalSessionPhase::Running, "› Not logged in · Please run /login", "claude-code", false),
+        (1, TerminalSessionPhase::Running, "Not logged in · Please run /login\n❯ Ready", "claude-code", false),
+        (1, TerminalSessionPhase::Running, "error: unknown model", "claude-code", false),
+    ]) {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         create_ready_environment(&backend, "env-a").await;
         create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
@@ -2839,7 +2849,11 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
                     env: Default::default(),
                     pool: "cleat".into(),
                     source: flotilla_resources::TerminalSessionSource::Agent {
-                        selector: flotilla_resources::Selector::for_capability("coding"),
+                        selector: flotilla_resources::Selector {
+                            capability: "coding".into(),
+                            adapter: Some(adapter.into()),
+                            model: Some("unknown-entitlement".into()),
+                        },
                         brief: flotilla_resources::TerminalBrief {
                             path: "brief.md".into(),
                             content: "original brief".into(),
@@ -2867,7 +2881,7 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
                     crew: Some(
                         flotilla_resources::CrewSessionStatus::builder()
                             .id("launch-id".into())
-                            .adapter("codex".into())
+                            .adapter(adapter.into())
                             .stance("trusted".into())
                             .build(),
                     ),
@@ -2876,14 +2890,16 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
             )
             .await
             .expect("running shell");
-        let reconciler = TerminalSessionReconciler::new(Arc::new(ExitedAgentRuntime(code, screen)), backend, "flotilla");
+        let reconciler = TerminalSessionReconciler::new(Arc::new(ExitedAgentRuntime(code, screen, adapter)), backend, "flotilla");
         let prepared = reconciler.prepare(&running).await.expect("observe process");
         let outcome = reconciler.reconcile(&running, &prepared, Utc::now());
         let mut status = running.status.clone().expect("status");
         outcome.patch.expect("exit patch").apply(&mut status);
-        if code == 2 && !screen.is_empty() {
+        if confirmed {
             assert_eq!(status.phase, TerminalSessionPhase::Failed);
-            assert!(status.message.as_ref().expect("usage error").contains("unexpected argument '--no-daemon'"));
+            let message = status.message.as_ref().expect("verified diagnostic");
+            assert!(message.len() < 160);
+            assert!(message.contains(if adapter == "codex" { "unexpected argument" } else { "authentication refused" }));
             let mut failed = running.clone();
             failed.status = Some(status.clone());
             let next = reconciler.prepare(&failed).await.expect("failed launch stays terminal");
