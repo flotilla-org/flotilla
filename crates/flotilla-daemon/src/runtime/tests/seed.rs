@@ -697,8 +697,8 @@ async fn cloud_policy_migration_uses_unique_controller() {
     assert!(matches!(kind.spec.realisation, flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { .. }));
 }
 
-// #3814: startup must finish after a bounded store read-deadline storm.
-// Use the real daemon/runtime over a memory store with refusals at its storage boundary.
+// A read-deadline storm lasting longer than five minutes must not terminate startup.
+// The real runtime exercises refusals at the memory store boundary.
 #[tokio::test(start_paused = true)]
 async fn runtime_starts_after_store_read_deadlines_clear() {
     let temp = TempDir::new().unwrap();
@@ -714,6 +714,7 @@ async fn runtime_starts_after_store_read_deadlines_clear() {
     }));
     let daemon = daemon_with_backend(Vec::new(), Arc::clone(&config), backend).await;
     armed.store(true, Ordering::Relaxed);
+    let started = tokio::time::Instant::now();
     let runtime = super::super::DaemonRuntime::start_with_options(
         Arc::clone(&daemon),
         config,
@@ -722,6 +723,7 @@ async fn runtime_starts_after_store_read_deadlines_clear() {
     )
     .await
     .expect("runtime recovers after store pressure");
+    assert!(started.elapsed() >= Duration::from_secs(360), "startup waited through the prolonged store pressure");
     assert!(refusals.load(Ordering::Relaxed) > 0, "startup exercised the deadline refusal");
     assert!(!daemon.resource_backend().using::<Host>(NAMESPACE).list().await.unwrap().items.is_empty());
     runtime.shutdown();

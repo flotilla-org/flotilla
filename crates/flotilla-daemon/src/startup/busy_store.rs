@@ -22,7 +22,7 @@ pub(crate) struct BusyStore {
 impl BusyStore {
     fn busy(&self) -> bool {
         self.armed.load(Ordering::Relaxed)
-            && self.busy_since.get_or_init(tokio::time::Instant::now).elapsed() < std::time::Duration::from_secs(2)
+            && self.busy_since.get_or_init(tokio::time::Instant::now).elapsed() < std::time::Duration::from_secs(360)
     }
 }
 #[async_trait]
