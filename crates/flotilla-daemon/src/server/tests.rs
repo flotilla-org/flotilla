@@ -6892,8 +6892,8 @@ impl PeerSender for StreamCommandWire {
     }
 }
 
-// A routed-only home supplies a consistent snapshot and resumed tail through the
-// production command dispatcher, spool and Follower, with no HTTP transport.
+// Socket connect/404 failures fall back to real routed snapshot/tail rounds;
+// a damaged HTTP body and unreachable point-read homes retain explicit failures.
 #[tokio::test]
 async fn routed_only_change_stream_follows_snapshot_and_tail() {
     use flotilla_schema::{Kind, KindRegistry, Origin, Timestamp};
@@ -6956,13 +6956,50 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
             }
         }
     });
-    super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
+    // A missing forwarded socket must use the working peer route immediately.
+    let missing = rigging_tls::client_builder().unix_socket(dir.path().join("missing.sock")).build().unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", Some(&missing), &router).await.unwrap();
     assert_eq!(target.watermark("home").unwrap().home_seq, 20);
+    // The stand-in replaces only HTTP: one unavailable route, then a damaged
+    // response body. The existing peer wire continues to dispatch real rounds.
+    let sockets = TestSocketDir::new();
+    let path = sockets.socket_path("fallback.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let http = rigging_tls::client_builder().unix_socket(path).build().unwrap();
+    let serving = tokio::spawn(async move {
+        for response in [
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nnot".as_slice(),
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /apis/flotilla.work/v1/change-stream?after="));
+            assert!(request.contains(super::change_stream::SESSION_HEADER));
+            socket.write_all(response).await.unwrap();
+        }
+    });
     seed("tail");
-    super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", Some(&http), &router).await.unwrap();
     assert_eq!(target.watermark("home").unwrap().home_seq, 21);
-    for index in 0..=20 {
-        let name = if index == 20 { "tail".into() } else { format!("item-{index}") };
+    seed("partial");
+    let error = super::change_stream::follow_round(Arc::clone(&target), "home", Some(&http), &router).await.unwrap_err();
+    assert_eq!(error, "truncated home stream", "a mid-body failure must not fall back");
+    assert_eq!(target.watermark("home").unwrap().home_seq, 21);
+    serving.await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
+    assert_eq!(target.watermark("home").unwrap().home_seq, 22);
+    for index in 0..=21 {
+        let name = match index {
+            20 => "tail".into(),
+            21 => "partial".into(),
+            _ => format!("item-{index}"),
+        };
         let snapshot = |service: &Service| {
             service
                 .with_store(|store| {
@@ -6974,6 +7011,20 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
         };
         assert_eq!(snapshot(&source), snapshot(&target));
     }
+    // Neither a routed-only home nor a broken socket proves a record absent.
+    use flotilla_core::primitives::ports::HomeReads;
+    let peers = Arc::new(StdMutex::new(std::collections::BTreeMap::from([("home".to_owned(), None)])));
+    let reads = super::change_stream::DecidedHomeReads {
+        service: Arc::clone(&target),
+        peers: Arc::clone(&peers),
+        clients: Default::default(),
+        clock: local.clock_for_scenarios(),
+    };
+    assert!(reads.find(RoutedStreamSample::CODE, "unseen").await.unwrap_err().contains("home unreachable: home"));
+    peers.lock().unwrap().insert("home".into(), Some(dir.path().join("missing-read.sock")));
+    assert!(reads.find(RoutedStreamSample::CODE, "unseen").await.unwrap_err().contains("home unreachable: home"));
+    peers.lock().unwrap().clear();
+    assert!(reads.find(RoutedStreamSample::CODE, "unseen").await.unwrap().is_none());
     // A home waiting behind its writer reports its own frame deadline to the
     // follower before the follower's network deadline expires.
     let store = source.store();
@@ -6989,7 +7040,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     release.send(()).unwrap();
     writer.await.unwrap();
     assert_eq!(error, "routed frame timed out");
-    assert_eq!(target.watermark("home").unwrap().home_seq, 21);
+    assert_eq!(target.watermark("home").unwrap().home_seq, 22);
     remote.abort();
 }
 

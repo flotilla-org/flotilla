@@ -107,11 +107,11 @@ pub async fn read_record(
     }
 }
 
-/// The routed read for an engine replica's misses (#3317): each connected
-/// home's record socket, read in turn until one holds the record.
+/// Connected homes are searched until one holds the record. A failed or missing
+/// socket makes absence unknown, so an unsuccessful search reports unreachable.
 pub(super) struct DecidedHomeReads {
     pub(super) service: Arc<Service>,
-    pub(super) peers: Arc<std::sync::Mutex<std::collections::BTreeMap<String, PathBuf>>>,
+    pub(super) peers: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Option<PathBuf>>>>,
     pub(super) clients: std::sync::Mutex<std::collections::BTreeMap<PathBuf, reqwest::Client>>,
     pub(super) clock: Arc<dyn flotilla_resources::Clock>,
 }
@@ -120,22 +120,38 @@ pub(super) struct DecidedHomeReads {
 impl flotilla_core::primitives::ports::HomeReads for DecidedHomeReads {
     async fn find(&self, kind: KindCode, name: &str) -> Result<Option<stream::ReadResult>, String> {
         let peers = self.peers.lock().expect("decided peers").clone();
-        self.clients.lock().expect("home clients").retain(|socket, _| peers.values().any(|live| live == socket));
+        self.clients.lock().expect("home clients").retain(|socket, _| peers.values().any(|live| live.as_ref() == Some(socket)));
+        let mut unreachable = Vec::new();
         for (home, socket) in peers {
-            let identity = flotilla_schema::Identity { kind, name: name.to_owned(), home };
+            let Some(socket) = socket else {
+                unreachable.push(format!("{home}: no forwarded record socket"));
+                continue;
+            };
+            let identity = flotilla_schema::Identity { kind, name: name.to_owned(), home: home.clone() };
             let clock = Arc::clone(&self.clock);
             let client = {
                 let mut clients = self.clients.lock().expect("home clients");
                 if !clients.contains_key(&socket) {
-                    clients.insert(socket.clone(), http_client(&socket)?);
+                    match http_client(&socket) {
+                        Ok(client) => {
+                            clients.insert(socket.clone(), client);
+                        }
+                        Err(error) => {
+                            unreachable.push(format!("{home}: {error}"));
+                            continue;
+                        }
+                    }
                 }
                 clients[&socket].clone()
             };
             match read_record(Arc::clone(&self.service), identity, &client, move || Timestamp::from_datetime(&clock.now())).await {
                 Ok(read) if read.value.is_some() => return Ok(Some(read)),
                 Ok(_) => {}
-                Err(error) => tracing::debug!(%error, "home read failed; trying the next home"),
+                Err(error) => unreachable.push(format!("{home}: {error}")),
             }
+        }
+        if !unreachable.is_empty() {
+            return Err(format!("home unreachable: {}", unreachable.join("; ")));
         }
         Ok(None)
     }
@@ -165,7 +181,14 @@ pub(super) async fn follow_round(
             let CommandValue::ChangeStreamFrame { session, frame } = value else {
                 return Err(format!("unexpected routed stream response: {value:?}"));
             };
-            follow_connection(service, home, client, &session, &frame).await
+            match follow_connection(Arc::clone(&service), home, client, &session, &frame).await {
+                Ok(()) => Ok(()),
+                Err(HttpRoundError::RouteUnavailable(error)) => {
+                    tracing::debug!(%home, %error, "home socket unavailable; using peer route for this round");
+                    routed_round(service, home, router).await
+                }
+                Err(HttpRoundError::Failed(error)) => Err(error),
+            }
         }
         None => routed_round(service, home, router).await,
     }
@@ -240,7 +263,25 @@ fn http_client(socket: &std::path::Path) -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-async fn follow_connection(service: Arc<Service>, home: &str, client: &reqwest::Client, session: &str, first: &[u8]) -> Result<(), String> {
+#[derive(Debug)]
+enum HttpRoundError {
+    RouteUnavailable(reqwest::Error),
+    Failed(String),
+}
+
+impl From<String> for HttpRoundError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+async fn follow_connection(
+    service: Arc<Service>,
+    home: &str,
+    client: &reqwest::Client,
+    session: &str,
+    first: &[u8],
+) -> Result<(), HttpRoundError> {
     let after = service.watermark(home).map_err(|e| e.to_string())?;
     let target = if !service.has_watermark(home) {
         format!("http://flotilla.local{}", stream::PATH)
@@ -251,16 +292,24 @@ async fn follow_connection(service: Arc<Service>, home: &str, client: &reqwest::
     spool.write_all(first).await.map_err(|e| e.to_string())?;
     if matches!(Frame::decode(first).map_err(|e| e.to_string())?, Frame::Keepalive { .. }) {
         spool.flush().await.map_err(|e| e.to_string())?;
-        return install_spool(service, home, spool.into_std().await).await;
+        return install_spool(service, home, spool.into_std().await).await.map_err(Into::into);
     }
     let response = client
         .get(target)
         .header(SESSION_HEADER, session)
         .send()
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(
+            |error| if error.is_connect() { HttpRoundError::RouteUnavailable(error) } else { HttpRoundError::Failed(error.to_string()) },
+        )?
         .error_for_status()
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| {
+            if error.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+                HttpRoundError::RouteUnavailable(error)
+            } else {
+                HttpRoundError::Failed(error.to_string())
+            }
+        })?;
     // Stage a complete round on disk before acquiring the writer. This keeps frame memory
     // bounded and preserves atomic snapshot install without holding a lock over network waits.
     let mut body = response.bytes_stream();
@@ -272,16 +321,16 @@ async fn follow_connection(service: Arc<Service>, home: &str, client: &reqwest::
         let mut remaining = chunk.as_ref();
         while !remaining.is_empty() {
             if complete {
-                return Err("frames after round keepalive".to_owned());
+                return Err("frames after round keepalive".to_owned().into());
             }
             let take = (expected - pending.len()).min(remaining.len());
             pending.extend_from_slice(&remaining[..take]);
             remaining = &remaining[take..];
             if pending.len() == HEADER_LEN && expected == HEADER_LEN {
-                let header: &[u8; HEADER_LEN] = pending.as_slice().try_into().map_err(|_| "invalid header length")?;
+                let header: &[u8; HEADER_LEN] = pending.as_slice().try_into().map_err(|_| "invalid header length".to_owned())?;
                 expected = HEADER_LEN + FRAMING.body_len(header).map_err(|e| e.to_string())?;
                 if expected == HEADER_LEN {
-                    return Err("empty CBOR frame".to_owned());
+                    return Err("empty CBOR frame".to_owned().into());
                 }
             }
             if pending.len() == expected {
@@ -293,10 +342,10 @@ async fn follow_connection(service: Arc<Service>, home: &str, client: &reqwest::
         }
     }
     if !pending.is_empty() || !complete {
-        return Err("truncated home stream".to_owned());
+        return Err("truncated home stream".to_owned().into());
     }
     spool.flush().await.map_err(|e| e.to_string())?;
-    install_spool(service, home, spool.into_std().await).await
+    install_spool(service, home, spool.into_std().await).await.map_err(Into::into)
 }
 
 async fn install_spool(service: Arc<Service>, home: &str, mut spool: std::fs::File) -> Result<(), String> {

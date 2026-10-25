@@ -604,10 +604,7 @@ impl PeerRuntime {
                         if decided_followers.get(&notice.peer).is_none_or(|(generation, _)| *generation < notice.generation) {
                             if let Ok(service) = outbound_daemon.decided_store() {
                                 let home = notice.peer.as_str().to_owned();
-                                decided_peers.lock().expect("decided peers").remove(&home);
-                                if let Some(socket) = &notice.resource_socket_path {
-                                    decided_peers.lock().expect("decided peers").insert(home.clone(), socket.clone());
-                                }
+                                decided_peers.lock().expect("decided peers").insert(home.clone(), notice.resource_socket_path.clone());
                                 let task = super::change_stream::follow(
                                     service,
                                     home,
