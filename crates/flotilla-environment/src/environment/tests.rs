@@ -1854,7 +1854,7 @@ async fn docker_agent_provisioning_reports_unsupported_host() {
     let provider = DockerEnvironmentProvider::new(Arc::new(RecordingRunner::new_ok("")));
     let prepared = super::PreparedEnvironment::new(&Arc::new(()), ());
     let error = provider.provision(EnvironmentId::new("unsupported"), &prepared, Default::default()).await.err().unwrap();
-    assert!(error.contains("require a Unix host"));
+    assert!(matches!(error, super::EnvironmentProvisionError::Failed(message) if message.contains("require a Unix host")));
 }
 
 // Unsupported guest targets refuse before any image preparation or guest push.
