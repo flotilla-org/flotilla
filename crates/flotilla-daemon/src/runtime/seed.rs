@@ -25,11 +25,17 @@ pub(super) async fn register_startup_resources(
     profile: &LocalProvisioningProfile,
 ) -> Result<(), String> {
     let backend = daemon.resource_backend();
-    ensure_host_exists(&backend, namespace, &profile.host_id, &profile.display_name).await?;
-    ensure_host_direct_environment_exists(&backend, namespace, profile).await?;
-    discover_local_clones(daemon, &backend, namespace, profile).await?;
-    ensure_default_policies(&backend, namespace, profile).await?;
-    reconcile_builtin_workflow_templates(&backend, namespace).await?;
+    ensure_host_exists(&backend, namespace, &profile.host_id, &profile.display_name)
+        .await
+        .map_err(|error| format!("ensure_host_exists: {error}"))?;
+    ensure_host_direct_environment_exists(&backend, namespace, profile)
+        .await
+        .map_err(|error| format!("ensure_host_direct_environment_exists: {error}"))?;
+    discover_local_clones(daemon, &backend, namespace, profile).await.map_err(|error| format!("discover_local_clones: {error}"))?;
+    ensure_default_policies(&backend, namespace, profile).await.map_err(|error| format!("ensure_default_policies: {error}"))?;
+    reconcile_builtin_workflow_templates(&backend, namespace)
+        .await
+        .map_err(|error| format!("reconcile_builtin_workflow_templates: {error}"))?;
     Ok(())
 }
 

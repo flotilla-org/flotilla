@@ -41,6 +41,49 @@ pub(crate) async fn phase<T>(phase: &'static str, operation: impl Future<Output 
     result
 }
 
+/// Log and return the same named failure for stderr, without replaying side effects.
+pub(crate) async fn result_phase<T, E: std::fmt::Display>(
+    name: &'static str,
+    operation: impl Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    phase(name, operation).await.map_err(|error| {
+        let message = format!("daemon startup phase {name}, operation {name}: {error}");
+        tracing::error!(phase = name, operation = name, error = %message, "daemon startup operation failed");
+        message
+    })
+}
+
+/// Retry an idempotent startup operation after explicit store-pressure refusals.
+/// Read pressure remains retryable until startup succeeds or is cancelled;
+/// individual store calls retain their deadlines and permanent errors still return.
+pub(crate) async fn retry_phase<T, E: std::fmt::Display, F: Future<Output = Result<T, E>>>(
+    name: &'static str,
+    mut operation: impl FnMut() -> F,
+) -> Result<T, String> {
+    result_phase(name, async {
+        let mut delay = Duration::from_millis(100);
+        loop {
+            match operation().await {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    let error = error.to_string();
+                    if error.contains(flotilla_resources::ResourceError::STORE_BUSY_READ_DEADLINE_MESSAGE) {
+                        warn!(phase = name, operation = name, %error, backoff_ms = delay.as_millis(), "daemon startup operation retrying");
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    })
+    .await
+}
+
+#[cfg(test)]
+pub(crate) mod busy_store;
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -48,6 +91,43 @@ mod tests {
     use tracing::instrument::WithSubscriber;
 
     use super::phase;
+
+    // Store pressure can outlast several minutes; permanent errors fail immediately with context.
+    #[tokio::test(start_paused = true)]
+    async fn startup_retry_recovers_or_names_the_failed_operation() {
+        use flotilla_resources::ResourceError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (failures, permanent, elapsed) in [
+            (0, false, Duration::ZERO),
+            (3, false, Duration::from_millis(700)),
+            (70, false, Duration::from_millis(326_300)),
+            (1, true, Duration::ZERO),
+        ] {
+            let attempts = AtomicUsize::new(0);
+            let started = tokio::time::Instant::now();
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(log.reopen().unwrap()).finish();
+            let result = super::retry_phase("list_manifest_roots", || async {
+                if attempts.fetch_add(1, Ordering::Relaxed) < failures {
+                    Err(if permanent { ResourceError::other("disk error") } else { ResourceError::store_busy_read_deadline() })
+                } else {
+                    Ok(42)
+                }
+            })
+            .with_subscriber(subscriber)
+            .await;
+            if permanent {
+                let error = result.unwrap_err();
+                assert!(error.contains("phase list_manifest_roots, operation list_manifest_roots"), "{error}");
+                assert!(std::fs::read_to_string(log.path()).unwrap().contains(&error));
+                assert_eq!(attempts.load(Ordering::Relaxed), 1);
+            } else {
+                assert_eq!(result.unwrap(), 42);
+                assert_eq!(attempts.load(Ordering::Relaxed), failures + 1);
+            }
+            assert_eq!(started.elapsed(), elapsed);
+        }
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum PhaseOutcome {

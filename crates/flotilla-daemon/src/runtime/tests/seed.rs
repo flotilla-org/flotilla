@@ -1,4 +1,5 @@
 use super::*;
+use crate::startup::busy_store::BusyStore;
 use flotilla_store_sqlite::SqliteBackend;
 
 #[tokio::test]
@@ -694,4 +695,36 @@ async fn cloud_policy_migration_uses_unique_controller() {
     let kind = backend.using::<FulfilmentKind>(NAMESPACE).get("cloud").await.unwrap();
     assert_eq!(kind.spec.host_ref, "cloud-controller");
     assert!(matches!(kind.spec.realisation, flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { .. }));
+}
+
+// A read-deadline storm lasting longer than five minutes must not terminate startup.
+// The real runtime exercises refusals at the memory store boundary.
+#[tokio::test(start_paused = true)]
+async fn runtime_starts_after_store_read_deadlines_clear() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"startup-retry-test\"\n").unwrap();
+    let config = Arc::new(ConfigStore::with_base(temp.path()));
+    let refusals = Arc::new(AtomicUsize::new(0));
+    let armed = Arc::new(AtomicBool::new(false));
+    let backend = ResourceBackend::from_arc(Arc::new(BusyStore {
+        inner: Arc::new(flotilla_store_memory::InMemoryBackend::default()),
+        armed: Arc::clone(&armed),
+        busy_since: Arc::new(std::sync::OnceLock::new()),
+        refusals: Arc::clone(&refusals),
+    }));
+    let daemon = daemon_with_backend(Vec::new(), Arc::clone(&config), backend).await;
+    armed.store(true, Ordering::Relaxed);
+    let started = tokio::time::Instant::now();
+    let runtime = super::super::DaemonRuntime::start_with_options(
+        Arc::clone(&daemon),
+        config,
+        None,
+        super::super::RuntimeOptions { start_controllers: false, ..Default::default() },
+    )
+    .await
+    .expect("runtime recovers after store pressure");
+    assert!(started.elapsed() >= Duration::from_secs(360), "startup waited through the prolonged store pressure");
+    assert!(refusals.load(Ordering::Relaxed) > 0, "startup exercised the deadline refusal");
+    assert!(!daemon.resource_backend().using::<Host>(NAMESPACE).list().await.unwrap().items.is_empty());
+    runtime.shutdown();
 }
