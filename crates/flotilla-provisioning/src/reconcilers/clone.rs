@@ -153,11 +153,10 @@ where
 
     fn retry_disposition(&self, obj: &ResourceObject<Self::Resource>) -> Option<flotilla_resources::ControllerRetryDisposition> {
         use flotilla_resources::ControllerRetryDisposition;
+        // Exhausted still owes GiveUp in engine prepare; only GaveUp is terminal.
         match self.reading(obj) {
             Ok(Some(LifecycleReading::Retrying { next, .. })) => Some(ControllerRetryDisposition::Retryable { next_attempt_at: next }),
-            Ok(Some(LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause })) => {
-                Some(ControllerRetryDisposition::Terminal { needs: cause })
-            }
+            Ok(Some(LifecycleReading::GaveUp { cause })) => Some(ControllerRetryDisposition::Terminal { needs: cause }),
             Ok(Some(_)) => None,
             Ok(None) => obj.status.as_ref()?.retry.as_ref().map(|retry| retry.disposition.clone()),
             // Let prepare return the read failure to the controller's error and backoff handling.

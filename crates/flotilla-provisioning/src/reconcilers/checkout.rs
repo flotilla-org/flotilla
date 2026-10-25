@@ -914,11 +914,10 @@ where
 
     fn retry_disposition(&self, obj: &ResourceObject<Self::Resource>) -> Option<flotilla_resources::ControllerRetryDisposition> {
         use flotilla_resources::ControllerRetryDisposition;
+        // Exhausted still owes GiveUp in engine prepare; only GaveUp is terminal.
         match self.lifecycle(obj) {
             Ok(Some(LifecycleReading::Retrying { next, .. })) => Some(ControllerRetryDisposition::Retryable { next_attempt_at: next }),
-            Ok(Some(LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause })) => {
-                Some(ControllerRetryDisposition::Terminal { needs: cause })
-            }
+            Ok(Some(LifecycleReading::GaveUp { cause })) => Some(ControllerRetryDisposition::Terminal { needs: cause }),
             // Prepare reports read errors through the controller's error backoff.
             Ok(_) | Err(_) => None,
         }

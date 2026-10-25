@@ -472,10 +472,24 @@ where
         let owned = ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status: obj.status.clone() };
         let home = Arc::clone(lifecycles);
         let ended_copy = tokio::task::spawn_blocking(move || {
-            current::<B>(home.as_ref(), &owned).1.filter(ended).filter(|_| !restarting).map(|resource| B::copy(&owned, &resource))
+            let (name, mut held) = current::<B>(home.as_ref(), &owned);
+            let mut completed_attempt = false;
+            // A committed failed attempt must finish before any provider work resumes.
+            if let Some(reads::Judgement::Exhausted { last }) =
+                held.as_ref().map(|resource| reads::judge::<B::Kind>(resource.state(), reads::Ending::Unknown))
+            {
+                completed_attempt = true;
+                held = Some(
+                    home.step(&name, &Step::Attempted(Outcome::Failed { cause: last, retryable: false }), at(Utc::now()))
+                        .map_err(|error| ResourceError::other(format!("engine GiveUp recovery: {error}")))?,
+                );
+            }
+            Ok::<_, ResourceError>(
+                held.filter(ended).filter(|_| completed_attempt || !restarting).map(|resource| B::copy(&owned, &resource)),
+            )
         })
         .await
-        .map_err(|error| ResourceError::other(format!("engine read: {error}")))?;
+        .map_err(|error| ResourceError::other(format!("engine read: {error}")))??;
         if let Some(copy) = ended_copy {
             return Ok(Prepared::Decided(Mutex::new(Some(ReconcileOutcome::new(copy)))));
         }

@@ -1189,7 +1189,75 @@ fn a_lifecycle_finishes_a_durable_failed_attempt_after_log_errors(tc: hegel::Tes
             lifecycles = LifecycleHome::new(HOME, home);
         }
     }
-    let ended = lifecycles.step(name, &step, Timestamp(10)).expect("GiveUp retry succeeds");
+    let lifecycles = Arc::new(lifecycles);
+    tokio::runtime::Runtime::new().expect("runtime").block_on(async {
+        use crate::reconcilers::{CloneReconciler, CloneRuntime};
+        use flotilla_protocol::LifecycleReading;
+        use flotilla_resources::lifecycle_reads::{LifecycleReads, ProvisioningKind};
+        use flotilla_resources::{InputMeta, Repository};
+        use flotilla_store::{controller::ControllerLoop, ResourceBackend};
+
+        // The read adapter judges the durable home, including the restored exhausted attempt.
+        struct Reads(Arc<dyn Lifecycles<CloneKind>>);
+        impl LifecycleReads for Reads {
+            fn try_reading(&self, _: ProvisioningKind, name: &str, _: Option<&str>) -> Result<Option<LifecycleReading>, String> {
+                Ok(self.0.get(name).map(|resource| {
+                    match super::reads::judge::<CloneKind>(resource.state(), super::reads::Ending::Unknown) {
+                        super::reads::Judgement::Exhausted { last } => LifecycleReading::Exhausted { cause: last.detail },
+                        super::reads::Judgement::GaveUp { cause } => LifecycleReading::GaveUp { cause: cause.detail },
+                        _ => panic!("only recovery states belong in this scenario"),
+                    }
+                }))
+            }
+        }
+        // Provider process boundary: recovery must never request clone or inspection work.
+        struct NoProvider(AtomicUsize);
+        #[async_trait::async_trait]
+        impl CloneRuntime for NoProvider {
+            async fn clone_and_inspect(&self, _: &str, _: &str) -> Result<Option<String>, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err("provider must not be repeated".into())
+            }
+            async fn inspect_existing(&self, _: &str) -> Result<Option<String>, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err("provider must not be repeated".into())
+            }
+        }
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let primary = backend.clone().using::<OldClone>("flotilla");
+        let mut metadata = InputMeta::builder().name(name.clone()).build();
+        metadata.finalizers = vec!["flotilla.work/clone-cleanup".into()];
+        let object = primary.create(&metadata, &obj.spec).await.expect("old resource");
+        let provider = Arc::new(NoProvider(AtomicUsize::new(0)));
+        let inner = CloneReconciler::new(provider.clone(), backend.clone().using::<Repository>("flotilla"))
+            .with_lifecycle_reads(Arc::new(Reads(lifecycles.clone())));
+        assert!(inner.retry_disposition(&object).is_none(), "Exhausted must reach engine prepare");
+        let engine = Engine::<_, CloneBinding>::new(inner, Some(lifecycles.clone()));
+        let controller = tokio::spawn(
+            ControllerLoop {
+                primary,
+                secondaries: vec![],
+                reconciler: engine,
+                resync_interval: std::time::Duration::from_secs(3600),
+                backend,
+            }
+            .run(),
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(lifecycles.get(name).expect("held").state(), LifecycleState::GaveUp { .. }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        controller.abort();
+        let _ = controller.await;
+        result.expect("controller finishes GiveUp after split write, including restart");
+        assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+    });
+    let ended = lifecycles.get(name).expect("controller completed GiveUp");
     assert_eq!(ended.version().0, attempted_version.expect("durable attempt").0 + 1, "only GiveUp is appended");
     assert!(matches!(ended.state(), LifecycleState::GaveUp { cause } if cause.detail == message));
 }
