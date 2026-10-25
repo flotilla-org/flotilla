@@ -327,7 +327,7 @@ use super::vessel_support::{vessels_over, RunnerVesselAgents};
 async fn agentless_host_without_vessel_agents_is_refused_at_placement() {
     let system = if cfg!(target_os = "macos") { "Darwin" } else { "Linux" };
     assert_eq!(HostPlatform::from_uname(system, std::env::consts::ARCH), HostPlatform::controller());
-    let controller_uname = format!("{system} {}\n", std::env::consts::ARCH);
+    let controller_uname = "Linux x86_64\n";
     let state = TempDir::new().expect("state");
     let build = state.path().join("drydock-agent");
     fs::write(&build, b"agent").expect("agent build");
@@ -370,7 +370,7 @@ async fn agentless_host_without_vessel_agents_is_refused_at_placement() {
     };
 
     let (conditions, ready) =
-        super::discovery::agentless_vessel_conditions(Some(&vessels), &profile("b1", Some(&controller_uname), true, Ok(reach.clone())))
+        super::discovery::agentless_vessel_conditions(Some(&vessels), &profile("b1", Some(controller_uname), true, Ok(reach.clone())))
             .await;
     assert!(ready, "{conditions:?}");
     assert!(conditions.is_empty());
@@ -384,7 +384,7 @@ async fn agentless_host_without_vessel_agents_is_refused_at_placement() {
 
     let missing = Err("hosts.toml [hosts.b3.vessel_agent] is not set".to_string());
     let (conditions, ready) =
-        super::discovery::agentless_vessel_conditions(Some(&vessels), &profile("b3", Some(&controller_uname), false, missing)).await;
+        super::discovery::agentless_vessel_conditions(Some(&vessels), &profile("b3", Some(controller_uname), false, missing)).await;
     assert!(!ready);
     let reasons = conditions.iter().map(|condition| condition.reason.clone()).collect::<Vec<_>>();
     assert_eq!(reasons, ["MissingReach", "NoRuntimeDirectory"]);
@@ -401,7 +401,7 @@ async fn agentless_host_without_vessel_agents_is_refused_at_placement() {
         state.path().join("vessels"),
     );
     let (conditions, ready) =
-        super::discovery::agentless_vessel_conditions(Some(&no_build), &profile("b5", Some(&controller_uname), true, Ok(reach))).await;
+        super::discovery::agentless_vessel_conditions(Some(&no_build), &profile("b5", Some(controller_uname), true, Ok(reach))).await;
     assert!(!ready);
     assert!(matches!(conditions.as_slice(), [condition] if condition.reason == "NoAgentBuild"), "{conditions:?}");
 }

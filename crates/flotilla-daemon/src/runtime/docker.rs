@@ -399,7 +399,11 @@ impl DockerControllerRuntime {
         let prepared = match provider
             .prepare(
                 &environment_spec,
-                &flotilla_environment::environment::PrepareOpts { legacy_baseline, prepared_auth: opts.prepared_auth.clone() },
+                &flotilla_environment::environment::PrepareOpts {
+                    legacy_baseline,
+                    prepared_auth: opts.prepared_auth.clone(),
+                    ..Default::default()
+                },
             )
             .await
         {

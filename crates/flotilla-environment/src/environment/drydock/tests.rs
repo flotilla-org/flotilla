@@ -60,7 +60,14 @@ impl HostFixture {
 struct ReferenceGuest;
 #[async_trait]
 impl reach::Connector for ReferenceGuest {
-    async fn connect(&self, _: &dyn ProviderApi, _: &str, _: &str, _: PathBuf) -> Result<Arc<dyn reach::Guest>, String> {
+    async fn connect(
+        &self,
+        _: &dyn ProviderApi,
+        _: &str,
+        _: &str,
+        _: &wire::Platform,
+        _: PathBuf,
+    ) -> Result<Arc<dyn reach::Guest>, String> {
         Ok(Arc::new(Self))
     }
 }
@@ -371,7 +378,14 @@ async fn independent_provisions_and_rotated_tokens() {
     }
     #[async_trait]
     impl reach::Connector for Connector {
-        async fn connect(&self, _: &dyn ProviderApi, _: &str, _: &str, _: PathBuf) -> Result<Arc<dyn reach::Guest>, String> {
+        async fn connect(
+            &self,
+            _: &dyn ProviderApi,
+            _: &str,
+            _: &str,
+            _: &wire::Platform,
+            _: PathBuf,
+        ) -> Result<Arc<dyn reach::Guest>, String> {
             if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 self.entered.notify_one();
                 self.release.notified().await;
@@ -420,7 +434,14 @@ async fn restart_failed_adoption_preserves_backing() {
     // Fake the SSH process boundary; provision and inventory use the real host.
     #[async_trait]
     impl reach::Connector for Unreachable {
-        async fn connect(&self, _: &dyn ProviderApi, _: &str, _: &str, _: PathBuf) -> Result<Arc<dyn reach::Guest>, String> {
+        async fn connect(
+            &self,
+            _: &dyn ProviderApi,
+            _: &str,
+            _: &str,
+            _: &wire::Platform,
+            _: PathBuf,
+        ) -> Result<Arc<dyn reach::Guest>, String> {
             Err("injected SSH failure".into())
         }
     }
@@ -479,7 +500,14 @@ async fn closed_session_reconnects_on_liveness() {
     }
     #[async_trait]
     impl reach::Connector for Connector {
-        async fn connect(&self, _: &dyn ProviderApi, _: &str, _: &str, _: PathBuf) -> Result<Arc<dyn reach::Guest>, String> {
+        async fn connect(
+            &self,
+            _: &dyn ProviderApi,
+            _: &str,
+            _: &str,
+            _: &wire::Platform,
+            _: PathBuf,
+        ) -> Result<Arc<dyn reach::Guest>, String> {
             if self.0.fail_reconnect.load(Ordering::SeqCst) {
                 return Err("injected unreachable SSH endpoint".into());
             }
@@ -637,7 +665,14 @@ async fn checkpoint_refresh_failure_reports_stale_health() {
     struct Guest(Arc<std::sync::atomic::AtomicUsize>);
     #[async_trait]
     impl reach::Connector for Guest {
-        async fn connect(&self, _: &dyn ProviderApi, _: &str, _: &str, _: PathBuf) -> Result<Arc<dyn reach::Guest>, String> {
+        async fn connect(
+            &self,
+            _: &dyn ProviderApi,
+            _: &str,
+            _: &str,
+            _: &wire::Platform,
+            _: PathBuf,
+        ) -> Result<Arc<dyn reach::Guest>, String> {
             Ok(Arc::new(self.clone()))
         }
     }
@@ -728,7 +763,14 @@ async fn adoption_does_not_wait_for_initial_checkpoint() {
     struct SlowCheckpoint(Arc<tokio::sync::Notify>);
     #[async_trait]
     impl reach::Connector for SlowCheckpoint {
-        async fn connect(&self, _: &dyn ProviderApi, _: &str, _: &str, _: PathBuf) -> Result<Arc<dyn reach::Guest>, String> {
+        async fn connect(
+            &self,
+            _: &dyn ProviderApi,
+            _: &str,
+            _: &str,
+            _: &wire::Platform,
+            _: PathBuf,
+        ) -> Result<Arc<dyn reach::Guest>, String> {
             Ok(Arc::new(self.clone()))
         }
     }

@@ -4,6 +4,7 @@ import argparse
 import base64
 import datetime
 import hashlib
+import gzip
 import io
 import json
 import re
@@ -216,6 +217,7 @@ def inspect_inner_archive(archive_bytes, platform, sources):
                 raise PromotionError(f"{platform} candidate files do not match its manifest")
             total_size = 0
             skill_bundle = None
+            guest_contents = {}
             for relative, entry in declared_by_path.items():
                 member = files[relative]
                 expected_size = entry.get("size_bytes")
@@ -236,20 +238,23 @@ def inspect_inner_archive(archive_bytes, platform, sources):
                 for chunk in iter(lambda: payload.read(1024 * 1024), b""):
                     observed_size += len(chunk)
                     digest.update(chunk)
-                    if relative == "share/flotilla/skills/.flotilla-sources.json":
+                    if relative == "share/flotilla/skills/.flotilla-sources.json" or relative.startswith(validation.GUEST_PREFIX + "/"):
                         captured.extend(chunk)
                 if observed_size != expected_size or observed_size != member.size:
                     raise PromotionError(f"{platform} candidate size mismatch: {relative}")
                 if digest.hexdigest() != expected_sha:
                     raise PromotionError(f"{platform} candidate digest mismatch: {relative}")
-                if captured:
+                if relative.startswith(validation.GUEST_PREFIX + "/"):
+                    guest_contents[relative] = bytes(captured)
+                elif captured:
                     try:
                         skill_bundle = json.loads(captured)
                     except json.JSONDecodeError as error:
                         raise PromotionError(f"{platform} candidate has an invalid skill bundle") from error
             try:
                 validation.validate_skill_bundle(skill_bundle, sources)
-            except validation.ValidationError as error:
+                validation.validate_guest_tools(guest_contents, sources, manifest.get("guest_tools_cohort"))
+            except ValueError as error:
                 raise PromotionError(f"{platform} candidate: {error}") from error
             return protocol_version
     except (tarfile.TarError, OSError) as error:
@@ -350,6 +355,83 @@ def fetch_candidates(api_root, run_id, sources, token):
     return candidates
 
 
+def repackage_guest_tools(candidates, sources, cohort):
+    """Copy this run's verified Linux payload before the Darwin signing boundary."""
+    roots = {}
+    directory_aliases = {}
+    manifests = {}
+    modes = {}
+    for candidate in candidates:
+        platform = candidate['platform']
+        root = f'fleet-candidate-{platform}'
+        with tarfile.open(fileobj=io.BytesIO(candidate['archive']), mode='r:gz') as archive:
+            members = validation.checked_archive_members(archive, root)
+            contents = {}
+            directory_aliases[platform] = [(member.name, member.bundle_directory_target) for member in members if getattr(member, "bundle_directory_target", None)]
+            for member in members:
+                if member.isfile():
+                    path = str(Path(member.name).relative_to(root))
+                    contents[path] = archive.extractfile(member).read()
+                    modes[(platform, path)] = member.mode
+        candidate.setdefault('native_candidate_sha256', hashlib.sha256(candidate['archive']).hexdigest())
+        manifest = json.loads(contents.pop('manifest.json'))
+        if manifest.get('guest_tools_cohort') != str(cohort):
+            raise PromotionError(f'{platform}: candidate guest cohort differs from the verified Actions run')
+        manifests[platform] = manifest
+        roots[platform] = contents
+    linux = roots['linux-x86_64-gnu2.36']
+    try:
+        validation.validate_guest_tools(linux, sources, str(cohort), required=True)
+    except ValueError as error:
+        raise PromotionError(str(error)) from error
+    guest = {path: content for path, content in linux.items() if path.startswith(validation.GUEST_PREFIX + '/')}
+    native = {path: content for path, content in linux.items()
+              if path in validation.GUEST_NATIVE or path.startswith('share/terminfo/')}
+    for name, target in directory_aliases['linux-x86_64-gnu2.36']:
+        prefix = 'fleet-candidate-linux-x86_64-gnu2.36/'
+        alias = name.removeprefix(prefix)
+        source = target.removeprefix(prefix)
+        for path, content in linux.items():
+            if alias.startswith('share/terminfo/') and path.startswith(source + '/'):
+                native[alias + path[len(source):]] = content
+    indexed = {path.removeprefix(validation.GUEST_TREE + '/'): content for path, content in guest.items()
+               if path != validation.GUEST_CATALOG}
+    if native != indexed:
+        raise PromotionError('linux/amd64: guest payload differs from the verified native Linux outputs')
+    for candidate in candidates:
+        platform = candidate['platform']
+        contents = roots[platform]
+        existing = {path for path in contents if path.startswith(validation.GUEST_PREFIX + '/')}
+        if existing and any(contents.get(path) != content for path, content in guest.items()):
+            raise PromotionError(f'{platform}: mixed guest payload before repackaging')
+        contents.update(guest)
+        manifest = manifests[platform]
+        manifest['files'] = [{'path': path, 'sha256': hashlib.sha256(content).hexdigest(), 'size_bytes': len(content)}
+                             for path, content in sorted(contents.items())]
+        contents['manifest.json'] = (json.dumps(manifest, indent=2, sort_keys=True) + '\n').encode()
+        output = io.BytesIO()
+        with gzip.GzipFile(fileobj=output, mode='wb', mtime=0) as compressed, tarfile.open(fileobj=compressed, mode='w') as archive:
+            import posixpath
+            for name, target in directory_aliases[platform]:
+                member = tarfile.TarInfo(name)
+                member.type = tarfile.SYMTYPE
+                member.linkname = posixpath.relpath(target, posixpath.dirname(name))
+                archive.addfile(member)
+            for path, content in sorted(contents.items()):
+                member = tarfile.TarInfo(f'fleet-candidate-{platform}/{path}')
+                member.size = len(content)
+                member.mode = modes.get((platform, path), modes.get(('linux-x86_64-gnu2.36', path), 0o644))
+                archive.addfile(member, io.BytesIO(content))
+        candidate['archive'] = output.getvalue()
+        candidate['sha256'] = hashlib.sha256(candidate['archive']).hexdigest()
+        candidate['size_bytes'] = len(candidate['archive'])
+        candidate['checksum'] = f"{candidate['sha256']}  {candidate['archive_name']}\n".encode()
+        metadata = json.loads(candidate['metadata'])
+        metadata.update(sha256=candidate['sha256'], size_bytes=candidate['size_bytes'])
+        candidate['metadata'] = (json.dumps(metadata, indent=2, sort_keys=True) + '\n').encode()
+        inspect_inner_archive(candidate['archive'], platform, sources)
+
+
 def generation_id(run, sources):
     stopped = run.get("stopped", "")
     try:
@@ -421,6 +503,7 @@ def build_generation_manifest(run, sources, candidates, generation):
                 "size_bytes": candidate["size_bytes"],
                 "signed": False,
                 "actions_artifact": candidate["actions_artifact"],
+                **({"native_candidate_sha256": candidate["native_candidate_sha256"]} if "native_candidate_sha256" in candidate else {}),
                 "state": (
                     "installable-internal"
                     if candidate["platform"] == "linux-x86_64-gnu2.36"
@@ -454,6 +537,7 @@ def main():
     tasks = get_json(f"{api_root}/actions/tasks?limit=50&page=1", read_token_value)
     validate_jobs(tasks, run)
     candidates = fetch_candidates(api_root, args.run_id, sources, read_token_value)
+    repackage_guest_tools(candidates, sources, args.run_id)
     generation = generation_id(run, sources)
     generation_manifest = build_generation_manifest(run, sources, candidates, generation)
     generation_bytes = (json.dumps(generation_manifest, indent=2, sort_keys=True) + "\n").encode()

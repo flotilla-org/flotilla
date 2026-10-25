@@ -34,11 +34,12 @@ pub struct UnixAgentConnector {
     pub socket: PathBuf,
     pub executable: PathBuf,
     pub timeout: Duration,
+    platform: Platform,
     executable_bytes: Arc<OnceCell<Vec<u8>>>,
 }
 impl UnixAgentConnector {
-    pub fn new(socket: PathBuf, executable: PathBuf, timeout: Duration) -> Self {
-        Self { socket, executable, timeout, executable_bytes: Arc::new(OnceCell::new()) }
+    pub fn new(socket: PathBuf, executable: PathBuf, platform: Platform, timeout: Duration) -> Self {
+        Self { socket, executable, timeout, platform, executable_bytes: Arc::new(OnceCell::new()) }
     }
     pub(crate) fn with_executable_cache(mut self, cache: Arc<OnceCell<Vec<u8>>>) -> Self {
         self.executable_bytes = cache;
@@ -54,9 +55,7 @@ impl AgentConnector for UnixAgentConnector {
                 let bytes = tokio::fs::read(&self.executable)
                     .await
                     .map_err(|e| format!("read current drydock agent {}: {e}", self.executable.display()))?;
-                if !bytes.starts_with(b"\x7fELF") {
-                    return Err("current drydock agent must be its Linux executable, not a host launcher script".into());
-                }
+                crate::guest_tools::validate_native(&bytes, "bin/drydock-agent")?;
                 Ok::<_, String>(bytes)
             })
             .await?;
@@ -65,8 +64,7 @@ impl AgentConnector for UnixAgentConnector {
                 let stream = UnixStream::connect(&self.socket).await?;
                 Transport::yamux(Box::new(stream), true, Limits::default()).await
             },
-            // TODO(#3773): choose the build from the vessel platform instead of the host.
-            &Platform::current(),
+            &self.platform,
             executable,
             self.timeout,
         )
@@ -95,6 +93,13 @@ where
         }
         match Client::connect_current(&mut open, platform, executable, remaining).await {
             Ok(client) => return Ok(client),
+            Err(error)
+                if error.kind() == io::ErrorKind::InvalidData
+                    || error.kind() == io::ErrorKind::InvalidInput
+                    || error.kind() == io::ErrorKind::Unsupported =>
+            {
+                return Err(error)
+            }
             Err(error) => last = error.to_string(),
         }
         tokio::time::sleep(Duration::from_millis(50).min(remaining)).await;

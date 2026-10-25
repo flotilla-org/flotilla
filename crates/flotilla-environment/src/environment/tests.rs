@@ -112,6 +112,9 @@ impl RecordingRunner {
 #[async_trait]
 impl CommandRunner for RecordingRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        if cmd == "docker" && args.starts_with(&["image", "inspect", "--format", "{{.Os}}/{{.Architecture}}"]) {
+            return Ok("linux/amd64".into());
+        }
         // Host capacity probe fixture, independent of the command under test.
         if cmd == "docker" && args == ["info", "--format", "{{json .}}"] {
             return self
@@ -138,7 +141,7 @@ impl CommandRunner for RecordingRunner {
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         assert_eq!(cmd, "docker");
-        assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
+        assert_eq!(args, ["build", "--platform", "linux/amd64", "--quiet", "--network=none", "-"]);
         let dockerfile = std::str::from_utf8(input).unwrap();
         assert!(dockerfile.contains("COPY --from=tools /opt/drydock /opt/drydock"));
         self.dockerfiles.lock().unwrap().push(dockerfile.into());
@@ -252,6 +255,9 @@ impl QueuedRunner {
 #[async_trait]
 impl CommandRunner for QueuedRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        if cmd == "docker" && args.starts_with(&["image", "inspect", "--format", "{{.Os}}/{{.Architecture}}"]) {
+            return Ok("linux/amd64".into());
+        }
         // Host capacity probe fixture, independent of the command under test.
         if args.starts_with(&["exec", "--user", "0"])
             || matches!(args, ["exec", _, "/opt/drydock/drydock-agent", "--supervise", "--socket", "/run/drydock/agent.sock"])
@@ -261,6 +267,9 @@ impl CommandRunner for QueuedRunner {
 
         if cmd == "docker" && args == ["info", "--format", "{{json .}}"] {
             return Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into());
+        }
+        if cmd == "docker" && args.starts_with(&["image", "inspect", "--format", "{{.Os}}/{{.Architecture}}"]) {
+            return Ok("linux/amd64".into());
         }
         self.calls.lock().expect("calls mutex").push((cmd.to_string(), args.iter().map(|a| a.to_string()).collect(), cwd.to_path_buf()));
         if let ("docker", ["tag", id, tag]) = (cmd, args) {
@@ -272,7 +281,7 @@ impl CommandRunner for QueuedRunner {
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         assert_eq!(cmd, "docker");
-        assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
+        assert_eq!(args, ["build", "--platform", "linux/amd64", "--quiet", "--network=none", "-"]);
         let dockerfile = std::str::from_utf8(input).unwrap();
         assert!(dockerfile.contains("COPY --from=tools /opt/drydock /opt/drydock"));
         self.calls.lock().unwrap().push((cmd.into(), args.iter().map(|s| s.to_string()).collect(), cwd.into()));
@@ -348,10 +357,10 @@ async fn derived_build_names_a_bare_local_id_before_building_from_it() {
     provider.prepare(&pinned_spec(), &Default::default()).await.expect("prepare local digest");
     let calls: Vec<_> = runner.calls().into_iter().map(|(_, args, _)| args).collect();
     assert_eq!(calls[1], ["tag", id.as_str(), tag.as_str()]);
-    assert_eq!(calls[2], ["build", "--quiet", "--network=none", "-"]);
+    assert_eq!(calls[2], ["build", "--platform", "linux/amd64", "--quiet", "--network=none", "-"]);
     let dockerfiles = runner.dockerfiles.lock().unwrap().clone();
     assert_eq!(dockerfiles.len(), 1);
-    assert!(dockerfiles[0].ends_with(&format!("\nFROM {tag}\nCOPY --from=tools /opt/drydock /opt/drydock\n")));
+    assert!(dockerfiles[0].ends_with(&format!("\nFROM --platform=linux/amd64 {tag}\nCOPY --from=tools /opt/drydock /opt/drydock\n")));
 }
 
 // A registry digest reference already resolves in BuildKit; it is built from
@@ -368,7 +377,7 @@ async fn derived_build_uses_a_registry_digest_reference_unchanged() {
     assert!(runner.calls().iter().all(|(_, args, _)| args.first().is_none_or(|arg| arg != "tag")));
     let dockerfiles = runner.dockerfiles.lock().unwrap().clone();
     assert_eq!(dockerfiles.len(), 1);
-    assert!(dockerfiles[0].ends_with(&format!("\nFROM {reference}\nCOPY --from=tools /opt/drydock /opt/drydock\n")));
+    assert!(dockerfiles[0].ends_with(&format!("\nFROM --platform=linux/amd64 {reference}\nCOPY --from=tools /opt/drydock /opt/drydock\n")));
 }
 
 // Host adoption returns the injected runner and never starts or stops the host.
@@ -820,7 +829,7 @@ async fn create_pulls_before_inspecting_when_the_policy_is_always() {
         .expect("create environment");
 
     let calls: Vec<Vec<String>> = runner.calls().into_iter().map(|(_, args, _)| args).collect();
-    assert_eq!(calls[0], vec!["pull".to_string(), "crew:latest".to_string()]);
+    assert_eq!(calls[0], vec!["pull".to_string(), "--platform".to_string(), "linux/amd64".to_string(), "crew:latest".to_string()]);
     assert_eq!(calls[1][..4], ["image", "inspect", "--format", "{{json .Config.Env}}"]);
     assert!(docker_run_args(&runner).contains(&"PATH=/opt/flotilla/cargo-shim:/usr/bin".to_string()));
 }
@@ -864,7 +873,7 @@ async fn create_pulls_a_missing_image_before_reading_its_environment_when_the_po
 
     let calls: Vec<Vec<String>> = runner.calls().into_iter().map(|(_, args, _)| args).collect();
     assert_eq!(calls[0][..4], ["image", "inspect", "--format", "{{json .Config.Env}}"]);
-    assert_eq!(calls[1], vec!["pull".to_string(), "crew:latest".to_string()]);
+    assert_eq!(calls[1], vec!["pull".to_string(), "--platform".to_string(), "linux/amd64".to_string(), "crew:latest".to_string()]);
     assert_eq!(calls[2][..4], ["image", "inspect", "--format", "{{json .Config.Env}}"]);
     let args = docker_run_args(&runner);
     assert!(args.contains(&"PATH=/opt/flotilla/cargo-shim:/usr/local/cargo/bin:/usr/bin".to_string()), "{args:?}");
@@ -1705,13 +1714,17 @@ async fn docker_provisions_prepared_digest_and_refuses_another_instance() {
 async fn preparation_pulls_only_pinned_registry_content() {
     let mut spec = pinned_spec();
     spec.docker.as_mut().expect("docker").image = format!("registry.example/crew@sha256:{}", "a".repeat(64));
-    let mut opts = super::PrepareOpts { legacy_baseline: false, prepared_auth: test_registry_auth("/private/operation-auth") };
+    let mut opts =
+        super::PrepareOpts { legacy_baseline: false, prepared_auth: test_registry_auth("/private/operation-auth"), ..Default::default() };
     let runner = Arc::new(QueuedRunner::new([Err("not held".into()), Ok("pulled".into()), Ok("held".into())]));
     let provider = super::contract_tests::docker_provider(runner.clone());
     provider.prepare(&spec, &opts).await.expect("pull existing digest");
     let calls = runner.calls();
     assert_eq!(calls.len(), 4);
-    assert_eq!(calls[1].1, ["--config", "/private/operation-auth", "pull", spec.docker.as_ref().expect("docker").image.as_str()]);
+    assert_eq!(
+        calls[1].1,
+        ["--config", "/private/operation-auth", "pull", "--platform", "linux/amd64", spec.docker.as_ref().expect("docker").image.as_str()]
+    );
     let absent = super::contract_tests::docker_provider(Arc::new(QueuedRunner::new([Err("not held".into()), Err("not published".into())])));
     opts.prepared_auth = test_registry_auth("/private/operation-auth");
     let error = absent.prepare(&spec, &opts).await.err().expect("pull failed");
@@ -1772,7 +1785,7 @@ async fn live_baseline_tag_without_image_build_provisions_a_digest() {
             provider.provision(EnvironmentId::new("live-baseline"), &prepared, Default::default()).await.expect("launch live record");
         assert_eq!(handle.image().as_str(), digest);
         let calls = runner.calls();
-        assert_eq!(calls[1].1, ["pull", tag]);
+        assert_eq!(calls[1].1, ["pull", "--platform", "linux/amd64", tag]);
         assert!(calls.iter().find(|(_, args, _)| args.first().is_some_and(|arg| arg == "run")).unwrap().1.contains(&digest));
         assert!(!calls.iter().find(|(_, args, _)| args.first().is_some_and(|arg| arg == "run")).unwrap().1.contains(&tag.to_string()));
         assert!(calls
@@ -1842,4 +1855,17 @@ async fn docker_agent_provisioning_reports_unsupported_host() {
     let prepared = super::PreparedEnvironment::new(&Arc::new(()), ());
     let error = provider.provision(EnvironmentId::new("unsupported"), &prepared, Default::default()).await.err().unwrap();
     assert!(error.contains("require a Unix host"));
+}
+
+// Unsupported guest targets refuse before any image preparation or guest push.
+#[cfg(unix)]
+#[tokio::test]
+async fn docker_refuses_unsupported_requested_guest_before_execution() {
+    for platform in [drydock_protocol::Platform::new("linux", "arm64"), drydock_protocol::Platform::new("darwin", "arm64")] {
+        let runner = Arc::new(RecordingRunner::new_ok("held"));
+        let provider = super::contract_tests::docker_provider(runner.clone());
+        let result = provider.prepare(&pinned_spec(), &super::PrepareOpts { platform: Some(platform.clone()), ..Default::default() }).await;
+        assert!(result.err().expect("unsupported target").contains(&format!("guest platform {platform}")));
+        assert!(runner.calls().is_empty());
+    }
 }

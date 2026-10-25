@@ -628,3 +628,52 @@ optional prefix restore, pruning and one save; repeat those dependency inputs to
 confirm the new exact hit skips save. Compare save duration and archive size to
 the old source-keyed cache. These action-service observations require lab runs;
 the host tests do not claim to verify remote cache-hit reporting.
+
+### Guest platform catalog
+
+New candidates admit Linux amd64 guests from Linux amd64 and macOS arm64
+controllers. Docker retains its Linux daemon-adjacent Unix-socket transport;
+macOS controllers reach Linux guests through Drydock or agentless SSH. Docker
+Desktop VM transport is outside this change. Other guest targets refuse with `NoPlatformBuild`; the controller's
+native tools are never a guest fallback. Previous generation archives remain
+valid for decoding and rollback, but without a catalog their guest provisioning
+reports a missing build.
+
+`share/flotilla/guest-tools/catalog.json` indexes the OCI target `linux/amd64`.
+Its tree at `share/flotilla/guest-tools/linux-amd64` contains
+`bin/{drydock-agent,flotilla-vessel,cleat}`, `lib/libghostty-vt.so.0`, and the
+complete `share/terminfo` database including aliases and license. Executable
+permissions and Cleat's `$ORIGIN/../lib` loader layout travel together. The
+catalog records the existing source set, Actions run identity (cohort), and each
+file's size and SHA-256. The run is bound to the promoted generation's
+`source_run.api_run_id`; a source-identical build from another run is a different
+cohort.
+
+The Linux builder packages its existing native outputs. Promotion first verifies
+both Actions artifacts from the same run, then copies that Linux tree into the
+unsigned Darwin archive and regenerates the unsigned manifest/checksums. No
+compiler runs during promotion or signing. The signer validates the catalog
+before signing controller Mach-O files; the Linux guest bytes remain unchanged.
+The finalizer and installed generation validator check the payload again. Runtime
+resolves the complete catalog before connecting or uploading, checks source/cohort
+identity, hashes, amd64 ELF machines, compiled terminfo and relative loader
+layout, and retains the validated installed paths for the daemon's lifetime.
+Installed verified generations must remain immutable; a roll restarts the daemon.
+Docker preparation pins both `FROM` stages and image/container selection to the
+requested admitted target and validates cached image architecture. Drydock reach
+uses the environment's recorded platform. SSH uses observed host platform. Hello
+verifies the decision and refuses a mismatch before upgrade.
+
+Operator sequence after merge:
+
+1. Deploy consumer validators/installers that recognize the new catalog payload.
+2. Deploy the signer and finalizer validation helpers, then the promoter and
+   canonical builder. Preserve signing identity and workflow permissions.
+3. Build and promote a same-run candidate pair, then sign/finalize Darwin.
+   Verify that the catalog and Linux guest payload hashes agree in both controller
+   archives and that the signed derivative retains those Linux bytes unchanged.
+4. In the operator's fleet rehearsal, provision Linux amd64 guests from both
+   controller platforms and exercise the vessel CLI, Cleat with its native
+   library, and compiled terminfo aliases as a unit. Also exercise old-generation
+   rollback and missing-build refusal. These checks follow merge; crew acceptance
+   uses isolated fixtures without fleet or signing credentials.

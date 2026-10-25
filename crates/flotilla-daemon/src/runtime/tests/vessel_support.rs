@@ -87,10 +87,20 @@ impl VesselHandle for RunnerVessel {
 
 #[async_trait]
 impl VesselAgents for RunnerVesselAgents {
+    // This process-boundary fake models a Linux amd64 host without invoking uname.
+    async fn observe_platform(&self, _: &AgentlessSshProfile) -> Result<super::agentless_vessels::HostPlatform, String> {
+        Ok(super::agentless_vessels::HostPlatform::from_uname("Linux", "x86_64"))
+    }
     async fn host_refusals(&self, _profile: &AgentlessSshProfile) -> Vec<HostRefusal> {
         self.refusals.lock().expect("refusals").clone()
     }
-    async fn open(&self, _profile: &AgentlessSshProfile, paths: &VesselPaths, _local: &Path) -> Result<Arc<dyn VesselHandle>, String> {
+    async fn open(
+        &self,
+        _profile: &AgentlessSshProfile,
+        _: &super::agentless_vessels::HostPlatform,
+        paths: &VesselPaths,
+        _local: &Path,
+    ) -> Result<Arc<dyn VesselHandle>, String> {
         Ok(Arc::new(RunnerVessel { agent: paths.agent.clone(), runner: Arc::clone(&self.runner), vessels: Arc::clone(&self.vessels) }))
     }
     async fn probe(

@@ -174,6 +174,7 @@ pub(super) fn state_root(bag: &EnvironmentBag) -> Result<PathBuf, String> {
 pub(super) struct HostPlatform(drydock_protocol::Platform);
 
 impl HostPlatform {
+    #[cfg(test)]
     pub(super) fn controller() -> Self {
         Self(drydock_protocol::Platform::current())
     }
@@ -365,11 +366,20 @@ pub(super) struct HostRefusal {
 /// uses drydock's SSH transport; tests substitute the agent.
 #[async_trait]
 pub(super) trait VesselAgents: Send + Sync {
+    async fn observe_platform(&self, profile: &AgentlessSshProfile) -> Result<HostPlatform, String> {
+        HostPlatform::probe(profile.runner.as_ref()).await
+    }
     /// Why this controller cannot run vessels on the host, if it cannot.
     async fn host_refusals(&self, profile: &AgentlessSshProfile) -> Vec<HostRefusal>;
     /// A handle on one vessel's agent at `paths`, with its attach forwards
     /// bound under `local` on the controller.
-    async fn open(&self, profile: &AgentlessSshProfile, paths: &VesselPaths, local: &Path) -> Result<Arc<dyn VesselHandle>, String>;
+    async fn open(
+        &self,
+        profile: &AgentlessSshProfile,
+        platform: &HostPlatform,
+        paths: &VesselPaths,
+        local: &Path,
+    ) -> Result<Arc<dyn VesselHandle>, String>;
     /// The vessel's providers, discovered through its own agent.
     async fn probe(
         &self,
@@ -396,9 +406,11 @@ pub(super) struct SshVesselAgents {
 }
 
 impl Default for SshVesselAgents {
-    /// The generation ships the agent beside the daemon (#3756).
+    /// Resolve the agent from the complete verified guest catalog.
     fn default() -> Self {
-        Self::with_agent_build(Box::new(::drydock::local::agent_build))
+        Self::with_agent_build(Box::new(|platform| {
+            flotilla_environment::guest_tools::GuestTools::installed(platform).map(|tools| tools.agent())
+        }))
     }
 }
 
@@ -417,15 +429,10 @@ impl SshVesselAgents {
         }
     }
 
-    /// The vessel's tools come from this controller's generation, so they run
-    /// only on its own platform; the agent build must exist for it too.
+    /// Admit the observed guest target before selecting its complete catalog build.
     fn supported(&self, platform: &HostPlatform) -> Result<PathBuf, (&'static str, String)> {
-        let controller = HostPlatform::controller();
-        if *platform != controller {
-            return Err((
-                "NoPlatformBuild",
-                format!("vessel tools come from this controller's generation, built for {controller}; the host runs {platform}"),
-            ));
+        if platform.drydock() != flotilla_environment::guest_tools::linux_amd64() {
+            return Err(("NoPlatformBuild", format!("unsupported guest platform {platform}; only linux/amd64 is admitted")));
         }
         (self.agent_build)(&platform.drydock()).map_err(|error| ("NoAgentBuild", format!("no drydock agent build: {error}")))
     }
@@ -433,6 +440,9 @@ impl SshVesselAgents {
 
 #[async_trait]
 impl VesselAgents for SshVesselAgents {
+    async fn observe_platform(&self, profile: &AgentlessSshProfile) -> Result<HostPlatform, String> {
+        self.platform(profile).await
+    }
     async fn host_refusals(&self, profile: &AgentlessSshProfile) -> Vec<HostRefusal> {
         let mut refusals = Vec::new();
         let refuse = |reason, message: String, blocks_readiness| HostRefusal {
@@ -463,10 +473,15 @@ impl VesselAgents for SshVesselAgents {
         refusals
     }
 
-    async fn open(&self, profile: &AgentlessSshProfile, paths: &VesselPaths, local: &Path) -> Result<Arc<dyn VesselHandle>, String> {
+    async fn open(
+        &self,
+        profile: &AgentlessSshProfile,
+        platform: &HostPlatform,
+        paths: &VesselPaths,
+        local: &Path,
+    ) -> Result<Arc<dyn VesselHandle>, String> {
         let reach = profile.vessel_agent.clone()?;
-        let platform = self.platform(profile).await?;
-        let build = self.supported(&platform).map_err(|(_, message)| message)?;
+        let build = self.supported(platform).map_err(|(_, message)| message)?;
         let cache = self.builds.lock().expect("builds").entry(build.clone()).or_default().clone();
         let connector = HostAgentConnector::new(
             profile.runner.clone(),
@@ -584,10 +599,13 @@ impl AgentlessVessels {
     ) -> Result<VesselAccess, String> {
         let paths = VesselPaths::new(&profile.env_bag, &key)?;
         let local = self.local_directory(&key)?;
-        let handle = self.agents.open(profile, &paths, &local).await?;
+        let platform = self.agents.observe_platform(profile).await?;
+        let context = LayerContext { prefix: paths.state.clone(), platform: platform.drydock() };
+        let tools = preparation.tools.prepare(AGENTLESS_SSH_PROVIDER_KIND, &key.environment, &context).await?;
+        let handle = self.agents.open(profile, &platform, &paths, &local).await?;
         // A failed preparation closes its handle at once: its listeners and
         // connection never linger beside the next attempt's.
-        match self.prepare_opened(preparation, profile, &key, &paths, &handle).await {
+        match self.prepare_opened(preparation, profile, &key, &paths, &handle, &tools).await {
             Ok(registry) => {
                 info!(environment = %key.environment, vessel = %key.vessel, agent = %paths.agent.display(), "vessel agent ready");
                 Ok(VesselAccess { key, paths, handle, registry })
@@ -606,6 +624,7 @@ impl AgentlessVessels {
         key: &VesselKey,
         paths: &VesselPaths,
         handle: &Arc<dyn VesselHandle>,
+        tools: &[flotilla_environment::environment::EnvironmentTool],
     ) -> Result<Arc<ProviderRegistry>, String> {
         let agent = handle.agent();
         agent.ready().await.map_err(|error| format!("vessel agent for {}: {error}", key.vessel))?;
@@ -619,9 +638,7 @@ impl AgentlessVessels {
             .run("mkdir", &["-p", &cleat.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
             .await
             .map_err(|error| format!("create vessel cleat state: {error}"))?;
-        let context = LayerContext { prefix: paths.state.clone() };
-        let tools = preparation.tools.prepare(AGENTLESS_SSH_PROVIDER_KIND, &key.environment, &context).await?;
-        agent.push_tools(&tools).await.map_err(|error| format!("push vessel tools: {error}"))?;
+        agent.push_tools(tools).await.map_err(|error| format!("push vessel tools: {error}"))?;
         let environment = vessel_environment(profile, paths)?;
         handle.configure_environment(environment.clone()).await.map_err(|error| format!("configure vessel environment: {error}"))?;
         let socket = self.sockets.prepare_vessel_forwarded(profile.environment_id.clone(), &key.vessel).await?;
@@ -847,11 +864,15 @@ done"#;
 
 /// The layer is published under the vessel's state directory.
 struct LayerContext {
+    platform: drydock_protocol::Platform,
     prefix: PathBuf,
 }
 
 #[async_trait]
 impl EnvironmentToolContext for LayerContext {
+    fn guest_platform(&self) -> drydock_protocol::Platform {
+        self.platform.clone()
+    }
     async fn rust_build_jobs(&self) -> Result<usize, String> {
         Err("vessel layers carry no build limits".into())
     }

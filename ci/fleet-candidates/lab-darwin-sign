@@ -380,8 +380,11 @@ def extract_verified_candidate(archive_bytes, stage, generation, sources, protoc
         try:
             skill_bundle = json.loads((stage / "share/flotilla/skills/.flotilla-sources.json").read_text())
             validation.validate_skill_bundle(skill_bundle, sources)
-        except (OSError, json.JSONDecodeError, validation.ValidationError) as error:
-            raise SigningError(f"Darwin candidate has an invalid skill bundle: {error}") from error
+            validation.validate_guest_tools(
+                {path: (stage / path).read_bytes() for path in declared if path.startswith(validation.GUEST_PREFIX + "/")},
+                sources, manifest.get("guest_tools_cohort"), required=manifest.get("guest_tools_cohort") is not None)
+        except (OSError, ValueError) as error:
+            raise SigningError(f"Darwin candidate has an invalid skill/guest bundle: {error}") from error
     return manifest, unsigned_digests
 
 
@@ -684,6 +687,10 @@ def main():
         unsigned_manifest, unsigned_digests = extract_verified_candidate(
             archive_bytes, stage, args.generation, sources, protocol
         )
+        if validation.GUEST_CATALOG in unsigned_digests:
+            cohort = str(generation_document.get("source_run", {}).get("api_run_id"))
+            if unsigned_manifest.get("guest_tools_cohort") != cohort:
+                raise SigningError("guest platform linux/amd64: candidate cohort differs from promoted run")
         signed_payloads = sign_payloads(
             stage,
             args.identity,
@@ -699,6 +706,7 @@ def main():
             "platform": INPUT_PLATFORM,
             "sources": sources,
             "build_profile": unsigned_manifest.get("build_profile"),
+            "guest_tools_cohort": unsigned_manifest.get("guest_tools_cohort"),
             "peer_protocol_version": protocol,
             "signed": True,
             "source_generation": args.generation,

@@ -12,6 +12,7 @@ import re
 import secrets
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -71,6 +72,119 @@ INDEPENDENT_PLATFORM = "platform-independent"
 
 
 
+GUEST_PREFIX = 'share/flotilla/guest-tools'
+GUEST_CATALOG = f'{GUEST_PREFIX}/catalog.json'
+GUEST_TARGET = 'linux/amd64'
+GUEST_TREE = f'{GUEST_PREFIX}/linux-amd64'
+GUEST_REQUIRED = {'bin/drydock-agent', 'bin/flotilla-vessel', 'bin/cleat',
+            'lib/libghostty-vt.so.0', 'share/terminfo/x/xterm-ghostty', 'share/terminfo/LICENSE'}
+GUEST_NATIVE = {'bin/drydock-agent', 'bin/flotilla-vessel', 'bin/cleat', 'lib/libghostty-vt.so.0'}
+
+
+def guest_native(content, name):
+    if len(content) < 64 or content[:6] != b'\x7fELF\x02\x01' or content[18:20] != b'\x3e\x00':
+        raise ValueError(f'{GUEST_TARGET}: invalid ELF64 little-endian amd64 artifact {name}')
+    # Validate the dynamic loader contract directly, without executing guest bytes.
+    offset = struct.unpack_from('<Q', content, 32)[0]
+    size, count = struct.unpack_from('<HH', content, 54)
+    if size < 56 or offset + size * count > len(content):
+        raise ValueError(f'{GUEST_TARGET}: invalid program headers: {name}')
+    segments = [struct.unpack_from('<IIQQQQQQ', content, offset + size * i) for i in range(count)]
+    if name != 'bin/cleat':
+        return
+    loads = [p for p in segments if p[0] == 1]
+    dynamic = next((p for p in segments if p[0] == 2), None)
+    if dynamic is None or dynamic[2] + dynamic[5] > len(content):
+        raise ValueError(f'{GUEST_TARGET}: cleat lacks dynamic loader metadata')
+    tags = [struct.unpack_from('<QQ', content, i) for i in range(dynamic[2], dynamic[2] + dynamic[5], 16)]
+    strings = next((value for tag, value in tags if tag == 5), None)
+    load = next((p for p in loads if strings is not None and p[3] <= strings < p[3] + p[5]), None)
+    if load is None:
+        raise ValueError(f'{GUEST_TARGET}: cleat lacks dynamic string table')
+    base = load[2] + strings - load[3]
+    def string(index):
+        start = base + index
+        end = content.find(b'\0', start)
+        if start >= len(content) or end < 0:
+            raise ValueError(f'{GUEST_TARGET}: invalid cleat loader string')
+        return content[start:end]
+    needed = [string(value) for tag, value in tags if tag == 1]
+    paths = [string(value) for tag, value in tags if tag in (15, 29)]
+    if b'libghostty-vt.so.0' not in needed or not any(b'$ORIGIN/../lib' in p.split(b':') for p in paths):
+        raise ValueError(f'{GUEST_TARGET}: incompatible cleat library layout')
+
+
+def validate_guest_tools(contents, sources, cohort=None, required=False):
+    present = {name for name in contents if name.startswith(GUEST_PREFIX + '/')}
+    if not present and not required:
+        return None
+    if GUEST_CATALOG not in contents:
+        raise ValueError(f'{GUEST_TARGET}: missing guest catalog')
+    try:
+        catalog = json.loads(contents[GUEST_CATALOG])
+    except (ValueError, UnicodeError) as error:
+        raise ValueError(f'{GUEST_TARGET}: malformed guest catalog') from error
+    if not isinstance(catalog, dict) or catalog.get('schema_version') != 1 or catalog.get('sources') != sources:
+        raise ValueError(f'{GUEST_TARGET}: inconsistent guest catalog sources')
+    identity = catalog.get('cohort')
+    if not isinstance(identity, str) or not identity or (cohort is not None and identity != cohort):
+        raise ValueError(f'{GUEST_TARGET}: inconsistent guest catalog cohort')
+    if not isinstance(catalog.get('platforms'), dict) or set(catalog['platforms']) != {GUEST_TARGET}:
+        raise ValueError('unsupported guest catalog platform matrix')
+    entry = catalog['platforms'][GUEST_TARGET]
+    if not isinstance(entry, dict) or entry.get('root') != GUEST_TREE or not isinstance(entry.get('files'), list) or len(entry['files']) > 16384:
+        raise ValueError(f'{GUEST_TARGET}: invalid guest catalog layout')
+    declared = set()
+    for item in entry['files']:
+        if not isinstance(item, dict) or not isinstance(item.get('path'), str):
+            raise ValueError(f'{GUEST_TARGET}: malformed guest artifact')
+        name = item['path']
+        parts = Path(name).parts
+        if not parts or name.startswith('/') or '..' in parts or name in declared:
+            raise ValueError(f'{GUEST_TARGET}: unsafe or duplicate guest artifact {name}')
+        if name not in GUEST_NATIVE and not name.startswith('share/terminfo/'):
+            raise ValueError(f'{GUEST_TARGET}: unexpected guest artifact {name}')
+        declared.add(name)
+        content = contents.get(f'{GUEST_TREE}/{name}')
+        if content is None or len(content) != item.get('size_bytes') or hashlib.sha256(content).hexdigest() != item.get('sha256'):
+            raise ValueError(f'{GUEST_TARGET}: missing or invalid guest artifact {name}')
+        if name in GUEST_NATIVE:
+            try:
+                guest_native(content, name)
+            except (ValueError, struct.error) as error:
+                raise ValueError(f'{GUEST_TARGET}: invalid native artifact {name}: {error}') from error
+        if name == 'share/terminfo/x/xterm-ghostty' and content[:2] not in (b'\x1a\x01', b'\x1e\x02'):
+            raise ValueError(f'{GUEST_TARGET}: invalid compiled terminfo')
+    if not GUEST_REQUIRED <= declared or present != {GUEST_CATALOG} | {f'{GUEST_TREE}/{name}' for name in declared}:
+        raise ValueError(f'{GUEST_TARGET}: incomplete or unindexed guest payload')
+    return catalog
+
+
+def produce_guest_tools(root, sources, cohort):
+    import shutil
+    root = Path(root)
+    destination = root / GUEST_TREE
+    if destination.exists():
+        raise ValueError('guest payload already exists')
+    for name in GUEST_NATIVE:
+        source = root / name
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    shutil.copytree(root / 'share/terminfo', destination / 'share/terminfo', symlinks=False)
+    files = []
+    for path in sorted(destination.rglob('*')):
+        if path.is_file():
+            content = path.read_bytes()
+            files.append({'path': str(path.relative_to(destination)), 'size_bytes': len(content),
+                          'sha256': hashlib.sha256(content).hexdigest()})
+    catalog = {'schema_version': 1, 'sources': sources, 'cohort': cohort,
+               'platforms': {GUEST_TARGET: {'root': GUEST_TREE, 'files': files}}}
+    (root / GUEST_CATALOG).write_text(json.dumps(catalog, sort_keys=True, indent=2) + '\n')
+    contents = {str(path.relative_to(root)): path.read_bytes() for path in (root / GUEST_PREFIX).rglob('*') if path.is_file()}
+    validate_guest_tools(contents, sources, cohort, required=True)
+
+
 class ValidationError(ValueError):
     pass
 
@@ -97,6 +211,8 @@ def require_size(value, description="size", *, allow_zero=False):
 
 
 def allowed_payload(path, platform=None):
+    if path.startswith(GUEST_PREFIX + "/"):
+        return True
     # Optional for prior-generation rollback; the producer always ships these.
     if path in {"bin/flotilla-vessel", "bin/drydock-agent"}:
         return platform.startswith("linux-")
@@ -539,6 +655,15 @@ def validate_release(root, outer, platform):
     actual = {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file() and path not in {manifest_path, root / ".generation.json"}}
     if actual != expected or not REQUIRED_PAYLOAD.issubset(expected):
         raise ValidationError("release files do not match the manifest or required payload")
+    if GUEST_CATALOG in expected and (not isinstance(outer.get("source_run"), dict)
+            or str(outer["source_run"].get("api_run_id")) != manifest.get("guest_tools_cohort")):
+        raise ValidationError("linux/amd64: guest cohort differs from installed generation")
+    try:
+        validate_guest_tools({rel: (root / rel).read_bytes() for rel in expected if rel.startswith(GUEST_PREFIX + "/")},
+                             sources, str(outer.get("source_run", {}).get("api_run_id")) if outer.get("source_run") else None,
+                             required=manifest.get("guest_tools_cohort") is not None)
+    except ValueError as error:
+        raise ValidationError(str(error)) from error
     validate_skill_bundle(json.loads((root / "share/flotilla/skills/.flotilla-sources.json").read_text()), sources)
     # Present only from the generation that introduced it onward; a rollback
     # target predating it is still a valid release. See REQUIRED_PAYLOAD.

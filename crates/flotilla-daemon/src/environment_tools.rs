@@ -1,6 +1,6 @@
+#[cfg(test)]
+use std::{env, io::Read};
 use std::{
-    env,
-    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -41,6 +41,7 @@ pub(crate) const ENVIRONMENT_CLEAT_RUNTIME_DIR: &str = "/var/lib/flotilla/cleat"
 const CLEAT_GHOSTTY_LIBRARY: &str = "libghostty-vt.so.0";
 #[cfg(test)]
 const FLEET_INSTALL_MARKER: &str = "# managed by fleet-install";
+#[cfg(test)]
 const FLEET_INSTALL_LAUNCHER_PREFIX: &[u8] = b"#!/usr/bin/env bash\n# managed by fleet-install\n";
 
 #[async_trait]
@@ -54,6 +55,10 @@ pub(crate) trait EnvironmentToolFactory: Send + Sync {
 #[async_trait]
 pub(crate) trait EnvironmentToolContext: Send + Sync {
     async fn rust_build_jobs(&self) -> Result<usize, String>;
+    #[cfg(unix)]
+    fn guest_platform(&self) -> drydock_protocol::Platform {
+        flotilla_environment::guest_tools::linux_amd64()
+    }
     /// Where the generation layer is published in the environment, when it is
     /// not a container's fixed `/opt/flotilla`.
     fn tools_prefix(&self) -> Option<&Path> {
@@ -156,6 +161,7 @@ impl EnvironmentToolProvisioner {
 /// masking image-owned harnesses. Other providers can populate volumes/upload.
 #[cfg(unix)]
 struct FleetToolsTool {
+    generation: Option<PathBuf>,
     cli: Arc<dyn EnvironmentToolFactory>,
     cleat: Arc<dyn EnvironmentToolFactory>,
     root: PathBuf,
@@ -165,6 +171,7 @@ struct FleetToolsTool {
 impl FleetToolsTool {
     fn for_local_host(context: &LocalToolContext<'_>) -> Arc<dyn EnvironmentToolFactory> {
         Arc::new(Self {
+            generation: None,
             cli: FlotillaCliTool::for_local_host(context),
             cleat: CleatTool::for_local_host(context),
             root: context.config.state_dir().join("environment-tools/fleet").as_path().to_path_buf(),
@@ -181,20 +188,21 @@ impl EnvironmentToolFactory for FleetToolsTool {
     async fn prepare(&self, name: &str, context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
         let mut cli = self.cli.prepare(name, context).await?;
         let cleat = self.cleat.prepare(name, context).await?;
-        let binary = cleat.assets[0].host_path.as_path();
-        // The library prefix owns terminfo too; both come from the same pin.
-        let library = cleat.assets[1].host_path.as_path();
-        let prefix = library.parent().and_then(Path::parent).ok_or("cleat library has no installation prefix")?;
-        let terminfo = prefix.join("share/terminfo");
-        let flotilla = cli.assets[0].host_path.as_path().join("flotilla");
-        self.publisher.publish(
-            &self.root,
-            &flotilla_environment::tools::ToolsSource { flotilla: &flotilla, cleat: binary, library, terminfo: &terminfo },
-        )
-        .map_err(|error| format!(
-            "publish fleet tools: {error}; vessel provisioning requires Linux fleet tools: flotilla, cleat, libghostty-vt.so.0, and compiled xterm-ghostty at {}; build/install a complete fleet candidate (cleat prepare supplies share/terminfo)",
-            terminfo.display()
-        ))?;
+        let tools = match &self.generation {
+            Some(root) => flotilla_environment::guest_tools::GuestTools::resolve(root, &context.guest_platform())?,
+            None => flotilla_environment::guest_tools::GuestTools::installed(&context.guest_platform())?,
+        };
+        self.publisher
+            .publish(
+                &self.root,
+                &flotilla_environment::tools::ToolsSource {
+                    flotilla: &tools.flotilla(),
+                    cleat: &tools.cleat(),
+                    library: &tools.library(),
+                    terminfo: &tools.terminfo(),
+                },
+            )
+            .map_err(|error| format!("publish guest platform {} tools: {error}", context.guest_platform()))?;
         if let Some(prefix) = context.tools_prefix() {
             return Ok(generation_layer(&self.root, prefix));
         }
@@ -415,6 +423,7 @@ impl EnvironmentToolFactory for FailingTool {
     }
 }
 
+#[cfg(test)]
 fn resolve_cleat_binary_from(path: &Path, current_dir: &Path, search_path: Option<&std::ffi::OsStr>) -> Result<DaemonHostPath, String> {
     let candidate = if path.is_absolute() {
         path.to_path_buf()
@@ -435,6 +444,7 @@ fn resolve_cleat_binary_from(path: &Path, current_dir: &Path, search_path: Optio
     Ok(DaemonHostPath::new(canonical))
 }
 
+#[cfg(test)]
 fn resolve_fleet_cleat_launcher(path: &Path) -> Result<Option<PathBuf>, String> {
     let Ok(mut file) = std::fs::File::open(path) else {
         return Ok(None);
@@ -472,6 +482,7 @@ fn resolve_fleet_cleat_launcher(path: &Path) -> Result<Option<PathBuf>, String> 
 ///
 /// Fleet install roots must be filesystem paths, so control-character paths
 /// (which Bash renders using `$'...'`) are deliberately unsupported.
+#[cfg(test)]
 fn decode_bash_printf_q_word(encoded: &str) -> Option<String> {
     if encoded.is_empty() {
         return None;
@@ -488,28 +499,15 @@ fn decode_bash_printf_q_word(encoded: &str) -> Option<String> {
     Some(decoded)
 }
 
-fn resolve_cleat_binary(path: &Path) -> Result<DaemonHostPath, String> {
-    let current_dir = env::current_dir().map_err(|error| format!("resolve current directory for {}: {error}", path.display()))?;
-    let search_path = env::var_os("PATH");
-    resolve_cleat_binary_from(path, &current_dir, search_path.as_deref())
-}
-
 fn running_daemon_flotilla_binary() -> Result<DaemonHostPath, String> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        let daemon = std::env::current_exe().map_err(|e| format!("resolve running daemon: {e}"))?;
-        let binary = daemon.parent().ok_or("daemon executable has no parent")?.join("flotilla-vessel");
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::metadata(&binary)
-            .map_err(|e| format!("cut-down vessel CLI {}: {e}; build/install flotilla-vessel with this generation", binary.display()))?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-            return Err("cut-down vessel CLI must be executable".into());
-        }
-        Ok(DaemonHostPath::new(binary))
+        flotilla_environment::guest_tools::GuestTools::installed(&flotilla_environment::guest_tools::linux_amd64())
+            .map(|tools| DaemonHostPath::new(tools.flotilla()))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
-        Err("Docker vessel tools require a Linux host".into())
+        Err("guest platform linux/amd64 tools require a Unix controller".into())
     }
 }
 
@@ -671,13 +669,17 @@ impl FlotillaCliTool {
 impl CleatTool {
     fn for_local_host(context: &LocalToolContext<'_>) -> Arc<dyn EnvironmentToolFactory> {
         Arc::new(Self {
-            binary_path: context
-                .daemon
-                .local_environment_bag()
-                .and_then(|bag| bag.find_binary("cleat").cloned())
-                .map(|path| resolve_cleat_binary(path.as_path()))
-                .transpose()
-                .and_then(|path| path.ok_or_else(|| "binary unavailable for contained environment delivery".to_string())),
+            binary_path: {
+                #[cfg(unix)]
+                {
+                    flotilla_environment::guest_tools::GuestTools::installed(&flotilla_environment::guest_tools::linux_amd64())
+                        .map(|tools| DaemonHostPath::new(tools.cleat()))
+                }
+                #[cfg(not(unix))]
+                {
+                    Err("guest platform linux/amd64 tools require a Unix controller".into())
+                }
+            },
             ghostty_library_path: OnceCell::new(),
             state_root: context.config.state_dir().join("contained-cleat").as_path().to_path_buf(),
             runner: context.daemon.local_command_runner(),
@@ -751,6 +753,7 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../ci/fleet-candidates/fixtures/guest_tools.rs"));
 
     // Generation tools expose stable real directories and complete assets,
     // preserving image siblings while later link replacement remains visible.
@@ -777,20 +780,17 @@ pub(crate) mod tests {
     async fn fleet_tools_publish_complete_generations_through_stable_directory_assets() {
         let temp = TempDir::new().unwrap();
         let release = temp.path().join("release");
-        for directory in ["bin", "lib", "share/terminfo/x"] {
-            fs::create_dir_all(release.join(directory)).unwrap();
-        }
-        for file in ["bin/flotilla", "bin/cleat", "lib/libghostty-vt.so.0", "share/terminfo/x/xterm-ghostty"] {
-            fs::write(release.join(file), b"first").unwrap();
-        }
+        write_guest_fixture(&release);
+        let guest = release.join("share/flotilla/guest-tools/linux-amd64");
         let factory = FleetToolsTool {
+            generation: Some(release.clone()),
             cli: Arc::new(FlotillaCliTool {
-                binary_path: Ok(DaemonHostPath::new(release.join("bin/flotilla"))),
+                binary_path: Ok(DaemonHostPath::new(guest.join("bin/flotilla-vessel"))),
                 daemon_socket_path: Ok(DaemonHostPath::new(temp.path().join("run/flotilla.sock"))),
             }),
             cleat: Arc::new(CleatTool {
-                binary_path: Ok(DaemonHostPath::new(release.join("bin/cleat"))),
-                ghostty_library_path: OnceCell::new_with(Some(DaemonHostPath::new(release.join("lib/libghostty-vt.so.0")))),
+                binary_path: Ok(DaemonHostPath::new(guest.join("bin/cleat"))),
+                ghostty_library_path: OnceCell::new_with(Some(DaemonHostPath::new(guest.join("lib/libghostty-vt.so.0")))),
                 state_root: temp.path().join("state/cleat"),
                 runner: None,
             }),
@@ -834,21 +834,16 @@ pub(crate) mod tests {
         );
         assert!(layer.assets.iter().all(|asset| asset.kind == EnvironmentToolAssetKind::Directory && !asset.requires_mount()));
         assert!(layer.environment.is_empty());
-        fs::write(release.join("bin/cleat"), b"second").unwrap();
-        factory.prepare("another-vessel", &TestToolContext).await.unwrap();
-        assert_eq!(fs::read(parent.host_path.as_path().join("cleat")).unwrap(), b"second");
-        assert_eq!(fs::read(factory.root.join("share/terminfo/x/xterm-ghostty")).unwrap(), b"first");
-        // Missing assets refuse provisioning with an actionable installation
-        // requirement, retaining the last complete generation.
+        let before = fs::read(factory.root.join("bin/cleat")).expect("published cleat");
+        // Tampering a verified cohort refuses and preserves the last publication.
         for missing in ["share/terminfo/x/xterm-ghostty", "lib/libghostty-vt.so.0"] {
-            let path = release.join(missing);
-            let bytes = fs::read(&path).unwrap();
-            fs::remove_file(&path).unwrap();
+            let path = guest.join(missing);
+            let bytes = fs::read(&path).expect("asset");
+            fs::remove_file(&path).expect("remove asset");
             let error = factory.prepare("missing-assets", &TestToolContext).await.unwrap_err();
-            assert!(error.contains("vessel provisioning requires Linux fleet tools"), "{error}");
-            assert!(error.contains("share/terminfo"), "{error}");
-            assert_eq!(fs::read(factory.root.join("bin/cleat")).unwrap(), b"second");
-            fs::write(path, bytes).unwrap();
+            assert!(error.contains("guest platform linux/amd64"), "{error}");
+            assert_eq!(fs::read(factory.root.join("bin/cleat")).expect("published cleat"), before);
+            fs::write(path, bytes).expect("restore asset");
         }
     }
 

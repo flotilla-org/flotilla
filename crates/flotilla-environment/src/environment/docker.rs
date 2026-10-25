@@ -75,7 +75,7 @@ impl DockerEnvironmentProvider {
         let config = super::RegistryAuth::config(opts.prepared_auth.as_ref())?;
         let directory = config.path().to_string_lossy();
         let mut args = vec!["--config", directory.as_ref()];
-        args.extend(["pull", image]);
+        args.extend(["pull", "--platform", "linux/amd64", image]);
         self.inner
             .runner
             .run("docker", &args, Path::new("/"), &ChannelLabel::Default)
@@ -136,6 +136,7 @@ impl DockerEnvironmentProvider {
 }
 #[cfg(unix)]
 struct DockerPrepared {
+    platform: drydock_protocol::Platform,
     original: ImageId,
     image: ImageId,
 }
@@ -189,7 +190,14 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, opts: &PrepareOpts) -> Result<super::PreparedEnvironment, String> {
         #[cfg(all(unix, not(target_os = "linux")))]
         if self.inner.connector.is_none() {
-            return Err("Docker vessel agents currently require a Linux host and Linux agent companion".into());
+            return Err("guest platform linux/amd64: Docker requires a Linux daemon-adjacent socket transport".into());
+        }
+        #[cfg(unix)]
+        if opts.platform.as_ref().is_some_and(|platform| platform != &crate::guest_tools::linux_amd64()) {
+            return Err(format!(
+                "unsupported guest platform {}; Docker admits linux/amd64",
+                opts.platform.as_ref().expect("requested platform")
+            ));
         }
         if Some(super::EnvironmentInput::of(spec)?) != self.legacy_input() {
             return Err("Docker provider requires a Docker environment spec".into());
@@ -248,6 +256,9 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         #[cfg(unix)]
         {
             let prepared = prepared.get::<DockerPrepared>(&self.preparation_owner)?;
+            if prepared.platform != crate::guest_tools::linux_amd64() {
+                return Err(format!("unsupported guest platform {}", prepared.platform));
+            }
             let directory = self.inner.runtime_directory(&id)?;
             let mut tools = opts.tools.clone();
             // Files are pushed only after hello. Shared writable material and
@@ -405,6 +416,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             match result {
                 Ok((index, Ok(Some(handle)))) => handles[index] = handle,
                 Ok((_, Ok(None))) => {}
+                Ok((_, Err(error))) if error.starts_with("guest platform ") => return Err(error),
                 Ok((index, Err(error))) => {
                     tracing::warn!(container = %handles[index].backing_id(), %error, "agent adoption failed; retaining Docker fallback")
                 }
@@ -503,6 +515,17 @@ impl DockerEnvironmentProviderInner {
         }
     }
 
+    async fn verify_image_platform(&self, image: &str) -> Result<(), String> {
+        let platform = self
+            .runner
+            .run("docker", &["image", "inspect", "--format", "{{.Os}}/{{.Architecture}}", image], Path::new("/"), &ChannelLabel::Default)
+            .await?;
+        if platform.trim() != "linux/amd64" {
+            return Err(format!("guest platform linux/amd64 required; image {image} is {}", platform.trim()));
+        }
+        Ok(())
+    }
+
     async fn image_exists(&self, tag: &str, cwd: &Path) -> Result<bool, String> {
         match self.runner.run("docker", &["image", "inspect", tag], cwd, &ChannelLabel::Default).await {
             Ok(_) => Ok(true),
@@ -587,7 +610,7 @@ impl DockerEnvironmentProviderInner {
         if let Some(config) = docker_config {
             args.extend(["--config", config]);
         }
-        args.extend(["pull", image]);
+        args.extend(["pull", "--platform", "linux/amd64", image]);
         self.runner.run("docker", &args, Path::new("/"), &ChannelLabel::Default).await.map(|_| ())
     }
 
@@ -1056,6 +1079,8 @@ impl DockerEnvironmentProvider {
             "run",
             "-d",
             "--init",
+            "--platform",
+            "linux/amd64",
             "--pull",
             pull_policy,
             "--name",
@@ -1210,19 +1235,20 @@ impl DockerEnvironmentProvider {
         }
         #[cfg(unix)]
         {
-            #[cfg(not(target_os = "linux"))]
+            let platform = crate::guest_tools::linux_amd64();
             if self.inner.connector.is_none() {
-                return Err("Docker vessel agents currently require a Linux host and Linux agent companion".into());
+                crate::guest_tools::GuestTools::installed(&platform)?;
             }
+            self.inner.verify_image_platform(original.as_str()).await?;
             let tools = drydock::launch::build_tools_digest().map_err(|e| e.to_string())?;
             let base = self.agent_image_base(&original).await?;
-            let dockerfile = format!("FROM {tools} AS tools\nFROM {base}\nCOPY --from=tools /opt/drydock /opt/drydock\n");
+            let dockerfile = format!("FROM --platform=linux/amd64 {tools} AS tools\nFROM --platform=linux/amd64 {base}\nCOPY --from=tools /opt/drydock /opt/drydock\n");
             let output = self
                 .inner
                 .runner
                 .run_with_input(
                     "docker",
-                    &["build", "--quiet", "--network=none", "-"],
+                    &["build", "--platform", "linux/amd64", "--quiet", "--network=none", "-"],
                     Path::new("/"),
                     &ChannelLabel::Default,
                     dockerfile.as_bytes(),
@@ -1232,7 +1258,7 @@ impl DockerEnvironmentProvider {
             if !flotilla_resources::is_image_digest(digest) {
                 return Err("preparing drydock tools did not return an image digest".into());
             }
-            Ok(super::PreparedEnvironment::new(&self.preparation_owner, DockerPrepared { original, image: ImageId::new(digest) }))
+            Ok(super::PreparedEnvironment::new(&self.preparation_owner, DockerPrepared { original, image: ImageId::new(digest), platform }))
         }
     }
 
@@ -1350,19 +1376,26 @@ impl DockerEnvironmentProviderInner {
     }
 
     async fn agent_for(self: &Arc<Self>, container: &str, directory: &Path) -> Result<Arc<AgentLease>, String> {
-        #[cfg(not(target_os = "linux"))]
-        if self.connector.is_none() {
-            return Err("Docker vessel agents currently require a Linux host and Linux agent companion".into());
-        }
         let cell = self.agents.lock().await.entry(container.into()).or_default().clone();
         let lease = cell
             .get_or_try_init(|| async {
+                let executable = if self.connector.is_none() {
+                    let tools = crate::guest_tools::GuestTools::installed(&crate::guest_tools::linux_amd64())?;
+                    let image = self
+                        .runner
+                        .run("docker", &["inspect", "--format", "{{.Image}}", container], Path::new("/"), &ChannelLabel::Default)
+                        .await?;
+                    self.verify_image_platform(image.trim()).await?;
+                    tools.agent()
+                } else {
+                    self.agent_settings.executable.clone()
+                };
                 Self::start_agent(self.runner.as_ref(), container).await?;
                 let socket = directory.join("guest/agent.sock");
                 let connector = match &self.connector {
                     Some(factory) => factory(&socket),
                     None => Arc::new(
-                        UnixAgentConnector::new(socket, self.agent_settings.executable.clone(), Duration::from_secs(30))
+                        UnixAgentConnector::new(socket, executable, crate::guest_tools::linux_amd64(), Duration::from_secs(30))
                             .with_executable_cache(self.agent_bytes.clone()),
                     ),
                 };
@@ -1493,6 +1526,7 @@ mod agent_contract_tests {
                     assert!(!self.created.swap(true, Ordering::SeqCst));
                     Ok(BACKING.into())
                 }
+                ["image", "inspect", "--format", "{{.Os}}/{{.Architecture}}", _] => Ok("linux/amd64".into()),
                 ["inspect", "--format", "{{.Image}}", _] => Ok(PREPARED.into()),
                 ["inspect", "--format", "{{json .Config.Env}}", BACKING] => Ok(r#"["HOME=/tmp","PATH=/usr/bin:/bin"]"#.into()),
                 ["exec", "--user", "0", "--env", path, "--env", "LD_LIBRARY_PATH=", "--env", "LD_PRELOAD=", BACKING, "/bin/sh", "-c", script, "flotilla-agent-owner", _] =>
@@ -1527,11 +1561,11 @@ mod agent_contract_tests {
         }
         async fn run_with_input(&self, program: &str, args: &[&str], _: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
             assert_eq!(program, "docker");
-            assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
+            assert_eq!(args, ["build", "--platform", "linux/amd64", "--quiet", "--network=none", "-"]);
             let file = std::str::from_utf8(input).unwrap();
             assert!(file.starts_with("FROM "));
             assert!(file.contains("@sha256:"));
-            assert!(file.ends_with(&format!("FROM {TAGGED_BASE}\nCOPY --from=tools /opt/drydock /opt/drydock\n")));
+            assert!(file.ends_with(&format!("FROM --platform=linux/amd64 {TAGGED_BASE}\nCOPY --from=tools /opt/drydock /opt/drydock\n")));
             assert!(!file.contains("ENTRYPOINT"));
             assert!(!file.contains("CMD"));
             assert_eq!(self.tags.resolve_build(file)?.as_deref(), Some(BASE));

@@ -650,8 +650,16 @@ async fn failed_forward_registration_cleans_path_and_can_retry() {
 async fn connector_caches_generation_bytes_after_first_read() {
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("agent");
-    std::fs::write(&file, b"\x7fELFtest").unwrap();
-    let connector = UnixAgentConnector::new(directory.path().join("absent.sock"), file.clone(), Duration::from_millis(20));
+    let mut executable = vec![0; 64];
+    executable[..6].copy_from_slice(b"\x7fELF\x02\x01");
+    executable[18] = 62;
+    std::fs::write(&file, executable).unwrap();
+    let connector = UnixAgentConnector::new(
+        directory.path().join("absent.sock"),
+        file.clone(),
+        crate::guest_tools::linux_amd64(),
+        Duration::from_millis(20),
+    );
     assert!(connector.connect().await.is_err());
     std::fs::remove_file(file).unwrap();
     assert!(!connector.connect().await.err().unwrap().contains("read current drydock agent"));
@@ -772,4 +780,36 @@ async fn guest_forward_reaches_host_endpoint_across_reconnects(agent: Arc<dyn Te
     assert!(runner.is_closed());
     assert!(VesselAgent::ready(&runner).await.unwrap_err().contains("closed"));
     assert!(runner.run("true", &[], Path::new("/"), &ChannelLabel::Default).await.is_err());
+}
+
+// A hello only verifies the prepared platform. A mismatch must stop before the
+// upgrade route is used, even when the fingerprint also needs an update.
+#[tokio::test]
+async fn recorded_platform_mismatch_refuses_before_upload() {
+    let current = Platform::current();
+    let recorded = Platform::new("linux", if current == crate::guest_tools::linux_amd64() { "arm64" } else { "amd64" });
+    let mut opens = 0;
+    let error = connect_current(
+        || {
+            opens += 1;
+            async {
+                let (host, guest) = tokio::io::duplex(4096);
+                let (host, guest) = tokio::join!(
+                    Transport::yamux(Box::new(host), true, Default::default()),
+                    Transport::yamux(Box::new(guest), false, Default::default())
+                );
+                tokio::spawn(drydock_agent::Agent::new(guest?, "older".into(), "/unused".into()).run());
+                host
+            }
+        },
+        &recorded,
+        b"matching recorded build",
+        Duration::from_millis(300),
+    )
+    .await
+    .err()
+    .expect("platform mismatch");
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert!(error.to_string().contains(&format!("prepared for {recorded} but its agent reports {current}")));
+    assert_eq!(opens, 1);
 }
