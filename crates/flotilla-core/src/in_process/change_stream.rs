@@ -28,7 +28,8 @@ impl Default for Rounds {
 }
 const DEADLINE: Duration = Duration::from_secs(15);
 // The whole-home mesh currently sizes for a few hosts. Reserve the blocking pool for
-// other SQLite users; at most one active session per originating peer can pin a worker.
+// other SQLite users. Replaced workers retain their permit until they exit; the global
+// semaphore, rather than the one-current-session-per-peer rule, bounds worker count.
 const MAX_ROUNDS: usize = 16;
 
 impl Rounds {
@@ -55,11 +56,12 @@ impl Rounds {
                 touched: std::sync::Mutex::new(tokio::time::Instant::now()),
             });
             let mut rounds = self.sessions.lock().await;
+            // A reconnect starts a new round immediately. Dropping the abandoned
+            // receiver makes its producer fail at its next send, releasing its permit
+            // only when the blocking worker exits (which may still await a writer).
+            rounds.retain(|_, session| session.peer != peer);
             if rounds.len() >= MAX_ROUNDS {
                 return Err("too many change-stream sessions".into());
-            }
-            if rounds.values().any(|session| session.peer == peer) {
-                return Err("peer already has an active change-stream session".into());
             }
             let permit = Arc::clone(&self.workers).try_acquire_owned().map_err(|_| "change-stream workers busy")?;
             rounds.insert(session.clone(), Arc::clone(&receiver));
@@ -183,7 +185,7 @@ mod tests {
         tokio::time::advance(DEADLINE + Duration::from_secs(1)).await;
         assert!(rounds.next("peer", service, None, Some(session), Timestamp(2)).await.is_err());
     }
-    // One stalled originating peer can reserve one cursor, not every slot. Other peers
+    // A fresh round replaces the peer's abandoned cursor immediately. Other peers
     // progress independently, and an opaque session token grants no cross-peer access.
     #[tokio::test]
     async fn peer_limits_isolate_sessions_and_bound_global_admission() {
@@ -195,8 +197,16 @@ mod tests {
         else {
             panic!("frame");
         };
-        assert!(rounds.next("first", Arc::clone(&service), None, None, Timestamp(1)).await.unwrap_err().contains("already has an active"));
-        assert!(rounds.next("other", Arc::clone(&service), None, Some(session), Timestamp(1)).await.unwrap_err().contains("another peer"));
+        let CommandValue::ChangeStreamFrame { session: active, .. } =
+            rounds.next("first", Arc::clone(&service), None, None, Timestamp(1)).await.unwrap()
+        else {
+            panic!("replacement frame");
+        };
+        assert_eq!(
+            rounds.next("first", Arc::clone(&service), None, Some(session), Timestamp(1)).await.unwrap_err(),
+            "change-stream session expired"
+        );
+        assert!(rounds.next("other", Arc::clone(&service), None, Some(active), Timestamp(1)).await.unwrap_err().contains("another peer"));
         for index in 1..MAX_ROUNDS {
             assert!(rounds.next(&format!("peer-{index}"), Arc::clone(&service), None, None, Timestamp(1)).await.is_ok());
         }

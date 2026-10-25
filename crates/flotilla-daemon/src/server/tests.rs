@@ -6974,6 +6974,22 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
         };
         assert_eq!(snapshot(&source), snapshot(&target));
     }
+    // A home waiting behind its writer reports its own frame deadline to the
+    // follower before the follower's network deadline expires.
+    let store = source.store();
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let writer = tokio::task::spawn_blocking(move || {
+        let _held = store.lock().unwrap();
+        entered.send(()).unwrap();
+        wait.recv().unwrap();
+    });
+    ready.await.unwrap();
+    let error = super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap_err();
+    release.send(()).unwrap();
+    writer.await.unwrap();
+    assert_eq!(error, "routed frame timed out");
+    assert_eq!(target.watermark("home").unwrap().home_seq, 21);
     remote.abort();
 }
 
@@ -7025,4 +7041,38 @@ async fn routed_change_stream_origin_admission_rows() {
             other => panic!("{name}: {other:?}"),
         }
     }
+}
+
+// Cancelling a replication query releases its pending acknowledgement even if the
+// peer never responds. The fake replaces only the peer-wire boundary.
+#[tokio::test]
+async fn dropped_replication_dispatch_releases_pending_entry() {
+    let (_dir, daemon) = empty_daemon().await;
+    let pm = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let pending = Arc::new(Mutex::new(HashMap::new()));
+    let router = make_remote_command_router(
+        &daemon,
+        &pm,
+        &pending,
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(AtomicU64::new(1 << 62)),
+    );
+    let (tx, mut rx) = mpsc::channel(1);
+    pm.lock().await.register_sender(NodeId::new("home"), Arc::new(StreamCommandWire(tx)));
+    let task = tokio::spawn(async move {
+        router
+            .dispatch_replication_query(
+                Command::builder()
+                    .node_id(NodeId::new("home"))
+                    .action(CommandAction::QueryChangeStream { after: None, session: None })
+                    .build(),
+            )
+            .await
+    });
+    rx.recv().await.unwrap();
+    assert_eq!(pending.lock().await.len(), 1);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(pending.lock().await.is_empty());
 }

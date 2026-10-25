@@ -49,8 +49,13 @@ hold at most two frames. A producer or abandoned session expires after 15 second
 consumer progress. At most **16 sessions/workers** may exist at once, protected by a
 semaphore permit held until the blocking worker actually exits, rather than only until its
 cursor disappears. This leaves capacity in the daemon's default blocking pool for other
-SQLite work. A single originating node may hold only one session, and another node cannot
-use its cursor. Completion and delivered errors remove the session immediately.
+SQLite work. A single originating node holds one current session: a fresh round replaces
+its abandoned cursor immediately, and another node cannot use its cursor. The replaced
+worker retains its permit until it exits, so the global cap, not the per-peer rule,
+bounds workers. Routed pulls wait 20 seconds, giving the producer's 15-second frame
+deadline a five-second round-trip allowance; producer errors reach the follower unchanged.
+Dropping a query dispatch removes its pending acknowledgement, including cancellation
+while sending the request. Completion and delivered errors remove the session immediately.
 Interactive query dispatch refuses `QueryChangeStream` before routing. The destination
 also refuses forwarded requests carrying a surface session or delegated caller, and the
 ordinary daemon query entry point cannot serve it. Only the internal replication dispatch
