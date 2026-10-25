@@ -646,6 +646,15 @@ impl<'a> AttachResolver<'a> {
             .get(&session.spec.env_ref)
             .await
             .map_err(|err| format!("environment {} lookup failed: {err}", session.spec.env_ref))?;
+        if let Some(handle) = self.checked_provisioned_handle(&environment)? {
+            // Host-direct resources without vessel capabilities retain their
+            // existing pool/host routing. Every offered vessel capability is
+            // selected from the handle, independently of its provider or spec kind.
+            if handle.agent().is_some() || handle.terminal_route().is_some() || environment.spec.host_direct.is_none() {
+                let plan = self.provisioned_attach_plan_for_session(reads, session, &environment, handle, seat).await?;
+                return Ok((plan, self.host_name.clone()));
+            }
+        }
         let host_ref = environment
             .spec
             .host_direct
@@ -685,8 +694,9 @@ impl<'a> AttachResolver<'a> {
             return Ok((plan, target_host));
         }
 
-        let plan = self.local_attach_plan_for_session(reads, session, &environment, seat).await?;
-        Ok((plan, self.host_name.clone()))
+        let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
+        let args = self.terminal_pool_attach_args(reads, session, &environment, &cwd, seat).await?;
+        Ok((ResolvedAttachPlan::command(args), self.host_name.clone()))
     }
 
     async fn recursive_attach_plan_for_remote(
@@ -729,69 +739,69 @@ impl<'a> AttachResolver<'a> {
         self.recursive_attach_plan_for_remote(&binding.host, reference, AttachMode::PreferTake).await
     }
 
-    async fn local_attach_plan_for_session(
+    fn checked_provisioned_handle(
+        &self,
+        environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
+    ) -> Result<Option<flotilla_environment::environment::EnvironmentHandle>, String> {
+        let handle = self.environment_manager.managed_environments().into_iter().find_map(|(id, state)| {
+            if id.as_str() != environment.metadata.name {
+                return None;
+            }
+            match state {
+                ManagedEnvironmentKind::Provisioned(state) => Some(state.handle),
+                ManagedEnvironmentKind::Direct(_) => None,
+            }
+        });
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        // The engine's checked identity is authoritative; no copied status or
+        // provider discriminator can authorize a handle for a different backing.
+        let realised = environment_attach_backing(self.lifecycle_reads, &environment.metadata.name)?;
+        if handle.id().as_str() != environment.metadata.name || realised.as_ref().is_some_and(|backing| handle.backing_id() != backing) {
+            return Err(format!("environment {} has no live handle for realised backing {realised:?}", environment.metadata.name));
+        }
+        Ok(Some(handle))
+    }
+
+    async fn provisioned_attach_plan_for_session(
         &self,
         reads: &AttachReadContext,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
         environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
+        handle: flotilla_environment::environment::EnvironmentHandle,
         seat: AttachMode,
     ) -> Result<ResolvedAttachPlan, String> {
         let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
-        if environment.spec.docker.is_some() {
-            // The engine's realised backing is authoritative behind [primitives].
-            // Use its live handle, never a stale prior backing.
-            let realised = environment_attach_backing(self.lifecycle_reads, &environment.metadata.name)?;
-            let handle = self
-                .environment_manager
-                .managed_environments()
-                .into_iter()
-                .find_map(|(id, state)| {
-                    if id.as_str() != session.spec.env_ref {
-                        return None;
-                    }
-                    match state {
-                        ManagedEnvironmentKind::Provisioned(state)
-                            if realised.as_ref().is_none_or(|backing| state.handle.backing_id() == backing) =>
-                        {
-                            Some(state.handle)
-                        }
-                        _ => None,
-                    }
-                })
-                .ok_or_else(|| format!("environment {} has no live handle for realised backing {realised:?}", session.spec.env_ref))?;
-            let resident = async {
-                let agent = handle.agent().ok_or("resident vessel agent is absent")?;
-                agent.ready().await?;
-                let registry = self.registry_for_resource_environment(reads, environment, cwd.as_path()).await?;
-                let pool =
-                    registry.terminal_pools.get(&session.spec.pool).map(|(_, pool)| pool.clone()).ok_or("terminal pool unavailable")?;
-                let endpoint = checked_cleat_endpoint(pool.as_ref(), session, seat).await?;
-                let guest = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
-                let socket = agent.forward_socket(&guest).await?;
-                Ok::<_, String>(cleat_socket_attach_plan(&socket, &endpoint.session, seat))
-            }
-            .await;
-            let resident_error = match resident {
-                Ok(plan) => return Ok(plan),
-                Err(error) => error,
-            };
-            let terminal = async {
-                let route = handle.terminal_route().ok_or("provider offers no authorized terminal route")?;
-                // This capability supplies terminal-only access. It must not replace
-                // the agent runner or mark the resident agent healthy.
-                let bag = self.environment_manager.environment_bag(handle.id()).ok_or("terminal environment unavailable")?;
-                let client = bag.find_binary("cleat").map(|binary| binary.as_path()).unwrap_or(Path::new("cleat"));
-                let pool = flotilla_terminal::cleat::CleatTerminalPool::new(route.terminal_runner(), client.to_string_lossy(), &bag);
-                let endpoint = checked_cleat_endpoint(&pool, session, seat).await?;
-                route.attach_plan(&endpoint, client, seat)
-            }
-            .await;
-            return terminal.map_err(|error| {
-                format!("resident vessel agent route unavailable: {resident_error}; provider terminal route unavailable: {error}")
-            });
+        let resident = async {
+            let agent = handle.agent().ok_or("resident vessel agent is absent")?;
+            agent.ready().await?;
+            let registry = self.registry_for_resource_environment(reads, environment, cwd.as_path()).await?;
+            let pool = registry.terminal_pools.get(&session.spec.pool).map(|(_, pool)| pool.clone()).ok_or("terminal pool unavailable")?;
+            let endpoint = checked_cleat_endpoint(pool.as_ref(), session, seat).await?;
+            let guest = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
+            let socket = agent.forward_socket(&guest).await?;
+            Ok::<_, String>(cleat_socket_attach_plan(&socket, &endpoint.session, seat))
         }
-        let attach_args = self.terminal_pool_attach_args(reads, session, environment, &cwd, seat).await?;
-        Ok(ResolvedAttachPlan(vec![ResolvedAttachAction::Command(attach_args)]))
+        .await;
+        let resident_error = match resident {
+            Ok(plan) => return Ok(plan),
+            Err(error) => error,
+        };
+        let terminal = async {
+            let route = handle.terminal_route().ok_or("provider offers no authorized terminal route")?;
+            // This capability supplies terminal-only access. It must not replace
+            // the agent runner or mark the resident agent healthy.
+            let bag = self.environment_manager.environment_bag(handle.id()).ok_or("terminal environment unavailable")?;
+            let client = bag.find_binary("cleat").map(|binary| binary.as_path()).unwrap_or(Path::new("cleat"));
+            let pool = flotilla_terminal::cleat::CleatTerminalPool::new(route.terminal_runner(), client.to_string_lossy(), &bag);
+            let endpoint = checked_cleat_endpoint(&pool, session, seat).await?;
+            route.attach_plan(&endpoint, client, seat)
+        }
+        .await;
+        terminal.map_err(|error| {
+            format!("resident vessel agent route unavailable: {resident_error}; provider terminal route unavailable: {error}")
+        })
     }
 
     async fn terminal_pool_attach_args(
@@ -1491,14 +1501,27 @@ mod tests {
     // Normal attach must preserve its selected live Cleat generation after readoption.
     #[tokio::test]
     async fn adopted_pre_agent_terminal_remains_attachable() {
-        adopted_terminal_contract(None).await;
+        adopted_terminal_contract(None, ContractProvider::Docker).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires an installed Cleat with controller-seat support and a real PTY"]
     async fn adopted_terminal_preserves_real_cleat_process() {
-        adopted_terminal_contract(Some(Arc::new(RealTerminal::new()))).await;
+        adopted_terminal_contract(Some(Arc::new(RealTerminal::new())), ContractProvider::Docker).await;
+    }
+
+    // A provider with neither a Docker spec nor a runtime container name must
+    // use the same normal attach contract solely through its explicit capability.
+    #[tokio::test]
+    async fn non_docker_provisioned_terminal_uses_explicit_route() {
+        adopted_terminal_contract(None, ContractProvider::Independent).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum ContractProvider {
+        Docker,
+        Independent,
     }
 
     struct RealTerminal {
@@ -1646,7 +1669,7 @@ finally:
         }
     }
 
-    async fn adopted_terminal_contract(real: Option<Arc<RealTerminal>>) {
+    async fn adopted_terminal_contract(real: Option<Arc<RealTerminal>>, provider_kind: ContractProvider) {
         use flotilla_discovery_api::EnvironmentBag;
         use flotilla_environment::environment::{
             docker::DockerEnvironmentProvider, EnvironmentHandle, EnvironmentProvider, EnvironmentTool, ProviderTerminalRoute,
@@ -1717,6 +1740,71 @@ finally:
             }
         }
 
+        // An independent adapter at the provider seam: no Docker spec, command,
+        // container name or wrapped Docker handle participates in this route.
+        struct Independent {
+            id: EnvironmentId,
+            image: flotilla_protocol::ImageId,
+            runner: Arc<dyn CommandRunner>,
+        }
+        #[async_trait::async_trait]
+        impl ProvisionedEnvironment for Independent {
+            fn id(&self) -> &EnvironmentId {
+                &self.id
+            }
+            fn image(&self) -> &flotilla_protocol::ImageId {
+                &self.image
+            }
+            fn backing_id(&self) -> &str {
+                "backing"
+            }
+            fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
+                flotilla_discovery_testkit::environment::injected_capabilities()
+            }
+            async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+                flotilla_environment::environment::ProviderObservation::new(flotilla_environment::environment::ObservationState::Running)
+            }
+            async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+                Ok(HashMap::new())
+            }
+            fn runner(&self) -> Arc<dyn CommandRunner> {
+                self.runner.clone()
+            }
+            fn fallback_runner(&self) -> Option<Arc<dyn CommandRunner>> {
+                Some(self.runner.clone())
+            }
+            fn terminal_route(&self) -> Option<&dyn ProviderTerminalRoute> {
+                Some(self)
+            }
+            async fn destroy(&self) -> Result<(), String> {
+                panic!("attach must preserve independent backing")
+            }
+        }
+        impl ProviderTerminalRoute for Independent {
+            fn terminal_runner(&self) -> Arc<dyn CommandRunner> {
+                self.runner.clone()
+            }
+            fn attach_plan(
+                &self,
+                endpoint: &flotilla_protocol::result_set::CleatEndpoint,
+                client: &Path,
+                seat: AttachMode,
+            ) -> Result<ResolvedAttachPlan, String> {
+                let socket = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
+                let ResolvedAttachPlan(actions) = cleat_socket_attach_plan(&socket, &endpoint.session, seat);
+                let [ResolvedAttachAction::Command(mut args)] = actions.try_into().expect("one terminal command");
+                args[0] = Arg::Quoted(client.to_string_lossy().into_owned());
+                let mut transport = vec![
+                    Arg::Literal("provider-terminal".into()),
+                    Arg::Literal("connect".into()),
+                    Arg::Literal("--backing".into()),
+                    Arg::Quoted(self.backing_id().into()),
+                ];
+                transport.extend(args);
+                Ok(ResolvedAttachPlan::command(transport))
+            }
+        }
+
         // Fake only the runtime process boundary, including Cleat inventory.
         struct Inventory(Option<Arc<RealTerminal>>, Arc<std::sync::atomic::AtomicBool>);
         #[async_trait::async_trait]
@@ -1761,7 +1849,13 @@ finally:
         let (mut daemon, backend, temp) = attach_fixture().await;
         let host = daemon.local_host_id().unwrap().to_string();
         backend.using::<ResourceHost>("flotilla").create(&test_meta(&host), &HostSpec::default()).await.unwrap();
-        let spec = serde_json::from_value(serde_json::json!({"docker": {"host_ref": host, "image": "base"}})).unwrap();
+        let spec = match provider_kind {
+            ContractProvider::Docker => serde_json::from_value(serde_json::json!({"docker": {"host_ref": host, "image": "base"}})).unwrap(),
+            ContractProvider::Independent => flotilla_resources::EnvironmentSpec {
+                provider_address: Some("account:isolated/provider:independent".parse().expect("provider address")),
+                ..Default::default()
+            },
+        };
         let environments = backend.using::<ResourceEnvironment>("flotilla");
         let environment = environments.create(&test_meta("pre-agent"), &spec).await.unwrap();
         environments
@@ -1800,8 +1894,17 @@ finally:
                 .await;
             }
             let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let provider = DockerEnvironmentProvider::new(Arc::new(Inventory(real.clone(), available.clone())));
-            let handle = provider.list().await.unwrap().pop().unwrap();
+            let runner = Arc::new(Inventory(real.clone(), available.clone()));
+            let provider = match provider_kind {
+                ContractProvider::Docker => Some(DockerEnvironmentProvider::new(runner.clone())),
+                ContractProvider::Independent => None,
+            };
+            let handle: EnvironmentHandle = match &provider {
+                Some(provider) => provider.list().await.unwrap().pop().unwrap(),
+                None => {
+                    Arc::new(Independent { id: EnvironmentId::new("pre-agent"), image: flotilla_protocol::ImageId::new("base"), runner })
+                }
+            };
             assert!(handle.agent().is_none(), "attachment must not bootstrap the resident agent");
             assert!(handle.provisioned_mounts().is_empty());
             let bag = real.as_ref().map(|real| EnvironmentBag::provisioned(real.baseline.clone())).unwrap_or_else(|| {
@@ -1893,7 +1996,14 @@ finally:
             // The same authorization, binding and seat contract applies with a
             // separately unreachable resident and with a healthy preferred route.
             for (resident, permission, expected) in [
-                (Resident(Err("resident unreachable".into())), Permission::Terminal, "docker"),
+                (
+                    Resident(Err("resident unreachable".into())),
+                    Permission::Terminal,
+                    match provider_kind {
+                        ContractProvider::Docker => "docker",
+                        ContractProvider::Independent => "provider-terminal",
+                    },
+                ),
                 (Resident(Ok(())), Permission::Terminal, "/forwarded/socket"),
                 (Resident(Err("resident unreachable".into())), Permission::ShellOnly, "no authorized terminal route"),
             ] {
@@ -1935,7 +2045,14 @@ finally:
             available.store(false, std::sync::atomic::Ordering::SeqCst);
             let error = daemon.attach_resolver().resolve_attach("crew", None, false, AttachMode::Default, None).await.unwrap_err();
             assert!(error.contains("resident vessel agent") && error.contains("provider terminal transport unreachable"), "{error}");
-            assert_eq!(provider.list().await.unwrap().len(), 1, "terminal failure cannot erase healthy provider inventory");
+            if let Some(provider) = provider {
+                assert_eq!(provider.list().await.unwrap().len(), 1, "terminal failure cannot erase healthy provider inventory");
+            } else {
+                assert!(
+                    daemon.environment_manager.managed_environments().iter().any(|(id, _)| id == handle.id()),
+                    "terminal failure retains the independent handle"
+                );
+            }
         }
     }
 
