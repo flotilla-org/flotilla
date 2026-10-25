@@ -2218,9 +2218,11 @@ mkdir -p "$2"
 chmod 700 "$2"
 if [ -d "$1" ] && [ ! -e "$2/.flotilla-home-imported" ]; then
   archive=$(mktemp) || exit 1
-  trap 'rm -f -- "$archive"' EXIT
+  staging=$(mktemp -d) || {{ rm -f -- "$archive"; exit 1; }}
+  trap 'rm -f -- "$archive"; rm -rf -- "$staging"' EXIT
   tar {excludes} -C "$1" -cf "$archive" .
-  tar --skip-old-files -C "$2" -xf "$archive"
+  tar -C "$staging" -xf "$archive"
+  cp -R -P -p -n "$staging/." "$2"
   touch "$2/.flotilla-home-imported"
 fi
 for file in {auth_files}; do
@@ -4889,8 +4891,72 @@ interactions:
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
     }
 
+    // Host runners use the platform's tar. Import must work on GNU/BSD tar,
+    // preserve newer destination files on the first import, and link live auth.
+    #[tokio::test]
+    async fn harness_home_import_preserves_existing_sessions() {
+        use flotilla_provider_runtime::ProcessCommandRunner;
+        struct HostTarRunner(String);
+        // Substitute only the executable at the host process boundary, running
+        // the actual migration against native tar and an optional BSD tar binary.
+        #[async_trait]
+        impl CommandRunner for HostTarRunner {
+            async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+                let script = format!("tar() {{ command {} \"$@\"; }}\n{}", shell_single_quote(&self.0), args[1]);
+                let mut args = args.to_vec();
+                args[1] = &script;
+                ProcessCommandRunner.run_output(cmd, &args, cwd, label).await
+            }
+            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+                let output = self.run_output(cmd, args, cwd, label).await?;
+                if output.success() {
+                    Ok(output.stdout)
+                } else {
+                    Err(output.stderr)
+                }
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+        }
+        // macOS exercises BSD tar natively. Linux can also exercise a real
+        // libarchive binary without mutating the process-wide PATH.
+        for binary in std::iter::once("tar".to_string()).chain(std::env::var("FLOTILLA_TEST_BSDTAR")) {
+            let runner = HostTarRunner(binary);
+            let directory = tempfile::tempdir().unwrap();
+            let paths = CredentialDeliveryPaths::new(directory.path().join("config ' quoted"));
+            for harness in ["codex", "claude"] {
+                let source = paths.credential_dir("login").join(harness);
+                let home = paths.harness_home("login", harness);
+                std::fs::create_dir_all(source.join("crews/coder/sessions")).unwrap();
+                std::fs::write(source.join("crews/coder/sessions/legacy"), "old session").unwrap();
+                for name in HARNESS_AUTH_FILES {
+                    std::fs::write(source.join(name), "live credential").unwrap();
+                    std::fs::write(source.join("crews/coder").join(name), "old crew credential").unwrap();
+                }
+                if harness == "claude" {
+                    std::fs::create_dir_all(home.join("crews/coder/sessions")).unwrap();
+                    std::fs::write(home.join("crews/coder/sessions/legacy"), "new session").unwrap();
+                }
+                let selected = prepare_harness_home(&paths, "login", harness, &runner).await.unwrap();
+                assert_eq!(Path::new(&selected), home);
+                assert_eq!(
+                    std::fs::read_to_string(home.join("crews/coder/sessions/legacy")).unwrap(),
+                    if harness == "claude" { "new session" } else { "old session" }
+                );
+                for name in HARNESS_AUTH_FILES {
+                    assert!(home.join(name).is_symlink(), "login must remain linked to private delivery");
+                    assert!(!home.join("crews/coder").join(name).exists(), "legacy crew auth must not be copied");
+                    std::fs::write(source.join(name), "rotated credential").unwrap();
+                    assert_eq!(std::fs::read_to_string(home.join(name)).unwrap(), "rotated credential");
+                }
+            }
+        }
+    }
+
     // #3797: checkpoints preserve sessions in the homes returned by production
     // credential and crew selection, but contain no delivered material or auth links.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn checkpoint_omits_delivered_credentials_and_keeps_sessions() {
         use crate::agent_material::AgentMaterialRegistry;
