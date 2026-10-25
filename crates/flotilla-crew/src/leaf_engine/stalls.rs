@@ -19,6 +19,145 @@ use super::wake::{ConvoyRead, ReconcilerWake};
 use super::{CrewTurnIntent, LeafWatcher, UnableEvidenceKey};
 use crate::crew_ops::convoy_message_address;
 
+// Observe lifecycle movement rather than refreshes or failed retry attempts.
+const LAUNCH_PROGRESS_BOUND: chrono::Duration = chrono::Duration::minutes(15);
+const LAUNCH_PROGRESS_SOURCE: &str = "launch-progress";
+
+#[derive(Default)]
+pub(super) struct PendingLaunches {
+    convoys: HashMap<(String, String), BTreeMap<String, LaunchProgress>>,
+}
+
+struct LaunchProgress {
+    signature: String,
+    since: DateTime<Utc>,
+}
+
+struct LaunchAttention<'a> {
+    attention: Option<ConvoyAttention>,
+    expected_crew: &'a BTreeMap<String, BTreeMap<String, flotilla_resources::CrewWorkState>>,
+}
+
+impl flotilla_resources::StatusPatch<ConvoyStatus> for LaunchAttention<'_> {
+    fn apply(&self, status: &mut ConvoyStatus) {
+        if status.attention.as_ref().is_some_and(|attention| attention.source != LAUNCH_PROGRESS_SOURCE) {
+            return;
+        }
+        // Recovery may race the diagnostic write; do not re-arm a recovered crew.
+        let pending = status.phase == ConvoyPhase::Active
+            && status.crew_work.values().flat_map(|roles| roles.values()).any(|work| work.phase == CrewWorkPhase::Pending);
+        if self.attention.is_some() && status.crew_work != *self.expected_crew {
+            return;
+        }
+        let next = self.attention.clone().filter(|_| pending);
+        if status.attention.as_ref().map(|attention| &attention.reason) != next.as_ref().map(|attention| &attention.reason) {
+            status.attention = next;
+        }
+    }
+
+    fn requires_write(&self, before: &ConvoyStatus, after: &ConvoyStatus) -> bool {
+        before.attention != after.attention
+    }
+}
+
+impl ReconcilerWake {
+    async fn observe_launch_progress(
+        &self,
+        convoy: &ResourceObject<Convoy>,
+        vessels: &BTreeMap<String, ResourceObject<flotilla_resources::Vessel>>,
+        sessions: &BTreeMap<String, ResourceObject<TerminalSession>>,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let Some(status) = &convoy.status else { return Ok(()) };
+        let mut pending = self.subscriptions.inner.pending_launches.lock().await;
+        let stages = pending.convoys.entry((convoy.metadata.namespace.clone(), convoy.metadata.name.clone())).or_default();
+        let mut active = HashSet::new();
+        let mut diagnostics = Vec::new();
+        if status.phase == ConvoyPhase::Active {
+            for (vessel, roles) in &status.crew_work {
+                if !status.work.get(vessel).is_some_and(|work| matches!(work.phase, WorkPhase::Launching | WorkPhase::Running)) {
+                    continue;
+                }
+                for (role, work) in roles.iter().filter(|(_, work)| work.phase == CrewWorkPhase::Pending) {
+                    let key = format!("{role}@{vessel}");
+                    let vessel_record = vessels.values().find(|item| item.spec.vessel_name == *vessel);
+                    let vessel_status = vessel_record.and_then(|item| item.status.as_ref());
+                    let session =
+                        sessions.values().find(|item| item.spec.role == *role && item.metadata.labels.get(VESSEL_LABEL) == Some(vessel));
+                    // Latent agents await handoff, not launch. Only eager or explicitly
+                    // assigned roles (or an existing launch) have launch work to diagnose.
+                    let eager = status
+                        .workflow_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.vessels.iter().find(|item| item.name == *vessel))
+                        .is_some_and(|requirement| {
+                            requirement
+                                .crew
+                                .iter()
+                                .enumerate()
+                                .any(|(index, member)| member.role == *role && requirement.starts_eagerly(index))
+                        });
+                    if session.is_none() && !eager && !work.task_assigned {
+                        continue;
+                    }
+                    active.insert(key.clone());
+                    let session_status = session.and_then(|item| item.status.as_ref());
+                    let signature = format!(
+                        "{:?}/{:?}/{:?}/{:?}/{:?}",
+                        vessel_status.map(|status| (status.phase, &status.environment_ref, &status.checkout_refs)),
+                        vessel_status.and_then(|status| status.ready_at),
+                        session.map(|item| item.metadata.creation_timestamp),
+                        session_status.map(|status| status.phase),
+                        session_status.and_then(|status| status.started_at)
+                    );
+                    let began = work.started_at.or(status.started_at).unwrap_or(convoy.metadata.creation_timestamp);
+                    let anchor = [
+                        vessel_status.and_then(|status| status.started_at),
+                        vessel_status.and_then(|status| status.ready_at),
+                        session.map(|item| item.metadata.creation_timestamp),
+                        session_status.and_then(|status| status.started_at),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .fold(began, std::cmp::max);
+                    let stage = stages.entry(key.clone()).or_insert_with(|| LaunchProgress { signature: signature.clone(), since: anchor });
+                    if stage.signature != signature {
+                        *stage = LaunchProgress { signature, since: now.max(anchor) };
+                    }
+                    if now.signed_duration_since(stage.since) >= LAUNCH_PROGRESS_BOUND {
+                        diagnostics.push(format!(
+                            "launch progress stalled for {key}: Pending since {began}; no lifecycle progress since {}; vessel {:?}, session {:?}; retry evidence {:?}; inspect the launcher and retry or resume the crew after repair",
+                            stage.since, vessel_status.map(|status| status.phase), session_status.map(|status| status.phase),
+                            (vessel_status.and_then(|status| status.credential_delivery_retry.as_ref()), session_status.and_then(|status| status.degraded.as_ref()))
+                        ));
+                    }
+                }
+            }
+        }
+        stages.retain(|key, _| active.contains(key));
+        drop(pending);
+        let attention = (!diagnostics.is_empty()).then(|| ConvoyAttention {
+            source: LAUNCH_PROGRESS_SOURCE.into(),
+            reason: diagnostics.join("\n"),
+            raised_at: now,
+        });
+        if status.attention.as_ref().is_some_and(|attention| attention.source != LAUNCH_PROGRESS_SOURCE)
+            || status.attention.as_ref().map(|attention| &attention.reason) == attention.as_ref().map(|attention| &attention.reason)
+        {
+            return Ok(());
+        }
+        flotilla_store::apply_status_patch_checked(
+            &self.subscriptions.inner.backend.using::<Convoy>(&convoy.metadata.namespace),
+            &convoy.metadata.name,
+            &LaunchAttention { attention, expected_crew: &status.crew_work },
+            |_| Ok(()),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
 pub(crate) fn crew_role_address(project: &str, convoy: &str, vessel: &str, role: &str) -> String {
     format!("{project}/{convoy}/{vessel}/{role}")
 }
@@ -322,6 +461,13 @@ impl ReconcilerWake {
             .collect::<HashMap<_, _>>();
         // The handle is shared with the loop; one lookup per tick is enough.
         let controller_queue = self.subscriptions.inner.controller_queues.lock().await.get(namespace).cloned();
+        self.subscriptions
+            .inner
+            .pending_launches
+            .lock()
+            .await
+            .convoys
+            .retain(|(ns, name), _| ns != namespace || convoys.contains_key(name));
         for convoy in convoys.values().map(ConvoyRead::convoy) {
             // Rows belong to the caller's convoy revision. A judge tick can win
             // the select before its convoy-watch wake; do not publish a new
@@ -344,6 +490,7 @@ impl ReconcilerWake {
             self.observe_queued_turns_from_messages(namespace, convoy, &selected_sessions, messages, now).await?;
             let selected_vessels = select_convoy_children(convoy, vessels);
             let selected_checkouts = select_convoy_children(convoy, checkouts);
+            self.observe_launch_progress(convoy, &selected_vessels, &selected_sessions, now).await?;
             let mut obligations = status.nudge_obligations.clone();
             let holding = matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing);
             if holding {
