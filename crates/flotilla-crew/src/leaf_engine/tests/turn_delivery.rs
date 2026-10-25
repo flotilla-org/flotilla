@@ -1236,16 +1236,16 @@ async fn fire_turn_row(wake: &ReconcilerWake, row: &LeafSubscriptionRow) {
 
 // #3565 (PR #3557): a crew pushing review fixes is making progress. Four
 // rounds, each a new head with a review and settled checks, all reach the
-// crew past the episode limit, including the round whose checks went green.
+// crew past the episode limit. A fail-to-pass rerun at the last head must
+// deliver green once, while duplicate outcomes stay deduplicated.
 #[tokio::test]
 async fn four_review_rounds_deliver_the_green_checks_on_the_last_round() {
     let (backend, wake, actuator, name) = review_rounds_fixture().await;
     let records = backend.using::<ChangeRequest>("flotilla");
     let checks = turn_row(&wake, "checks-settled").await;
     let review = turn_row(&wake, "actionable-review").await;
-    let heads = ["ae5be374", "51844bae", "765a01ce", "a2bc4085"];
-    for (round, head) in heads.into_iter().enumerate() {
-        let green = round == heads.len() - 1;
+    let rounds = [("ae5be374", false), ("51844bae", false), ("765a01ce", false), ("a2bc4085", false), ("a2bc4085", true)];
+    for (head, green) in rounds {
         let current = records.get(&name).await.expect("record");
         let observed_at = Utc::now();
         let observed = flotilla_resources::ChangeRequestStatus {
@@ -1273,19 +1273,21 @@ async fn four_review_rounds_deliver_the_green_checks_on_the_last_round() {
         sources,
         [
             ("actionable-review", "ae5be374"),
-            ("checks-settled", "ae5be374"),
+            ("checks-settled", "ae5be374@fail"),
             ("actionable-review", "51844bae"),
-            ("checks-settled", "51844bae"),
+            ("checks-settled", "51844bae@fail"),
             ("actionable-review", "765a01ce"),
-            ("checks-settled", "765a01ce"),
-            ("checks-settled", "a2bc4085"),
+            ("checks-settled", "765a01ce@fail"),
+            ("actionable-review", "a2bc4085"),
+            ("checks-settled", "a2bc4085@fail"),
+            ("checks-settled", "a2bc4085@pass"),
         ]
     );
     let last = &requests.last().expect("green turn").brief;
     assert!(last.contains("- Head SHA: `a2bc4085`") && last.contains("- Checks: pass"), "{last}");
     assert_eq!(actuator.holds.load(Ordering::SeqCst), 0);
     let status = backend.using::<Convoy>("flotilla").get("rounds").await.expect("convoy").status.expect("status");
-    assert_eq!(status.turn_deliveries["checks-settled"].episodes.len(), 4);
+    assert_eq!(status.turn_deliveries["checks-settled"].episodes.len(), 5);
     assert!(status.turn_delivery_holds().is_empty());
     assert!(status.attention.is_none());
 }

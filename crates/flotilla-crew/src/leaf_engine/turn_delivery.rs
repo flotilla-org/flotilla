@@ -367,7 +367,17 @@ impl LeafSubscriptionTable {
                 }
                 // Merge is one terminal episode for the subject, independent of
                 // later head observations (including a previously unknown head).
-                let revision = if merged_settlement { format!("{}@merged", leaf.address) } else { head_sha };
+                let revision = if merged_settlement {
+                    format!("{}@merged", leaf.address)
+                } else if leaf.field_path == ".checks" {
+                    match cr.checks.value {
+                        Some(ObservedChecks::Pass) => format!("{head_sha}@pass"),
+                        Some(ObservedChecks::Fail) => format!("{head_sha}@fail"),
+                        _ => return Ok(()),
+                    }
+                } else {
+                    head_sha
+                };
                 let subject = cr.head_sha.value.as_ref().map_or_else(
                     || flotilla_resources::MessageReference::ControlRecord {
                         resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "ChangeRequest", &namespace, &record_name),
