@@ -13,22 +13,39 @@ use flotilla_resources::*;
 use flotilla_store::*;
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Contention {
+    Once,
+    Persistent,
+}
+
 #[derive(Debug)]
 pub(crate) struct RacingStore {
     pub inner: Arc<dyn Store>,
     pub armed: Arc<AtomicBool>,
     pub observed: ResourceBackend,
+    pub contention: Contention,
 }
 #[async_trait]
 impl Store for RacingStore {
     fn with_local_root(&self, root: NodeId) -> Arc<dyn Store> {
-        Arc::new(Self { inner: self.inner.with_local_root(root), armed: Arc::clone(&self.armed), observed: self.observed.clone() })
+        Arc::new(Self {
+            inner: self.inner.with_local_root(root),
+            armed: Arc::clone(&self.armed),
+            observed: self.observed.clone(),
+            contention: self.contention,
+        })
     }
     fn local_root(&self) -> Result<NodeId, ResourceError> {
         self.inner.local_root()
     }
     fn with_read_observer(&self, observer: Arc<dyn ReadObserver>) -> Arc<dyn Store> {
-        Arc::new(Self { inner: self.inner.with_read_observer(observer), armed: Arc::clone(&self.armed), observed: self.observed.clone() })
+        Arc::new(Self {
+            inner: self.inner.with_read_observer(observer),
+            armed: Arc::clone(&self.armed),
+            observed: self.observed.clone(),
+            contention: self.contention,
+        })
     }
     fn read_observer(&self) -> Option<&dyn ReadObserver> {
         self.inner.read_observer()
@@ -139,6 +156,13 @@ impl Store for RacingStore {
             let prepared = reconciler.prepare(&repository).await?;
             let outcome = reconciler.reconcile(&repository, &prepared, chrono::Utc::now());
             apply_status_patch(&repositories, &meta.name, &outcome.patch.expect("repository status patch")).await?;
+        }
+        // Persistent refusal models a storage writer winning every spec CAS.
+        if resource_kind.paths.kind == "Repository"
+            && meta.annotations.contains_key(flotilla_charter::project_declaration::BOOTSTRAP_COMMIT_ANNOTATION)
+            && matches!(self.contention, Contention::Persistent)
+        {
+            return Err(ResourceError::conflict(&meta.name, "stale resourceVersion"));
         }
         self.inner.update_raw(resource_kind, namespace, meta, resource_version, spec).await
     }
