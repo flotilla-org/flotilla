@@ -515,6 +515,7 @@ impl DockerEnvironmentProviderInner {
         }
     }
 
+    #[cfg(unix)]
     async fn verify_image_platform(&self, image: &str) -> Result<(), String> {
         let platform = self
             .runner
