@@ -426,6 +426,7 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
     migrate_live_placement_policies(&backend, namespace, &profile.host_id, std::env::consts::OS).await?;
     let mut conditions = runtime_health.conditions().await;
     conditions.extend(daemon.project_image_layer_conditions().await);
+    conditions.extend(daemon.observation_credential_conditions().await);
     if let Some(error) = disk_probe_error {
         conditions.push(
             HostCondition::builder()

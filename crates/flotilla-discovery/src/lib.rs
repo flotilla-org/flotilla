@@ -28,6 +28,7 @@ pub mod detectors;
 pub mod environment_manager;
 pub mod environments;
 pub mod factories;
+pub mod observation_credentials;
 pub mod registry;
 
 use std::{
@@ -140,6 +141,8 @@ impl FactoryRegistry {
 #[derive(bon::Builder)]
 pub struct DiscoveryRuntime {
     pub runner: Arc<dyn CommandRunner>,
+    #[builder(default)]
+    pub observation_credentials: observation_credentials::ObservationCredentials,
     pub env: Arc<dyn EnvVars>,
     /// Host free-space measurement for admission; injected like the runner.
     pub available_space_probe: Arc<dyn AvailableSpaceProbe>,
@@ -311,6 +314,7 @@ impl DiscoveryRuntime {
     pub fn for_process() -> Self {
         Self {
             runner: Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
+            observation_credentials: Default::default(),
             env: Arc::new(ProcessEnvVars),
             available_space_probe: system_available_space_probe(),
             admission_probe: Default::default(),

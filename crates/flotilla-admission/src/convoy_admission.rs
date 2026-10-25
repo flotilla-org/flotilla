@@ -1933,6 +1933,9 @@ impl AdmissionReadContext<'_> {
                 .ok()
             })
             .filter_map(|remote| remote.split_once("://").and_then(|(_, rest)| rest.split('/').next()).map(str::to_ascii_lowercase))
+            .chain(project.spec.issue_source_bindings.iter().filter_map(|binding| {
+                binding.source.service.split_once("://").and_then(|(_, rest)| rest.split('/').next()).map(str::to_ascii_lowercase)
+            }))
             .collect();
         let forges = backend
             .definitions::<Forge>(namespace)
@@ -3238,6 +3241,33 @@ impl AdmissionReadContext<'_> {
             repositories_snapshot.retain(|repository| selected.contains(&repository.repo_ref));
             if repositories_snapshot.is_empty() {
                 return Err("standing convoy must select at least one project repository".to_string());
+            }
+        }
+        let forges = self.backend.definitions::<Forge>(namespace).list().await.map_err(|error| error.to_string())?;
+        let forges = forges.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
+        let repositories = self
+            .backend
+            .query_declared::<Repository>(
+                namespace,
+                &flotilla_store::StoreQuery::names(repositories_snapshot.iter().map(|repository| repository.repo_ref.to_string()), true),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut services = flotilla_discovery::observation_credentials::ObservationCredentials::repository_services(
+            repositories.items.iter().map(|repository| &repository.object.spec),
+            &forges,
+        )?;
+        if let IssueSourceResolution::Available { bindings } =
+            resolve_project_issue_sources(&self.backend.including_replicas::<Repository>(namespace), &project.spec).await
+        {
+            services.extend(bindings.into_iter().map(|binding| binding.source.service));
+        }
+        let overrides = self.runtime.config.load_daemon_config()?.forge_overrides;
+        for service in services {
+            if !overrides.contains_key(service.trim_end_matches('/'))
+                && flotilla_discovery::observation_credentials::ObservationCredentials::github_service(&service, &forges)
+            {
+                self.runtime.discovery.observation_credentials.require(self.runtime.discovery.runner.as_ref(), &service).await?;
             }
         }
         let mut normalized_intent = intent.clone();
@@ -5628,6 +5658,73 @@ mod tests {
             let reads = counted.read_snapshot().since(&before);
             assert!(reads.is_empty(), "capacity validation must not reread the native store\n{reads}");
         }
+    }
+
+    // A public, grant-free GitHub project must be refused before creating work
+    // when its controller has no observation credential.
+    #[tokio::test(start_paused = true)]
+    async fn github_observation_credential_gates_grant_free_admission() {
+        let mut fixture = handler_contract_fixture().await;
+        let runner = flotilla_discovery_testkit::DiscoveryMockRunner::builder()
+            .on_run("gh", &["auth", "status", "--hostname", "github.com"], Err("please run gh auth login; secret diagnostic".into()))
+            .on_run("gh", &["auth", "status", "--hostname", "github.com"], Ok("authenticated".into()))
+            .build();
+        Arc::get_mut(&mut fixture.owner.discovery).expect("fixture discovery").runner = Arc::new(runner);
+        Arc::get_mut(&mut fixture.owner.discovery).expect("fixture discovery").observation_credentials = Default::default();
+        let repository = flotilla_resources::RepositorySpec::remote("https://github.com/example/public").expect("repository");
+        let key = repository.key();
+        fixture
+            .backend
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name(key.to_string()).build(), &repository)
+            .await
+            .expect("repository");
+        let workflow = WorkflowTemplateSpec::builder()
+            .vessels(vec![VesselRequirement::builder()
+                .name("work".into())
+                .crew(vec![CrewSpec::builder().role("tool".into()).source(CrewSource::Tool { command: "true".into() }).build()])
+                .build()])
+            .build();
+        fixture
+            .backend
+            .definitions::<WorkflowTemplate>("flotilla")
+            .create(&InputMeta::builder().name("work".into()).build(), &workflow)
+            .await
+            .expect("workflow");
+        fixture
+            .backend
+            .definitions::<Project>("flotilla")
+            .create(
+                &InputMeta::builder().name("public".into()).build(),
+                &ProjectSpec::builder()
+                    .display_name("Public".into())
+                    .default_workflow_ref("work".into())
+                    .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder()
+                        .repo(key)
+                        .default_branch("main".into())
+                        .build()])
+                    .build(),
+            )
+            .await
+            .expect("project");
+        let intent = flotilla_protocol::ConvoyStartIntent::builder()
+            .project_ref("public".into())
+            .name("public-work".into())
+            .branch("public-work".into())
+            .build();
+        let result = fixture.owner.prepare_convoy_admission("flotilla", &intent, &PrincipalRef::implicit_for_namespace("flotilla")).await;
+        let error = result.err().expect("missing controller credential must refuse admission");
+        assert!(error.contains("GitHub observation credential"), "{error}");
+        assert!(error.contains("https://github.com"), "{error}");
+        assert!(!error.contains("secret diagnostic"), "subprocess diagnostics must not leak");
+        assert!(fixture.backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items.is_empty());
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        assert!(fixture
+            .owner
+            .prepare_convoy_admission("flotilla", &intent, &PrincipalRef::implicit_for_namespace("flotilla"))
+            .await
+            .is_ok());
+        assert!(fixture.owner.discovery.observation_credentials.failures().is_empty());
     }
 
     // Admission prepares multiple vessels from one selected inventory per kind;

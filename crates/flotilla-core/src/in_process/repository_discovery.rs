@@ -14,6 +14,7 @@ pub(super) async fn discover_repository_change_request_with(
 ) -> Result<Arc<dyn ChangeRequestTracker>, String> {
     let identity = repository.forge().ok_or("no forge identity")?;
     let bag = repository_provider_bag(resource_backend, config, environment_manager, local_environment_id, namespace, repository).await?;
+    discovery.observation_credentials.require_for_bag(discovery.runner.as_ref(), &bag).await?;
     let probe_root = ExecutionEnvironmentPath::new(config.base_path().as_ref());
     let mut unmet = Vec::new();
     for factory in &discovery.factories.change_requests {

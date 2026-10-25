@@ -480,3 +480,84 @@ async fn project_issue_binding_uses_source_forge_instead_of_mirror_transport() {
     );
     assert!(daemon.list_repos().await.expect("presentation rows").is_empty());
 }
+
+// A missing controller credential is visible on its Host and only affected
+// convoy explanations; repairing it clears the diagnosis without restart.
+#[tokio::test(start_paused = true)]
+async fn github_observation_credential_failure_is_visible_and_recovers() {
+    use crate::testkits::discovery::{fake_discovery_with_provider_set, DiscoveryMockRunner, FakeDiscoveryProviders};
+    use flotilla_resources::ConvoyRepositorySpec;
+    let temp = tempfile::tempdir().expect("config");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"credential-visibility\"\n").expect("config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("gh", &["auth", "status", "--hostname", "github.com"], Err("secret diagnostic".into()))
+        .on_run("gh", &["auth", "status", "--hostname", "github.com"], Ok("authenticated".into()))
+        .build();
+    let mut discovery =
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::default().with_issue_tracker(Arc::new(FakeIssueProvider::new())));
+    discovery.runner = Arc::new(runner);
+    discovery.observation_credentials = Default::default();
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::new("test-host"),
+        Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let backend = daemon.resource_backend();
+    let forge = flotilla_resources::ForgeSpec::builder()
+        .forge_id("github".into())
+        .kind(flotilla_resources::ForgeKind::Github)
+        .https_url("https://github.com".into())
+        .hosts(BTreeSet::from(["github.com".into()]))
+        .git_ssh_host("github.com".into())
+        .build();
+    backend.definitions::<Forge>("flotilla").create(&InputMeta::builder().name("github".into()).build(), &forge).await.expect("forge");
+    let repository = RepositorySpec::remote("https://github.com/example/public")
+        .expect("repository")
+        .on_forge(&forge)
+        .expect("forge identity")
+        .with_declared_remotes(["https://mirror.example/example/public"])
+        .expect("mirror transport");
+    let key = repository.key();
+    backend
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(key.to_string()).build(), &repository)
+        .await
+        .expect("repository");
+    let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "example/public".into() };
+    let (first, second) = tokio::join!(daemon.issue_provider_for_source(&source), daemon.issue_provider_for_source(&source));
+    let error = first.err().expect("missing credential");
+    assert_eq!(second.err().expect("coalesced credential failure"), error);
+    assert!(error.contains("GitHub observation credential") && !error.contains("secret diagnostic"), "{error}");
+    let conditions = daemon.observation_credential_conditions().await;
+    assert_eq!(conditions.len(), 1);
+    assert_eq!(conditions[0].message, error);
+    assert!(!conditions[0].blocks_readiness() && !conditions[0].blocks_forge_observation());
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let spec = ConvoySpec::builder()
+        .workflow_ref("work".into())
+        .repositories(vec![ConvoyRepositorySpec::builder()
+            .repo_ref(key)
+            .url("https://github.com/example/public".into())
+            .source_ref("main".into())
+            .target_ref("main".into())
+            .workspace_slug("public".into())
+            .subpaths(Vec::new())
+            .build()])
+        .build();
+    convoys.create(&InputMeta::builder().name("affected".into()).build(), &spec).await.expect("convoy");
+    convoys
+        .create(&InputMeta::builder().name("unrelated".into()).build(), &ConvoySpec::builder().workflow_ref("work".into()).build())
+        .await
+        .expect("unrelated convoy");
+    assert!(daemon.explain_convoy_internal(Some("flotilla"), "affected").await.expect("explain").warnings.contains(&error));
+    assert!(daemon.explain_convoy_internal(Some("flotilla"), "unrelated").await.expect("explain").warnings.is_empty());
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert_eq!(daemon.observation_credential_conditions().await[0].message, error);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(daemon.observation_credential_conditions().await.is_empty());
+    assert!(daemon.issue_provider_for_source(&source).await.is_ok());
+    assert!(daemon.explain_convoy_internal(Some("flotilla"), "affected").await.expect("repaired").warnings.is_empty());
+}
