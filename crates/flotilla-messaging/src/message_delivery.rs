@@ -14,7 +14,7 @@ use crate::{
     apply_status_patch,
     delivery_hold::{
         delivery_acceptance_evidence, delivery_demand, delivery_demand_name, delivery_retry_backoff, delivery_retry_exhausted,
-        DELIVERY_HOLD_FOR, DELIVERY_HOLD_REASON_ANNOTATION, DELIVERY_MAX_ATTEMPTS,
+        CONTROLLER_FENCE_RECHECK_FOR, DELIVERY_HOLD_FOR, DELIVERY_HOLD_REASON_ANNOTATION, DELIVERY_MAX_ATTEMPTS,
     },
     message_expectation_open, message_supersedes,
     role_routing::topic_receiver_addresses,
@@ -56,6 +56,7 @@ pub fn delivery_target(holder: &ResourceObject<TerminalSession>) -> DeliveryTarg
 /// The durable submission as the transport router sees it.
 pub fn submission_ref(submission: &MessageSubmission) -> SubmissionRef {
     SubmissionRef {
+        operator_reason: submission.operator_reason.clone(),
         batch_id: submission.batch_id.clone(),
         crew_id: submission.crew_id.clone(),
         session: submission.session.clone(),
@@ -77,6 +78,13 @@ impl MessageInbox {
                 let submission = status.and_then(|status| status.submission.as_ref());
                 [
                     message.spec.deadline.filter(|deadline| *deadline > now),
+                    status
+                        .filter(|status| {
+                            status.submission.is_none() && status.fence_recheck_at.is_some() && HeldMessageBatch::is_held(message)
+                        })
+                        .map(|status| {
+                            status.fence_recheck_at.unwrap_or(now + CONTROLLER_FENCE_RECHECK_FOR).max(now + CONTROLLER_FENCE_RECHECK_FOR)
+                        }),
                     status.and_then(|status| status.retry.as_ref()).and_then(|retry| retry.next_attempt_at()).filter(|due| *due > now),
                     submission
                         .map(|submission| submission.started_at + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR)
@@ -113,7 +121,7 @@ impl MessageInbox {
         }
         let mut messages = self.messages.query(&MessageQuery::active()).await?;
         if messages.is_empty() {
-            self.cleanup_delivery_gates(None, now).await?;
+            self.cleanup_delivery_gates(None).await?;
             tokio::time::timeout(TRANSPORT_CALL_BOUND, router.release_closed()).await.ok();
             return Ok(());
         }
@@ -267,8 +275,49 @@ impl MessageInbox {
         for (_, (holder, pending)) in groups {
             self.deliver_group(receivers, router, &holder, &pending, &messages, now).await?;
         }
-        self.cleanup_delivery_gates(Some(receivers), now).await?;
+        self.cleanup_delivery_gates(Some(receivers)).await?;
         tokio::time::timeout(TRANSPORT_CALL_BOUND, router.release_closed()).await.ok();
+        Ok(())
+    }
+
+    /// Authorize exactly one additional attempt, retaining the old uncertain write.
+    /// The command never restarts a child or treats authorization as acceptance.
+    pub async fn deliver_held_batch(&self, name: &str, reason: &str) -> Result<(), ResourceError> {
+        if reason.trim().is_empty() {
+            return Err(ResourceError::invalid("operator delivery requires a reason"));
+        }
+        let _delivery = self.delivery.lock().await;
+        let _admission = self.admission.lock().await;
+        let message = self.messages.get(name).await?;
+        if !HeldMessageBatch::is_held(&message) && !message.status.as_ref().is_some_and(|status| status.operator_delivery.is_some()) {
+            return Err(ResourceError::invalid("Message batch is not held"));
+        }
+        let snapshot = self.load_delivery_receivers(std::slice::from_ref(&message)).await?;
+        let holder = self.resolve_receiver(&snapshot, &message).await?.ok_or_else(|| ResourceError::invalid("receiver is unavailable"))?;
+        if !matches!(holder.provenance, ResourceProvenance::Local) {
+            return Err(ResourceError::invalid("operator delivery must run on the receiver host"));
+        }
+        let target = delivery_target(&holder.object);
+        let request = crate::OperatorMessageDelivery {
+            reason: reason.into(),
+            session: target.session.ok_or_else(|| ResourceError::invalid("receiver session is unavailable"))?,
+            crew_id: target.crew_id.ok_or_else(|| ResourceError::invalid("receiver crew is unavailable"))?,
+        };
+        let status = status_for(&message);
+        let members =
+            status.submission.as_ref().map(|submission| submission.members.clone()).unwrap_or_else(|| status.failed_batch_members.clone());
+        let members = if members.is_empty() { vec![name.into()] } else { members };
+        // Persist the request on each member. Any partial write leaves the batch
+        // held: the delivery pass requires matching authorization on all members.
+        for name in members {
+            let current = self.messages.get(&name).await?;
+            if !HeldMessageBatch::is_held(&current) && !current.status.as_ref().is_some_and(|status| status.operator_delivery.is_some()) {
+                return Err(ResourceError::invalid("held batch changed during operator authorization"));
+            }
+            let mut status = status_for(&current);
+            status.operator_delivery = Some(request.clone());
+            self.write(&current, &status).await?;
+        }
         Ok(())
     }
 
@@ -297,6 +346,7 @@ impl MessageInbox {
             }
         });
         let members = if members.is_empty() { vec![name.to_string()] } else { members };
+        let held_message_id = members.first().cloned().unwrap_or_else(|| name.into());
         for member in members {
             apply_status_patch(
                 &self.messages,
@@ -310,6 +360,14 @@ impl MessageInbox {
             .await?;
         }
         let snapshot = self.load_delivery_receivers(std::slice::from_ref(&message)).await?;
+        if let Some(holder) = self.resolve_receiver(&snapshot, &message).await? {
+            apply_status_patch(
+                &self.backend.using::<TerminalSession>(&self.namespace),
+                &holder.object.metadata.name,
+                &crate::TerminalSessionStatusPatch::ClearMessageDeliveryHold { message_id: held_message_id },
+            )
+            .await?;
+        }
         self.clear_signal(&snapshot, &message).await
     }
 
@@ -477,9 +535,36 @@ impl MessageInbox {
         now: DateTime<Utc>,
     ) -> Result<(), ResourceError> {
         tracing::info!("message delivery attempt");
-        let pending = &self.supersede_held_system_turns(receivers, pending, all, now).await?;
+        let remaining = self.supersede_held_system_turns(receivers, pending, all, now).await?;
+        // Authorization belongs to one FIFO batch, never to newly queued text.
+        let authorization =
+            remaining.first().and_then(|message| message.status.as_ref()).and_then(|status| status.operator_delivery.as_ref());
+        let pending = &remaining
+            .iter()
+            .take_while(|message| message.status.as_ref().and_then(|status| status.operator_delivery.as_ref()) == authorization)
+            .cloned()
+            .collect::<Vec<_>>();
         if pending.is_empty() {
             return Ok(());
+        }
+        // Authorization cannot migrate to another activation, including after
+        // its old submission was archived while waiting for readiness.
+        if let Some(request) = authorization {
+            let target = delivery_target(holder);
+            if target.session.as_ref() != Some(&request.session) || target.crew_id.as_ref() != Some(&request.crew_id) {
+                for message in pending {
+                    let mut status = status_for(message);
+                    status.operator_delivery = None;
+                    status.fence_recheck_at = None;
+                    let reason = "delivery held: operator authorization belongs to a previous receiver activation; inspect the current conversation before authorizing again";
+                    status.retry = Some(ControllerRetry::terminal(status.retry.as_ref(), now, reason));
+                    MessageStatusPatch::Wait { phase: MessagePhase::Deliverable, reason: reason.into(), at: now }.apply(&mut status);
+                    self.write(message, &status).await?;
+                }
+                let first = self.messages.get(&pending[0].metadata.name).await?;
+                self.signal(receivers, &first, now).await?;
+                return Ok(());
+            }
         }
         // The session marker is persisted before the batch members. Repair a
         // partially written refusal before observing Working/receipt evidence:
@@ -503,10 +588,58 @@ impl MessageInbox {
                             .ok_or_else(|| ResourceError::invalid(format!("rejected message batch member `{name}` is absent")))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                if members.iter().any(|member| member.status.as_ref().is_some_and(|status| status.submission.is_some())) {
+                if members.iter().any(|member| {
+                    member
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.submission.as_ref())
+                        .is_some_and(|submission| submission.started_at <= condition.observed_at)
+                }) {
                     self.controller_fence_unverifiable(receivers, &members, &condition.message, now).await?;
                     return Ok(());
                 }
+            }
+        }
+        if let Some(request) = pending
+            .iter()
+            .filter(|message| HeldMessageBatch::is_held(message))
+            .find_map(|message| message.status.as_ref().and_then(|status| status.operator_delivery.clone()))
+        {
+            let authorized: Vec<_> = pending
+                .iter()
+                .filter(|message| message.status.as_ref().and_then(|status| status.operator_delivery.as_ref()) == Some(&request))
+                .cloned()
+                .collect();
+            let batch = HeldMessageBatch::collect(&authorized);
+            if batch
+                .first()
+                .is_some_and(|batch| batch.members.iter().all(|name| authorized.iter().any(|message| message.metadata.name == *name)))
+            {
+                let target = delivery_target(holder);
+                if target.session.as_ref() == Some(&request.session) && target.crew_id.as_ref() == Some(&request.crew_id) {
+                    for message in &authorized {
+                        let mut status = status_for(message);
+                        if let Some(previous) = status.submission.take() {
+                            status.delivery_history.push(previous);
+                        }
+                        status.retry = None;
+                        self.write(message, &status).await?;
+                    }
+                    // Reload to keep the authorization and pre-write intent together.
+                    let mut refreshed = Vec::new();
+                    for message in pending {
+                        refreshed.push(self.messages.get(&message.metadata.name).await?);
+                    }
+                    return Box::pin(self.deliver_group_traced(receivers, router, holder, &refreshed, all, now)).await;
+                }
+            } else {
+                // A command interrupted between member writes authorizes no
+                // subset of the original batch. Wait for an explicit repair,
+                // retaining attention even after the terminal marker was lost.
+                if let Some(held) = pending.iter().find(|message| HeldMessageBatch::is_held(message)) {
+                    self.signal(receivers, held, now).await?;
+                }
+                return Ok(());
             }
         }
         let existing = pending.iter().find_map(|message| message.status.as_ref().and_then(|status| status.submission.clone()));
@@ -520,6 +653,34 @@ impl MessageInbox {
                 self.wait(message, MessagePhase::Deliverable, "waiting for holder terminal startup", now).await?;
             }
             return Ok(());
+        }
+        if existing.is_none() {
+            // Preserve FIFO after a definitely-unsent batch exhausts its budget.
+            // A later message must not silently bypass the operator's held intent.
+            if let Some(held) = pending.iter().find(|message| {
+                message
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.retry.as_ref())
+                    .is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }))
+            }) {
+                self.signal(receivers, held, now).await?;
+            }
+            if pending.iter().any(|message| {
+                message.status.as_ref().and_then(|status| status.retry.as_ref()).is_some_and(|retry| match &retry.disposition {
+                    ControllerRetryDisposition::Retryable { next_attempt_at } => now < *next_attempt_at,
+                    ControllerRetryDisposition::Terminal { .. } => {
+                        let fence = message.status.as_ref().is_some_and(|status| status.fence_recheck_at.is_some())
+                            || holder.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
+                                condition.is_controller_fence_unverifiable()
+                                    && pending.iter().any(|member| condition.message_id.as_deref() == Some(member.metadata.name.as_str()))
+                            });
+                        !fence || message.status.as_ref().and_then(|status| status.fence_recheck_at).is_some_and(|due| now < due)
+                    }
+                })
+            }) {
+                return Ok(());
+            }
         }
         let target = delivery_target(holder);
         let existing_ref = existing.as_ref().map(submission_ref);
@@ -605,7 +766,7 @@ impl MessageInbox {
                             .crew_id(submission.crew_id.clone())
                             .session(submission.session.clone())
                             .delivered_at(now)
-                            .evidence(evidence)
+                            .evidence(receipt_evidence(&submission, evidence))
                             .maybe_transport(submission.transport.clone())
                             .build(),
                     )
@@ -621,6 +782,7 @@ impl MessageInbox {
                 }
                 let mut status = status_for(message);
                 status.submission = Some(submission.clone());
+
                 self.write(message, &status).await?;
             }
             if !same_holder {
@@ -641,25 +803,6 @@ impl MessageInbox {
             }
             return Ok(());
         }
-        // Preserve FIFO after a definitely-unsent batch exhausts its budget.
-        // A later message must not silently bypass the operator's held intent.
-        if let Some(held) = pending.iter().find(|message| {
-            message
-                .status
-                .as_ref()
-                .and_then(|status| status.retry.as_ref())
-                .is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }))
-        }) {
-            self.signal(receivers, held, now).await?;
-        }
-        if pending.iter().any(|message| {
-            message.status.as_ref().and_then(|status| status.retry.as_ref()).is_some_and(|retry| match &retry.disposition {
-                ControllerRetryDisposition::Retryable { next_attempt_at } => now < *next_attempt_at,
-                ControllerRetryDisposition::Terminal { .. } => true,
-            })
-        }) {
-            return Ok(());
-        }
         if running_holder.is_none() || !observation.ready {
             let reason = observation.waiting_reason.as_deref().unwrap_or("waiting for holder terminal readiness and a turn boundary");
             for message in pending {
@@ -672,7 +815,19 @@ impl MessageInbox {
         };
         // The key is stable for every possibly submitted attempt. Membership
         // can change only after definitely-unsent evidence clears that attempt.
+        let operator = pending[0].status.as_ref().and_then(|status| status.operator_delivery.as_ref());
+        if let Some(request) = operator {
+            if request.session != *session
+                || request.crew_id != crew.id
+                || pending
+                    .iter()
+                    .any(|message| message.status.as_ref().and_then(|status| status.operator_delivery.as_ref()) != Some(request))
+            {
+                return Ok(());
+            }
+        }
         let submission = MessageSubmission::builder()
+            .maybe_operator_reason(operator.map(|request| request.reason.clone()))
             .batch_id(format!(
                 "batch-{}-{}",
                 pending[0].metadata.name,
@@ -707,7 +862,12 @@ impl MessageInbox {
             let mut status = status_for(message);
             MessageStatusPatch::Wait { phase: MessagePhase::Deliverable, reason: "awaiting transport acceptance evidence".into(), at: now }
                 .apply(&mut status);
+            if status.fence_recheck_at.is_some() {
+                status.retry = None;
+            }
             status.submission = Some(submission.clone());
+            status.operator_delivery = None;
+            status.fence_recheck_at = None;
             self.write(message, &status).await?;
         }
         drop(admission);
@@ -795,6 +955,23 @@ impl MessageInbox {
         let remaining: Vec<_> = pending.iter().filter(|message| !closed.contains(&message.metadata.name)).cloned().collect();
         // The receiver's gate stays raised while another held batch remains.
         if !remaining.iter().any(HeldMessageBatch::is_held) {
+            if let Some(holder) = self.resolve_receiver(receivers, successor).await? {
+                if let Some(id) = holder
+                    .object
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.degraded.as_ref())
+                    .and_then(|condition| condition.message_id.as_ref())
+                    .filter(|id| closed.contains(*id))
+                {
+                    apply_status_patch(
+                        &self.backend.using::<TerminalSession>(&self.namespace),
+                        &holder.object.metadata.name,
+                        &crate::TerminalSessionStatusPatch::ClearMessageDeliveryHold { message_id: id.clone() },
+                    )
+                    .await?;
+                }
+            }
             self.clear_signal(receivers, successor).await?;
         }
         Ok(remaining)
@@ -819,7 +996,7 @@ impl MessageInbox {
                         .crew_id(submission.crew_id.clone())
                         .session(submission.session.clone())
                         .delivered_at(now)
-                        .evidence(evidence)
+                        .evidence(receipt_evidence(submission, evidence))
                         .maybe_transport(submission.transport.clone())
                         .build(),
                 )
@@ -860,6 +1037,18 @@ impl MessageInbox {
                     &MessageStatusPatch::Delivered { receiver: receiver.clone(), at: receiver.delivered_at },
                 )
                 .await?;
+                if let Some(holder) = self
+                    .resolve_receiver(receivers, member)
+                    .await?
+                    .filter(|holder| holder.object.status.as_ref().is_some_and(|status| status.degraded.is_some()))
+                {
+                    apply_status_patch(
+                        &self.backend.using::<TerminalSession>(&self.namespace),
+                        &holder.object.metadata.name,
+                        &crate::TerminalSessionStatusPatch::ClearMessageDeliveryHold { message_id: member.metadata.name.clone() },
+                    )
+                    .await?;
+                }
                 self.clear_signal(receivers, member).await
             }
             .instrument(flotilla_tracing::queued_span(&member.metadata.name, "receipt"))
@@ -882,10 +1071,29 @@ impl MessageInbox {
         // repaired at the start of deliver_group_traced without retyping input.
         // A receiver lost between result and snapshot is still a known-unsent
         // batch: park it durably; a future holder lookup can raise its gate.
+        let mut failures = 1;
         if let Some(holder) = self.resolve_receiver(receivers, first).await? {
+            let current = self.messages.get(&first.metadata.name).await?;
+            let submitted_at =
+                current.status.as_ref().and_then(|status| status.submission.as_ref()).map(|submission| submission.started_at);
             let already_recorded = holder.object.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
-                condition.is_controller_fence_unverifiable() && condition.message_id.as_deref() == Some(first.metadata.name.as_str())
+                condition.is_controller_fence_unverifiable()
+                    && condition.message_id.as_deref() == Some(first.metadata.name.as_str())
+                    && submitted_at.is_none_or(|at| at <= condition.observed_at)
             });
+            failures = holder
+                .object
+                .status
+                .as_ref()
+                .and_then(|status| status.degraded.as_ref())
+                .filter(|condition| condition.message_id.as_deref() == Some(first.metadata.name.as_str()))
+                .map_or(1, |condition| {
+                    if already_recorded {
+                        condition.consecutive_failures
+                    } else {
+                        condition.consecutive_failures.saturating_add(1)
+                    }
+                });
             if !already_recorded {
                 apply_status_patch(
                     &self.backend.using::<TerminalSession>(&self.namespace),
@@ -907,6 +1115,7 @@ impl MessageInbox {
             let mut status = status_for(&current);
             status.retry = Some(ControllerRetry::terminal(status.retry.as_ref(), now, reason));
             status.submission = None;
+            status.fence_recheck_at = Some(now + crate::delivery_hold::controller_fence_recheck_delay(failures));
             status.failed_batch_members = members.iter().map(|message| message.metadata.name.clone()).collect();
             MessageStatusPatch::Wait { phase: MessagePhase::Deliverable, reason: reason.into(), at: now }.apply(&mut status);
             self.write(&current, &status).await?;
@@ -967,11 +1176,7 @@ impl MessageInbox {
             status.retry = Some(retry);
             self.write(&current, &status).await?;
             let current = ResourceObject { status: Some(status.clone()), ..current };
-            let overdue = status
-                .submission
-                .as_ref()
-                .is_some_and(|submission| crate::delivery_hold::delivery_hold_overdue(submission.started_at, now));
-            if held && (!ambiguous || overdue) && member.metadata.name == members[0].metadata.name {
+            if held && member.metadata.name == members[0].metadata.name {
                 self.signal(receivers, &current, now).await?;
             }
         }
@@ -1031,7 +1236,7 @@ impl MessageInbox {
 
     // Repair a crash between terminal closure/receipt and gate deletion. Only
     // actual receiver gates are checked; historical Messages cause no deletes.
-    async fn cleanup_delivery_gates(&self, receivers: Option<&MessageReceiverSnapshot>, _now: DateTime<Utc>) -> Result<(), ResourceError> {
+    async fn cleanup_delivery_gates(&self, receivers: Option<&MessageReceiverSnapshot>) -> Result<(), ResourceError> {
         let demands = self.backend.using::<Demand>(&self.namespace);
         let gates: Vec<_> = demands
             .list()
@@ -1055,10 +1260,12 @@ impl MessageInbox {
                 message.status.as_ref().is_some_and(|status| {
                     !status.phase.is_terminal()
                         && status.resolved_receiver.is_none()
-                        && status
-                            .retry
-                            .as_ref()
-                            .is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }))
+                        && (status.operator_delivery.is_some()
+                            || status.submission.as_ref().is_some_and(|submission| submission.operator_reason.is_some())
+                            || status
+                                .retry
+                                .as_ref()
+                                .is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. })))
                 })
             })
             .collect();
@@ -1084,6 +1291,33 @@ impl MessageInbox {
             if retained.contains(&gate.metadata.name) {
                 continue;
             }
+            if let Some(owner) = gate.metadata.owner_references.iter().find(|owner| owner.kind == "TerminalSession" && owner.controller) {
+                let terminals = self.backend.using::<TerminalSession>(&self.namespace);
+                match terminals.get(&owner.name).await {
+                    Ok(holder) => {
+                        // The legacy queue shares this receiver gate and can still own it.
+                        if flotilla_resources::delivery_hold::legacy_delivery_gate_needed(&holder) {
+                            continue;
+                        }
+                        if let Some(id) = holder
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.degraded.as_ref())
+                            .filter(|condition| condition.is_delivery())
+                            .and_then(|condition| condition.message_id.clone())
+                        {
+                            apply_status_patch(
+                                &terminals,
+                                &owner.name,
+                                &crate::TerminalSessionStatusPatch::ClearMessageDeliveryHold { message_id: id },
+                            )
+                            .await?;
+                        }
+                    }
+                    Err(ResourceError::NotFound { .. }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
             match demands.delete(&gate.metadata.name).await {
                 Ok(()) | Err(ResourceError::NotFound { .. }) => {}
                 Err(error) => return Err(error),
@@ -1101,6 +1335,24 @@ impl MessageInbox {
         let Some(holder) = self.resolve_receiver(receivers, message).await? else {
             return Ok(());
         };
+        let current = self.backend.using::<TerminalSession>(&self.namespace).get(&holder.object.metadata.name).await?;
+        if !current.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
+            condition.is_delivery()
+                && condition.message_id.as_deref() == Some(message.metadata.name.as_str())
+                && (!condition.is_controller_fence_unverifiable()
+                    || message.status.as_ref().is_none_or(|status| status.submission.is_none()))
+        }) {
+            apply_status_patch(
+                &self.backend.using::<TerminalSession>(&self.namespace),
+                &holder.object.metadata.name,
+                &crate::TerminalSessionStatusPatch::MarkDeliveryUnconfirmed {
+                    message_id: message.metadata.name.clone(),
+                    message: message.status.as_ref().and_then(|status| status.reason.clone()).unwrap_or_else(|| "delivery held".into()),
+                    observed_at: now,
+                },
+            )
+            .await?;
+        }
         let demands = self.backend.using::<Demand>(&self.namespace);
         let (mut meta, spec) = delivery_demand(&holder.object);
         let description = HeldMessageBatch::collect([message]).first().map(|batch| batch.describe(&self.namespace));
@@ -1138,6 +1390,13 @@ impl MessageInbox {
             Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
             Err(error) => Err(error),
         }
+    }
+}
+
+fn receipt_evidence(submission: &MessageSubmission, evidence: String) -> String {
+    match &submission.operator_reason {
+        Some(reason) => format!("operator-authorized delivery ({reason}): {evidence}"),
+        None => evidence,
     }
 }
 

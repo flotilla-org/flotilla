@@ -127,6 +127,7 @@ define_patch_kinds! {
     TerminalObserveToolActivity => NONE,
     TerminalObserveNativeCodexHook => NONE,
     TerminalMarkCompletionPending => NONE,
+    TerminalClearMessageDeliveryHold => NONE,
     TerminalClearCompletionPending => NONE,
     TerminalMarkStopped => DUPLICATE,
     TerminalMarkLost => DUPLICATE,
@@ -226,6 +227,7 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
         TerminalSessionStatusPatch::ObserveNativeCodexHook { .. } => PatchKind::TerminalObserveNativeCodexHook,
         TerminalSessionStatusPatch::Observe { .. } => PatchKind::TerminalObserveAttention,
         TerminalSessionStatusPatch::MarkCompletionPending { .. } => PatchKind::TerminalMarkCompletionPending,
+        TerminalSessionStatusPatch::ClearMessageDeliveryHold { .. } => PatchKind::TerminalClearMessageDeliveryHold,
         TerminalSessionStatusPatch::ClearCompletionPending => PatchKind::TerminalClearCompletionPending,
     }
 }

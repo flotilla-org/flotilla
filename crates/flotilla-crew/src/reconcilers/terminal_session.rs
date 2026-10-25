@@ -174,6 +174,7 @@ pub trait TerminalRuntime: Send + Sync {
 
 pub struct TerminalSessionReconciler<R> {
     runtime: Arc<R>,
+    clock: Arc<dyn flotilla_resources::Clock>,
     decisions: crate::decision_log::DecisionLog,
     convoys: TypedResolver<Convoy>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
@@ -188,6 +189,7 @@ impl<R> TerminalSessionReconciler<R> {
     pub fn new(runtime: Arc<R>, backend: ResourceBackend, namespace: &str) -> Self {
         Self {
             runtime,
+            clock: Arc::new(flotilla_resources::SystemClock),
             decisions: Default::default(),
             convoys: backend.clone().using::<Convoy>(namespace),
             federated_convoys: None,
@@ -197,6 +199,11 @@ impl<R> TerminalSessionReconciler<R> {
             local_host_ref: None,
             additional_host_refs: Default::default(),
         }
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn flotilla_resources::Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     pub fn with_local_host_ref(mut self, local_host_ref: CanonicalHostId) -> Self {
@@ -434,7 +441,7 @@ where
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
         let hold_overdue = pending_delivery_hold(obj).is_some_and(|condition| {
             condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
-                && Utc::now().signed_duration_since(condition.observed_at) >= DELIVERY_HOLD_FOR
+                && self.clock.now().signed_duration_since(condition.observed_at) >= DELIVERY_HOLD_FOR
         });
         if retirement_pending(obj) {
             let status = obj.status.as_ref().expect("retirement requires status");
@@ -504,12 +511,14 @@ where
                 if let Some(message) = head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
                     if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
                         condition.message_id.as_deref() == Some(message.id.as_str())
-                            && (condition.is_controller_fence_unverifiable()
+                            && ((condition.is_controller_fence_unverifiable()
+                                && self.clock.now().signed_duration_since(condition.observed_at)
+                                    < flotilla_resources::delivery_hold::controller_fence_recheck_delay(condition.consecutive_failures))
                                 || condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
                                 || condition.reason == TERMINAL_DELIVERY_EXPIRED_REASON
                                 || (condition.reason == TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
                                     && (delivery_retry_exhausted(condition.consecutive_failures)
-                                        || Utc::now().signed_duration_since(condition.observed_at)
+                                        || self.clock.now().signed_duration_since(condition.observed_at)
                                             < chrono::Duration::from_std(delivery_retry_delay(condition.consecutive_failures))
                                                 .unwrap_or(chrono::Duration::MAX))))
                     }) {
@@ -623,7 +632,12 @@ where
             if let Some(observation) = self.runtime.observe_attention(session_id, &obj.spec).await.map_err(ResourceError::other)? {
                 return Ok(TerminalPrepared::Attention(observation));
             }
-            if obj.status.as_ref().and_then(|status| status.attention.as_ref()).is_some_and(|attention| attention.is_stale_at(Utc::now())) {
+            if obj
+                .status
+                .as_ref()
+                .and_then(|status| status.attention.as_ref())
+                .is_some_and(|attention| attention.is_stale_at(self.clock.now()))
+            {
                 return Ok(TerminalPrepared::AttentionStale);
             }
             return Ok(TerminalPrepared::None);
@@ -639,7 +653,7 @@ where
             let lost_at = obj.status.as_ref().and_then(|status| status.stopped_at);
             return Ok(
                 if lost_at.is_some_and(|at| {
-                    Utc::now().signed_duration_since(at) >= chrono::Duration::from_std(LOST_RECHECK_AFTER).expect("duration fits")
+                    self.clock.now().signed_duration_since(at) >= chrono::Duration::from_std(LOST_RECHECK_AFTER).expect("duration fits")
                 }) {
                     TerminalPrepared::RecoverLost
                 } else {
@@ -923,7 +937,7 @@ where
             }
             _ => Vec::new(),
         };
-        let delivery_failure_visible = flotilla_resources::delivery_hold::legacy_delivery_gate_needed(obj, now);
+        let delivery_failure_visible = flotilla_resources::delivery_hold::legacy_delivery_gate_needed(obj);
         if delivery_failure_visible
             && (consumed
                 || matches!(
@@ -939,8 +953,12 @@ where
                 || matches!(phase, TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed | TerminalSessionPhase::Lost))
         {
             actuations.push(Actuation::DeleteDemand { name: delivery_demand_name(obj) });
-        } else if expired
-            || matches!(prepared, TerminalPrepared::ControllerFenceUnverifiable { .. })
+        } else if delivery_failure_visible
+            || expired
+            || matches!(
+                prepared,
+                TerminalPrepared::ControllerFenceUnverifiable { .. } | TerminalPrepared::MessageDeliveryUnconfirmed { .. }
+            )
             || obj
                 .status
                 .as_ref()
@@ -1063,7 +1081,7 @@ where
         Some(TerminalSessionStatusPatch::MarkReconcileDegraded {
             message: failure.message.clone(),
             consecutive_failures: failure.consecutive_failures,
-            observed_at: Utc::now(),
+            observed_at: self.clock.now(),
         })
     }
 

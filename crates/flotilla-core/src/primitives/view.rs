@@ -249,6 +249,9 @@ pub fn old_view(
             retry: None,
             submission: None,
             failed_batch_members: Vec::new(),
+            operator_delivery: None,
+            delivery_history: Vec::new(),
+            fence_recheck_at: None,
         }),
     })
 }

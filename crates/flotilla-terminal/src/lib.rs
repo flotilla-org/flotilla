@@ -67,13 +67,13 @@ pub enum ScreenActivity {
 }
 
 /// The atomic submission result. Refusals prove no input was written; only
-/// temporary refusals can recover without restarting the child activation.
+/// a known-unsent refusal may be rechecked without restarting the child activation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalSubmission {
     Submitted,
     /// A temporary controller refusal; keep the batch queued without a receipt.
     Refused(String),
-    /// No input was written, but the controller fence cannot clear in this activation.
+    /// No input was written; keep the unverifiable controller fence visible.
     ControllerFenceUnverifiable,
 }
 
@@ -197,6 +197,12 @@ pub trait TerminalPool: Send + Sync {
         Ok(TerminalSubmission::Submitted)
     }
 
+    /// One explicitly authorized operator attempt, bypassing the controller fence.
+    /// Callers persist authorization and intent first; an error may have written input.
+    async fn operator_deliver(&self, _session_name: &str, _text: &str) -> Result<(), String> {
+        Err("terminal pool does not support operator-authorized delivery".into())
+    }
+
     /// Retry a delivery whose text is still present in a TUI composer. Pools
     /// with keyboard-level control should clear that text before resubmitting.
     /// This legacy API reports failures after clearing as transport errors,
@@ -206,7 +212,7 @@ pub trait TerminalPool: Send + Sync {
         self.deliver(session_name, text).await
     }
 
-    /// Preserve a permanent refusal even on the legacy composer-clear path.
+    /// Preserve an unverifiable refusal even on the legacy composer-clear path.
     /// Other failures retain that path's conservative ambiguity policy.
     async fn guarded_retry_delivery(&self, session_name: &str, text: &str) -> Result<TerminalSubmission, String> {
         self.retry_delivery(session_name, text).await?;

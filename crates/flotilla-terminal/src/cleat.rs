@@ -399,7 +399,9 @@ impl TerminalPool for CleatTerminalPool {
         match self.guarded_deliver(session_name, text).await? {
             TerminalSubmission::Submitted => Ok(()),
             TerminalSubmission::Refused(reason) => Err(reason),
-            TerminalSubmission::ControllerFenceUnverifiable => Err("cleat controller fence requires an agent restart".into()),
+            TerminalSubmission::ControllerFenceUnverifiable => {
+                Err("cleat controller fence is unverifiable; inspect the held batch for same-session operator delivery".into())
+            }
         }
     }
 
@@ -430,6 +432,11 @@ impl TerminalPool for CleatTerminalPool {
             (Some(1), Some("fence-unverifiable")) => Ok(TerminalSubmission::ControllerFenceUnverifiable),
             _ => Err(reason),
         }
+    }
+
+    async fn operator_deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
+        run!(self.runner, &self.binary, &["send", "--submit", "--", session_name, text], Path::new("/"))?;
+        Ok(())
     }
 
     async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
@@ -810,6 +817,17 @@ mod tests {
             assert_eq!(call.0, "cleat");
             assert_eq!(call.1, vec!["send", "--submit", "--controller-idle", "1750ms", "--", "reviewer-session", text]);
         }
+    }
+
+    // Glue: an explicit operator attempt uses one atomic send into the same
+    // child, without controller guards, clearing the composer or restarting it.
+    #[tokio::test]
+    async fn operator_delivery_uses_one_unguarded_atomic_send() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
+        test_pool(runner.clone(), "cleat").operator_deliver("agent", "--payload").await.unwrap();
+        let calls = logical_calls(&runner);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, vec!["send", "--submit", "--", "agent", "--payload"]);
     }
 
     // Only explicit pre-write controller refusals establish a safe retry;

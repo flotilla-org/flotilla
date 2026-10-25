@@ -221,6 +221,20 @@ pub async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format
         }
         ResourceSubCommand::Sync(args) => run_manifest_resolution(cli, args, flotilla_protocol::ManifestResolution::Sync, format).await,
         ResourceSubCommand::Adopt(args) => run_manifest_resolution(cli, args, flotilla_protocol::ManifestResolution::Adopt, format).await,
+        ResourceSubCommand::DeliverMessageBatch(args) => {
+            let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
+            run_control_command(
+                cli,
+                Command {
+                    node_id,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::MessageDeliverBatch { namespace: args.namespace, name: args.name, reason: args.reason },
+                },
+                format,
+            )
+            .await
+        }
         ResourceSubCommand::FailMessageBatch(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
             run_control_command(

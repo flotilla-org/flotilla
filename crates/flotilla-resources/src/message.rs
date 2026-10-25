@@ -205,6 +205,18 @@ pub struct ResolvedMessageReceiver {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct MessageStatus {
+    /// Explicit operator authorization, pinned to the receiver that was inspected.
+    // Compatibility default for pre-#3799 records; removable one roll after #3799.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_delivery: Option<OperatorMessageDelivery>,
+    // Compatibility default for pre-#3799 records; removable one roll after #3799.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_recheck_at: Option<DateTime<Utc>>,
+    /// Preserve possibly-written submissions when an operator authorizes another attempt.
+    // Compatibility default for pre-#3799 records; removable one roll after #3799.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub delivery_history: Vec<MessageSubmission>,
     pub phase: MessagePhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_sequence: Option<u64>,
@@ -231,6 +243,9 @@ pub struct MessageStatus {
 impl Default for MessageStatus {
     fn default() -> Self {
         Self {
+            operator_delivery: None,
+            fence_recheck_at: None,
+            delivery_history: Vec::new(),
             phase: MessagePhase::Accepted,
             accepted_sequence: None,
             // An absent status has no evidence timestamp. Writers provide their clock.
@@ -247,6 +262,9 @@ impl Default for MessageStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct MessageSubmission {
+    // Compatibility default for pre-#3799 records; removable one roll after #3799.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_reason: Option<String>,
     pub batch_id: String,
     pub crew_id: String,
     pub session: String,
@@ -263,6 +281,13 @@ pub struct MessageSubmission {
     /// transport router (#3545), which poll the session's first offered transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorMessageDelivery {
+    pub reason: String,
+    pub session: String,
+    pub crew_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +329,11 @@ impl StatusPatch<MessageStatus> for MessageStatusPatch {
                 if status.submission.is_some() && status.resolved_receiver.is_none() && *phase == MessagePhase::Expired {
                     return;
                 }
+                // Terminal disposition revokes any queued operator attempt; the
+                // original submission remains available for audit.
+                if phase.is_terminal() {
+                    status.operator_delivery = None;
+                }
                 (*phase, Some(reason.clone()), *at)
             }
         };
@@ -343,6 +373,8 @@ pub struct HeldMessageBatch {
     /// Every member is a flotilla system turn, so an operator or supervisor
     /// message to the same receiver supersedes the whole batch.
     pub system_only: bool,
+    /// A previous attempt may already appear in the conversation.
+    pub prior_submission: bool,
 }
 
 impl HeldMessageBatch {
@@ -385,6 +417,7 @@ impl HeldMessageBatch {
                 reason: status.reason.clone().unwrap_or_else(|| "delivery held".into()),
                 members,
                 system_only,
+                prior_submission: status.submission.is_some() || !status.delivery_history.is_empty(),
             });
         }
         batches
@@ -398,13 +431,16 @@ impl HeldMessageBatch {
     /// One plain sentence naming the batch, why it is held and how to clear it.
     pub fn describe(&self, namespace: &str) -> String {
         format!(
-            "message batch `{}` is held for {} ({} message{}: {}): {}; clear it with `{}`",
+            "message batch `{}` is held for {} ({} message{}: {}): {}; {}, then authorize same-session delivery with `flotilla resource deliver-message-batch {} --namespace {} --reason '<why>'`; dispose of it with `{}`",
             self.batch,
             self.receiver,
             self.members.len(),
             if self.members.len() == 1 { "" } else { "s" },
             self.members.join(", "),
             self.reason,
+            if self.prior_submission { "confirm the message is not already in the conversation and verify the pane shows the agent composer" } else { "verify the pane shows the agent composer first" },
+            self.members[0],
+            namespace,
             self.clear_command(namespace)
         )
     }
