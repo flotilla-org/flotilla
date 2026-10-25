@@ -1236,16 +1236,16 @@ async fn fire_turn_row(wake: &ReconcilerWake, row: &LeafSubscriptionRow) {
 
 // #3565 (PR #3557): a crew pushing review fixes is making progress. Four
 // rounds, each a new head with a review and settled checks, all reach the
-// crew past the episode limit, including the round whose checks went green.
+// crew past the episode limit. A fail-to-pass rerun at the last head must
+// deliver green once, while duplicate outcomes stay deduplicated.
 #[tokio::test]
 async fn four_review_rounds_deliver_the_green_checks_on_the_last_round() {
     let (backend, wake, actuator, name) = review_rounds_fixture().await;
     let records = backend.using::<ChangeRequest>("flotilla");
     let checks = turn_row(&wake, "checks-settled").await;
     let review = turn_row(&wake, "actionable-review").await;
-    let heads = ["ae5be374", "51844bae", "765a01ce", "a2bc4085"];
-    for (round, head) in heads.into_iter().enumerate() {
-        let green = round == heads.len() - 1;
+    let rounds = [("ae5be374", false), ("51844bae", false), ("765a01ce", false), ("a2bc4085", false), ("a2bc4085", true)];
+    for (head, green) in rounds {
         let current = records.get(&name).await.expect("record");
         let observed_at = Utc::now();
         let observed = flotilla_resources::ChangeRequestStatus {
@@ -1273,21 +1273,70 @@ async fn four_review_rounds_deliver_the_green_checks_on_the_last_round() {
         sources,
         [
             ("actionable-review", "ae5be374"),
-            ("checks-settled", "ae5be374"),
+            ("checks-settled", "ae5be374@fail"),
             ("actionable-review", "51844bae"),
-            ("checks-settled", "51844bae"),
+            ("checks-settled", "51844bae@fail"),
             ("actionable-review", "765a01ce"),
-            ("checks-settled", "765a01ce"),
-            ("checks-settled", "a2bc4085"),
+            ("checks-settled", "765a01ce@fail"),
+            ("actionable-review", "a2bc4085"),
+            ("checks-settled", "a2bc4085@fail"),
+            ("checks-settled", "a2bc4085@pass"),
         ]
     );
     let last = &requests.last().expect("green turn").brief;
     assert!(last.contains("- Head SHA: `a2bc4085`") && last.contains("- Checks: pass"), "{last}");
     assert_eq!(actuator.holds.load(Ordering::SeqCst), 0);
     let status = backend.using::<Convoy>("flotilla").get("rounds").await.expect("convoy").status.expect("status");
-    assert_eq!(status.turn_deliveries["checks-settled"].episodes.len(), 4);
+    assert_eq!(status.turn_deliveries["checks-settled"].episodes.len(), 5);
     assert!(status.turn_delivery_holds().is_empty());
     assert!(status.attention.is_none());
+}
+
+// Custom checks predicates may request Pending too; outcome-aware identity must
+// preserve that delivery and deduplicate repeated observations at the same head.
+#[hegel::test]
+fn custom_checks_rules_deliver_pending_once(tc: hegel::TestCase) {
+    // Both admitted predicate forms can match Pending, for either active crew phase.
+    let predicate = if tc.draw(hegel::generators::booleans()) { "$cr.checks == pending" } else { "$cr.checks != pass" };
+    let phase = if tc.draw(hegel::generators::booleans()) { CrewWorkPhase::Working } else { CrewWorkPhase::Interrupted };
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let (backend, wake, actuator, name) = review_rounds_fixture().await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        let current = convoys.get("rounds").await.expect("convoy");
+        let mut status = current.status.expect("status");
+        let rules = &mut status.workflow_snapshot.as_mut().expect("workflow").turn_delivery;
+        let mut rule = rules["checks-settled"].clone();
+        rule.on = flotilla_resources::parse_leaf_template(predicate).expect("custom predicate");
+        rules.insert("custom-pending".into(), rule);
+        status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").phase = phase;
+        let updated = convoys.update_status("rounds", &current.metadata.resource_version, &status).await.expect("custom rule");
+        wake.sync_rows("flotilla", &HashMap::from([("rounds".into(), updated)])).await.expect("custom subscription");
+        for task in wake.subscriptions.inner.tasks.lock().await.drain().map(|(_, task)| task) {
+            task.abort();
+        }
+        let row = turn_row(&wake, "custom-pending").await;
+        let records = backend.using::<ChangeRequest>("flotilla");
+        let record = records.get(&name).await.expect("PR");
+        let now = Utc::now();
+        let observed = flotilla_resources::ChangeRequestStatus {
+            head_sha: Observation::known("same-head".into(), now),
+            checks: Observation::known(ObservedChecks::Pending, now),
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
+            state: Default::default(),
+            review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+            mergeable: Default::default(),
+        };
+        records.update_status(&name, &record.metadata.resource_version, &observed).await.expect("pending checks");
+        fire_turn_row(&wake, &row).await;
+        fire_turn_row(&wake, &row).await;
+        let requests = actuator.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1, "{predicate}, {phase:?}");
+        assert_eq!(requests[0].subject_revision, "same-head@pending");
+        assert!(requests[0].brief.contains("- Checks: pending"));
+    });
 }
 
 // #3565: the limit still catches a loop that makes no progress. Review-round
