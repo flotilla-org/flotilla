@@ -137,6 +137,9 @@ impl CommandRunner for FakeHost {
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
         match (cmd, args) {
+            ("sh", ["-c", "command -v claude"]) => {
+                Ok(CommandOutput { stdout: "/tools/claude\n".into(), stderr: String::new(), exit_code: Some(0) })
+            }
             ("pwd", ["-P"]) => Ok(CommandOutput { stdout: format!("{}\n", cwd.display()), stderr: String::new(), exit_code: Some(0) }),
             // The checkout is a plain directory in this model, as a
             // multi-repository workspace root is.
@@ -150,11 +153,7 @@ impl CommandRunner for FakeHost {
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel, _input: &[u8]) -> Result<String, String> {
-        match (cmd, args) {
-            // The Claude OAuth delivery preflight (`claude -p ok`).
-            ("sh", ["-c", _, "flotilla-claude-oauth-preflight", _]) => Ok("ok".into()),
-            _ => Err(format!("unexpected host command with input {cmd} {args:?}")),
-        }
+        panic!("credential preparation cannot send model turns: {cmd} {args:?}")
     }
 
     async fn exists(&self, cmd: &str, _args: &[&str]) -> bool {

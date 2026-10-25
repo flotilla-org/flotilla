@@ -381,6 +381,9 @@ impl ReadProjections<'_> {
                             let models = harness
                                 .models
                                 .iter()
+                                // Historical requests used a different login;
+                                // never project them as current model access.
+                                .filter(|(_, model)| model.source != flotilla_resources::ModelFactSource::Probe)
                                 .map(|(name, model)| {
                                     (
                                         name.clone(),

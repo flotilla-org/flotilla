@@ -1167,9 +1167,36 @@ impl super::EnvironmentDetection for DockerEnvironmentProvider {
         scratch: &Path,
     ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
         let image = image.ok_or("detection requires an image reference")?;
-        let mut command = vec!["run", "--rm", "--pull=never", "--workdir", "/probe", "--tmpfs", "/probe", image, binary];
-        command.extend_from_slice(args);
-        self.inner.runner.run_output("docker", &command, scratch, &ChannelLabel::Default).await
+        let name = format!("flotilla-observation-{}", uuid::Uuid::new_v4());
+        let mut command = [
+            "run",
+            "--rm",
+            "--name",
+            &name,
+            "--pull=never",
+            "--network=none",
+            "--workdir",
+            "/",
+            "--tmpfs",
+            "/tmp",
+            "--entrypoint",
+            "env",
+            image,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        command.extend(super::detection::observation_args("/tmp/flotilla-observation", binary, args));
+        super::detection::run_with_cleanup(
+            self.inner.runner.clone(),
+            "docker",
+            command,
+            scratch.into(),
+            "docker",
+            vec!["rm".into(), "--force".into(), name],
+            false,
+        )
+        .await
     }
 }
 

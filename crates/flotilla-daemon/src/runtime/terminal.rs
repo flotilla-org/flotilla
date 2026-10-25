@@ -796,14 +796,10 @@ impl TerminalRuntime for TerminalControllerRuntime {
         };
         let Some(reason) = adapter.classify_screen_failure(&screen) else { return Ok(None) };
 
-        // Static material means every crew runs the same central login, so the
-        // operator-facing name is that login's path, not a leased slot: if a
-        // crew saw an auth failure, the host's refresher is what needs looking at.
-        let material = match &self.state.agent_material {
-            Some(registry) => format!("the central Codex credential {}", registry.codex_credential_source().display()),
-            None => format!("the central Codex credential (no material registry for environment {})", spec.env_ref),
-        };
-        Ok(Some(format!("Codex authentication failed for {material} in environment {}: {reason}", spec.env_ref)))
+        Ok(Some(format!(
+            "{} authentication failed for the selected credential in environment {}: {reason}",
+            requirement.adapter, spec.env_ref
+        )))
     }
 
     async fn deliver_message(

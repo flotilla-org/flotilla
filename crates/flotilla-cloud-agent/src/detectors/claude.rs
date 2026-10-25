@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::HostDetector;
 
-use flotilla_discovery_api::detectors::{parse_first_dotted_version, resolve_binary_path};
+use flotilla_discovery_api::detectors::resolve_binary_path;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
@@ -17,27 +17,15 @@ pub struct ClaudeDetector;
 #[async_trait]
 impl HostDetector for ClaudeDetector {
     async fn detect(&self, runner: &dyn CommandRunner, env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
-        // 1. Check PATH, then retain the exact executable that satisfied the probe.
-        if let Ok(output) = run!(runner, "claude", &["--version"], Path::new("/")) {
-            if let Some(path) = resolve_binary_path(runner, "claude").await {
-                return match parse_first_dotted_version(&output) {
-                    Some(version) => vec![EnvironmentAssertion::versioned_binary("claude", path, version)],
-                    None => vec![EnvironmentAssertion::binary("claude", path)],
-                };
-            }
+        // Generic discovery only looks up executables. Version observation
+        // belongs to the provider's isolated fulfilment detection capability.
+        if let Some(path) = resolve_binary_path(runner, "claude").await {
+            return vec![EnvironmentAssertion::binary("claude", path)];
         }
-
-        // 2. Check known installation location via runner (not local filesystem)
         if let Some(home) = env.get("HOME") {
             let path = PathBuf::from(home).join(".claude/local/claude");
-            let path_str = path.to_str().unwrap_or("");
-            if let Ok(output) = run!(runner, path_str, &["--version"], Path::new("/")) {
-                return match parse_first_dotted_version(&output) {
-                    Some(version) => {
-                        vec![EnvironmentAssertion::versioned_binary("claude", &path, version)]
-                    }
-                    None => vec![EnvironmentAssertion::binary("claude", &path)],
-                };
+            if run!(runner, "test", &["-x", &path.to_string_lossy()], Path::new("/")).is_ok() {
+                return vec![EnvironmentAssertion::binary("claude", &path)];
             }
         }
 
@@ -55,7 +43,6 @@ mod tests {
     #[tokio::test]
     async fn claude_detector_found_on_path() {
         let runner = DiscoveryMockRunner::builder()
-            .on_run("claude", &["--version"], Ok("1.0.20 (Claude Code)\n".into()))
             .on_run("sh", &["-c", "command -v \"$1\"", "flotilla-binary-discovery", "claude"], Ok("/x/y/claude\n".into()))
             .build();
         let assertions = ClaudeDetector.detect(&runner, &TestEnvVars::default()).await;
@@ -64,7 +51,7 @@ mod tests {
             EnvironmentAssertion::BinaryAvailable { name, path, version } => {
                 assert_eq!(name, "claude");
                 assert_eq!(*path, ExecutionEnvironmentPath::new("/x/y/claude"));
-                assert_eq!(version.as_deref(), Some("1.0.20"));
+                assert!(version.is_none());
             }
             other => panic!("expected BinaryAvailable, got {other:?}"),
         }
@@ -73,9 +60,7 @@ mod tests {
     #[tokio::test]
     async fn claude_detector_fallback_to_home() {
         // Not on PATH, but found at $HOME/.claude/local/claude
-        let runner = DiscoveryMockRunner::builder()
-            .on_run("/test/home/.claude/local/claude", &["--version"], Ok("1.2.3 (Claude Code)\n".into()))
-            .build();
+        let runner = DiscoveryMockRunner::builder().on_run("test", &["-x", "/test/home/.claude/local/claude"], Ok(String::new())).build();
         let env = TestEnvVars::new([("HOME", "/test/home")]);
         let assertions = ClaudeDetector.detect(&runner, &env).await;
         assert_eq!(assertions.len(), 1);
@@ -83,7 +68,7 @@ mod tests {
             EnvironmentAssertion::BinaryAvailable { name, path, version } => {
                 assert_eq!(name, "claude");
                 assert_eq!(*path, ExecutionEnvironmentPath::new("/test/home/.claude/local/claude"));
-                assert_eq!(version.as_deref(), Some("1.2.3"));
+                assert!(version.is_none());
             }
             other => panic!("expected BinaryAvailable, got {other:?}"),
         }

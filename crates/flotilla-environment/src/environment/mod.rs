@@ -1,5 +1,6 @@
 #[cfg(unix)]
 pub mod agent;
+mod detection;
 #[cfg(unix)]
 pub mod drydock;
 mod seam;

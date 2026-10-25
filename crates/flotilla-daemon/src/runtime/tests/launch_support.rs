@@ -61,15 +61,10 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
             .await
             .expect("environment");
     }
-    // Credential preflight runs through the contained runner, so its
-    // scratch directory must be inside the container user's writable
-    // world rather than derived from daemon-host paths (#1508).
-    let preflight_config_dir = PathBuf::from("/home/crew/flotilla/credentials/claude-max/claude-preflight");
     let crew_config_dir = PathBuf::from("/home/crew/flotilla/agent-homes/claude-max/claude");
     let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
         DiscoveryMockRunner::builder()
             .tool_exists("claude", true)
-            .on_run("mkdir", &["-p", &preflight_config_dir.to_string_lossy()], Ok(String::new()))
             .on_run("mkdir", &["-p", &crew_config_dir.to_string_lossy()], Ok(String::new()))
             .build(),
         None,

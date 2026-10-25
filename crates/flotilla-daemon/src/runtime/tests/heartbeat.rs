@@ -137,10 +137,10 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
             Err("unused".to_string())
         }
 
-        async fn run_output(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
-            if cmd == "mkdir" {
+        async fn run_output(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            if cmd == "rm" {
                 Ok(CommandOutput { stdout: String::new(), stderr: String::new(), exit_code: Some(0) })
-            } else if cmd == "rustc" {
+            } else if cmd == "env" && args.last() == Some(&"--version") && args.get(args.len() - 2) == Some(&"rustc") {
                 self.entered.notify_one();
                 self.release.notified().await;
                 Ok(CommandOutput { stdout: "rustc 1.94.1".to_string(), stderr: String::new(), exit_code: Some(0) })
@@ -177,6 +177,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
     let probe_host = host_id.clone();
     let probe_pools = profile.available_pools.clone();
     let probe_runner = Arc::new(GatedProbeRunner { entered: Arc::clone(&entered), release: Arc::clone(&release) });
+    let cache_runner = probe_runner.clone();
     let probe = tokio::spawn(async move {
         observe_fulfilment_facts(
             &backend,
@@ -237,6 +238,54 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
         .expect("heartbeat preserves model probe count");
     assert_eq!(hosts.get(&host_id).await.expect("host").status.expect("status").model_probes.total_requests, 2);
 
+    // Recently cached observations retain independent availability, but neither
+    // old verdict from another account can be republished as model evidence.
+    let mut cached = status.fulfilment_facts.clone();
+    let observation = cached.get_mut("host-direct-async-facts-test").expect("cached fact");
+    observation.harnesses.insert(
+        "claude-code".into(),
+        flotilla_resources::HarnessFacts {
+            version: "2.1.300".into(),
+            models: [("yes", true), ("no", false)]
+                .into_iter()
+                .map(|(model, usable)| {
+                    (model.into(), flotilla_resources::ModelFact { usable, source: flotilla_resources::ModelFactSource::Probe })
+                })
+                .collect(),
+        },
+    );
+    for (model, usable) in [("yes", true), ("no", false)] {
+        model_probes.entries.insert(
+            model.into(),
+            flotilla_resources::CachedModelProbe {
+                observed_at: Utc::now(),
+                fact: Some(flotilla_resources::ModelFact { usable, source: flotilla_resources::ModelFactSource::Probe }),
+            },
+        );
+    }
+    let cached_facts = observe_fulfilment_facts(
+        &daemon.resource_backend(),
+        NAMESPACE,
+        &host_id,
+        &profile.available_pools,
+        &cached,
+        FulfilmentProbeContext {
+            providers: &detection_registry(cache_runner.clone()),
+            runner: cache_runner.as_ref(),
+            env: &TestEnvVars::default(),
+            scratch: Path::new("/tmp/flotilla-probe-test"),
+        },
+        &mut model_probes,
+    )
+    .await
+    .expect("reuse recent availability without another command");
+    let clean = &cached_facts["host-direct-async-facts-test"];
+    assert!(clean.harnesses["claude-code"].models.is_empty());
+    assert_eq!(clean.harnesses["claude-code"].version, "2.1.300");
+    assert_eq!(clean.toolchains, cached["host-direct-async-facts-test"].toolchains);
+    assert_eq!(clean.free_vessel_slots, cached["host-direct-async-facts-test"].free_vessel_slots);
+    assert_eq!(model_probes, ModelProbeState::default());
+
     let mut previous = status.fulfilment_facts;
     previous.get_mut("host-direct-async-facts-test").expect("prior fact").observed_at = Utc::now() - chrono::Duration::minutes(10);
     let failing_runner = Arc::new(DiscoveryMockRunner::builder().build());
@@ -256,7 +305,8 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
     )
     .await
     .expect("observation retains prior facts");
-    assert_eq!(after_failure, previous);
+    assert!(after_failure["host-direct-async-facts-test"].toolchains.is_empty());
+    assert_eq!(model_probes, ModelProbeState::default());
 }
 
 // #1496: a replicated description must produce a HostSnapshot for live

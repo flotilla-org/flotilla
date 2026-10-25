@@ -20,21 +20,39 @@ Malformed policies with both realisations are skipped during kind migration so
 they cannot interrupt host heartbeats. Host-direct GUI observation reads display
 variables on X11 and Wayland, and checks the user's launchd GUI domain on macOS.
 
-Each Host status carries observations keyed by kind name. Host-direct probes
-run through its injected command runner; Docker probes execute the binary in
-the resolved image with `docker run --rm --pull=never`. Harness versions and
-toolchain versions come from `--version`. Candidate Claude models are `sonnet`
-and `opus`; a comma-separated `FLOTILLA_PROBE_MODELS` value supplied through
-the injected environment replaces that list (an empty value disables model
-probes). A one-turn, tool-free invocation records model
-acceptance as `probe` evidence. A failed launch leaves the model unknown;
-explicit CLI rejection records it unusable. Probes run on daemon start and
-again when a Docker kind's resolved image changes. A missing or conflicted image
-baseline leaves that kind without current facts. Each command has a 15-second
-deadline, and each kind has a 45-second total deadline; a timed-out kind is
-retried on the next observation. Current terminal pools have no
-configured vessel-slot ceiling, so an available pool reports unbounded capacity;
-an unavailable pool reports zero free slots.
+Each Host status carries observations keyed by kind name. Independent units
+observe image identity/presence from the provider's local image inventory,
+harness and toolchain versions from isolated `--version` invocations, GUI
+session state from display variables or launchd, and capacity from discovered
+terminal pools. Command failure or missing detection leaves that observation
+unknown without suppressing unrelated successful observations.
+
+Detection belongs to the provider. Local and agentless SSH observations use
+the injected endpoint; image observations run in the resolved image without
+pulling or network access. Detection requires target Bash for owned process
+groups; missing Bash leaves detection unknown. Startup files, exported shell
+functions and shell options are disabled before the observation wrapper runs.
+Harness invocations have disposable HOME, explicit
+harness and XDG config/cache/state directories, an empty authentication
+environment, and a CWD outside operator/project configuration. Bounded cleanup
+runs after success, failure, or caller cancellation. Each detection operation
+has a 12-second execution deadline and a two-second cleanup deadline inside
+the observation's 15-second limit. Kinds retain their 45-second pass deadline.
+
+Account/model entitlement remains **unknown**. Observation and OAuth credential
+preparation never send model turns. A selected model may be attempted with the
+credential selected by its scoped grant, subject to ordinary harness/version,
+capability and placement checks. Neither grant presence nor a successful
+version check proves model access. Retired request caches remain decodable;
+neither positive nor negative old model observations affect admission, and
+cached observations lose their model facts before being published again.
+Real, recognized standalone launch authentication diagnostics use the existing
+adapter/lifecycle failure channel with fixed bounded messages. Unrecognized
+model errors, quoted diagnostics, conversation screens and ambiguous exits
+remain resumable; they are not evidence of a confirmed refusal.
+
+Current terminal pools have no configured vessel-slot ceiling: an available
+pool reports unbounded capacity and an unavailable pool reports zero slots.
 
 `flotilla fulfilment list`, `flotilla host list`, and the TUI fleet pane use
 these same Host facts. They are observations, not admissions; the policy based

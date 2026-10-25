@@ -1847,23 +1847,6 @@ impl CredentialStore {
         expand_path(&*self.env, path)
     }
 
-    // The preflight scratch dir must keep the `claude -p` probe blind to
-    // ambient authentication (`apiKeyHelper`, stored logins) — an empty
-    // per-credential dir. The daemon runs as an unprivileged user with no
-    // systemd `RuntimeDirectory=`, so absolute `/run` is unwritable; derive
-    // the dir from a daemon-owned writable base instead: the user runtime dir
-    // when present and writable, the daemon state dir otherwise (#1498,
-    // #1508). The runner owns the choice because it may target a different
-    // filesystem world, such as a provisioned container. Resolve on every
-    // preflight because logind can remove an inherited runtime dir after
-    // daemon startup.
-    async fn claude_preflight_config_dir(&self, credential_name: &str, runner: &dyn CommandRunner) -> Result<String, String> {
-        let runtime_dir =
-            self.env.get("XDG_RUNTIME_DIR").map(|value| PathBuf::from(value.trim())).filter(|value| !value.as_os_str().is_empty());
-        let base = runner.writable_scratch_base(runtime_dir.as_deref(), &self.state_dir).await?;
-        Ok(base.join("credentials").join(safe_component(credential_name)).join("claude-preflight").to_string_lossy().into_owned())
-    }
-
     async fn delivery_paths(&self, runner: &dyn CommandRunner) -> Result<CredentialDeliveryPaths, String> {
         let runtime_dir =
             self.env.get("XDG_RUNTIME_DIR").map(|value| PathBuf::from(value.trim())).filter(|value| !value.as_os_str().is_empty());
@@ -2051,7 +2034,11 @@ impl CredentialStore {
                 });
             }
             CredentialConsumer::Claude => {
-                if !runner.exists("claude", &["--version"]).await {
+                if !runner
+                    .run_output("sh", &["-c", "command -v claude"], Path::new("/"), &ChannelLabel::Default)
+                    .await
+                    .is_ok_and(|output| output.success())
+                {
                     return Err("consumer binary is unavailable".to_string());
                 }
                 if !already_prepared {
@@ -2064,76 +2051,16 @@ impl CredentialStore {
                 }
                 env.insert("ANTHROPIC_API_KEY".to_string(), material.to_string());
             }
-            // Subscription OAuth material (a `claude setup-token` long-lived
-            // token) is delivered per-process through `CLAUDE_CODE_OAUTH_TOKEN`
-            // — no login transformation exists or is needed, and one mint
-            // serves N crews (ADR 0022 amendment). The credential-specific
-            // preflight config directory isolates its probe from ambient
-            // authentication. Delivery also offers a credential-specific
-            // mutable config path for contained crews; the trusted Claude
-            // adapter removes that override so host settings, skills, and MCP
-            // configuration remain ambient. See
-            // docs/research/2026-07-28-multi-crew-agent-config-seeding.md.
+            // Delivery does not prove model entitlement. Only actual requested
+            // work may spend a turn; preparation checks the consumer binary.
             CredentialConsumer::ClaudeOauth { .. } => {
                 let delivery_paths = delivery_paths.expect("Claude OAuth adapter resolves delivery paths");
-                if !runner.exists("claude", &["--version"]).await {
+                if !runner
+                    .run_output("sh", &["-c", "command -v claude"], Path::new("/"), &ChannelLabel::Default)
+                    .await
+                    .is_ok_and(|output| output.success())
+                {
                     return Err("consumer binary is unavailable".to_string());
-                }
-                if !already_prepared {
-                    let config_dir = self.claude_preflight_config_dir(name, &*runner).await?;
-                    runner
-                        .run("mkdir", &["-p", &config_dir], Path::new("/"), &ChannelLabel::Default)
-                        .await
-                        .map_err(|error| format!("create writable config directory: {error}"))?;
-                    // Preflight: a trivial `claude -p` request under the token.
-                    // There is no documented headless status command and no
-                    // documented HTTP endpoint that accepts subscription OAuth
-                    // tokens (the `/v1/models` x-api-key probe used for the
-                    // API-key adapter takes API keys, not OAuth bearers), so
-                    // the cheapest reliable probe is the CLI itself on exactly
-                    // the path the crew will use — a dead token fails the
-                    // request loudly in print mode. `ANTHROPIC_AUTH_TOKEN` and
-                    // `ANTHROPIC_API_KEY` are unset and the empty
-                    // per-credential config dir excludes any ambient
-                    // `apiKeyHelper`, since each of those outranks
-                    // `CLAUDE_CODE_OAUTH_TOKEN` and would mask a dead token
-                    // (the stored ambient login ranks below it, so it cannot).
-                    let probe = runner
-                        .run_with_input(
-                            "sh",
-                            &[
-                                "-c",
-                                "IFS= read -r token; unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; \
-                                 output=$(CLAUDE_CODE_OAUTH_TOKEN=\"$token\" CLAUDE_CONFIG_DIR=\"$1\" claude -p ok 2>&1) || \
-                                 { status=$?; printf '%s\\n' \"$output\" >&2; exit \"$status\"; }; printf '%s' \"$output\"",
-                                "flotilla-claude-oauth-preflight",
-                                &config_dir,
-                            ],
-                            Path::new("/"),
-                            &ChannelLabel::Default,
-                            material.as_bytes(),
-                        )
-                        .await
-                        .or_else(|error| {
-                            if claude_headless_credit_pool_is_exhausted(&error) {
-                                tracing::warn!(
-                                    credential = %name,
-                                    detail = %bounded_adapter_error(name, "claude-oauth", &error.replace(material, "[redacted]")),
-                                    "Claude OAuth preflight exhausted headless credits; continuing because interactive crews use subscription limits"
-                                );
-                                Ok(String::new())
-                            } else {
-                                Err(format!("subscription token preflight failed: {error}"))
-                            }
-                        });
-                    // The scratch dir is only needed while the probe runs; the
-                    // persistent-base fallback would otherwise accumulate
-                    // whatever `claude -p` writes for the daemon's lifetime,
-                    // and removal guarantees the next probe starts empty.
-                    if let Err(error) = runner.run("rm", &["-rf", &config_dir], Path::new("/"), &ChannelLabel::Default).await {
-                        tracing::warn!(credential = %name, %error, "failed to remove Claude OAuth preflight scratch directory");
-                    }
-                    probe?;
                 }
                 env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), material.to_string());
                 env.insert("CLAUDE_CONFIG_DIR".to_string(), prepare_harness_home(delivery_paths, name, "claude", &*runner).await?);
@@ -2506,11 +2433,6 @@ fn safe_component(name: &str) -> String {
 
 fn image_registry_matches(image: &str, registry: &str) -> bool {
     image == registry || image.strip_prefix(registry).is_some_and(|remainder| remainder.starts_with('/'))
-}
-
-fn claude_headless_credit_pool_is_exhausted(output: &str) -> bool {
-    let output = output.to_ascii_lowercase();
-    ["credit", "quota", "billing"].iter().any(|indicator| output.contains(indicator))
 }
 
 fn bounded_adapter_error(name: &str, adapter: &str, detail: &str) -> String {
@@ -3509,12 +3431,6 @@ mod tests {
         runtime_dir_checks: StdMutex<VecDeque<bool>>,
         // Pause the Docker login process boundary while its cache is unindexed.
         registry_login_gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Semaphore)>>,
-    }
-
-    impl RecordingRunner {
-        fn with_runtime_dir_checks(checks: impl IntoIterator<Item = bool>) -> Self {
-            Self { runtime_dir_checks: StdMutex::new(checks.into_iter().collect()), ..Self::default() }
-        }
     }
 
     #[async_trait]
@@ -5181,24 +5097,8 @@ interactions:
             .iter()
             .any(|(name, value)| { name == "CLAUDE_CONFIG_DIR" && value == "/tmp/flotilla-test-state/agent-homes/claude-max/claude" }));
         let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls
-            .iter()
-            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight"]));
-        assert!(calls.iter().any(|(cmd, args, input)| {
-            cmd == "sh"
-                && args.iter().any(|arg| arg.contains("unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN"))
-                && args.iter().any(|arg| arg.contains("CLAUDE_CODE_OAUTH_TOKEN=\"$token\"") && arg.contains("claude -p"))
-                && args.iter().any(|arg| arg.contains("claude -p ok 2>&1") && arg.contains("printf '%s\\n' \"$output\" >&2"))
-                && args.iter().any(|arg| arg == "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight")
-                && input == secret.as_bytes()
-        }));
-        assert!(
-            calls
-                .iter()
-                .any(|(cmd, args, _)| cmd == "rm" && args == &["-rf", "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight"]),
-            "the preflight scratch directory must not outlive the probe"
-        );
-        assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
+        assert!(calls.iter().all(|(_, args, _)| args.iter().all(|arg| !arg.contains(secret))));
+        assert!(calls.iter().all(|(cmd, args, _)| cmd != "sh" || !args.iter().any(|arg| arg.contains("claude -p"))));
     }
 
     #[tokio::test]
@@ -5212,6 +5112,9 @@ interactions:
             }
 
             async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+                if cmd == "sh" && args == ["-c", "command -v claude"] {
+                    return Err("consumer binary unavailable".into());
+                }
                 self.0.run_output(cmd, args, cwd, label).await
             }
 
@@ -5232,101 +5135,6 @@ interactions:
             .await
             .expect_err("a matching harness without its binary must still refuse");
         assert!(error.contains("consumer binary is unavailable"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn claude_oauth_preflight_scratch_dir_prefers_the_user_runtime_dir_over_absolute_run() {
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
-        let env = Arc::new(TestEnv(BTreeMap::from([
-            ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
-            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
-        ])));
-        let runner = Arc::new(RecordingRunner::default());
-        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
-        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
-
-        store.prepare("env-a", &BTreeSet::from(["claude-max".to_string()]), runner.clone()).await.expect("prepare claude-oauth credential");
-
-        let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls
-            .iter()
-            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/run/user/1000/flotilla/credentials/claude-max/claude-preflight"]));
-        assert!(calls.iter().any(|(cmd, args, _)| {
-            cmd == "sh" && args.iter().any(|arg| arg == "/run/user/1000/flotilla/credentials/claude-max/claude-preflight")
-        }));
-        assert!(
-            calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.starts_with("/run/flotilla")),
-            "the preflight must never touch root-owned /run/flotilla on the host"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_blank_user_runtime_dir_falls_back_to_the_daemon_state_dir() {
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
-        let env = Arc::new(TestEnv(BTreeMap::from([
-            ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
-            ("XDG_RUNTIME_DIR".to_string(), "   ".to_string()),
-        ])));
-        let runner = Arc::new(RecordingRunner::default());
-        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
-        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
-
-        store.prepare("env-a", &BTreeSet::from(["claude-max".to_string()]), runner.clone()).await.expect("prepare claude-oauth credential");
-
-        let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls
-            .iter()
-            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight"]));
-    }
-
-    #[tokio::test]
-    async fn a_dangling_user_runtime_dir_falls_back_to_the_daemon_state_dir() {
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
-        let env = Arc::new(TestEnv(BTreeMap::from([
-            ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
-            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000-removed".to_string()),
-        ])));
-        let runner = Arc::new(RecordingRunner::with_runtime_dir_checks([false, false]));
-        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
-        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
-
-        store.prepare("env-a", &BTreeSet::from(["claude-max".to_string()]), runner.clone()).await.expect("prepare claude-oauth credential");
-
-        let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls
-            .iter()
-            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight"]));
-        assert!(calls.iter().all(|(cmd, args, _)| {
-            cmd != "mkdir" || args != &["-p", "/run/user/1000-removed/flotilla/credentials/claude-max/claude-preflight"]
-        }));
-    }
-
-    #[tokio::test]
-    async fn user_runtime_dir_is_rechecked_for_each_claude_oauth_preflight() {
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
-        let env = Arc::new(TestEnv(BTreeMap::from([
-            ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
-            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
-        ])));
-        let runner = Arc::new(RecordingRunner::with_runtime_dir_checks([true, true, false, false]));
-        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
-        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
-        let credential_refs = BTreeSet::from(["claude-max".to_string()]);
-
-        store.prepare("env-a", &credential_refs, runner.clone()).await.expect("first preflight");
-        store.prepare("env-b", &credential_refs, runner.clone()).await.expect("second preflight");
-
-        let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls
-            .iter()
-            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/run/user/1000/flotilla/credentials/claude-max/claude-preflight"]));
-        assert!(calls
-            .iter()
-            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight"]));
     }
 
     #[tokio::test]
@@ -5432,123 +5240,52 @@ interactions:
             .all(|arg| !arg.contains("token-before-rotation") && !arg.contains("token-after-rotation")));
     }
 
-    struct DeadTokenRunner {
-        inner: RecordingRunner,
-        secret: String,
-    }
-
+    // Subprocess seam: credential preparation must never request inference,
+    // regardless of the token's actual validity or inference quota.
+    struct NoInferenceRunner(RecordingRunner);
     #[async_trait]
-    impl CommandRunner for DeadTokenRunner {
+    impl CommandRunner for NoInferenceRunner {
         async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-            self.inner.run(cmd, args, cwd, label).await
+            assert!(!args.iter().any(|arg| arg.contains("claude -p")
+                || arg.contains("--print")
+                || arg.contains("/messages")
+                || arg.contains("/completions")));
+            self.0.run(cmd, args, cwd, label).await
         }
-
         async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-            self.inner.run_output(cmd, args, cwd, label).await
+            self.run(cmd, args, cwd, label).await?;
+            self.0.run_output(cmd, args, cwd, label).await
         }
-
-        async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
-            self.inner.run_with_input(cmd, args, cwd, label, input).await?;
-            if args.iter().any(|arg| arg.contains("claude -p")) {
-                return Err(format!("Login expired for {} · Please run /login", self.secret));
-            }
-            Ok(String::new())
+        async fn run_with_input(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel, _: &[u8]) -> Result<String, String> {
+            panic!("OAuth delivery must not authenticate by sending a model turn")
         }
-
         async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
-            self.inner.exists(cmd, args).await
+            self.0.exists(cmd, args).await
         }
-
         async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
-            self.inner.write_file(path, content).await
+            self.0.write_file(path, content).await
         }
     }
 
+    // Unknown entitlement permits delivery of exactly the selected credential;
+    // preparation never spends a turn to learn whether it will be refused.
     #[tokio::test]
-    async fn a_dead_claude_oauth_token_fails_preparation_loudly_without_leaking_material() {
+    async fn claude_oauth_preparation_never_requests_inference() {
         let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
-        let secret = "sk-ant-oat01-expired-token";
+        let secret = "fake-selected-credential";
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_CLAUDE_TOKEN".to_string(), secret.to_string())])));
-        let runner = Arc::new(DeadTokenRunner { inner: RecordingRunner::default(), secret: secret.to_string() });
+        let runner = Arc::new(NoInferenceRunner(RecordingRunner::default()));
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
         let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
-        let credential_refs = BTreeSet::from(["claude-max".to_string()]);
-
-        let error = store.prepare("env-a", &credential_refs, runner.clone()).await.expect_err("a dead token must fail preparation");
-
-        assert!(error.contains("credential `claude-max` adapter `claude-oauth`"), "unexpected error: {error}");
-        assert!(error.contains("preflight failed"), "unexpected error: {error}");
-        assert!(!error.contains(secret), "material must be redacted: {error}");
-        assert!(error.contains("[redacted]"), "unexpected error: {error}");
-
-        store.prepare("env-a", &credential_refs, runner.clone()).await.expect_err("a dead token must fail again, not be cached");
-        let calls = runner.inner.calls.lock().expect("calls lock");
-        assert_eq!(
-            calls.iter().filter(|(cmd, args, _)| cmd == "sh" && args.iter().any(|arg| arg.contains("claude -p"))).count(),
-            2,
-            "failed preparation must not mark the credential prepared"
-        );
-    }
-
-    struct ExhaustedHeadlessCreditsRunner {
-        inner: RecordingRunner,
-    }
-
-    #[async_trait]
-    impl CommandRunner for ExhaustedHeadlessCreditsRunner {
-        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-            self.inner.run(cmd, args, cwd, label).await
+        for environment in ["env-a", "env-a", "env-b"] {
+            let delivered = store
+                .prepare(environment, &BTreeSet::from(["claude-max".to_string()]), runner.clone())
+                .await
+                .expect("deliver unknown entitlement");
+            assert!(delivered.contains(&("CLAUDE_CODE_OAUTH_TOKEN".into(), secret.into())));
         }
-
-        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-            self.inner.run_output(cmd, args, cwd, label).await
-        }
-
-        async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
-            self.inner.run_with_input(cmd, args, cwd, label, input).await?;
-            if args.iter().any(|arg| arg.contains("claude -p")) {
-                return Err(
-                    "You've reached your monthly Agent SDK credit quota. Add billing credits to continue using Claude Code headlessly."
-                        .to_string(),
-                );
-            }
-            Ok(String::new())
-        }
-
-        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
-            self.inner.exists(cmd, args).await
-        }
-
-        async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
-            self.inner.write_file(path, content).await
-        }
-    }
-
-    #[tokio::test]
-    async fn exhausted_headless_credits_do_not_reject_a_valid_claude_oauth_token() {
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
-        let secret = "sk-ant-oat01-valid-token";
-        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_CLAUDE_TOKEN".to_string(), secret.to_string())])));
-        let runner = Arc::new(ExhaustedHeadlessCreditsRunner { inner: RecordingRunner::default() });
-        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
-        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
-        let credential_refs = BTreeSet::from(["claude-max".to_string()]);
-
-        let delivered = store
-            .prepare("env-a", &credential_refs, runner.clone())
-            .await
-            .expect("headless credit exhaustion does not invalidate the token used by interactive crews");
-
-        assert!(delivered.contains(&("CLAUDE_CODE_OAUTH_TOKEN".to_string(), secret.to_string())));
-        store.prepare("env-a", &credential_refs, runner.clone()).await.expect("successful preparation is cached");
-        let calls = runner.inner.calls.lock().expect("calls lock");
-        assert_eq!(
-            calls.iter().filter(|(cmd, args, _)| cmd == "sh" && args.iter().any(|arg| arg.contains("claude -p"))).count(),
-            1,
-            "accepted credit exhaustion should mark the credential prepared"
-        );
+        assert!(runner.0.calls.lock().expect("calls").iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
     }
 
     #[tokio::test]

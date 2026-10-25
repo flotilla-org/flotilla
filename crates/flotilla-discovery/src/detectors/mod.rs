@@ -27,7 +27,7 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
         Box::new(EnvVarDetector::new("ZELLIJ_SESSION_NAME")),
         Box::new(CommandDetector::new("zellij", &["--version"], parse_first_dotted_version)),
         Box::new(CommandDetector::new("cleat", &["--version"], parse_first_dotted_version)),
-        Box::new(CommandDetector::new("gemini", &["--version"], parse_first_dotted_version)),
+        Box::new(cloud_agent::binary_presence_detector("gemini")),
         Box::new(EnvVarDetector::new("TERM")),
         Box::new(EnvVarDetector::new("COLORTERM")),
     ];
@@ -80,10 +80,10 @@ mod tests {
             ("git", &["--version"], "git version 2.43.0\n", None, "git", "2.43.0"),
             ("curl", &["--version"], "curl 8.7.1 (arm64-apple-darwin)\n", None, "curl", "8.7.1"),
             ("gh", &["--version"], "gh version 2.49.0\n", None, "gh", "2.49.0"),
-            ("agent", &["--version"], "0.1.0\n", None, "agent", "0.1.0"),
+            ("agent", &["--version"], "0.1.0\n", Some(resolve("agent")), "/tools/agent", "0.1.0"),
             ("zellij", &["--version"], "zellij 0.40.1\n", None, "zellij", "0.40.1"),
             ("cleat", &["--version"], "cleat 0.1.0\n", None, "cleat", "0.1.0"),
-            ("gemini", &["--version"], "gemini 1.0.0\n", None, "gemini", "1.0.0"),
+            ("gemini", &["--version"], "gemini 1.0.0\n", Some(resolve("gemini")), "/tools/gemini", "1.0.0"),
             ("codex", &["--version"], "codex-cli 0.5.0\n", Some(resolve("codex")), "/tools/codex", "0.5.0"),
             ("claude", &["--version"], "1.0.20 (Claude Code)\n", Some(resolve("claude")), "/tools/claude", "1.0.20"),
         ];
@@ -95,7 +95,12 @@ mod tests {
             }
             let bag = run_host_detectors(&default_host_detectors(), &runner.build(), &TestEnvVars::default()).await;
 
-            assert_eq!(bag.assertions(), [EnvironmentAssertion::versioned_binary(command, path, version)], "{command}");
+            let expected = if ["claude", "codex", "agent", "gemini"].contains(&command) {
+                EnvironmentAssertion::binary(command, path)
+            } else {
+                EnvironmentAssertion::versioned_binary(command, path, version)
+            };
+            assert_eq!(bag.assertions(), [expected], "{command}");
         }
     }
 

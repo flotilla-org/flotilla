@@ -321,6 +321,11 @@ pub(super) async fn apply_agentless_ssh_observation(
     } else {
         BTreeMap::new()
     };
+    for facts in fulfilment_facts.values_mut() {
+        for harness in facts.harnesses.values_mut() {
+            harness.models.clear();
+        }
+    }
     // The owning daemon is the only placer here, so it alone counts the
     // vessels held against the host's cap (#3793).
     if let Some(cap) = ssh.max_vessels {
@@ -358,7 +363,7 @@ pub(super) async fn apply_agentless_ssh_observation(
             (OWNING_DAEMON_CAPABILITY.to_string(), json!(daemon.local_host_id().map(|id| id.to_string()))),
         ]),
         fulfilment_facts,
-        model_probes: host.status.as_ref().map(|status| status.model_probes.clone()).unwrap_or_default(),
+        model_probes: ModelProbeState::default(),
         // This timestamp is the owning daemon's last successful SSH probe,
         // never a heartbeat emitted by a daemon on the target host.
         heartbeat_at: probe_succeeded.then(Utc::now),
@@ -520,6 +525,7 @@ pub(super) async fn observe_fulfilment_facts(
     probe: FulfilmentProbeContext<'_>,
     model_probes: &mut ModelProbeState,
 ) -> Result<BTreeMap<String, FulfilmentFacts>, String> {
+    *model_probes = ModelProbeState::default();
     let hosts = backend.clone().using::<Host>(namespace).list().await.map_err(|error| error.to_string())?;
     let all_kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?.items;
     let mut kinds = Vec::new();
@@ -534,8 +540,7 @@ pub(super) async fn observe_fulfilment_facts(
     let baselines = backend.clone().definitions::<flotilla_resources::CrewImageBaseline>(namespace);
     let mut facts = BTreeMap::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
-    // Model requests share a host budget, so kinds run serially. Rotate the
-    // starting kind each pass: a persistently slow kind must not always take
+    // Rotate the starting kind each pass: a persistently slow kind must not always take
     // the first slice of the host-wide deadline.
     if !kinds.is_empty() {
         let offset = (Utc::now().timestamp() as usize / FULFILMENT_CHANGE_CHECK_INTERVAL.as_secs() as usize) % kinds.len();
@@ -624,7 +629,10 @@ pub(super) async fn observe_fulfilment_facts(
                 }
             },
         };
-        if let Some(observed) = observed.or_else(|| previous.get(&name).cloned()) {
+        if let Some(mut observed) = observed.or_else(|| previous.get(&name).cloned()) {
+            for harness in observed.harnesses.values_mut() {
+                harness.models.clear();
+            }
             facts.insert(name, observed);
         }
     }
