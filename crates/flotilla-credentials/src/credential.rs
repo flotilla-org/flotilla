@@ -8,6 +8,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use flotilla_discovery_api::EnvironmentBag;
+use flotilla_environment::environment::runner::{CredentialDeliveryPaths, HARNESS_AUTH_FILES};
 use flotilla_environment::environment::{
     registry_auth::{RegistryAuthMaterial, RegistryConfig},
     PreparedEnvironmentAuth, RegistryAuth,
@@ -410,22 +411,6 @@ struct GitCredentialContribution {
     preflight: Option<GitCredentialPreflight>,
 }
 
-struct CredentialDeliveryPaths {
-    base: PathBuf,
-    git_config: PathBuf,
-}
-
-impl CredentialDeliveryPaths {
-    fn new(base: PathBuf) -> Self {
-        let git_config = base.join("credentials/gitconfig");
-        Self { base, git_config }
-    }
-
-    fn credential_dir(&self, name: &str) -> PathBuf {
-        self.base.join("credentials").join(safe_component(name))
-    }
-}
-
 #[derive(bon::Builder)]
 struct PendingGitPreflight {
     credential_name: String,
@@ -651,7 +636,7 @@ impl CredentialStore {
             let paths = self.delivery_paths(runner).await?;
             Ok(codex_credentials
                 .into_iter()
-                .map(|name| codex_home_fragment(name, paths.credential_dir(name).join("codex").to_string_lossy()))
+                .map(|name| codex_home_fragment(name, paths.harness_home(name, "codex").to_string_lossy()))
                 .collect())
         })
     }
@@ -1296,11 +1281,10 @@ impl CredentialStore {
                 return Err(bounded_adapter_error(credential_name, "github-app", "installation token response was empty"));
             }
             let paths = self.delivery_paths(runner).await?;
-            prune_abandoned_skill_source_tokens(runner, &paths.base.join("skill-sources")).await?;
+            prune_abandoned_skill_source_tokens(runner, &paths.skill_source_dir()).await?;
             // Each staging owns its token. A concurrent staging must not replace or
             // delete a token while another Git process is still reading it.
-            let token_file =
-                paths.base.join("skill-sources").join(safe_component(credential_name)).join(format!("token-{}", uuid::Uuid::new_v4()));
+            let token_file = paths.skill_source_dir().join(safe_component(credential_name)).join(format!("token-{}", uuid::Uuid::new_v4()));
             write_github_app_token_file(runner, &token_file, token.value.trim_end()).await?;
             Ok(token_file)
         })
@@ -2152,10 +2136,7 @@ impl CredentialStore {
                     probe?;
                 }
                 env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), material.to_string());
-                env.insert(
-                    "CLAUDE_CONFIG_DIR".to_string(),
-                    delivery_paths.credential_dir(name).join("claude").to_string_lossy().into_owned(),
-                );
+                env.insert("CLAUDE_CONFIG_DIR".to_string(), prepare_harness_home(delivery_paths, name, "claude", &*runner).await?);
             }
             CredentialConsumer::Codex => {
                 let delivery_paths = delivery_paths.expect("Codex adapter resolves delivery paths");
@@ -2191,7 +2172,7 @@ impl CredentialStore {
                     )
                     .await?;
                 }
-                env.insert("CODEX_HOME".to_string(), codex_home);
+                env.insert("CODEX_HOME".to_string(), prepare_harness_home(delivery_paths, name, "codex", &*runner).await?);
             }
             CredentialConsumer::ReviewBundleStore { endpoint, bucket, region, public_base_url, allow_http, virtual_hosted_style } => {
                 let delivery_paths = delivery_paths.expect("review bundle store adapter resolves delivery paths");
@@ -2217,6 +2198,44 @@ impl CredentialStore {
         }
         Ok(AdapterDelivery { env, git_credential })
     }
+}
+
+// Keep pre-roll session scratch, but import neither login files nor crew auth
+// links. Once imported, old snapshots must never overwrite newer session state.
+async fn prepare_harness_home(
+    paths: &CredentialDeliveryPaths,
+    name: &str,
+    harness: &str,
+    runner: &dyn CommandRunner,
+) -> Result<String, String> {
+    let delivered = paths.credential_dir(name).join(harness);
+    let home = paths.harness_home(name, harness);
+    let excludes = HARNESS_AUTH_FILES.iter().map(|name| format!("--exclude={name}")).collect::<Vec<_>>().join(" ");
+    let auth_files = HARNESS_AUTH_FILES.join(" ");
+    let script = format!(
+        r#"set -eu
+mkdir -p "$2"
+chmod 700 "$2"
+if [ -d "$1" ] && [ ! -e "$2/.flotilla-home-imported" ]; then
+  archive=$(mktemp) || exit 1
+  trap 'rm -f -- "$archive"' EXIT
+  tar {excludes} -C "$1" -cf "$archive" .
+  tar --skip-old-files -C "$2" -xf "$archive"
+  touch "$2/.flotilla-home-imported"
+fi
+for file in {auth_files}; do
+  if [ -f "$1/$file" ]; then ln -sf "$1/$file" "$2/$file"; fi
+done"#
+    );
+    runner
+        .run(
+            "sh",
+            &["-c", &script, "flotilla-harness-home", &delivered.to_string_lossy(), &home.to_string_lossy()],
+            Path::new("/"),
+            &ChannelLabel::Default,
+        )
+        .await?;
+    Ok(home.to_string_lossy().into_owned())
 }
 
 fn canonical_git_http_host(host: &str) -> Result<String, String> {
@@ -4859,7 +4878,7 @@ interactions:
 
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0, "CODEX_HOME");
-        assert_eq!(delivered[0].1, "/tmp/flotilla-test-state/credentials/model-api/codex");
+        assert_eq!(delivered[0].1, "/tmp/flotilla-test-state/agent-homes/model-api/codex");
         assert!(!delivered.iter().any(|(name, value)| name == "OPENAI_API_KEY" || value == secret));
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, input)| {
@@ -4868,6 +4887,141 @@ interactions:
         assert!(calls.iter().any(|(cmd, args, _)| cmd == "sh" && args.iter().any(|arg| arg.contains("codex login status"))));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.starts_with("/run/flotilla")));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
+    }
+
+    // #3797: checkpoints preserve sessions in the homes returned by production
+    // credential and crew selection, but contain no delivered material or auth links.
+    #[tokio::test]
+    async fn checkpoint_omits_delivered_credentials_and_keeps_sessions() {
+        use crate::agent_material::AgentMaterialRegistry;
+        use flotilla_environment::environment::drydock::write_checkpoint;
+        use flotilla_environment::environment::runner::{CONTAINED_CODEX_HOME, CONTAINED_WRITABLE_CONFIG_BASE};
+        use flotilla_provider_runtime::ProcessCommandRunner;
+        struct GuestFilesystem(PathBuf);
+        impl GuestFilesystem {
+            fn map(&self, value: &str) -> String {
+                let mut value = value.to_string();
+                for path in [CONTAINED_WRITABLE_CONFIG_BASE, CONTAINED_CODEX_HOME] {
+                    value = value.replace(
+                        path.trim_start_matches('/'),
+                        self.0.join(path.trim_start_matches('/')).to_str().unwrap().trim_start_matches('/'),
+                    );
+                }
+                for path in ["/root", "/workspace", "/var/lib/flotilla/cleat"] {
+                    let local = self.0.join(path.trim_start_matches('/')).display().to_string();
+                    value = if value == path || value.starts_with(&format!("{path}/")) {
+                        value.replacen(path, &local, 1)
+                    } else {
+                        value.replace(&format!("'{path}'"), &format!("'{local}'"))
+                    };
+                }
+                value
+            }
+        }
+        // Only the remote process/filesystem boundary is substituted. Home
+        // selection, migration, credential linking and GNU tar are production code.
+        #[async_trait]
+        impl CommandRunner for GuestFilesystem {
+            async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+                let args = args.iter().map(|arg| self.map(arg)).collect::<Vec<_>>();
+                ProcessCommandRunner.run_output(cmd, &args.iter().map(String::as_str).collect::<Vec<_>>(), cwd, label).await
+            }
+            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+                let output = self.run_output(cmd, args, cwd, label).await?;
+                if output.success() {
+                    Ok(output.stdout)
+                } else {
+                    Err(output.stderr)
+                }
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+            async fn writable_config_base(&self, _: Option<&Path>, _: &Path) -> Result<PathBuf, String> {
+                Ok(CONTAINED_WRITABLE_CONFIG_BASE.into())
+            }
+            async fn run_to_file(&self, cmd: &str, args: &[&str], cwd: &Path, target: &Path) -> Result<(), String> {
+                let args = args.iter().map(|arg| self.map(arg)).collect::<Vec<_>>();
+                ProcessCommandRunner.run_to_file(cmd, &args.iter().map(String::as_str).collect::<Vec<_>>(), cwd, target).await
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let runner = Arc::new(GuestFilesystem(directory.path().join("guest")));
+        let write = |path: &Path, bytes: &[u8]| {
+            let path = PathBuf::from(runner.map(path.to_str().unwrap()));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        let paths = CredentialDeliveryPaths::new(CONTAINED_WRITABLE_CONFIG_BASE.into());
+        let registry = AgentMaterialRegistry::new(Arc::new(TestEnv(BTreeMap::new())));
+        let mut sessions = vec![PathBuf::from("/workspace/work.txt"), PathBuf::from("/var/lib/flotilla/cleat/session")];
+        for (name, harness, adapter, variable) in [
+            ("claude-max", "claude", "claude-code", "CLAUDE_CONFIG_DIR"),
+            ("model-api", "codex", "codex", "CODEX_HOME"),
+            ("central-login", "codex", "codex", "CODEX_HOME"),
+        ] {
+            let delivered = paths.credential_dir(name).join(harness);
+            for file in HARNESS_AUTH_FILES {
+                write(&delivered.join(file), b"delivered secret");
+            }
+            // Existing base and crew sessions survive the directory separation.
+            for relative in ["sessions/base.jsonl", "crews/coder/sessions/crew.jsonl"] {
+                write(&delivered.join(relative), b"old session");
+            }
+            let home = if name == "central-login" {
+                for file in HARNESS_AUTH_FILES {
+                    write(&Path::new(CONTAINED_CODEX_HOME).join(file), b"central secret");
+                }
+                CONTAINED_CODEX_HOME.to_string()
+            } else {
+                prepare_harness_home(&paths, name, harness, &*runner).await.unwrap()
+            };
+            let crew_env = registry
+                .crew_environment("coder", &BTreeSet::from([adapter.into()]), &[(variable.into(), home.clone())], &*runner)
+                .await
+                .unwrap();
+            let crew = PathBuf::from(&crew_env.iter().find(|(key, _)| key == variable).unwrap().1);
+            assert_ne!(crew, Path::new(&home), "selection must give each crew private scratch");
+            if name != "central-login" {
+                assert_eq!(std::fs::read(runner.map(crew.join("sessions/crew.jsonl").to_str().unwrap())).unwrap(), b"old session");
+                write(&Path::new(&home).join("sessions/base.jsonl"), b"new session");
+                write(&delivered.join("auth.json"), b"rotated secret");
+                prepare_harness_home(&paths, name, harness, &*runner).await.unwrap();
+                assert_eq!(
+                    std::fs::read(runner.map(Path::new(&home).join("sessions/base.jsonl").to_str().unwrap())).unwrap(),
+                    b"new session"
+                );
+                assert_eq!(std::fs::read(runner.map(crew.join("auth.json").to_str().unwrap())).unwrap(), b"rotated secret");
+            }
+            sessions.extend([Path::new(&home).join("sessions/base.jsonl"), crew.join("sessions/crew.jsonl")]);
+        }
+        write(&paths.credential_dir("future-kind").join("arbitrary-name"), b"future secret");
+        write(&paths.skill_source_dir().join("source/token"), b"source secret");
+        for path in &sessions {
+            write(path, b"recoverable state");
+        }
+        let target = directory.path().join("checkpoint.tar");
+        write_checkpoint(runner.clone(), &target, Path::new("/workspace")).await.unwrap();
+        let listing =
+            ProcessCommandRunner.run("tar", &["-tf", target.to_str().unwrap()], Path::new("/"), &ChannelLabel::Default).await.unwrap();
+        for forbidden in ["/credentials/", "/skill-sources/", "auth.json", ".credentials.json"] {
+            assert!(!listing.contains(forbidden), "archived credential entry: {forbidden}");
+        }
+        for path in &sessions {
+            assert!(listing.contains(path.strip_prefix("/").unwrap().to_str().unwrap()), "session missing: {path:?}");
+        }
+        let restored = directory.path().join("restored");
+        std::fs::create_dir(&restored).unwrap();
+        ProcessCommandRunner
+            .run("tar", &["-xf", target.to_str().unwrap(), "-C", restored.to_str().unwrap()], Path::new("/"), &ChannelLabel::Default)
+            .await
+            .unwrap();
+        for path in sessions {
+            assert_eq!(
+                std::fs::read(restored.join(runner.map(path.to_str().unwrap()).trim_start_matches('/'))).unwrap(),
+                b"recoverable state"
+            );
+        }
     }
 
     async fn create_claude_oauth_spec(backend: &ResourceBackend, name: &str, account_email: &str, source_env: &str) {
@@ -4916,7 +5070,7 @@ interactions:
         );
         assert!(delivered
             .iter()
-            .any(|(name, value)| { name == "CLAUDE_CONFIG_DIR" && value == "/tmp/flotilla-test-state/credentials/claude-max/claude" }));
+            .any(|(name, value)| { name == "CLAUDE_CONFIG_DIR" && value == "/tmp/flotilla-test-state/agent-homes/claude-max/claude" }));
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls
             .iter()
@@ -5109,8 +5263,8 @@ interactions:
 
         assert_eq!(alice.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-alice".to_string()));
         assert_eq!(bob.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-bob".to_string()));
-        assert_eq!(alice.get("CLAUDE_CONFIG_DIR"), Some(&"/tmp/flotilla-test-state/credentials/claude-alice/claude".to_string()));
-        assert_eq!(bob.get("CLAUDE_CONFIG_DIR"), Some(&"/tmp/flotilla-test-state/credentials/claude-bob/claude".to_string()));
+        assert_eq!(alice.get("CLAUDE_CONFIG_DIR"), Some(&"/tmp/flotilla-test-state/agent-homes/claude-alice/claude".to_string()));
+        assert_eq!(bob.get("CLAUDE_CONFIG_DIR"), Some(&"/tmp/flotilla-test-state/agent-homes/claude-bob/claude".to_string()));
 
         let error = store
             .prepare("env-c", &BTreeSet::from(["claude-alice".to_string(), "claude-bob".to_string()]), runner.clone())
@@ -5158,7 +5312,7 @@ interactions:
         assert_eq!(before.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-before-rotation".to_string()));
         assert_eq!(after.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-after-rotation".to_string()));
         assert_eq!(before.get("CLAUDE_CONFIG_DIR"), after.get("CLAUDE_CONFIG_DIR"));
-        assert_eq!(after.get("CLAUDE_CONFIG_DIR"), Some(&"/tmp/flotilla-test-state/credentials/claude-max/claude".to_string()));
+        assert_eq!(after.get("CLAUDE_CONFIG_DIR"), Some(&"/tmp/flotilla-test-state/agent-homes/claude-max/claude".to_string()));
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().all(|(command, args, _)| {
             command != "rm" || args == &["-rf".to_string(), "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight".to_string()]

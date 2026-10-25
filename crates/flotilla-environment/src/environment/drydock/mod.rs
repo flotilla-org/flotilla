@@ -470,7 +470,8 @@ impl Drop for DrydockEnvironment {
         }
     }
 }
-async fn write_checkpoint(runner: Arc<dyn CommandRunner>, target: &Path, root: &Path) -> Result<(), String> {
+/// Capture recoverable guest state through its runner, publishing only a complete archive.
+pub async fn write_checkpoint(runner: Arc<dyn CommandRunner>, target: &Path, root: &Path) -> Result<(), String> {
     let temporary = target.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     // Synchronous drop cleanup also runs when the async task is cancelled.
     struct PartialArchive(PathBuf);
