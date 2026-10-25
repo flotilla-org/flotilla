@@ -476,20 +476,29 @@ impl ProjectService<'_> {
                     .map_err(|error| format!("project member alias `{}` refers to unavailable repository {key}: {error}", member.alias))?
             };
             let live_remote = declared_spec.live_remote().expect("remote RepositorySpec has a live remote");
-            let updated_spec = repository.spec.clone().update_remotes(live_remote)?;
-            let mut repository_meta = InputMeta::from(&repository.metadata);
-            for (annotation, value) in &provenance {
-                if repository_meta.annotations.get(annotation) != Some(value) {
-                    converged = true;
-                    repository_meta.annotations.insert(annotation.clone(), value.clone());
+            let mut backoff = std::time::Duration::from_millis(10);
+            loop {
+                let updated_spec = repository.spec.clone().update_remotes(live_remote)?;
+                let mut repository_meta = InputMeta::from(&repository.metadata);
+                repository_meta.annotations.extend(provenance.clone());
+                if repository_meta.annotations == repository.metadata.annotations && updated_spec == repository.spec {
+                    break;
                 }
-            }
-            if repository_meta.annotations != repository.metadata.annotations || updated_spec != repository.spec {
-                converged = true;
-                repository = repositories
-                    .update(&repository_meta, &repository.metadata.resource_version, &updated_spec)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                // Status and spec share a version. Rebase this narrow declaration
+                // change onto the latest object without replaying registration.
+                match repositories.update(&repository_meta, &repository.metadata.resource_version, &updated_spec).await {
+                    Ok(updated) => {
+                        converged = true;
+                        repository = updated;
+                        break;
+                    }
+                    Err(ResourceError::Conflict { .. }) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(1));
+                        repository = repositories.get(&key.to_string()).await.map_err(|error| error.to_string())?;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
             }
             repository
                 .spec
@@ -1687,6 +1696,9 @@ pub async fn snapshot_project_repositories_from_project(
 }
 
 #[cfg(test)]
+mod registration_race;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
 
@@ -1895,6 +1907,7 @@ mod tests {
         }
     }
 
+    // Registration must survive a startup status write between its Repository read and spec write.
     #[tokio::test]
     async fn project_registration_uses_injected_inspection_and_identity_resolution() {
         let temp = tempfile::tempdir().expect("checkout directory");
@@ -1920,8 +1933,13 @@ mod tests {
             })),
             ..Default::default()
         };
-        let backend = ResourceBackend::new(InMemoryBackend::default());
         let observed = ResourceBackend::new(InMemoryBackend::observed());
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let backend = ResourceBackend::new(super::registration_race::RacingStore {
+            inner: Arc::new(InMemoryBackend::default()),
+            armed: Arc::clone(&armed),
+            observed: observed.clone(),
+        });
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
         let service = ProjectService {
@@ -1954,6 +1972,10 @@ mod tests {
         .await
         .expect("bootstrap and fleet authoring must not deadlock");
         assert_eq!(registration.expect("register"), ("app".into(), 1));
+        assert!(!armed.load(Ordering::SeqCst), "startup reconciler must have raced registration");
+        let repository = backend.using::<Repository>("flotilla").get(&repository_spec.key().to_string()).await.expect("repository");
+        assert_eq!(repository.status.expect("controller status must survive registration").default_branch.as_deref(), Some("main"));
+        assert_eq!(repository.metadata.annotations[BOOTSTRAP_COMMIT_ANNOTATION], "abc123");
         assert_eq!(operations.identity_resolutions.load(Ordering::SeqCst), 1);
         let project = backend.definitions::<Project>("flotilla").get("app").await.expect("registered project");
         assert_eq!(project.spec.repositories[0].repo, repository_spec.key());
