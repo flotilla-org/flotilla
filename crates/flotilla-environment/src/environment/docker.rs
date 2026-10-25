@@ -257,7 +257,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         {
             let prepared = prepared.get::<DockerPrepared>(&self.preparation_owner)?;
             if prepared.platform != crate::guest_tools::linux_amd64() {
-                return Err(format!("unsupported guest platform {}", prepared.platform));
+                return Err(format!("unsupported guest platform {}", prepared.platform).into());
             }
             let directory = self.inner.runtime_directory(&id)?;
             let mut tools = opts.tools.clone();
