@@ -1223,6 +1223,15 @@ impl ReadProjections<'_> {
     }
 
     pub async fn explain_convoy(&self, namespace: &str, name: &str) -> Result<ConvoyExplanation, String> {
+        self.explain_convoy_with_resource(namespace, name).await.map(|(explanation, _)| explanation)
+    }
+
+    /// Keep the resolved, engine-viewed resource available for explanation enrichment.
+    pub async fn explain_convoy_with_resource(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(ConvoyExplanation, ResourceObject<ResourceConvoy>), String> {
         let mut candidates = vec![StoreQuery::names([name.to_string()], true)];
         if let Ok((role, project)) = flotilla_resources::parse_role_address(name) {
             let mut labels = BTreeMap::from([(ROLE_LABEL.into(), role.into())]);
@@ -1683,7 +1692,7 @@ impl ReadProjections<'_> {
         artifacts.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.address.cmp(&b.address)));
 
         let (messages, held) = message_evidence(self.backend, namespace, receivers.as_ref(), Some(&convoy), &receiver_aliases).await?;
-        Ok(ConvoyExplanation {
+        let explanation = ConvoyExplanation {
             warnings: convoy.spec.issues.iter().flat_map(|issue| issue.placement_needs().1).collect(),
             dispatch_scores: BTreeMap::new(),
             dispatch_score_error: None,
@@ -1816,7 +1825,8 @@ impl ReadProjections<'_> {
             settlement,
             recent_events,
             lifecycle_mutations,
-        })
+        };
+        Ok((explanation, convoy))
     }
 }
 
