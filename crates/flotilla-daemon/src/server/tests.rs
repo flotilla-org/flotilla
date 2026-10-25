@@ -1,3 +1,4 @@
+use flotilla_environment::environment::EnvironmentProvisionError;
 use flotilla_store_http::HttpBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
@@ -5234,7 +5235,7 @@ impl flotilla_environment::environment::EnvironmentProvider for GatedStartupEnvi
         _id: EnvironmentId,
         _image: &flotilla_environment::environment::PreparedEnvironment,
         _opts: flotilla_environment::environment::ProvisionOpts,
-    ) -> Result<flotilla_environment::environment::EnvironmentHandle, String> {
+    ) -> Result<flotilla_environment::environment::EnvironmentHandle, EnvironmentProvisionError> {
         Err("unused".into())
     }
     async fn list(&self) -> Result<Vec<flotilla_environment::environment::EnvironmentHandle>, String> {

@@ -1,4 +1,5 @@
 //! Docker resource runtime and provisioning cleanup.
+use flotilla_environment::environment::EnvironmentProvisionError;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -42,9 +43,9 @@ impl DockerControllerRuntime {
         &self,
         name: &str,
         spec: &flotilla_resources::DockerEnvironmentSpec,
-    ) -> Result<EnvironmentProvisioning, String> {
+    ) -> Result<EnvironmentProvisioning, EnvironmentProvisionError> {
         let result = self.provision_contained(name, spec).await;
-        if result.is_err() {
+        if matches!(result, Err(EnvironmentProvisionError::Failed(_))) {
             if let Some(sockets) = &self.state.environment_sockets {
                 sockets.remove(&EnvironmentId::new(name)).await?;
             }
@@ -171,7 +172,7 @@ impl DockerControllerRuntime {
         &self,
         name: &str,
         spec: &flotilla_resources::DockerEnvironmentSpec,
-    ) -> Result<EnvironmentProvisioning, String> {
+    ) -> Result<EnvironmentProvisioning, EnvironmentProvisionError> {
         let legacy_baseline = self.legacy_baseline_for_environment(name).await?;
         let (mut environment_spec, instance) =
             match self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(name).await {
@@ -182,7 +183,7 @@ impl DockerControllerRuntime {
                 Err(ResourceError::NotFound { .. }) => {
                     (EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) }, None)
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(error.to_string().into()),
             };
         if environment_spec.cloud_sandbox.is_none() {
             environment_spec.docker = Some(spec.clone());
@@ -231,7 +232,7 @@ impl DockerControllerRuntime {
         // resolve it. Path component comparisons already ignore redundant `.`.
         for mount in &spec.mounts {
             if Path::new(&mount.target_path).components().any(|part| part == std::path::Component::ParentDir) {
-                return Err(format!("mount target {} must not contain parent traversal", mount.target_path));
+                return Err(format!("mount target {} must not contain parent traversal", mount.target_path).into());
             }
         }
         for tool in &tools {
@@ -245,13 +246,13 @@ impl DockerControllerRuntime {
                     EnvironmentToolAssetKind::File | EnvironmentToolAssetKind::Directory => asset.environment_path.as_path(),
                 };
                 if spec.mounts.iter().any(|mount| Path::new(&mount.target_path) == reserved_path) {
-                    return Err(format!("mount target {} is reserved for {}", reserved_path.display(), asset.purpose));
+                    return Err(format!("mount target {} is reserved for {}", reserved_path.display(), asset.purpose).into());
                 }
             }
             for update in &tool.environment {
                 if let EnvironmentVariableUpdate::Set { name, purpose, .. } = update {
                     if spec.env.contains_key(name) {
-                        return Err(format!("environment variable {name} is reserved for {purpose}"));
+                        return Err(format!("environment variable {name} is reserved for {purpose}").into());
                     }
                 }
             }
@@ -339,7 +340,9 @@ impl DockerControllerRuntime {
             for mount in &spec.mounts {
                 let target = Path::new(&mount.target_path);
                 if target.starts_with(reserved) || reserved.starts_with(target) {
-                    return Err(format!("mount target {} overlaps reserved agent material at {}", target.display(), reserved.display()));
+                    return Err(
+                        format!("mount target {} overlaps reserved agent material at {}", target.display(), reserved.display()).into()
+                    );
                 }
             }
         }
@@ -420,11 +423,12 @@ impl DockerControllerRuntime {
         };
         let handle = match provider.provision(env_id.clone(), &prepared, opts.into()).await {
             Ok(handle) => handle,
+            Err(error @ EnvironmentProvisionError::RetryAdoption(_)) => return Err(error),
             Err(error) => {
                 let cleanup_errors =
                     forget_environment_state(self.state.credential_store.as_deref(), self.state.agent_material.as_deref(), name).await;
                 if !cleanup_errors.is_empty() {
-                    return Err(format!("{error}; additionally failed to {}", cleanup_errors.join("; ")));
+                    return Err(format!("{error}; additionally failed to {}", cleanup_errors.join("; ")).into());
                 }
                 return Err(error);
             }
@@ -708,7 +712,7 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         &self,
         name: &str,
         spec: &EnvironmentSpec,
-    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
         use flotilla_provisioning::reconcilers::EnvironmentProvisioning;
         if let Some(cloud) = &spec.cloud_sandbox {
             let carrier = flotilla_resources::DockerEnvironmentSpec {
@@ -988,9 +992,9 @@ pub(super) async fn discard_failed_environment(
     agent_material: Option<&AgentMaterialRegistry>,
     environment_ref: &str,
     error: String,
-) -> String {
+) -> EnvironmentProvisionError {
     if !handle.created_for_setup() {
-        return format!("{} {error}", flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX);
+        return EnvironmentProvisionError::RetryAdoption(error);
     }
     let mut cleanup_errors = Vec::new();
     if let Err(cleanup_error) = handle.destroy().await {
@@ -998,9 +1002,9 @@ pub(super) async fn discard_failed_environment(
     }
     cleanup_errors.extend(forget_environment_state(credential_store, agent_material, environment_ref).await);
     if cleanup_errors.is_empty() {
-        error
+        error.into()
     } else {
-        format!("{error}; additionally failed to {}", cleanup_errors.join("; "))
+        format!("{error}; additionally failed to {}", cleanup_errors.join("; ")).into()
     }
 }
 
@@ -1009,12 +1013,12 @@ pub(super) async fn discard_uncreated_environment(
     agent_material: Option<&AgentMaterialRegistry>,
     environment_ref: &str,
     error: String,
-) -> String {
+) -> EnvironmentProvisionError {
     let cleanup_errors = forget_environment_state(credential_store, agent_material, environment_ref).await;
     if cleanup_errors.is_empty() {
-        error
+        error.into()
     } else {
-        format!("{error}; additionally failed to {}", cleanup_errors.join("; "))
+        format!("{error}; additionally failed to {}", cleanup_errors.join("; ")).into()
     }
 }
 

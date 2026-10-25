@@ -13,6 +13,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_environment::environment::EnvironmentProvisionError;
 use flotilla_environment::environment::{
     image::{BuiltImage, FailedImageBuild, ImageBuildRequest, ImageDeliveryTarget, SecretFile},
     registry_auth::{RegistryAuthMaterial, RegistryConfig},
@@ -713,7 +714,7 @@ impl EnvironmentRuntime for Docker {
         &self,
         _name: &str,
         spec: &flotilla_resources::EnvironmentSpec,
-    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
         let spec = spec.docker.as_ref().expect("Docker scenario input");
 
         self.provisioned.lock().expect("provisioned").push((spec.image.clone(), spec.pull_policy));

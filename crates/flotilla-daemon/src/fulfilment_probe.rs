@@ -1,5 +1,7 @@
 //! Independent availability observations. Account/model entitlement is unknown:
 //! only actual crew work uses the selected credential and may spend model turns.
+#[cfg(test)]
+use flotilla_environment::environment::EnvironmentProvisionError;
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use chrono::Utc;
@@ -302,7 +304,7 @@ mod tests {
             id: flotilla_protocol::EnvironmentId,
             prepared: &flotilla_environment::environment::PreparedEnvironment,
             opts: flotilla_environment::environment::ProvisionOpts,
-        ) -> Result<flotilla_environment::environment::EnvironmentHandle, String> {
+        ) -> Result<flotilla_environment::environment::EnvironmentHandle, EnvironmentProvisionError> {
             self.0.provision(id, prepared, opts).await
         }
         async fn list(&self) -> Result<Vec<flotilla_environment::environment::EnvironmentHandle>, String> {

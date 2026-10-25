@@ -180,6 +180,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use flotilla_environment::environment::EnvironmentProvisionError;
     use flotilla_environment::environment::{EnvironmentHandle, ProvisionOpts};
     use flotilla_protocol::EnvironmentId;
     use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, InputMeta};
@@ -214,7 +215,7 @@ mod tests {
             _: EnvironmentId,
             _: &flotilla_environment::environment::PreparedEnvironment,
             _: ProvisionOpts,
-        ) -> Result<EnvironmentHandle, String> {
+        ) -> Result<EnvironmentHandle, EnvironmentProvisionError> {
             unreachable!()
         }
         async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
@@ -240,7 +241,7 @@ mod tests {
             &self,
             _: &str,
             _spec: &flotilla_resources::EnvironmentSpec,
-        ) -> Result<crate::reconcilers::EnvironmentProvisioning, String> {
+        ) -> Result<crate::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
             unreachable!()
         }
         async fn destroy(&self, environment: &str, id: &str) -> Result<(), String> {

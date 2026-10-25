@@ -1,3 +1,4 @@
+use flotilla_environment::environment::EnvironmentProvisionError;
 use std::{
     collections::HashMap,
     sync::{
@@ -100,8 +101,13 @@ impl EnvironmentProvider for MockEnvironmentProvider {
         Ok(PreparedEnvironment::new(&Arc::new(()), ()))
     }
 
-    async fn provision(&self, _id: EnvironmentId, _image: &PreparedEnvironment, _opts: ProvisionOpts) -> Result<EnvironmentHandle, String> {
-        self.create_result.lock().await.take().expect("create called more than expected")
+    async fn provision(
+        &self,
+        _id: EnvironmentId,
+        _image: &PreparedEnvironment,
+        _opts: ProvisionOpts,
+    ) -> Result<EnvironmentHandle, EnvironmentProvisionError> {
+        self.create_result.lock().await.take().expect("create called more than expected").map_err(Into::into)
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {

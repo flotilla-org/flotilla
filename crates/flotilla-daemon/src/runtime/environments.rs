@@ -372,7 +372,7 @@ async fn reconcile_cloud_environment(
                             Some(format!("Unknown: adoption failed; will retry: {error}")),
                         )
                         .await?;
-                        return Err(error);
+                        return Err(error.to_string());
                     }
                 }
                 let health = handle.detect_readiness().await;

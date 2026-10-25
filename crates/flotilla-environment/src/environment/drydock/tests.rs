@@ -456,7 +456,9 @@ async fn restart_failed_adoption_preserves_backing() {
     let mut restarted = host.provider();
     restarted.connector = Arc::new(Unreachable);
     let prepared = fixture_prepared(&host, &restarted).await;
-    assert!(restarted.provision(EnvironmentId::new("survivor"), &prepared, Default::default()).await.is_err());
+    assert!(
+        matches!(restarted.provision(EnvironmentId::new("survivor"), &prepared, Default::default()).await, Err(EnvironmentProvisionError::RetryAdoption(diagnostic)) if diagnostic == "injected SSH failure")
+    );
     assert_eq!(host.client.inspect("reference", &backing).await.unwrap().id, backing);
 }
 
@@ -637,8 +639,8 @@ async fn incomplete_adoption_keypair_requires_restore() {
         let original = tokio::fs::read(directory.join(missing)).await.unwrap();
         tokio::fs::remove_file(directory.join(missing)).await.unwrap();
         let failure = provider.provision(id.clone(), &prepared, Default::default()).await.err().expect("adoption must not regenerate keys");
-        assert!(failure.starts_with(CLOUD_ADOPTION_RETRY_PREFIX));
-        assert!(failure.contains("SSH keypair incomplete or missing for adopted backing"));
+        assert!(matches!(failure, EnvironmentProvisionError::RetryAdoption(_)));
+        assert!(failure.to_string().contains("SSH keypair incomplete or missing for adopted backing"));
         assert!(!directory.join(missing).exists());
         assert_eq!(host.client.inspect("reference", first.backing_id()).await.unwrap().id, first.backing_id());
         tokio::fs::write(directory.join(missing), original).await.unwrap();

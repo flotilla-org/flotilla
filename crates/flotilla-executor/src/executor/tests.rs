@@ -1,3 +1,4 @@
+use flotilla_environment::environment::EnvironmentProvisionError;
 use std::{path::PathBuf, sync::Arc};
 
 use flotilla_ai_utility::AiUtility;
@@ -1592,9 +1593,14 @@ impl EnvironmentProvider for MockEnvironmentProvider {
         Ok(PreparedEnvironment::new(&Arc::new(()), ()))
     }
 
-    async fn provision(&self, _id: EnvironmentId, _image: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String> {
+    async fn provision(
+        &self,
+        _id: EnvironmentId,
+        _image: &PreparedEnvironment,
+        opts: ProvisionOpts,
+    ) -> Result<EnvironmentHandle, EnvironmentProvisionError> {
         self.seen_create_opts.lock().await.push(opts);
-        self.create_results.lock().await.remove(0)
+        self.create_results.lock().await.remove(0).map_err(Into::into)
     }
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
         Ok(vec![])

@@ -685,7 +685,7 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
         } else {
             format!("mount target {} overlaps reserved agent material at {CONTAINER_CODEX_HOME}", Path::new(&target).display())
         };
-        assert_eq!(error, expected);
+        assert_eq!(error.to_string(), expected);
         assert!(provider.create_opts.lock().await.is_none(), "conflicts must fail before provider provisioning");
     }
 
@@ -887,8 +887,8 @@ async fn an_unprovisioned_central_codex_credential_fails_before_registry_preflig
         .await
         .expect_err("a host with no central Codex login cannot provision a Codex crew");
 
-    assert!(error.contains("codex-central/auth.json"), "the failure must name the central path: {error}");
-    assert!(error.contains("not provisioned"), "the failure must say the host lacks the credential: {error}");
+    assert!(error.to_string().contains("codex-central/auth.json"), "the failure must name the central path: {error}");
+    assert!(error.to_string().contains("not provisioned"), "the failure must say the host lacks the credential: {error}");
     assert_eq!(registry_runner.calls.load(Ordering::SeqCst), 0, "registry login and pull must not run before material is available");
     assert!(provider.create_opts.lock().await.is_none(), "provider create must not run without agent material");
     assert!(
