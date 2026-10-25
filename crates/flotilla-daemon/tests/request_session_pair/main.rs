@@ -4992,9 +4992,21 @@ fn generated_capabilities_queries_use_session_home(tc: hegel::TestCase) {
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 
-#[tokio::test]
-async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject() {
-    message_homes::messages_are_homed_at_the_receiver_and_replies_route_by_subject().await;
+// Sender records end on the receiver's replicated drop, across duplicate delivery and restart.
+#[hegel::test]
+fn messages_are_homed_at_the_receiver_and_replies_route_by_subject(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    // Generate short cancellation sequences: supersede, withdraw, expire;
+    // records may arrive after the drop, and the observer may restart between steps.
+    let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+    let operations = (0..steps)
+        .map(|_| (tc.draw(gs::integers::<usize>().min_value(0).max_value(2)), tc.draw(gs::booleans()), tc.draw(gs::booleans())))
+        .collect::<Vec<_>>();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(message_homes::messages_are_homed_at_the_receiver_and_replies_route_by_subject(&operations));
 }
 
 #[derive(flotilla_schema::Stored)]

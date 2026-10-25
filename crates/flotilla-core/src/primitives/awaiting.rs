@@ -27,7 +27,7 @@ use flotilla_state_machines::{
         awaiting_reply::{
             Answer, AwaitingReply, AwaitingReplyLabel, AwaitingReplyRefusal, AwaitingReplySpec, Expire, MemoryAwaitingReplyWorld, Withdraw,
         },
-        message::MessageRef,
+        message::{Message, MessageRef},
     },
     Home, Ref, Resource, WriteError,
 };
@@ -105,15 +105,65 @@ impl AwaitingReplies {
             Some(open) => Some(open.clone()),
             None => self.stored(&name)?,
         };
-        if let Some(existing) = existing {
+        let created = if let Some(existing) = existing {
             if *existing.spec() != spec {
                 return Err(format!("AwaitingReply `{name}` is recorded as {:?}, not {spec:?}", existing.spec()));
             }
-            return Ok(false);
+            false
+        } else {
+            home.create(&name, spec, &MemoryAwaitingReplyWorld::default(), now)
+                .map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))?;
+            true
+        };
+        // Replication may have delivered the drop before the send's record was
+        // written. Repeats retry this read and withdrawal after a store failure.
+        if let Some(record) = home.get(&name) {
+            let awaited = record.spec().message.clone();
+            let message = self
+                .service
+                .with_store(|store| {
+                    let mut read = store.read()?;
+                    let Some(id) = read.resolve(<Resource<Message> as flotilla_schema::Kind>::CODE, &awaited.name, &awaited.home)? else {
+                        return Ok(None);
+                    };
+                    Ok(read.load::<Resource<Message>>(id)?.map(|loaded| loaded.value))
+                })
+                .map_err(|error| error.to_string())?;
+            if let Some(message) = message {
+                Self::withdraw_dropped(&mut home, &awaited.home, &message, now)?;
+            }
         }
-        home.create(&name, spec, &MemoryAwaitingReplyWorld::default(), now)
-            .map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))?;
-        Ok(true)
+        Ok(created)
+    }
+
+    /// A receiver's drop is replicated evidence; only this home's sender ends
+    /// the matching record. Other homes and already-ended records are untouched.
+    pub(super) fn observe_drop(&self, message_home: &str, message: &Resource<Message>, now: Timestamp) -> Result<(), String> {
+        if message.state().drop_reason().is_none() {
+            return Ok(());
+        }
+        Self::withdraw_dropped(&mut locked(&self.home), message_home, message, now)
+    }
+
+    fn withdraw_dropped(
+        home: &mut Home<AwaitingReply, StoreLog>,
+        message_home: &str,
+        message: &Resource<Message>,
+        now: Timestamp,
+    ) -> Result<(), String> {
+        let Some(reason) = message.state().drop_reason() else { return Ok(()) };
+        let name = record_name(&MessageRef::new(message.name(), message_home));
+        let Some(record) = home.get(&name) else { return Ok(()) };
+        if record.spec().sender != message.spec().sender {
+            return Ok(());
+        }
+        let sender = record.spec().sender.clone();
+        Self::withdraw_open(home, &name, &sender, &format!("awaited message dropped: {reason:?}"), now)
+    }
+
+    /// Whether the sender still awaits this message, without loading ended history.
+    pub(super) fn is_open(&self, message: &MessageRef) -> bool {
+        locked(&self.home).get(&record_name(message)).is_some()
     }
 
     /// The record awaiting `message`, if it is homed here: open in memory, or

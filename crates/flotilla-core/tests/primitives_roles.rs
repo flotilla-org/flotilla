@@ -230,7 +230,12 @@ async fn a_stall_is_open_until_the_supervisors_reply_lands() {
     primitives.admit(NAMESPACE, &late, &stall).await.expect("stall sent");
     let (reply_name, reply) = resume("resume-2", &late);
     primitives.admit(NAMESPACE, &reply_name, &reply).await.expect("reply");
-    primitives.await_reply(NAMESPACE, &late, &stall, "home-a", "stall", Some(CREW)).await.expect("recorded");
+    // A send may have persisted its record before a later reconciliation read failed.
+    let mut partial = primitives.awaiting().get(&awaited).expect("earlier record").spec().clone();
+    partial.message = MessageRef::new(format!("project:fleet/role:governor/message:{late}"), "home-a");
+    primitives.awaiting().record(partial.clone(), flotilla_schema::Timestamp(1)).expect("record persisted before retry");
+    assert_eq!(primitives.awaiting().get(&partial.message).expect("partial record").label(), AwaitingReplyLabel::Open);
+    assert!(!primitives.await_reply(NAMESPACE, &late, &stall, "home-a", "stall", Some(CREW)).await.expect("retry reconciles reply"));
     let awaited = MessageRef::new(format!("project:fleet/role:governor/message:{late}"), "home-a");
     assert_eq!(primitives.awaiting().get(&awaited).expect("record").label(), AwaitingReplyLabel::Answered);
     // A send expecting nothing records nothing.

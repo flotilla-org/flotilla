@@ -534,15 +534,13 @@ impl MessagePrimitives {
                 }
                 Ok(())
             };
-            // A repeat finds its record and stops: the reply scan ran when it was written.
-            if let Some(existing) = awaiting.get(&message) {
-                return match *existing.spec() == spec {
-                    true => replace(&spec).map(|()| false),
-                    false => Err(format!("AwaitingReply for `{}` is recorded as {:?}, not {spec:?}", message.name, existing.spec())),
-                };
-            }
             let recorded = awaiting.record(spec.clone(), now)?;
             replace(&spec)?;
+            // A prior attempt may have persisted the record but failed before
+            // reconciling its evidence. Retry while open; never reopen an ended record.
+            if !awaiting.is_open(&message) {
+                return Ok(recorded);
+            }
             // A reply may have landed before the record: replies are indexed by what they answer.
             let replies = service
                 .with_store(|store| {

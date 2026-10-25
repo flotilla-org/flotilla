@@ -15,7 +15,7 @@ use flotilla_state_machines::{
 };
 
 use super::MessagePrimitives;
-use flotilla_inbox::InboxBackend;
+use flotilla_inbox::{InboxBackend, Observations};
 
 /// This home's open messages, and the replies and successors naming them.
 #[derive(Debug, Default)]
@@ -49,66 +49,93 @@ impl OpenMessages {
     /// Reads every followed home's log entries since the last refresh. A home
     /// seen for the first time, or one whose resume floor has passed this
     /// cursor (its log compacted below it), is seeded from one scan of its
-    /// messages instead, read in the same transaction as its last sequence,
-    /// so a message last written below the floor is still swept.
+    /// messages instead, then tails from the sequence preceding that scan.
+    /// Writes between pages are replayed, so none can be missed.
     pub fn refresh(&mut self, primitives: &MessagePrimitives) -> Result<(), String> {
         let own = primitives.home().to_owned();
         let homes = primitives.service().homes();
-        primitives
-            .service()
-            .with_store(|store| {
-                for home in &homes {
-                    let mut read = store.read()?;
-                    let floor = read.resume_floor(home)?;
-                    match self.cursors.get(home).copied().filter(|cursor| *cursor >= floor) {
-                        None => {
-                            let through = read.last_sequence(home)?;
-                            let mut after = None;
-                            loop {
+        for home in &homes {
+            let floor = primitives.service().with_store(|store| store.read()?.resume_floor(home)).map_err(|error| error.to_string())?;
+            match self.cursors.get(home).copied().filter(|cursor| *cursor >= floor) {
+                None => {
+                    let through =
+                        primitives.service().with_store(|store| store.read()?.last_sequence(home)).map_err(|error| error.to_string())?;
+                    let mut after = None;
+                    loop {
+                        let (messages, next) = primitives
+                            .service()
+                            .with_store(|store| {
+                                let mut read = store.read()?;
                                 let page = read.scan::<Resource<Message>>(home, after, 64)?;
+                                let mut messages = Vec::new();
                                 for id in page.ids {
                                     if let Some(loaded) = read.load::<Resource<Message>>(id)? {
-                                        let name = loaded.value.name().to_owned();
-                                        self.observe(&own, home, name, Some(loaded.value));
+                                        messages.push(loaded.value);
                                     }
                                 }
-                                after = page.next;
-                                if after.is_none() {
-                                    break;
-                                }
-                            }
-                            self.cursors.insert(home.clone(), through);
+                                Ok((messages, page.next))
+                            })
+                            .map_err(|error| error.to_string())?;
+                        for message in messages {
+                            self.observe_message(primitives, &own, home, message)?;
                         }
-                        Some(mut cursor) => {
-                            loop {
-                                let events = read.changes_since(home, cursor, 256)?;
-                                let Some(last) = events.last().map(|event| event.home_seq) else { break };
-                                let names: BTreeSet<_> = events
-                                    .iter()
-                                    .filter(|event| event.kind == Resource::<Message>::CODE)
-                                    .map(|event| event.name.clone())
-                                    .collect();
-                                for name in names {
-                                    let message = match read.resolve(Resource::<Message>::CODE, &name, home)? {
-                                        Some(id) => read.load::<Resource<Message>>(id)?.map(|loaded| loaded.value),
-                                        None => None,
-                                    };
-                                    self.observe(&own, home, name, message);
-                                }
-                                cursor = last;
-                            }
-                            self.cursors.insert(home.clone(), cursor);
+                        after = next;
+                        if after.is_none() {
+                            break;
                         }
                     }
+                    // A page may include newer writes; replaying from the initial
+                    // sequence bridges writes between pages, idempotently.
+                    self.cursors.insert(home.clone(), through);
                 }
-                Ok(())
-            })
-            .map_err(|error| error.to_string())?;
+                Some(mut cursor) => loop {
+                    let (last, messages) = primitives
+                        .service()
+                        .with_store(|store| {
+                            let mut read = store.read()?;
+                            let events = read.changes_since(home, cursor, 256)?;
+                            let last = events.last().map(|event| event.home_seq);
+                            let names: BTreeSet<_> = events
+                                .iter()
+                                .filter(|event| event.kind == Resource::<Message>::CODE)
+                                .map(|event| event.name.clone())
+                                .collect();
+                            let mut messages = Vec::new();
+                            for name in names {
+                                let message = match read.resolve(Resource::<Message>::CODE, &name, home)? {
+                                    Some(id) => read.load::<Resource<Message>>(id)?.map(|loaded| loaded.value),
+                                    None => None,
+                                };
+                                messages.push((name, message));
+                            }
+                            Ok((last, messages))
+                        })
+                        .map_err(|error| error.to_string())?;
+                    let Some(last) = last else { break };
+                    for (name, message) in messages {
+                        match message {
+                            Some(message) => self.observe_message(primitives, &own, home, message)?,
+                            None => self.observe(&own, home, name, None),
+                        }
+                    }
+                    // A failed withdrawal leaves the cursor before its evidence.
+                    cursor = last;
+                    self.cursors.insert(home.clone(), cursor);
+                },
+            }
+        }
         // Evidence about a message that is no longer open is spent.
         let open = &self.open;
         self.replied.retain(|name| open.contains(name));
         self.superseded.retain(|name, _| open.contains(name));
         self.refusals.retain(|name, _| open.contains(name));
+        Ok(())
+    }
+
+    fn observe_message(&mut self, primitives: &MessagePrimitives, own: &str, home: &str, message: Resource<Message>) -> Result<(), String> {
+        // Store reads finish before this home's sender writes its record.
+        primitives.awaiting().observe_drop(home, &message, primitives.world().now())?;
+        self.observe(own, home, message.name().to_owned(), Some(message));
         Ok(())
     }
 
