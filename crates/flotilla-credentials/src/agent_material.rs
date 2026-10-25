@@ -8,6 +8,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_environment::environment::runner::CONTAINED_CODEX_HOME;
 use flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE;
+use flotilla_environment::environment::runner::{CONTAINED_CODEX_AUTH_FILE, HARNESS_AUTH_FILES};
 use flotilla_environment::environment::ProvisionedMount;
 use flotilla_environment::environment::ProvisionedMountMode;
 use flotilla_provider_runtime::ChannelLabel;
@@ -41,7 +42,7 @@ const CONTAINER_SKILLS_SOURCE: &str = "/run/flotilla/skills";
 pub const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
 /// The one credential file inside a crew's `CODEX_HOME`. Everything else under
 /// that directory is per-crew scratch Codex may write freely.
-const CODEX_AUTH_FILE: &str = "auth.json";
+const CODEX_AUTH_FILE: &str = CONTAINED_CODEX_AUTH_FILE;
 /// Codex must never rewrite the delivered credential: a crew's copy is a
 /// read-only snapshot of the central login, kept fresh by the host refresher.
 const CODEX_AUTH_MODE: u32 = 0o400;
@@ -300,14 +301,17 @@ impl AgentMaterialRegistry {
                         "sh",
                         &[
                             "-c",
-                            r#"set -eu
+                            &format!(
+                                r#"set -eu
 mkdir -p "$2"
 for file in config.toml settings.json .claude.json; do
   if [ -f "$1/$file" ] && [ ! -e "$2/$file" ]; then cp "$1/$file" "$2/$file"; fi
 done
-for file in auth.json .credentials.json; do
+for file in {}; do
   if [ -f "$1/$file" ]; then ln -sf "$1/$file" "$2/$file"; fi
 done"#,
+                                HARNESS_AUTH_FILES.join(" ")
+                            ),
                             "flotilla-crew-home",
                             &base.to_string_lossy(),
                             &home.to_string_lossy(),
@@ -1184,8 +1188,8 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
         "CODEX_HOME"
     }
 
-    fn is_managed_config_home(&self, config_home: &Path, _config_base: &Path) -> bool {
-        config_home.starts_with(Path::new(CONTAINER_CODEX_HOME))
+    fn is_managed_config_home(&self, config_home: &Path, config_base: &Path) -> bool {
+        config_home.starts_with(Path::new(CONTAINER_CODEX_HOME)) || config_home.starts_with(config_base.join("agent-homes"))
     }
 
     fn host_home_name(&self) -> &'static str {
@@ -1805,28 +1809,28 @@ esac
         let required = BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string(), CODEX_ADAPTER_ID.to_string()]);
         for (claude, codex, expected_claude, expected_codex) in [
             (
-                Some("/host/state/flotilla/credentials/claude-max/claude"),
-                Some("/host/state/flotilla/credentials/codex-key/codex"),
-                "/host/state/flotilla/credentials/claude-max/claude/crews/coder",
-                "/host/state/flotilla/credentials/codex-key/codex",
+                Some("/host/state/flotilla/agent-homes/claude-max/claude"),
+                Some("/host/state/flotilla/agent-homes/codex-key/codex"),
+                "/host/state/flotilla/agent-homes/claude-max/claude/crews/coder",
+                "/host/state/flotilla/agent-homes/codex-key/codex/crews/coder",
             ),
             (
                 Some("/home/crew/.claude"),
                 Some("/home/crew/.codex"),
                 "/host/state/flotilla/agent-homes/host-direct-b3/claude/crews/coder",
-                "/host/state/flotilla/agent-homes/host-direct-b3/codex",
+                "/host/state/flotilla/agent-homes/host-direct-b3/codex/crews/coder",
             ),
             (
                 Some("/host/state/flotilla/../../../home/crew/.claude"),
                 Some("/host/state/flotilla/credentials/../../../home/crew/.codex"),
                 "/host/state/flotilla/agent-homes/host-direct-b3/claude/crews/coder",
-                "/host/state/flotilla/agent-homes/host-direct-b3/codex",
+                "/host/state/flotilla/agent-homes/host-direct-b3/codex/crews/coder",
             ),
             (
                 None,
                 None,
                 "/host/state/flotilla/agent-homes/host-direct-b3/claude/crews/coder",
-                "/host/state/flotilla/agent-homes/host-direct-b3/codex",
+                "/host/state/flotilla/agent-homes/host-direct-b3/codex/crews/coder",
             ),
         ] {
             let runner = HostHomeRunner::default();
@@ -1848,13 +1852,14 @@ esac
             let calls = runner.calls.lock().expect("calls");
             let claude_home =
                 Path::new(expected_claude).parent().and_then(Path::parent).expect("claude home").to_string_lossy().into_owned();
-            for home in [&claude_home, &expected_codex.to_string()] {
+            let codex_home = Path::new(expected_codex).parent().and_then(Path::parent).unwrap().to_string_lossy().into_owned();
+            for home in [&claude_home, &codex_home] {
                 assert!(calls.iter().any(|call| call == &["mkdir", "-p", home]), "{home} created: {calls:?}");
                 assert!(calls.iter().any(|call| call == &["chmod", "700", home]), "{home} owner-only: {calls:?}");
             }
             let adoptions =
                 calls.iter().filter(|call| call.get(3).map(String::as_str) == Some("flotilla-codex-ambient-login")).collect::<Vec<_>>();
-            assert!(matches!(adoptions.as_slice(), [call] if call[4] == expected_codex), "{adoptions:?}");
+            assert!(matches!(adoptions.as_slice(), [call] if call[4] == codex_home), "{adoptions:?}");
         }
 
         let error = registry
@@ -3266,18 +3271,23 @@ esac
     async fn crews_in_one_environment_see_only_their_own_skills() {
         // Issue #2672: crews sharing an adapter and vessel must have disjoint
         // homes, each containing exactly its frozen selection, including empty.
-        for adapter in [CLAUDE_CODE_ADAPTER_ID, CODEX_ADAPTER_ID] {
+        for (adapter, api_key) in [(CLAUDE_CODE_ADAPTER_ID, false), (CODEX_ADAPTER_ID, false), (CODEX_ADAPTER_ID, true)] {
             let temp = tempfile::tempdir().expect("tempdir");
             let registry = registry(temp.path());
             let bundle = registry.skills.source.as_ref().expect("source");
             std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#).expect("manifest");
             let runner = promisor_runner(temp.path());
-            let base = runner.config_base.join(if adapter == CODEX_ADAPTER_ID { "codex" } else { "claude" });
+            let base = if api_key {
+                runner.config_base.join("agent-homes/model-api/codex")
+            } else {
+                runner.config_base.join(if adapter == CODEX_ADAPTER_ID { "codex" } else { "claude" })
+            };
             std::fs::create_dir_all(&base).expect("base home");
             std::fs::write(base.join("settings.json"), "{}").expect("settings");
             std::fs::write(base.join("auth.json"), "first-token").expect("auth");
             let variable = if adapter == CODEX_ADAPTER_ID { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" };
-            let virtual_base = if adapter == CODEX_ADAPTER_ID { CONTAINER_CODEX_HOME.into() } else { base.display().to_string() };
+            let virtual_base =
+                if adapter == CODEX_ADAPTER_ID && !api_key { CONTAINER_CODEX_HOME.into() } else { base.display().to_string() };
             let token = temp.path().join("token");
             std::fs::write(&token, "test-token").expect("token");
             let crews = BTreeMap::from([

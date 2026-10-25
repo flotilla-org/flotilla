@@ -22,6 +22,48 @@ use flotilla_provider_runtime::FLOTILLA_HELPER_SCRIPT;
 /// material mounts and post-create runner writes can share one path contract.
 pub const CONTAINED_WRITABLE_CONFIG_BASE: &str = "/tmp/flotilla-config";
 pub const CONTAINED_CODEX_HOME: &str = "/tmp/flotilla-codex";
+/// Credential delivery and capture share this filename contract.
+pub const CONTAINED_CODEX_AUTH_FILE: &str = "auth.json";
+
+/// Authentication files linked from delivered material into writable harness homes.
+/// This list also drives crew links and archive exclusions.
+pub const HARNESS_AUTH_FILES: &[&str] = &[CONTAINED_CODEX_AUTH_FILE, ".credentials.json"];
+
+/// Shared delivery layout: opaque credential kinds stay in private directories;
+/// harness scratch lives separately and can be recovered without those directories.
+pub struct CredentialDeliveryPaths {
+    pub base: PathBuf,
+    pub git_config: PathBuf,
+}
+impl CredentialDeliveryPaths {
+    pub fn new(base: PathBuf) -> Self {
+        let git_config = base.join("credentials/gitconfig");
+        Self { base, git_config }
+    }
+    pub fn credential_dir(&self, name: &str) -> PathBuf {
+        self.base.join("credentials").join(Self::component(name))
+    }
+    pub fn harness_home(&self, name: &str, harness: &str) -> PathBuf {
+        self.base.join("agent-homes").join(Self::component(name)).join(harness)
+    }
+    pub fn skill_source_dir(&self) -> PathBuf {
+        self.base.join("skill-sources")
+    }
+    fn component(name: &str) -> String {
+        name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect()
+    }
+}
+
+/// Delivery-derived exclusions; auth links are excluded at every depth too.
+#[cfg(unix)]
+pub(crate) fn contained_credential_exclusions() -> Vec<String> {
+    let paths = CredentialDeliveryPaths::new(CONTAINED_WRITABLE_CONFIG_BASE.into());
+    [paths.base.join("credentials"), paths.skill_source_dir()]
+        .into_iter()
+        .map(|p| p.to_string_lossy().trim_start_matches('/').to_string())
+        .chain(HARNESS_AUTH_FILES.iter().map(|p| p.to_string()))
+        .collect()
+}
 
 /// A `CommandRunner` decorator that executes all commands inside a Docker container
 /// via `docker exec`. Absolute working directories are forwarded as `-w`; relative

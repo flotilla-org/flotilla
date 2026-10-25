@@ -85,7 +85,7 @@ impl CommandRunner for AgentRunner {
         Ok("/tmp/flotilla".into())
     }
     async fn writable_config_base(&self, _: Option<&Path>, _: &Path) -> Result<PathBuf, String> {
-        Ok("/tmp/flotilla-config".into())
+        Ok(CONTAINED_WRITABLE_CONFIG_BASE.into())
     }
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
         self.write_file_with_mode(path, content, 0o600).await

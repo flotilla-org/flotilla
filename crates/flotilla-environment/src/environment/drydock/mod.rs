@@ -4,6 +4,7 @@ mod observations;
 mod reach;
 mod runner;
 use super::*;
+use crate::environment::runner::{contained_credential_exclusions, CONTAINED_CODEX_HOME, CONTAINED_WRITABLE_CONFIG_BASE};
 use ::drydock::api::ProviderApi;
 use drydock_protocol as wire;
 use flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX;
@@ -469,7 +470,8 @@ impl Drop for DrydockEnvironment {
         }
     }
 }
-async fn write_checkpoint(runner: Arc<dyn CommandRunner>, target: &Path, root: &Path) -> Result<(), String> {
+/// Capture recoverable guest state through its runner, publishing only a complete archive.
+pub async fn write_checkpoint(runner: Arc<dyn CommandRunner>, target: &Path, root: &Path) -> Result<(), String> {
     let temporary = target.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     // Synchronous drop cleanup also runs when the async task is cancelled.
     struct PartialArchive(PathBuf);
@@ -482,8 +484,8 @@ async fn write_checkpoint(runner: Arc<dyn CommandRunner>, target: &Path, root: &
     let paths = [
         root.to_string_lossy().into_owned(),
         "/root".into(),
-        "/tmp/flotilla-config".into(),
-        "/tmp/flotilla-codex".into(),
+        CONTAINED_WRITABLE_CONFIG_BASE.into(),
+        CONTAINED_CODEX_HOME.into(),
         "/var/lib/flotilla/cleat".into(),
     ];
     let script = checkpoint_script(&paths);
@@ -495,7 +497,14 @@ fn checkpoint_script(paths: &[String]) -> String {
     // the archive. Stage remotely and check the exact archive size before any
     // bytes cross SSH; the runner's stream bound remains defence in depth.
     let excludes = ["target", "node_modules", ".cache", ".cargo/registry", ".cargo/git", ".rustup", ".npm", ".uv"];
-    let excludes = excludes.iter().map(|p| format!("--exclude={}", runner::quote(p))).collect::<Vec<_>>().join(" ");
+    let credentials = contained_credential_exclusions();
+    let excludes = excludes
+        .iter()
+        .copied()
+        .chain(credentials.iter().map(String::as_str))
+        .map(|p| format!("--exclude={}", runner::quote(p)))
+        .collect::<Vec<_>>()
+        .join(" ");
     let paths = paths.iter().map(|p| runner::quote(p)).collect::<Vec<_>>().join(" ");
     format!(
         "flotilla_checkpoint_size=$(du -sb {excludes} -- {paths} 2>/dev/null | awk '{{n += $1}} END {{printf \"%.0f\", n}}'); \
