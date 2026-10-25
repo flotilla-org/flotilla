@@ -65,7 +65,7 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
     // scratch directory must be inside the container user's writable
     // world rather than derived from daemon-host paths (#1508).
     let preflight_config_dir = PathBuf::from("/home/crew/flotilla/credentials/claude-max/claude-preflight");
-    let crew_config_dir = PathBuf::from("/home/crew/flotilla/credentials/claude-max/claude");
+    let crew_config_dir = PathBuf::from("/home/crew/flotilla/agent-homes/claude-max/claude");
     let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
         DiscoveryMockRunner::builder()
             .tool_exists("claude", true)

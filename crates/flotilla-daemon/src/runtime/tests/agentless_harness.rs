@@ -8,6 +8,7 @@
 //! file the launch writes on the host is observable.
 
 use super::*;
+use flotilla_environment::environment::runner::HARNESS_AUTH_FILES;
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 
@@ -63,6 +64,25 @@ impl FakeHost {
         self.files.lock().expect("files").insert(path.to_path_buf(), HostEntry::File(content.to_string()));
     }
 
+    /// Model the process boundary's credential-free, no-overwrite home import.
+    fn import_harness_home(&self, base: &Path, home: &Path) {
+        let snapshot = self.files.lock().expect("files").clone();
+        let auth_files = HARNESS_AUTH_FILES;
+        let mut files = self.files.lock().expect("files");
+        for (path, value) in &snapshot {
+            if let Ok(relative) = path.strip_prefix(base) {
+                if !auth_files.iter().any(|name| relative.file_name().is_some_and(|file| file == *name)) {
+                    files.entry(home.join(relative)).or_insert_with(|| value.clone());
+                }
+            }
+        }
+        for file in auth_files {
+            if snapshot.contains_key(&base.join(file)) {
+                files.insert(home.join(file), HostEntry::Link(base.join(file)));
+            }
+        }
+    }
+
     /// `agent_material::crew_environment`'s seeding script, on this filesystem.
     fn seed_crew_home(&self, base: &Path, home: &Path) {
         for file in ["config.toml", "settings.json", ".claude.json"] {
@@ -95,6 +115,10 @@ impl CommandRunner for FakeHost {
                 Some(HostEntry::File(content)) => Ok(content),
                 _ => Err(format!("cat: {path}: No such file")),
             },
+            ("sh", ["-c", _, "flotilla-harness-home", base, home]) => {
+                self.import_harness_home(Path::new(base), Path::new(home));
+                ok()
+            }
             ("sh", ["-c", _, "flotilla-crew-home", base, home]) => {
                 self.seed_crew_home(Path::new(base), Path::new(home));
                 ok()
@@ -408,7 +432,7 @@ fn assert_image_harness_environment(launch: &AgentlessLaunch) {
 #[tokio::test]
 async fn agentless_claude_crew_starts_in_a_prepared_flotilla_home() {
     let launch = launch_on_agentless_host("claude-code").await;
-    let home = format!("{HOST_BASE}/credentials/claude-max/claude/crews/coder");
+    let home = format!("{HOST_BASE}/agent-homes/claude-max/claude/crews/coder");
 
     assert_eq!(launch.value("CLAUDE_CONFIG_DIR").as_deref(), Some(home.as_str()));
     assert_eq!(launch.value("CLAUDE_CODE_OAUTH_TOKEN").as_deref(), Some("oauth-secret-material"));
@@ -431,7 +455,8 @@ async fn agentless_claude_crew_starts_in_a_prepared_flotilla_home() {
 #[tokio::test]
 async fn agentless_codex_crew_starts_in_a_prepared_flotilla_home() {
     let launch = launch_on_agentless_host("codex").await;
-    let home = format!("{HOST_BASE}/agent-homes/{ENVIRONMENT}/codex");
+    let base = format!("{HOST_BASE}/agent-homes/{ENVIRONMENT}/codex");
+    let home = format!("{base}/crews/coder");
 
     assert_eq!(launch.value("CODEX_HOME").as_deref(), Some(home.as_str()));
     assert_eq!(launch.value("FLOTILLA_ENVIRONMENT_ID").as_deref(), Some(ENVIRONMENT));
@@ -445,7 +470,8 @@ async fn agentless_codex_crew_starts_in_a_prepared_flotilla_home() {
         assert_eq!(launch.command.matches(&command).count(), 1, "invocation defines {command} once");
     }
     assert!(launch.command.contains("hooks.state="), "invocation carries hook trust records");
-    assert_eq!(launch.host.entry(format!("{home}/auth.json")), Some(HostEntry::Link(PathBuf::from("/home/crew/.codex/auth.json"))));
+    assert_eq!(launch.host.entry(format!("{home}/auth.json")), Some(HostEntry::Link(PathBuf::from(format!("{base}/auth.json")))));
+    assert_eq!(launch.host.entry(format!("{base}/auth.json")), Some(HostEntry::Link(PathBuf::from("/home/crew/.codex/auth.json"))));
     assert_image_harness_environment(&launch);
     assert_host_harness_untouched(&launch);
 }

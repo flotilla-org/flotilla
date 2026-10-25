@@ -108,6 +108,7 @@ impl CommandRunner for CredentialInteriorRunner {
                 // This runner stands in for the contained process boundary;
                 // real scratch copying and credential links are tested in agent_material.
                 || (cmd == "sh" && args.contains(&"flotilla-crew-home"))
+                || (cmd == "sh" && args.contains(&"flotilla-harness-home"))
         {
             Ok(String::new())
         } else {
