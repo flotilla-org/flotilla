@@ -494,11 +494,24 @@ pub fn bound_change_request_address(
 /// The actuator host wins when placement identifies one, followed by a local
 /// object and then any replica. Keeping this selection shared ensures lifecycle
 /// decisions and their derived wake subscriptions consume identical evidence.
+/// Origin admission belongs to the supplying read boundary. Selection preserves
+/// its provenance; stored origin annotations confer no authority or preference.
 pub fn select_convoy_children<T: Resource + Clone>(
     convoy: &ResourceObject<Convoy>,
     sources: &[ReadResourceObject<T>],
 ) -> BTreeMap<String, ResourceObject<T>> {
-    select_convoy_child_sources(convoy, sources).into_iter().map(|(name, source)| (name, source.object)).collect()
+    select_convoy_child_sources(convoy, sources)
+        .into_iter()
+        .map(|(name, source)| {
+            // Plain projections retain the read boundary's origin, never a stored origin claim.
+            let mut object = source.object;
+            object.metadata.annotations.remove(crate::ORIGIN_ROOT_ANNOTATION);
+            if let ResourceProvenance::Replica { origin_root, .. } = source.provenance {
+                object.metadata.annotations.insert(crate::ORIGIN_ROOT_ANNOTATION.into(), origin_root.to_string());
+            }
+            (name, object)
+        })
+        .collect()
 }
 
 /// Select the same authoritative children while retaining their typed origin for keyed reads.
@@ -4350,5 +4363,76 @@ mod issue_placement_label_tests {
         let frozen: ConvoyIssue = serde_json::from_value(serde_json::to_value(&issue).unwrap()).unwrap();
         assert_eq!(frozen.placement_needs(), (needs, warnings));
         assert!(crate::CapabilityNeed::parse_ad_hoc(invalid).is_err());
+    }
+}
+
+#[cfg(test)]
+mod selected_child_provenance_tests {
+    use super::*;
+
+    // A projected child's origin comes from trusted read provenance, never a stored annotation.
+    // Both local and replica selection leave the input resource unchanged.
+    #[test]
+    fn selected_children_preserve_trusted_origins() {
+        let convoy = ResourceObject::<Convoy> {
+            metadata: crate::ObjectMeta {
+                name: "crew".into(),
+                namespace: "test".into(),
+                resource_version: "1".into(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                owner_references: vec![],
+                finalizers: vec![],
+                deletion_timestamp: None,
+                creation_timestamp: chrono::DateTime::UNIX_EPOCH,
+                merge: None,
+            },
+            spec: ConvoySpec::builder().workflow_ref("workflow".into()).build(),
+            status: None,
+        };
+        let mut child = convoy.clone();
+        child.metadata.name = "child".into();
+        child.metadata.labels.insert(CONVOY_LABEL.into(), "crew".into());
+        child.metadata.annotations.insert(crate::ORIGIN_ROOT_ANNOTATION.into(), "forged".into());
+        for provenance in [
+            ResourceProvenance::Local,
+            ResourceProvenance::Replica {
+                origin_root: flotilla_protocol::NodeId::new("actual"),
+                last_synced_at: chrono::DateTime::UNIX_EPOCH,
+            },
+            ResourceProvenance::Replica {
+                origin_root: flotilla_protocol::NodeId::new("untrusted"),
+                last_synced_at: chrono::DateTime::UNIX_EPOCH,
+            },
+        ] {
+            let expected = match &provenance {
+                ResourceProvenance::Local => None,
+                ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+            };
+            let source = ReadResourceObject { object: child.clone(), provenance };
+            let selected = select_convoy_children(&convoy, std::slice::from_ref(&source));
+            assert_eq!(selected["child"].metadata.annotations.get(crate::ORIGIN_ROOT_ANNOTATION).map(String::as_str), expected.as_deref());
+            assert_eq!(source.object.metadata.annotations[crate::ORIGIN_ROOT_ANNOTATION], "forged");
+        }
+        let local = ReadResourceObject { object: child.clone(), provenance: ResourceProvenance::Local };
+        let mut untrusted_child = child.clone();
+        untrusted_child.spec.workflow_ref = "untrusted-workflow".into();
+        untrusted_child.metadata.annotations.insert(crate::ORIGIN_ROOT_ANNOTATION.into(), "actual".into());
+        let untrusted = ReadResourceObject {
+            object: untrusted_child,
+            provenance: ResourceProvenance::Replica {
+                origin_root: flotilla_protocol::NodeId::new("untrusted"),
+                last_synced_at: chrono::DateTime::UNIX_EPOCH,
+            },
+        };
+        // An origin claim in an untrusted child's annotations cannot elevate it over a local child.
+        for sources in [[untrusted.clone(), local.clone()], [local.clone(), untrusted.clone()]] {
+            let selected = select_convoy_children(&convoy, &sources);
+            assert_eq!(selected["child"].spec.workflow_ref, child.spec.workflow_ref);
+            assert!(!selected["child"].metadata.annotations.contains_key(crate::ORIGIN_ROOT_ANNOTATION));
+        }
+        let mut unrelated = untrusted;
+        unrelated.object.metadata.labels.insert(CONVOY_LABEL.into(), "other-crew".into());
+        assert!(select_convoy_children(&convoy, &[unrelated]).is_empty());
     }
 }

@@ -1,3 +1,6 @@
+/// Trusted origin retained when a typed replica read is projected to a resource object.
+pub const ORIGIN_ROOT_ANNOTATION: &str = "flotilla.work/origin-root";
+
 use chrono::{DateTime, Utc};
 use flotilla_protocol::NodeId;
 use serde::{Deserialize, Serialize};

@@ -210,7 +210,7 @@ pub use project::{
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, forge_clone_key, forge_repo_key, repo_key};
 pub use replica::{
     compare_replica_reads, pick_replica_read, ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass,
-    ResourceProvenance,
+    ResourceProvenance, ORIGIN_ROOT_ANNOTATION,
 };
 pub use repository::{
     repository_display_labels, repository_workspace_slugs, resolve_default_branch, DefaultBranchObservation, DefaultBranchProvenance,

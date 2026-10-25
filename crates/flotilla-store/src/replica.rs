@@ -4,7 +4,7 @@ pub const REPLICA_BATCH_SIZE: usize = 64;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::NodeId;
 
-pub const ORIGIN_ROOT_ANNOTATION: &str = "flotilla.work/origin-root";
+pub use flotilla_resources::ORIGIN_ROOT_ANNOTATION;
 pub const LAST_SYNCED_AT_ANNOTATION: &str = "flotilla.work/last-synced-at";
 #[derive(Debug, Clone, bon::Builder)]
 pub struct StoredReplicaEvent {
