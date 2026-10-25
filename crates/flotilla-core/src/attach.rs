@@ -737,10 +737,9 @@ impl<'a> AttachResolver<'a> {
         seat: AttachMode,
     ) -> Result<ResolvedAttachPlan, String> {
         let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
-        let attach_args = self.terminal_pool_attach_args(reads, session, environment, &cwd, seat).await?;
         if environment.spec.docker.is_some() {
             // The engine's realised backing is authoritative behind [primitives].
-            // Attach through its live agent handle, never a stale prior backing.
+            // Use its live handle, never a stale prior backing.
             let realised = environment_attach_backing(self.lifecycle_reads, &environment.metadata.name)?;
             let handle = self
                 .environment_manager
@@ -759,16 +758,39 @@ impl<'a> AttachResolver<'a> {
                         _ => None,
                     }
                 })
-                .ok_or_else(|| format!("environment {} has no live handle", session.spec.env_ref))?;
-            let agent = handle.agent().ok_or("vessel has no agent; use environment shell for diagnosis")?;
-            let registry = self.registry_for_resource_environment(reads, environment, cwd.as_path()).await?;
-            let pool = registry.terminal_pools.get(&session.spec.pool).map(|(_, pool)| pool.clone()).ok_or("terminal pool unavailable")?;
-            let target = terminal_session_attach_target_with_stale_status(session)?;
-            let endpoint = pool.cleat_endpoint(target.session_id).await?.ok_or("vessel attach requires a cleat socket endpoint")?;
-            let guest = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
-            let socket = agent.forward_socket(&guest).await?;
-            return Ok(cleat_socket_attach_plan(&socket, &endpoint.session, seat));
+                .ok_or_else(|| format!("environment {} has no live handle for realised backing {realised:?}", session.spec.env_ref))?;
+            let resident = async {
+                let agent = handle.agent().ok_or("resident vessel agent is absent")?;
+                agent.ready().await?;
+                let registry = self.registry_for_resource_environment(reads, environment, cwd.as_path()).await?;
+                let pool =
+                    registry.terminal_pools.get(&session.spec.pool).map(|(_, pool)| pool.clone()).ok_or("terminal pool unavailable")?;
+                let endpoint = checked_cleat_endpoint(pool.as_ref(), session, seat).await?;
+                let guest = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
+                let socket = agent.forward_socket(&guest).await?;
+                Ok::<_, String>(cleat_socket_attach_plan(&socket, &endpoint.session, seat))
+            }
+            .await;
+            let resident_error = match resident {
+                Ok(plan) => return Ok(plan),
+                Err(error) => error,
+            };
+            let terminal = async {
+                let route = handle.terminal_route().ok_or("provider offers no authorized terminal route")?;
+                // This capability supplies terminal-only access. It must not replace
+                // the agent runner or mark the resident agent healthy.
+                let bag = self.environment_manager.environment_bag(handle.id()).ok_or("terminal environment unavailable")?;
+                let client = bag.find_binary("cleat").map(|binary| binary.as_path()).unwrap_or(Path::new("cleat"));
+                let pool = flotilla_terminal::cleat::CleatTerminalPool::new(route.terminal_runner(), client.to_string_lossy(), &bag);
+                let endpoint = checked_cleat_endpoint(&pool, session, seat).await?;
+                route.attach_plan(&endpoint, client, seat)
+            }
+            .await;
+            return terminal.map_err(|error| {
+                format!("resident vessel agent route unavailable: {resident_error}; provider terminal route unavailable: {error}")
+            });
         }
+        let attach_args = self.terminal_pool_attach_args(reads, session, environment, &cwd, seat).await?;
         Ok(ResolvedAttachPlan(vec![ResolvedAttachAction::Command(attach_args)]))
     }
 
@@ -1285,6 +1307,49 @@ fn transient_checkout_session_name(checkout: &CheckoutRow) -> String {
     format!("flotilla-checkout-{}", &digest[..32])
 }
 
+/// Both authorized routes target the same recorded physical generation. An ID
+/// found on a different daemon is not permission to attach to that daemon.
+async fn checked_cleat_endpoint(
+    pool: &dyn flotilla_terminal::TerminalPool,
+    session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
+    seat: AttachMode,
+) -> Result<flotilla_protocol::result_set::CleatEndpoint, String> {
+    let target = terminal_session_attach_target_with_stale_status(session)?;
+    let recorded = session
+        .status
+        .as_ref()
+        .and_then(|status| status.cleat_endpoint.as_ref())
+        .ok_or("selected terminal has no recorded Cleat endpoint")?;
+    if recorded.session != target.session_id
+        || !Path::new(&recorded.runtime_root).is_absolute()
+        || recorded.daemon.contains('/')
+        || recorded
+            .daemon
+            .rsplit_once('@')
+            .and_then(|(_, generation)| generation.parse::<u64>().ok())
+            .is_none_or(|generation| generation == 0)
+    {
+        return Err("selected terminal has a mismatched Cleat session or generation".into());
+    }
+    match pool.session_liveness(target.session_id).await? {
+        TerminalSessionLiveness::Running => {}
+        state => return Err(format!("selected terminal is not live: {state:?}")),
+    }
+    pool.preflight_attach(seat).await?;
+    pool.attach_args_for_mode(
+        target.session_id,
+        target.launch_command,
+        &ExecutionEnvironmentPath::new(&session.spec.cwd),
+        &Vec::new(),
+        seat,
+    )?;
+    let current = pool.cleat_endpoint(target.session_id).await?.ok_or("selected terminal has no unique live Cleat endpoint")?;
+    if current != *recorded {
+        return Err("selected terminal Cleat endpoint/generation no longer matches current inventory".into());
+    }
+    Ok(current)
+}
+
 fn cleat_socket_attach_plan(socket: &Path, session: &str, seat: AttachMode) -> ResolvedAttachPlan {
     let mut args = vec![
         Arg::Literal("cleat".into()),
@@ -1420,6 +1485,458 @@ mod tests {
         )
         .await;
         (daemon, backend, temp)
+    }
+
+    // A pre-agent backing is adopted from inventory, never newly provisioned.
+    // Normal attach must preserve its selected live Cleat generation after readoption.
+    #[tokio::test]
+    async fn adopted_pre_agent_terminal_remains_attachable() {
+        adopted_terminal_contract(None).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires an installed Cleat with controller-seat support and a real PTY"]
+    async fn adopted_terminal_preserves_real_cleat_process() {
+        adopted_terminal_contract(Some(Arc::new(RealTerminal::new()))).await;
+    }
+
+    struct RealTerminal {
+        root: tempfile::TempDir,
+        endpoint: flotilla_protocol::result_set::CleatEndpoint,
+        baseline: HashMap<String, String>,
+        crew_pid: String,
+    }
+
+    impl RealTerminal {
+        #[cfg(unix)]
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let root = tempfile::Builder::new().prefix("fa-").tempdir_in("/tmp").expect("short private Cleat root");
+            let probe = root.path().join("crew");
+            std::fs::write(&probe, format!("#!/usr/bin/python3\nimport os,time\nopen({:?},'w').write(str(os.getpid()))\nprint('preserved conversation',flush=True)\nwhile True: time.sleep(1)\n", root.path().join("crew.pid"))).expect("crew probe");
+            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).expect("executable crew");
+            std::fs::write(root.path().join("agent-home"), "conversation identity").expect("agent home");
+            let baseline = HashMap::from([
+                ("PATH".into(), std::env::var("PATH").expect("test binary path")),
+                ("CLEAT_RUNTIME_DIR".into(), root.path().to_string_lossy().into_owned()),
+                ("CLEAT_DAEMON".into(), "provider-attach".into()),
+                ("SHELL".into(), probe.to_string_lossy().into_owned()),
+            ]);
+            let launch = std::process::Command::new("cleat")
+                .env_clear()
+                .envs(&baseline)
+                .args([
+                    "launch",
+                    "session-crew",
+                    "--cwd",
+                    root.path().to_str().expect("UTF8 root"),
+                    "--cmd",
+                    "crew",
+                    "--tag",
+                    "purpose=test",
+                ])
+                .output()
+                .expect("launch isolated Cleat");
+            assert!(launch.status.success(), "{}", String::from_utf8_lossy(&launch.stderr));
+            let daemon = std::fs::read_dir(root.path())
+                .expect("private generations")
+                .filter_map(Result::ok)
+                .find(|entry| entry.path().join("daemon.pid").is_file())
+                .expect("private daemon")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            let endpoint = flotilla_protocol::result_set::CleatEndpoint {
+                runtime_root: root.path().to_string_lossy().into_owned(),
+                daemon,
+                session: "session-crew".into(),
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let crew_pid = loop {
+                if let Ok(pid) = std::fs::read_to_string(root.path().join("crew.pid")) {
+                    if !pid.is_empty() {
+                        break pid;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "crew did not start");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            Self { root, endpoint, baseline, crew_pid }
+        }
+
+        fn attach(&self, plan: &ResolvedAttachPlan, secondary: &ResolvedAttachPlan) {
+            let args: Vec<Vec<String>> = [plan, secondary]
+                .into_iter()
+                .map(|plan| {
+                    let [ResolvedAttachAction::Command(args)] = plan.0.as_slice() else { panic!("single provider hop") };
+                    args.iter()
+                        .skip(4)
+                        .map(|arg| match arg {
+                            Arg::Literal(value) | Arg::Quoted(value) => value.clone(),
+                            _ => panic!("plain provider arguments"),
+                        })
+                        .collect()
+                })
+                .collect();
+            // Reuse the PTY/drain pattern from Cleat's controller-refusal fixture.
+            // Only the Docker exec boundary is substituted: the emitted Cleat
+            // command attaches to the actual selected session with no handover.
+            let script = r#"import json,os,pty,subprocess,sys,threading,time
+args=json.loads(sys.argv[1]); root=sys.argv[2]
+clients=[]; masters=[]
+def drain(master):
+ try:
+  while os.read(master,65536): pass
+ except OSError: pass
+try:
+ controller=None
+ for index,command in enumerate(args):
+  master,slave=pty.openpty(); masters.append(master)
+  client=subprocess.Popen(command,stdin=slave,stdout=slave,stderr=slave,env={**os.environ,'TERM':'xterm-256color'})
+  clients.append(client); os.close(slave)
+  threading.Thread(target=drain,args=(master,),daemon=True).start()
+  deadline=time.monotonic()+5
+  while True:
+   result=subprocess.run(['cleat','--runtime-root',root,'--server',os.environ['CLEAT_DAEMON'],'inspect','session-crew','--json'],capture_output=True,text=True,check=True)
+   seats=json.loads(result.stdout)['attachments']
+   if len(seats)==index+1: break
+   assert client.poll() is None and time.monotonic()<deadline, 'attachment did not connect'
+   time.sleep(.01)
+  controllers=[seat for seat in seats if seat['role']=='controller']
+  assert controllers, seats
+  if controller is None: controller=controllers[0]['identity']
+  assert any(seat['identity']==controller for seat in controllers), 'attachment displaced the original controller'
+finally:
+ for client in clients:
+  client.terminate(); client.wait(timeout=5)
+ for master in masters: os.close(master)
+"#;
+            let output = std::process::Command::new("python3")
+                .env_clear()
+                .envs(&self.baseline)
+                .args(["-c", script, &serde_json::to_string(&args).expect("argv"), self.root.path().to_str().expect("root")])
+                .output()
+                .expect("actual PTY attachment");
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(Path::new(&format!("/proc/{}", self.crew_pid)).exists(), "crew process survived attachment");
+            assert_eq!(std::fs::read_to_string(self.root.path().join("crew.pid")).expect("crew PID"), self.crew_pid);
+            assert_eq!(std::fs::read_link(format!("/proc/{}/cwd", self.crew_pid)).expect("crew checkout"), self.root.path());
+            assert_eq!(std::fs::read_to_string(self.root.path().join("agent-home")).expect("agent home"), "conversation identity");
+            let transcript = std::process::Command::new("cleat")
+                .env_clear()
+                .envs(&self.baseline)
+                .args(["transcript", "session-crew", "--since", "0"])
+                .output()
+                .expect("same conversation");
+            assert!(
+                transcript.status.success() && String::from_utf8_lossy(&transcript.stdout).contains("preserved conversation"),
+                "transcript: {transcript:?}"
+            );
+        }
+    }
+
+    impl Drop for RealTerminal {
+        fn drop(&mut self) {
+            // Fixture teardown only, after preservation assertions, scoped to the
+            // daemon PID file under this fixture's private runtime root.
+            if let Ok(pid) = std::fs::read_to_string(self.root.path().join(&self.endpoint.daemon).join("daemon.pid")) {
+                let _ = std::process::Command::new("kill").args(["-TERM", pid.trim()]).status();
+            }
+        }
+    }
+
+    async fn adopted_terminal_contract(real: Option<Arc<RealTerminal>>) {
+        use flotilla_discovery_api::EnvironmentBag;
+        use flotilla_environment::environment::{
+            docker::DockerEnvironmentProvider, EnvironmentHandle, EnvironmentProvider, EnvironmentTool, ProviderTerminalRoute,
+            ProvisionedEnvironment, VesselAgent,
+        };
+        use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
+
+        // The resident process boundary can fail independently of the provider transport.
+        struct Resident(Result<(), String>);
+        #[async_trait::async_trait]
+        impl VesselAgent for Resident {
+            async fn ready(&self) -> Result<(), String> {
+                self.0.clone()
+            }
+            async fn forward_socket(&self, _: &Path) -> Result<PathBuf, String> {
+                Ok("/forwarded/socket".into())
+            }
+            async fn push_tools(&self, _: &[EnvironmentTool]) -> Result<(), String> {
+                panic!("attach must not bootstrap")
+            }
+        }
+        enum Permission {
+            Terminal,
+            ShellOnly,
+        }
+        struct Access {
+            inner: EnvironmentHandle,
+            resident: Arc<dyn VesselAgent>,
+            permission: Permission,
+        }
+        #[async_trait::async_trait]
+        impl ProvisionedEnvironment for Access {
+            fn backing_id(&self) -> &str {
+                self.inner.backing_id()
+            }
+            fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
+                self.inner.capabilities()
+            }
+            fn id(&self) -> &EnvironmentId {
+                self.inner.id()
+            }
+            fn image(&self) -> &flotilla_protocol::ImageId {
+                self.inner.image()
+            }
+            async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+                self.inner.observe().await
+            }
+            async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+                self.inner.env_vars().await
+            }
+            fn runner(&self) -> Arc<dyn CommandRunner> {
+                self.inner.runner()
+            }
+            fn agent(&self) -> Option<Arc<dyn VesselAgent>> {
+                Some(self.resident.clone())
+            }
+            fn fallback_runner(&self) -> Option<Arc<dyn CommandRunner>> {
+                self.inner.fallback_runner()
+            }
+            fn terminal_route(&self) -> Option<&dyn ProviderTerminalRoute> {
+                match self.permission {
+                    Permission::Terminal => self.inner.terminal_route(),
+                    Permission::ShellOnly => None,
+                }
+            }
+            async fn destroy(&self) -> Result<(), String> {
+                panic!("attach must preserve the backing")
+            }
+        }
+
+        // Fake only the runtime process boundary, including Cleat inventory.
+        struct Inventory(Option<Arc<RealTerminal>>, Arc<std::sync::atomic::AtomicBool>);
+        #[async_trait::async_trait]
+        impl CommandRunner for Inventory {
+            async fn run(&self, _: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+                if args.first() == Some(&"ps") {
+                    return Ok("backing work\tpre-agent\tbase\t[]".into());
+                }
+                if !self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("provider terminal transport unreachable".into());
+                }
+                if let Some(real) = &self.0 {
+                    if args.contains(&"daemons") {
+                        return Ok(
+                            serde_json::json!([{"name": real.endpoint.daemon, "runtime_root": real.endpoint.runtime_root, "alive": true}])
+                                .to_string(),
+                        );
+                    }
+                    let command = if args.get(1) == Some(&"-w") { &args[4..] } else { &args[2..] };
+                    return flotilla_provider_runtime::ProcessCommandRunner
+                        .run(command[0], &command[1..], Path::new("/"), &ChannelLabel::Default)
+                        .await;
+                }
+                if args.contains(&"daemons") {
+                    return Ok(r#"[{"name":"crew@7","runtime_root":"/tmp/cleat","alive":true}]"#.into());
+                }
+                if args.contains(&"list") {
+                    return Ok(r#"[{"id":"session-crew","status":"Detached"}]"#.into());
+                }
+                if args.contains(&"--help") {
+                    return Ok("--strict --take".into());
+                }
+                panic!("unexpected runtime mutation or command: {args:?}");
+            }
+            async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+                unreachable!()
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+        }
+        let (mut daemon, backend, temp) = attach_fixture().await;
+        let host = daemon.local_host_id().unwrap().to_string();
+        backend.using::<ResourceHost>("flotilla").create(&test_meta(&host), &HostSpec::default()).await.unwrap();
+        let spec = serde_json::from_value(serde_json::json!({"docker": {"host_ref": host, "image": "base"}})).unwrap();
+        let environments = backend.using::<ResourceEnvironment>("flotilla");
+        let environment = environments.create(&test_meta("pre-agent"), &spec).await.unwrap();
+        environments
+            .update_status(
+                "pre-agent",
+                &environment.metadata.resource_version,
+                &flotilla_resources::EnvironmentStatus {
+                    docker_container_id: Some("backing".into()),
+                    message: Some("resident vessel agent unavailable; recovery required".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        create_running_session(&daemon, "pre-agent", "crew", "convoy", "coder").await;
+        let terminals = backend.using::<ResourceTerminalSession>("flotilla");
+        let mut session = terminals.get("crew").await.unwrap();
+        let endpoint = real.as_ref().map(|real| real.endpoint.clone()).unwrap_or(flotilla_protocol::result_set::CleatEndpoint {
+            runtime_root: "/tmp/cleat".into(),
+            daemon: "crew@7".into(),
+            session: "session-crew".into(),
+        });
+        session.status.as_mut().unwrap().cleat_endpoint = Some(endpoint.clone());
+        terminals.update_status("crew", &session.metadata.resource_version, session.status.as_ref().unwrap()).await.unwrap();
+
+        for round in 0..2 {
+            if round > 0 {
+                daemon = InProcessDaemon::new_with_resource_backend(
+                    Vec::new(),
+                    Arc::new(ConfigStore::with_base(temp.path())),
+                    fake_discovery(false),
+                    HostName::new("local"),
+                    backend.clone(),
+                    Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+                )
+                .await;
+            }
+            let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let provider = DockerEnvironmentProvider::new(Arc::new(Inventory(real.clone(), available.clone())));
+            let handle = provider.list().await.unwrap().pop().unwrap();
+            assert!(handle.agent().is_none(), "attachment must not bootstrap the resident agent");
+            assert!(handle.provisioned_mounts().is_empty());
+            let bag = real.as_ref().map(|real| EnvironmentBag::provisioned(real.baseline.clone())).unwrap_or_else(|| {
+                EnvironmentBag::new().with(flotilla_discovery_api::EnvironmentAssertion::binary("cleat", "/declared/cleat"))
+            });
+            let pool = Arc::new(flotilla_terminal::cleat::CleatTerminalPool::new(handle.runner(), "cleat", &bag));
+            let mut registry = ProviderRegistry::new();
+            registry.terminal_pools.insert(
+                "passthrough",
+                flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::TerminalPool, "cleat"),
+                pool,
+            );
+            daemon
+                .environment_manager
+                .register_provisioned_environment(handle.id().clone(), handle.clone(), bag.clone(), Some(Arc::new(registry)))
+                .unwrap();
+            let plan = daemon
+                .attach_resolver()
+                .resolve_attach("crew", None, false, AttachMode::Strict, None)
+                .await
+                .expect("adopted live terminal")
+                .plan;
+            let rendered = format!("{plan:?}");
+            let [ResolvedAttachAction::Command(args)] = plan.0.as_slice() else { panic!("one provider hop") };
+            assert_eq!(args.get(3), Some(&Arg::Quoted("backing".into())), "transport targets the immutable backing, not its reusable name");
+            assert!(
+                rendered.contains(&endpoint.daemon)
+                    && rendered.contains("session-crew")
+                    && rendered.contains("--strict")
+                    && rendered.contains("--no-create"),
+                "{rendered}"
+            );
+            if let Some(real) = &real {
+                let secondary = daemon
+                    .attach_resolver()
+                    .resolve_attach("crew", None, false, AttachMode::Default, None)
+                    .await
+                    .expect("default seat route")
+                    .plan;
+                real.attach(&plan, &secondary);
+            }
+            assert!(handle.agent().is_none(), "successful degraded attach does not repair agent health");
+            assert_eq!(
+                environments.get("pre-agent").await.unwrap().status.as_ref().and_then(|status| status.message.as_deref()),
+                Some("resident vessel agent unavailable; recovery required"),
+                "degraded terminal access preserves the resident-agent recovery diagnostic"
+            );
+
+            struct BackingReading(&'static str);
+            impl flotilla_projections::ports::LifecycleReads for BackingReading {
+                fn try_reading(&self, kind: ProvisioningKind, _: &str, _: Option<&str>) -> Result<Option<LifecycleReading>, String> {
+                    Ok((kind == ProvisioningKind::Environment).then(|| LifecycleReading::Ready { identity: self.0.into() }))
+                }
+            }
+            let ready = BackingReading("backing");
+            let mut held = daemon.attach_resolver();
+            held.lifecycle_reads = &ready;
+            held.resolve_attach("crew", None, false, AttachMode::Default, None).await.expect("current engine identity");
+            let engine = BackingReading("current-backing");
+            let mut resolver = daemon.attach_resolver();
+            resolver.lifecycle_reads = &engine;
+            let error = resolver.resolve_attach("crew", None, false, AttachMode::Default, None).await.unwrap_err();
+            assert!(error.contains("current-backing"), "the engine's realised identity overrides older resource status: {error}");
+
+            // Copied legacy status cannot override the realised identity; a changed physical endpoint revokes access.
+            let mut environment = environments.get("pre-agent").await.unwrap();
+            let original = environment.status.clone().unwrap();
+            environment.status.as_mut().unwrap().docker_container_id = Some("replaced-backing".into());
+            let updated = environments
+                .update_status("pre-agent", &environment.metadata.resource_version, environment.status.as_ref().unwrap())
+                .await
+                .unwrap();
+            held.resolve_attach("crew", None, false, AttachMode::Default, None).await.expect("stale copied status is ignored");
+            environments.update_status("pre-agent", &updated.metadata.resource_version, &original).await.unwrap();
+            for wrong in [
+                flotilla_protocol::result_set::CleatEndpoint { session: "another-terminal".into(), ..endpoint.clone() },
+                flotilla_protocol::result_set::CleatEndpoint { daemon: "crew@6".into(), ..endpoint.clone() },
+                flotilla_protocol::result_set::CleatEndpoint { runtime_root: "/another/root".into(), ..endpoint.clone() },
+            ] {
+                let mut current = terminals.get("crew").await.unwrap();
+                current.status.as_mut().unwrap().cleat_endpoint = Some(wrong);
+                terminals.update_status("crew", &current.metadata.resource_version, current.status.as_ref().unwrap()).await.unwrap();
+                assert!(daemon.attach_resolver().resolve_attach("crew", None, false, AttachMode::Default, None).await.is_err());
+            }
+            let mut current = terminals.get("crew").await.unwrap();
+            current.status.as_mut().unwrap().cleat_endpoint = Some(endpoint.clone());
+            terminals.update_status("crew", &current.metadata.resource_version, current.status.as_ref().unwrap()).await.unwrap();
+
+            // The same authorization, binding and seat contract applies with a
+            // separately unreachable resident and with a healthy preferred route.
+            for (resident, permission, expected) in [
+                (Resident(Err("resident unreachable".into())), Permission::Terminal, "docker"),
+                (Resident(Ok(())), Permission::Terminal, "/forwarded/socket"),
+                (Resident(Err("resident unreachable".into())), Permission::ShellOnly, "no authorized terminal route"),
+            ] {
+                let access = Arc::new(Access { inner: handle.clone(), resident: Arc::new(resident), permission });
+                let mut registry = ProviderRegistry::new();
+                registry.terminal_pools.insert(
+                    "passthrough",
+                    flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::TerminalPool, "cleat"),
+                    Arc::new(flotilla_terminal::cleat::CleatTerminalPool::new(handle.runner(), "cleat", &bag)),
+                );
+                daemon
+                    .environment_manager
+                    .register_provisioned_environment(handle.id().clone(), access.clone(), bag.clone(), Some(Arc::new(registry)))
+                    .unwrap();
+                for mode in [AttachMode::Default, AttachMode::Strict, AttachMode::PreferTake, AttachMode::Take] {
+                    let result = daemon.attach_resolver().resolve_attach("crew", None, false, mode, None).await;
+                    if expected == "no authorized terminal route" {
+                        let error = result.unwrap_err();
+                        assert!(error.contains("resident unreachable") && error.contains(expected), "{error}");
+                        assert!(access.fallback_runner().is_some(), "a shell runner is insufficient permission");
+                    } else {
+                        let plan = result.expect("authorized terminal route").plan;
+                        let [ResolvedAttachAction::Command(args)] = plan.0.as_slice() else { panic!("single attach hop") };
+                        assert!(format!("{plan:?}").contains(expected));
+                        assert_eq!(
+                            args.contains(&Arg::Literal("--take".into())),
+                            matches!(mode, AttachMode::Take | AttachMode::PreferTake)
+                        );
+                        assert_eq!(args.contains(&Arg::Literal("--strict".into())), mode == AttachMode::Strict);
+                        assert_eq!(
+                            environments.get("pre-agent").await.unwrap().status,
+                            Some(original.clone()),
+                            "terminal access leaves health status untouched"
+                        );
+                    }
+                }
+            }
+            daemon.environment_manager.register_provisioned_environment(handle.id().clone(), handle.clone(), bag, None).unwrap();
+            available.store(false, std::sync::atomic::Ordering::SeqCst);
+            let error = daemon.attach_resolver().resolve_attach("crew", None, false, AttachMode::Default, None).await.unwrap_err();
+            assert!(error.contains("resident vessel agent") && error.contains("provider terminal transport unreachable"), "{error}");
+            assert_eq!(provider.list().await.unwrap().len(), 1, "terminal failure cannot erase healthy provider inventory");
+        }
     }
 
     // Transient checkout resolution must retain its selected host without

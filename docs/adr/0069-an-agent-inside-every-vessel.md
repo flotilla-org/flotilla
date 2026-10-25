@@ -122,3 +122,17 @@ Later features are each filed when a consumer needs them:
 - **Egress, "TLS interception happens only for hosts where the proxy swaps credentials":** already replaced by ADR 0044's P4a, which decrypts all HTTPS under enforced egress.
 
 Everything else stands: the control API's trust rule, the hello as readiness, exec with no terminal, and egress capture. The tested isolation invariant stands and grows: it also checks that the host end of each guest-to-host forward serves one vessel only.
+
+## Amendment (2026-10-25, degraded terminal access; #3863)
+
+The owner's ruling permits attachment to an existing live Cleat session independently
+of resident-agent recovery. A live environment handle may explicitly offer a
+`ProviderTerminalRoute`; a diagnostic shell or fallback runner alone is not terminal
+permission. The provider owns the transport and binds it to its immutable backing ID.
+The host prefers the usable resident-agent route, then may use this terminal route.
+Both routes retain authorization, liveness and controller/viewer seat checks, and
+must match the selected TerminalSession's recorded runtime root, daemon generation
+and session against current Cleat inventory. They never select a default generation
+or create a session. Degraded attachment neither repairs the resident agent nor
+changes its health or recovery condition. It grants no bootstrap, restart,
+replacement or migration authority over a live vessel.

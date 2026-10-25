@@ -437,6 +437,11 @@ pub trait ProvisionedEnvironment: Send + Sync {
     fn agent(&self) -> Option<Arc<dyn VesselAgent>> {
         None
     }
+    /// Explicit permission to reach an existing terminal independently of the
+    /// resident vessel agent. A diagnostic runner alone grants no such access.
+    fn terminal_route(&self) -> Option<&dyn ProviderTerminalRoute> {
+        None
+    }
     fn fallback_runner(&self) -> Option<Arc<dyn CommandRunner>> {
         None
     }
@@ -445,6 +450,20 @@ pub trait ProvisionedEnvironment: Send + Sync {
     }
 
     async fn destroy(&self) -> Result<(), String>;
+}
+
+/// Provider-owned transport to existing Cleat terminals on one live backing.
+/// Consumers validate the realised backing, selected session and current endpoint
+/// before asking for a plan. Implementations must never create or replace a session.
+pub trait ProviderTerminalRoute: Send + Sync {
+    /// Terminal inventory/preflight only; does not change the general agent runner.
+    fn terminal_runner(&self) -> Arc<dyn CommandRunner>;
+    fn attach_plan(
+        &self,
+        endpoint: &flotilla_protocol::result_set::CleatEndpoint,
+        client: &Path,
+        seat: flotilla_protocol::commands::AttachMode,
+    ) -> Result<flotilla_protocol::ResolvedAttachPlan, String>;
 }
 
 /// Decode the preceding checkout configuration at its admission seam. Building
