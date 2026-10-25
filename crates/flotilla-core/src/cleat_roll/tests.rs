@@ -200,7 +200,7 @@ fn incoming_fixture() -> (tempfile::TempDir, PathBuf) {
         .expect("C compiler")
         .success());
     let source = directory.path().join("cleat.c");
-    std::fs::write(&source, format!("#include <stdio.h>\n#include <string.h>\nextern const char *generation(void);\nint main(void) {{ if (strcmp(generation(), \"incoming\")) return 1; puts({}); return 0; }}\n", serde_json::to_string(&recorded("success").stdout).expect("C string"))).expect("executable source");
+    std::fs::write(&source, format!("#include <stdio.h>\n#include <string.h>\nextern const char *generation(void);\nint main(int argc, char **argv) {{ if (strcmp(generation(), \"incoming\")) return 1; if (argc > 5 && !strcmp(argv[4], \"no-daemon\")) {{ if (!strcmp(argv[5], \"daemons\")) {{ puts(\"[]\"); return 0; }} fputs(\"connect daemon: No such file or directory\\n\", stderr); return 1; }} puts({}); return 0; }}\n", serde_json::to_string(&recorded("success").stdout).expect("C string"))).expect("executable source");
     assert!(Command::new("cc")
         .arg(&source)
         .arg("-L")
@@ -254,6 +254,29 @@ async fn contained_roll_uses_incoming_payload_and_relative_library() {
             }
         }
     }
+}
+
+// A legacy target with no live daemon uses its staged incoming executable for
+// read-only discovery even when the registered old executable no longer exists.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn contained_legacy_without_live_daemon_is_informational() {
+    use flotilla_provider_runtime::ProcessCommandRunner;
+    let (directory, incoming) = incoming_fixture();
+    let bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var("PATH", "/usr/bin:/bin"));
+    let mut target = target(ControlledTerminalEnvironment::from_bag(&bag).runner(Arc::new(ProcessCommandRunner)), "no-daemon", true);
+    target.runtime_root = directory.path().join("legacy runtime");
+    target.binary = directory.path().join("missing-legacy-tool/bin/cleat").display().to_string();
+    let report = drain("host".into(), "generation".into(), &incoming, std::slice::from_ref(&target), vec![]).await;
+    assert!(!report.failed(), "{report:?}");
+    assert!(assess_drain(&report).actionable.is_empty());
+    assert_eq!(report.information.len(), 1);
+    assert!(report.information[0].contains("no running host cleat daemon"));
+    assert!(!report.attempts[0].success, "retain the actual failed handover exit");
+    assert!(report.attempts[0].stderr.starts_with("connect daemon:"));
+    let entries =
+        std::fs::read_dir(&target.runtime_root).expect("runtime root").map(|entry| entry.expect("entry").file_name()).collect::<Vec<_>>();
+    assert_eq!(entries, [std::ffi::OsString::from(".fleet-bin")], "no daemon directory or socket may be created");
 }
 
 // Failed per-session handovers preserve diagnostics and become build skew,
@@ -778,12 +801,12 @@ async fn interrupted_delivery_retains_old_payload_and_diagnostics_until_verified
     let mut different = original.clone();
     different.extend_from_slice(b"# different verified release\n");
     let guest = contained_incoming(&incoming).expect("verified guest");
-    std::fs::write(&guest, different).expect("different incoming guest bytes");
+    std::fs::write(&guest.cleat, different).expect("different incoming guest bytes");
     refresh_guest_catalog(incoming.parent().and_then(Path::parent).expect("release"));
     let collision = drain("host".into(), "new".into(), &incoming, std::slice::from_ref(&first), vec![]).await;
     assert!(collision.failed(), "same-generation different content must not replace the payload");
     assert_eq!(std::fs::read(&delivered).expect("unchanged generation"), original);
-    std::fs::remove_file(guest.parent().expect("guest bin").join("../lib/libghostty-vt.so.0")).expect("remove incoming library");
+    std::fs::remove_file(&guest.library).expect("remove incoming library");
     let missing = drain("host".into(), "later".into(), &incoming, std::slice::from_ref(&first), vec![]).await;
     assert!(missing.failed());
     assert!(!first.runtime_root.join(".fleet-bin/later").exists());

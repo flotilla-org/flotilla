@@ -145,15 +145,20 @@ async fn delivery_command(target: &CleatTarget, script: &str, args: Vec<&str>) -
     target.runner.run_with_timeout("sh", &words, Path::new("/"), &ChannelLabel::Default, Duration::from_secs(30)).await
 }
 
+struct IncomingTools {
+    cleat: PathBuf,
+    library: PathBuf,
+}
+
 #[cfg(unix)]
-fn contained_incoming(incoming: &Path) -> Result<PathBuf, String> {
+fn contained_incoming(incoming: &Path) -> Result<IncomingTools, String> {
     let release = incoming.parent().and_then(Path::parent).ok_or("incoming cleat has no release root")?;
     flotilla_environment::guest_tools::GuestTools::resolve(release, &flotilla_environment::guest_tools::linux_amd64())
-        .map(|tools| tools.cleat())
+        .map(|tools| IncomingTools { cleat: tools.cleat(), library: tools.library() })
 }
 
 #[cfg(not(unix))]
-fn contained_incoming(_incoming: &Path) -> Result<PathBuf, String> {
+fn contained_incoming(_incoming: &Path) -> Result<IncomingTools, String> {
     Err("contained Cleat delivery requires a supported guest-tool controller".into())
 }
 
@@ -167,11 +172,9 @@ async fn incoming_for_target(target: &CleatTarget, generation: &str, incoming: &
     if !target.runtime_root.is_absolute() {
         return Err("cleat runtime root must be absolute".into());
     }
-    let incoming = contained_incoming(incoming)?;
-    let release = incoming.parent().and_then(Path::parent).ok_or("incoming guest cleat has no tool root")?;
-    let library = release.join("lib/libghostty-vt.so.0");
+    let tools = contained_incoming(incoming)?;
     let mut files = Vec::new();
-    for (name, source) in [("bin/cleat", incoming.as_path()), ("lib/libghostty-vt.so.0", library.as_path())] {
+    for (name, source) in [("bin/cleat", tools.cleat.as_path()), ("lib/libghostty-vt.so.0", tools.library.as_path())] {
         let bytes = tokio::fs::read(source).await.map_err(|error| format!("read incoming {}: {error}", source.display()))?;
         if bytes.is_empty() {
             return Err(format!("incoming {} is empty", source.display()));
@@ -234,12 +237,13 @@ pub async fn drain(host: String, generation: String, incoming: &Path, targets: &
         return report;
     }
     for target in targets {
-        let output = match incoming_for_target(target, &report.generation, incoming).await {
+        let selected_incoming = incoming_for_target(target, &report.generation, incoming).await;
+        let output = match &selected_incoming {
             Ok(incoming) => match incoming.to_str() {
                 Some(binary) => command(target, binary, &["server", "handover", "--json"], Duration::from_secs(30)).await,
                 None => Err("installed cleat path is not UTF-8".into()),
             },
-            Err(error) => Err(error),
+            Err(error) => Err(error.clone()),
         };
         let (stdout, stderr, success, mut error) = match output {
             Ok(output) => {
@@ -307,7 +311,10 @@ pub async fn drain(host: String, generation: String, incoming: &Path, targets: &
             && stderr.starts_with("connect daemon:")
             && (stderr.contains("No such file or directory") || stderr.contains("Connection refused"))
         {
-            let listing = parsed(command(target, &target.binary, &["daemons", "--json"], Duration::from_secs(5)).await);
+            let listing = match selected_incoming.as_ref().ok().and_then(|path| path.to_str()) {
+                Some(binary) => parsed(command(target, binary, &["daemons", "--json"], Duration::from_secs(5)).await),
+                None => None,
+            };
             if let Some(daemons) = listing.as_ref().and_then(Value::as_array) {
                 let live: Vec<_> = daemons
                     .iter()
