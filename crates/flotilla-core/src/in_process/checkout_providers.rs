@@ -73,14 +73,8 @@ impl CheckoutProviders {
             return Ok(provider);
         }
         let checkouts = self.checkout_provider_facts(&namespace).await?;
-        let mut observed = None;
-        for checkout in &checkouts {
-            if self.checked_checkout_lifetime_key(&namespace, checkout)?.is_some_and(|key| key.path == path && key.environment == *env_id) {
-                observed = Some(checkout);
-                break;
-            }
-        }
-        let Some(observed) = observed else {
+        let observed = checkouts.iter().find(|(_, key)| key.path == path && key.environment == *env_id);
+        let Some((observed, key)) = observed else {
             return discover_vcs_for_checkout(
                 &self.environment_manager,
                 &self.discovery,
@@ -92,11 +86,10 @@ impl CheckoutProviders {
             .await
             .map(Arc::new);
         };
-        let key = self.checked_checkout_lifetime_key(&namespace, observed)?.expect("eligible Checkout");
         let cell = {
             let mut cache = self.checkout_vcs.lock().await;
-            self.retain_checkout_providers(&mut cache, &namespace, &checkouts)?;
-            cache.entry(key).or_insert_with(|| Arc::new(OnceCell::new())).clone()
+            Self::retain_checkout_providers(&mut cache, &checkouts);
+            cache.entry(key.clone()).or_insert_with(|| Arc::new(OnceCell::new())).clone()
         };
         // A hit has already been validated against the current Checkout instance.
         // Avoid fetching Repository settings and repeating the inventory read.
@@ -180,7 +173,10 @@ impl CheckoutProviders {
         }
     }
 
-    async fn checkout_provider_facts(&self, namespace: &str) -> Result<Vec<ReadResourceObject<ResourceCheckout>>, String> {
+    async fn checkout_provider_facts(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<(ReadResourceObject<ResourceCheckout>, CheckoutLifetimeKey)>, String> {
         let mut checkouts = self
             .observed_resource_backend
             .clone()
@@ -203,7 +199,7 @@ impl CheckoutProviders {
         checkouts
             .into_values()
             .filter_map(|source| match self.checked_checkout_lifetime_key(namespace, &source) {
-                Ok(Some(_)) => Some(Ok(source)),
+                Ok(Some(key)) => Some(Ok((source, key))),
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
             })
@@ -266,27 +262,16 @@ impl CheckoutProviders {
         }))
     }
 
-    fn retain_checkout_providers(
-        &self,
-        cache: &mut CheckoutVcsCache,
-        namespace: &str,
-        checkouts: &[ReadResourceObject<ResourceCheckout>],
-    ) -> Result<(), String> {
-        let live: HashSet<_> = checkouts
-            .iter()
-            .map(|checkout| self.checked_checkout_lifetime_key(namespace, checkout))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+    fn retain_checkout_providers(cache: &mut CheckoutVcsCache, checkouts: &[(ReadResourceObject<ResourceCheckout>, CheckoutLifetimeKey)]) {
+        let live: HashSet<_> = checkouts.iter().map(|(_, key)| key).collect();
         cache.retain(|key, _| live.contains(key));
-        Ok(())
     }
 
     pub(super) async fn retire_checkout_providers(&self) -> Result<(), String> {
         let namespace = self.provisioning_namespace().await;
         let checkouts = self.checkout_provider_facts(&namespace).await?;
-        self.retain_checkout_providers(&mut *self.checkout_vcs.lock().await, &namespace, &checkouts)
+        Self::retain_checkout_providers(&mut *self.checkout_vcs.lock().await, &checkouts);
+        Ok(())
     }
 
     /// Resolve capabilities through discovery once for each observed Checkout.
@@ -435,7 +420,7 @@ mod lifecycle_contract {
     // Provider facts and lifetime keys use the same checked engine readiness/path at each origin.
     #[tokio::test]
     async fn provider_lifetimes_follow_engine_without_a_copy() {
-        for replica in [false, true] {
+        for (replica, race) in [(false, false), (true, false), (false, true)] {
             let temp = tempfile::tempdir().expect("config");
             std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"provider-contract\"\n").expect("config");
             let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -480,13 +465,43 @@ mod lifecycle_contract {
                     .expect("replica");
             }
             let fixture = LifecycleFixture::<CheckoutBinding>::new(replica);
+            if race {
+                // Live read boundary: two Ready observations, then concurrent backing loss.
+                struct ReadyThenLost(std::sync::atomic::AtomicUsize);
+                impl LifecycleReads for ReadyThenLost {
+                    fn try_reading(&self, _: ProvisioningKind, _: &str, _: Option<&str>) -> Result<Option<LifecycleReading>, String> {
+                        use std::sync::atomic::Ordering;
+                        Ok(Some(if self.0.fetch_add(1, Ordering::SeqCst) < 2 {
+                            LifecycleReading::Ready { identity: "/engine-path".into() }
+                        } else {
+                            LifecycleReading::Lost
+                        }))
+                    }
+                }
+                let reads = Arc::new(ReadyThenLost(std::sync::atomic::AtomicUsize::new(0)));
+                daemon.install_lifecycle_reads(reads.clone()).expect("install");
+                // Repository lookup fails normally; eligibility changes must never panic acquisition.
+                assert!(daemon
+                    .checkout_providers
+                    .checkout_provider(&daemon.local_environment_id, Path::new("/engine-path"))
+                    .await
+                    .is_err());
+                assert_eq!(reads.0.load(std::sync::atomic::Ordering::SeqCst), 1, "one checked read per inventory entry");
+                assert!(daemon
+                    .checkout_providers
+                    .checkout_provider(&daemon.local_environment_id, Path::new("/engine-path"))
+                    .await
+                    .is_err());
+                assert!(daemon.checkout_providers.checkout_provider_facts("flotilla").await.expect("lost").is_empty());
+                continue;
+            }
             daemon.install_lifecycle_reads(fixture.reads.clone()).expect("install");
             fixture.request(&obj);
             assert!(daemon.checkout_providers.checkout_provider_facts("flotilla").await.expect("requested").is_empty());
             fixture.finish(&obj, Ending::Ready("/engine-path"));
             let facts = daemon.checkout_providers.checkout_provider_facts("flotilla").await.expect("ready");
             assert_eq!(facts.len(), 1);
-            let key = daemon.checkout_providers.checked_checkout_lifetime_key("flotilla", &facts[0]).expect("key").expect("ready key");
+            let key = &facts[0].1;
             assert_eq!(key.path, PathBuf::from("/engine-path"));
             fixture.finish(&obj, Ending::Lost("/engine-path"));
             assert!(daemon.checkout_providers.checkout_provider_facts("flotilla").await.expect("lost").is_empty());
