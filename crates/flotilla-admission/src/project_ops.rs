@@ -476,20 +476,38 @@ impl ProjectService<'_> {
                     .map_err(|error| format!("project member alias `{}` refers to unavailable repository {key}: {error}", member.alias))?
             };
             let live_remote = declared_spec.live_remote().expect("remote RepositorySpec has a live remote");
-            let updated_spec = repository.spec.clone().update_remotes(live_remote)?;
-            let mut repository_meta = InputMeta::from(&repository.metadata);
-            for (annotation, value) in &provenance {
-                if repository_meta.annotations.get(annotation) != Some(value) {
-                    converged = true;
-                    repository_meta.annotations.insert(annotation.clone(), value.clone());
+            let mut backoff = std::time::Duration::from_millis(10);
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                let updated_spec = repository.spec.clone().update_remotes(live_remote)?;
+                let mut repository_meta = InputMeta::from(&repository.metadata);
+                repository_meta.annotations.extend(provenance.clone());
+                if repository_meta.annotations == repository.metadata.annotations && updated_spec == repository.spec {
+                    break;
                 }
-            }
-            if repository_meta.annotations != repository.metadata.annotations || updated_spec != repository.spec {
-                converged = true;
-                repository = repositories
-                    .update(&repository_meta, &repository.metadata.resource_version, &updated_spec)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                // Status and spec share a version. Rebase this narrow declaration
+                // change onto the latest object without replaying registration.
+                match repositories.update(&repository_meta, &repository.metadata.resource_version, &updated_spec).await {
+                    Ok(updated) => {
+                        converged = true;
+                        repository = updated;
+                        break;
+                    }
+                    Err(error @ ResourceError::Conflict { .. }) => {
+                        // Other charter writers share the namespace lock held here.
+                        // Bound this episode even when the client has disconnected.
+                        if attempts >= 5 {
+                            return Err(format!(
+                                "repository {key} remains busy after {attempts} update attempts; retry project register: {error}"
+                            ));
+                        }
+                        tokio::time::sleep(backoff).await;
+                        backoff *= 2;
+                        repository = repositories.get(&key.to_string()).await.map_err(|error| error.to_string())?;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
             }
             repository
                 .spec
@@ -1687,6 +1705,9 @@ pub async fn snapshot_project_repositories_from_project(
 }
 
 #[cfg(test)]
+mod registration_race;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
 
@@ -1895,8 +1916,23 @@ mod tests {
         }
     }
 
+    // Registration must survive a startup status write between its Repository read and spec write.
     #[tokio::test]
     async fn project_registration_uses_injected_inspection_and_identity_resolution() {
+        registration_scenario(super::registration_race::Contention::Once).await;
+    }
+
+    // Persistent Repository contention must release the namespace lock so unrelated authoring can proceed.
+    #[tokio::test(start_paused = true)]
+    async fn persistent_registration_contention_releases_authoring_lock() {
+        registration_scenario(super::registration_race::Contention::Persistent).await;
+    }
+
+    async fn registration_scenario(contention: super::registration_race::Contention) {
+        let test_namespace = match contention {
+            super::registration_race::Contention::Once => "flotilla",
+            super::registration_race::Contention::Persistent => "registration-persistent",
+        };
         let temp = tempfile::tempdir().expect("checkout directory");
         let remote = "https://github.com/example/app";
         let repository_spec = RepositorySpec::remote(remote).expect("repository spec");
@@ -1920,10 +1956,16 @@ mod tests {
             })),
             ..Default::default()
         };
-        let backend = ResourceBackend::new(InMemoryBackend::default());
         let observed = ResourceBackend::new(InMemoryBackend::observed());
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let backend = ResourceBackend::new(super::registration_race::RacingStore {
+            inner: Arc::new(InMemoryBackend::default()),
+            armed: Arc::clone(&armed),
+            observed: observed.clone(),
+            contention,
+        });
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let namespace = std::sync::RwLock::new("flotilla".to_string());
+        let namespace = std::sync::RwLock::new(test_namespace.to_string());
         let service = ProjectService {
             image_layer_refresh: Default::default(),
             resource_backend: &backend,
@@ -1943,7 +1985,22 @@ mod tests {
         // #2777 review: exercise bootstrap's handoff to ops materialization
         // while the fleet writer's namespace critical section contends. A
         // retained non-reentrant guard must fail this deadline, not hang CI.
-        let fleet_lock = flotilla_charter::charter_store::authoring_lock("flotilla");
+        let fleet_lock = flotilla_charter::charter_store::authoring_lock(test_namespace);
+        if matches!(contention, super::registration_race::Contention::Persistent) {
+            let registration = service.project_register(temp.path().to_str().expect("checkout path"));
+            tokio::pin!(registration);
+            assert!(futures::poll!(registration.as_mut()).is_pending(), "registration must encounter a conflict and back off");
+            let unrelated_author = fleet_lock.lock();
+            tokio::pin!(unrelated_author);
+            assert!(futures::poll!(unrelated_author.as_mut()).is_pending(), "the retry episode holds the authoring lock");
+            let (failure, _guard) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), async { tokio::join!(registration, unrelated_author) })
+                    .await
+                    .expect("persistent contention must release unrelated authoring within the retry budget");
+            assert!(failure.expect_err("contention must return a retryable refusal").contains("retry project register"));
+            assert!(!armed.load(Ordering::SeqCst), "the real startup writer must also have raced registration");
+            return;
+        }
         let fleet_guard = fleet_lock.lock().await;
         let (registration, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(service.project_register(temp.path().to_str().expect("UTF-8 checkout path")), async {
@@ -1954,6 +2011,10 @@ mod tests {
         .await
         .expect("bootstrap and fleet authoring must not deadlock");
         assert_eq!(registration.expect("register"), ("app".into(), 1));
+        assert!(!armed.load(Ordering::SeqCst), "startup reconciler must have raced registration");
+        let repository = backend.using::<Repository>("flotilla").get(&repository_spec.key().to_string()).await.expect("repository");
+        assert_eq!(repository.status.expect("controller status must survive registration").default_branch.as_deref(), Some("main"));
+        assert_eq!(repository.metadata.annotations[BOOTSTRAP_COMMIT_ANNOTATION], "abc123");
         assert_eq!(operations.identity_resolutions.load(Ordering::SeqCst), 1);
         let project = backend.definitions::<Project>("flotilla").get("app").await.expect("registered project");
         assert_eq!(project.spec.repositories[0].repo, repository_spec.key());
