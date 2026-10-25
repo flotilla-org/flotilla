@@ -33,6 +33,10 @@ const DEADLINE: Duration = Duration::from_secs(15);
 const MAX_ROUNDS: usize = 16;
 
 impl Rounds {
+    pub(super) async fn peer(&self, session: &str) -> Result<String, String> {
+        self.sessions.lock().await.get(session).map(|session| session.peer.clone()).ok_or_else(|| "change-stream session expired".into())
+    }
+
     pub(super) async fn next(
         &self,
         peer: &str,

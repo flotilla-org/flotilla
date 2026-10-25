@@ -21,12 +21,6 @@ pub(in crate::server) enum Reply {
     },
     /// Newline-delimited JSON watch events until the watch ends.
     Watch(DynamicResourceWatch),
-    /// The ADR 0064 change stream, as chunked CBOR frames.
-    ChangeStream {
-        service: Arc<Service>,
-        after: Option<u64>,
-        clock: Arc<dyn flotilla_resources::Clock>,
-    },
     /// One encoded point read.
     Record {
         service: Arc<Service>,
@@ -80,7 +74,7 @@ pub(in crate::server) async fn respond(
     }
 
     let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
-    if path == flotilla_schema_sqlite::stream::PATH || path == flotilla_schema_sqlite::stream::RECORD_PATH {
+    if path == flotilla_schema_sqlite::stream::RECORD_PATH {
         let Some(daemon) = daemon else {
             return Reply::error(503, "decided store unavailable");
         };
@@ -89,26 +83,17 @@ pub(in crate::server) async fn respond(
             Err(error) => return Reply::error(503, &error),
         };
         let query = parse_query(raw_query);
-        if path == flotilla_schema_sqlite::stream::RECORD_PATH {
-            let (Some(kind), Some(name)) = (query.get("kind"), query.get("name")) else {
-                return Reply::error(400, "record requires kind and name");
-            };
-            return Reply::Record {
-                service,
-                kind: kind.clone(),
-                name: name.clone(),
-                now: flotilla_schema::Timestamp::from_datetime(&daemon.clock().now()),
-            };
-        }
-        let after = match query.get("after") {
-            Some(value) => match value.parse::<u64>() {
-                Ok(after) => Some(after),
-                Err(_) => return Reply::error(400, "invalid home cursor"),
-            },
-            None => None,
+        let (Some(kind), Some(name)) = (query.get("kind"), query.get("name")) else {
+            return Reply::error(400, "record requires kind and name");
         };
-        return Reply::ChangeStream { service, after, clock: daemon.clock_for_scenarios() };
+        return Reply::Record {
+            service,
+            kind: kind.clone(),
+            name: name.clone(),
+            now: flotilla_schema::Timestamp::from_datetime(&daemon.clock().now()),
+        };
     }
+
     let observed_path = path == "/observed" || path.starts_with("/observed/");
     let additional_stores = if daemon.is_some() && !observed_path { vec!["/observed"] } else { Vec::new() };
     let (path, backend) = if observed_path {

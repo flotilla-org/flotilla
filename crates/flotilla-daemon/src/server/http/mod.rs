@@ -70,9 +70,6 @@ pub(in crate::server) struct HttpRouter {
     /// The TCP listener's origin, for login URLs; unset when no TCP listener is declared.
     #[builder(default)]
     tcp_origin: ListenerOrigin,
-    /// How long a change-stream body waits on a consumer that stopped reading.
-    #[builder(default = super::change_stream::CONSUMER_DEADLINE)]
-    change_stream_deadline: std::time::Duration,
 }
 
 /// The TCP listener's origin, known only once it binds (its port may be chosen then). The
@@ -113,7 +110,6 @@ impl HttpRouter {
             table_store: None,
             logins,
             tcp_origin,
-            change_stream_deadline: super::change_stream::CONSUMER_DEADLINE,
         }
     }
 
@@ -267,21 +263,43 @@ async fn logout(State(RouterState(state)): State<RouterState>, Extension(caller)
     response
 }
 
-/// The resource API, with its paths, query parameters, statuses and bodies unchanged.
+/// A peer-issued cursor authenticates HTTP replication before the user resource routes.
 async fn resource_api(
     State(RouterState(state)): State<RouterState>,
     Extension(caller): Extension<CallerAuth>,
     request: Request,
 ) -> Response {
+    if request.uri().path() == flotilla_schema_sqlite::stream::PATH {
+        if !matches!(caller, CallerAuth::Socket(_)) {
+            return auth::refusal(StatusCode::FORBIDDEN, "change-stream requires peer replication transport");
+        }
+        let Some(session) = request.headers().get(super::change_stream::SESSION_HEADER).and_then(|value| value.to_str().ok()) else {
+            return auth::refusal(StatusCode::FORBIDDEN, "change-stream requires peer replication transport");
+        };
+        let Some(daemon) = &state.daemon else {
+            return auth::refusal(StatusCode::SERVICE_UNAVAILABLE, "decided store unavailable");
+        };
+        let peer = match daemon.change_stream_peer(session).await {
+            Ok(peer) => peer,
+            Err(error) => return auth::refusal(StatusCode::FORBIDDEN, &error),
+        };
+        if request.method() != axum::http::Method::GET {
+            return auth::refusal(StatusCode::METHOD_NOT_ALLOWED, "resource API is read-only");
+        }
+        return streaming(
+            super::change_stream::CONTENT_TYPE,
+            Body::from_stream(super::change_stream::body(Arc::clone(daemon), peer, session.to_owned())),
+        );
+    }
     if let Some(refused) = caller.refusal_unless_user() {
         return refused;
     }
     let target = request.uri().path_and_query().map_or_else(|| request.uri().path().to_owned(), |target| target.as_str().to_owned());
     let reply = resource_api::respond(request.method().as_str(), &target, state.backend.clone(), state.daemon.as_ref()).await;
-    render(reply, state.change_stream_deadline).await
+    render(reply).await
 }
 
-async fn render(reply: Reply, change_stream_deadline: std::time::Duration) -> Response {
+async fn render(reply: Reply) -> Response {
     match reply {
         Reply::Json { status, body } => {
             (StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), Json(body)).into_response()
@@ -293,10 +311,6 @@ async fn render(reply: Reply, change_stream_deadline: std::time::Duration) -> Re
             });
             streaming("application/json", Body::from_stream(lines))
         }
-        Reply::ChangeStream { service, after, clock } => streaming(
-            super::change_stream::CONTENT_TYPE,
-            Body::from_stream(super::change_stream::body(service, after, clock, change_stream_deadline)),
-        ),
         Reply::Record { service, kind, name, now } => match super::change_stream::query_record(service, &kind, &name, now).await {
             Ok(bytes) => ([(header::CONTENT_TYPE, super::change_stream::CONTENT_TYPE)], bytes).into_response(),
             Err(error) => auth::refusal(StatusCode::INTERNAL_SERVER_ERROR, &error),

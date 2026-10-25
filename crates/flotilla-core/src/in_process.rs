@@ -2206,6 +2206,12 @@ impl InProcessDaemon {
             .await
     }
 
+    /// Resolve an opaque cursor issued only through peer replication dispatch.
+    /// HTTP uses this capability to continue the same bounded producer.
+    pub async fn change_stream_peer(&self, session: &str) -> Result<String, String> {
+        self.change_stream_rounds.peer(session).await
+    }
+
     /// Present only after the first kind migration installs its registered store.
     pub fn decided_store(&self) -> Result<Arc<flotilla_schema_sqlite::stream::Service>, String> {
         self.decided_store
