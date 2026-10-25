@@ -373,7 +373,8 @@ impl LeafSubscriptionTable {
                     match cr.checks.value {
                         Some(ObservedChecks::Pass) => format!("{head_sha}@pass"),
                         Some(ObservedChecks::Fail) => format!("{head_sha}@fail"),
-                        _ => return Ok(()),
+                        Some(ObservedChecks::Pending) => format!("{head_sha}@pending"),
+                        None => return Ok(()),
                     }
                 } else {
                     head_sha
