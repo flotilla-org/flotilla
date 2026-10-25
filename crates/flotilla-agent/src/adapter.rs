@@ -862,6 +862,10 @@ impl AgentAdapter for CliAgentAdapter {
     fn launch(&self, request: &AgentLaunchRequest) -> Result<AgentLaunchPlan, String> {
         let mut env = request.environment.clone();
         let claude = matches!(&self.flavor, AdapterFlavor::ClaudeCode { .. });
+        if claude {
+            env.retain(|(name, _)| name != "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION");
+            env.push(("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".to_string(), "false".to_string()));
+        }
         let contained = session_is_contained(&env);
         if claude && contained && !env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
             return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
@@ -929,6 +933,7 @@ impl CliAgentAdapter {
                 // while flotillad has a loopback listener; vessel sessions keep commands.
                 let mut settings = crate::claude_code_hook_settings_over(crate::ClaudeCodeHookTransport::from_environment(environment));
                 settings["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
+                settings["promptSuggestionEnabled"] = serde_json::Value::Bool(false);
                 if contained {
                     settings["attribution"] = serde_json::json!({ "commit": "", "pr": "", "sessionUrl": false });
                     settings["includeCoAuthoredBy"] = serde_json::Value::Bool(false);
@@ -2261,6 +2266,7 @@ mod tests {
         };
 
         let invocation_environment = vec![
+            ("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".to_string(), "true".to_string()),
             ("FLOTILLA_ENVIRONMENT_ID".to_string(), "contained-claude".to_string()),
             ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string()),
             ("CLAUDE_CONFIG_DIR".to_string(), claude_config.display().to_string()),
@@ -2291,6 +2297,13 @@ mod tests {
                 .expect("parse settings");
         assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"], "flotilla hook claude-code session-start");
         assert_eq!(settings["hooks"]["Notification"][0]["matcher"], "permission_prompt");
+        // Glue: crew settings and launch environment both disable prompt suggestions,
+        // including an explicitly supplied conflicting environment value.
+        assert_eq!(settings["promptSuggestionEnabled"], false);
+        assert_eq!(
+            plan.env.iter().filter(|(name, _)| name == "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION").collect::<Vec<_>>(),
+            vec![&("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".to_string(), "false".to_string())]
+        );
         assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
         assert_eq!(settings["attribution"], serde_json::json!({ "commit": "", "pr": "", "sessionUrl": false }));
         assert_eq!(settings["includeCoAuthoredBy"], false);
