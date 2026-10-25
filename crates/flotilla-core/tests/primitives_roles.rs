@@ -313,27 +313,35 @@ async fn a_newer_stall_about_the_seat_replaces_the_older_once_written() {
     assert!(primitives.awaiting().stalled(&seat).expect("read"));
 }
 
-// Behaviour (#3730 review, a stall cleared without a reply): ending a seat's stall withdraws every
-// open stall record about it, whoever sent them; a seat still stalled keeps its records, and a
-// home with no open stall reads nothing.
+// Clearing a crew or convoy stall withdraws its records without a reply; a still-stalled
+// subject keeps its records, and a home with no open stall reads nothing.
 #[tokio::test]
-async fn a_cleared_stall_withdraws_the_seats_records() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let primitives = primitives(&dir).await;
-    let seat: flotilla_address::Address = "project:flotilla/convoy:demo/role:coder".parse().expect("seat");
-    assert!(primitives.end_stalls(NAMESPACE, &[CREW.to_owned()], None, "cleared").await.expect("nothing open").is_empty());
-    let mut stall = intent("fleet/bosun", "fleet/governor");
-    stall.relation = MessageRelation::Supervisor;
-    stall.expectation = flotilla_resources::MessageExpectation::Reply;
-    let name = flotilla_resources::message_record_name("fleet/governor", "fleet/bosun", "stall-1");
-    primitives.admit(NAMESPACE, &name, &stall).await.expect("sent");
-    primitives.await_reply(NAMESPACE, &name, &stall, "home-a", "stall", Some(CREW)).await.expect("recorded");
-    // Another vessel's seat of the same role shares the record's subject: it keeps the records.
-    let twin = "flotilla/demo/other/coder";
-    assert!(primitives.end_stalls(NAMESPACE, &[twin.to_owned()], Some(CREW), "cleared").await.expect("kept").is_empty());
-    assert!(primitives.awaiting().stalled(&seat).expect("read"));
-    assert_eq!(primitives.end_stalls(NAMESPACE, &[CREW.to_owned()], None, "cleared").await.expect("ended").len(), 1);
-    assert!(!primitives.awaiting().stalled(&seat).expect("read"), "the cleared stall is not open");
+async fn a_cleared_stall_withdraws_its_subjects_records() {
+    for (subject, canonical) in
+        [(CREW, "project:flotilla/convoy:demo/role:coder"), ("project:flotilla/convoy:demo", "project:flotilla/convoy:demo")]
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primitives = primitives(&dir).await;
+        let seat: flotilla_address::Address = canonical.parse().expect("subject");
+        assert!(primitives.end_stalls(NAMESPACE, &[subject.to_owned()], None, "cleared").await.expect("nothing open").is_empty());
+        let mut stall = intent("system:stall-judge", "fleet/governor");
+        stall.relation = MessageRelation::Supervisor;
+        stall.expectation = flotilla_resources::MessageExpectation::Reply;
+        let name = flotilla_resources::message_record_name("fleet/governor", "system:stall-judge", "stall-1");
+        primitives.admit(NAMESPACE, &name, &stall).await.expect("sent");
+        primitives.await_reply(NAMESPACE, &name, &stall, "home-a", "stall", Some(subject)).await.expect("recorded");
+        // Another vessel's seat of the same role shares the record's subject: it keeps the records.
+        let twin = "flotilla/demo/other/coder";
+        assert!(primitives.end_stalls(NAMESPACE, &[twin.to_owned()], Some(subject), "cleared").await.expect("kept").is_empty());
+        assert!(primitives.awaiting().stalled(&seat).expect("read"));
+        assert_eq!(primitives.end_stalls(NAMESPACE, &[subject.to_owned()], None, "cleared").await.expect("ended").len(), 1);
+        assert!(!primitives.awaiting().stalled(&seat).expect("read"), "the cleared stall is not open");
+        let sender = "fleet:lab/role:stall-judge".parse().expect("sender");
+        assert!(
+            primitives.awaiting().open_from(&sender).expect("sender records").is_empty(),
+            "clearing without a reply leaves no open record"
+        );
+    }
 }
 
 // Behaviour (#3730 review nit): a system producer with no fleet role, or a person until #3457, has

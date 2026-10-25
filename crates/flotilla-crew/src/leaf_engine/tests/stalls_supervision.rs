@@ -1909,3 +1909,19 @@ fn pending_crew_startup_never_stalls(tc: hegel::TestCase) {
         }
     });
 }
+
+// Supervision has a crew or convoy subject, and only a recipient with an inbox awaits a reply.
+#[tokio::test]
+async fn supervision_records_have_a_subject_and_operator_notices_expect_nothing() {
+    let (backend, wake, _) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let source = convoys.get("stalled-work").await.expect("source");
+    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("judge");
+    let source = convoys.get("stalled-work").await.expect("source");
+    let mut condition = source.status.as_ref().expect("status").stalled.clone().expect("stall");
+    assert_eq!(super::super::stalls::stall_subject("flotilla", &source, &condition), "wheelhouse/stalled-work/work/coder");
+    condition.leaves.clear();
+    assert_eq!(super::super::stalls::stall_subject("flotilla", &source, &condition), "project:wheelhouse/convoy:stalled-work");
+    assert_eq!(super::super::stalls::supervision_expectation(StallRung::Operator), flotilla_resources::MessageExpectation::None);
+    assert_eq!(super::super::stalls::supervision_expectation(StallRung::Governor), flotilla_resources::MessageExpectation::Reply);
+}

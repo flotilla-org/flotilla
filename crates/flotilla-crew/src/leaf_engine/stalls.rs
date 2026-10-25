@@ -23,6 +23,30 @@ pub(crate) fn crew_role_address(project: &str, convoy: &str, vessel: &str, role:
     format!("{project}/{convoy}/{vessel}/{role}")
 }
 
+fn convoy_stall_subject(project: &str, convoy: &str) -> String {
+    flotilla_address::Address::project(project)
+        .and_then(|project| project.child(flotilla_address::Kind::Convoy, convoy))
+        .expect("a stored convoy has a project and a name")
+        .to_string()
+}
+
+/// A convoy stall has a subject even when no crew caused it.
+pub(super) fn stall_subject(namespace: &str, convoy: &ResourceObject<Convoy>, condition: &StalledCondition) -> String {
+    let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+    stalled_source_actor(condition)
+        .map(|(vessel, role)| crew_role_address(project, &convoy.metadata.name, vessel, role))
+        .unwrap_or_else(|| convoy_stall_subject(project, &convoy.metadata.name))
+}
+
+pub(super) fn supervision_expectation(rung: StallRung) -> flotilla_resources::MessageExpectation {
+    // The operator has no inbox at a home until the principals model lands.
+    if rung == StallRung::Operator {
+        flotilla_resources::MessageExpectation::None
+    } else {
+        flotilla_resources::MessageExpectation::Reply
+    }
+}
+
 pub(crate) fn supervision_message_source(convoy: &str, index: usize) -> String {
     format!("supervision-{convoy}-{index}")
 }
@@ -205,12 +229,8 @@ pub(super) fn is_active_change_request_probe(
 }
 
 impl ReconcilerWake {
-    /// Withdraws this home's open stall records about `convoy`'s seats that
-    /// its stored stall status, `stalled`, does not show stalled (#3730
-    /// review): wherever the old status is cleared or leaves a seat, the
-    /// engine's record of that stall ends too. A newer stall about the same
-    /// seat replaces the older record as it is written (`await_reply`). A
-    /// failure is logged, and the next pass repeats it.
+    /// Withdraws records about the convoy or its roles once the stored stall
+    /// status no longer names that subject. Failed withdrawals retry next pass.
     async fn end_settled_stalls(
         &self,
         namespace: &str,
@@ -221,11 +241,13 @@ impl ReconcilerWake {
         let Some(primitives) = self.subscriptions.message_primitives() else { return };
         let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
         let address = |vessel: &str, role: &str| crew_role_address(project, &convoy.metadata.name, vessel, role);
-        let stalled = stalled.and_then(stalled_source_actor).map(|(vessel, role)| address(vessel, role));
+        let stalled =
+            stalled.filter(|condition| condition.rung != StallRung::Operator).map(|condition| stall_subject(namespace, convoy, condition));
         let seats = status
             .crew_work
             .iter()
             .flat_map(|(vessel, roles)| roles.keys().map(|role| address(vessel, role)))
+            .chain(std::iter::once(convoy_stall_subject(project, &convoy.metadata.name)))
             .filter(|seat| Some(seat) != stalled.as_ref())
             .collect::<Vec<_>>();
         match primitives.end_stalls(namespace, &seats, stalled.as_deref(), "the seat's stall ended").await {
@@ -1291,7 +1313,7 @@ impl ReconcilerWake {
                                             .unwrap_or_else(|| "system:stall-judge".into()),
                                     )
                                     .relation(flotilla_resources::MessageRelation::Supervisor)
-                                    .expectation(flotilla_resources::MessageExpectation::Reply)
+                                    .expectation(supervision_expectation(rung))
                                     .references(vec![flotilla_resources::MessageReference::ControlRecord {
                                         resource: flotilla_protocol::ResourceRef::new(
                                             "flotilla.work/v1",
@@ -1301,17 +1323,7 @@ impl ReconcilerWake {
                                         ),
                                         revision: convoy.metadata.resource_version.clone(),
                                     }])
-                                    // An operator-rung stall has no engine record until #3457 (#3587 ruling 6353447431).
-                                    .maybe_stall_of(stalled_source_actor(&condition).filter(|_| rung != StallRung::Operator).map(
-                                        |(vessel, role)| {
-                                            crew_role_address(
-                                                convoy.spec.project_ref.as_deref().unwrap_or(namespace),
-                                                &convoy.metadata.name,
-                                                vessel,
-                                                role,
-                                            )
-                                        },
-                                    ))
+                                    .maybe_stall_of((rung != StallRung::Operator).then(|| stall_subject(namespace, convoy, &condition)))
                                     .build();
                                 let admission = match self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await {
                                     Ok(admission) => admission,

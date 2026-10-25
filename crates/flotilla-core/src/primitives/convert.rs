@@ -69,6 +69,18 @@ impl Conversion<'_> {
         }
     }
 
+    /// A stall may concern a whole convoy rather than a role inbox.
+    pub fn stall_subject(&self, subject: &str) -> Result<Address, String> {
+        if subject.starts_with("project:") {
+            let address: Address = subject.parse().map_err(|error| format!("invalid stall subject: {error}"))?;
+            if address.kind() == Kind::Convoy {
+                return Ok(address);
+            }
+            return Err(format!("`{subject}` is not a convoy address"));
+        }
+        self.inbox(subject)
+    }
+
     /// A sender's address: a role as [`Conversion::inbox`] maps it, and a
     /// `system:` producer as the fleet role it sends as.
     pub fn sender(&self, sender: &str) -> Result<Address, String> {

@@ -1186,7 +1186,7 @@ fn assert_escalation_transferred(
     assert_eq!(records.len(), 2);
     let escalation = records.iter().find(|record| record.spec.receiver == receiver).expect("next receiver Message");
     assert_eq!(escalation.spec.relation, MessageRelation::Supervisor);
-    assert_eq!(escalation.spec.expectation, MessageExpectation::Reply);
+    assert_eq!(escalation.spec.expectation, if operator { MessageExpectation::None } else { MessageExpectation::Reply });
 }
 
 // Receiver refusal preserves the existing owner and creates no notifications.
