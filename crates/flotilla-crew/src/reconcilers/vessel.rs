@@ -1,4 +1,5 @@
 use flotilla_resources::checkout_path::checkout_path_component;
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::Actuation;
 use flotilla_store::DockerImageSourceStoreExt;
 use std::{
@@ -15,7 +16,7 @@ use flotilla_agent::adapter::{
     CrewBriefTemplateResolver,
 };
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
-use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, PlacementDecision};
+use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading, PlacementDecision};
 use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{
     address::artifact_slot_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot,
@@ -81,6 +82,8 @@ pub trait WorktreeMetadataResolver: Send + Sync {
 #[derive(bon::Builder)]
 pub struct VesselReconciler {
     backend: ResourceBackend,
+    #[builder(default = Arc::new(NoLifecycleReads))]
+    lifecycle_reads: Arc<dyn LifecycleReads>,
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
     placement_policies: TypedResolver<PlacementPolicy>,
@@ -102,10 +105,24 @@ pub struct VesselReconciler {
     recent_checkout_create_attempts: Mutex<BTreeMap<String, Instant>>,
 }
 
+struct EnvironmentDependency {
+    engine_held: bool,
+    ready: bool,
+    waiting: Option<String>,
+    unavailable: Option<VesselPrepared>,
+}
+
+struct CheckoutDependency {
+    phase: CheckoutPhase,
+    failure: Option<String>,
+    path: Option<String>,
+}
+
 impl VesselReconciler {
     pub fn new(backend: ResourceBackend, namespace: &str) -> Self {
         Self {
             backend: backend.clone(),
+            lifecycle_reads: Arc::new(NoLifecycleReads),
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
             placement_policies: backend.clone().using::<PlacementPolicy>(namespace),
@@ -124,6 +141,72 @@ impl VesselReconciler {
             brief_templates: CrewBriefTemplateResolver::default(),
             recent_checkout_create_attempts: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
+        self.lifecycle_reads = reads;
+        self
+    }
+
+    fn checkout_dependency(&self, checkout: &ResourceObject<Checkout>) -> Result<CheckoutDependency, ResourceError> {
+        let reading =
+            self.lifecycle_reads.try_reading(ProvisioningKind::Checkout, &checkout.metadata.name, None).map_err(ResourceError::other)?;
+        Ok(match reading {
+            Some(LifecycleReading::Ready { identity }) => {
+                CheckoutDependency { phase: CheckoutPhase::Ready, failure: None, path: Some(identity) }
+            }
+            Some(LifecycleReading::GaveUp { cause } | LifecycleReading::Exhausted { cause }) => {
+                CheckoutDependency { phase: CheckoutPhase::Failed, failure: Some(cause), path: None }
+            }
+            Some(LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::Gone) => {
+                CheckoutDependency { phase: CheckoutPhase::Gone, failure: None, path: None }
+            }
+            Some(_) => CheckoutDependency { phase: CheckoutPhase::Pending, failure: None, path: None },
+            None => CheckoutDependency {
+                phase: checkout.status.as_ref().map(|status| status.phase).unwrap_or_default(),
+                failure: checkout.status.as_ref().and_then(|status| status.message.clone()),
+                path: checkout
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.path.clone())
+                    .or_else(|| checkout.spec.target_path().map(str::to_string)),
+            },
+        })
+    }
+
+    fn environment_dependency(&self, environment: &ResourceObject<Environment>) -> Result<EnvironmentDependency, ResourceError> {
+        let reading = self
+            .lifecycle_reads
+            .try_reading(ProvisioningKind::Environment, &environment.metadata.name, None)
+            .map_err(ResourceError::other)?;
+        Ok(match reading {
+            Some(reading) => {
+                let unavailable = match &reading {
+                    LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause } => {
+                        Some(VesselPrepared::failed(cause.clone()))
+                    }
+                    LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::Gone => Some(VesselPrepared {
+                        patch: PlannedPatch::Lost {
+                            message: format!("environment {} {}", environment.metadata.name, reading.reason().unwrap_or_default()),
+                        },
+                        actuations: Vec::new(),
+                    }),
+                    _ => None,
+                };
+                EnvironmentDependency {
+                    engine_held: true,
+                    ready: matches!(reading, LifecycleReading::Ready { .. }),
+                    waiting: reading.reason(),
+                    unavailable,
+                }
+            }
+            None => EnvironmentDependency {
+                engine_held: false,
+                ready: environment.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Ready),
+                waiting: environment.status.as_ref().and_then(|status| status.message.clone()),
+                unavailable: VesselPrepared::legacy_unavailable_environment(environment),
+            },
+        })
     }
 
     pub fn new_with_config_dir(backend: ResourceBackend, namespace: &str, config_dir: impl Into<PathBuf>) -> Self {
@@ -420,20 +503,7 @@ impl VesselPrepared {
         }
     }
 
-    fn provisioning_for_environment(
-        placement_policy: &ResourceObject<PlacementPolicy>,
-        placement_decision: Option<PlacementDecision>,
-        environment: &ResourceObject<Environment>,
-        fallback: impl Into<String>,
-        actuations: Vec<Actuation>,
-    ) -> Self {
-        let fallback = fallback.into();
-        let waiting_for = environment.status.as_ref().and_then(|status| status.message.clone()).unwrap_or(fallback);
-        let waiting_for = legible_waiting_for(waiting_for, placement_decision.as_ref());
-        Self { patch: provisioning_patch(placement_policy, placement_decision, waiting_for), actuations }
-    }
-
-    fn unavailable_environment(environment: &ResourceObject<Environment>) -> Option<Self> {
+    fn legacy_unavailable_environment(environment: &ResourceObject<Environment>) -> Option<Self> {
         let status = environment.status.as_ref()?;
         let patch = match status.phase {
             EnvironmentPhase::Lost => PlannedPatch::Lost {
@@ -503,7 +573,8 @@ impl Reconciler for VesselReconciler {
         if let Some(environment_ref) = obj.status.as_ref().and_then(|status| status.environment_ref.as_ref()) {
             match self.environments.get(environment_ref).await {
                 Ok(environment) => {
-                    if let Some(prepared) = VesselPrepared::unavailable_environment(&environment) {
+                    let dependency = self.environment_dependency(&environment)?;
+                    if let Some(prepared) = dependency.unavailable {
                         return Ok(prepared);
                     }
                 }
@@ -613,7 +684,7 @@ impl Reconciler for VesselReconciler {
                 Some(spec) => spec,
                 None => return Ok(VesselPrepared::failed(format!("environment {clone_env_ref} is not a host_direct environment"))),
             };
-            if clone_env.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
+            if !self.environment_dependency(&clone_env)?.ready {
                 return Ok(VesselPrepared::provisioning(
                     &placement_policy,
                     placement_decision.clone(),
@@ -631,25 +702,30 @@ impl Reconciler for VesselReconciler {
                 let env_name = environment_name(&obj.metadata.name);
                 let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
-                        if let Some(prepared) = VesselPrepared::unavailable_environment(&existing) {
+                        let dependency = self.environment_dependency(&existing)?;
+                        if let Some(prepared) = dependency.unavailable {
                             return Ok(prepared);
                         }
-                        if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                            let waiting_for = existing
-                                .status
-                                .as_ref()
-                                .and_then(|status| status.message.clone())
-                                .unwrap_or_else(|| format!("environment {env_name} to become ready"));
-                            return Ok(VesselPrepared::provisioning_for_environment(
+                        if !dependency.ready {
+                            let waiting_for = dependency.waiting.unwrap_or_else(|| format!("environment {env_name} to become ready"));
+                            return Ok(VesselPrepared::provisioning(
                                 &placement_policy,
                                 placement_decision.clone(),
-                                &existing,
                                 waiting_for,
                                 actuations,
                             ));
                         }
                         match image_stamp(&existing, &placement_policy) {
                             Ok(image) => image,
+                            Err(message) if dependency.engine_held => {
+                                // Readiness can commit before the provider's image observations are published.
+                                return Ok(VesselPrepared::provisioning(
+                                    &placement_policy,
+                                    placement_decision.clone(),
+                                    message,
+                                    actuations,
+                                ));
+                            }
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         }
                     }
@@ -900,7 +976,8 @@ impl Reconciler for VesselReconciler {
                     if adopted_checkout_ref.is_some() && existing.metadata.lifecycle_authority()? != Some(LifecycleAuthority::Adopted) {
                         return Ok(VesselPrepared::failed(format!("checkout {checkout_name} is not adopted")));
                     }
-                    if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Gone) {
+                    let dependency = self.checkout_dependency(&existing)?;
+                    if dependency.phase == CheckoutPhase::Gone {
                         if adopted_checkout_ref.is_some() {
                             return Ok(VesselPrepared::failed(format!("adopted checkout {checkout_name} is gone")));
                         }
@@ -910,24 +987,15 @@ impl Reconciler for VesselReconciler {
                         waiting_for_checkouts.push(checkout_name);
                         continue;
                     }
-                    if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Failed) {
-                        let message = existing
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.message.clone())
-                            .unwrap_or_else(|| format!("checkout {checkout_name} failed"));
+                    if dependency.phase == CheckoutPhase::Failed {
+                        let message = dependency.failure.unwrap_or_else(|| format!("checkout {checkout_name} failed"));
                         return Ok(VesselPrepared::failed(message));
                     }
-                    if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Ready) {
+                    if dependency.phase == CheckoutPhase::Ready {
                         if let Some(message) = existing.status.as_ref().and_then(|status| status.degraded.clone()) {
                             degraded.insert(checkout_name.clone(), message);
                         }
-                        let Some(path) = existing
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.path.clone())
-                            .or_else(|| existing.spec.target_path().map(str::to_string))
-                        else {
+                        let Some(path) = dependency.path else {
                             return Ok(VesselPrepared::failed(format!("checkout {checkout_name} is ready but has no target path")));
                         };
                         if matches!(&strategy, PlacementStrategy::DockerHostCheckoutAndMount { local_clone: false, .. }) {
@@ -1050,10 +1118,11 @@ impl Reconciler for VesselReconciler {
                     }
                     Err(err) => return Err(err),
                 };
-                if let Some(prepared) = VesselPrepared::unavailable_environment(&environment) {
+                let dependency = self.environment_dependency(&environment)?;
+                if let Some(prepared) = dependency.unavailable {
                     return Ok(prepared);
                 }
-                if environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
+                if !dependency.ready {
                     return Ok(VesselPrepared::provisioning(
                         &placement_policy,
                         placement_decision.clone(),
@@ -1111,25 +1180,30 @@ impl Reconciler for VesselReconciler {
                             });
                         }
 
-                        if let Some(prepared) = VesselPrepared::unavailable_environment(&existing) {
+                        let dependency = self.environment_dependency(&existing)?;
+                        if let Some(prepared) = dependency.unavailable {
                             return Ok(prepared);
                         }
-                        if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                            let waiting_for = existing
-                                .status
-                                .as_ref()
-                                .and_then(|status| status.message.clone())
-                                .unwrap_or_else(|| format!("environment {env_name} to become ready"));
-                            return Ok(VesselPrepared::provisioning_for_environment(
+                        if !dependency.ready {
+                            let waiting_for = dependency.waiting.unwrap_or_else(|| format!("environment {env_name} to become ready"));
+                            return Ok(VesselPrepared::provisioning(
                                 &placement_policy,
                                 placement_decision.clone(),
-                                &existing,
                                 waiting_for,
                                 actuations,
                             ));
                         }
                         match image_stamp(&existing, &placement_policy) {
                             Ok(image) => image,
+                            Err(message) if dependency.engine_held => {
+                                // Readiness can commit before the provider's image observations are published.
+                                return Ok(VesselPrepared::provisioning(
+                                    &placement_policy,
+                                    placement_decision.clone(),
+                                    message,
+                                    actuations,
+                                ));
+                            }
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         }
                     }
@@ -1613,7 +1687,8 @@ fn image_stamp(
     environment: &ResourceObject<Environment>,
     placement_policy: &ResourceObject<PlacementPolicy>,
 ) -> Result<ImageStamp, String> {
-    let status = environment.status.as_ref().expect("ready environment has status");
+    let status =
+        environment.status.as_ref().ok_or_else(|| format!("environment {} awaiting image observations", environment.metadata.name))?;
     let image_ref =
         status.image_ref.clone().ok_or_else(|| format!("environment {} is missing its image ref", environment.metadata.name))?;
     let local_image_id =
@@ -2312,5 +2387,66 @@ mod tests {
         assert!(logs.contains("placement_host_ref=kiwi-host"), "missing placement-host context: {logs}");
         assert!(logs.contains("reconciler_host_ref=feta-host"), "missing store-host context: {logs}");
         assert!(message.contains("resource store for reconciler host feta-host"));
+    }
+    // The crew sees Environment engine readiness, waits and endings with no copied status.
+    // Enumerate all old phases, success, both Gone endings and empty/Unicode give-up causes.
+    #[tokio::test]
+    async fn vessel_reads_environment_dependencies_without_a_status_copy() {
+        use flotilla_provisioning::engine::environment::EnvironmentBinding;
+        use flotilla_provisioning_testkit::{object, Ending, LifecycleFixture};
+        use flotilla_resources::{Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec};
+        let env = object::<Environment>(
+            "env",
+            EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
+                ..Default::default()
+            },
+            EnvironmentStatus { phase: EnvironmentPhase::Ready, message: Some("stale".into()), ..Default::default() },
+        );
+        let fixture = LifecycleFixture::<EnvironmentBinding>::new(false);
+        let reconciler = VesselReconciler::new(ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()), "flotilla")
+            .with_lifecycle_reads(fixture.reads.clone());
+        fixture.request(&env);
+        assert!(!reconciler.environment_dependency(&env).expect("requested").ready);
+        fixture.finish(&env, Ending::Ready("/work"));
+        assert!(reconciler.environment_dependency(&env).expect("ready").ready);
+        fixture.finish(&env, Ending::Lost("/work"));
+        let plan = reconciler.environment_dependency(&env).expect("lost").unavailable.expect("unavailable");
+        assert!(matches!(plan.patch, super::PlannedPatch::Lost { message } if message == "environment env observed absent"));
+        fixture.poison();
+        assert!(reconciler.environment_dependency(&env).err().expect("checked read").to_string().contains("poisoned"));
+    }
+    // Vessel checkout gates take phase, failure and realised path from one engine judgement.
+    // A stale path cannot override the realised identity or hide a checked read failure.
+    #[tokio::test]
+    async fn vessel_reads_checkout_dependencies_without_a_copy() {
+        use flotilla_provisioning::engine::checkout::CheckoutBinding;
+        use flotilla_provisioning_testkit::{object, Ending, LifecycleFixture};
+        use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, RepositoryKey};
+        let mut checkout = object::<Checkout>(
+            "checkout",
+            CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey("repo".into()),
+                env_ref: "env".into(),
+                r#ref: "feature".into(),
+                base_ref: None,
+                target_path: "/work".into(),
+                clone_ref: "source".into(),
+            }),
+            CheckoutStatus { phase: CheckoutPhase::Gone, path: Some("/stale".into()), ..Default::default() },
+        );
+        checkout.metadata.labels.insert(flotilla_resources::CONVOY_LABEL.into(), "crew".into());
+        let fixture = LifecycleFixture::<CheckoutBinding>::new(false);
+        let reconciler = VesselReconciler::new(ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()), "flotilla")
+            .with_lifecycle_reads(fixture.reads.clone());
+        fixture.request(&checkout);
+        assert_eq!(reconciler.checkout_dependency(&checkout).expect("requested").phase, CheckoutPhase::Pending);
+        fixture.finish(&checkout, Ending::Ready("/engine-path"));
+        let ready = reconciler.checkout_dependency(&checkout).expect("ready");
+        assert_eq!((ready.phase, ready.path.as_deref()), (CheckoutPhase::Ready, Some("/engine-path")));
+        fixture.finish(&checkout, Ending::Lost("/engine-path"));
+        assert_eq!(reconciler.checkout_dependency(&checkout).expect("lost").phase, CheckoutPhase::Gone);
+        fixture.poison();
+        assert!(reconciler.checkout_dependency(&checkout).err().expect("checked read").to_string().contains("poisoned"));
     }
 }

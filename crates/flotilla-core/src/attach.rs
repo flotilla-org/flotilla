@@ -37,6 +37,18 @@ use flotilla_provider_runtime::host_environment::HostEnvironment;
 use flotilla_resources::convoy_address::{convoy_address, RoleAddress};
 use flotilla_terminal::TerminalSessionLiveness;
 
+// A held environment can only attach to its realised backing; unheld environments use the legacy handle.
+fn environment_attach_backing(
+    reads: &dyn flotilla_resources::lifecycle_reads::LifecycleReads,
+    name: &str,
+) -> Result<Option<String>, String> {
+    match reads.try_reading(ProvisioningKind::Environment, name, None)? {
+        Some(LifecycleReading::Ready { identity }) => Ok(Some(identity)),
+        Some(reading) => Err(format!("environment {name} is {}: {}", reading.label(), reading.reason().unwrap_or_default())),
+        None => Ok(None),
+    }
+}
+
 type HostSnapshot = Result<Vec<ReadResourceObject<ResourceHost>>, String>;
 
 /// One lazy Host snapshot per attach request (including failed loads). Namespace
@@ -215,12 +227,13 @@ impl<'a> AttachResolver<'a> {
             return Ok(None);
         };
         let namespace = self.provisioning_namespace().await;
-        let repository_key = flotilla_admission::repository_addressing::resolve_repository(
+        let repository_key = flotilla_admission::repository_addressing::resolve_repository_with_lifecycle_reads(
             self.resource_backend,
             self.observed_resource_backend,
             &namespace,
             self.environment_manager.local_host_id().as_str(),
             selector,
+            self.lifecycle_reads,
         )
         .await?;
         let Some(repository_key) = repository_key else {
@@ -728,10 +741,7 @@ impl<'a> AttachResolver<'a> {
         if environment.spec.docker.is_some() {
             // The engine's realised backing is authoritative behind [primitives].
             // Attach through its live agent handle, never a stale prior backing.
-            let realised = match self.lifecycle_reads.reading(ProvisioningKind::Environment, &environment.metadata.name, None) {
-                Some(LifecycleReading::Ready { identity }) => Some(identity),
-                _ => None,
-            };
+            let realised = environment_attach_backing(self.lifecycle_reads, &environment.metadata.name)?;
             let handle = self
                 .environment_manager
                 .managed_environments()
@@ -1312,6 +1322,34 @@ mod tests {
     use crate::testkits::discovery::fake_discovery;
     use flotilla_config::ConfigStore;
     use flotilla_daemon_api::daemon::DaemonHandle;
+
+    // Attach uses the engine identity, refuses every non-ready held state, and propagates read errors.
+    // Every old phase is stale; repeated reads cannot create a copy or resurrect a stale handle.
+    #[tokio::test]
+    async fn attach_reads_environment_backing_without_a_copy() {
+        use flotilla_provisioning::engine::environment::EnvironmentBinding;
+        use flotilla_provisioning_testkit::{object, Ending, LifecycleFixture};
+        use flotilla_resources::{EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec};
+        let obj = object::<ResourceEnvironment>(
+            "env",
+            EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
+                ..Default::default()
+            },
+            EnvironmentStatus { phase: EnvironmentPhase::Failed, docker_container_id: Some("stale".into()), ..Default::default() },
+        );
+        let fixture = LifecycleFixture::<EnvironmentBinding>::new(false);
+        let read = || environment_attach_backing(fixture.reads.as_ref(), "env");
+        assert_eq!(read().expect("unheld"), None);
+        fixture.request(&obj);
+        assert!(read().is_err());
+        fixture.finish(&obj, Ending::Ready("live-backing"));
+        assert_eq!(read().expect("ready"), Some("live-backing".into()));
+        fixture.finish(&obj, Ending::Lost("live-backing"));
+        assert!(read().expect_err("lost").contains("observed absent"));
+        fixture.poison();
+        assert!(read().expect_err("read error").contains("poisoned"));
+    }
 
     // #3722: attach to an agentless session runs its command in the host's
     // composed environment. The plan's remote part runs here as sshd runs it,

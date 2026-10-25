@@ -131,10 +131,12 @@ use terminal_support::*;
 
 mod adopted_checkouts;
 mod agentless_harness;
+mod clone_reads;
 mod convoy_lifecycle;
 mod credential_delivery;
 mod discovery;
 mod docker;
+mod environment_reads;
 mod environments;
 mod health;
 mod heartbeat;

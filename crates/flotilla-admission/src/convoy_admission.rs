@@ -121,6 +121,8 @@ pub struct ConvoyCreateAdmission<'a> {
 pub struct ConvoyAdmission {
     backend: ResourceBackend,
     observed_backend: ResourceBackend,
+    #[builder(default = Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))]
+    lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     observed_checkout_reconciliation: Arc<Mutex<()>>,
     config: Arc<ConfigStore>,
     discovery: Arc<DiscoveryRuntime>,
@@ -1147,9 +1149,14 @@ impl ConvoyAdmission {
         let templates = CrewBriefTemplateResolver::with_config_dir(self.config.base_path().as_path());
         let repositories = reads.clone().using::<Repository>(namespace);
         let checkouts = reads.clone().using::<ResourceCheckout>(namespace);
-        let local_checkouts =
-            crate::repository_addressing::local_checkouts(&reads, &observed, namespace, self.environment_manager.local_host_id().as_str())
-                .await?;
+        let local_checkouts = crate::repository_addressing::local_checkouts_with_lifecycle_reads(
+            &reads,
+            &observed,
+            namespace,
+            self.environment_manager.local_host_id().as_str(),
+            self.lifecycle_reads.as_ref(),
+        )
+        .await?;
         for requirement in &workflow.vessels {
             let repository_refs = requirement
                 .repository_refs

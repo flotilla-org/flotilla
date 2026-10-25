@@ -1341,7 +1341,8 @@ impl ReadProjections<'_> {
             .await
             .map_err(|error| error.to_string())?
             .items;
-        let selected_checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources);
+        let selected_checkout_sources = flotilla_resources::select_convoy_child_sources(&convoy, &checkout_sources);
+        let selected_checkouts = selected_checkout_sources.iter().map(|(name, source)| (name.clone(), source.object.clone())).collect();
         let vessel_sources = self
             .backend
             .query_declared::<Vessel>(
@@ -1356,24 +1357,22 @@ impl ReadProjections<'_> {
         let checkouts = expected
             .iter()
             .map(|checkout_name| {
-                let selected = selected_checkouts.get(checkout_name);
-                let source = selected.and_then(|object| {
-                    checkout_sources.iter().find(|source| {
-                        source.object.metadata.name == object.metadata.name
-                            && source.object.metadata.resource_version == object.metadata.resource_version
-                    })
-                });
+                let source = selected_checkout_sources.get(checkout_name);
+                let selected = source.map(|source| &source.object);
                 let provenance = source.map(|source| explained_provenance(&source.provenance, self.node_id));
                 // One keyed engine read per checkout, at the checkout's home.
-                let lifecycle = source.and_then(|source| {
-                    let origin = match &source.provenance {
-                        flotilla_resources::ResourceProvenance::Local => None,
-                        flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
-                    };
-                    self.lifecycles.reading(crate::ports::ProvisioningKind::Checkout, checkout_name, origin.as_deref())
-                });
+                let lifecycle = source
+                    .map(|source| {
+                        let origin = match &source.provenance {
+                            flotilla_resources::ResourceProvenance::Local => None,
+                            flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+                        };
+                        self.lifecycles.try_reading(crate::ports::ProvisioningKind::Checkout, checkout_name, origin.as_deref())
+                    })
+                    .transpose()?
+                    .flatten();
                 let integration = selected.and_then(|checkout| checkout.status.as_ref()).map(|status| &status.integration);
-                ExplainedCheckout {
+                Ok(ExplainedCheckout {
                     name: checkout_name.clone(),
                     observed: selected.is_some(),
                     provenance,
@@ -1381,9 +1380,9 @@ impl ReadProjections<'_> {
                     pushed: integration.map(|status| explain_condition(&status.pushed, now, LANDING_EVIDENCE_TTL)),
                     landed: integration.map(|status| explain_condition(&status.landed, now, LANDING_EVIDENCE_TTL)),
                     lifecycle,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
 
         let change_request_sources = self
             .backend

@@ -498,12 +498,20 @@ pub fn select_convoy_children<T: Resource + Clone>(
     convoy: &ResourceObject<Convoy>,
     sources: &[ReadResourceObject<T>],
 ) -> BTreeMap<String, ResourceObject<T>> {
+    select_convoy_child_sources(convoy, sources).into_iter().map(|(name, source)| (name, source.object)).collect()
+}
+
+/// Select the same authoritative children while retaining their typed origin for keyed reads.
+pub fn select_convoy_child_sources<T: Resource + Clone>(
+    convoy: &ResourceObject<Convoy>,
+    sources: &[ReadResourceObject<T>],
+) -> BTreeMap<String, ReadResourceObject<T>> {
     let target_host_ref = convoy
         .status
         .as_ref()
         .and_then(|status| status.placement_decision.as_ref())
         .map(|decision| decision.target_host.reference.as_str());
-    let mut selected = BTreeMap::<String, (u8, ResourceObject<T>)>::new();
+    let mut selected = BTreeMap::<String, (u8, ReadResourceObject<T>)>::new();
     for source in sources {
         if source.object.metadata.labels.get(CONVOY_LABEL) != Some(&convoy.metadata.name) {
             continue;
@@ -519,7 +527,7 @@ pub fn select_convoy_children<T: Resource + Clone>(
         };
         let name = source.object.metadata.name.clone();
         if selected.get(&name).is_none_or(|(current_priority, _)| priority > *current_priority) {
-            selected.insert(name, (priority, source.object.clone()));
+            selected.insert(name, (priority, source.clone()));
         }
     }
     selected.into_iter().map(|(name, (_, object))| (name, object)).collect()

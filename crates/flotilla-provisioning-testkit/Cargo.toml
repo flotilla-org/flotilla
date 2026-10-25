@@ -1,0 +1,25 @@
+[package]
+name = "flotilla-provisioning-testkit"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+flotilla-store = { path = "../flotilla-store" }
+flotilla-provisioning = { path = "../flotilla-provisioning" }
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-schema = { path = "../flotilla-schema" }
+flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
+flotilla-state-machines = { path = "../flotilla-state-machines" }
+flotilla-engine-store = { path = "../flotilla-engine-store" }
+flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

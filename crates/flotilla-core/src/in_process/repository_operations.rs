@@ -67,11 +67,12 @@ impl InProcessDaemon {
     }
 
     pub(super) async fn local_checkout_for_repository(&self, key: &RepositoryKey) -> Result<Option<PathBuf>, String> {
-        let checkouts = flotilla_admission::repository_addressing::local_checkouts(
+        let checkouts = flotilla_admission::repository_addressing::local_checkouts_with_lifecycle_reads(
             &self.resource_backend,
             &self.observed_resource_backend,
             &self.provisioning_namespace().await,
             self.environment_manager.local_host_id().as_str(),
+            self.lifecycle_reads.as_ref(),
         )
         .await?;
         let mut paths = checkouts

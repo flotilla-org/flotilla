@@ -1,11 +1,12 @@
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::Actuation;
 use flotilla_terminal::{TerminalPool, TerminalSessionTag};
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, PrincipalRef, ResourceRef};
+use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading, PrincipalRef, ResourceRef};
 use flotilla_resources::{
     api_version, Convoy, ConvoyPhase, CrewMessageDelivery, Demand, DemandAddressee, DemandKind, DemandSpec, Environment, EnvironmentPhase,
     InputMeta, LifecycleAuthority, OwnerReference, Resource, ResourceError, ResourceObject, ResourceProvenance, TerminalAttention,
@@ -175,6 +176,7 @@ pub trait TerminalRuntime: Send + Sync {
 pub struct TerminalSessionReconciler<R> {
     runtime: Arc<R>,
     clock: Arc<dyn flotilla_resources::Clock>,
+    lifecycle_reads: Arc<dyn LifecycleReads>,
     decisions: crate::decision_log::DecisionLog,
     convoys: TypedResolver<Convoy>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
@@ -190,6 +192,7 @@ impl<R> TerminalSessionReconciler<R> {
         Self {
             runtime,
             clock: Arc::new(flotilla_resources::SystemClock),
+            lifecycle_reads: Arc::new(NoLifecycleReads),
             decisions: Default::default(),
             convoys: backend.clone().using::<Convoy>(namespace),
             federated_convoys: None,
@@ -203,6 +206,11 @@ impl<R> TerminalSessionReconciler<R> {
 
     pub fn with_clock(mut self, clock: Arc<dyn flotilla_resources::Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
+        self.lifecycle_reads = reads;
         self
     }
 
@@ -421,7 +429,15 @@ where
             }
             Err(err) => return Err(err),
         };
-        if environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Failed) {
+        let environment_reading = self
+            .lifecycle_reads
+            .try_reading(ProvisioningKind::Environment, &environment.metadata.name, None)
+            .map_err(ResourceError::other)?;
+        let owner_failed = match &environment_reading {
+            Some(reading) => matches!(reading, LifecycleReading::Exhausted { .. } | LifecycleReading::GaveUp { .. }),
+            None => environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Failed),
+        };
+        if owner_failed {
             return Ok(TerminalPrepared::OwnerTerminal);
         }
         match self.session_owner_state(obj).await? {
@@ -432,10 +448,18 @@ where
 
         // Backing loss is recoverable work interruption, not provisioning failure.
         // Keep it distinct from process loss: never probe or relaunch in a dead environment.
-        if let Some(status) = environment.status.as_ref().filter(|status| status.phase == EnvironmentPhase::Lost) {
-            return Ok(TerminalPrepared::EnvironmentLost(
-                status.message.clone().unwrap_or_else(|| format!("environment {} disappeared", environment.metadata.name)),
-            ));
+        let lost_reason =
+            match &environment_reading {
+                Some(reading @ (LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::Gone)) => {
+                    Some(format!("environment {} {}", environment.metadata.name, reading.reason().unwrap_or_default()))
+                }
+                Some(_) => None,
+                None => environment.status.as_ref().filter(|status| status.phase == EnvironmentPhase::Lost).map(|status| {
+                    status.message.clone().unwrap_or_else(|| format!("environment {} disappeared", environment.metadata.name))
+                }),
+            };
+        if let Some(reason) = lost_reason {
+            return Ok(TerminalPrepared::EnvironmentLost(reason));
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
@@ -665,7 +689,11 @@ where
             return Ok(TerminalPrepared::None);
         }
 
-        if !environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Ready && status.ready) {
+        let environment_ready = match &environment_reading {
+            Some(reading) => matches!(reading, LifecycleReading::Ready { .. }),
+            None => environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Ready && status.ready),
+        };
+        if !environment_ready {
             return Ok(TerminalPrepared::Waiting);
         }
         if !self.runtime.brief_ready(&obj.spec).await.map_err(ResourceError::other)? {

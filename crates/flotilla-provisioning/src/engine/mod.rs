@@ -7,14 +7,12 @@
 //! [`Lifecycles`] home applies them. The engine's answer decides:
 //!
 //! - every step accepted: the old patch is written, since it says what the engine now holds;
-//! - a step refused: the old status is copied from the engine instead ([`Binding::copy`]), so the
-//!   old reconciler's view never overrules the engine;
-//! - a resource the engine has ended (Gone or GaveUp): the old reconciler is not run, and only the
-//!   copy is written.
+//! - a step refused: no lifecycle patch may overrule the engine;
+//! - a resource the engine has ended (Gone or GaveUp): the old reconciler is not run.
 //!
-//! The copy runs one way, engine to old. It is idempotent and computed from the engine's state
-//! alone, so it is rebuilt by any later reconcile; a failed copy never changes the engine. The
-//! read-port layer (layer 4) deletes it.
+//! Clone, Checkout and Environment consumers read the engine directly and their bindings emit
+//! no status copy. Bindings whose readers have not moved retain a one-way, rebuildable copy;
+//! that copy is removed with the kind's last legacy phase reader.
 //!
 //! In progress, suspect and next attempt are judgements, never stored: a reconciler's in-progress
 //! patches (cloning, waiting for an image build, a build's reservation) carry no step, and its
@@ -47,8 +45,8 @@ use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
         lifecycle::{
-            Attempted, GiveUp, Lifecycle, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed, Realise,
-            Release, Vanish,
+            Attempted, GiveUp, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed,
+            Realise, Release, Vanish,
         },
         vessel::VesselKind,
     },
@@ -198,14 +196,12 @@ where
         let world = evidence(name, step);
         match step {
             Step::Attempted(outcome) => {
-                home.apply(name, Attempted { outcome: outcome.clone() }, &world, at)?;
-                if let Outcome::Failed { cause, .. } = outcome {
-                    // The engine judges exhaustion: before it, the give-up is refused and writes nothing.
-                    match home.apply(name, GiveUp { cause: cause.clone() }, &world, at) {
-                        Ok(_) | Err(WriteError::Refused(LifecycleRefusal::MissingEvidence)) => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                }
+                apply_attempt::<K, _, _>(
+                    &mut *home,
+                    outcome,
+                    |home| home.get(name).map(|resource| resource.state().clone()),
+                    |home, edge| home.apply(name, edge, &world, at).map(|_| ()),
+                )?;
             }
             Step::Realised { identity } => {
                 home.apply(name, Realise { identity: identity.clone(), observed: Ref::new(name) }, &world, at)?;
@@ -219,6 +215,33 @@ where
         }
         Ok(home.get(name).cloned().expect("stepped"))
     }
+}
+
+/// Finish a durable exhausted attempt before accepting another report of the same failure.
+/// Read and write use the same home lock; a failed GiveUp therefore resumes without retallying.
+fn apply_attempt<K: LifecycleKind, H, E>(
+    home: &mut H,
+    outcome: &Outcome,
+    state: impl Fn(&H) -> Option<LifecycleState>,
+    mut apply: impl FnMut(&mut H, LifecycleEdge) -> Result<(), E>,
+) -> Result<(), E> {
+    let cause = match outcome {
+        Outcome::Failed { cause, .. } => Some(cause),
+        _ => None,
+    };
+    let exhausted = |home: &H| {
+        state(home).and_then(|state| match reads::judge::<K>(&state, reads::Ending::Unknown) {
+            reads::Judgement::Exhausted { last } => Some(last),
+            _ => None,
+        })
+    };
+    if exhausted(home).as_ref().is_none_or(|last| Some(last) != cause) {
+        apply(home, Attempted { outcome: outcome.clone() }.into())?;
+    }
+    if let Some(cause) = cause.filter(|_| exhausted(home).is_some()) {
+        apply(home, GiveUp { cause: cause.clone() }.into())?;
+    }
+    Ok(())
 }
 
 /// How one old kind's reconciler reports to its lifecycle kind.
@@ -247,9 +270,16 @@ pub trait Binding: Send + Sync + 'static {
     /// The lifecycle steps `patch` reports, in order.
     fn steps(obj: &ResourceObject<Self::Old>, patch: &Patch<Self::Old>) -> Vec<Step>;
 
+    /// Interpret a report using the engine state when the resource is already held.
+    fn steps_with_state(obj: &ResourceObject<Self::Old>, patch: &Patch<Self::Old>, _state: Option<&LifecycleState>) -> Vec<Step> {
+        Self::steps(obj, patch)
+    }
+
     /// The old status the engine's `resource` implies, when `obj`'s status does not already say
     /// it: the one-way copy.
-    fn copy(obj: &ResourceObject<Self::Old>, resource: &Resource<Lifecycle<Self::Kind>>) -> Option<Patch<Self::Old>>;
+    fn copy(_obj: &ResourceObject<Self::Old>, _resource: &Resource<Lifecycle<Self::Kind>>) -> Option<Patch<Self::Old>> {
+        None
+    }
 }
 
 /// An old kind's status patch.
@@ -326,9 +356,10 @@ pub fn decide<B: Binding>(
     now: DateTime<Utc>,
 ) -> Decision<B::Old> {
     let kind = <B::Kind as LifecycleKind>::NAME;
-    let steps = patch.as_ref().map(|patch| B::steps(obj, patch)).unwrap_or_default();
-    let requesting = !steps.is_empty() || patch.as_ref().is_some_and(|patch| B::requests(obj, patch));
     let (mut current, held) = current::<B>(lifecycles, obj);
+    let steps =
+        patch.as_ref().map(|patch| B::steps_with_state(obj, patch, held.as_ref().map(|resource| resource.state()))).unwrap_or_default();
+    let requesting = !steps.is_empty() || patch.as_ref().is_some_and(|patch| B::requests(obj, patch));
     // A kind with launches restarted in place: the ended launch stays ended, and this is the next.
     let held = match held {
         Some(resource) if B::LAUNCHES && ended(&resource) && !steps.is_empty() && B::initial(obj) => {
@@ -441,10 +472,24 @@ where
         let owned = ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status: obj.status.clone() };
         let home = Arc::clone(lifecycles);
         let ended_copy = tokio::task::spawn_blocking(move || {
-            current::<B>(home.as_ref(), &owned).1.filter(ended).filter(|_| !restarting).map(|resource| B::copy(&owned, &resource))
+            let (name, mut held) = current::<B>(home.as_ref(), &owned);
+            let mut completed_attempt = false;
+            // A committed failed attempt must finish before any provider work resumes.
+            if let Some(reads::Judgement::Exhausted { last }) =
+                held.as_ref().map(|resource| reads::judge::<B::Kind>(resource.state(), reads::Ending::Unknown))
+            {
+                completed_attempt = true;
+                held = Some(
+                    home.step(&name, &Step::Attempted(Outcome::Failed { cause: last, retryable: false }), at(Utc::now()))
+                        .map_err(|error| ResourceError::other(format!("engine GiveUp recovery: {error}")))?,
+                );
+            }
+            Ok::<_, ResourceError>(
+                held.filter(ended).filter(|_| completed_attempt || !restarting).map(|resource| B::copy(&owned, &resource)),
+            )
         })
         .await
-        .map_err(|error| ResourceError::other(format!("engine read: {error}")))?;
+        .map_err(|error| ResourceError::other(format!("engine read: {error}")))??;
         if let Some(copy) = ended_copy {
             return Ok(Prepared::Decided(Mutex::new(Some(ReconcileOutcome::new(copy)))));
         }

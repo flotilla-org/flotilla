@@ -785,3 +785,42 @@ async fn unrecorded_cloud_adoption_failure_requeues() {
     reconciler.reconcile(&healthy, &healthy_prepared, chrono::Utc::now());
     assert_eq!(reconciler.reconcile(&object, &prepared, chrono::Utc::now()).requeue_after, Some(std::time::Duration::from_secs(5)));
 }
+
+// Provisioning and retry decisions follow the engine while the old phase stays unchanged.
+// Enumerate every old phase against success, both Gone endings and empty/Unicode give-up causes.
+pub(super) async fn assert_environment_lifecycle(old_phase: EnvironmentPhase, ending: flotilla_provisioning_testkit::Ending<'_>) {
+    use flotilla_provisioning::engine::environment::EnvironmentBinding;
+    use flotilla_provisioning_testkit::{Ending, LifecycleFixture};
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let records = backend.using::<Environment>("flotilla");
+    let mut obj = records
+        .create(
+            &InputMeta::builder().name("env".into()).build(),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("environment");
+    obj.status = Some(EnvironmentStatus { phase: old_phase, message: Some("stale".into()), ..Default::default() });
+    let fixture = LifecycleFixture::<EnvironmentBinding>::new(false);
+    fixture.request(&obj);
+    let reconciler =
+        EnvironmentReconciler::new(Arc::new(FailingEnvironmentRuntime), backend, "flotilla").with_lifecycle_reads(fixture.reads.clone());
+    let prepared = reconciler.prepare(&obj).await.expect("requested");
+    assert!(matches!(reconciler.reconcile(&obj, &prepared, chrono::Utc::now()).patch, Some(EnvironmentStatusPatch::MarkFailed { .. })));
+    fixture.retry(&obj, "retry");
+    assert!(matches!(reconciler.retry_disposition(&obj), Some(flotilla_resources::ControllerRetryDisposition::Retryable { .. })));
+    fixture.finish(&obj, ending);
+    let prepared = reconciler.prepare(&obj).await.expect("settled");
+    assert!(reconciler.reconcile(&obj, &prepared, chrono::Utc::now()).patch.is_none());
+    if let Ending::GaveUp(cause) = ending {
+        assert_eq!(
+            reconciler.retry_disposition(&obj),
+            Some(flotilla_resources::ControllerRetryDisposition::Terminal { needs: cause.into() })
+        );
+    }
+    fixture.poison();
+    assert!(reconciler.prepare(&obj).await.err().expect("read error").to_string().contains("poisoned"));
+}

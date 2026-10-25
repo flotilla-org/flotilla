@@ -2,11 +2,11 @@
 
 use flotilla_resources::{Checkout as OldCheckout, CheckoutPhase, CheckoutSpec, CheckoutStatusPatch, ResourceObject, CONVOY_LABEL};
 use flotilla_schema::Ref;
-use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Outcome, Resource};
+use flotilla_state_machines::{Cause, CauseCategory, Outcome};
 
 use super::{Binding, Step};
 use crate::stored::{
-    checkout::{Checkout, CheckoutKind, CheckoutRequest, Source},
+    checkout::{CheckoutKind, CheckoutRequest, Source},
     Holder,
 };
 
@@ -71,24 +71,6 @@ impl Binding for CheckoutBinding {
             | CheckoutStatusPatch::ObserveCloneRetry { .. }
             | CheckoutStatusPatch::ObserveValidation { .. }
             | CheckoutStatusPatch::UpdateIntegration { .. } => vec![],
-        }
-    }
-
-    fn copy(obj: &ResourceObject<OldCheckout>, resource: &Resource<Checkout>) -> Option<CheckoutStatusPatch> {
-        let status = obj.status.as_ref();
-        match (resource.state(), phase(obj)) {
-            // The old shape has no patch back to Pending; a Requested checkout is never past it.
-            (LifecycleState::Requested { .. }, _) => None,
-            (LifecycleState::Realised { .. }, CheckoutPhase::Ready) => None,
-            (LifecycleState::Realised { identity }, _) => Some(CheckoutStatusPatch::MarkReady {
-                path: identity.clone(),
-                commit: status.and_then(|status| status.commit.clone()),
-                branch_provenance: status.map(|status| status.branch_provenance).unwrap_or_default(),
-            }),
-            (LifecycleState::Gone, CheckoutPhase::Gone) => None,
-            (LifecycleState::Gone, _) => Some(CheckoutStatusPatch::MarkGone),
-            (LifecycleState::GaveUp { .. }, CheckoutPhase::Failed) => None,
-            (LifecycleState::GaveUp { cause }, _) => Some(CheckoutStatusPatch::MarkFailed { message: cause.detail.clone() }),
         }
     }
 }

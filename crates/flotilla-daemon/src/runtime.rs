@@ -176,6 +176,7 @@ impl DaemonRuntime {
         if daemon_config.primitives()?.is_some() {
             result_phase("open_message_primitives", open_message_primitives(&daemon, &config)).await?;
             provisioning_lifecycles = Some(open_provisioning_lifecycles(&daemon).await?);
+            daemon.require_lifecycle_reads_installed()?;
         }
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
@@ -901,12 +902,14 @@ fn spawn_controller_loops(
             move |backend: ResourceBackend, namespace_string: String| {
                 let local_host_ref = state.local_host_ref.clone();
                 let additional_host_refs = state.agentless_host_refs();
+                let lifecycle_reads = state.daemon.lifecycle_reads();
                 let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.environments));
                 let state = Arc::clone(&state);
                 (
                     vec![],
                     Engine::<_, EnvironmentBinding>::new(
                         EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, &namespace_string)
+                            .with_lifecycle_reads(lifecycle_reads)
                             .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
                             .with_additional_host_refs(additional_host_refs),
                         lifecycles,
@@ -923,7 +926,8 @@ fn spawn_controller_loops(
                         CloneReconciler::new(
                             Arc::new(RoutingCloneRuntime { state: Arc::clone(&state) }),
                             backend.using::<Repository>(&namespace_string),
-                        ),
+                        )
+                        .with_lifecycle_reads(state.daemon.lifecycle_reads()),
                         state.provisioning.as_ref().map(|engine| Arc::clone(&engine.clones)),
                     ),
                 )
@@ -937,6 +941,7 @@ fn spawn_controller_loops(
                 // initialized from this value by with_checkout_removal_concurrency.
                 // A namespace-local task cap alone cannot pace all removals.
                 let removal_concurrency = state.checkout_removal_concurrency;
+                let lifecycle_reads = state.daemon.lifecycle_reads();
                 let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.checkouts));
                 (
                     CheckoutReconciler::<RoutingCheckoutRuntime>::federated_secondary_watches(&backend, &namespace_string),
@@ -949,6 +954,7 @@ fn spawn_controller_loops(
                             backend.clone(),
                             &namespace_string,
                         )
+                        .with_lifecycle_reads(lifecycle_reads)
                         .with_background_removal_limit(removal_concurrency)
                         .with_federated_convoys(&backend, &namespace_string),
                         lifecycles,
@@ -963,10 +969,12 @@ fn spawn_controller_loops(
                 let additional_host_refs = state.agentless_host_refs();
                 let state = Arc::clone(&state);
                 let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.terminal_sessions));
+                let reads = state.daemon.lifecycle_reads();
                 (
                     vec![],
                     Engine::<_, TerminalSessionBinding>::new(
                         TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
+                            .with_lifecycle_reads(reads)
                             .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
                             .with_additional_host_refs(additional_host_refs)
                             .with_federated_convoys(&backend, &namespace_string),
@@ -989,6 +997,7 @@ fn spawn_controller_loops(
                     VesselReconciler::secondary_watches(),
                     Engine::<_, VesselBinding>::new(
                         VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
+                            .with_lifecycle_reads(state.daemon.lifecycle_reads())
                             .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None }))
                             .with_federated_dependencies(&backend, CanonicalHostId::resolved(local_host_ref))
                             .with_additional_host_refs(additional_host_refs),
@@ -1214,7 +1223,10 @@ async fn open_provisioning_lifecycles(
     use flotilla_provisioning::engine::{reads::StoreReads, vessel::PlacementLifecycles, LifecycleHome, ProvisioningLifecycles};
     let store = daemon.decided_store()?.store();
     let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
-    daemon.install_lifecycle_reads(Arc::new(EngineLifecycleReads { reads: StoreReads::new(Arc::clone(&store)), home }))?;
+    daemon.install_lifecycle_reads(Arc::new(flotilla_provisioning::engine::reads::LifecycleReadPort::new(
+        StoreReads::new(Arc::clone(&store)),
+        home,
+    )))?;
     daemon.install_vessel_seats(Arc::new(EngineVesselSeats {
         reads: StoreReads::new(Arc::clone(&store)),
         backend: daemon.resource_backend(),
@@ -1233,41 +1245,6 @@ async fn open_provisioning_lifecycles(
     })
     .await
     .map_err(|error| error.to_string())?
-}
-
-/// The views' provisioning readings over the decided store (#3629 layer 4): one keyed read each,
-/// at the named home or this one.
-struct EngineLifecycleReads {
-    reads: flotilla_provisioning::engine::reads::StoreReads,
-    home: String,
-}
-
-impl flotilla_projections::ports::LifecycleReads for EngineLifecycleReads {
-    fn reading(
-        &self,
-        kind: flotilla_projections::ports::ProvisioningKind,
-        name: &str,
-        origin: Option<&str>,
-    ) -> Option<flotilla_protocol::LifecycleReading> {
-        use flotilla_projections::ports::ProvisioningKind;
-        use flotilla_provisioning::engine::reads::ProvisioningReads;
-        let home = origin.unwrap_or(&self.home);
-        let judgement = match kind {
-            ProvisioningKind::Environment => self.reads.environment(name, home).map(|view| view.map(|view| view.judgement)),
-            ProvisioningKind::ImageBuild => self.reads.image_build(name, home).map(|view| view.map(|view| view.judgement)),
-            ProvisioningKind::Clone => self.reads.repository_clone(name, home).map(|view| view.map(|view| view.judgement)),
-            ProvisioningKind::Checkout => self.reads.checkout(name, home).map(|view| view.map(|view| view.judgement)),
-            ProvisioningKind::TerminalSession => self.reads.terminal_session(name, home).map(|view| view.map(|view| view.judgement)),
-            ProvisioningKind::Vessel => self.reads.vessel(name, home).map(|view| view.map(|view| view.judgement)),
-        };
-        match judgement {
-            Ok(judgement) => judgement.map(|judgement| judgement.reading()),
-            Err(error) => {
-                tracing::warn!(?kind, resource = name, %error, "engine reading failed; the view reads the old status");
-                None
-            }
-        }
-    }
 }
 
 /// Which seats a vessel serves (#3629 layer 8): its sessions by their vessel label, with each role

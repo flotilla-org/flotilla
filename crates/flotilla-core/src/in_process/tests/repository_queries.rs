@@ -195,3 +195,142 @@ async fn cli_lists_include_active_provider_sessions() {
     assert_eq!(agents.items.len(), 1);
     assert_eq!(agents.items[0].reference, "active");
 }
+
+// CLI rows and explanations read engine phases without a status copy, including replicas.
+// An ended durable lifecycle cannot reappear through an observed shadow.
+#[tokio::test]
+async fn cli_checkout_rows_follow_engine_without_a_copy() {
+    use flotilla_provisioning::engine::checkout::CheckoutBinding;
+    use flotilla_resources::{CheckoutPhase, CheckoutStatus, CheckoutWorktreeSpec, RepositoryKey};
+
+    for replica in [false, true] {
+        let temp = tempfile::tempdir().expect("config");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"checkout-rows\"\n").expect("config");
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let author = if replica { ResourceBackend::new(InMemoryBackend::default()) } else { backend.clone() };
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            fake_discovery(false),
+            HostName::new("local"),
+            backend.clone(),
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
+        let fixture = flotilla_provisioning_testkit::LifecycleFixture::<CheckoutBinding>::new(replica);
+        daemon.install_lifecycle_reads(fixture.reads.clone()).expect("install");
+        let records = author.using::<ResourceCheckout>("flotilla");
+        let mut last_convoy = None;
+        for (index, old_phase) in [CheckoutPhase::Gone].into_iter().enumerate() {
+            for (end_index, ending) in ["ready", "lost"].into_iter().enumerate() {
+                let name = format!("checkout-{index}-{end_index}");
+                let convoy_name = format!("crew-{name}");
+                backend
+                    .using::<flotilla_resources::Convoy>("flotilla")
+                    .create(
+                        &test_meta(&convoy_name),
+                        &flotilla_resources::ConvoySpec::builder()
+                            .workflow_ref("workflow".into())
+                            .adopted_checkout_refs(std::collections::BTreeMap::from([(
+                                RepositoryKey("github.com/org/repo".into()),
+                                name.clone(),
+                            )]))
+                            .build(),
+                    )
+                    .await
+                    .expect("convoy");
+                let mut checkout_meta = test_meta(&name);
+                checkout_meta.labels.insert(flotilla_resources::CONVOY_LABEL.into(), convoy_name.clone());
+                last_convoy = Some(convoy_name.clone());
+                let mut checkout = records
+                    .create(
+                        &checkout_meta,
+                        &ResourceCheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                            repo_ref: RepositoryKey("github.com/org/repo".into()),
+                            env_ref: "env".into(),
+                            r#ref: "branch".into(),
+                            base_ref: None,
+                            target_path: "/work".into(),
+                            clone_ref: "source".into(),
+                        }),
+                    )
+                    .await
+                    .expect("checkout");
+                let old_status = CheckoutStatus { phase: old_phase, ..Default::default() };
+                checkout = records.update_status(&name, &checkout.metadata.resource_version, &old_status).await.expect("status");
+                if replica {
+                    backend
+                        .replica_writer::<ResourceCheckout>(flotilla_protocol::NodeId::new("home"), "flotilla")
+                        .replace(&records.list().await.expect("snapshot"), Utc::now())
+                        .await
+                        .expect("replicate");
+                }
+                daemon
+                    .observed_resource_backend()
+                    .using::<ResourceCheckout>("flotilla")
+                    .create(
+                        &test_meta(&name),
+                        &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                            repo_ref: checkout.spec.repo_ref().clone(),
+                            r#ref: "stale-observation".into(),
+                            path: "/stale".into(),
+                            host_ref: "local".into(),
+                            is_main: false,
+                        }),
+                    )
+                    .await
+                    .expect("observed shadow");
+                fixture.request(&checkout);
+                let rows = daemon.list_cli_items_internal(CliListKind::Checkout).await.expect("progress");
+                assert_eq!(rows.items.iter().find(|row| row.reference == name).expect("row").status, "pending");
+                fixture.retry(&checkout, "retry");
+                let rows = daemon.list_cli_items_internal(CliListKind::Checkout).await.expect("retry");
+                assert_eq!(rows.items.iter().find(|row| row.reference == name).expect("row").status, "pending");
+                fixture.finish(
+                    &checkout,
+                    if ending == "ready" {
+                        flotilla_provisioning_testkit::Ending::Ready("/work")
+                    } else {
+                        flotilla_provisioning_testkit::Ending::Lost("/work")
+                    },
+                );
+                for _ in 0..2 {
+                    let rows = daemon.list_cli_items_internal(CliListKind::Checkout).await.expect("rows");
+                    let row = rows.items.iter().find(|row| row.reference == name);
+                    let explanation = daemon.explain_convoy_internal(Some("flotilla"), &convoy_name).await.expect("explain");
+                    let lifecycle = explanation
+                        .checkouts
+                        .iter()
+                        .find(|checkout| checkout.name == name)
+                        .expect("explained checkout")
+                        .lifecycle
+                        .as_ref()
+                        .expect("engine phase");
+                    match ending {
+                        "ready" => {
+                            assert!(matches!(lifecycle, flotilla_protocol::LifecycleReading::Ready { identity } if identity == "/work"))
+                        }
+                        "released" => assert_eq!(lifecycle, &flotilla_protocol::LifecycleReading::Released),
+                        "lost" => assert_eq!(lifecycle, &flotilla_protocol::LifecycleReading::Lost),
+                        cause => assert_eq!(lifecycle, &flotilla_protocol::LifecycleReading::GaveUp { cause: cause.into() }),
+                    }
+                    if matches!(ending, "released" | "lost") {
+                        assert!(row.is_none());
+                    } else {
+                        let row = row.expect("row");
+                        assert_eq!(row.status, if ending == "ready" { "ready" } else { "failed" });
+                        assert_eq!(row.name, "branch");
+                    }
+                }
+                assert_eq!(records.get(&name).await.expect("record").status, Some(old_status));
+            }
+        }
+        fixture.poison();
+        assert!(daemon.list_cli_items_internal(CliListKind::Checkout).await.expect_err("read failure").contains("poisoned"));
+        assert!(daemon
+            .explain_convoy_internal(Some("flotilla"), &last_convoy.expect("convoy"))
+            .await
+            .expect_err("explain read failure")
+            .contains("poisoned"));
+    }
+}

@@ -3,6 +3,8 @@ pub mod runtime;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use flotilla_protocol::LifecycleReading;
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{Clone, ClonePhase, CloneStatusPatch, ObjectEvent, Repository, ResourceError, ResourceObject};
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler},
@@ -14,6 +16,7 @@ const CLONE_BACKOFF: flotilla_resources::RetryBackoff =
 
 #[async_trait]
 pub trait CloneRuntime: Send + Sync {
+    /// Repeated requests for the same repository and target recover a clone whose report was not recorded.
     async fn clone_and_inspect(&self, repo_url: &str, target_path: &str) -> Result<Option<String>, String>;
     async fn inspect_existing(&self, target_path: &str) -> Result<Option<String>, String>;
     async fn clone_and_inspect_in(&self, _env_ref: &str, repo_url: &str, target_path: &str) -> Result<Option<String>, String> {
@@ -27,11 +30,28 @@ pub trait CloneRuntime: Send + Sync {
 pub struct CloneReconciler<R> {
     runtime: Arc<R>,
     repositories: TypedResolver<Repository>,
+    lifecycle_reads: Arc<dyn LifecycleReads>,
 }
 
 impl<R> CloneReconciler<R> {
     pub fn new(runtime: Arc<R>, repositories: TypedResolver<Repository>) -> Self {
-        Self { runtime, repositories }
+        Self { runtime, repositories, lifecycle_reads: Arc::new(NoLifecycleReads) }
+    }
+
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
+        self.lifecycle_reads = reads;
+        self
+    }
+
+    fn reading(&self, obj: &ResourceObject<Clone>) -> Result<Option<LifecycleReading>, String> {
+        self.lifecycle_reads.try_reading(ProvisioningKind::Clone, &obj.metadata.name, None)
+    }
+
+    fn provisioning(obj: &ResourceObject<Clone>, reading: Option<&LifecycleReading>) -> bool {
+        match reading {
+            Some(reading) => matches!(reading, LifecycleReading::InProgress | LifecycleReading::Retrying { .. }),
+            None => matches!(obj.status.as_ref().map(|status| status.phase).unwrap_or_default(), ClonePhase::Pending | ClonePhase::Cloning),
+        }
     }
 }
 
@@ -50,6 +70,7 @@ where
     type Prepared = ClonePrepared;
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        let reading = self.reading(obj).map_err(ResourceError::other)?;
         let repository = match self.repositories.get(&obj.spec.repo_ref.to_string()).await {
             Ok(repository) => repository,
             Err(ResourceError::NotFound { .. }) => return Ok(ClonePrepared::Failed(format!("repository {} not found", obj.spec.repo_ref))),
@@ -65,8 +86,7 @@ where
         if obj.metadata.name != expected_name {
             return Ok(ClonePrepared::Failed(format!("clone name mismatch: expected {expected_name}")));
         }
-        let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(ClonePhase::Pending);
-        if !matches!(phase, ClonePhase::Pending | ClonePhase::Cloning) {
+        if !Self::provisioning(obj, reading.as_ref()) {
             return Ok(ClonePrepared::None);
         }
 
@@ -87,8 +107,17 @@ where
         prepared: &Self::Prepared,
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
-        let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(ClonePhase::Pending);
-        let patch = if matches!(phase, ClonePhase::Pending | ClonePhase::Cloning) {
+        let reading = match self.reading(obj) {
+            Ok(reading) => reading,
+            Err(error) => {
+                // The runtime recovers an existing target when its prior report was not recorded.
+                let mut outcome = ReconcileOutcome::new(None);
+                outcome.events.push(ObjectEvent::for_object(obj, "LifecycleReadFailed", error));
+                outcome.requeue_after = Some(Duration::from_secs(30));
+                return outcome;
+            }
+        };
+        let patch = if Self::provisioning(obj, reading.as_ref()) {
             match prepared {
                 ClonePrepared::Ready { default_branch } => Some(CloneStatusPatch::MarkReady { default_branch: default_branch.clone() }),
                 ClonePrepared::Retrying(message) => Some(CloneStatusPatch::MarkRetrying { message: message.clone() }),
@@ -104,8 +133,11 @@ where
             outcome.events.push(ObjectEvent::for_object(obj, "CloneFailed", message.clone()));
         }
         if matches!(prepared, ClonePrepared::Retrying(_)) {
-            let next_attempt =
-                obj.status.as_ref().and_then(|status| status.retry.as_ref()).map_or(1, |retry| retry.attempts.saturating_add(1));
+            let next_attempt = match reading {
+                Some(LifecycleReading::Retrying { failures, .. }) => failures.saturating_add(1),
+                Some(_) => 1,
+                None => obj.status.as_ref().and_then(|status| status.retry.as_ref()).map_or(1, |retry| retry.attempts.saturating_add(1)),
+            };
             outcome.requeue_after = Some(CLONE_BACKOFF.delay(next_attempt));
         }
         outcome
@@ -120,6 +152,15 @@ where
     }
 
     fn retry_disposition(&self, obj: &ResourceObject<Self::Resource>) -> Option<flotilla_resources::ControllerRetryDisposition> {
-        obj.status.as_ref()?.retry.as_ref().map(|retry| retry.disposition.clone())
+        use flotilla_resources::ControllerRetryDisposition;
+        // Exhausted still owes GiveUp in engine prepare; only GaveUp is terminal.
+        match self.reading(obj) {
+            Ok(Some(LifecycleReading::Retrying { next, .. })) => Some(ControllerRetryDisposition::Retryable { next_attempt_at: next }),
+            Ok(Some(LifecycleReading::GaveUp { cause })) => Some(ControllerRetryDisposition::Terminal { needs: cause }),
+            Ok(Some(_)) => None,
+            Ok(None) => obj.status.as_ref()?.retry.as_ref().map(|retry| retry.disposition.clone()),
+            // Let prepare return the read failure to the controller's error and backoff handling.
+            Err(_) => None,
+        }
     }
 }

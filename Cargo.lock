@@ -1354,6 +1354,8 @@ dependencies = [
  "flotilla-protocol",
  "flotilla-protocol-testkit",
  "flotilla-provider-runtime",
+ "flotilla-provisioning",
+ "flotilla-provisioning-testkit",
  "flotilla-replay-testkit",
  "flotilla-resources",
  "flotilla-store",
@@ -2037,6 +2039,8 @@ dependencies = [
  "flotilla-protocol",
  "flotilla-protocol-testkit",
  "flotilla-provider-runtime",
+ "flotilla-provisioning",
+ "flotilla-provisioning-testkit",
  "flotilla-relay-protocol",
  "flotilla-replay-testkit",
  "flotilla-resources",
@@ -2172,6 +2176,8 @@ dependencies = [
  "flotilla-protocol",
  "flotilla-protocol-testkit",
  "flotilla-provider-runtime",
+ "flotilla-provisioning",
+ "flotilla-provisioning-testkit",
  "flotilla-replay-testkit",
  "flotilla-resources",
  "flotilla-store",
@@ -2262,6 +2268,7 @@ dependencies = [
  "flotilla-protocol-testkit",
  "flotilla-provider-runtime",
  "flotilla-provisioning",
+ "flotilla-provisioning-testkit",
  "flotilla-relay-protocol",
  "flotilla-replay-testkit",
  "flotilla-replication",
@@ -3144,6 +3151,7 @@ dependencies = [
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-provider-runtime",
+ "flotilla-provisioning-testkit",
  "flotilla-quint-testkit",
  "flotilla-resources",
  "flotilla-schema",
@@ -3166,6 +3174,23 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "flotilla-provisioning-testkit"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flotilla-engine-store",
+ "flotilla-provisioning",
+ "flotilla-resources",
+ "flotilla-schema",
+ "flotilla-schema-sqlite",
+ "flotilla-state-machines",
+ "flotilla-store",
+ "flotilla-store-testkit",
+ "rusqlite",
+ "tokio",
 ]
 
 [[package]]

@@ -246,3 +246,140 @@ async fn legacy_adoption_reads_only_live_convoys() {
     // Two queries each read the 10 Active rows plus the fixture's live "crew" convoy.
     assert_eq!(reads.of(&backend).objects("Convoy", ReadOperation::Query), 22);
 }
+
+// Resume uses the held Environment's ending and cause even when every old phase disagrees.
+// Unheld resources preserve the legacy refusal; requested, retrying and realised resources may resume.
+#[tokio::test]
+async fn resume_reads_environment_lifecycle_without_a_copy() {
+    use flotilla_provisioning::engine::environment::EnvironmentBinding;
+    use flotilla_provisioning_testkit::{object, store_object, Ending, LifecycleFixture};
+    use flotilla_resources::{
+        Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec, Vessel, VesselSpec, VesselStatus,
+    };
+    let (mut crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    let env = store_object(
+        &backend,
+        object::<Environment>(
+            "env",
+            EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
+                ..Default::default()
+            },
+            EnvironmentStatus { phase: EnvironmentPhase::Ready, message: Some("stale".into()), ..Default::default() },
+        ),
+    )
+    .await;
+    store_object(
+        &backend,
+        object::<Vessel>(
+            &flotilla_resources::vessel_resource_name("crew", "work"),
+            VesselSpec {
+                convoy_ref: "crew".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "policy".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+            VesselStatus { environment_ref: Some("env".into()), ..Default::default() },
+        ),
+    )
+    .await;
+    let lifecycle = LifecycleFixture::<EnvironmentBinding>::new(false);
+    Arc::get_mut(&mut crew).expect("unique service").lifecycle_reads = lifecycle.reads.clone();
+    lifecycle.request(&env);
+    crew.ensure_vessel_backing_available("flotilla", "crew", "work").await.expect("requested may resume");
+    lifecycle.finish(&env, Ending::Ready("/work"));
+    crew.ensure_vessel_backing_available("flotilla", "crew", "work").await.expect("ready may resume");
+    lifecycle.finish(&env, Ending::Lost("/work"));
+    let error = crew.ensure_vessel_backing_available("flotilla", "crew", "work").await.expect_err("lost cannot resume");
+    assert!(error.contains("lost, recoverable") && !error.contains("stale"));
+    lifecycle.poison();
+    assert!(crew.ensure_vessel_backing_available("flotilla", "crew", "work").await.expect_err("checked read").contains("poisoned"));
+}
+
+// Teardown reads Checkout endings from the engine, including the selected replica's origin.
+// Stale Gone must not authorize deletion of a live checkout; every old phase is left unchanged.
+#[tokio::test]
+async fn teardown_reads_checkout_endings_without_a_copy() {
+    use flotilla_provisioning::engine::checkout::CheckoutBinding;
+    use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, RepositoryKey};
+
+    for replica in [false, true] {
+        let old_phase = CheckoutPhase::Gone;
+        {
+            for ending in ["released", "lost", "gave_up"] {
+                let (mut crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+                let fixture = flotilla_provisioning_testkit::LifecycleFixture::<CheckoutBinding>::new(replica);
+
+                Arc::get_mut(&mut crew).expect("unique service").lifecycle_reads = fixture.reads.clone();
+                let author = if replica { ResourceBackend::new(InMemoryBackend::default()) } else { backend.clone() };
+                let records = author.using::<Checkout>("flotilla");
+                let mut checkout = records
+                    .create(
+                        &InputMeta::builder()
+                            .name("checkout".into())
+                            .labels(BTreeMap::from([(CONVOY_LABEL.into(), "crew".into())]))
+                            .build(),
+                        &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                            repo_ref: RepositoryKey("github.com/org/repo".into()),
+                            env_ref: "env".into(),
+                            r#ref: "branch".into(),
+                            base_ref: None,
+                            target_path: "/work".into(),
+                            clone_ref: "source".into(),
+                        }),
+                    )
+                    .await
+                    .expect("checkout");
+                let old_status = CheckoutStatus { phase: old_phase, ..Default::default() };
+                records.update_status("checkout", &checkout.metadata.resource_version, &old_status).await.expect("status");
+                let mut convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
+                convoy.spec.adopted_checkout_refs.insert(RepositoryKey("github.com/org/repo".into()), "checkout".into());
+                if replica {
+                    backend
+                        .replica_writer::<Checkout>(flotilla_protocol::NodeId::new("home"), "flotilla")
+                        .replace(&records.list().await.expect("snapshot"), chrono::Utc::now())
+                        .await
+                        .expect("replicate");
+                }
+                let sources = backend.including_replicas::<Checkout>("flotilla").list().await.expect("read sources");
+                let selected =
+                    flotilla_resources::select_convoy_child_sources(&convoy, &sources.items).remove("checkout").expect("selected");
+                let origins = match selected.provenance {
+                    flotilla_resources::ResourceProvenance::Local => BTreeMap::new(),
+                    flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => {
+                        [("checkout".into(), origin_root.to_string())].into()
+                    }
+                };
+                checkout = selected.object;
+                let list = std::slice::from_ref(&checkout);
+                assert_eq!(
+                    crew.verify_convoy_teardown_gate_at_origins(&convoy, list, &origins, false).await.is_ok(),
+                    old_phase == CheckoutPhase::Gone
+                );
+                fixture.request(&checkout);
+                assert!(crew.verify_convoy_teardown_gate_at_origins(&convoy, list, &origins, false).await.is_err());
+                let ending = match ending {
+                    "gave_up" => flotilla_provisioning_testkit::Ending::GaveUp("failure"),
+                    "released" => flotilla_provisioning_testkit::Ending::Released,
+                    _ => flotilla_provisioning_testkit::Ending::Lost("/work"),
+                };
+                fixture.finish(&checkout, ending);
+                for _ in 0..2 {
+                    assert_eq!(
+                        crew.verify_convoy_teardown_gate_at_origins(&convoy, std::slice::from_ref(&checkout), &origins, false)
+                            .await
+                            .is_ok(),
+                        !matches!(ending, flotilla_provisioning_testkit::Ending::GaveUp(_))
+                    );
+                }
+                assert_eq!(records.get("checkout").await.expect("record").status, Some(old_status));
+                fixture.poison();
+                assert!(crew
+                    .verify_convoy_teardown_gate_at_origins(&convoy, std::slice::from_ref(&checkout), &origins, false)
+                    .await
+                    .expect_err("read failure")
+                    .contains("poisoned"));
+            }
+        }
+    }
+}

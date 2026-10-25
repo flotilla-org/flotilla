@@ -1,0 +1,124 @@
+//! Real decided-store fixture shared by lifecycle reader contract tests.
+use std::sync::{Arc, Mutex};
+
+use flotilla_engine_store::StoreLog;
+use flotilla_provisioning::engine::{
+    reads::{LifecycleReadPort, StoreReads},
+    Binding, LifecycleHome, Lifecycles, Step,
+};
+use flotilla_resources::{lifecycle_reads::LifecycleReads, ResourceObject};
+use flotilla_schema::Timestamp;
+use flotilla_schema_sqlite::Store;
+use flotilla_state_machines::{
+    machines::lifecycle::{Lifecycle, LifecycleKind},
+    Cause, CauseCategory, Home, Log, Outcome,
+};
+
+/// Endings shared by every resource reader; the identity belongs to that kind's realisation.
+#[derive(Clone, Copy)]
+pub enum Ending<'a> {
+    Ready(&'a str),
+    Lost(&'a str),
+    Released,
+    GaveUp(&'a str),
+}
+
+/// Drives the real engine and SQLite adapter without publishing any old status copy.
+pub struct LifecycleFixture<B: Binding>
+where
+    StoreLog: Log<Lifecycle<B::Kind>>,
+{
+    pub home: Arc<LifecycleHome<B::Kind, StoreLog>>,
+    pub reads: Arc<dyn LifecycleReads>,
+    pub store: Arc<Mutex<Store>>,
+}
+
+impl<B: Binding> LifecycleFixture<B>
+where
+    <B::Kind as LifecycleKind>::Request: Send + Sync,
+    StoreLog: Log<Lifecycle<B::Kind>>,
+{
+    pub fn new(replica: bool) -> Self {
+        let mut registry = flotilla_schema::KindRegistry::new();
+        flotilla_provisioning::stored::register(&mut registry).expect("registry");
+        let store =
+            Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry).expect("store")));
+        let home = Arc::new(LifecycleHome::new("home", Home::with_log("home", StoreLog::new(Arc::clone(&store))).expect("home")));
+        let reads = Arc::new(LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), if replica { "reader" } else { "home" }.into()));
+        Self { home, reads, store }
+    }
+
+    pub fn request(&self, obj: &ResourceObject<B::Old>) {
+        self.home.request(&obj.metadata.name, B::request(obj, "home").expect("request"), Timestamp(1_000_000)).expect("requested");
+    }
+
+    pub fn retry(&self, obj: &ResourceObject<B::Old>, cause: &str) {
+        self.home
+            .step(
+                &obj.metadata.name,
+                &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Transient, cause), retryable: true }),
+                Timestamp(2_000_000),
+            )
+            .expect("retry");
+    }
+
+    pub fn finish(&self, obj: &ResourceObject<B::Old>, ending: Ending<'_>) {
+        let name = &obj.metadata.name;
+        let step = match ending {
+            Ending::Ready(identity) => Step::Realised { identity: identity.into() },
+            Ending::Lost(identity) => {
+                if !self.home.get(name).is_some_and(|resource| {
+                    matches!(resource.state(), flotilla_state_machines::machines::lifecycle::LifecycleState::Realised { .. })
+                }) {
+                    self.home.step(name, &Step::Realised { identity: identity.into() }, Timestamp(3_000_000)).expect("ready");
+                }
+                Step::Vanished
+            }
+            Ending::Released => Step::Released,
+            Ending::GaveUp(cause) => {
+                Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Refused, cause), retryable: false })
+            }
+        };
+        self.home.step(name, &step, Timestamp(4_000_000)).expect("ending");
+        assert!(B::copy(obj, &self.home.get(name).expect("held")).is_none(), "a migrated binding emits no copy");
+    }
+
+    pub fn poison(&self) {
+        flotilla_store_testkit::poison_mutex(Arc::clone(&self.store));
+    }
+}
+
+/// A stale resource snapshot for pure reader seams; no provider or persistence is replaced.
+pub fn object<T: flotilla_resources::Resource>(name: &str, spec: T::Spec, status: T::Status) -> ResourceObject<T> {
+    ResourceObject {
+        metadata: flotilla_resources::ObjectMeta {
+            name: name.into(),
+            namespace: "flotilla".into(),
+            resource_version: "1".into(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            owner_references: Vec::new(),
+            finalizers: Vec::new(),
+            deletion_timestamp: None,
+            creation_timestamp: chrono::DateTime::UNIX_EPOCH,
+            merge: None,
+        },
+        spec,
+        status: Some(status),
+    }
+}
+
+/// Store a stale snapshot through the real backend's validation and versioning.
+pub async fn store_object<T: flotilla_resources::Resource>(
+    backend: &flotilla_store::ResourceBackend,
+    object: ResourceObject<T>,
+) -> ResourceObject<T> {
+    let records = backend.using::<T>(&object.metadata.namespace);
+    let created = records.create(&flotilla_resources::InputMeta::from(&object.metadata), &object.spec).await.expect("resource");
+    match object.status {
+        Some(status) => {
+            records.update_status(&created.metadata.name, &created.metadata.resource_version, &status).await.expect("stale status")
+        }
+        None => created,
+    }
+}

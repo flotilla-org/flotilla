@@ -123,7 +123,19 @@ impl Aggregator {
                 };
                 // Behind `[primitives]` the engine's reading of the checkout decides (#3629 layer 4).
                 let origin = engine_origin(&source.provenance);
-                let engine = self.lifecycle_reads.reading(ProvisioningKind::Checkout, name, origin.as_deref());
+                let engine = match self.lifecycle_reads.try_reading(ProvisioningKind::Checkout, name, origin.as_deref()) {
+                    Ok(reading) => reading,
+                    Err(error) => {
+                        result.state = result.state.max(ReadinessState::Blocked);
+                        result.blockers.push(ReadinessBlocker {
+                            resource: ResourceRef::new(api_version(Checkout::API_PATHS), Checkout::API_PATHS.kind, &convoy.namespace, name)
+                                .on_host(host.clone()),
+                            phase: "Unknown".into(),
+                            reason: error,
+                        });
+                        continue;
+                    }
+                };
                 let status = source.object.status.as_ref();
                 let phase = status.map(|status| status.phase).unwrap_or_default();
                 if engine.as_ref().map_or(phase == CheckoutPhase::Ready, |reading| matches!(reading, LifecycleReading::Ready { .. })) {
@@ -144,11 +156,19 @@ impl Aggregator {
                             )
                             .on_host(host.clone())
                         };
-                        let reading = self.lifecycle_reads.reading(
+                        let reading = self.lifecycle_reads.try_reading(
                             ProvisioningKind::Clone,
                             &spec.clone_ref,
                             engine_origin(&clone.provenance).as_deref(),
                         );
+                        let reading = match reading {
+                            Ok(reading) => reading,
+                            Err(error) => {
+                                result.state = result.state.max(ReadinessState::Blocked);
+                                result.blockers.push(ReadinessBlocker { resource: clone_ref(), phase: "Unknown".into(), reason: error });
+                                continue;
+                            }
+                        };
                         if let Some(reading) = reading {
                             if let Some((state, phase, reason)) = reading_blocker(&reading, "clone is not ready") {
                                 result.state = result.state.max(state);
