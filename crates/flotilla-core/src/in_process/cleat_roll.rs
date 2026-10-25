@@ -23,6 +23,20 @@ struct CleatInventory {
     information: BTreeSet<String>,
 }
 
+fn retain_unattempted_failures(previous: &RollReport, current: &mut RollReport, registered: &BTreeSet<String>) {
+    for attempt in &previous.attempts {
+        if attempt.error.is_some()
+            && registered.contains(&attempt.environment)
+            && !current
+                .attempts
+                .iter()
+                .any(|new| new.environment == attempt.environment && new.runtime_root == attempt.runtime_root && new.name == attempt.name)
+        {
+            current.attempts.push(attempt.clone());
+        }
+    }
+}
+
 impl InProcessDaemon {
     async fn crew_cleat_targets(&self, require_local: bool) -> Result<CleatInventory, String> {
         let namespaces = self.resource_backend.local_namespaces::<TerminalSession>().await.map_err(|error| error.to_string())?;
@@ -54,9 +68,7 @@ impl InProcessDaemon {
                         .and_then(|environment| environment.spec.docker.as_ref())
                         .is_some_and(|docker| docker.host_ref == self.environment_manager.local_host_id().as_str())
                     {
-                        inventory
-                            .information
-                            .insert(format!("{vessel}: vessel cleat unknown, refreshes on restart (environment runner unavailable)"));
+                        inventory.errors.push(format!("{vessel}: cleat environment runner unavailable: {}", session.spec.env_ref));
                     } else if environment
                         .as_ref()
                         .and_then(|environment| environment.spec.host_direct.as_ref())
@@ -86,11 +98,7 @@ impl InProcessDaemon {
                 continue;
             }
             let Some(runner) = self.environment_manager.environment_runner(&id) else {
-                if contained {
-                    inventory.information.insert(format!("{id}: vessel cleat unknown, refreshes on restart (runner unavailable)"));
-                } else {
-                    inventory.errors.push(format!("host cleat runner unavailable for {id}"));
-                }
+                inventory.errors.push(format!("cleat runner unavailable for {id}"));
                 continue;
             };
             let environment = CleatEnvironment::builder().id(id.clone()).bag(bag).runner(runner).contained(contained).build();
@@ -99,9 +107,6 @@ impl InProcessDaemon {
                     target.vessels = vessels.get(&id).map_or_else(Vec::new, |vessels| vessels.iter().cloned().collect());
                     target
                 })),
-                Err(error) if contained => {
-                    inventory.information.insert(format!("{id}: vessel cleat unknown, refreshes on restart ({error})"));
-                }
                 Err(error) => inventory.errors.push(format!("{id}: {error}")),
             }
         }
@@ -112,13 +117,18 @@ impl InProcessDaemon {
         let inventory = self.crew_cleat_targets(true).await?;
         #[cfg(unix)]
         let mut inventory = inventory;
-        // Publish under the same stable parent supplied at provisioning. A
-        // container runner receives its environment path, never the host path.
+        // Refresh current-layout shared mounts independently of handover.
+        // Legacy targets remain reachable even if this publication fails.
         #[cfg(unix)]
         if inventory.targets.iter().any(|target| target.contained) {
-            let release = incoming.parent().and_then(Path::parent).ok_or("incoming cleat has no release root")?;
             let root = self.config.state_dir().join("environment-tools/fleet");
-            let result = flotilla_environment::guest_tools::GuestTools::resolve(release, &flotilla_environment::guest_tools::linux_amd64())
+            let result = incoming
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| "incoming cleat has no release root".to_string())
+                .and_then(|release| {
+                    flotilla_environment::guest_tools::GuestTools::resolve(release, &flotilla_environment::guest_tools::linux_amd64())
+                })
                 .and_then(|tools| {
                     flotilla_environment::tools::publish(
                         root.as_path(),
@@ -133,12 +143,18 @@ impl InProcessDaemon {
                 });
             if let Err(error) = result {
                 inventory.errors.push(format!("publish vessel tools: {error}"));
-                inventory.targets.retain(|target| !target.contained);
             }
         }
         let mut report =
             cleat_roll::drain(self.host_name.to_string(), generation.to_string(), incoming, &inventory.targets, inventory.errors).await;
         report.information.extend(inventory.information);
+        // A registered environment can temporarily lose its runner. Retain its
+        // previous failed attempt until a retry actually addresses that target.
+        if let Some(previous) = self.cleat_roll_report.lock().await.as_ref() {
+            let registered = self.environment_manager.managed_environments().into_iter().map(|(id, _)| id.to_string()).collect();
+            retain_unattempted_failures(previous, &mut report, &registered);
+        }
+
         #[cfg(target_os = "linux")]
         {
             let root = self.config.state_dir().join("environment-tools/fleet");
@@ -366,14 +382,9 @@ mod tests {
             .await
             .expect("retained endpoint");
         let inventory = daemon.crew_cleat_targets(true).await.expect("known targets");
-        assert!(inventory.errors.is_empty(), "{:?}", inventory.errors);
-        assert_eq!(inventory.information.len(), 1);
-        assert!(inventory
-            .information
-            .iter()
-            .next()
-            .expect("vessel info")
-            .contains("work-vessel: vessel cleat unknown, refreshes on restart"));
+        assert_eq!(inventory.errors.len(), 1);
+        assert!(inventory.errors[0].contains("work-vessel: cleat environment runner unavailable"));
+        assert!(inventory.information.is_empty());
         let targets = inventory.targets;
         assert_eq!(targets.len(), 4);
         assert!(targets.iter().any(|target| target.runtime_root == Path::new("/host-home/.local/state/cleat") && target.name == "default"));
@@ -384,8 +395,8 @@ mod tests {
         assert_eq!(targets.iter().filter(|target| target.name == "named").count(), 1);
         assert!(!targets.iter().any(|target| target.environment == "remote"));
         assert!(runner.calls().is_empty(), "enumeration is a resource/environment read");
-        // A failed first publication records the error without handing over any
-        // contained target or reporting a second spurious prune error.
+        // Missing incoming artifacts produce an attempt for every target and
+        // leave the contained runners untouched.
         let report = daemon
             .post_install_cleat(
                 &directory.path().join("missing-release/bin/cleat"),
@@ -394,10 +405,62 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(report.errors.iter().any(|error| error.starts_with("publish vessel tools:")));
+        assert_eq!(report.attempts.len(), 4);
+        assert!(report
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.environment == "contained-work")
+            .all(|attempt| { attempt.error.as_ref().is_some_and(|error| error.contains("NoPlatformBuild")) }));
         assert!(!report.errors.iter().any(|error| error.starts_with("prune vessel tools:")));
-        assert!(report.attempts.iter().all(|attempt| attempt.environment != "contained-work"));
         assert!(runner.calls().is_empty(), "publication failure must leave contained sessions alone");
+        // A malformed installed path is another diagnostic publication failure,
+        // not an early return that suppresses independent runtime attempts.
+        let malformed = daemon
+            .post_install_cleat(Path::new("/cleat"), "test-generation", &directory.path().join("diagnostics"))
+            .await
+            .expect("captured failure");
+        assert!(malformed.errors.iter().any(|error| error.contains("incoming cleat has no release root")));
+        assert_eq!(malformed.attempts.len(), 4);
+        assert!(malformed.diagnostics_path.expect("durable report").exists());
+    }
+
+    // Unavailable registered targets retain their last failed evidence. A real
+    // attempt replaces it, including success; removed environments lose it.
+    #[hegel::test]
+    fn retry_evidence_changes_only_for_attempted_or_removed_targets(tc: hegel::TestCase) {
+        use crate::cleat_roll::DrainAttempt;
+        use hegel::generators as gs;
+        // Generate registered/removed, attempted/unavailable, and success/failure.
+        let registered = tc.draw(gs::booleans());
+        let attempted = tc.draw(gs::booleans());
+        let successful = tc.draw(gs::booleans());
+        let old = DrainAttempt::builder()
+            .environment("crew".into())
+            .runtime_root("/runtime".into())
+            .name("default".into())
+            .stdout("previous raw evidence".into())
+            .stderr("failure".into())
+            .success(false)
+            .error("failed handover".into())
+            .build();
+        let previous =
+            RollReport::builder().host("host".into()).generation("old".into()).attempts(vec![old.clone()]).errors(vec![]).build();
+        let mut attempts = vec![];
+        if attempted {
+            let mut new = old;
+            new.stdout = "new verified evidence".into();
+            new.success = successful;
+            new.error = (!successful).then(|| "retry failed".into());
+            attempts.push(new);
+        }
+        let mut current = RollReport::builder().host("host".into()).generation("new".into()).attempts(attempts).errors(vec![]).build();
+        let environments = if registered { BTreeSet::from(["crew".to_string()]) } else { BTreeSet::new() };
+        retain_unattempted_failures(&previous, &mut current, &environments);
+        assert_eq!(current.attempts.len(), usize::from(attempted || registered));
+        if let Some(evidence) = current.attempts.first() {
+            assert_eq!(evidence.stdout, if attempted { "new verified evidence" } else { "previous raw evidence" });
+            assert_eq!(evidence.error.is_none(), attempted && successful);
+        }
     }
 
     // The advisory host condition gives fleet-wide users exact installed and
