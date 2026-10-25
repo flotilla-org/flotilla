@@ -7,3 +7,6 @@ mod test_config;
 
 #[cfg(unix)]
 pub mod tools;
+
+#[cfg(unix)]
+pub mod guest_tools;

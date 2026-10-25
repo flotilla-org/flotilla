@@ -107,6 +107,7 @@ impl DrydockEnvironmentProvider {
                 .observations
                 .get_or_init(|| observations::Hub::start(self.api.clone(), self.instance.clone()))
                 .watch(environment.id.clone()),
+            platform: environment.platform.ok_or("guest platform unknown in recorded drydock environment")?,
             backing: environment.id,
             image: ImageId::new(image),
             env: RwLock::new(env),
@@ -140,9 +141,13 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
             Err(reason) => ProviderReadiness::Unknown { reason },
         }
     }
-    async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, _: &PrepareOpts) -> Result<PreparedEnvironment, String> {
+    async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, opts: &PrepareOpts) -> Result<PreparedEnvironment, String> {
         if spec.docker.is_some() || spec.host_direct.is_some() {
             return Err("cloud sandbox must be the only environment input".into());
+        }
+        let platform = opts.platform.clone().unwrap_or_else(crate::guest_tools::linux_amd64);
+        if platform != crate::guest_tools::linux_amd64() {
+            return Err(format!("unsupported guest platform {platform}"));
         }
         let spec = spec.cloud_sandbox.as_ref().ok_or("missing cloud sandbox input")?;
         if spec.size.cpus == 0 || spec.size.memory_bytes == 0 || spec.size.disk_bytes == 0 {
@@ -162,7 +167,7 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
             .prepare(
                 &self.instance,
                 &wire::PrepareRequest {
-                    platform: None,
+                    platform: Some(platform.clone()),
                     image_digest: spec.image.clone(),
                     tools_digest: ::drydock::launch::build_tools_digest().map_err(|e| e.to_string())?.into(),
                     size: size(&spec.size),
@@ -170,6 +175,10 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
             )
             .await
             .map_err(api_error)?;
+        if prepared.platform != platform {
+            return Err(format!("unsupported guest platform {}", prepared.platform));
+        }
+        self.connector.preflight(&prepared.platform)?;
         Ok(PreparedEnvironment::new(&self.owner, Prepared { prepared, spec: spec.clone() }))
     }
     async fn provision(&self, id: EnvironmentId, prepared: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String> {
@@ -444,6 +453,7 @@ fn capabilities(c: &wire::Capabilities) -> ProviderCapabilities {
     }
 }
 struct DrydockEnvironment {
+    platform: wire::Platform,
     api: Arc<dyn ProviderApi>,
     connector: Arc<dyn reach::Connector>,
     instance: String,
@@ -536,7 +546,8 @@ impl DrydockEnvironment {
         }
         self.connection.write().expect("connection").take();
         let keydir = key_dir(&self.directory, &self.id);
-        let connection = self.connector.connect(&*self.api, &self.instance, &self.backing, keydir.join("id_ed25519")).await?;
+        let connection =
+            self.connector.connect(&*self.api, &self.instance, &self.backing, &self.platform, keydir.join("id_ed25519")).await?;
         let assets = self.assets.read().expect("assets").clone();
         for asset in assets {
             connection.deliver(asset).await?;

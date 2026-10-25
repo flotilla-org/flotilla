@@ -613,12 +613,14 @@ pub(super) fn held_baseline_docker_provider(
 impl CommandRunner for HeldBaselineRunner {
     async fn run_with_input(&self, command: &str, args: &[&str], _: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         assert_eq!(command, "docker");
-        assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
+        assert_eq!(args, ["build", "--platform", "linux/amd64", "--quiet", "--network=none", "-"]);
         let dockerfile = std::str::from_utf8(input).unwrap();
         assert!(dockerfile.contains("COPY --from=tools /opt/drydock /opt/drydock"));
         // BuildKit reads `FROM sha256:<hex>` as Docker Hub's `sha256` repository
         // and pulls unknown tags; only registry digests and local tags resolve.
-        for image in dockerfile.lines().filter_map(|line| line.strip_prefix("FROM ")?.split_whitespace().next()) {
+        for image in
+            dockerfile.lines().filter_map(|line| line.strip_prefix("FROM ")?.split_whitespace().find(|part| !part.starts_with("--")))
+        {
             if !image.contains('@') && (image.starts_with("sha256:") || !self.tags.lock().unwrap().contains_key(image)) {
                 return Err(format!(
                     "failed to resolve source metadata for docker.io/library/{image}: pull access denied, repository does not exist or may require authorization"
@@ -631,13 +633,14 @@ impl CommandRunner for HeldBaselineRunner {
     async fn run(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
         assert_eq!(cmd, "docker");
         match args {
+            ["image", "inspect", "--format", "{{.Os}}/{{.Architecture}}", _] => Ok("linux/amd64".into()),
             ["tag", id, tag] => {
                 assert_eq!(*id, format!("sha256:{}", "a".repeat(64)), "only the resolved baseline is tagged");
                 self.tags.lock().unwrap().insert(tag.to_string(), id.to_string());
                 Ok(String::new())
             }
             ["image", "inspect", image] if *image == self.image => Ok(String::new()),
-            ["--config", directory, "pull", image] if *image == self.image => {
+            ["--config", directory, "pull", "--platform", "linux/amd64", image] if *image == self.image => {
                 assert!(directory.contains("flotilla-anonymous-"), "baseline pull must isolate ambient credentials");
                 Ok(String::new())
             }

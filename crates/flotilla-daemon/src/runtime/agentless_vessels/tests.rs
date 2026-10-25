@@ -100,7 +100,13 @@ impl VesselAgents for LocalAgents {
     async fn host_refusals(&self, _profile: &AgentlessSshProfile) -> Vec<HostRefusal> {
         Vec::new()
     }
-    async fn open(&self, profile: &AgentlessSshProfile, paths: &VesselPaths, local: &Path) -> Result<Arc<dyn VesselHandle>, String> {
+    async fn open(
+        &self,
+        profile: &AgentlessSshProfile,
+        _: &HostPlatform,
+        paths: &VesselPaths,
+        local: &Path,
+    ) -> Result<Arc<dyn VesselHandle>, String> {
         self.opened.fetch_add(1, Ordering::SeqCst);
         self.serve(&paths.agent);
         let connector = LocalConnector(paths.agent.join("agent.sock"));
@@ -488,11 +494,10 @@ impl crate::environment_tools::EnvironmentToolFactory for MissingLayer {
     }
 }
 
-// Review #3808: a preparation that fails after the agent opened closes that
-// handle at once, so nothing of it lingers beside the next attempt, which
-// opens afresh and succeeds.
+// Missing tools refuse before opening an agent or uploading any guest bytes;
+// a later complete preparation can retry successfully.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_failed_preparation_closes_its_handle() {
+async fn missing_tools_refuse_before_opening_an_agent() {
     let host = host(Arc::new(ProcessCommandRunner));
     let agents = Arc::new(LocalAgents::default());
     let (sockets, _received) = recording_sockets(host.state.path());
@@ -502,12 +507,11 @@ async fn a_failed_preparation_closes_its_handle() {
         .err()
         .expect("missing layer");
     assert!(error.contains("xterm-ghostty"), "{error}");
-    let first = agents.handles.lock().unwrap()[0].clone();
-    assert!(first.is_closed(), "the failed attempt's handle is closed");
+    assert!(agents.handles.lock().unwrap().is_empty(), "tool preflight must precede agent upload");
     access(&vessels, &host, "convoy-1-work").await.expect("the retry prepares the vessel");
     let handles = agents.handles.lock().unwrap().clone();
-    assert_eq!(handles.len(), 2);
-    assert!(!handles[1].is_closed());
+    assert_eq!(handles.len(), 1);
+    assert!(!handles[0].is_closed());
 }
 
 /// The host, except that its vessel markers cannot be listed.

@@ -249,6 +249,21 @@ import os
 from pathlib import Path
 
 bundle = Path(os.environ["FLEET_BUNDLE"])
+# The run identity is bound to both platform artifacts by the promoter.
+cohort = os.environ.get("GITHUB_RUN_ID") or os.environ.get("FORGEJO_RUN_ID")
+if not cohort:
+    raise SystemExit("candidate build requires its Actions run identity")
+if os.environ["FLEET_PLATFORM"] == "linux-x86_64-gnu2.36":
+    import sys
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(bundle))
+    import generation_validation
+    generation_validation.produce_guest_tools(bundle, {
+        "flotilla": os.environ["FLEET_FLOTILLA_SHA"],
+        "cleat": os.environ["FLEET_CLEAT_SHA"],
+        "mattpocock-skills": os.environ["FLEET_MATTPOCOCK_SKILLS_SHA"],
+        "rjw-skills": os.environ["FLEET_RJW_SKILLS_SHA"],
+    }, cohort)
 files = []
 for path in sorted(bundle.rglob("*")):
     if not path.is_file() or path.name == "manifest.json":
@@ -272,6 +287,7 @@ manifest = {
         "rjw-skills": os.environ["FLEET_RJW_SKILLS_SHA"],
     },
     "build_profile": "release",
+    "guest_tools_cohort": cohort,
     "peer_protocol_version": int(os.environ["FLEET_PROTOCOL_VERSION"]),
     "signed": False,
     "files": files,

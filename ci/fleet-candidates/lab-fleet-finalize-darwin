@@ -253,6 +253,11 @@ def inspect_archive(archive_bytes, root, description):
         entry = declared[path]
         if len(content) != entry["size_bytes"] or sha256(content) != entry["sha256"]:
             raise FinalizationError(f"{description} payload digest mismatch: {path}")
+    try:
+        validation.validate_guest_tools(contents, manifest.get("sources"), manifest.get("guest_tools_cohort"),
+                                        required=manifest.get("guest_tools_cohort") is not None)
+    except ValueError as error:
+        raise FinalizationError(str(error)) from error
     return manifest, manifest_bytes, contents
 
 
@@ -350,6 +355,7 @@ def validate_derivative(
     identity,
     team_id,
     entitlements,
+    expected_cohort=None,
 ):
     expected_marker = {
         "schema_version": 1,
@@ -411,6 +417,8 @@ def validate_derivative(
         )
     except (KeyError, validation.ValidationError) as error:
         raise FinalizationError(f"unsigned Darwin candidate has an invalid skill bundle: {error}") from error
+    if validation.GUEST_CATALOG in unsigned_files and unsigned_manifest.get("guest_tools_cohort") != expected_cohort:
+        raise FinalizationError("linux/amd64: guest cohort differs from source generation")
     expected_input = {
         "artifact": darwin["artifact"],
         "sha256": darwin["sha256"],
@@ -605,6 +613,7 @@ def main():
         args.expected_identity,
         args.expected_team_id,
         entitlements,
+        expected_cohort=str(source_document.get("source_run", {}).get("api_run_id")),
     )
 
     package_metadata = parse_json(get_bytes(signed_metadata_url, read_auth), "signed package metadata")

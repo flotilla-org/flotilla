@@ -50,9 +50,15 @@ impl Drop for Forwarder {
     }
 }
 impl Connection {
-    pub async fn open(api: &dyn ProviderApi, instance: &str, id: &str, identity_file: PathBuf) -> Result<Self, String> {
-        // TODO(#3773): choose the build from the vessel platform instead of the host.
-        let executable = tokio::fs::read(::drydock::local::agent_build(&wire::Platform::current())?).await.map_err(error)?;
+    pub async fn open(
+        api: &dyn ProviderApi,
+        instance: &str,
+        id: &str,
+        platform: &wire::Platform,
+        identity_file: PathBuf,
+    ) -> Result<Self, String> {
+        let tools = crate::guest_tools::GuestTools::installed(platform)?;
+        let executable = tokio::fs::read(tools.agent()).await.map_err(error)?;
         let sessions = Arc::new(tokio::sync::Mutex::new(None));
         let saved = sessions.clone();
         let agent = drydock_agent::Client::connect_current(
@@ -77,8 +83,7 @@ impl Connection {
                 *saved.lock().await = Some(session.clone());
                 drydock_transport::Transport::native(Arc::new(Connections { session, listener }), Default::default())
             },
-            // TODO(#3773): choose the build from the vessel platform instead of the host.
-            &wire::Platform::current(),
+            platform,
             &executable,
             Duration::from_secs(60),
         )
@@ -204,22 +209,42 @@ pub(super) trait Guest: Send + Sync {
 }
 #[async_trait]
 pub(super) trait Connector: Send + Sync {
-    async fn connect(&self, api: &dyn ProviderApi, instance: &str, backing: &str, key: PathBuf) -> Result<Arc<dyn Guest>, String>;
+    fn preflight(&self, _: &wire::Platform) -> Result<(), String> {
+        Ok(())
+    }
+    async fn connect(
+        &self,
+        api: &dyn ProviderApi,
+        instance: &str,
+        backing: &str,
+        platform: &wire::Platform,
+        key: PathBuf,
+    ) -> Result<Arc<dyn Guest>, String>;
 }
 pub(super) struct SshConnector;
 #[async_trait]
 impl Connector for SshConnector {
-    async fn connect(&self, api: &dyn ProviderApi, instance: &str, backing: &str, key: PathBuf) -> Result<Arc<dyn Guest>, String> {
+    fn preflight(&self, platform: &wire::Platform) -> Result<(), String> {
+        crate::guest_tools::GuestTools::installed(platform).map(|_| ())
+    }
+    async fn connect(
+        &self,
+        api: &dyn ProviderApi,
+        instance: &str,
+        backing: &str,
+        platform: &wire::Platform,
+        key: PathBuf,
+    ) -> Result<Arc<dyn Guest>, String> {
         // Fail immediately for a missing companion, rather than obscuring an
         // installation error as guest boot latency.
-        // TODO(#3773): choose the build from the vessel platform instead of the host.
-        let executable = ::drydock::local::agent_build(&wire::Platform::current())?;
+        let executable = crate::guest_tools::GuestTools::installed(platform)?.agent();
         tokio::fs::metadata(executable).await.map_err(|e| format!("drydock-agent companion unavailable: {e}"))?;
         let last_error = std::sync::Mutex::new(String::new());
         let connection = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
-                match Connection::open(api, instance, backing, key.clone()).await {
-                    Ok(c) => return c,
+                match Connection::open(api, instance, backing, platform, key.clone()).await {
+                    Ok(c) => return Ok(c),
+                    Err(cause) if cause.contains("prepared for") || cause.starts_with("guest platform ") => return Err(cause),
                     Err(cause) => {
                         *last_error.lock().expect("SSH error") = cause;
                         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -228,7 +253,7 @@ impl Connector for SshConnector {
             }
         })
         .await
-        .map_err(|_| format!("SSH agent hello did not complete within 60 seconds: {}", last_error.lock().expect("SSH error")))?;
+        .map_err(|_| format!("SSH agent hello did not complete within 60 seconds: {}", last_error.lock().expect("SSH error")))??;
         Ok(Arc::new(connection))
     }
 }

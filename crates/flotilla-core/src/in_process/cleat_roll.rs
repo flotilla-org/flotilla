@@ -118,15 +118,19 @@ impl InProcessDaemon {
         if inventory.targets.iter().any(|target| target.contained) {
             let release = incoming.parent().and_then(Path::parent).ok_or("incoming cleat has no release root")?;
             let root = self.config.state_dir().join("environment-tools/fleet");
-            let result = flotilla_environment::tools::publish(
-                root.as_path(),
-                &flotilla_environment::tools::ToolsSource {
-                    flotilla: &release.join("bin/flotilla"),
-                    cleat: incoming,
-                    library: &release.join("lib/libghostty-vt.so.0"),
-                    terminfo: &release.join("share/terminfo"),
-                },
-            );
+            let result = flotilla_environment::guest_tools::GuestTools::resolve(release, &flotilla_environment::guest_tools::linux_amd64())
+                .and_then(|tools| {
+                    flotilla_environment::tools::publish(
+                        root.as_path(),
+                        &flotilla_environment::tools::ToolsSource {
+                            flotilla: &tools.flotilla(),
+                            cleat: &tools.cleat(),
+                            library: &tools.library(),
+                            terminfo: &tools.terminfo(),
+                        },
+                    )
+                    .map_err(|error| error.to_string())
+                });
             if let Err(error) = result {
                 inventory.errors.push(format!("publish vessel tools: {error}"));
                 inventory.targets.retain(|target| !target.contained);

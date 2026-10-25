@@ -31,7 +31,9 @@ impl LocalImageTags {
     // final stage starts from, when it names a tagged local image.
     pub(super) fn resolve_build(&self, dockerfile: &str) -> Result<Option<String>, String> {
         let mut base = None;
-        for image in dockerfile.lines().filter_map(|line| line.strip_prefix("FROM ")?.split_whitespace().next()) {
+        for image in
+            dockerfile.lines().filter_map(|line| line.strip_prefix("FROM ")?.split_whitespace().find(|part| !part.starts_with("--")))
+        {
             if image.contains('@') {
                 base = None;
                 continue;
@@ -69,6 +71,7 @@ impl CommandRunner for DockerEngine {
         }
         let mut inventory = self.inventory.lock().unwrap();
         match args {
+            ["image", "inspect", "--format", "{{.Os}}/{{.Architecture}}", _] => Ok("linux/amd64".into()),
             ["image", "inspect", ..] => Ok("[]".into()),
             ["tag", id, tag] => self.tags.tag(id, tag),
             ["exec", "--user", "0", ..]
@@ -108,7 +111,7 @@ impl CommandRunner for DockerEngine {
     }
     async fn run_with_input(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         assert_eq!(cmd, "docker");
-        assert_eq!(args, ["build", "--quiet", "--network=none", "-"]);
+        assert_eq!(args, ["build", "--platform", "linux/amd64", "--quiet", "--network=none", "-"]);
         let dockerfile = std::str::from_utf8(input).unwrap();
         assert!(dockerfile.contains("COPY --from=tools /opt/drydock /opt/drydock"));
         self.tags.resolve_build(dockerfile)?;
