@@ -1504,11 +1504,13 @@ mod tests {
         adopted_terminal_contract(None, ContractProvider::Docker).await;
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires an installed Cleat with controller-seat support and a real PTY"]
     async fn adopted_terminal_preserves_real_cleat_process() {
-        adopted_terminal_contract(Some(Arc::new(RealTerminal::new())), ContractProvider::Docker).await;
+        let mut real = Arc::new(RealTerminal::new());
+        adopted_terminal_contract(Some(real.clone()), ContractProvider::Docker).await;
+        Arc::get_mut(&mut real).expect("all attach consumers released").native.shutdown();
     }
 
     // A provider with neither a Docker spec nor a runtime container name must
@@ -1525,74 +1527,34 @@ mod tests {
     }
 
     struct RealTerminal {
-        root: tempfile::TempDir,
         endpoint: flotilla_protocol::result_set::CleatEndpoint,
         baseline: HashMap<String, String>,
-        crew_pid: String,
+        #[cfg(target_os = "linux")]
+        native: flotilla_discovery_testkit::native_terminal::NativeTerminal,
+    }
+
+    // The opt-in child is this compiled Rust test, never an interpreted program.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "private native crew subprocess only"]
+    fn native_crew_probe() {
+        flotilla_discovery_testkit::native_terminal::crew_probe();
     }
 
     impl RealTerminal {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         fn new() -> Self {
-            use std::os::unix::fs::PermissionsExt;
-            let root = tempfile::Builder::new().prefix("fa-").tempdir_in("/tmp").expect("short private Cleat root");
-            let probe = root.path().join("crew");
-            std::fs::write(&probe, format!("#!/usr/bin/python3\nimport os,time\nopen({:?},'w').write(str(os.getpid()))\nprint('preserved conversation',flush=True)\nwhile True: time.sleep(1)\n", root.path().join("crew.pid"))).expect("crew probe");
-            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).expect("executable crew");
-            std::fs::write(root.path().join("agent-home"), "conversation identity").expect("agent home");
-            let baseline = HashMap::from([
-                ("PATH".into(), std::env::var("PATH").expect("test binary path")),
-                ("CLEAT_RUNTIME_DIR".into(), root.path().to_string_lossy().into_owned()),
-                ("CLEAT_DAEMON".into(), "provider-attach".into()),
-                ("SHELL".into(), probe.to_string_lossy().into_owned()),
-            ]);
-            let launch = std::process::Command::new("cleat")
-                .env_clear()
-                .envs(&baseline)
-                .args([
-                    "launch",
-                    "session-crew",
-                    "--cwd",
-                    root.path().to_str().expect("UTF8 root"),
-                    "--cmd",
-                    "crew",
-                    "--tag",
-                    "purpose=test",
-                ])
-                .output()
-                .expect("launch isolated Cleat");
-            assert!(launch.status.success(), "{}", String::from_utf8_lossy(&launch.stderr));
-            let daemon = std::fs::read_dir(root.path())
-                .expect("private generations")
-                .filter_map(Result::ok)
-                .find(|entry| entry.path().join("daemon.pid").is_file())
-                .expect("private daemon")
-                .file_name()
-                .to_string_lossy()
-                .into_owned();
-            let endpoint = flotilla_protocol::result_set::CleatEndpoint {
-                runtime_root: root.path().to_string_lossy().into_owned(),
-                daemon,
-                session: "session-crew".into(),
-            };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let crew_pid = loop {
-                if let Ok(pid) = std::fs::read_to_string(root.path().join("crew.pid")) {
-                    if !pid.is_empty() {
-                        break pid;
-                    }
-                }
-                assert!(std::time::Instant::now() < deadline, "crew did not start");
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            };
-            Self { root, endpoint, baseline, crew_pid }
+            let native = flotilla_discovery_testkit::native_terminal::NativeTerminal::new("in_process::attach::tests::native_crew_probe");
+            Self { endpoint: native.endpoint.clone(), baseline: native.baseline.clone(), native }
         }
 
         fn attach(&self, plan: &ResolvedAttachPlan, secondary: &ResolvedAttachPlan) {
-            let args: Vec<Vec<String>> = [plan, secondary]
+            let commands: Vec<Vec<String>> = [plan, secondary]
                 .into_iter()
                 .map(|plan| {
                     let [ResolvedAttachAction::Command(args)] = plan.0.as_slice() else { panic!("single provider hop") };
+                    // Substitute only the Docker process boundary; execute the emitted
+                    // Cleat command against the selected physical session unchanged.
                     args.iter()
                         .skip(4)
                         .map(|arg| match arg {
@@ -1602,69 +1564,12 @@ mod tests {
                         .collect()
                 })
                 .collect();
-            // Reuse the PTY/drain pattern from Cleat's controller-refusal fixture.
-            // Only the Docker exec boundary is substituted: the emitted Cleat
-            // command attaches to the actual selected session with no handover.
-            let script = r#"import json,os,pty,subprocess,sys,threading,time
-args=json.loads(sys.argv[1]); root=sys.argv[2]
-clients=[]; masters=[]
-def drain(master):
- try:
-  while os.read(master,65536): pass
- except OSError: pass
-try:
- controller=None
- for index,command in enumerate(args):
-  master,slave=pty.openpty(); masters.append(master)
-  client=subprocess.Popen(command,stdin=slave,stdout=slave,stderr=slave,env={**os.environ,'TERM':'xterm-256color'})
-  clients.append(client); os.close(slave)
-  threading.Thread(target=drain,args=(master,),daemon=True).start()
-  deadline=time.monotonic()+5
-  while True:
-   result=subprocess.run(['cleat','--runtime-root',root,'--server',os.environ['CLEAT_DAEMON'],'inspect','session-crew','--json'],capture_output=True,text=True,check=True)
-   seats=json.loads(result.stdout)['attachments']
-   if len(seats)==index+1: break
-   assert client.poll() is None and time.monotonic()<deadline, 'attachment did not connect'
-   time.sleep(.01)
-  controllers=[seat for seat in seats if seat['role']=='controller']
-  assert controllers, seats
-  if controller is None: controller=controllers[0]['identity']
-  assert any(seat['identity']==controller for seat in controllers), 'attachment displaced the original controller'
-finally:
- for client in clients:
-  client.terminate(); client.wait(timeout=5)
- for master in masters: os.close(master)
-"#;
-            let output = std::process::Command::new("python3")
-                .env_clear()
-                .envs(&self.baseline)
-                .args(["-c", script, &serde_json::to_string(&args).expect("argv"), self.root.path().to_str().expect("root")])
-                .output()
-                .expect("actual PTY attachment");
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-            assert!(Path::new(&format!("/proc/{}", self.crew_pid)).exists(), "crew process survived attachment");
-            assert_eq!(std::fs::read_to_string(self.root.path().join("crew.pid")).expect("crew PID"), self.crew_pid);
-            assert_eq!(std::fs::read_link(format!("/proc/{}/cwd", self.crew_pid)).expect("crew checkout"), self.root.path());
-            assert_eq!(std::fs::read_to_string(self.root.path().join("agent-home")).expect("agent home"), "conversation identity");
-            let transcript = std::process::Command::new("cleat")
-                .env_clear()
-                .envs(&self.baseline)
-                .args(["transcript", "session-crew", "--since", "0"])
-                .output()
-                .expect("same conversation");
-            assert!(
-                transcript.status.success() && String::from_utf8_lossy(&transcript.stdout).contains("preserved conversation"),
-                "transcript: {transcript:?}"
-            );
-        }
-    }
-
-    impl Drop for RealTerminal {
-        fn drop(&mut self) {
-            // Fixture teardown only, after preservation assertions, scoped to the
-            // daemon PID file under this fixture's private runtime root.
-            if let Ok(pid) = std::fs::read_to_string(self.root.path().join(&self.endpoint.daemon).join("daemon.pid")) {
-                let _ = std::process::Command::new("kill").args(["-TERM", pid.trim()]).status();
+            #[cfg(target_os = "linux")]
+            self.native.attach(&commands);
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = commands;
+                panic!("native acceptance is Linux-only");
             }
         }
     }

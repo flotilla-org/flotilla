@@ -5,6 +5,9 @@
 //! `exists` calls were made.
 
 pub mod environment;
+pub mod native_process;
+#[cfg(target_os = "linux")]
+pub mod native_terminal;
 
 use std::{
     collections::HashMap,

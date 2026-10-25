@@ -23,6 +23,12 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+tempfile.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true
 

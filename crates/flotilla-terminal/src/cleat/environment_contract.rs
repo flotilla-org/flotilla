@@ -391,19 +391,11 @@ impl CommandRunner for RealProcessRunner {
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
         // Actual process boundary: pollution is subprocess-local, never test-global.
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            tokio::process::Command::new(cmd)
-                .args(args)
-                .current_dir(cwd)
-                .env_clear()
-                .envs(polluted_environment())
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .map_err(|_| "cleat command deadline".to_string())?
-        .map_err(|error| error.to_string())?;
+        let mut command = std::process::Command::new(cmd);
+        command.args(args).current_dir(cwd).env_clear().envs(polluted_environment());
+        let output = tokio::task::spawn_blocking(move || flotilla_discovery_testkit::native_process::output(&mut command))
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(CommandOutput {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
