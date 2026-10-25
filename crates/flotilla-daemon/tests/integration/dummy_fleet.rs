@@ -34,9 +34,11 @@ struct DummyDaemon {
     daemon: Arc<InProcessDaemon>,
     fleet: Arc<DummyFleet>,
     _runtime: DaemonRuntime,
+    relay: Option<Arc<RestartRelay>>,
     _dir: tempfile::TempDir,
 }
 
+#[bon::bon]
 impl DummyDaemon {
     /// A daemon whose `daemon.toml` enables the dummy fleet with these agent
     /// and environment settings, started through the composition-root switch.
@@ -54,12 +56,24 @@ impl DummyDaemon {
     }
 
     async fn start_switched(agent: &str, environment: &str, resync: Duration, primitives: bool) -> Self {
+        Self::start_with_relay().agent(agent).environment(environment).resync(resync).primitives(primitives).host("dummy-load").call().await
+    }
+
+    #[builder]
+    async fn start_with_relay(
+        #[builder(default)] agent: &str,
+        #[builder(default)] environment: &str,
+        #[builder(default = Duration::from_millis(200))] resync: Duration,
+        #[builder(default = true)] primitives: bool,
+        host: &str,
+        #[builder(default)] restartable: bool,
+    ) -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_dir = dir.path().join("config");
         std::fs::create_dir_all(&config_dir).expect("config dir");
         let switch = if primitives { "[primitives]\n" } else { "" };
         let daemon_toml = format!(
-            "machine_id = \"dummy-load\"\n\n{switch}[dummy_fleet]\n[dummy_fleet.agent]\nlong_runner_turns = {LONG_RUNNER_TURNS}\n{agent}\n[dummy_fleet.environment]\n{environment}"
+            "machine_id = \"{host}\"\n\n{switch}[dummy_fleet]\n[dummy_fleet.agent]\nlong_runner_turns = {LONG_RUNNER_TURNS}\n{agent}\n[dummy_fleet.environment]\n{environment}"
         );
         std::fs::write(config_dir.join("daemon.toml"), daemon_toml).expect("daemon.toml");
         let config = Arc::new(ConfigStore::with_base(config_dir));
@@ -71,12 +85,24 @@ impl DummyDaemon {
             vec![],
             Arc::clone(&config),
             discovery,
-            HostName::new("dummy-load"),
+            HostName::new(host),
             backend,
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
-        attach_dummy_fleet(&fleet, &daemon).expect("attach fleet");
+        let relay = if restartable {
+            let relay = Arc::new(RestartRelay {
+                commands: std::sync::Mutex::new(None),
+                ready: tokio::sync::Notify::new(),
+                backend: daemon.resource_backend(),
+            });
+            relay.connect(&daemon);
+            fleet.attach(Arc::clone(&relay) as Arc<dyn flotilla_dummy_fleet::CrewCommandPort>).expect("attach restart relay");
+            Some(relay)
+        } else {
+            attach_dummy_fleet(&fleet, &daemon).expect("attach fleet");
+            None
+        };
         let options = RuntimeOptions {
             namespace: NAMESPACE.into(),
             heartbeat_interval: Duration::from_secs(5),
@@ -84,7 +110,7 @@ impl DummyDaemon {
             ..RuntimeOptions::default()
         };
         let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime");
-        let started = Self { daemon, fleet, _runtime: runtime, _dir: dir };
+        let started = Self { daemon, fleet, _runtime: runtime, relay, _dir: dir };
         started.seed().await;
         started
     }
@@ -231,10 +257,12 @@ impl DummyDaemon {
                 convoy if tokio::time::Instant::now() > deadline => {
                     let status = convoy.and_then(|convoy| convoy.status);
                     panic!(
-                        "convoy {name} never reached {what}: phase {:?}, message {:?}, crew {:?}, fleet {:?}",
+                        "convoy {name} never reached {what}: phase {:?}, message {:?}, crew {:?}, stall {:?}, supervision {:?}, fleet {:?}",
                         status.as_ref().map(|status| status.phase),
                         status.as_ref().and_then(|status| status.message.clone()),
                         status.as_ref().map(|status| &status.crew_work),
+                        status.as_ref().and_then(|status| status.stalled.as_ref()),
+                        status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).and_then(|w| w.supervision.as_ref()),
                         self.fleet.snapshot()
                     );
                 }
@@ -274,7 +302,10 @@ impl DummyDaemon {
 
     async fn deliver(&self, name: &str, mix: CrewMix) -> DummyFleetSnapshot {
         self.dispatch(name, mix).await;
-        self.wait_for_phase(name, ConvoyPhase::Landed).await;
+        let landed = self.wait_for_phase(name, ConvoyPhase::Landed).await;
+        if self.daemon.message_primitives().is_some() {
+            self.assert_engine_delivered(&landed.metadata.name);
+        }
         self.fleet.snapshot()
     }
 }
@@ -377,7 +408,19 @@ async fn a_stalled_crew_resumes_on_supervision_and_lands() {
 // A zero-task long runner finishes first; its aide then hands back work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
-    let fleet = DummyDaemon::start(SCENARIO_AGENT, "").await;
+    late_handoff_scenario(false).await;
+}
+
+// A late handoff reopens the recipient and transfers the engine promises; the
+// recipient delivers its engine Convoy after handling that additional turn.
+#[tokio::test(start_paused = true)]
+#[ignore = "late handoff reaches the dummy process but no engine Message receipt is committed before convoy teardown"]
+async fn on_the_engine_a_finished_long_runner_handles_a_late_handoff() {
+    late_handoff_scenario(true).await;
+}
+
+async fn late_handoff_scenario(primitives: bool) {
+    let fleet = DummyDaemon::start_switched(SCENARIO_AGENT, "", Duration::from_millis(200), primitives).await;
     let workflows = fleet.backend().using::<WorkflowTemplate>(NAMESPACE);
     let workflow = workflows.get(CrewMix::LongRunner.workflow_name()).await.expect("workflow");
     // Isolate the legacy same-vessel hand-back path. Normal peer tasks retain
@@ -448,6 +491,28 @@ async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
         CommandValue::Ok
     );
     let landed = fleet.wait_for_phase("late-handoff", ConvoyPhase::Landed).await;
+    if primitives {
+        fleet.assert_engine_delivered(&landed.metadata.name);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if fleet
+                    .daemon
+                    .message_primitives()
+                    .expect("engine")
+                    .messages()
+                    .expect("messages")
+                    .iter()
+                    .any(|(_, message)| message.state().receiver().is_some())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("engine handoff receipt");
+        fleet.assert_on_the_engine().await;
+    }
     assert_eq!(fleet.fleet.snapshot().turns_received, before.turns_received + 1, "the reopened governor receives the handoff turn");
     assert_eq!(
         landed.status.expect("status").crew_work["govern"]["governor"].completion_authority,
@@ -545,7 +610,7 @@ async fn on_the_engine_an_operator_ruling_is_refused_until_principals() {
 // A supervisor must be able to resume a stalled engine convoy, after which its
 // change-request promise is kept and the engine Convoy is delivered.
 #[tokio::test(start_paused = true)]
-#[ignore = "operator resume is refused: principal:implicit needs the principals model (#3457); awaiting owner ruling"]
+#[ignore = "operator resume is refused: principal:implicit needs the principals model (#3457); crew-supervised resume is the approved scenario"]
 async fn on_the_engine_a_stalled_coder_resumes_and_delivers() {
     use flotilla_state_machines::machines::convoy::ConvoyState;
 
@@ -645,7 +710,7 @@ async fn on_the_engine_an_unrealised_environment_records_failure_without_a_termi
 // A standing Ensure binds an admitted engine convoy. Abandoning that convoy
 // must let the same Ensure bind a fresh generation without losing its history.
 #[tokio::test(start_paused = true)]
-#[ignore = "engine Convoy admission explicitly skips standing convoys pending seat growth/import; awaiting owner ruling"]
+#[ignore = "engine Convoy admission explicitly skips standing convoys; #3794 remains behind owner schema review"]
 async fn on_the_engine_a_standing_ensure_readmits_after_abandon() {
     use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec};
     use flotilla_schema::Intern;
@@ -749,4 +814,510 @@ async fn on_the_engine_a_standing_ensure_readmits_after_abandon() {
     .await
     .expect("engine Ensure binds a fresh convoy after abandon");
     assert_ne!(first, second);
+}
+
+impl DummyDaemon {
+    // A fixed admitted identity makes the dummy provider's seeded failure draw
+    // reproducible while the runtime still bootstraps and reconciles the convoy.
+    async fn create_named(&self, name: &str, workflow: &str) {
+        let forge = catalog::forge(&self.fleet.config().forge_service_url);
+        let repository = catalog::repository(&forge).expect("repository");
+        self.backend()
+            .using::<Convoy>(NAMESPACE)
+            .create(
+                &InputMeta::builder().name(name.into()).labels(std::collections::BTreeMap::from([("proof".into(), name.into())])).build(),
+                &flotilla_resources::ConvoySpec::builder()
+                    .workflow_ref(workflow.into())
+                    .role(name.into())
+                    .r#ref("main".into())
+                    .project_ref("fleet".into())
+                    .placement_policy(DUMMY_PLACEMENT_POLICY.into())
+                    .repositories(vec![flotilla_resources::ConvoyRepositorySpec {
+                        url: catalog::repository_url(&forge),
+                        repo_ref: repository.key(),
+                        source_ref: "main".into(),
+                        target_ref: "main".into(),
+                        workspace_slug: "dummy".into(),
+                        subpaths: Vec::new(),
+                    }])
+                    .build(),
+            )
+            .await
+            .expect("named convoy");
+    }
+
+    fn assert_engine_delivered(&self, name: &str) {
+        use flotilla_state_machines::machines::convoy::ConvoyState;
+        let engine = self.daemon.message_primitives().expect("engine").convoys().get(name).expect("engine convoy");
+        assert!(matches!(engine.state(), ConvoyState::Delivered { .. }), "engine delivery: {engine:?}");
+    }
+}
+
+// A real governor must resume a stalled coder and deliver its engine Convoy.
+#[tokio::test(start_paused = true)]
+#[ignore = "crew stall stays at the operator rung despite the declared healthy governor; no crew-supervised ruling is available"]
+async fn on_the_engine_crew_supervision_resumes_a_stalled_coder() {
+    supervised_coder_scenario(CrewSupervisionAction::Resume).await;
+}
+
+// A failing crew proposes failure; its named governor must fail it while its
+// engine promises stay unmet and its supervision is recorded on the engine.
+#[tokio::test(start_paused = true)]
+#[ignore = "failing coder remains at the operator rung despite the declared healthy governor; crew failure ruling cannot be authenticated"]
+async fn on_the_engine_crew_supervision_fails_a_failing_coder() {
+    supervised_coder_scenario(CrewSupervisionAction::Fail).await;
+}
+
+async fn supervised_coder_scenario(action: CrewSupervisionAction) {
+    use flotilla_environment::environment::dummy::dummy_draw;
+    use flotilla_resources::SupervisionTarget;
+    use flotilla_state_machines::machines::awaiting_reply::AwaitingReply;
+    use flotilla_state_machines::{machines::convoy::ConvoyState, Resource};
+
+    let (domain, agent) =
+        if action == CrewSupervisionAction::Resume { ("crew-stall", "stall_rate = 0.5\n") } else { ("crew-failure", "fail_rate = 0.5\n") };
+    // Explicitly cover a faulting coder and a healthy supervisor, without
+    // random UUIDs changing the dummy provider's deterministic draws.
+    let name = (0..128)
+        .map(|n| format!("engine-supervised-{n}"))
+        .find(|name| {
+            dummy_draw(0, domain, &format!("{name}/{name}-implement/coder")) < 0.5
+                && dummy_draw(0, domain, &format!("{name}/{name}-supervise/governor")) >= 0.5
+        })
+        .expect("seeded case");
+    let fleet = DummyDaemon::start_on_primitives(agent, "").await;
+    let mut workflow = CrewMix::CoderSupervisor.workflow(LONG_RUNNER_TURNS);
+    workflow.supervision =
+        Some(vec![SupervisionTarget::ConvoyCrew { vessel: "supervise".into(), role: "governor".into() }, SupervisionTarget::Operator]);
+    fleet
+        .backend()
+        .using::<WorkflowTemplate>(NAMESPACE)
+        .create(&InputMeta::builder().name("engine-supervised".into()).build(), &workflow)
+        .await
+        .expect("supervised workflow");
+    fleet.create_named(&name, "engine-supervised").await;
+    let convoy = fleet
+        .wait_for(&name, "crew-supervised stall", |convoy| {
+            convoy.status.as_ref().and_then(|s| s.stalled.as_ref()).is_some_and(|s| s.supervisor.is_some())
+        })
+        .await;
+    let engine = fleet.daemon.message_primitives().expect("engine").convoys().get(&name).expect("engine convoy");
+    assert!(matches!(engine.state(), ConvoyState::Open { .. }), "engine obligations remain open while stalled");
+    let supervisor = fleet
+        .backend()
+        .using::<flotilla_resources::TerminalSession>(NAMESPACE)
+        .list()
+        .await
+        .expect("terminals")
+        .items
+        .into_iter()
+        .find(|session| session.spec.role == "governor")
+        .expect("governor session");
+    let actor = supervisor.status.expect("status").crew.expect("crew identity").id;
+    let mut ruling = supervise(&convoy, action);
+    if let CommandAction::CrewSupervise { actor_crew_id, .. } = &mut ruling {
+        *actor_crew_id = Some(actor);
+    }
+    assert_eq!(fleet.execute(ruling).await, CommandValue::Ok, "the named crew supervisor can rule");
+    if action == CrewSupervisionAction::Resume {
+        fleet.wait_for_phase(&name, ConvoyPhase::Landed).await;
+        fleet.assert_engine_delivered(&name);
+    } else {
+        fleet.wait_for_phase(&name, ConvoyPhase::Failed).await;
+        let engine = fleet.daemon.message_primitives().expect("engine").convoys().get(&name).expect("engine convoy");
+        assert!(engine.spec().promises.iter().any(|promise| promise.record.open()), "failure must not keep the engine promises");
+    }
+    fleet
+        .daemon
+        .decided_store()
+        .expect("store")
+        .with_store(|store| {
+            let home = store.home().to_string();
+            assert!(
+                !store.read()?.scan::<Resource<AwaitingReply>>(&home, None, 64)?.ids.is_empty(),
+                "the crew stall has an engine AwaitingReply"
+            );
+            Ok(())
+        })
+        .expect("engine supervision records");
+}
+
+impl DummyDaemon {
+    // Transport fixtures for kinds the dummy workflow does not request. These
+    // enter through real engine homes; they prove replication, not provisioning
+    // or standing-convoy admission.
+    fn seed_transport_kinds(&self) {
+        use flotilla_engine_store::StoreLog;
+        use flotilla_provisioning::stored::{
+            clone::{Clone, CloneRequest},
+            image_build::{Architecture, Delivery, ImageBuild, ImageBuildRequest, Reservation},
+        };
+        use flotilla_schema::{Address, Frozen, Timestamp};
+        use flotilla_state_machines::{
+            machines::{
+                ensure::{Ensure, EnsureSpec, MemoryEnsureWorld},
+                lifecycle::MemoryLifecycleWorld,
+            },
+            Home,
+        };
+        let service = self.daemon.decided_store().expect("store");
+        let home = self.daemon.node_id().as_str();
+        let at = Timestamp::from_datetime(&chrono::Utc::now());
+        let mut builds = Home::<ImageBuild, _>::with_log(home, StoreLog::new(service.store())).expect("image home");
+        builds
+            .create(
+                "transport-build",
+                ImageBuildRequest {
+                    composition: "sha256:transport".into(),
+                    architecture: Architecture::Amd64,
+                    layers: Frozen::new(Vec::new()).expect("layers"),
+                    delivery: Delivery::Local,
+                    reservation: Reservation { cpu: 1, disk_bytes: 1 },
+                },
+                &MemoryLifecycleWorld::default(),
+                at,
+            )
+            .expect("image record");
+        let mut clones = Home::<Clone, _>::with_log(home, StoreLog::new(service.store())).expect("clone home");
+        clones
+            .create(
+                "transport-clone",
+                CloneRequest {
+                    repository: "transport-repository".into(),
+                    url: "https://forge.dummy.invalid/transport".into(),
+                    environment: flotilla_schema::Ref::new("transport-environment", home),
+                    path: "/transport".into(),
+                },
+                &MemoryLifecycleWorld::default(),
+                at,
+            )
+            .expect("clone record");
+        let mut awaiting =
+            Home::<flotilla_state_machines::machines::awaiting_reply::AwaitingReply, _>::with_log(home, StoreLog::new(service.store()))
+                .expect("awaiting home");
+        awaiting
+            .create(
+                "transport-awaiting",
+                flotilla_state_machines::machines::awaiting_reply::AwaitingReplySpec {
+                    message: flotilla_schema::Ref::new("transport-message", home),
+                    sender: Address::project("fleet").expect("sender"),
+                    recipient: Address::project("fleet").expect("recipient"),
+                    subject: None,
+                    kind: "transport".into(),
+                    awaited: flotilla_state_machines::machines::awaiting_reply::Awaited::Reply,
+                    deadline: None,
+                },
+                &flotilla_state_machines::machines::awaiting_reply::MemoryAwaitingReplyWorld::default(),
+                at,
+            )
+            .expect("awaiting record");
+        let mut ensures = Home::<Ensure, _>::with_log(home, StoreLog::new(service.store())).expect("ensure home");
+        ensures
+            .create(
+                "transport-ensure",
+                EnsureSpec {
+                    inbox: Address::project("fleet").expect("project"),
+                    policy: flotilla_state_machines::AttemptPolicy::immediate(3),
+                },
+                &MemoryEnsureWorld::default(),
+                at,
+            )
+            .expect("ensure record");
+    }
+
+    fn engine_snapshots(&self) -> Vec<flotilla_schema_sqlite::Snapshot> {
+        use flotilla_provisioning::stored::{
+            checkout::Checkout, clone::Clone, environment::Environment, image_build::ImageBuild, terminal_session::TerminalSession,
+        };
+        use flotilla_state_machines::{
+            machines::{
+                agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message,
+                vessel::Vessel,
+            },
+            Resource,
+        };
+        self.daemon
+            .decided_store()
+            .expect("store")
+            .with_store(|store| {
+                let home = store.home().to_string();
+                let registered: std::collections::BTreeSet<_> = store.kinds().iter().map(|kind| kind.code).collect();
+                let mut covered = std::collections::BTreeSet::new();
+                let mut snapshots = Vec::new();
+                let mut read = store.read()?;
+                macro_rules! collect {
+                    ($kind:ty) => {{
+                        let code = <Resource<$kind> as flotilla_schema::Kind>::CODE;
+                        covered.insert(code);
+                        let mut after = None;
+                        let before = snapshots.len();
+                        loop {
+                            let page = read.scan::<Resource<$kind>>(&home, after, 64)?;
+                            for id in page.ids {
+                                snapshots.push(read.load_snapshot(id)?.expect("snapshot"));
+                            }
+                            after = page.next;
+                            if after.is_none() {
+                                break;
+                            }
+                        }
+                        assert!(snapshots.len() > before, "transport proof has no {} record", stringify!($kind));
+                    }};
+                }
+                collect!(Message);
+                collect!(AgentSession);
+                collect!(Convoy);
+                collect!(AwaitingReply);
+                collect!(Environment);
+                collect!(ImageBuild);
+                collect!(Clone);
+                collect!(Checkout);
+                collect!(TerminalSession);
+                collect!(Vessel);
+                collect!(Ensure);
+                assert_eq!(covered, registered, "every registered engine kind needs a transport fixture");
+                Ok(snapshots)
+            })
+            .expect("engine snapshots")
+    }
+}
+
+// Both live peer runtimes consume the real change stream. Every registered
+// engine kind is read back at the other host with the same home, version and
+// stored rows; the old replicator runs beside it and still copies old Convoys.
+#[tokio::test(start_paused = true)]
+async fn on_the_engine_two_daemons_replicate_every_kind_alongside_the_old_replicator() {
+    use OldInventory::{HomeLocal, Replicated};
+    let a = DummyDaemon::start_with_relay().host("engine-a").call().await;
+    let b = DummyDaemon::start_with_relay().host("engine-b").call().await;
+    a.deliver("replicated-a", CrewMix::CoderReviewer).await;
+    b.deliver("replicated-b", CrewMix::CoderReviewer).await;
+    let _peers = flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful(Arc::clone(&a.daemon), Arc::clone(&b.daemon))
+        .await
+        .expect("peer runtimes");
+    for (source, destination, role) in [(&a, &b, "replicated-a"), (&b, &a, "replicated-b")] {
+        let convoy = source.convoy(role).await.expect("source convoy");
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while destination
+                .daemon
+                .message_primitives()
+                .expect("engine")
+                .convoys()
+                .replica(&convoy.metadata.name, source.daemon.node_id().as_str())
+                .expect("replica")
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("initial engine snapshot replicates");
+    }
+    // These admissions follow the initial snapshot, so the proof also needs
+    // committed cursor continuation; an initial snapshot alone is insufficient.
+    a.seed_transport_kinds();
+    b.seed_transport_kinds();
+    let expected_a = a.engine_snapshots();
+    let expected_b = b.engine_snapshots();
+    for (source, destination, expected) in [(&a, &b, &expected_a), (&b, &a, &expected_b)] {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let complete = destination
+                    .daemon
+                    .decided_store()
+                    .expect("store")
+                    .with_store(|store| {
+                        let mut read = store.read()?;
+                        for snapshot in expected {
+                            let Some(id) = read.resolve(snapshot.kind, &snapshot.name, &snapshot.home)? else { return Ok(false) };
+                            if read.load_snapshot(id)?.as_ref() != Some(snapshot) {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    })
+                    .expect("replicated engine rows");
+                if complete {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("every engine kind replicates through the peer runtime");
+        assert_old_inventory::<flotilla_resources::Convoy>(source, destination, Replicated).await;
+        assert_old_inventory::<flotilla_resources::Vessel>(source, destination, Replicated).await;
+        assert_old_inventory::<flotilla_resources::Environment>(source, destination, HomeLocal).await;
+        assert_old_inventory::<flotilla_resources::Checkout>(source, destination, Replicated).await;
+        assert_old_inventory::<flotilla_resources::TerminalSession>(source, destination, Replicated).await;
+        assert_old_inventory::<flotilla_resources::Clone>(source, destination, HomeLocal).await;
+        assert_old_inventory::<flotilla_resources::ImageBuild>(source, destination, Replicated).await;
+        assert_old_inventory::<flotilla_resources::ConvoyEnsure>(source, destination, Replicated).await;
+        assert_old_inventory::<flotilla_resources::Message>(source, destination, Replicated).await;
+        assert!(
+            destination
+                .backend()
+                .including_replicas::<flotilla_resources::Message>(NAMESPACE)
+                .list()
+                .await
+                .expect("old messages")
+                .items
+                .is_empty(),
+            "Messages live only on the engine"
+        );
+    }
+}
+
+// Stands in for the reconnecting command socket at the process boundary. The
+// dummy terminal processes survive, while their daemon endpoint is replaced.
+struct RestartRelay {
+    commands: std::sync::Mutex<Option<Arc<flotilla_dummy_fleet::DaemonCommandPort>>>,
+    ready: tokio::sync::Notify,
+    backend: ResourceBackend,
+}
+
+impl RestartRelay {
+    fn connect(&self, daemon: &Arc<InProcessDaemon>) {
+        let handle = Arc::clone(daemon) as Arc<dyn DaemonHandle>;
+        *self.commands.lock().expect("relay") = Some(flotilla_dummy_fleet::DaemonCommandPort::new(&handle));
+        self.ready.notify_waiters();
+    }
+}
+
+#[async_trait::async_trait]
+impl flotilla_dummy_fleet::CrewCommandPort for RestartRelay {
+    async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
+        loop {
+            let ready = self.ready.notified();
+            let commands = self.commands.lock().expect("relay").clone();
+            if let Some(commands) = commands {
+                return commands.execute(action).await;
+            }
+            ready.await;
+        }
+    }
+
+    async fn report_attention(&self, namespace: &str, session: &str, working: bool) -> Result<(), String> {
+        use flotilla_resources::{
+            TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionStatusPatch,
+        };
+        let attention = TerminalAttention {
+            state: if working { TerminalAttentionState::Working } else { TerminalAttentionState::Idle },
+            as_of: chrono::Utc::now(),
+            source: TerminalAttentionSource::Hook,
+        };
+        flotilla_store::apply_status_patch(
+            &self.backend.clone().using::<TerminalSession>(namespace),
+            session,
+            &TerminalSessionStatusPatch::ObserveAttention { attention },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+}
+
+impl DummyDaemon {
+    async fn restart(self) -> Self {
+        let Self { daemon, fleet, _runtime, relay, _dir } = self;
+        let relay = relay.expect("restartable fixture");
+        *relay.commands.lock().expect("relay") = None;
+        let backend = daemon.resource_backend();
+        let host = daemon.host_name().clone();
+        let node = daemon.node_id().clone();
+        _runtime.shutdown();
+        drop(daemon);
+        tokio::task::yield_now().await;
+        let config = Arc::new(ConfigStore::with_base(_dir.path().join("config")));
+        let mut discovery = fake_discovery(false);
+        fleet.install(&mut discovery.factories);
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            vec![],
+            Arc::clone(&config),
+            discovery,
+            host,
+            backend,
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
+        assert_eq!(daemon.node_id(), &node, "restart preserves the engine home identity");
+        let runtime = DaemonRuntime::start_with_options(
+            Arc::clone(&daemon),
+            config,
+            None,
+            RuntimeOptions { namespace: NAMESPACE.into(), controller_resync_interval: Duration::from_millis(200), ..Default::default() },
+        )
+        .await
+        .expect("restarted runtime");
+        relay.connect(&daemon);
+        Self { daemon, fleet, _runtime: runtime, relay: Some(relay), _dir }
+    }
+}
+
+// A daemon restart restores its engine Convoy and provisioning records while
+// the crew process survives. Its next submissions advance that restored record
+// and deliver the convoy without re-admission or a duplicate process launch.
+#[tokio::test(start_paused = true)]
+#[ignore = "restart restores the engine record but recovery reports the dummy Docker container lost (#2872)"]
+async fn on_the_engine_a_daemon_restart_restores_an_active_convoy_and_lands() {
+    let fleet = DummyDaemon::start_with_relay().agent("turn_delay_ms = 10000\n").host("restart-proof").restartable(true).call().await;
+    fleet.dispatch("engine-restart", CrewMix::Coder).await;
+    let convoy = fleet
+        .wait_for("engine-restart", "a launched coder before its first submission", |_| fleet.fleet.snapshot().sessions_launched == 1)
+        .await;
+    let before =
+        fleet.daemon.message_primitives().expect("engine").convoys().get(&convoy.metadata.name).expect("engine admission before restart");
+    let persisted = fleet
+        .daemon
+        .decided_store()
+        .expect("store")
+        .with_store(|store| {
+            let home = store.home().to_string();
+            let mut read = store.read()?;
+            let id = read
+                .resolve(
+                    <flotilla_state_machines::Resource<flotilla_state_machines::machines::convoy::Convoy> as flotilla_schema::Kind>::CODE,
+                    &convoy.metadata.name,
+                    &home,
+                )?
+                .expect("persisted convoy");
+            Ok(read.load_snapshot(id)?.expect("snapshot"))
+        })
+        .expect("persisted engine record")
+        .decode::<flotilla_state_machines::Resource<flotilla_state_machines::machines::convoy::Convoy>>()
+        .expect("decode stored convoy");
+    let fleet = fleet.restart().await;
+    let restored = fleet.daemon.message_primitives().expect("engine").convoys().get(&convoy.metadata.name).expect("restored engine convoy");
+    assert_eq!(restored.version(), before.version(), "the persisted engine version is restored");
+    assert_eq!(restored.spec(), persisted.spec(), "engine promises and seats survive restart");
+    fleet.wait_for_phase("engine-restart", ConvoyPhase::Landed).await;
+    fleet.assert_engine_delivered(&convoy.metadata.name);
+    assert_eq!(fleet.fleet.snapshot().sessions_launched, 1, "the surviving process is adopted");
+}
+
+// The old replicator copies old-store representations, not decided-store rows.
+// Compare every old counterpart's actual inventory, including empty kinds.
+#[derive(Clone, Copy, Debug)]
+enum OldInventory {
+    Replicated,
+    HomeLocal,
+}
+
+async fn assert_old_inventory<T: flotilla_resources::Resource>(source: &DummyDaemon, destination: &DummyDaemon, inventory: OldInventory) {
+    match inventory {
+        OldInventory::HomeLocal => assert_eq!(T::REPLICATION_CLASS, flotilla_resources::ReplicationClass::None, "home-local old kind"),
+        OldInventory::Replicated => assert_ne!(T::REPLICATION_CLASS, flotilla_resources::ReplicationClass::None, "replicated old kind"),
+    }
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let expected: std::collections::BTreeMap<_, _> = source.backend().using::<T>(NAMESPACE).list().await.expect("old source inventory").items.into_iter()
+                .map(|row| (row.metadata.name, serde_json::to_value(row.spec).expect("old spec"))).collect();
+            let replicated: std::collections::BTreeMap<_, _> = destination.backend().including_replicas::<T>(NAMESPACE).list().await.expect("old replica inventory").items.into_iter()
+                .filter(|row| matches!(&row.provenance, flotilla_resources::ResourceProvenance::Replica { origin_root, .. } if origin_root == source.daemon.node_id()))
+                .map(|row| (row.object.metadata.name, serde_json::to_value(row.object.spec).expect("replica spec"))).collect();
+            let expected = match inventory { OldInventory::HomeLocal => std::collections::BTreeMap::new(), OldInventory::Replicated => expected };
+            if expected == replicated { break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }).await.unwrap_or_else(|error| panic!("old {} inventory does not replicate: {error}", T::API_PATHS.kind));
 }
