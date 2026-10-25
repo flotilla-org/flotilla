@@ -2201,7 +2201,9 @@ impl CredentialStore {
 }
 
 // Keep pre-roll session scratch, but import neither login files nor crew auth
-// links. Once imported, old snapshots must never overwrite newer session state.
+// links. Same-filesystem staging lets physical hard links publish copied files
+// without replacing existing state. Expected collisions succeed; other IO errors
+// fail the batched find command before the import marker or auth links publish.
 async fn prepare_harness_home(
     paths: &CredentialDeliveryPaths,
     name: &str,
@@ -2218,11 +2220,22 @@ mkdir -p "$2"
 chmod 700 "$2"
 if [ -d "$1" ] && [ ! -e "$2/.flotilla-home-imported" ]; then
   archive=$(mktemp) || exit 1
-  staging=$(mktemp -d) || {{ rm -f -- "$archive"; exit 1; }}
+  staging=$(mktemp -d "$2/.flotilla-import.XXXXXXXX") || {{ rm -f -- "$archive"; exit 1; }}
   trap 'rm -f -- "$archive"; rm -rf -- "$staging"' EXIT
   tar {excludes} -C "$1" -cf "$archive" .
   tar -C "$staging" -xf "$archive"
-  cp -R -P -p -n "$staging/." "$2"
+  find "$staging" -type d -exec sh -c '
+    root=$1; destination=$2; shift 2
+    for source do mkdir -p "$destination${{source#"$root"}}" || exit 1; done
+  ' import-directories "$staging" "$2" {{}} +
+  find "$staging" ! -type d -exec sh -c '
+    root=$1; destination=$2; shift 2
+    for source do
+      target="$destination${{source#"$root"}}"
+      if [ -e "$target" ] || [ -L "$target" ]; then continue; fi
+      ln -P "$source" "$target" || {{ [ -e "$target" ] || [ -L "$target" ]; }} || exit 1
+    done
+  ' import-files "$staging" "$2" {{}} +
   touch "$2/.flotilla-home-imported"
 fi
 for file in {auth_files}; do
@@ -4896,13 +4909,21 @@ interactions:
     #[tokio::test]
     async fn harness_home_import_preserves_existing_sessions() {
         use flotilla_provider_runtime::ProcessCommandRunner;
-        struct HostTarRunner(String);
+        struct HostTarRunner {
+            tar: String,
+            commands: Option<PathBuf>,
+        }
         // Substitute only the executable at the host process boundary, running
         // the actual migration against native tar and an optional BSD tar binary.
         #[async_trait]
         impl CommandRunner for HostTarRunner {
             async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-                let script = format!("tar() {{ command {} \"$@\"; }}\n{}", shell_single_quote(&self.0), args[1]);
+                let path = self
+                    .commands
+                    .as_ref()
+                    .map(|path| format!("PATH={}:$PATH; export PATH;\n", shell_single_quote(path.to_str().unwrap())))
+                    .unwrap_or_default();
+                let script = format!("{path}tar() {{ command {} \"$@\"; }}\n{}", shell_single_quote(&self.tar), args[1]);
                 let mut args = args.to_vec();
                 args[1] = &script;
                 ProcessCommandRunner.run_output(cmd, &args, cwd, label).await
@@ -4922,7 +4943,7 @@ interactions:
         // macOS exercises BSD tar natively. Linux can also exercise a real
         // libarchive binary without mutating the process-wide PATH.
         for binary in std::iter::once("tar".to_string()).chain(std::env::var("FLOTILLA_TEST_BSDTAR")) {
-            let runner = HostTarRunner(binary);
+            let runner = HostTarRunner { tar: binary, commands: None };
             let directory = tempfile::tempdir().unwrap();
             let paths = CredentialDeliveryPaths::new(directory.path().join("config ' quoted"));
             for harness in ["codex", "claude"] {
@@ -4930,6 +4951,8 @@ interactions:
                 let home = paths.harness_home("login", harness);
                 std::fs::create_dir_all(source.join("crews/coder/sessions")).unwrap();
                 std::fs::write(source.join("crews/coder/sessions/legacy"), "old session").unwrap();
+                std::os::unix::fs::symlink("legacy", source.join("crews/coder/sessions/link")).unwrap();
+                std::os::unix::fs::symlink("absent", source.join("crews/coder/sessions/dangling")).unwrap();
                 for name in HARNESS_AUTH_FILES {
                     std::fs::write(source.join(name), "live credential").unwrap();
                     std::fs::write(source.join("crews/coder").join(name), "old crew credential").unwrap();
@@ -4940,6 +4963,9 @@ interactions:
                 }
                 let selected = prepare_harness_home(&paths, "login", harness, &runner).await.unwrap();
                 assert_eq!(Path::new(&selected), home);
+                assert!(home.join(".flotilla-home-imported").is_file());
+                assert_eq!(std::fs::read_link(home.join("crews/coder/sessions/link")).unwrap(), Path::new("legacy"));
+                assert_eq!(std::fs::read_link(home.join("crews/coder/sessions/dangling")).unwrap(), Path::new("absent"));
                 assert_eq!(
                     std::fs::read_to_string(home.join("crews/coder/sessions/legacy")).unwrap(),
                     if harness == "claude" { "new session" } else { "old session" }
@@ -4951,6 +4977,23 @@ interactions:
                     assert_eq!(std::fs::read_to_string(home.join(name)).unwrap(), "rotated credential");
                 }
             }
+            // A genuine publication failure must not be mistaken for a skip.
+            // Inject only the failing link executable, leaving migration real.
+            let commands = directory.path().join("commands");
+            std::fs::create_dir(&commands).unwrap();
+            let link = commands.join("ln");
+            std::fs::write(&link, "#!/bin/sh\nprintf 'injected import link failure\\n' >&2\nexit 73\n").unwrap();
+            std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let source = paths.credential_dir("broken").join("codex");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("session"), "recoverable state").unwrap();
+            std::fs::write(source.join("auth.json"), "private credential").unwrap();
+            let runner = HostTarRunner { tar: runner.tar, commands: Some(commands) };
+            let failure = prepare_harness_home(&paths, "broken", "codex", &runner).await.unwrap_err();
+            assert!(failure.contains("injected import link failure"));
+            let home = paths.harness_home("broken", "codex");
+            assert!(!home.join(".flotilla-home-imported").exists());
+            assert!(!home.join("auth.json").exists());
         }
     }
 
