@@ -324,12 +324,15 @@ impl Judgement {
         use flotilla_protocol::LifecycleReading;
         match self {
             Judgement::InProgress => LifecycleReading::InProgress,
-            // A next try is a stored failure's time plus a capped backoff, always within chrono's
-            // range, so the epoch never stands in for a real one.
+            // Valid failure times plus capped backoff fit chrono's range; report corrupt times
+            // before retaining the existing fallback in release builds.
             Judgement::Retrying { failures, next, last } => {
-                let next = next.to_datetime();
-                debug_assert!(next.is_some(), "stored retry time is within chrono range");
-                LifecycleReading::Retrying { failures: *failures, next: next.unwrap_or_default(), cause: last.detail.clone() }
+                let converted = next.to_datetime();
+                if converted.is_none() {
+                    tracing::warn!(retry_at = ?next, "stored lifecycle retry time is outside chrono range; using epoch fallback");
+                }
+                debug_assert!(converted.is_some(), "stored retry time is within chrono range");
+                LifecycleReading::Retrying { failures: *failures, next: converted.unwrap_or_default(), cause: last.detail.clone() }
             }
             Judgement::Exhausted { last } => LifecycleReading::Exhausted { cause: last.detail.clone() },
             Judgement::Ready { identity } => LifecycleReading::Ready { identity: identity.clone() },

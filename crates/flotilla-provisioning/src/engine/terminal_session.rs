@@ -11,7 +11,10 @@ use flotilla_resources::{
     ResourceObject, TerminalSession as OldTerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
 };
 use flotilla_schema::{Frozen, Ref};
-use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Outcome, Resource};
+use flotilla_state_machines::{
+    machines::lifecycle::{LifecycleState, VanishCause},
+    Cause, CauseCategory, Outcome, Resource,
+};
 
 use super::{Binding, Step};
 use crate::stored::{
@@ -68,7 +71,7 @@ impl Binding for TerminalSessionBinding {
             // Relaunched after being lost: the old launch is observed absent; the next launch is
             // requested when it starts running.
             TerminalSessionStatusPatch::MarkStarting => {
-                vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }]
+                vec![Step::Vanished { cause: VanishCause::Lost }]
             }
             // A launch that never ran failed its attempt and cannot succeed on the same inputs;
             // a running one that failed is gone.
@@ -76,9 +79,7 @@ impl Binding for TerminalSessionBinding {
                 TerminalSessionPhase::Starting => {
                     vec![Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, message), retryable: false })]
                 }
-                _ => vec![Step::Vanished {
-                    cause: flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: message.clone() },
-                }],
+                _ => vec![Step::Vanished { cause: VanishCause::Failed { reason: message.clone() } }],
             },
             // Unobservable for a while, or observed again: a judgement, no edge.
             TerminalSessionStatusPatch::MarkLost { .. } | TerminalSessionStatusPatch::MarkRevived => vec![],
