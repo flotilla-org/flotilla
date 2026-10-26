@@ -142,33 +142,33 @@ where
                 if let Some(name) = &original.image_build_ref {
                     // The composed image is the per-identity build's digest.
                     // Never fall back to another image: wait with the reason.
-                    let reading = match flotilla_store::read_image_build_with_lifecycle(
-                        &self.backend,
-                        &self.namespace,
-                        name,
-                        Arc::clone(&self.lifecycle_reads),
-                    )
-                    .await
-                    {
-                        Ok(build) => build,
-                        Err(ResourceError::NotFound { .. }) => {
-                            // A previous-generation per-stage build can never
-                            // be satisfied: fail so recreation relaunches it.
-                            let retired =
-                                match self.backend.including_replicas::<flotilla_resources::ImageBuild>(&self.namespace).get(name).await {
+                    let reading =
+                        match flotilla_store::read_image_build(&self.backend, &self.namespace, name, Arc::clone(&self.lifecycle_reads))
+                            .await
+                        {
+                            Ok(build) => build,
+                            Err(ResourceError::NotFound { .. }) => {
+                                // A previous-generation per-stage build can never
+                                // be satisfied: fail so recreation relaunches it.
+                                let retired = match self
+                                    .backend
+                                    .including_replicas::<flotilla_resources::ImageBuild>(&self.namespace)
+                                    .get(name)
+                                    .await
+                                {
                                     Ok(record) => record.object.spec.is_retired(),
                                     Err(ResourceError::NotFound { .. }) => false,
                                     Err(error) => return Err(error),
                                 };
-                            if retired {
-                                return Ok(EnvironmentPrepared::Failed(format!(
-                                    "ImageBuild {name} is a previous-generation image build; relaunch the vessel"
-                                )));
+                                if retired {
+                                    return Ok(EnvironmentPrepared::Failed(format!(
+                                        "ImageBuild {name} is a previous-generation image build; relaunch the vessel"
+                                    )));
+                                }
+                                return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} awaiting replicated build status")));
                             }
-                            return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} awaiting replicated build status")));
-                        }
-                        Err(error) => return Err(error),
-                    };
+                            Err(error) => return Err(error),
+                        };
                     let build = reading.build.object;
                     let status = build.status.clone().unwrap_or_default();
                     let digest = match reading.lifecycle {

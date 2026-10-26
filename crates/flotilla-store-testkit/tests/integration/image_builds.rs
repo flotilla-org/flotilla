@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use chrono::Utc;
 use flotilla_protocol::NodeId;
+use flotilla_resources::lifecycle_reads::NoLifecycleReads;
 use flotilla_resources::{
     image_identity, ImageBuild, ImageBuildPhase, ImageBuildReservation, ImageBuildSpec, ImageBuildStatus, ImageDelivery, ImageLayerSource,
     ImageLayerSpec, ImageLayerTier, InputMeta,
@@ -58,7 +61,9 @@ async fn disagreeing_replicas_resolve_deterministically() {
                 .expect("replicate");
         }
     };
-    let read = || async { read_image_build(&local, "flotilla", &name).await.expect("read despite disagreement") };
+    let read = || async {
+        read_image_build(&local, "flotilla", &name, Arc::new(NoLifecycleReads)).await.expect("read despite disagreement").build.object
+    };
     replicate(authored("root-b", "feta", None).await, "root-b").await;
     assert_eq!(read().await.spec.current().expect("current").host_ref, "feta", "equal phases tie-break by builder host");
     replicate(authored("root-c", "kiwi", Some(ImageBuildPhase::Failed)).await, "root-c").await;

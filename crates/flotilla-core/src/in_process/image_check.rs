@@ -256,7 +256,7 @@ pub async fn image_build_report(
     name: &str,
     reads: Arc<dyn LifecycleReads>,
 ) -> Result<ImageBuildReport, String> {
-    let selected = match flotilla_store::read_image_build_with_lifecycle(backend, namespace, name, reads).await {
+    let selected = match flotilla_store::read_image_build(backend, namespace, name, reads).await {
         Ok(selected) => selected,
         Err(ResourceError::NotFound { .. }) => return Err(format!("ImageBuild `{name}` does not exist")),
         Err(error) => return Err(error.to_string()),
@@ -285,18 +285,15 @@ fn build_report(
         })
     };
     let lifecycle_failure = |reason: String| Some(ImageBuildFailureReport { class: "lifecycle".into(), reason });
-    let running = status.started_at.is_some() && status.finished_at.is_none();
+    let running = status.attempt_started_since(None);
     let pending_phase = if running { ImageBuildReportPhase::Building } else { ImageBuildReportPhase::Queued };
     let (phase, settled, digest, failure) = match lifecycle {
         Some(LifecycleReading::Ready { identity }) => (ImageBuildReportPhase::Built, true, Some(identity.clone()), None),
         Some(LifecycleReading::InProgress) => (pending_phase, false, None, None),
         Some(LifecycleReading::Retrying { next, cause, .. }) => {
             // A started attempt is an actuator observation; the engine alone decides whether it may retry.
-            let phase = if running && status.started_at.is_some_and(|started| started >= *next) {
-                ImageBuildReportPhase::Building
-            } else {
-                ImageBuildReportPhase::Queued
-            };
+            let phase =
+                if status.attempt_started_since(Some(*next)) { ImageBuildReportPhase::Building } else { ImageBuildReportPhase::Queued };
             (phase, false, None, lifecycle_failure(cause.clone()))
         }
         Some(LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause }) => {
@@ -351,7 +348,7 @@ fn build_report(
         attempt: match lifecycle {
             Some(LifecycleReading::InProgress) => u32::from(running),
             Some(LifecycleReading::Retrying { failures, next, .. }) => {
-                failures.saturating_add(u32::from(running && status.started_at.is_some_and(|started| started >= *next)))
+                failures.saturating_add(u32::from(status.attempt_started_since(Some(*next))))
             }
             _ => status.attempt,
         },

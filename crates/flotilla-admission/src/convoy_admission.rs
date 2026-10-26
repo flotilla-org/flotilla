@@ -5097,7 +5097,7 @@ async fn image_placement_cost(
             let digest = match (&architecture, host) {
                 (Some(architecture), Some(host)) => {
                     let name = crate::image_build::expected_build_name(identity, architecture, image_cache.as_ref(), &host.metadata.name);
-                    match flotilla_store::read_image_build_with_lifecycle(backend, namespace, &name, Arc::clone(&lifecycle_reads)).await {
+                    match flotilla_store::read_image_build(backend, namespace, &name, Arc::clone(&lifecycle_reads)).await {
                         Ok(reading) => match reading.lifecycle {
                             Some(flotilla_protocol::LifecycleReading::Ready { identity }) => Some(identity),
                             Some(_) => None,

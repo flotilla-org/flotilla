@@ -270,3 +270,22 @@ fn settlement_is_the_complement_of_an_admitted_retry(tc: hegel::TestCase) {
     }
     assert!(!(status.is_settled() && status.will_retry()));
 }
+
+// Every timestamp has the same inclusive retry boundary; missing or finished attempts are never running.
+#[hegel::test]
+fn attempt_observation_respects_retry_deadline(tc: hegel::TestCase) {
+    let seconds = tc.draw(gs::integers::<i64>().min_value(-1_000_000).max_value(1_000_000));
+    let offset = tc.draw(gs::integers::<i64>().min_value(-120).max_value(120));
+    let at = Utc.timestamp_opt(seconds, 0).unwrap();
+    let deadline = at + chrono::Duration::seconds(offset);
+    let mut status = ImageBuildStatus { started_at: Some(at), ..Default::default() };
+    assert!(status.attempt_started_since(None));
+    assert!(status.attempt_started_since(Some(at)), "the boundary is inclusive for every timestamp");
+    assert_eq!(status.attempt_started_since(Some(deadline)), offset <= 0);
+    status.finished_at = Some(at);
+    assert!(!status.attempt_started_since(None));
+    assert!(!status.attempt_started_since(Some(deadline)));
+    status.started_at = None;
+    status.finished_at = None;
+    assert!(!status.attempt_started_since(None));
+}

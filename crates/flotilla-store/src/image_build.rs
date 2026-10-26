@@ -1,5 +1,5 @@
 use flotilla_protocol::LifecycleReading;
-use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
+use flotilla_resources::lifecycle_reads::{LifecycleReads, ProvisioningKind};
 use flotilla_resources::*;
 
 /// A selected build and the lifecycle reading used to select it, at its origin.
@@ -8,22 +8,8 @@ pub struct ImageBuildReading {
     pub lifecycle: Option<LifecycleReading>,
 }
 
-/// Legacy selection for callers without lifecycle state. Engine-aware callers use the checked read below.
-/// Read one per-identity ImageBuild across the local store and replicas.
-/// Retired ADR 0053 records are ignored. Copies of one name may disagree
-/// under replication lag (another builder or delivery view): the read never
-/// fails on that, preferring Built, then Building, then Queued, then Failed,
-/// with the builder host and then the origin as deterministic tiebreaks.
-pub async fn read_image_build(
-    backend: &crate::ResourceBackend,
-    namespace: &str,
-    name: &str,
-) -> Result<crate::ResourceObject<ImageBuild>, ResourceError> {
-    Ok(read_image_build_with_lifecycle(backend, namespace, name, std::sync::Arc::new(NoLifecycleReads)).await?.build.object)
-}
-
 /// Select a build using the engine's judgement at each origin, falling back only for unheld builds.
-pub async fn read_image_build_with_lifecycle(
+pub async fn read_image_build(
     backend: &crate::ResourceBackend,
     namespace: &str,
     name: &str,

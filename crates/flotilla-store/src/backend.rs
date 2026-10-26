@@ -620,12 +620,24 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn update_status(&self, name: &str, resource_version: &str, status: &T::Status) -> Result<ResourceObject<T>, ResourceError> {
-        let mut kind = crate::ResourceKind::of::<T>();
-        if let (Some(lifecycle), Some(reads)) = (T::STATUS_LIFECYCLE_KIND, self.lifecycle_status_reads.as_ref()) {
-            if reads.try_reading(lifecycle, name, None).map_err(ResourceError::other)?.is_some() {
-                kind = kind.with_engine_status_validator::<T>();
+        let engine_owned = match (T::STATUS_LIFECYCLE_KIND, self.lifecycle_status_reads.as_ref()) {
+            (Some(lifecycle), Some(reads)) => {
+                let reads = std::sync::Arc::clone(reads);
+                let name = name.to_owned();
+                tokio::task::spawn_blocking(move || reads.try_reading(lifecycle, &name, None))
+                    .await
+                    .map_err(|error| ResourceError::other(error.to_string()))?
+                    .map_err(ResourceError::other)?
+                    .is_some()
             }
+            _ => false,
+        };
+        if !engine_owned {
+            return dispatch_backend!(self, update_status_typed, name, resource_version, status);
         }
+        // Ownership is checked before the resource transaction. Endings do not revoke it:
+        // the engine retains ended resources, so lifecycle progress cannot select the old validator again.
+        let kind = crate::ResourceKind::of::<T>().with_engine_status_validator::<T>();
         let status = transcode_request(self.backend.blocking_request_encoding(), status.clone()).await?;
         crate::typed_object(self.backend.update_status_raw(kind, &self.namespace, name, resource_version, &status).await?)
     }
