@@ -21,7 +21,7 @@ use flotilla_schema::{Stored, Timestamp};
 use crate::{
     machines::{
         convoy::{ConvoyId, Priority, Quota, VesselClass},
-        lifecycle::{LifecycleEdge, LifecycleState, LifecycleWorld, MemoryLifecycleWorld},
+        lifecycle::{LifecycleEdge, LifecycleWorld, MemoryLifecycleWorld},
         vessel::{live_leases, Vessel as VesselMachine, VesselSpec},
     },
     Home, Log, Resource, WriteError,
@@ -316,19 +316,14 @@ pub enum PlacementError {
     Ledger(LedgerError),
     /// The vessel's resource refused it, or the log did not take it.
     Write(WriteError<VesselMachine>),
-    /// An edge `vessel.qnt` has no place for: a vessel takes no attempts and never gives up.
-    NotAVesselEdge,
 }
 
 impl PlacementError {
-    /// The spec's refusal, when this is one: a placement refusal; any lifecycle refusal of a
-    /// leased vessel, which `vessel.qnt` reports as `MissingEvidence`; or `WrongState` for an
-    /// edge the vessel has none of.
+    /// A placement refusal or a leased lifecycle's missing evidence.
     pub fn refusal(&self) -> Option<PlacementRefusal> {
         match self {
             PlacementError::Ledger(LedgerError::Refused(refusal)) => Some(*refusal),
             PlacementError::Write(WriteError::Refused(_)) => Some(PlacementRefusal::MissingEvidence),
-            PlacementError::NotAVesselEdge => Some(PlacementRefusal::WrongState),
             _ => None,
         }
     }
@@ -415,10 +410,8 @@ impl<L: Log<VesselMachine>> Placements<L> {
         self.home.get(&id.0).ok_or_else(|| PlacementError::Ledger(LedgerError::UnknownVessel(id.clone())))
     }
 
-    /// A lifecycle edge on leased vessel `id`: realise, release or vanish (the spec's leased
-    /// events). Reaching Gone frees the lease, if the ledger holds it: a vessel whose lease no
-    /// longer fit after a restart (#3438) holds none, and still ends. A vessel's attempts and
-    /// give-up are no edges of `vessel.qnt`, so they are refused as the wrong state.
+    /// A lifecycle edge on a leased vessel. Every terminal state frees its lease; a failed
+    /// provisioning attempt gives up with its cause before a backing has been realised.
     pub fn apply(
         &mut self,
         id: &VesselId,
@@ -426,11 +419,8 @@ impl<L: Log<VesselMachine>> Placements<L> {
         world: &(dyn LifecycleWorld + 'static),
         now: Timestamp,
     ) -> Result<&Resource<VesselMachine>, PlacementError> {
-        if matches!(edge, LifecycleEdge::Attempted(_) | LifecycleEdge::GiveUp(_)) {
-            return Err(PlacementError::NotAVesselEdge);
-        }
         self.home.apply(&id.0, edge, world, now).map_err(PlacementError::Write)?;
-        if self.home.get(&id.0).is_some_and(|vessel| *vessel.state() == LifecycleState::Gone) {
+        if self.home.get(&id.0).is_some_and(|vessel| !vessel.state().live()) {
             // The edge is written; a lease the ledger never held (an unplaced vessel) is no error.
             match self.ledger.release(id) {
                 Ok(_) | Err(LedgerError::UnknownVessel(_)) => {}
@@ -445,7 +435,7 @@ impl<L: Log<VesselMachine>> Placements<L> {
 mod placements_tests {
     use super::*;
     use crate::{
-        machines::lifecycle::{Attempted, Observed, Realise, Release, Vanish},
+        machines::lifecycle::{Attempted, GiveUp, LifecycleState, Observed, Realise, Release, Vanish},
         Cause, CauseCategory, MemoryLog, Outcome, Ref,
     };
 
@@ -494,22 +484,26 @@ mod placements_tests {
         placements.place(&b, host(), Timestamp(4)).expect("now it fits");
     }
 
-    // Behaviour: a vessel takes no attempts and never gives up (`vessel.qnt` has neither edge).
+    // A failed provisioning attempt retains its cause, and giving up frees the granted lease.
+    // One example suffices for this delegation to the shared lifecycle's failure gate.
     #[test]
-    fn a_vessel_refuses_attempts() {
+    fn a_vessel_gives_up_with_its_provisioning_failure() {
         let mut placements = placements(Home::new("home").expect("declaration"));
         let a = VesselId::new("a");
         placements.request(a.clone(), request("c", 1)).expect("request");
         placements.place(&a, host(), Timestamp(1)).expect("granted");
-        let failed = Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "x"), retryable: true };
         let world = MemoryLifecycleWorld::default();
-        let refused = placements.apply(&a, Attempted { outcome: failed }.into(), &world, Timestamp(2)).expect_err("refused");
-        assert!(matches!(refused, PlacementError::NotAVesselEdge));
-        assert_eq!(refused.refusal(), Some(PlacementRefusal::WrongState), "the spec's refusal for an edge it has none of");
         let unrealised = placements
-            .apply(&a, Vanish { observed: Ref::new("a") }.into(), &MemoryLifecycleWorld::default(), Timestamp(3))
+            .apply(&a, Vanish { observed: Ref::new("a") }.into(), &world, Timestamp(2))
             .expect_err("a Requested vessel cannot vanish");
-        assert_eq!(unrealised.refusal(), Some(PlacementRefusal::MissingEvidence), "vessel.qnt reports lifecycle refusals so");
+        assert_eq!(unrealised.refusal(), Some(PlacementRefusal::MissingEvidence));
+        let cause = Cause::new(CauseCategory::External, "provider refused provisioning");
+        let failed = Outcome::Failed { cause: cause.clone(), retryable: false };
+        placements.apply(&a, Attempted { outcome: failed }.into(), &world, Timestamp(3)).expect("attempted");
+        assert!(placements.ledger().vessel(&a).is_some(), "a request still holds its lease");
+        let vessel = placements.apply(&a, GiveUp { cause: cause.clone() }.into(), &world, Timestamp(4)).expect("gave up");
+        assert_eq!(vessel.state(), &LifecycleState::GaveUp { cause });
+        assert!(placements.ledger().vessel(&a).is_none(), "giving up returns the lease");
     }
 
     // Behaviour (#3733 review): a vessel the ledger could not hold after a restart (its host
