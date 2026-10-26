@@ -441,6 +441,11 @@ pub(super) async fn probe_local_provider_registry(
     Ok(Arc::new(registry))
 }
 
+// Per-vessel providers that bring their own runtime do not need a host pool.
+pub(super) fn crew_pool_available(host_has_pool: bool, per_vessel: bool, receives_host_tools: bool) -> bool {
+    host_has_pool || (per_vessel && !receives_host_tools)
+}
+
 pub(super) async fn build_local_profile(
     daemon: &Arc<InProcessDaemon>,
     local_registry: &ProviderRegistry,
@@ -465,7 +470,12 @@ pub(super) async fn build_local_profile(
     // narrower because it reads docker_container_id. Remove that legacy-input
     // bridge and its recovery filters together at the generated-table move (#3108).
     let docker_available = local_registry.environment_providers.iter().any(|(_, provider)| {
-        provider.capabilities().per_vessel && (!provider.receives_host_tools() || local_registry.terminal_pools.contains_key(&docker_pool))
+        provider.capabilities().per_vessel
+            && crew_pool_available(
+                local_registry.terminal_pools.contains_key(&docker_pool),
+                provider.capabilities().per_vessel,
+                provider.receives_host_tools(),
+            )
     });
     let available_agent_adapters = local_registry.agent_adapters.ids().map(ToString::to_string).collect();
 
@@ -547,6 +557,17 @@ pub(super) async fn observe_fulfilment_facts(
         kinds.rotate_left(offset);
     }
     for kind in kinds {
+        let provider_kind = match kind.spec.realisation {
+            FulfilmentRealisation::HostDirect => EnvironmentInput::HostDirect,
+            FulfilmentRealisation::DockerPerVessel { .. } => EnvironmentInput::Docker,
+            FulfilmentRealisation::CloudSandboxPerVessel { .. } => continue,
+        };
+        let provider = probe.providers.environment_providers.for_legacy_input(provider_kind).map(|(_, provider)| provider);
+        let pool_available = crew_pool_available(
+            available_pools.contains(&kind.spec.pool),
+            provider.is_some_and(|provider| provider.capabilities().per_vessel),
+            provider.is_none_or(|provider| provider.receives_host_tools()),
+        );
         let image = match &kind.spec.realisation {
             FulfilmentRealisation::DockerPerVessel { image: Some(image) } => match image.resolve(&baselines).await {
                 Ok(image) => Some(image),
@@ -561,23 +582,14 @@ pub(super) async fn observe_fulfilment_facts(
             FulfilmentRealisation::DockerPerVessel { image: None } => {
                 facts.insert(
                     kind.metadata.name,
-                    FulfilmentFacts {
-                        observed_at: Utc::now(),
-                        free_vessel_slots: (!available_pools.contains(&kind.spec.pool)).then_some(0),
-                        ..Default::default()
-                    },
+                    FulfilmentFacts { observed_at: Utc::now(), free_vessel_slots: (!pool_available).then_some(0), ..Default::default() },
                 );
                 continue;
             }
             FulfilmentRealisation::HostDirect => None,
             FulfilmentRealisation::CloudSandboxPerVessel { .. } => continue,
         };
-        let provider_kind = match kind.spec.realisation {
-            FulfilmentRealisation::HostDirect => EnvironmentInput::HostDirect,
-            FulfilmentRealisation::DockerPerVessel { .. } => EnvironmentInput::Docker,
-            FulfilmentRealisation::CloudSandboxPerVessel { .. } => continue,
-        };
-        let Some((_, provider)) = probe.providers.environment_providers.for_legacy_input(provider_kind) else {
+        let Some(provider) = provider else {
             debug!(kind = %kind.metadata.name, ?provider_kind, "cannot observe fulfilment facts without an unambiguous environment provider");
             // Absence or ambiguity cannot attest a runtime endpoint. Replace
             // stale affirmative evidence with a fresh unknown observation.
@@ -586,13 +598,12 @@ pub(super) async fn observe_fulfilment_facts(
                 FulfilmentFacts {
                     image: image.map(Into::into),
                     observed_at: Utc::now(),
-                    free_vessel_slots: (!available_pools.contains(&kind.spec.pool)).then_some(0),
+                    free_vessel_slots: (!pool_available).then_some(0),
                     ..Default::default()
                 },
             );
             continue;
         };
-        let pool_available = available_pools.contains(&kind.spec.pool);
         let name = kind.metadata.name;
         let current = previous
             .get(&name)
