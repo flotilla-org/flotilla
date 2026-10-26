@@ -803,7 +803,7 @@ fn unrecorded_cloud_adoption_failure_requeues(tc: hegel::TestCase) {
         outcome.patch.unwrap().apply(&mut status);
         assert_eq!(status.phase, EnvironmentPhase::Provisioning);
         assert!(!status.ready);
-        assert_eq!(status.message.unwrap(), format!("Unknown: {diagnostic}"));
+        assert_eq!(status.message.unwrap(), format!("Unknown: adoption failed; backing retained for retry: {diagnostic}"));
         // Repeated failures back off and cap at five minutes; a healthy observation
         // resets the retry budget for the next independent outage.
         for seconds in [10, 20, 40, 80, 160, 300, 300] {

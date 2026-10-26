@@ -1,6 +1,4 @@
 //! Docker resource runtime and provisioning cleanup.
-use flotilla_environment::environment::EnvironmentProvisionError;
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -13,11 +11,10 @@ use flotilla_credentials::{compose_agent_environment, AgentMaterialRegistry, Cre
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_discovery::run_provisioned_host_detectors;
 use flotilla_discovery_api::EnvironmentBag;
-use flotilla_environment::environment::CreateOpts;
-use flotilla_environment::environment::EnvironmentHandle;
-use flotilla_environment::environment::EnvironmentVariableUpdate;
-use flotilla_environment::environment::{contained_daemon_socket_path, DAEMON_SOCKET_ENV};
-use flotilla_environment::environment::{EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind};
+use flotilla_environment::environment::{
+    contained_daemon_socket_path, CreateOpts, EnvironmentHandle, EnvironmentProvisionError, EnvironmentTool, EnvironmentToolAsset,
+    EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate, DAEMON_SOCKET_ENV,
+};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
@@ -45,6 +42,7 @@ impl DockerControllerRuntime {
         spec: &flotilla_resources::DockerEnvironmentSpec,
     ) -> Result<EnvironmentProvisioning, EnvironmentProvisionError> {
         let result = self.provision_contained(name, spec).await;
+        // RetryAdoption keeps the socket paired with the retained backing.
         if matches!(result, Err(EnvironmentProvisionError::Failed(_))) {
             if let Some(sockets) = &self.state.environment_sockets {
                 sockets.remove(&EnvironmentId::new(name)).await?;
@@ -423,6 +421,7 @@ impl DockerControllerRuntime {
         };
         let handle = match provider.provision(env_id.clone(), &prepared, opts.into()).await {
             Ok(handle) => handle,
+            // Retained backing may still use staged credentials and harness homes.
             Err(error @ EnvironmentProvisionError::RetryAdoption(_)) => return Err(error),
             Err(error) => {
                 let cleanup_errors =

@@ -189,7 +189,7 @@ where
                 {
                     Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
                     Err(EnvironmentProvisionError::RetryAdoption(message)) => {
-                        Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: {message}")))
+                        Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: adoption failed; backing retained for retry: {message}")))
                     }
                     Err(error) if error.to_string().starts_with("waiting on build:") => Ok(EnvironmentPrepared::Waiting(error.to_string())),
                     Err(error) => Ok(EnvironmentPrepared::Failed(error.to_string())),
@@ -198,7 +198,7 @@ where
                 match self.runtime.provision_environment(&obj.metadata.name, &obj.spec).await {
                     Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
                     Err(EnvironmentProvisionError::RetryAdoption(message)) => {
-                        Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: {message}")))
+                        Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: adoption failed; backing retained for retry: {message}")))
                     }
                     Err(error) => Ok(EnvironmentPrepared::Failed(error.to_string())),
                 }

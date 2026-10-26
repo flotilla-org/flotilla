@@ -1,7 +1,5 @@
 //! Independent availability observations. Account/model entitlement is unknown:
 //! only actual crew work uses the selected credential and may spend model turns.
-#[cfg(test)]
-use flotilla_environment::environment::EnvironmentProvisionError;
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use chrono::Utc;
@@ -153,7 +151,7 @@ pub(crate) async fn probe_kind(
 mod tests {
     use super::*;
     use flotilla_discovery_testkit::{DiscoveryMockRunner, TestEnvVars};
-    use flotilla_environment::environment::{command_provider, EnvironmentInput};
+    use flotilla_environment::environment::{command_provider, EnvironmentInput, EnvironmentProvisionError};
     use flotilla_provider_runtime::{ChannelLabel, CommandOutput};
     use std::sync::{Arc, Mutex};
 

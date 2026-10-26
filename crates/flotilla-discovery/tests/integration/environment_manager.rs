@@ -1,4 +1,3 @@
-use flotilla_environment::environment::EnvironmentProvisionError;
 use std::{
     collections::HashMap,
     sync::{
@@ -8,8 +7,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_environment::environment::PrepareOpts;
-use flotilla_environment::environment::ProvisionOpts;
+use flotilla_environment::environment::{
+    EnvironmentHandle, EnvironmentProvider, EnvironmentProvisionError, PrepareOpts, PreparedEnvironment, ProvisionOpts,
+    ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode,
+};
 use flotilla_protocol::{EnvironmentId, EnvironmentInfo, EnvironmentStatus, ImageId};
 use tokio::sync::Notify;
 
@@ -23,12 +24,6 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_discovery_testkit::DiscoveryMockRunner;
-use flotilla_environment::environment::EnvironmentHandle;
-use flotilla_environment::environment::EnvironmentProvider;
-use flotilla_environment::environment::PreparedEnvironment;
-use flotilla_environment::environment::ProvisionedEnvironment;
-use flotilla_environment::environment::ProvisionedMount;
-use flotilla_environment::environment::ProvisionedMountMode;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::qualified_path::HostId;
 use flotilla_provider_runtime::CommandRunner;

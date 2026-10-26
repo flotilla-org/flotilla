@@ -1,4 +1,3 @@
-use flotilla_environment::environment::EnvironmentProvisionError;
 use flotilla_store_http::HttpBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
@@ -22,6 +21,7 @@ use flotilla_discovery_api::provider_config;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_discovery_testkit::git_process_discovery;
 use flotilla_discovery_testkit::init_git_repo_with_remote;
+use flotilla_environment::environment::EnvironmentProvisionError;
 use flotilla_protocol::{
     commands::{CrewPromiseOperation, DaemonLogQuery},
     qualified_path::QualifiedPath,

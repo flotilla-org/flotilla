@@ -328,6 +328,7 @@ impl PreparedEnvironment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentProvisionError {
     Failed(String),
+    /// A retained backing needs another setup attempt, regardless of spec kind.
     RetryAdoption(String),
 }
 impl std::fmt::Display for EnvironmentProvisionError {

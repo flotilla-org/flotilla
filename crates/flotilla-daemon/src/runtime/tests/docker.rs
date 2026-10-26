@@ -1,7 +1,6 @@
 use super::*;
 use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
-use flotilla_environment::environment::EnvironmentProvisionError;
-use flotilla_environment::environment::EnvironmentToolAssetKind;
+use flotilla_environment::environment::{EnvironmentProvisionError, EnvironmentToolAssetKind};
 
 #[tokio::test]
 async fn local_profile_does_not_advertise_docker_without_interior_cleat() {
@@ -1377,9 +1376,10 @@ async fn cloud_image_probe_refuses_missing_harness() {
 }
 
 // #3765 B1: post-provider credential/probe failures must preserve an adopted
-// backing too. The fake represents the remote environment destruction boundary.
+// backing too, while a fresh backing is destroyed and fails terminally.
+// The fake represents the remote environment destruction boundary.
 #[tokio::test]
-async fn controller_setup_rollback_preserves_adopted_backing() {
+async fn controller_setup_rollback_preserves_adopted_and_destroys_fresh_backing() {
     struct Adopted(TestInteriorEnvironment);
     #[async_trait]
     impl ProvisionedEnvironment for Adopted {
@@ -1417,4 +1417,15 @@ async fn controller_setup_rollback_preserves_adopted_backing() {
     let message = super::super::docker::discard_failed_environment(&handle, None, None, "adopted", "injected setup failure".into()).await;
     assert!(matches!(message, EnvironmentProvisionError::RetryAdoption(ref diagnostic) if diagnostic == "injected setup failure"));
     assert!(!destroyed.load(Ordering::SeqCst));
+    let fresh_destroyed = Arc::new(AtomicBool::new(false));
+    let fresh: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+        id: EnvironmentId::new("fresh"),
+        image: ImageId::new("cloud"),
+        runner: Arc::new(DiscoveryMockRunner::builder().build()),
+        env_vars: Default::default(),
+        destroyed: fresh_destroyed.clone(),
+    });
+    let error = super::super::docker::discard_failed_environment(&fresh, None, None, "fresh", "injected setup failure".into()).await;
+    assert!(matches!(error, EnvironmentProvisionError::Failed(ref diagnostic) if diagnostic == "injected setup failure"));
+    assert!(fresh_destroyed.load(Ordering::SeqCst));
 }
