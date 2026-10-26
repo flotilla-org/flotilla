@@ -521,6 +521,20 @@ async fn standing_admission_and_rollover_use_the_ensure_role_identity() {
     assert!(fixture.engine.holds(&old));
     assert_eq!(fixture.convoys.get(name).unwrap().name(), name);
     assert!(fixture.engine.promises(&old, None).unwrap().is_some());
+    // A nonterminal old-store generation must not mask an ended engine record:
+    // the next Ensure generation reaches admission under the same stable name.
+    fixture.engine.abandon(&old, "operator", "replace generation").await.expect("end engine generation");
+    assert_eq!(old.status.as_ref().expect("old status").phase, ConvoyPhase::Active);
+    assert!(!fixture.engine.holds(&old));
+    let mut next = old_convoy(&fixture.backend, "next-generation-id", old.status.clone().expect("bootstrap")).await;
+    next.spec.role = old.spec.role.clone();
+    next.metadata.annotations = old.metadata.annotations.clone();
+    assert!(!fixture.engine.holds(&next));
+    assert_eq!(fixture.engine.admit(&next).await.expect("next generation"), Admission::Held);
+    let version = fixture.convoys.get(name).expect("fresh engine generation").version();
+    assert!(fixture.engine.holds(&next));
+    assert_eq!(fixture.engine.admit(&next).await.expect("duplicate generation"), Admission::Held);
+    assert_eq!(fixture.convoys.get(name).expect("same generation").version(), version);
 }
 
 #[tokio::test]

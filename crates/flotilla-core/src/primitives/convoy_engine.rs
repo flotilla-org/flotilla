@@ -131,26 +131,27 @@ fn open(promise: &Promise) -> bool {
     matches!(promise.progress.value, Progress::Pending | Progress::Submitted)
 }
 
+// A new standing generation must reach admission when its stable record has
+// ended; terminal old records still read the engine view. Admission and routing
+// use the same predicate so they cannot disagree about a held generation.
+fn holds_generation(convoy: &ResourceObject<OldConvoy>, current: &Resource<Convoy>) -> bool {
+    !flotilla_resources::convoy::reconcile::is_ensured(convoy)
+        || current.label() == ConvoyLabel::Open
+        || convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())
+}
+
 #[async_trait]
 impl EngineConvoys for ConvoyEngine {
     fn holds(&self, convoy: &ResourceObject<OldConvoy>) -> bool {
         // Fail closed: route an invalid identity to this writer, whose edits return
         // the naming error, rather than falling back to the legacy writer.
-        // A new standing generation must reach admission when its stable
-        // record has ended; terminal old records still read the engine view.
-        map::engine_name(convoy).map_or(true, |name| {
-            self.convoys.get(&name).is_some_and(|current| {
-                !flotilla_resources::convoy::reconcile::is_ensured(convoy)
-                    || current.label() == ConvoyLabel::Open
-                    || convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())
-            })
-        })
+        map::engine_name(convoy).map_or(true, |name| self.convoys.get(&name).is_some_and(|current| holds_generation(convoy, &current)))
     }
 
     async fn admit(&self, convoy: &ResourceObject<OldConvoy>) -> Result<Admission, String> {
         let name = map::engine_name(convoy)?;
         let standing = flotilla_resources::convoy::reconcile::is_ensured(convoy);
-        if self.convoys.get(&name).is_some_and(|current| !standing || current.label() == ConvoyLabel::Open) {
+        if self.convoys.get(&name).is_some_and(|current| holds_generation(convoy, &current)) {
             return Ok(Admission::Held);
         }
         let Some(status) = convoy.status.as_ref().filter(|status| status.workflow_snapshot.is_some()) else {

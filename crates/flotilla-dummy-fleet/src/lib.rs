@@ -48,6 +48,8 @@ impl DummyFleet {
     pub fn install(self: &Arc<Self>, factories: &mut FactoryRegistry) {
         let environment = &self.config.environment;
         let weak = Arc::downgrade(self);
+        // Every install comes from this same fleet Arc. Retain its first weak
+        // cleanup callback together with the surviving external environment world.
         let provider = self.environments.get_or_init(|| {
             Arc::new(
                 DummyEnvironmentProvider::new(DummyEnvironmentBehaviour {

@@ -209,3 +209,50 @@ fn ended_standing_generations_are_replaced_atomically(tc: hegel::TestCase) {
         convoys.world(|world| world.projects.put(&Ref::new(address("fleet").as_str()), ()));
     }
 }
+
+// A missing stored body or identity must return an error without evicting the
+// resident ended generation or poisoning its writer locks.
+#[test]
+fn a_missing_resident_generation_returns_an_error() {
+    use flotilla_schema::{Kind, Origin};
+    use flotilla_state_machines::{
+        machines::convoy::{Abandon, Convoy},
+        Resource, WriteError,
+    };
+    for expunge in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = service(&dir);
+        let convoys = Convoys::open("home-a", &service).expect("open");
+        convoys.world(|world| {
+            world.projects.put(&Ref::new(address("fleet").as_str()), ());
+            world.authority.put(&Ref::new("operator"), true);
+        });
+        convoys.admit_standing("standing", request(), Timestamp(1)).expect("admit");
+        convoys
+            .apply(
+                "standing",
+                Abandon { by: SeatName::new("operator", ""), reason: "ended".into(), authority: Ref::new("operator") },
+                Timestamp(2),
+            )
+            .expect("end");
+        let version = convoys.get("standing").expect("resident").version();
+        service
+            .with_store(|store| {
+                let mut read = store.read()?;
+                let id = read.resolve(<Resource<Convoy> as Kind>::CODE, "standing", "home-a")?.expect("identity");
+                let stamp = read.load::<Resource<Convoy>>(id)?.expect("stored").stamp();
+                drop(read);
+                let mut write = store.write()?;
+                let origin = Origin::new("test", Timestamp(3));
+                write.delete::<Resource<Convoy>>(stamp, &origin)?;
+                if expunge {
+                    write.expunge::<Resource<Convoy>>(id, &origin)?;
+                }
+                write.commit()
+            })
+            .expect("inject missing backing");
+        let error = convoys.admit_standing("standing", request(), Timestamp(4)).expect_err("missing backing");
+        assert!(matches!(error, WriteError::Log(_)), "{error:?}");
+        assert_eq!(convoys.get("standing").expect("resident retained").version(), version);
+    }
+}

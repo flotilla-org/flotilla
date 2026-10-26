@@ -145,19 +145,25 @@ impl Convoys {
             .with_store(|store| {
                 let loaded = {
                     let mut read = store.read()?;
-                    let id =
-                        read.resolve(<Resource<Convoy> as flotilla_schema::Kind>::CODE, name, &self.home_name)?.expect("resident identity");
-                    read.load::<Resource<Convoy>>(id)?
-                }
-                .expect("resident convoy is stored");
+                    let Some(id) = read.resolve(<Resource<Convoy> as flotilla_schema::Kind>::CODE, name, &self.home_name)? else {
+                        return Ok(None);
+                    };
+                    let Some(loaded) = read.load::<Resource<Convoy>>(id)? else {
+                        return Ok(None);
+                    };
+                    loaded
+                };
                 let mut write = store.write()?;
                 write.delete::<Resource<Convoy>>(loaded.stamp(), &origin)?;
                 let stamp = write.insert(name, &resource, &origin)?;
                 write.commit()?;
-                Ok(stamp.version)
+                Ok(Some(stamp.version))
             })
-            .map_err(|error| WriteError::Log(LogError::new(error)))?;
+            .map_err(|error| WriteError::Log(LogError::new(error)))?
+            .ok_or_else(|| WriteError::Log(LogError::new(format!("resident Convoy `{name}` is missing from the store"))))?;
         home.evict(name);
+        // Restore only refuses an existing name. The writer lock is still held
+        // and that name was just evicted, so it cannot fail after this commit.
         home.restore(Resource::stored(name, resource.spec().clone(), resource.stored_state().clone(), Version(version)))?;
         Ok(true)
     }
