@@ -32,7 +32,7 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
   A cache hit never skips these checks. For a private source, the narrowed read token is minted on every staging. The mint is the live authority check, even when the bytes come from the cache. The token is used only by the host-side fetch, and never leaves the host.
 - **One daemon-private object cache per repository URL.** It sits under the daemon's state directory with mode 0700, in the same `revision_cache` layout as charter fetches, but in a separate root. A new `Vcs` method, `fetch_commit(cache, repo, sha, auth)`, keeps `fetch_revision`'s writer-owns-exclusion and deadline rules, and leaves its branch semantics unchanged. It works in two steps:
   1. **Exact want.** `git fetch --depth=1 --no-tags -- <repo> <sha>`. GitHub and protocol-v2 servers that allow reachable wants serve this.
-  2. **Fallback for servers that refuse an unadvertised want.** Some self-hosted Forgejo, Gitea or plain Git servers reject such a want, without `uploadpack.allowReachableSHA1InWant` or `allowAnySHA1InWant`. For those, the fallback fetches every advertised head, `+refs/heads/*:refs/flotilla/heads/*` with `--filter=blob:none`, then checks `cat-file -e <sha>^{commit}`.
+  2. **Fallback for servers that refuse an unadvertised want.** Some self-hosted Forgejo, Gitea or plain Git servers reject such a want, without `uploadpack.allowReachableSHA1InWant` or `allowAnySHA1InWant`. For those, the fallback fetches every advertised head, `+refs/heads/*:refs/flotilla/heads/*`, **without** a partial-clone filter, then checks `cat-file -e <sha>^{commit}`. A server that refuses unadvertised wants usually also refuses the lazy blob fetches a promisor clone would need later. Those reads would also fall outside the fetch's credential helper, exclusion window and error classification. So every object that the later tree reads use is local by the time `fetch_commit` returns.
 
   Afterwards, `FETCH_HEAD`, or the object found by the fallback, must be exactly `<sha>`.
   - Public sources run with ambient credentials disabled: `GIT_CONFIG_GLOBAL=/dev/null`, an empty `credential.helper`, `GIT_TERMINAL_PROMPT=0`, and no askpass.
@@ -44,12 +44,12 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
 
   | Evidence | Disposition |
   |---|---|
-  | Both fetch steps succeed, but the commit is absent | **Permanent:** `skill source <name> revision <sha>: pinned revision is not available from <repository>` |
+  | Both fetch steps succeed, but the commit is absent | **Permanent:** `skill source <name> revision <sha>: <repository> could not serve this pinned revision (not reachable from any advertised branch, and the server refuses fetch by SHA); re-pin the crew's skills to a revision the server serves` |
   | The forge rejects a freshly minted token, or the public request, with 401, 403, `Permission denied (publickey)` or `repository not found` | **Permanent:** authority refusal (today's `is_auth_failure` patterns) |
   | Supply authorization or the credential mint refuses | **Permanent** |
   | Anything else, including an unclassified Git exit | **Transient** |
 
-  "Not our ref" from step 1 is never a refusal; it only selects step 2. The default being transient means a misclassification costs retries, not a broken standing convoy.
+  "Not our ref" from step 1 is never a refusal; it only selects step 2. The permanent row can also be a server limit rather than a missing commit, for example an old pin that a force-push orphaned, or one reachable only from a tag or a PR ref. The diagnostic therefore says the server could not serve the SHA, not that it does not exist, and it names re-pinning as the operator's remedy. The default being transient means a misclassification costs retries, not a broken standing convoy.
 - **Alternative considered:** retaining source artifacts produced with the catalog (the issue's option 2). The owner's ruling that skills stay out of the generation rules it out.
 
 ## Decision 2: supported tree metadata
