@@ -93,11 +93,27 @@ pub(crate) struct PassReport {
     pub(crate) shipped: Vec<Identity>,
     pub(crate) expunged: Vec<Identity>,
     pub(crate) failed: Vec<(Identity, String)>,
+    /// Due, but left for a later pass after a store failed this one.
+    pub(crate) deferred: Vec<Identity>,
     /// Ended resources unshipped past [`ALERT_AFTER`].
     pub(crate) overdue: usize,
 }
 
 type Report = Arc<dyn Fn(Option<HostCondition>) + Send + Sync>;
+
+/// Why a resource did not ship: its store failed, or its home did.
+enum ShipError {
+    Store(String),
+    Local(String),
+}
+
+impl ShipError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Store(message) | Self::Local(message) => message,
+        }
+    }
+}
 
 pub(crate) struct ArchiveShipper {
     store: Arc<Mutex<Store>>,
@@ -168,8 +184,12 @@ impl ArchiveShipper {
             })
             .await?;
         let mut report = PassReport::default();
+        // A store that refused one bundle is not asked for the rest of this pass's: an outage
+        // costs one failed request per pass, not one per ended resource.
+        let mut store_down = false;
         for due in due {
             match due {
+                Due::Ship(identity) if store_down => report.deferred.push(identity),
                 Due::Ship(identity) => match self.ship(&identity, now).await {
                     Ok(shipped) => {
                         self.failures.remove(&identity);
@@ -178,6 +198,8 @@ impl ArchiveShipper {
                         }
                     }
                     Err(error) => {
+                        store_down |= matches!(error, ShipError::Store(_));
+                        let error = error.into_message();
                         tracing::warn!(kind = %identity.kind, name = %identity.name, %error, "archive shipping failed; the resource stays");
                         self.failures.insert(identity.clone(), error.clone());
                         report.failed.push((identity, error));
@@ -200,24 +222,23 @@ impl ArchiveShipper {
 
     /// Bundles, uploads and confirms, then deletes. `false` when the resource is no longer there
     /// to ship.
-    async fn ship(&self, identity: &Identity, now: Timestamp) -> Result<bool, String> {
+    async fn ship(&self, identity: &Identity, now: Timestamp) -> Result<bool, ShipError> {
         let target = identity.clone();
-        let Prepared::Ready { bundle, version } = self.blocking(move |archiver, store| archiver.prepare(store, &target)).await? else {
-            return Ok(false);
-        };
-        let bytes = bundle.encode().map_err(|error| error.to_string())?;
+        let prepared = self.blocking(move |archiver, store| archiver.prepare(store, &target)).await.map_err(ShipError::Local)?;
+        let Prepared::Ready { bundle, version } = prepared else { return Ok(false) };
+        let bytes = bundle.encode().map_err(|error| ShipError::Local(error.to_string()))?;
         let key = bundle_key(identity);
-        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let digest = Sha256::digest(&bytes);
         for store in &self.targets {
-            store.put(&key, &bytes).await.map_err(|error| format!("{}: upload: {error}", store.location()))?;
-            let held = store.get(&key).await.map_err(|error| format!("{}: confirm: {error}", store.location()))?;
-            if held.map(|held| format!("{:x}", Sha256::digest(&held))) != Some(digest.clone()) {
-                return Err(format!("{}: confirm: the store does not hold the uploaded bundle", store.location()));
+            store.put(&key, &bytes).await.map_err(|error| ShipError::Store(format!("{}: upload: {error}", store.location())))?;
+            let held = store.get(&key).await.map_err(|error| ShipError::Store(format!("{}: confirm: {error}", store.location())))?;
+            if held.map(|held| Sha256::digest(&held)) != Some(digest) {
+                return Err(ShipError::Store(format!("{}: confirm: the store does not hold the uploaded bundle", store.location())));
             }
         }
-        let note = ArchiveNote { key, digest };
+        let note = ArchiveNote { key, digest: format!("{digest:x}") };
         let target = identity.clone();
-        self.blocking(move |archiver, store| archiver.delete(store, &target, version, &note, now)).await?;
+        self.blocking(move |archiver, store| archiver.delete(store, &target, version, &note, now)).await.map_err(ShipError::Local)?;
         Ok(true)
     }
 
@@ -288,9 +309,11 @@ pub(crate) async fn read_by_name(
     name: &str,
     home: &str,
 ) -> Result<Option<Value>, String> {
+    // A code names one kind exactly, so it wins over a name that happens to spell it.
     let set = kinds
         .iter()
-        .find(|set| set.kind.eq_ignore_ascii_case(kind) || set.code.as_str() == kind)
+        .find(|set| set.code.as_str() == kind)
+        .or_else(|| kinds.iter().find(|set| set.kind.eq_ignore_ascii_case(kind)))
         .ok_or_else(|| format!("unknown kind {kind}"))?;
     let identity = Identity { kind: set.code, name: name.to_owned(), home: home.to_owned() };
     read_archived(targets, &identity).await?.map(|bundle| readable(&bundle, kinds)).transpose()

@@ -48,12 +48,13 @@ enum Behaviour {
 /// prefix or not in canonical form, and a bundle PUT without the bundle media type.
 struct S3StandIn {
     objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    puts: std::sync::atomic::AtomicUsize,
     behaviour: Mutex<Behaviour>,
 }
 
 impl S3StandIn {
     fn new() -> Arc<Self> {
-        Arc::new(Self { objects: Mutex::default(), behaviour: Mutex::new(Behaviour::Healthy) })
+        Arc::new(Self { objects: Mutex::default(), puts: Default::default(), behaviour: Mutex::new(Behaviour::Healthy) })
     }
 
     fn set(&self, behaviour: Behaviour) {
@@ -130,6 +131,7 @@ impl HttpClient for S3StandIn {
         let behaviour = *self.behaviour.lock().unwrap();
         match request.method().as_str() {
             "PUT" => {
+                self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let media = request.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok());
                 if key.starts_with("archive/") && media != Some(BUNDLE_MEDIA_TYPE) {
                     return respond(http::StatusCode::BAD_REQUEST, b"bundle media type".to_vec());
@@ -181,6 +183,11 @@ struct Harness {
 impl Harness {
     /// A decided store at `alpha` holding one standing-inbox message, dropped now.
     fn new() -> Self {
+        Self::with_neighbours(&[])
+    }
+
+    /// As [`Harness::new`], with more messages dropped at the same time beside it.
+    fn with_neighbours(neighbours: &[&str]) -> Self {
         let registry = crate::runtime::decided_registry().expect("registry");
         let store =
             Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("SQLite"), HOME, registry).expect("store")));
@@ -200,8 +207,11 @@ impl Harness {
                 MessageBody::text("a standing-inbox notice").expect("body"),
             )
         };
-        messages.create(&name, spec, &world, now).expect("create");
-        messages.apply(&name, DropMessage { reason: DropReason::Undeliverable }, &world, now).expect("drop");
+        for id in std::iter::once("notice").chain(neighbours.iter().copied()) {
+            let message = Address::message(&inbox(), id).expect("address").as_str().to_owned();
+            messages.create(&message, spec.clone(), &world, now).expect("create");
+            messages.apply(&message, DropMessage { reason: DropReason::Undeliverable }, &world, now).expect("drop");
+        }
         let s3 = S3StandIn::new();
         let credentials = S3Credentials { access_key_id: ACCESS_KEY.into(), secret_access_key: SECRET_KEY.into(), session_token: None };
         let client = S3BlobStore::new_with_region(ENDPOINT, BUCKET, PREFIX, REGION, credentials, s3.clone()).expect("S3 store");
@@ -287,10 +297,11 @@ async fn an_ended_message_is_shipped_expunged_and_read_back_by_name() {
 // raises the `Archive` condition with the failure, and the next confirmed upload clears it.
 #[tokio::test(start_paused = true)]
 async fn failed_uploads_keep_the_resource_and_a_stuck_bundle_alerts_infra() {
-    let mut harness = Harness::new();
+    let mut harness = Harness::with_neighbours(&["neighbour"]);
     harness.s3.set(Behaviour::RefusePuts);
     let refused = harness.after(Duration::from_secs(7 * 24 * 60 * 60)).await;
-    assert_eq!(refused.failed.len(), 1);
+    assert_eq!((refused.failed.len(), refused.deferred.len()), (1, 1), "a refusing store is asked once per pass");
+    assert_eq!(harness.s3.puts.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(refused.failed[0].1.contains("HTTP 503"), "{:?}", refused.failed);
     assert_eq!(harness.stored(), (true, true), "a failed upload leaves the resource in place");
     assert_eq!(harness.condition(), None, "not yet a day past due");
@@ -301,17 +312,21 @@ async fn failed_uploads_keep_the_resource_and_a_stuck_bundle_alerts_infra() {
     assert_eq!(harness.stored(), (true, true), "an unconfirmed upload leaves the resource in place");
 
     let stuck = harness.after(ALERT_AFTER).await;
-    assert_eq!(stuck.overdue, 1);
+    assert_eq!(stuck.overdue, 2);
     let condition = harness.condition().expect("the stuck bundle raises the condition");
     assert_eq!(condition.condition_type, ARCHIVE_CONDITION);
     assert!(!condition.blocks_readiness, "the alert does not take the host out of service");
-    assert!(condition.message.contains(&harness.name) && condition.message.contains("does not hold"), "{}", condition.message);
+    assert!(
+        condition.message.starts_with("2 ended") && condition.message.contains("message:") && condition.message.contains("does not hold"),
+        "{}",
+        condition.message
+    );
 
     harness.s3.set(Behaviour::Healthy);
     let recovered = harness.after(PASS_INTERVAL).await;
-    assert_eq!(recovered.shipped.len(), 1);
-    assert_eq!(harness.condition(), None, "a shipped bundle clears the alert");
-    assert_eq!(harness.after(EXPUNGE_GRACE).await.expunged.len(), 1);
+    assert_eq!(recovered.shipped.len(), 2);
+    assert_eq!(harness.condition(), None, "shipped bundles clear the alert");
+    assert_eq!(harness.after(EXPUNGE_GRACE).await.expunged.len(), 2);
     assert_eq!(harness.stored(), (false, false));
 }
 

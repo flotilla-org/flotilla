@@ -122,6 +122,8 @@ fn a_dropped_message_ships_a_week_later_and_leaves_in_two_writes() {
     let note = ArchiveNote { key: bundle_key(&identity(&dropped)), digest: "0".repeat(64) };
     let deleted_at = due.saturating_add(1);
     archiver.delete(&mut store, &identity(&dropped), version, &note, deleted_at).expect("delete");
+    assert!(matches!(archiver.prepare(&mut store, &identity(&dropped)).expect("prepare"), Prepared::Gone));
+    assert_eq!(archiver.candidates().count(), 0, "a candidate no longer stored at its end is dropped");
     archiver.refresh(&mut store).expect("refresh");
     assert_eq!(
         archiver.candidates().next().map(|candidate| &candidate.stage),

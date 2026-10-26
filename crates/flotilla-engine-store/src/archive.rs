@@ -12,6 +12,11 @@
 //! transaction would raise the home's resume floor past every follower's cursor and send each a
 //! fresh snapshot of the whole home. Both entries carry an [`ArchiveNote`] naming the bundle.
 //!
+//! The guarantee before the local, irreversible delete is that every configured store answered
+//! the upload and then served back the exact bytes (same SHA-256). It is not a proof of the
+//! store's own replication or durability; that is the object store's, and configuring more than
+//! one `[[blob_stores]]` store keeps more than one copy.
+//!
 //! Bundles are named by the resource's identity ([`bundle_key`]), so a reader holding only the
 //! kind, name and home finds one. The [`Archiver`] keeps no state of its own that a restart would
 //! lose: it finds candidates with the startup scan, then follows the home's log.
@@ -39,6 +44,9 @@ pub const BUNDLE_FORMAT: u32 = 1;
 pub const BUNDLE_MEDIA_TYPE: &str = "application/vnd.flotilla.archive-bundle+cbor";
 
 /// Bounds of one encoded bundle: a long-lived resource's entries, each within the log's limits.
+/// A bundle is built, uploaded and read back whole in memory, once per store, so these bounds are
+/// also the shipper's peak memory per resource. One past them never encodes: it stays at its home
+/// and, a day past due, raises the archive alert rather than shipping partially.
 pub const BUNDLE_LIMITS: flotilla_cbor::Limits =
     flotilla_cbor::Limits { max_message: 256 * 1024 * 1024, max_depth: 32, max_elements: 1 << 22, max_byte_string: 16 * 1024 * 1024 };
 
@@ -384,8 +392,18 @@ impl Archiver {
             .collect()
     }
 
-    /// The bundle of an ended resource: its snapshot and every entry of its history.
-    pub fn prepare(&self, store: &mut Store, identity: &Identity) -> Result<Prepared, ArchiveError> {
+    /// The bundle of an ended resource: its snapshot and every entry of its history. A candidate
+    /// that is no longer stored, or no longer at an end, is dropped, so the candidates (and the
+    /// alert counted from them) follow the store rather than wait for a later log entry.
+    pub fn prepare(&mut self, store: &mut Store, identity: &Identity) -> Result<Prepared, ArchiveError> {
+        let prepared = self.bundle(store, identity)?;
+        if matches!(prepared, Prepared::Gone) {
+            self.candidates.remove(identity);
+        }
+        Ok(prepared)
+    }
+
+    fn bundle(&self, store: &mut Store, identity: &Identity) -> Result<Prepared, ArchiveError> {
         let kind = self.kinds.get(identity.kind)?;
         let mut read = store.read()?;
         let Some(id) = read.resolve(identity.kind, &identity.name, &identity.home)? else { return Ok(Prepared::Gone) };
