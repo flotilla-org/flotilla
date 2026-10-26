@@ -351,6 +351,7 @@ pub enum ImageBuildAction {
 }
 
 pub struct FinishedAttempt {
+    /// The collected job's attempt; only the reconciler assigns retry ownership.
     attempt: u32,
     pub outcome: Result<BuiltImage, FailedImageBuild>,
     pub log_ref: Result<String, String>,

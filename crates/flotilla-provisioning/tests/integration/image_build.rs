@@ -1039,6 +1039,8 @@ async fn completed_build_survives_post_collection_read_failure() {
     .await
     .expect("completed build log");
     tokio::task::yield_now().await;
+    // Building reads authority once before collecting, then refreshes after collection.
+    // Fail the refresh; failing the gate would return a prepare error rather than this frame.
     reads.countdown.store(2, Ordering::SeqCst);
     let obj = builds.get(&name).await.expect("build");
     let prepared = reconciler.prepare(&obj).await.expect("read error frame");
