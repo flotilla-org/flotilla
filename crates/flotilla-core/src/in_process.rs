@@ -2633,6 +2633,7 @@ impl InProcessDaemon {
             | flotilla_protocol::CommandAction::ConvoyLink { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyUnlink { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, .. }
+            | flotilla_protocol::CommandAction::ConvoyRebind { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyResume { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyWithdrawPendingBrief { namespace, name }
             | flotilla_protocol::CommandAction::QueryExplainConvoy { namespace, name } => {
@@ -3459,6 +3460,30 @@ impl InProcessDaemon {
 
     pub fn admission_free_space_floor_bytes(&self) -> Result<u64, String> {
         self.admission.admission_free_space_floor_bytes()
+    }
+
+    /// Replace the account draw's random source (#3884); tests fix its seed.
+    pub fn set_account_random(&self, random: Arc<dyn flotilla_resources::RandomSource>) {
+        self.admission.set_account_random(random);
+    }
+
+    /// The home pass over this daemon's account bindings (#3907).
+    pub async fn reconcile_account_bindings(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<(String, flotilla_admission::account_access::BindingChange)>, String> {
+        self.admission.reconcile_account_bindings(namespace).await
+    }
+
+    /// Rebind one requester's account (#3907).
+    pub async fn rebind_account(
+        &self,
+        namespace: &str,
+        convoy: &str,
+        role: &str,
+        pin: Option<&str>,
+    ) -> Result<flotilla_resources::AccountBindingSpec, String> {
+        self.admission.rebind_account(namespace, convoy, role, pin).await
     }
 
     #[cfg(test)]
@@ -5484,6 +5509,7 @@ impl InProcessDaemon {
             CommandAction::ConvoyStart { .. } => {
                 return boxed_action!(admission.execute_action_convoy_start(id, &command, &dispatching_principal_ref))
             }
+            CommandAction::ConvoyRebind { .. } => return boxed_action!(admission.execute_action_convoy_rebind(id, &command)),
             CommandAction::ConvoyCreate { .. } => {
                 return boxed_action!(admission.execute_action_convoy_create(id, &command, &dispatching_principal_ref))
             }

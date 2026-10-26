@@ -91,7 +91,7 @@ use flotilla_resources::{
     ResourceList, Selector, StatusPatch, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
     TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, VesselRequirement, VesselSpec,
     VesselStatus, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
-    CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
+    CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
 };
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},

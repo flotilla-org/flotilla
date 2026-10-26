@@ -473,6 +473,9 @@ pub struct ConvoyExplanation {
     pub placement: Option<PlacementDecision>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub vessel_placements: std::collections::BTreeMap<String, PlacementDecision>,
+    /// Each requester's account bindings, open and retired (#3907).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_bindings: Vec<ExplainedAccountBinding>,
     pub evidence_ttl_seconds: u64,
     pub change_request_stale_after_seconds: u64,
     pub checkouts: Vec<ExplainedCheckout>,
@@ -500,6 +503,49 @@ pub struct ConvoyExplanation {
     pub recent_events: Vec<ExplainedEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_mutations: Vec<ExplainedLifecycleMutation>,
+}
+
+/// One requester's account binding (#3907): which managed credential and account it selected,
+/// how, from which candidates, under which grants, and where it is provisioned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedAccountBinding {
+    pub binding: String,
+    pub role: String,
+    pub requirement: String,
+    pub credential: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// `open`, `closed` or `revoked`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Directly delivered material was present until this time (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_until: Option<String>,
+    pub selection: String,
+    pub candidates: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub exclusions: std::collections::BTreeMap<String, String>,
+    pub grants: Vec<String>,
+    pub epochs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provisions: Vec<ExplainedAccountProvision>,
+}
+
+/// One binding's provision at one place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedAccountProvision {
+    pub place: String,
+    pub environment_kind: String,
+    pub implementation: String,
+    pub effective_access: String,
+    pub mechanism: String,
+    pub update_mode: String,
+    pub home: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_generation: Option<String>,
 }
 
 /// One held Message batch (#3455): what it is, why it is held, and the
@@ -693,6 +739,11 @@ pub struct ConvoyStartIntent {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub promise_exclusions: Vec<(String, String)>,
+    /// Account pins at admission (`--account role=credential`, #3907): an
+    /// authorized pin wins over the draw; an unauthorized one refuses.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_pins: Vec<(String, String)>,
     /// Dispatch-supplied promises (`--promise kind:label[@vessel/role]`).
     /// Admission resolves kind and owner against the final workflow.
     #[builder(default)]
@@ -975,6 +1026,16 @@ pub enum CommandAction {
         namespace: Option<String>,
         name: String,
         reason: String,
+    },
+    /// Close a requester's account binding and open a new one, by pin or
+    /// draw; its harness starts afresh on the new account (#3907).
+    ConvoyRebind {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        name: String,
+        role: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
     },
     ConvoyResume {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1329,6 +1390,7 @@ impl Command {
             CommandAction::ConvoyLink { .. } => "Linking convoy subject...",
             CommandAction::ConvoyUnlink { .. } => "Unlinking convoy subject...",
             CommandAction::ConvoyAbandon { .. } => "Abandoning convoy...",
+            CommandAction::ConvoyRebind { .. } => "Rebinding crew account...",
             CommandAction::ConvoyResume { .. } => "Resuming convoy crew...",
             CommandAction::ConvoyWithdrawPendingBrief { .. } => "Withdrawing pending convoy brief...",
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
@@ -1603,6 +1665,15 @@ pub enum CommandValue {
     ConvoyAbandoned {
         name: String,
         archives: Vec<CheckoutArchiveOutcome>,
+    },
+    AccountRebound {
+        convoy: String,
+        role: String,
+        credential: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+        /// How the new binding was chosen, for display.
+        selection: String,
     },
     ConvoyStarted {
         name: String,
@@ -2176,6 +2247,13 @@ mod tests {
                     .checkout("work".to_string())
                     .status(CheckoutArchiveStatus::NothingToArchive)
                     .build()],
+            },
+            CommandValue::AccountRebound {
+                convoy: "my-convoy".into(),
+                role: "coder".into(),
+                credential: "claude-jseo-oauth".into(),
+                account: Some("someone@example.com".into()),
+                selection: "pinned by convoy rebind --account".into(),
             },
             CommandValue::WorkflowTemplateApplied { name: "scratch".into() },
             CommandValue::ProjectAdded { name: "my-project".into() },

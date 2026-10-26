@@ -74,6 +74,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::ConvoyLink { .. }
         | CommandAction::ConvoyUnlink { .. }
         | CommandAction::ConvoyAbandon { .. }
+        | CommandAction::ConvoyRebind { .. }
         | CommandAction::ConvoyResume { .. }
         | CommandAction::ConvoyWithdrawPendingBrief { .. }
         | CommandAction::CrewHandoff { .. }

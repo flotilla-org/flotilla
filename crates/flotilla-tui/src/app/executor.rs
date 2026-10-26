@@ -249,6 +249,10 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
             info!(%name, "convoy created");
             app.set_status_message(Some(format!("Convoy created: {name}")));
         }
+        CommandValue::AccountRebound { convoy, role, credential, .. } => {
+            info!(%convoy, %role, %credential, "account rebound");
+            app.set_status_message(Some(format!("Account rebound: {convoy} {role} -> {credential}")));
+        }
         CommandValue::ConvoyAbandoned { name, archives } => {
             let failed = archives.iter().filter(|archive| archive.status == flotilla_protocol::CheckoutArchiveStatus::Failed).count();
             let archived = archives.iter().filter(|archive| archive.status == flotilla_protocol::CheckoutArchiveStatus::Archived).count();

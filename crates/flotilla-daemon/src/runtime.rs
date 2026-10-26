@@ -1,5 +1,6 @@
 //! Daemon composition, startup restoration, and resource-controller wiring.
 
+mod account_access;
 pub(crate) mod agentless_vessels;
 mod credentials;
 mod discovery;
@@ -747,6 +748,13 @@ impl StartupRestoration {
             options.controller_resync_interval,
         )));
         controller_tasks.push(AbortOnDropHandle::new(spawn_environment_orphan_sweep_task(Arc::clone(state))));
+        // #3907: account bindings follow grant withdrawal, epochs and teardown;
+        // provisions follow their bindings and push new material generations.
+        controller_tasks.push(AbortOnDropHandle::new(account_access::spawn_account_access_task(
+            Arc::clone(state),
+            options.namespace.clone(),
+            options.controller_resync_interval,
+        )));
         controller_tasks.push(AbortOnDropHandle::new(spawn_codex_credential_redelivery_task(
             Arc::clone(state),
             options.namespace.clone(),

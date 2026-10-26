@@ -3,6 +3,8 @@
 // Remove when async_trait or Clippy stops producing this warning.
 #![allow(clippy::double_must_use)]
 
+pub mod account_access;
+pub use account_access::{AccountBinding, AccountBindingSpec, AccountProvision, AccountProvisionSpec};
 #[doc(hidden)]
 pub mod address;
 pub mod artifact;
@@ -82,6 +84,7 @@ pub mod prepared_snapshot;
 mod principal_attention;
 mod project;
 mod provisioning_identity;
+pub mod random;
 mod replica;
 #[doc(hidden)]
 pub mod repository;
@@ -145,7 +148,8 @@ pub use credential::{
     CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
     CredentialSpecSpec, LandingCredentialScope, RepositoryTrust, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV,
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG,
-    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, CREW_SKILLS_ENV, RESOLVED_SKILLS_ENV,
+    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, CREW_SKILLS_ENV, INITIAL_AUTHORIZATION_EPOCH,
+    RESOLVED_SKILLS_ENV,
 };
 pub use crew_image_baseline::{CrewImageBaseline, CrewImageBaselineSpec};
 pub use dispatch_hold::{
@@ -208,6 +212,7 @@ pub use project::{
     DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, forge_clone_key, forge_repo_key, repo_key};
+pub use random::{RandomSource, SeededRandom};
 pub use replica::{
     compare_replica_reads, pick_replica_read, ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass,
     ResourceProvenance, ORIGIN_ROOT_ANNOTATION,
@@ -252,6 +257,8 @@ pub use watch::{ResourceList, ResourcePosition, ResourceTombstone, WatchEvent, W
 #[macro_export]
 macro_rules! for_each_registered_resource {
     ($callback:ident, $($argument:expr),* $(,)?) => {{
+        $callback::<$crate::AccountBinding>($($argument),*);
+        $callback::<$crate::AccountProvision>($($argument),*);
         $callback::<$crate::Artifact>($($argument),*);
         $callback::<$crate::Checkout>($($argument),*);
         $callback::<$crate::ChangeRequest>($($argument),*);

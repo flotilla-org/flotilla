@@ -140,6 +140,9 @@ pub struct ConvoyAdmission {
     regard_lifecycle: Arc<RegardLifecycle>,
     host_name: HostName,
     clock: Arc<dyn Clock>,
+    /// The draw that selects a requester's account (#3884); tests fix the seed.
+    #[builder(default = std::sync::RwLock::new(Arc::new(flotilla_resources::SeededRandom::from_entropy())))]
+    random: std::sync::RwLock<Arc<dyn flotilla_resources::RandomSource>>,
     fulfilment_decider: Arc<dyn FulfilmentDecider>,
     /// Serializes the identity selector check with Convoy creation on the owner host.
     #[builder(default)]
@@ -737,6 +740,19 @@ impl ConvoyAdmission {
         admission.name = convoy_record_name();
         admission.spec.generation =
             allocate_convoy_generation_from_inventory(&inventory, admission.spec.project_ref.as_deref(), &admission.spec.role)?;
+        let bindings = self
+            .choose_account_bindings(
+                namespace,
+                &admission.name,
+                &admission.spec,
+                &admission.workflow,
+                AdmittedPlacements {
+                    vessels: &admission.vessel_placements,
+                    convoy: admission.placement_policy.as_ref().zip(admission.placement_decision.as_ref()),
+                },
+                &intent.account_pins,
+            )
+            .await?;
         self.create_convoy_with_workflow_snapshot(
             namespace,
             &admission.name,
@@ -752,6 +768,7 @@ impl ConvoyAdmission {
             intent.auto_attach.into(),
         )
         .await?;
+        crate::account_access::write_bindings(&self.backend, namespace, bindings).await?;
         self.record_admission_naming(namespace, &admission.name, admission.naming.clone()).await;
         let address = convoy_address(&admission.spec.role, admission.spec.project_ref.as_deref());
         let warnings = admission.spec.issues.iter().flat_map(|issue| issue.placement_needs().1).collect();
@@ -1427,6 +1444,19 @@ impl ConvoyAdmission {
         admission.name = convoy_record_name();
         admission.spec.generation =
             allocate_convoy_generation_from_inventory(&inventory, admission.spec.project_ref.as_deref(), &admission.spec.role)?;
+        let bindings = self
+            .choose_account_bindings(
+                namespace,
+                &admission.name,
+                &admission.spec,
+                &admission.workflow,
+                AdmittedPlacements {
+                    vessels: &admission.vessel_placements,
+                    convoy: admission.placement_policy.as_ref().zip(admission.placement_decision.as_ref()),
+                },
+                &[],
+            )
+            .await?;
         let workflow_value = serde_json::to_value(&admission.workflow).map_err(|error| error.to_string())?;
         let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
         ensure_prepared_workflow_snapshot(&self.backend, namespace, &workflow_name, &admission.workflow).await?;
@@ -1465,6 +1495,7 @@ impl ConvoyAdmission {
             crate::image_build::remove_created_builds(&self.backend, namespace, &created).await;
         }
         result?;
+        crate::account_access::write_bindings(&self.backend, namespace, bindings).await?;
         self.record_admission_naming(namespace, &admission.name, admission.naming.clone()).await;
         apply_resource_status_patch(
             &self.backend.using::<ResourceConvoy>(namespace),
@@ -1556,6 +1587,23 @@ impl ConvoyAdmission {
                 return CommandValue::Error { message };
             }
         };
+        let bindings = match self
+            .choose_account_bindings(
+                namespace,
+                name,
+                &spec,
+                workflow,
+                AdmittedPlacements {
+                    vessels: &vessel_placements,
+                    convoy: placement.selected.as_ref().map(|placement| &placement.spec).zip(placement_decision.as_ref()),
+                },
+                &[],
+            )
+            .await
+        {
+            Ok(bindings) => bindings,
+            Err(message) => return CommandValue::Error { message },
+        };
         match self
             .create_convoy_with_workflow_snapshot(
                 namespace,
@@ -1573,10 +1621,81 @@ impl ConvoyAdmission {
             )
             .await
         {
-            Ok(()) => CommandValue::ConvoyCreated { name: address },
+            Ok(()) => match crate::account_access::write_bindings(&self.backend, namespace, bindings).await {
+                Ok(()) => CommandValue::ConvoyCreated { name: address },
+                Err(message) => CommandValue::Error { message },
+            },
             Err(message) => CommandValue::Error { message },
         }
     }
+
+    /// Choose each requester's account binding at the admitted placements, before the convoy
+    /// is written: an unauthorized pin or an unusable requirement refuses admission (#3907).
+    async fn choose_account_bindings(
+        &self,
+        namespace: &str,
+        convoy: &str,
+        spec: &ConvoySpec,
+        workflow: &WorkflowTemplateSpec,
+        placements: AdmittedPlacements<'_>,
+        pins: &[(String, String)],
+    ) -> Result<Vec<crate::account_access::PendingBinding>, String> {
+        let mut by_role = BTreeMap::new();
+        for (role, credential) in pins {
+            if by_role.insert(role.clone(), credential.clone()).is_some() {
+                return Err(format!("duplicate --account pin for role `{role}`"));
+            }
+        }
+        crate::account_access::choose_bindings(
+            &self.backend,
+            namespace,
+            spec.project_ref.as_deref(),
+            &spec.repositories,
+            convoy,
+            workflow,
+            placements.vessels,
+            placements.convoy,
+            &by_role,
+            &*self.account_random(),
+            flotilla_schema::Timestamp::from_datetime(&self.clock.now()),
+        )
+        .await
+    }
+
+    fn account_random(&self) -> Arc<dyn flotilla_resources::RandomSource> {
+        Arc::clone(&self.random.read().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+
+    /// Replace the account draw's random source; tests fix its seed (#3884).
+    pub fn set_account_random(&self, random: Arc<dyn flotilla_resources::RandomSource>) {
+        *self.random.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = random;
+    }
+
+    /// The home pass over this daemon's account bindings (#3882 lifecycle).
+    pub async fn reconcile_account_bindings(&self, namespace: &str) -> Result<Vec<(String, crate::account_access::BindingChange)>, String> {
+        let _admission_guard = self.lock().await;
+        let now = flotilla_schema::Timestamp::from_datetime(&self.clock.now());
+        crate::account_access::reconcile_home_bindings(&self.backend, namespace, &*self.account_random(), now).await
+    }
+
+    /// An explicit rebind of one requester's account (#3882).
+    pub async fn rebind_account(
+        &self,
+        namespace: &str,
+        convoy: &str,
+        role: &str,
+        pin: Option<&str>,
+    ) -> Result<flotilla_resources::AccountBindingSpec, String> {
+        let _admission_guard = self.lock().await;
+        let now = flotilla_schema::Timestamp::from_datetime(&self.clock.now());
+        crate::account_access::rebind(&self.backend, namespace, convoy, role, pin, &*self.account_random(), now).await
+    }
+}
+
+/// The placements a convoy was admitted at: per vessel, or one for the whole convoy.
+struct AdmittedPlacements<'a> {
+    vessels: &'a BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
+    convoy: Option<(&'a PlacementPolicySpec, &'a PlacementDecision)>,
 }
 
 impl PlacementBuildJoiner<'_> {
@@ -2000,26 +2119,10 @@ impl AdmissionReadContext<'_> {
             .flat_map(|grant| grant.object.spec.credentials.iter().cloned())
             .chain(owner.config.load_daemon_config()?.credentials.forgejo.into_values())
             .collect::<BTreeSet<_>>();
-        // Agent consumers participate in missing-grant diagnostics even when
-        // no grant selected them. Other consumers are selected by referenced name.
+        // Every consumer is selected by the name a grant references (#3907):
+        // no adapter list decides which declarations admission reads.
         let credentials = backend
-            .query_declared::<CredentialSpec>(
-                namespace,
-                &StoreQuery {
-                    any_of: Some(vec![
-                        StoreQuery::names(credential_names, true),
-                        StoreQuery {
-                            field_values: BTreeMap::from([(
-                                "spec.consumer.adapter".into(),
-                                ["claude", "claude-oauth", "codex"].map(str::to_string).into(),
-                            )]),
-                            ..Default::default()
-                        },
-                    ]),
-                    include_replicas: true,
-                    ..Default::default()
-                },
-            )
+            .query_declared::<CredentialSpec>(namespace, &StoreQuery::names(credential_names, true))
             .await
             .map_err(|error| error.to_string())?;
         let mut baseline_names = BTreeSet::new();
@@ -2625,6 +2728,23 @@ impl AdmissionReadContext<'_> {
             };
             let policy_name = kind.metadata.name.clone();
             let refusal = |reason: String| PlacementRefusal { policy_name: policy_name.clone(), target_host: target_host.clone(), reason };
+            // #3907: a kind where some requester's access has no plan drops out.
+            let environment_kind = match &kind.spec.realisation {
+                flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { .. } => {
+                    flotilla_agent::account_access::environment_kind::CLOUD_SANDBOX
+                }
+                flotilla_resources::FulfilmentRealisation::DockerPerVessel { .. } => {
+                    flotilla_agent::account_access::environment_kind::DOCKER
+                }
+                flotilla_resources::FulfilmentRealisation::HostDirect if host.is_some_and(is_agentless_ssh_host) => {
+                    flotilla_agent::account_access::environment_kind::AGENTLESS_SSH
+                }
+                flotilla_resources::FulfilmentRealisation::HostDirect => flotilla_agent::account_access::environment_kind::HOST_DIRECT,
+            };
+            if let Some(reason) = crate::account_access::plan_refusal(workflow, environment_kind)? {
+                rejected.push(refusal(reason));
+                continue;
+            }
             let canonical_kind_host = match canonical_kind_host {
                 Ok(host) => host,
                 Err(error) => {
@@ -4233,6 +4353,11 @@ async fn decide_default_placement(
             Some(AGENTLESS_SSH_PIN_ONLY.to_string())
         } else if purpose == PlacementPurpose::Routing {
             None
+        } else if let Some(reason) =
+            crate::account_access::plan_refusal(workflow, crate::account_access::placement_environment_kind(&policy.spec, None))?
+        {
+            // #3907: a kind where some requester's access has no plan drops out.
+            Some(reason)
         } else if let Err(reason) = resolve_placement_provider(backend, namespace, &mut policy).await {
             Some(reason)
         } else if let Err(reason) = validate_workflow_agent_adapters(backend, namespace, workflow, Some(&policy), false).await {
@@ -4465,7 +4590,7 @@ pub async fn validate_workflow_agent_adapters(
 
 /// One declared candidate query shared by admission and credential resolution.
 /// Empty selector sets are wildcards; detailed repository trust remains a join.
-fn credential_grant_query(project: Option<&str>, roles: BTreeSet<String>) -> StoreQuery {
+pub(crate) fn credential_grant_query(project: Option<&str>, roles: BTreeSet<String>) -> StoreQuery {
     let mut projects = vec![StoreQuery { missing_fields: ["spec.selector.projects.*".into()].into(), ..Default::default() }];
     if let Some(project) = project {
         projects.push(StoreQuery { fields: BTreeMap::from([("spec.selector.projects.*".into(), project.into())]), ..Default::default() });
@@ -4610,8 +4735,13 @@ pub async fn resolve_workflow_credentials(
         // and roles, and its other vessels' images lack the consumer binary.
         let vessel_adapters =
             flotilla_agent::adapter::required_agent_adapters(&vessel.crew).map_err(|error| format!("vessel `{}`: {error}", vessel.name))?;
+        // A credential that supplies a registered account access (a Claude
+        // subscription) reaches a requester only through its binding (#3907),
+        // never as a vessel-wide reference.
+        let account_access = flotilla_agent::account_access::AccountProvisioners::seeded();
         granted.retain(|name| {
-            specs.get(name).and_then(CredentialConsumer::harness_adapter).is_none_or(|adapter| vessel_adapters.contains(adapter))
+            specs.get(name).is_some_and(|consumer| !account_access.supplies_any(consumer))
+                && specs.get(name).and_then(CredentialConsumer::harness_adapter).is_none_or(|adapter| vessel_adapters.contains(adapter))
         });
         let mut credential_scopes = BTreeMap::<String, BTreeSet<_>>::new();
         let mut credential_permissions = BTreeMap::<String, BTreeMap<String, String>>::new();
@@ -4666,7 +4796,8 @@ pub async fn resolve_and_validate_workflow_credentials(
     workflow: &mut WorkflowTemplateSpec,
 ) -> Result<(), String> {
     resolve_workflow_credentials(backend, namespace, project_ref, repositories, workflow).await?;
-    validate_workflow_credentials(backend, namespace, workflow, placement).await
+    validate_workflow_credentials(backend, namespace, workflow, placement).await?;
+    crate::account_access::validate_account_access(backend, namespace, project_ref, repositories, workflow, placement).await.map(|_| ())
 }
 
 pub async fn resolve_and_validate_workflow_credentials_for_capability_admission(
@@ -4678,8 +4809,16 @@ pub async fn resolve_and_validate_workflow_credentials_for_capability_admission(
     workflow: &mut WorkflowTemplateSpec,
 ) -> Result<(), String> {
     resolve_workflow_credentials(backend, namespace, project_ref, repositories, workflow).await?;
-    validate_workflow_credentials_with_capabilities_for_admission(backend, namespace, workflow, placement, &CapabilityTable::seeded(), true)
-        .await
+    validate_workflow_credentials_with_capabilities_for_admission(
+        backend,
+        namespace,
+        workflow,
+        placement,
+        &CapabilityTable::seeded(),
+        true,
+    )
+    .await?;
+    crate::account_access::validate_account_access(backend, namespace, project_ref, repositories, workflow, placement).await.map(|_| ())
 }
 
 pub async fn validate_workflow_credentials(
@@ -4709,68 +4848,9 @@ pub async fn validate_workflow_credentials_with_capabilities_for_admission(
     capabilities: &CapabilityTable,
     allow_unready: bool,
 ) -> Result<(), String> {
-    let specs = backend
-        .query_declared::<CredentialSpec>(
-            namespace,
-            &StoreQuery {
-                any_of: Some(vec![
-                    StoreQuery::names(workflow.vessels.iter().flat_map(|vessel| vessel.credential_refs.iter().cloned()), true),
-                    StoreQuery {
-                        field_values: BTreeMap::from([(
-                            "spec.consumer.adapter".into(),
-                            ["claude", "claude-oauth", "codex"].into_iter().map(str::to_string).collect(),
-                        )]),
-                        ..Default::default()
-                    },
-                ]),
-                include_replicas: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|error| format!("list credential specs: {error}"))?
-        .items
-        .into_iter()
-        .map(|source| (source.object.metadata.name, source.object.spec.consumer))
-        .collect::<BTreeMap<_, _>>();
-    for vessel in &workflow.vessels {
-        for crew in &vessel.crew {
-            let CrewSource::Agent { selector, .. } = &crew.source else {
-                continue;
-            };
-            let requirement = capabilities.resolve_selector(selector)?;
-            let Some(delivery_slot) = requirement.credential_delivery_slot() else {
-                continue;
-            };
-            let has_granted_credential =
-                vessel.credential_refs.iter().any(|name| specs.get(name).is_some_and(|consumer| consumer.delivery_slot() == delivery_slot));
-            if has_granted_credential {
-                continue;
-            }
-            let compatible = specs
-                .iter()
-                .filter(|(_, consumer)| consumer.delivery_slot() == delivery_slot)
-                .map(|(name, _)| name.as_str())
-                .collect::<Vec<_>>();
-            let credential = match compatible.as_slice() {
-                [name] => format!("credential `{name}`"),
-                [] => format!("a `{delivery_slot}` credential"),
-                names => format!("one of credentials `{}`", names.join("`, `")),
-            };
-            return Err(format!(
-                "agent adapter `{}` requires {credential}, but no matching CredentialGrant selected it",
-                requirement.adapter
-            ));
-        }
-    }
-
     let required = workflow.vessels.iter().flat_map(|vessel| vessel.credential_refs.iter().cloned()).collect::<BTreeSet<_>>();
-    let ambient_dependent_vessels = ambient_credential_dependent_vessels(
-        capabilities,
-        &specs,
-        workflow,
-        placement.is_some_and(|policy| policy.spec.host_direct.is_some()),
-    )?;
+    let ambient_dependent_vessels =
+        ambient_credential_dependent_vessels(capabilities, workflow, placement.is_some_and(|policy| policy.spec.host_direct.is_some()))?;
     if required.is_empty() && ambient_dependent_vessels.is_empty() {
         return Ok(());
     }
@@ -4837,16 +4917,13 @@ pub async fn validate_workflow_credentials_with_capabilities_for_admission(
     Ok(())
 }
 
-/// Vessels whose agent crews will authenticate through a host's ambient login
-/// rather than delivered material: host-direct vessels with a crew on an
-/// ambient-capable adapter and no granted credential covering that adapter's
-/// delivery slot. Returns `(vessel name, ambient scope)` pairs, the scope
-/// being the entry name under the Host `credential_expiry` capability.
-/// The seeded adapters currently pair ambient Claude scope with a delivery
-/// slot, so this is forward-provisioned for an ambient-only adapter.
+/// Vessels whose agent crews authenticate through a host's ambient login:
+/// host-direct vessels with a crew on an ambient-only adapter. Returns
+/// `(vessel name, ambient scope)` pairs, the scope being the entry name under
+/// the Host `credential_expiry` capability. No seeded adapter is ambient-only:
+/// Claude resolves through its binding (#3907), so this is forward-provisioned.
 pub fn ambient_credential_dependent_vessels<'workflow>(
     capabilities: &CapabilityTable,
-    specs: &BTreeMap<String, CredentialConsumer>,
     workflow: &'workflow WorkflowTemplateSpec,
     host_direct: bool,
 ) -> Result<Vec<(&'workflow str, &'static str)>, String> {
@@ -4857,14 +4934,7 @@ pub fn ambient_credential_dependent_vessels<'workflow>(
                 continue;
             };
             let requirement = capabilities.resolve_selector(selector)?;
-            let Some(scope) = requirement.ambient_credential_scope() else {
-                continue;
-            };
-            let delivery_slot = requirement.credential_delivery_slot();
-            let has_delivered_credential = delivery_slot.is_some_and(|slot| {
-                vessel.credential_refs.iter().any(|name| specs.get(name).is_some_and(|consumer| consumer.delivery_slot() == slot))
-            });
-            if !has_delivered_credential {
+            if let Some(scope) = requirement.ambient_credential_scope() {
                 vessels.push((vessel.name.as_str(), scope));
                 break;
             }

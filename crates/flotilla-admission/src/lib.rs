@@ -1,4 +1,5 @@
 //! Convoy admission, placement planning, and project operations.
+pub mod account_access;
 pub mod admission;
 pub mod admission_actions;
 pub mod convoy_admission;

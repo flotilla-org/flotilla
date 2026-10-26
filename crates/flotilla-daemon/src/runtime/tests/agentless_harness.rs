@@ -15,6 +15,7 @@ use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 use flotilla_provider_runtime::host_environment::{HostEnvironment, HostSupply};
 use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 
+use super::super::account_access::reconcile_place_provisions;
 use super::agentless_vessels::{VesselKey, VesselPaths};
 use super::vessel_support::{vessels_over, RunnerVesselAgents};
 
@@ -106,7 +107,12 @@ fn ok() -> Result<String, String> {
 impl CommandRunner for FakeHost {
     async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
         match (cmd, args) {
+            ("rm", ["-f", "--", path]) => {
+                self.files.lock().expect("files").remove(Path::new(path));
+                ok()
+            }
             ("mkdir" | "chmod" | "mv" | "rm", _) => ok(),
+            ("sh", ["-c", _, "flotilla-requester-home", _]) => ok(),
             ("getconf", ["_NPROCESSORS_ONLN"]) => Ok("8\n".into()),
             // Executables and sockets lie outside the modelled filesystem: the
             // delivered CLI is present and the forwarded socket is listening.
@@ -265,14 +271,26 @@ struct AgentlessHost {
 }
 
 /// What the terminal pool was asked to start.
+#[derive(Debug)]
 struct LaunchedSession {
     env_vars: TerminalEnvVars,
     command: String,
 }
 
-/// Launch one crew of `adapter` on `host` through the terminal runtime's real
-/// launch path, with a fake terminal pool recording what it would start.
-async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool) -> Result<LaunchedSession, String> {
+/// The terminal runtime, agentless host and crew session spec a launch runs with.
+struct AgentlessRuntime {
+    _temp: TempDir,
+    daemon: Arc<InProcessDaemon>,
+    state: Arc<ControllerRuntimeState>,
+    pool: Arc<FakeTerminalPool>,
+    agents: Arc<RunnerVesselAgents>,
+    vessel: VesselPaths,
+    spec: flotilla_resources::TerminalSessionSpec,
+}
+
+/// The runtime for one crew of `adapter` on `host`, with the Claude credential
+/// declared but not yet bound.
+async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRuntime {
     let temp = TempDir::new().expect("tempdir");
     let config_dir = temp.path().join("config");
     fs::create_dir_all(&config_dir).expect("config directory");
@@ -291,6 +309,7 @@ async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool
                 source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -378,28 +397,42 @@ async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool
         env: session_env,
         pool: "cleat".to_string(),
     };
-    let tags = if grant_claude {
-        vec![TerminalSessionTag { key: CREDENTIAL_REF_SESSION_TAG.to_string(), value: "claude-max".to_string() }]
-    } else {
-        Vec::new()
-    };
-    let launched = TerminalControllerRuntime { state }.ensure_session("terminal-demo-work-coder", (&spec).into(), &tags).await;
-    let ensured = pool.ensured.lock().await;
-    if let Err(error) = launched {
-        assert!(ensured.is_empty(), "a refused launch started a session");
-        return Err(error);
+    AgentlessRuntime { _temp: temp, daemon, state, pool, agents, vessel, spec }
+}
+
+/// Launch one crew of `adapter` on `host` through the terminal runtime's real
+/// launch path, with a fake terminal pool recording what it would start.
+async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool) -> Result<LaunchedSession, String> {
+    let runtime = agentless_runtime(host, adapter).await;
+    if grant_claude {
+        bind_account(&runtime.daemon.resource_backend(), "demo", "coder", "claude-max", "crew@example.com").await;
     }
-    let [launch] = ensured.as_slice() else { panic!("expected one launch, got {}", ensured.len()) };
-    // The vessel was prepared before its crew started: its layer pushed, its
-    // environment configured, and its daemon forward up at the socket the
-    // session names.
-    let prepared = agents.recorded(&vessel);
-    assert_eq!(prepared.tool_pushes, 1);
-    let socket = launch.env_vars.iter().find(|(name, _)| name == "FLOTILLA_DAEMON_SOCKET").map(|(_, value)| PathBuf::from(value));
-    assert_eq!(socket.as_ref(), Some(&vessel.daemon_socket()));
-    assert_eq!(prepared.environment.get("FLOTILLA_DAEMON_SOCKET").map(PathBuf::from), socket);
-    assert!(matches!(prepared.forwards.as_slice(), [(guest, _)] if *guest == vessel.daemon_socket()), "{:?}", prepared.forwards);
-    Ok(LaunchedSession { env_vars: launch.env_vars.clone(), command: launch.command.clone() })
+    runtime.launch().await
+}
+
+impl AgentlessRuntime {
+    async fn launch(&self) -> Result<LaunchedSession, String> {
+        let AgentlessRuntime { state, pool, agents, vessel, spec, .. } = self;
+        let before = pool.ensured.lock().await.len();
+        let launched =
+            TerminalControllerRuntime { state: Arc::clone(state) }.ensure_session("terminal-demo-work-coder", spec.into(), &[]).await;
+        let ensured = pool.ensured.lock().await;
+        if let Err(error) = launched {
+            assert_eq!(ensured.len(), before, "a refused launch started a session");
+            return Err(error);
+        }
+        let Some(launch) = ensured.last() else { panic!("expected a launch") };
+        // The vessel was prepared before its crew started: its layer pushed, its
+        // environment configured, and its daemon forward up at the socket the
+        // session names.
+        let prepared = agents.recorded(vessel);
+        assert!(prepared.tool_pushes >= 1);
+        let socket = launch.env_vars.iter().find(|(name, _)| name == "FLOTILLA_DAEMON_SOCKET").map(|(_, value)| PathBuf::from(value));
+        assert_eq!(socket.as_ref(), Some(&vessel.daemon_socket()));
+        assert_eq!(prepared.environment.get("FLOTILLA_DAEMON_SOCKET").map(PathBuf::from), socket);
+        assert!(matches!(prepared.forwards.as_slice(), [(guest, _)] if *guest == vessel.daemon_socket()), "{:?}", prepared.forwards);
+        Ok(LaunchedSession { env_vars: launch.env_vars.clone(), command: launch.command.clone() })
+    }
 }
 
 /// No launch writes the host user's harness configuration; it reads as it did.
@@ -432,10 +465,15 @@ fn assert_image_harness_environment(launch: &AgentlessLaunch) {
 #[tokio::test]
 async fn agentless_claude_crew_starts_in_a_prepared_flotilla_home() {
     let launch = launch_on_agentless_host("claude-code").await;
-    let home = format!("{HOST_BASE}/agent-homes/claude-max/claude/crews/coder");
+    let bound = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/claude");
+    let home = format!("{bound}/crews/coder");
 
     assert_eq!(launch.value("CLAUDE_CONFIG_DIR").as_deref(), Some(home.as_str()));
-    assert_eq!(launch.value("CLAUDE_CODE_OAUTH_TOKEN").as_deref(), Some("oauth-secret-material"));
+    // #3907: the vessel agent wrote the bound token into the requester's home;
+    // the session environment carries no token of its own.
+    assert_eq!(launch.value("CLAUDE_CODE_OAUTH_TOKEN"), None);
+    assert_eq!(launch.host.entry(format!("{bound}/.flotilla-oauth-token")), Some(HostEntry::File("oauth-secret-material".into())));
+    assert!(launch.command.contains(&claude_token_prefix(&bound)), "{}", launch.command);
     assert_eq!(launch.value("FLOTILLA_ENVIRONMENT_ID").as_deref(), Some(ENVIRONMENT));
     let state = launch.host.json(format!("{home}/.claude.json"));
     assert_eq!(state["hasCompletedOnboarding"], true);
@@ -476,16 +514,15 @@ async fn agentless_codex_crew_starts_in_a_prepared_flotilla_home() {
     assert_host_harness_untouched(&launch);
 }
 
-// Review #3659: an agentless Claude crew has no ambient-login fallback, since
-// the host login's configuration is never selected. Without a delivered OAuth
-// credential the launch is refused with a reason naming the missing grant,
+// Review #3659, #3907 contract 8: an agentless Claude crew has no ambient-login
+// fallback. Without an account binding the launch is refused with the reason,
 // and nothing starts or touches the host's configuration.
 #[tokio::test]
 async fn agentless_claude_crew_without_a_delivered_credential_is_refused_with_the_reason() {
     let Err(error) = try_launch_on_agentless_host("claude-code", false).await else {
         panic!("an agentless Claude crew without a credential must not launch");
     };
-    assert!(error.contains("require a delivered Claude OAuth credential") && error.contains("claude-oauth"), "{error}");
+    assert_eq!(error, "crew `coder` has no account binding for `claude:subscription`: its harness home is never left to an ambient login");
 }
 
 /// Stands in for `ssh` to an agentless host and its sshd: the remote command
@@ -735,4 +772,209 @@ async fn a_supply_setting_a_family_account_variable_is_a_host_configuration_erro
         error,
         "host configuration error for host-direct-b3: supply `claude` sets CLAUDE_CONFIG_DIR, which carries `claude-code` account state"
     );
+}
+
+/// A Claude crew on an agentless host bound to `claude-box-a`, whose token is the host-local
+/// file `token`: launched once, with its TerminalSession recorded.
+async fn bound_agentless_crew(token: &Path) -> (AgentlessRuntime, Arc<FakeHost>, flotilla_test_support::TestSocketDir) {
+    bound_agentless_crew_with(token, None).await
+}
+
+/// As [`bound_agentless_crew`], with the binding replicated from another home whose clock runs
+/// `skew` ahead of this host's.
+async fn bound_agentless_crew_with(
+    token: &Path,
+    skew: Option<(&str, chrono::Duration)>,
+) -> (AgentlessRuntime, Arc<FakeHost>, flotilla_test_support::TestSocketDir) {
+    let runtime_dir = flotilla_test_support::TestSocketDir::new();
+    let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
+    let bag = EnvironmentBag::new()
+        .with(EnvironmentAssertion::env_var("HOME", HOST_HOME))
+        .with(EnvironmentAssertion::env_var("PATH", "/usr/bin:/bin"))
+        .with(EnvironmentAssertion::env_var("XDG_RUNTIME_DIR", runtime_dir.path().display().to_string()))
+        .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
+        .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"));
+    let runtime = agentless_runtime(
+        AgentlessHost {
+            runner: host.clone(),
+            bag,
+            host_environment: HostEnvironment::default(),
+            checkout: CHECKOUT.to_string(),
+            session_env: BTreeMap::new(),
+        },
+        "claude-code",
+    )
+    .await;
+    let backend = runtime.daemon.resource_backend();
+    backend
+        .clone()
+        .definitions::<CredentialSpec>(NAMESPACE)
+        .create(
+            &empty_meta("claude-box-a"),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::ClaudeOauth { account_email: "box-a@example.com".to_string() },
+                source: CredentialSource::File { path: token.display().to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
+            },
+        )
+        .await
+        .expect("box account declaration");
+    match skew {
+        None => bind_account(&backend, "demo", "coder", "claude-box-a", "box-a@example.com").await,
+        Some((home, ahead)) => bind_account_from_home(&backend, home, "demo", "coder", "claude-box-a", ahead).await,
+    }
+    backend.using::<TerminalSession>(NAMESPACE).create(&empty_meta("terminal-demo-work-coder"), &runtime.spec).await.expect("session");
+    runtime.launch().await.expect("bound launch");
+    (runtime, host, runtime_dir)
+}
+
+const BOUND_HOME: &str = "/home/crew/.local/state/flotilla/agent-homes/requesters/demo/coder/claude";
+const BINDING: &str = "demo.coder.claude-subscription";
+
+async fn provision(backend: &ResourceBackend) -> Option<flotilla_resources::AccountProvisionSpec> {
+    backend
+        .using::<flotilla_resources::AccountProvision>(NAMESPACE)
+        .get(&format!("{BINDING}.{ENVIRONMENT}"))
+        .await
+        .ok()
+        .map(|record| record.spec)
+}
+
+// Acceptance (#3907 sticky): a refresh is a new material generation of the same managed
+// credential. The place pass pushes it into the requester's home (update mode push) and
+// records the new generation; the binding does not move.
+#[tokio::test]
+async fn a_refreshed_token_is_pushed_into_the_bound_home_without_moving_the_binding() {
+    let tokens = TempDir::new().expect("token dir");
+    let token = tokens.path().join("box-a");
+    fs::write(&token, "generation-one\n").expect("token");
+    let (runtime, host, _runtime_dir) = bound_agentless_crew(&token).await;
+    let backend = runtime.daemon.resource_backend();
+    let binding = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE).get(BINDING).await.expect("binding").spec;
+    let delivered = provision(&backend).await.expect("provision recorded at launch");
+    assert_eq!((delivered.place.as_str(), delivered.environment_kind.as_str()), (ENVIRONMENT, "agentless-ssh"));
+    assert_eq!(delivered.home, BOUND_HOME);
+    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), Some(HostEntry::File("generation-one".into())));
+
+    fs::write(&token, "generation-two\n").expect("refreshed token");
+    reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
+
+    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), Some(HostEntry::File("generation-two".into())));
+    let pushed = provision(&backend).await.expect("provision kept");
+    let generation =
+        |spec: &flotilla_resources::AccountProvisionSpec| spec.delivered.as_ref().map(|delivered| delivered.generation.clone());
+    assert_ne!(generation(&pushed), generation(&delivered));
+    assert_eq!(generation(&pushed), Some(flotilla_resources::account_access::material_generation("generation-two")));
+    assert_eq!(backend.using::<flotilla_resources::AccountBinding>(NAMESPACE).get(BINDING).await.expect("binding").spec, binding);
+}
+
+// Acceptance (#3907 grant withdrawal, at the place): once the binding is revoked, the place
+// pass deletes the delivered copy, stops the harness session and removes the record; a
+// relaunch is refused with the binding's reason.
+#[tokio::test]
+async fn a_revoked_binding_stops_the_session_and_deletes_its_copy() {
+    let tokens = TempDir::new().expect("token dir");
+    let token = tokens.path().join("box-a");
+    fs::write(&token, "box-a-token").expect("token");
+    let (runtime, host, _runtime_dir) = bound_agentless_crew(&token).await;
+    let backend = runtime.daemon.resource_backend();
+    let bindings = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE);
+    let binding = bindings.get(BINDING).await.expect("binding");
+    let mut revoked = binding.spec.clone();
+    let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
+    revoked.state = flotilla_schema::State::new(
+        flotilla_resources::account_access::BindingState::Revoked {
+            reason: "binding revoked: no authorizing grant".into(),
+            delivered_until: Some(now),
+        },
+        now,
+    );
+    bindings.update(&empty_meta(BINDING), &binding.metadata.resource_version, &revoked).await.expect("revoke");
+
+    reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
+
+    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), None, "the delivered copy is deleted");
+    assert!(provision(&backend).await.is_none(), "the provision record is removed");
+    assert!(
+        matches!(backend.using::<TerminalSession>(NAMESPACE).get("terminal-demo-work-coder").await, Err(ResourceError::NotFound { .. })),
+        "the harness session is stopped"
+    );
+    let refused = runtime.launch().await.expect_err("a revoked requester waits");
+    assert_eq!(refused, "crew `coder` waits: binding revoked: no authorizing grant; `flotilla convoy rebind` opens a new binding");
+}
+
+// Acceptance (#3907 rebind, at the place): a binding reopened after the delivery (a rebind)
+// has its old copy deleted and its session stopped, so the requester starts afresh.
+#[tokio::test]
+async fn a_rebound_requester_loses_its_old_copy_and_session() {
+    let tokens = TempDir::new().expect("token dir");
+    let token = tokens.path().join("box-a");
+    fs::write(&token, "box-a-token").expect("token");
+    let (runtime, host, _runtime_dir) = bound_agentless_crew(&token).await;
+    let backend = runtime.daemon.resource_backend();
+    let bindings = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE);
+    let binding = bindings.get(BINDING).await.expect("binding");
+    let mut reopened = binding.spec.clone();
+    reopened.opened_at = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + chrono::Duration::seconds(1)));
+    bindings.update(&empty_meta(BINDING), &binding.metadata.resource_version, &reopened).await.expect("rebind");
+
+    reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
+
+    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), None);
+    assert!(provision(&backend).await.is_none());
+    assert!(matches!(
+        backend.using::<TerminalSession>(NAMESPACE).get("terminal-demo-work-coder").await,
+        Err(ResourceError::NotFound { .. })
+    ));
+}
+
+// Acceptance (#3907 sticky): a harness restart re-reads the same binding and redelivers the
+// current generation; a record left at a replaced vessel's place, whose environment is gone,
+// is swept without touching the binding.
+#[tokio::test]
+async fn a_restart_keeps_the_account_and_a_gone_place_is_swept() {
+    let tokens = TempDir::new().expect("token dir");
+    let token = tokens.path().join("box-a");
+    fs::write(&token, "box-a-token").expect("token");
+    let (runtime, _host, _runtime_dir) = bound_agentless_crew(&token).await;
+    let backend = runtime.daemon.resource_backend();
+    let mut old_place = provision(&backend).await.expect("provision");
+    old_place.place = "replaced-vessel-env".into();
+    backend
+        .using::<flotilla_resources::AccountProvision>(NAMESPACE)
+        .create(&empty_meta(&format!("{BINDING}.replaced-vessel-env")), &old_place)
+        .await
+        .expect("old place record");
+
+    let restarted = runtime.launch().await.expect("restart");
+    let token_file = restarted.env_vars.iter().find(|(name, _)| name == "FLOTILLA_CLAUDE_OAUTH_TOKEN_FILE").map(|(_, value)| value.clone());
+    assert_eq!(token_file.as_deref(), Some(format!("{BOUND_HOME}/.flotilla-oauth-token").as_str()));
+    reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
+
+    let provisions = backend.using::<flotilla_resources::AccountProvision>(NAMESPACE).list().await.expect("provisions").items;
+    assert_eq!(provisions.iter().map(|record| record.spec.place.as_str()).collect::<Vec<_>>(), [ENVIRONMENT]);
+    let binding = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE).get(BINDING).await.expect("binding").spec;
+    assert_eq!(binding.credential.0, "claude-box-a");
+}
+
+// Review #3910: a binding homed on another daemon whose clock runs ahead of this place is still
+// delivered from its replica, and the place pass never mistakes the fresh copy for one made
+// before the binding opened.
+#[tokio::test]
+async fn a_replica_binding_from_a_clock_ahead_keeps_its_fresh_copy() {
+    let tokens = TempDir::new().expect("token dir");
+    let token = tokens.path().join("box-a");
+    fs::write(&token, "box-a-token").expect("token");
+    let (runtime, host, _runtime_dir) = bound_agentless_crew_with(&token, Some(("udder-root", chrono::Duration::hours(1)))).await;
+    let backend = runtime.daemon.resource_backend();
+    let delivered = provision(&backend).await.expect("provision recorded at launch");
+    assert_eq!(delivered.binding.home, "udder-root", "the provision names the binding's home");
+
+    reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
+
+    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
+    assert_eq!(provision(&backend).await, Some(delivered));
+    assert!(backend.using::<TerminalSession>(NAMESPACE).get("terminal-demo-work-coder").await.is_ok(), "the session keeps running");
 }

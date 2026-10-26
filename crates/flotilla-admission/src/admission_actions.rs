@@ -67,6 +67,32 @@ impl AdmissionActions<'_> {
         Ok(id)
     }
 
+    pub async fn execute_action_convoy_rebind(&self, id: u64, command: &Command) -> Result<u64, String> {
+        let CommandAction::ConvoyRebind { namespace, name, role, account } = &command.action else {
+            return Err("ConvoyRebind action selected the wrong handler".to_string());
+        };
+        let identity = self.events.start(id, command.description().to_string());
+        let namespace = match namespace {
+            Some(namespace) => namespace.clone(),
+            None => self.provisioning_namespace().await,
+        };
+        let result = match flotilla_store::resolve_local_convoy_name(self.resource_backend, &namespace, name).await {
+            Ok(record) => match self.admission.rebind_account(&namespace, &record, role, account.as_deref()).await {
+                Ok(binding) => CommandValue::AccountRebound {
+                    convoy: name.clone(),
+                    role: role.clone(),
+                    credential: binding.credential.0.clone(),
+                    account: binding.account.clone(),
+                    selection: binding.describe_selection(),
+                },
+                Err(message) => CommandValue::Error { message },
+            },
+            Err(message) => CommandValue::Error { message },
+        };
+        self.events.finish(id, identity, result);
+        Ok(id)
+    }
+
     pub async fn execute_action_convoy_start(
         &self,
         id: u64,

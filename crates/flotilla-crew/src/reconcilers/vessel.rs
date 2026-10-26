@@ -143,6 +143,30 @@ impl VesselReconciler {
         }
     }
 
+    /// Why an agent crew must not start yet: its account binding is no longer open.
+    async fn account_wait(&self, convoy: &str, process: &flotilla_resources::CrewSpec) -> Result<Option<String>, ResourceError> {
+        let CrewSource::Agent { selector, .. } = &process.source else { return Ok(None) };
+        let Some(access) = flotilla_agent::adapter::CapabilityTable::seeded()
+            .resolve_selector(selector)
+            .ok()
+            .and_then(|requirement| requirement.account_access().cloned())
+        else {
+            return Ok(None);
+        };
+        let name = flotilla_resources::account_access::binding_name(convoy, &process.role, &access);
+        match self.backend.including_replicas::<flotilla_resources::AccountBinding>(&self.namespace).get(&name).await {
+            Ok(binding) => Ok(binding
+                .object
+                .spec
+                .state
+                .value
+                .reason()
+                .map(|reason| format!("crew `{}` waits: {reason}; `flotilla convoy rebind` opens a new binding", process.role))),
+            Err(ResourceError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
         self.lifecycle_reads = reads;
         self
@@ -1406,6 +1430,11 @@ impl VesselReconciler {
                 Err(ResourceError::NotFound { .. }) => {
                     if !should_start {
                         continue;
+                    }
+                    // #3907: a requester whose binding was revoked waits with the
+                    // reason; only a rebind or a new authorization starts it again.
+                    if let Some(reason) = self.account_wait(&obj.spec.convoy_ref, process).await? {
+                        return Ok(VesselPrepared::provisioning(&placement_policy, placement_decision.clone(), reason, actuations));
                     }
                     let source = match &process.source {
                         CrewSource::Tool { command } => flotilla_resources::TerminalSessionSource::Tool { command: command.clone() },

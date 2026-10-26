@@ -28,6 +28,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
                 source: CredentialSource::Env { name: "TEST_WORK_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Issued,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await

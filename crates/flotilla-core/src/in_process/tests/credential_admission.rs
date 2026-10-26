@@ -16,6 +16,7 @@ use flotilla_store::ResourceBackend;
 use super::support::{create_docker_placement, create_host_direct_placement, set_host_credential_expiry, test_meta};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_admission::account_access::validate_account_access;
 use flotilla_admission::convoy_admission::{
     resolve_workflow_credentials, validate_workflow_credentials, validate_workflow_credentials_with_capabilities,
 };
@@ -97,6 +98,7 @@ async fn grant_resolution_scopes_roles_trust_and_permissions_independently_of_is
                 source: CredentialSource::GithubApp { app_id_path: "app-id".to_string(), private_key_path: "key".to_string() },
                 lifecycle: CredentialLifecycle::Refreshable,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -205,6 +207,7 @@ async fn admission_refuses_mixed_grant_permissions_and_preserves_homogeneous_mod
                     source: CredentialSource::GithubApp { app_id_path: "app-id".into(), private_key_path: "key".into() },
                     lifecycle: CredentialLifecycle::Refreshable,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -274,6 +277,7 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
                 source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -292,14 +296,14 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
             .build()])
         .build();
 
-    let mut without_grant = workflow.clone();
-    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut without_grant)
-        .await
-        .expect("resolve default-deny grants");
-    let error = validate_workflow_credentials(&backend, "flotilla", &without_grant, None)
+    // #3907: the requirement resolves through grants; with none, admission refuses.
+    let error = validate_account_access(&backend, "flotilla", Some("flotilla"), &[], &workflow, None)
         .await
         .expect_err("contained Claude must not reach interactive login without OAuth");
-    assert_eq!(error, "agent adapter `claude-code` requires credential `claude-max`, but no matching CredentialGrant selected it");
+    assert_eq!(
+        error,
+        "agent adapter `claude-code` for role `coder` requires `claude:subscription`, but no CredentialGrant authorizes a credential that supplies it"
+    );
 
     backend
         .clone()
@@ -317,13 +321,23 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
     resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut with_grant)
         .await
         .expect("resolve matching Claude grant");
-    assert_eq!(with_grant.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
+    assert!(with_grant.vessels[0].credential_refs.is_empty(), "a subscription credential is never vessel-wide");
 
     create_docker_placement(&backend, "docker-claude", "host-a", BTreeSet::from(["claude-max".to_string()])).await;
     let placement = backend.using::<PlacementPolicy>("flotilla").get("docker-claude").await.expect("get placement");
     validate_workflow_credentials(&backend, "flotilla", &with_grant, Some(&placement))
         .await
         .expect("matching held OAuth grant admits contained Claude");
+    let alternatives = validate_account_access(&backend, "flotilla", Some("flotilla"), &[], &with_grant, Some(&placement))
+        .await
+        .expect("matching held OAuth grant admits contained Claude");
+    assert_eq!(alternatives[0].usable().into_iter().map(|name| name.0.as_str()).collect::<Vec<_>>(), ["claude-max"]);
+    create_docker_placement(&backend, "docker-bare", "host-b", BTreeSet::new()).await;
+    let bare = backend.using::<PlacementPolicy>("flotilla").get("docker-bare").await.expect("get placement");
+    assert_eq!(
+        validate_account_access(&backend, "flotilla", Some("flotilla"), &[], &with_grant, Some(&bare)).await.expect_err("unheld"),
+        "role `coder` has no usable credential for `claude:subscription`: `claude-max`: host `host-b` does not hold it"
+    );
 }
 
 #[tokio::test]
@@ -339,6 +353,7 @@ async fn harness_bound_credential_reaches_only_vessels_running_that_harness() {
                 source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -370,8 +385,10 @@ async fn harness_bound_credential_reaches_only_vessels_running_that_harness() {
     };
     let mut workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("claude", "claude-code"), vessel("codex", "codex")]).build();
     resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut workflow).await.expect("resolve grants");
-    assert_eq!(workflow.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
-    assert!(workflow.vessels[0].credential_scopes.contains_key("claude-max"));
+    // #3907: the Claude requirement is per requester, never vessel-wide; Codex declares none.
+    assert!(workflow.vessels[0].credential_refs.is_empty());
+    let alternatives = validate_account_access(&backend, "flotilla", Some("flotilla"), &[], &workflow, None).await.expect("alternatives");
+    assert_eq!(alternatives.iter().map(|alternative| alternative.requester.vessel.as_str()).collect::<Vec<_>>(), ["claude"]);
     assert!(workflow.vessels[1].credential_refs.is_empty());
     assert!(workflow.vessels[1].credential_scopes.is_empty());
     create_docker_placement(&backend, "docker-claude", "host-a", BTreeSet::from(["claude-max".to_string()])).await;
@@ -402,6 +419,7 @@ async fn docker_placement_selects_credentials_for_the_effective_contained_stance
                 source: CredentialSource::Env { name: "GITHUB_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -447,6 +465,7 @@ async fn project_grant_entitlement_is_independent_of_vessel_stance() {
                 source: CredentialSource::Env { name: "GITHUB_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -573,6 +592,7 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
                 source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -591,14 +611,14 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
             .build()])
         .build();
 
-    let mut without_grant = workflow.clone();
-    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut without_grant)
-        .await
-        .expect("resolve default-deny grants");
-    let error = validate_workflow_credentials(&backend, "flotilla", &without_grant, None)
+    // #3907: the requirement resolves through grants; with none, admission refuses.
+    let error = validate_account_access(&backend, "flotilla", Some("flotilla"), &[], &workflow, None)
         .await
         .expect_err("trusted Claude must not reach ambient login without delivered OAuth");
-    assert_eq!(error, "agent adapter `claude-code` requires credential `claude-max`, but no matching CredentialGrant selected it");
+    assert_eq!(
+        error,
+        "agent adapter `claude-code` for role `coder` requires `claude:subscription`, but no CredentialGrant authorizes a credential that supplies it"
+    );
 
     backend
         .clone()
@@ -616,7 +636,7 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
     resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut with_grant)
         .await
         .expect("resolve matching trusted Claude grant");
-    assert_eq!(with_grant.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
+    assert!(with_grant.vessels[0].credential_refs.is_empty(), "a subscription credential is never vessel-wide");
 
     create_docker_placement(&backend, "host-claude", "host-a", BTreeSet::from(["claude-max".to_string()])).await;
     let placement = backend.using::<PlacementPolicy>("flotilla").get("host-claude").await.expect("get placement");
@@ -628,6 +648,9 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
     )
     .await;
     validate_workflow_credentials(&backend, "flotilla", &with_grant, Some(&placement))
+        .await
+        .expect("delivered OAuth admits trusted Claude despite an expired ambient login");
+    validate_account_access(&backend, "flotilla", Some("flotilla"), &[], &with_grant, Some(&placement))
         .await
         .expect("delivered OAuth admits trusted Claude despite an expired ambient login");
 }
@@ -681,6 +704,7 @@ async fn dispatch_against_an_expired_credential_is_refused_with_the_credential_a
                 source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await

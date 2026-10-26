@@ -252,6 +252,7 @@ pub async fn build_plan(
         | CommandAction::ConvoyLink { .. }
         | CommandAction::ConvoyUnlink { .. }
         | CommandAction::ConvoyAbandon { .. }
+        | CommandAction::ConvoyRebind { .. }
         | CommandAction::ConvoyResume { .. }
         | CommandAction::ConvoyWithdrawPendingBrief { .. }
         | CommandAction::CrewPromise { .. }

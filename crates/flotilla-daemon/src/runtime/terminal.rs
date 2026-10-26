@@ -34,6 +34,7 @@ use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, T
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use super::account_access::{deliver_bound_account, AccountLaunch};
 use super::agentless_vessels::{apply_reach_environment, compose_session_environment, vessel_base, VesselAccess};
 use super::credentials::{agent_material_environment, RuntimeSessionCapabilities};
 use super::state::ControllerRuntimeState;
@@ -474,6 +475,25 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 } else {
                     self.state.daemon.vcs_for_checkout(&EnvironmentId::new(&spec.env_ref), cwd.as_path()).await?
                 };
+                // #3907: a requester whose item declares account access starts
+                // only in the home its binding delivers, before any harness home
+                // below is derived from it.
+                if let Some(access) = requirement.account_access() {
+                    let launch = AccountLaunch {
+                        namespace: &context.namespace,
+                        convoy: &context.convoy,
+                        role: &spec.role,
+                        env_ref: &spec.env_ref,
+                        agentless: agentless.is_some(),
+                    };
+                    let bound = deliver_bound_account(&self.state, &launch, access, launch_runner()?).await?;
+                    credential_env.retain(|(key, _)| !bound.iter().any(|(name, _)| name == key));
+                    // #3913: the binding's home and token file are the crew's bound
+                    // layer; the prepared context sets them from there.
+                    bound_material.retain(|(key, _)| !bound.iter().any(|(name, _)| name == key));
+                    bound_material.extend(bound.iter().cloned());
+                    credential_env.extend(bound);
+                }
                 if let Some(material) = &self.state.agent_material {
                     let environment =
                         self.state.daemon.resource_backend().including_replicas::<Environment>(&context.namespace).get(&spec.env_ref).await;
@@ -492,13 +512,6 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 // #3655: an agentless crew's harness home is flotilla-owned and
                 // lives on the host, under its runner's writable base.
                 if agentless.is_some() {
-                    if requirement.adapter == "claude-code" && !credential_env.iter().any(|(key, _)| key == "CLAUDE_CODE_OAUTH_TOKEN") {
-                        return Err(format!(
-                            "agentless Claude Code crews on {} require a delivered Claude OAuth credential (grant a `claude-oauth` \
-                             credential to the crew); the host login's own Claude configuration is not used",
-                            spec.env_ref
-                        ));
-                    }
                     let material = self
                         .state
                         .agent_material

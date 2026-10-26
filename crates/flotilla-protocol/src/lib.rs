@@ -285,11 +285,12 @@ pub use commands::{
     AgentOverride, AttachBinding, CheckoutArchiveOutcome, CheckoutArchiveStatus, CheckoutSelector, CheckoutStatus, CheckoutTarget,
     CliListKind, CliListResponse, CliListRow, Command, CommandAction, CommandValue, ConvoyAutoAttach, ConvoyContinuation,
     ConvoyDispatchRegard, ConvoyExplanation, ConvoyNaming, ConvoyStartIntent, CrewSupervisionAction, DispatchPromiseRequest,
-    EvidenceFreshness, ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery,
-    ExplainedDecisionLedger, ExplainedEvent, ExplainedLeafFiring, ExplainedLifecycleMutation, ExplainedSettlement, ExplainedSubscription,
-    ExplainedTerminalCondition, ExplainedUnclaimedWork, ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PromiseOwner,
-    RepoSelector, ResourceCursor, ResourceDigest, ResourceDigestQuery, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
-    ResourceRecordProvenance, ResourceRecordType, StallProposedDisposition, StallReason, StepStatus, TurnDeliveryRung,
+    EvidenceFreshness, ExplainedAccountBinding, ExplainedAccountProvision, ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout,
+    ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent, ExplainedLeafFiring, ExplainedLifecycleMutation,
+    ExplainedSettlement, ExplainedSubscription, ExplainedTerminalCondition, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
+    IssueSelector, ManifestResolution, PromiseOwner, RepoSelector, ResourceCursor, ResourceDigest, ResourceDigestQuery,
+    ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StallProposedDisposition,
+    StallReason, StepStatus, TurnDeliveryRung,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{

@@ -1,4 +1,5 @@
 //! Agent harness adapters, hook handling, agent state and process-exit receipts.
+pub mod account_access;
 pub mod adapter;
 pub mod attachable;
 pub mod hooks;

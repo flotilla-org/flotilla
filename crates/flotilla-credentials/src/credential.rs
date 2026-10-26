@@ -1624,6 +1624,19 @@ impl CredentialStore {
         current.record_refresh_failure(self.clock.now())
     }
 
+    /// A bound credential's current declaration and material, for its account binding's delivery
+    /// (#3907). The material goes only to the plan's delivery; it is never logged or stored.
+    pub async fn account_material(&self, name: &str) -> Result<(CredentialSpecSpec, String), String> {
+        let spec = self.spec(name).await?;
+        let material = self.resolve(name, &spec).await?;
+        Ok((spec, material.trim().to_string()))
+    }
+
+    /// The writable base a runner's deliveries live under.
+    pub async fn writable_base(&self, runner: &dyn CommandRunner) -> Result<PathBuf, String> {
+        Ok(self.delivery_paths(runner).await?.base)
+    }
+
     async fn spec(&self, name: &str) -> Result<CredentialSpecSpec, String> {
         self.backend.clone().definitions::<CredentialSpec>(&self.namespace).get(name).await.map(|object| object.spec).map_err(|error| {
             match error {
@@ -2598,6 +2611,7 @@ mod tests {
                     },
                     lifecycle: CredentialLifecycle::Refreshable,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -2737,6 +2751,7 @@ mod tests {
                     source: CredentialSource::Env { name: "TEST_TOKEN".into() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: Default::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -2776,6 +2791,7 @@ mod tests {
                     source: CredentialSource::Env { name: "ABSENT_REGISTRY_TOKEN".into() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: Default::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -2860,6 +2876,7 @@ mod tests {
                         source: CredentialSource::GithubApp { app_id_path: "/host/id".into(), private_key_path: "/host/key".into() },
                         lifecycle: CredentialLifecycle::Refreshable,
                         placement: Default::default(),
+                        authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                     },
                 )
                 .await
@@ -3253,6 +3270,7 @@ mod tests {
             source: CredentialSource::GithubApp { app_id_path: "/host/app-id".to_string(), private_key_path: "/host/key".to_string() },
             lifecycle: CredentialLifecycle::Refreshable,
             placement: CredentialPlacementRequirements::default(),
+            authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
         };
         let scope = BTreeSet::from([repository.key()]);
         for permissions in [
@@ -3326,6 +3344,7 @@ mod tests {
                     },
                     lifecycle: CredentialLifecycle::Refreshable,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -3857,6 +3876,7 @@ mod tests {
                     },
                     lifecycle: CredentialLifecycle::Refreshable,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -3984,6 +4004,7 @@ interactions:
                     },
                     lifecycle: CredentialLifecycle::Refreshable,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -4093,6 +4114,7 @@ interactions:
                     },
                     lifecycle: CredentialLifecycle::Refreshable,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -4344,6 +4366,7 @@ interactions:
                     },
                     lifecycle: CredentialLifecycle::Refreshable,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -4516,6 +4539,7 @@ interactions:
                     },
                     lifecycle: CredentialLifecycle::Refreshable,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -4624,6 +4648,7 @@ interactions:
                     },
                     lifecycle: CredentialLifecycle::Refreshable,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -4698,6 +4723,7 @@ interactions:
             },
             lifecycle: CredentialLifecycle::Refreshable,
             placement: CredentialPlacementRequirements::default(),
+            authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
         };
 
         for scope in [None, Some(&BTreeSet::new())] {
@@ -4787,6 +4813,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_OPENAI_KEY".to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -5060,6 +5087,7 @@ interactions:
                     source: CredentialSource::Env { name: source_env.to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -5152,6 +5180,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_ANTHROPIC_KEY".to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -5208,6 +5237,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
                     lifecycle: CredentialLifecycle::Refreshable,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -5301,6 +5331,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_OPENAI_KEY".to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -5372,6 +5403,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
                     lifecycle: CredentialLifecycle::Issued,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -5442,6 +5474,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -5492,6 +5525,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -5559,6 +5593,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -5603,6 +5638,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -5674,6 +5710,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_REVIEW_STORE_CREDENTIAL".to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -5720,6 +5757,7 @@ interactions:
                     source: CredentialSource::Env { name: source_env.to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -5879,6 +5917,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -5932,6 +5971,7 @@ interactions:
                         source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
                         lifecycle: CredentialLifecycle::Static,
                         placement: CredentialPlacementRequirements::default(),
+                        authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                     },
                 )
                 .await
@@ -6001,6 +6041,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -6044,6 +6085,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -6089,6 +6131,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".into() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: Default::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -6171,6 +6214,7 @@ interactions:
                         source: CredentialSource::Env { name: env.into() },
                         lifecycle: CredentialLifecycle::Static,
                         placement: Default::default(),
+                        authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                     },
                 )
                 .await
@@ -6301,6 +6345,7 @@ interactions:
                     source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".into() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: Default::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await

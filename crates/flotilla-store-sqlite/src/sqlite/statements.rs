@@ -44,7 +44,7 @@ const GENERATED_SHAPES: usize = REGISTERED_KINDS * 4;
 
 /// Registered kinds the generated-shape budget was sized for;
 /// `statement_cache_budget_covers_the_fixed_set` fails when the registry grows.
-const REGISTERED_KINDS: usize = 36;
+const REGISTERED_KINDS: usize = 38;
 
 /// `MessageQuery` shapes: five variants over two tables.
 const MESSAGE_QUERY_SHAPES: usize = 10;

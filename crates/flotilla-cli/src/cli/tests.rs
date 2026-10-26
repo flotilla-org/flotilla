@@ -291,6 +291,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
             },
         ],
         settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
+        account_bindings: Vec::new(),
     };
 
     // Every claim renders the active-process marker, including a superseded
@@ -309,6 +310,45 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         assert!(format_convoy_explanation_human(&named).contains(expected));
     }
     assert!(format_convoy_explanation_human(&explanation).contains("Naming: unknown (not recorded)"));
+    // Glue (#3907): explain names each requester's account, how it was chosen, the
+    // exclusions and where it is provisioned, and a revoked binding's reason.
+    let mut accounts = explanation.clone();
+    accounts.account_bindings = vec![flotilla_protocol::ExplainedAccountBinding {
+        binding: "c1.coder.claude-subscription".into(),
+        role: "coder".into(),
+        requirement: "claude:subscription".into(),
+        credential: "claude-jseo-oauth".into(),
+        account: Some("jseo@example.com".into()),
+        state: "revoked".into(),
+        reason: Some("binding revoked: no authorizing grant".into()),
+        delivered_until: Some("2026-10-26T12:00:00+00:00".into()),
+        selection: "drawn: 2 of 6 usable".into(),
+        candidates: vec!["claude-jseo-oauth".into(), "claude-max".into()],
+        exclusions: BTreeMap::from([("claude-max".into(), "host `b1` does not hold it".into())]),
+        grants: vec!["claude-box-accounts".into()],
+        epochs: vec!["1".into(), "2".into()],
+        provisions: vec![flotilla_protocol::ExplainedAccountProvision {
+            place: "env-b1".into(),
+            environment_kind: "agentless-ssh".into(),
+            implementation: "claude-direct".into(),
+            effective_access: "account".into(),
+            mechanism: "oauth-token-file:CLAUDE_CONFIG_DIR".into(),
+            update_mode: "push".into(),
+            home: "/state/agent-homes/requesters/c1/coder/claude".into(),
+            delivered_epoch: Some("2".into()),
+            delivered_generation: Some("0123456789abcdef".into()),
+        }],
+    }];
+    let rendered = format_convoy_explanation_human(&accounts);
+    for expected in [
+        "Account for coder: claude-jseo-oauth (jseo@example.com) [revoked] for claude:subscription, drawn: 2 of 6 usable",
+        "  Reason: binding revoked: no authorizing grant; directly delivered until 2026-10-26T12:00:00+00:00",
+        "  Grants: claude-box-accounts; epochs: 1 -> 2",
+        "  Excluded claude-max: host `b1` does not hold it",
+        "  Provisioned at env-b1 (agentless-ssh): claude-direct oauth-token-file:CLAUDE_CONFIG_DIR into /state/agent-homes/requesters/c1/coder/claude, update push, delivered epoch 2",
+    ] {
+        assert!(rendered.contains(expected), "{expected}\n{rendered}");
+    }
     let mut all_active = explanation.clone();
     for ledger in &mut all_active.decision_ledgers {
         ledger.completed_while_crew_active = true;
@@ -479,6 +519,7 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
         recent_events: Vec::new(),
         lifecycle_mutations: Vec::new(),
+        account_bindings: Vec::new(),
     };
 
     let output = format_convoy_explanation_human(&explanation);
