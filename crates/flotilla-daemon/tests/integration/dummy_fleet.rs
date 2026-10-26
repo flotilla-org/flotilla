@@ -1028,18 +1028,19 @@ impl DummyDaemon {
     // A replica may consume a later edge before the driver checks its earlier
     // snapshot. Exercise that ordering without depending on teardown timing.
     fn advance_transport_ensure(&self) {
+        use flotilla_engine_store::{open_home, StoreLog};
+        use flotilla_schema::Timestamp;
         use flotilla_state_machines::{
             machines::ensure::{Ensure, MemoryEnsureWorld, Record},
             Ref,
         };
         let service = self.daemon.decided_store().expect("store");
-        let mut home =
-            flotilla_engine_store::open_home::<Ensure>(flotilla_engine_store::StoreLog::new(service.store())).expect("ensure home");
+        let mut home = open_home::<Ensure>(StoreLog::new(service.store())).expect("ensure home");
         home.apply(
             "transport-ensure",
             Record { fulfiller: Ref::new("later-transport-generation") },
             &MemoryEnsureWorld::default(),
-            flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()),
+            Timestamp::from_datetime(&chrono::Utc::now()),
         )
         .expect("advance transport ensure");
     }
@@ -1144,6 +1145,8 @@ async fn on_the_engine_two_daemons_replicate_every_kind_alongside_the_old_replic
         let mut mismatch = None;
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
+                // The source and replica reads are not atomic. A replica newer
+                // than this cut fails equality and is checked again next poll.
                 let current = source.engine_snapshots();
                 let complete = destination
                     .daemon
@@ -1157,9 +1160,19 @@ async fn on_the_engine_two_daemons_replicate_every_kind_alongside_the_old_replic
                                 .find(|snapshot| {
                                     snapshot.kind == minimum.kind && snapshot.name == minimum.name && snapshot.home == minimum.home
                                 })
-                                .expect("source retains the transport record");
-                            assert!(snapshot.version >= minimum.version, "source versions never regress");
-                            let Some(id) = read.resolve(snapshot.kind, &snapshot.name, &snapshot.home)? else { return Ok(false) };
+                                .unwrap_or_else(|| panic!("source retains transport record {} {}", minimum.kind, minimum.name));
+                            assert!(
+                                snapshot.version >= minimum.version,
+                                "source version regressed for {} {}: {} < {}",
+                                minimum.kind,
+                                minimum.name,
+                                snapshot.version,
+                                minimum.version
+                            );
+                            let Some(id) = read.resolve(snapshot.kind, &snapshot.name, &snapshot.home)? else {
+                                mismatch = Some((snapshot.kind, snapshot.name.clone(), snapshot.version, None));
+                                return Ok(false);
+                            };
                             let actual = read.load_snapshot(id)?;
                             if actual.as_ref() != Some(snapshot) {
                                 mismatch =
