@@ -915,7 +915,8 @@ async fn built_in_definitions_are_read_from_the_code_and_never_written(#[case] a
     use flotilla_resources::{builtins::builtin_definitions, ImageLayer, WorkflowTemplate};
     let (backend, _server) = backend(adapter).await;
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
-    let builtin_names = |kind: &str| builtin_definitions(kind).iter().map(|builtin| builtin.name.clone()).collect::<Vec<_>>();
+    let builtin_names =
+        |kind: &str| builtin_definitions(kind).expect("built-ins load").iter().map(|builtin| builtin.name.clone()).collect::<Vec<_>>();
     let template_names = builtin_names("WorkflowTemplate");
     assert!(template_names.contains(&"single-agent".to_string()));
     let single = templates.get("single-agent").await.expect("a built-in reads with nothing stored");
@@ -923,7 +924,11 @@ async fn built_in_definitions_are_read_from_the_code_and_never_written(#[case] a
     assert_eq!(single.metadata.resource_version, flotilla_store::BUILTIN_VERSION);
     // A user template reads beside the built-ins; listing and a named read see both.
     let user = flotilla_resources::single_agent_workflow_spec();
-    templates.apply(&InputMeta::builder().name("variant".to_string()).build(), &user).await.expect("a new name is stored");
+    let labelled = BTreeMap::from([("team".to_string(), "alpha".to_string())]);
+    templates
+        .apply(&InputMeta::builder().name("variant".to_string()).labels(labelled.clone()).build(), &user)
+        .await
+        .expect("a new name is stored");
     let mut listed: Vec<_> = templates.list().await.expect("list").into_iter().map(|template| template.metadata.name).collect();
     listed.sort();
     let mut expected = template_names.clone();
@@ -932,9 +937,14 @@ async fn built_in_definitions_are_read_from_the_code_and_never_written(#[case] a
     assert_eq!(listed, expected);
     let named = templates.list_names(["single-agent".to_string(), "variant".to_string()]).await.expect("named");
     assert_eq!(named.len(), 2);
+    // A selection by label is a semijoin over stored rows: it selects stored definitions only.
+    let selected = templates.list_selected(flotilla_store::StoreQuery::labels(&labelled, true, false)).await.expect("selected");
+    assert_eq!(selected.into_iter().map(|template| template.metadata.name).collect::<Vec<_>>(), ["variant"]);
     // Writes under a built-in's name are refused, whatever the path.
     let refused = templates.apply(&InputMeta::builder().name("single-agent".to_string()).build(), &user).await;
     assert!(matches!(refused, Err(ResourceError::Invalid { .. })), "{refused:?}");
+    let created = templates.create(&InputMeta::builder().name("implement-review".to_string()).build(), &user).await;
+    assert!(matches!(created, Err(ResourceError::Invalid { .. })), "{created:?}");
     assert!(templates.delete("single-agent").await.is_err());
     assert!(templates.update_metadata(&InputMeta::builder().name("single-agent".to_string()).build()).await.is_err());
     // A copy an earlier generation seeded under a built-in's name is shadowed by the built-in.

@@ -45,10 +45,13 @@ impl<T: Resource> DefinitionResolver<T> {
 
     pub async fn get(&self, name: &str) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
-        if let Some(builtin) =
-            builtin_objects::<T>(T::API_PATHS.kind, &self.namespace)?.into_iter().find(|object| object.metadata.name == name)
-        {
-            return Ok(builtin);
+        // Decode the built-ins only for a built-in's name.
+        if flotilla_resources::builtins::is_builtin(T::API_PATHS.kind, name) {
+            if let Some(builtin) =
+                builtin_objects::<T>(T::API_PATHS.kind, &self.namespace)?.into_iter().find(|object| object.metadata.name == name)
+            {
+                return Ok(builtin);
+            }
         }
         if self.backend.serves_read_views() {
             return self.backend.using::<T>(&self.namespace).get(name).await;
@@ -399,6 +402,7 @@ pub(crate) fn merge_cached_definitions<T: Resource>(
 /// stored, so their version is fixed and they carry no merge metadata.
 pub(crate) fn builtin_objects<T: Resource>(kind: &str, namespace: &str) -> Result<Vec<ResourceObject<T>>, ResourceError> {
     flotilla_resources::builtins::builtin_definitions(kind)
+        .map_err(ResourceError::invalid)?
         .iter()
         .map(|builtin| {
             let spec = serde_json::from_value::<T::Spec>(builtin.spec.clone())

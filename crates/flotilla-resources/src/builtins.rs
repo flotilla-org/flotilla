@@ -28,12 +28,12 @@ fn definition(name: String, manager: &str, spec: Value) -> BuiltinDefinition {
 }
 
 /// The built-in definitions of `kind` (by its API kind name), in name order; none for a kind with
-/// no built-ins.
-pub fn builtin_definitions(kind: &str) -> &'static [BuiltinDefinition] {
+/// no built-ins. Refused with the cause when the release's built-ins of the kind do not load.
+pub fn builtin_definitions(kind: &str) -> Result<&'static [BuiltinDefinition], String> {
     static TEMPLATES: OnceLock<Vec<BuiltinDefinition>> = OnceLock::new();
     static LAYERS: OnceLock<Vec<BuiltinDefinition>> = OnceLock::new();
     match kind {
-        "WorkflowTemplate" => TEMPLATES.get_or_init(|| {
+        "WorkflowTemplate" => Ok(TEMPLATES.get_or_init(|| {
             let mut templates: Vec<_> = builtin_workflow_templates()
                 .into_iter()
                 .map(|(name, spec)| {
@@ -42,23 +42,30 @@ pub fn builtin_definitions(kind: &str) -> &'static [BuiltinDefinition] {
                 .collect();
             templates.sort_by(|left, right| left.name.cmp(&right.name));
             templates
-        }),
-        "ImageLayer" => LAYERS.get_or_init(|| {
-            let mut layers: Vec<_> = stdlib_image_layers()
-                .iter()
-                .map(|layer| {
-                    let spec = ImageLayerResourceSpec::from(layer.clone());
-                    definition(layer.resource_name(), STDLIB_MANAGER, serde_json::to_value(spec).expect("a layer serializes"))
-                })
-                .collect();
-            layers.sort_by(|left, right| left.name.cmp(&right.name));
-            layers
-        }),
-        _ => &[],
+        })),
+        "ImageLayer" => {
+            let stdlib = stdlib_image_layers().map_err(|error| format!("the shipped stdlib image layers do not parse: {error}"))?;
+            Ok(LAYERS.get_or_init(|| {
+                let mut layers: Vec<_> = stdlib
+                    .iter()
+                    .map(|layer| {
+                        let spec = ImageLayerResourceSpec::from(layer.clone());
+                        definition(layer.resource_name(), STDLIB_MANAGER, serde_json::to_value(spec).expect("a layer serializes"))
+                    })
+                    .collect();
+                layers.sort_by(|left, right| left.name.cmp(&right.name));
+                layers
+            }))
+        }
+        _ => Ok(&[]),
     }
 }
 
-/// Whether `name` is a built-in definition of `kind`.
+/// Whether `name` is a built-in definition of `kind`. A stdlib layer's name is one whatever the
+/// release's layers load, so a write can never take one.
 pub fn is_builtin(kind: &str, name: &str) -> bool {
-    builtin_definitions(kind).iter().any(|definition| definition.name == name)
+    match builtin_definitions(kind) {
+        Ok(definitions) => definitions.iter().any(|definition| definition.name == name),
+        Err(_) => kind == "ImageLayer" && name.starts_with("stdlib-"),
+    }
 }

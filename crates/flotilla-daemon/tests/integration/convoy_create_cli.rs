@@ -295,6 +295,32 @@ async fn workflow_template_apply_creates_then_updates() {
     assert_eq!(v2_command, "echo updated");
 }
 
+// Behaviour (#3824 layer 2a): applying a template under a built-in's name is refused with the
+// reason, and the built-in reads unchanged: nothing is stored for the built-in to shadow.
+#[tokio::test]
+async fn workflow_template_apply_refuses_a_built_in_name() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+    let mut rx = daemon.subscribe();
+    let id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::WorkflowTemplateApply {
+                    name: "single-agent".into(),
+                    spec_yaml: "vessels:\n  - name: only\n    crew:\n      - role: shell\n        command: 'echo mine'\n".into(),
+                })
+                .build(),
+        )
+        .await
+        .expect("execute");
+    let result = await_command_result(&mut rx, id).await;
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("built in and read-only")),
+        "expected the built-in refusal, got {result:?}"
+    );
+    let read = backend.definitions::<WorkflowTemplate>("flotilla").get("single-agent").await.expect("built-in");
+    assert_eq!(read.spec, flotilla_resources::single_agent_workflow_spec());
+}
+
 #[tokio::test]
 async fn workflow_template_apply_rejects_invalid_yaml() {
     let (daemon, _backend, _config, _runtime, _tmp) = start_daemon().await;

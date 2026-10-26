@@ -37,15 +37,14 @@ pub fn parse_stdlib_layers(directories: &[EmbeddedLayerDirectory]) -> Result<Vec
 }
 
 /// This release's stdlib layers, parsed once. A release whose stdlib does not parse is a
-/// packaging error the shipped-catalogue test catches; at run time it reads as no stdlib.
-pub fn stdlib_image_layers() -> &'static [ImageLayerSpec] {
-    static LAYERS: OnceLock<Vec<ImageLayerSpec>> = OnceLock::new();
-    LAYERS.get_or_init(|| {
-        parse_stdlib_layers(STDLIB_IMAGE_LAYERS).unwrap_or_else(|error| {
-            tracing::error!(%error, "the shipped stdlib image layers do not parse");
-            Vec::new()
-        })
-    })
+/// packaging error the shipped-catalogue test catches; were one to ship, every read of a built-in
+/// layer refuses with the parse error, never an empty stdlib.
+pub fn stdlib_image_layers() -> Result<&'static [ImageLayerSpec], &'static str> {
+    static LAYERS: OnceLock<Result<Vec<ImageLayerSpec>, String>> = OnceLock::new();
+    match LAYERS.get_or_init(|| parse_stdlib_layers(STDLIB_IMAGE_LAYERS)) {
+        Ok(layers) => Ok(layers),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
