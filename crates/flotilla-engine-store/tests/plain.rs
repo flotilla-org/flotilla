@@ -184,3 +184,21 @@ fn sample_keeps_the_plain_contract(tc: TestCase) {
     register_plain::<Sample>(&mut kinds).expect("register");
     contract(&tc, kinds, sample);
 }
+
+// Behaviour (ADR 0064, #3392 G9): a delete keeps the identity as a tombstone, and a create of the
+// same name afterwards reuses it at a new version, which a replica applies after the delete.
+#[test]
+fn a_deleted_name_is_created_again_at_a_new_version() {
+    let mut kinds = KindRegistry::new();
+    register_plain::<Sample>(&mut kinds).expect("register");
+    let (home, replica) = (open(HOME, &kinds), open(REPLICA, &kinds));
+    let log = PlainLog::new(Arc::clone(&home));
+    let spec = Sample { title: "a".into(), owner: "b".into(), limit: None, tags: Vec::new() };
+    let first = log.create("one", &spec, "writer", Timestamp::from_micros(1)).expect("create");
+    log.delete::<Sample>("one", first, "writer", Timestamp::from_micros(2)).expect("delete");
+    let second = log.create("one", &spec, "writer", Timestamp::from_micros(3)).expect("create again");
+    assert!(second > first);
+    follow(&home, &replica, 0);
+    let again = PlainLog::new(replica).get::<Sample>("one", HOME).expect("replica get");
+    assert_eq!(again, Some(Plain { name: "one".into(), home: HOME.into(), version: second, spec }));
+}
