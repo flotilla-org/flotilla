@@ -1025,6 +1025,25 @@ impl DummyDaemon {
             .expect("ensure record");
     }
 
+    // A replica may consume a later edge before the driver checks its earlier
+    // snapshot. Exercise that ordering without depending on teardown timing.
+    fn advance_transport_ensure(&self) {
+        use flotilla_state_machines::{
+            machines::ensure::{Ensure, MemoryEnsureWorld, Record},
+            Ref,
+        };
+        let service = self.daemon.decided_store().expect("store");
+        let mut home =
+            flotilla_engine_store::open_home::<Ensure>(flotilla_engine_store::StoreLog::new(service.store())).expect("ensure home");
+        home.apply(
+            "transport-ensure",
+            Record { fulfiller: Ref::new("later-transport-generation") },
+            &MemoryEnsureWorld::default(),
+            flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()),
+        )
+        .expect("advance transport ensure");
+    }
+
     fn engine_snapshots(&self) -> Vec<flotilla_schema_sqlite::Snapshot> {
         use flotilla_provisioning::stored::{
             checkout::Checkout, clone::Clone, environment::Environment, image_build::ImageBuild, terminal_session::TerminalSession,
@@ -1119,18 +1138,32 @@ async fn on_the_engine_two_daemons_replicate_every_kind_alongside_the_old_replic
     b.seed_transport_kinds();
     let expected_a = a.engine_snapshots();
     let expected_b = b.engine_snapshots();
+    a.advance_transport_ensure();
+    b.advance_transport_ensure();
     for (source, destination, expected) in [(&a, &b, &expected_a), (&b, &a, &expected_b)] {
+        let mut mismatch = None;
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
+                let current = source.engine_snapshots();
                 let complete = destination
                     .daemon
                     .decided_store()
                     .expect("store")
                     .with_store(|store| {
                         let mut read = store.read()?;
-                        for snapshot in expected {
+                        for minimum in expected {
+                            let snapshot = current
+                                .iter()
+                                .find(|snapshot| {
+                                    snapshot.kind == minimum.kind && snapshot.name == minimum.name && snapshot.home == minimum.home
+                                })
+                                .expect("source retains the transport record");
+                            assert!(snapshot.version >= minimum.version, "source versions never regress");
                             let Some(id) = read.resolve(snapshot.kind, &snapshot.name, &snapshot.home)? else { return Ok(false) };
-                            if read.load_snapshot(id)?.as_ref() != Some(snapshot) {
+                            let actual = read.load_snapshot(id)?;
+                            if actual.as_ref() != Some(snapshot) {
+                                mismatch =
+                                    Some((snapshot.kind, snapshot.name.clone(), snapshot.version, actual.map(|value| value.version)));
                                 return Ok(false);
                             }
                         }
@@ -1144,7 +1177,7 @@ async fn on_the_engine_two_daemons_replicate_every_kind_alongside_the_old_replic
             }
         })
         .await
-        .expect("every engine kind replicates through the peer runtime");
+        .unwrap_or_else(|error| panic!("every engine kind replicates through the peer runtime: {error}; mismatch={mismatch:?}"));
         assert_old_inventory::<flotilla_resources::Convoy>(source, destination, Replicated).await;
         assert_old_inventory::<flotilla_resources::Vessel>(source, destination, Replicated).await;
         assert_old_inventory::<flotilla_resources::Environment>(source, destination, HomeLocal).await;
