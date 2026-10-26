@@ -455,10 +455,6 @@ pub struct AgentRequirement {
 
 const CLAUDE_CODE_ADAPTER_ID: &str = "claude-code";
 
-/// Token sources that would compete with a Claude plan's own. Claude's precedence among them is
-/// unverified (#3882 "Unknown precedence stays unknown"), so a bound launch clears them.
-const CLAUDE_COMPETING_TOKEN_SOURCES: &[&str] = &["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
-
 /// The requester's bound Claude home and its token file. A Claude harness without both is
 /// refused: nothing falls through to `~/.claude` or an ambient token (#3907 contract 8).
 fn bound_claude_home(environment: &TerminalEnvVars) -> Result<(&str, &str), String> {
@@ -878,7 +874,9 @@ impl AgentAdapter for CliAgentAdapter {
             // #3907: the harness home is always the requester's bound home, and
             // the plan's token file is its only token source.
             let token_file = bound_claude_home(&env)?.1.to_string();
-            env.retain(|(name, _)| !CLAUDE_COMPETING_TOKEN_SOURCES.contains(&name.as_str()));
+            // Other token sources would compete with the plan's own (#3882 "Unknown precedence
+            // stays unknown"), so a bound launch clears the family's declared secrets.
+            env.retain(|(name, _)| !CLAUDE_CODE_ACCOUNT_STATE.secrets.contains(&name.as_str()));
             command = format!("{} {command}", crate::account_access::claude_token_prefix(&token_file));
         }
         Ok(AgentLaunchPlan { command, env, stance: TRUSTED_IMPLICIT_STANCE.into() })
@@ -1230,7 +1228,7 @@ pub trait AgentAdapterFactory: Send + Sync {
 /// authenticate it directly.
 pub const CLAUDE_CODE_ACCOUNT_STATE: AccountState = AccountState::new("claude-code")
     .homes(&["CLAUDE_CONFIG_DIR"])
-    .secrets(&["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", crate::account_access::CLAUDE_OAUTH_TOKEN_FILE_ENV])
+    .secrets(&["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"])
     .observation_defaults(&[("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")]);
 
 /// Codex's login and configuration home, and the variables that authenticate
