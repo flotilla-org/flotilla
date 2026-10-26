@@ -10,11 +10,11 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use flotilla_engine_store::StoreLog;
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Origin, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
-    machines::convoy::{Convoy, ConvoyEdge, ConvoyRefusal, ConvoyRequest, MemoryConvoyWorld},
-    Edge as _, Home, Resource, Version, WriteError,
+    machines::convoy::{Convoy, ConvoyEdge, ConvoyLabel, ConvoyRefusal, ConvoyRequest, MemoryConvoyWorld},
+    Edge as _, Home, LogError, Resource, Version, WriteError,
 };
 
 /// This home's Convoy records and the world their gates read.
@@ -107,12 +107,58 @@ impl Convoys {
     /// Admits `name`, unless a Convoy of that name is already homed here
     /// (`Ok(false)`). A refusal is the machine's, as `Err`.
     pub fn admit(&self, name: &str, request: ConvoyRequest, now: Timestamp) -> Result<bool, WriteError<Convoy>> {
+        self.admit_generation(name, request, now, false)
+    }
+
+    /// Admit a standing generation, retiring an ended generation's live rows.
+    /// Delete and create share a transaction; the per-home log retains both.
+    pub fn admit_standing(&self, name: &str, request: ConvoyRequest, now: Timestamp) -> Result<bool, WriteError<Convoy>> {
+        self.admit_generation(name, request, now, true)
+    }
+
+    fn admit_generation(
+        &self,
+        name: &str,
+        request: ConvoyRequest,
+        now: Timestamp,
+        replace_ended: bool,
+    ) -> Result<bool, WriteError<Convoy>> {
         let mut home = locked(&self.home);
-        if home.get(name).is_some() {
+        let world = locked(&self.world);
+        let Some(previous) = home.get(name) else {
+            home.create(name, request, &*world, now)?;
+            return Ok(true);
+        };
+        if !replace_ended || previous.label() == ConvoyLabel::Open {
             return Ok(false);
         }
-        let world = locked(&self.world);
-        home.create(name, request, &*world, now)?;
+        // Validate admission before retiring anything. A gate or store refusal
+        // leaves the ended generation intact in memory and on disk.
+        let mut fresh = Home::<Convoy>::new(&self.home_name)
+            .map_err(|errors| WriteError::Log(LogError::new(format!("Convoy definition: {errors:?}"))))?;
+        let created = fresh.create(name, request, &*world, now)?;
+        let resource = created.resource.clone();
+        let origin =
+            Origin::new(&self.home_name, now).with_payload(&created.reads).map_err(|error| WriteError::Log(LogError::new(error)))?;
+        let version = self
+            .service
+            .with_store(|store| {
+                let loaded = {
+                    let mut read = store.read()?;
+                    let id =
+                        read.resolve(<Resource<Convoy> as flotilla_schema::Kind>::CODE, name, &self.home_name)?.expect("resident identity");
+                    read.load::<Resource<Convoy>>(id)?
+                }
+                .expect("resident convoy is stored");
+                let mut write = store.write()?;
+                write.delete::<Resource<Convoy>>(loaded.stamp(), &origin)?;
+                let stamp = write.insert(name, &resource, &origin)?;
+                write.commit()?;
+                Ok(stamp.version)
+            })
+            .map_err(|error| WriteError::Log(LogError::new(error)))?;
+        home.evict(name);
+        home.restore(Resource::stored(name, resource.spec().clone(), resource.stored_state().clone(), Version(version)))?;
         Ok(true)
     }
 

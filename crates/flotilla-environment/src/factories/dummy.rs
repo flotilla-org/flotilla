@@ -11,26 +11,19 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
-use crate::environment::dummy::{
-    DummyEnvironmentBehaviour, DummyEnvironmentCleanup, DummyEnvironmentProvider, DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV,
-};
+use crate::environment::dummy::{DummyEnvironmentProvider, DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV};
 use crate::environment::EnvironmentProvider;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 
 pub struct DummyEnvironmentFactory {
-    behaviour: DummyEnvironmentBehaviour,
-    cleanup: Option<DummyEnvironmentCleanup>,
+    provider: Arc<DummyEnvironmentProvider>,
 }
 
 impl DummyEnvironmentFactory {
-    pub fn new(behaviour: DummyEnvironmentBehaviour) -> Self {
-        Self { behaviour, cleanup: None }
-    }
-
-    pub fn with_cleanup(mut self, cleanup: DummyEnvironmentCleanup) -> Self {
-        self.cleanup = Some(cleanup);
-        self
+    /// The fleet owns the external environment world across daemon restarts.
+    pub fn new(provider: Arc<DummyEnvironmentProvider>) -> Self {
+        Self { provider }
     }
 }
 
@@ -54,10 +47,6 @@ impl Factory for DummyEnvironmentFactory {
         if env.find_env_var(DUMMY_FLEET_ENV).is_some() {
             return Err(vec![UnmetRequirement::MissingConfig("dummy environments do not nest".into())]);
         }
-        let mut provider = DummyEnvironmentProvider::new(self.behaviour.clone());
-        if let Some(cleanup) = &self.cleanup {
-            provider = provider.with_cleanup(Arc::clone(cleanup));
-        }
-        Ok(Arc::new(provider))
+        Ok(Arc::clone(&self.provider) as Arc<dyn EnvironmentProvider>)
     }
 }

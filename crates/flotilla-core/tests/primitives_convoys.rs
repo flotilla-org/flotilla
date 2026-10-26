@@ -130,3 +130,82 @@ fn a_taken_label_is_refused_after_a_restart_and_changes_nothing() {
     let free = Declare { label: "l2-quint".into(), ..declare };
     assert_eq!(convoys.apply("c", free, Timestamp(3)).expect("a free label"), Version(2));
 }
+
+// Owner ruling #3825: replacing an ended standing generation reuses its name,
+// retains all log history, and never changes an active or refused generation.
+#[hegel::test]
+fn ended_standing_generations_are_replaced_atomically(tc: hegel::TestCase) {
+    use flotilla_schema::{Cause, Kind};
+    use flotilla_state_machines::{
+        machines::convoy::{Abandon, Authority, Convoy, ConvoyLabel, Deliver, Keep},
+        Resource,
+    };
+    // Sequences cover both terminal labels, duplicate admission and optional
+    // restart before replacement, across one to three generations.
+    let steps = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(&dir);
+    let mut convoys = Convoys::open("home-a", &service).expect("open");
+    convoys.world(|world| world.projects.put(&Ref::new(address("fleet").as_str()), ()));
+    assert!(convoys.admit_standing("standing", request(), Timestamp(1)).expect("initial generation"));
+    for _ in 0..steps {
+        assert!(!convoys.admit_standing("standing", request(), Timestamp(2)).expect("duplicate active admission"));
+        if tc.draw(hegel::generators::booleans()) {
+            convoys
+                .apply(
+                    "standing",
+                    Keep::Verdict {
+                        promise: PromiseId(0),
+                        by: SeatName::new("operator", ""),
+                        authority: Authority::Operator,
+                        reason: "accepted".into(),
+                    },
+                    Timestamp(3),
+                )
+                .expect("keep");
+            convoys.apply("standing", Deliver, Timestamp(4)).expect("deliver");
+        } else {
+            convoys.world(|world| world.authority.put(&Ref::new("operator"), true));
+            convoys
+                .apply(
+                    "standing",
+                    Abandon { by: SeatName::new("operator", ""), reason: "replace generation".into(), authority: Ref::new("operator") },
+                    Timestamp(4),
+                )
+                .expect("abandon");
+        }
+        if tc.draw(hegel::generators::booleans()) {
+            convoys = Convoys::open("home-a", &service).expect("reopen ended generation");
+            convoys.world(|world| world.projects.put(&Ref::new(address("fleet").as_str()), ()));
+        }
+        let ended = convoys.get("standing").expect("ended generation");
+        let (ended_version, ended_state) = (ended.version(), ended.state().clone());
+        let mut invalid = request();
+        invalid.project = address("missing");
+        assert!(convoys.admit_standing("standing", invalid, Timestamp(5)).is_err(), "gate refusal");
+        let mut conflicting = request();
+        conflicting.promises.insert(PromiseId(1), conflicting.promises[&PromiseId(0)].clone());
+        assert!(convoys.admit_standing("standing", conflicting, Timestamp(5)).is_err(), "store refusal rolls retirement back");
+        let reopened = Convoys::open("home-a", &service).expect("reopen after refusals");
+        let retained = reopened.get("standing").expect("retained ended generation");
+        assert_eq!((retained.version(), retained.state()), (ended_version, &ended_state));
+        assert!(convoys.admit_standing("standing", request(), Timestamp(6)).expect("new generation"));
+        let next = convoys.get("standing").expect("fresh generation");
+        assert_eq!(next.label(), ConvoyLabel::Open);
+        assert!(next.version() > ended_version);
+        assert_eq!(next.spec().promise(PromiseId(0)).expect("fresh promise").1.progress.value, Progress::Pending);
+        service
+            .with_store(|store| {
+                let mut read = store.read()?;
+                let id = read.resolve(<Resource<Convoy> as Kind>::CODE, "standing", "home-a")?.expect("identity");
+                let events = read.changes(id, 0, 64)?;
+                assert!(events.iter().any(|event| event.home_seq == ended_version.0), "ended history retained");
+                assert!(events.iter().any(|event| event.cause == Cause::Delete), "retirement logged");
+                Ok(())
+            })
+            .expect("read retained history");
+        convoys = Convoys::open("home-a", &service).expect("restart fresh generation");
+        assert_eq!(convoys.get("standing").expect("restored").label(), ConvoyLabel::Open);
+        convoys.world(|world| world.projects.put(&Ref::new(address("fleet").as_str()), ()));
+    }
+}

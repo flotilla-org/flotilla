@@ -136,12 +136,21 @@ impl EngineConvoys for ConvoyEngine {
     fn holds(&self, convoy: &ResourceObject<OldConvoy>) -> bool {
         // Fail closed: route an invalid identity to this writer, whose edits return
         // the naming error, rather than falling back to the legacy writer.
-        map::engine_name(convoy).map_or(true, |name| self.convoys.get(&name).is_some())
+        // A new standing generation must reach admission when its stable
+        // record has ended; terminal old records still read the engine view.
+        map::engine_name(convoy).map_or(true, |name| {
+            self.convoys.get(&name).is_some_and(|current| {
+                !flotilla_resources::convoy::reconcile::is_ensured(convoy)
+                    || current.label() == ConvoyLabel::Open
+                    || convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())
+            })
+        })
     }
 
     async fn admit(&self, convoy: &ResourceObject<OldConvoy>) -> Result<Admission, String> {
         let name = map::engine_name(convoy)?;
-        if self.convoys.get(&name).is_some() {
+        let standing = flotilla_resources::convoy::reconcile::is_ensured(convoy);
+        if self.convoys.get(&name).is_some_and(|current| !standing || current.label() == ConvoyLabel::Open) {
             return Ok(Admission::Held);
         }
         let Some(status) = convoy.status.as_ref().filter(|status| status.workflow_snapshot.is_some()) else {
@@ -160,7 +169,11 @@ impl EngineConvoys for ConvoyEngine {
         let admitted = tokio::task::spawn_blocking(move || {
             // Old admission read the project; the engine's gate reads that record.
             convoys.world(|world| world.projects.put(&Ref::new(project.as_str()), ()));
-            convoys.admit(&name, request, now)
+            if standing {
+                convoys.admit_standing(&name, request, now)
+            } else {
+                convoys.admit(&name, request, now)
+            }
         })
         .await
         .map_err(|error| error.to_string())?;

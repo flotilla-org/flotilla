@@ -28,7 +28,10 @@ mod vcs;
 use std::{sync::Arc, time::Duration};
 
 use flotilla_discovery::FactoryRegistry;
-use flotilla_environment::{environment::dummy::DummyEnvironmentBehaviour, factories::dummy::DummyEnvironmentFactory};
+use flotilla_environment::{
+    environment::dummy::{DummyEnvironmentBehaviour, DummyEnvironmentProvider},
+    factories::dummy::DummyEnvironmentFactory,
+};
 
 pub use adapter::{DummyAgentAdapter, DUMMY_AGENT_ADAPTER, DUMMY_SCRIPT_ENV};
 pub use crew::{CrewScript, LAST_TURN_MARKER, SCRIPT_LINE_PREFIX};
@@ -45,18 +48,22 @@ impl DummyFleet {
     pub fn install(self: &Arc<Self>, factories: &mut FactoryRegistry) {
         let environment = &self.config.environment;
         let weak = Arc::downgrade(self);
-        let provider = DummyEnvironmentFactory::new(DummyEnvironmentBehaviour {
-            seed: self.config.seed,
-            realise_delay: Duration::from_millis(environment.realise_delay_ms),
-            failure_rate: environment.failure_rate,
-        })
-        .with_cleanup(Arc::new(move |id| {
-            if let Some(fleet) = weak.upgrade() {
-                fleet.sessions.destroy_environment(id);
-                fleet.checkouts.destroy_environment(id);
-            }
-        }));
-        factories.environment_providers.push(Box::new(provider));
+        let provider = self.environments.get_or_init(|| {
+            Arc::new(
+                DummyEnvironmentProvider::new(DummyEnvironmentBehaviour {
+                    seed: self.config.seed,
+                    realise_delay: Duration::from_millis(environment.realise_delay_ms),
+                    failure_rate: environment.failure_rate,
+                })
+                .with_cleanup(Arc::new(move |id| {
+                    if let Some(fleet) = weak.upgrade() {
+                        fleet.sessions.destroy_environment(id);
+                        fleet.checkouts.destroy_environment(id);
+                    }
+                })),
+            )
+        });
+        factories.environment_providers.push(Box::new(DummyEnvironmentFactory::new(Arc::clone(provider))));
         factories.change_requests.insert(0, Box::new(forge::DummyChangeRequestFactory { fleet: Arc::clone(self) }));
         factories.vcs.insert(0, Box::new(vcs::DummyVcsFactory { fleet: Arc::clone(self) }));
         factories.terminal_pools.push(Box::new(terminal::DummyTerminalPoolFactory { fleet: Arc::clone(self) }));

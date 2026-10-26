@@ -40,6 +40,7 @@ pub struct DummyFleet {
     /// Where coders open change requests instead of `forge`, when configured.
     pub(crate) shared_forge: Option<Arc<SharedForge>>,
     pub(crate) sessions: DummySessions,
+    pub(crate) environments: OnceLock<Arc<flotilla_environment::environment::dummy::DummyEnvironmentProvider>>,
     pub(crate) checkouts: DummyCheckouts,
     port: OnceLock<Arc<dyn CrewCommandPort>>,
     counters: Counters,
@@ -71,6 +72,7 @@ impl DummyFleet {
             forge: DummyForge::new(&config),
             shared_forge,
             sessions: DummySessions::default(),
+            environments: OnceLock::new(),
             checkouts: DummyCheckouts::default(),
             config,
             port: OnceLock::new(),

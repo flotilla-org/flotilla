@@ -414,7 +414,7 @@ async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
 // A late handoff reopens the recipient and transfers the engine promises; the
 // recipient delivers its engine Convoy after handling that additional turn.
 #[tokio::test(start_paused = true)]
-#[ignore = "late handoff reaches the dummy process but no engine Message receipt is committed before convoy teardown"]
+#[ignore = "flotilla#3894: late handoff reaches the dummy process but no engine Message receipt is committed before convoy teardown"]
 async fn on_the_engine_a_finished_long_runner_handles_a_late_handoff() {
     late_handoff_scenario(true).await;
 }
@@ -708,9 +708,9 @@ async fn on_the_engine_an_unrealised_environment_records_failure_without_a_termi
 }
 
 // A standing Ensure binds an admitted engine convoy. Abandoning that convoy
-// must let the same Ensure bind a fresh generation without losing its history.
+// must let the same Ensure admit a fresh generation under the stable engine
+// identity, retaining the ended generation in the per-home log.
 #[tokio::test(start_paused = true)]
-#[ignore = "engine Convoy admission explicitly skips standing convoys; #3794 remains behind owner schema review"]
 async fn on_the_engine_a_standing_ensure_readmits_after_abandon() {
     use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec};
     use flotilla_schema::Intern;
@@ -795,25 +795,58 @@ async fn on_the_engine_a_standing_ensure_readmits_after_abandon() {
     })
     .await
     .expect("the bound convoy is admitted on the engine");
+    let first_old = fleet
+        .backend()
+        .using::<ConvoyEnsure>(NAMESPACE)
+        .get("engine-standing")
+        .await
+        .expect("ensure")
+        .status
+        .expect("status")
+        .convoy_ref
+        .expect("generation");
     let abandoned = fleet
         .execute_as_operator(CommandAction::ConvoyAbandon {
             namespace: Some(NAMESPACE.into()),
-            name: name.into(),
+            name: first_old.clone(),
             reason: "exercise standing re-admission".into(),
         })
         .await;
     assert!(!matches!(abandoned, CommandValue::Error { .. }), "{abandoned:?}");
+    // Explicit reconciliation bypasses the wall-clock retry backoff under paused time.
+    fleet.daemon.reconcile_convoy_ensure_now(NAMESPACE, "engine-standing", fleet.daemon.as_ref()).await.expect("re-admit ensure now");
     let second = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if let Some(next) = bound().filter(|next| next != &first) {
-                break next;
+            let ensure = fleet.backend().using::<ConvoyEnsure>(NAMESPACE).get("engine-standing").await.expect("ensure");
+            if let Some(next) = ensure.status.and_then(|status| status.convoy_ref).filter(|next| next != &first_old) {
+                if fleet
+                    .daemon
+                    .message_primitives()
+                    .expect("engine")
+                    .convoys()
+                    .get(first.as_str())
+                    .is_some_and(|convoy| matches!(convoy.state(), flotilla_state_machines::machines::convoy::ConvoyState::Open { .. }))
+                {
+                    break next;
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("engine Ensure binds a fresh convoy after abandon");
-    assert_ne!(first, second);
+    .unwrap_or_else(|error| {
+        panic!(
+            "Ensure admits a fresh generation after abandon: {error}; engine={:?}",
+            fleet.daemon.message_primitives().expect("engine").convoys().get(first.as_str())
+        )
+    });
+    assert_ne!(first_old, second);
+    assert_eq!(bound(), Some(first.clone()), "the engine fulfiller identity stays stable");
+    let engine = fleet.daemon.message_primitives().expect("engine").convoys().get(first.as_str()).expect("standing convoy");
+    assert!(
+        matches!(engine.state(), flotilla_state_machines::machines::convoy::ConvoyState::Open { .. }),
+        "new generation must be active: {engine:?}"
+    );
 }
 
 impl DummyDaemon {
@@ -855,7 +888,7 @@ impl DummyDaemon {
 
 // A real governor must resume a stalled coder and deliver its engine Convoy.
 #[tokio::test(start_paused = true)]
-#[ignore = "crew stall stays at the operator rung despite the declared healthy governor; no crew-supervised ruling is available"]
+#[ignore = "flotilla#3893: crew stall stays at the operator rung despite the declared healthy governor; no crew-supervised ruling is available"]
 async fn on_the_engine_crew_supervision_resumes_a_stalled_coder() {
     supervised_coder_scenario(CrewSupervisionAction::Resume).await;
 }
@@ -863,7 +896,7 @@ async fn on_the_engine_crew_supervision_resumes_a_stalled_coder() {
 // A failing crew proposes failure; its named governor must fail it while its
 // engine promises stay unmet and its supervision is recorded on the engine.
 #[tokio::test(start_paused = true)]
-#[ignore = "failing coder remains at the operator rung despite the declared healthy governor; crew failure ruling cannot be authenticated"]
+#[ignore = "flotilla#3893: failing coder remains at the operator rung despite the declared healthy governor; crew failure ruling cannot be authenticated"]
 async fn on_the_engine_crew_supervision_fails_a_failing_coder() {
     supervised_coder_scenario(CrewSupervisionAction::Fail).await;
 }
@@ -1258,7 +1291,6 @@ impl DummyDaemon {
 // the crew process survives. Its next submissions advance that restored record
 // and deliver the convoy without re-admission or a duplicate process launch.
 #[tokio::test(start_paused = true)]
-#[ignore = "restart restores the engine record but recovery reports the dummy Docker container lost (#2872)"]
 async fn on_the_engine_a_daemon_restart_restores_an_active_convoy_and_lands() {
     let fleet = DummyDaemon::start_with_relay().agent("turn_delay_ms = 10000\n").host("restart-proof").restartable(true).call().await;
     fleet.dispatch("engine-restart", CrewMix::Coder).await;
