@@ -90,6 +90,8 @@ impl Binding for VesselBinding {
             // An observed backing can vanish; a failed provisioning attempt retains its cause.
             VesselStatusPatch::MarkLost { .. } | VesselStatusPatch::MarkFailed { .. } if realised(obj) => vec![Step::Vanished],
             VesselStatusPatch::MarkLost { message } | VesselStatusPatch::MarkFailed { message } => {
+                // Both reports come from outside the machine. Before realisation the same inputs
+                // cannot recover by retrying, so the failure spends the request immediately.
                 vec![Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, message), retryable: false })]
             }
             // Interrupted roles, provisioning progress, images, observations and credentials are
