@@ -55,6 +55,10 @@ pub struct GrantScope {
 }
 
 /// How the binding's credential was chosen (#3882, amended by #3884).
+///
+/// The serde tags (`pin`, `draw`) are the resource store's JSON vocabulary; the store codes (`pn`,
+/// `dr`) are the generated tables'. They are separate and need not match; the same holds for every
+/// enum in this module.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(tag = "by", rename_all = "kebab-case")]
 pub enum Selection {
@@ -139,8 +143,9 @@ pub struct AccountBinding {
     /// grant is withdrawn while another still authorizes the credential.
     #[store(child)]
     pub grants: BTreeMap<GrantName, GrantScope>,
-    /// The selection record: the authorized candidates, the exclusions with their reasons, and
-    /// how the result was chosen.
+    /// The selection record: every authorized candidate, the exclusions with their reasons, and
+    /// how the result was chosen. Exclusions are a subset of the candidates (an authorized
+    /// candidate known to be unusable); a draw is over the candidates less the exclusions.
     #[store(child)]
     pub candidates: BTreeSet<CredentialName>,
     #[store(child)]

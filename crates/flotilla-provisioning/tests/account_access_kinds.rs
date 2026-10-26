@@ -81,7 +81,11 @@ fn binding(state: BindingState, selection: Selection) -> AccountBinding {
             (GrantName("claude-box-accounts".into()), GrantScope { scope: "account".into() }),
             (GrantName("claude-max-contained".into()), GrantScope { scope: "account".into() }),
         ]),
-        candidates: BTreeSet::from([CredentialName("claude-jseo-oauth".into()), CredentialName("claude-max".into())]),
+        candidates: BTreeSet::from([
+            CredentialName("claude-jseo-oauth".into()),
+            CredentialName("claude-max".into()),
+            CredentialName("claude-time-to-change-oauth".into()),
+        ]),
         exclusions: BTreeMap::from([(CredentialName("claude-time-to-change-oauth".into()), "replacement required".into())]),
         selection,
         epochs,
