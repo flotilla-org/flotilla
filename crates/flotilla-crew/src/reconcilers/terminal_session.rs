@@ -11,10 +11,10 @@ use flotilla_resources::{
     api_version, Convoy, ConvoyPhase, CrewMessageDelivery, Demand, DemandAddressee, DemandKind, DemandSpec, Environment, EnvironmentPhase,
     InputMeta, LifecycleAuthority, OwnerReference, Resource, ResourceError, ResourceObject, ResourceProvenance, TerminalAttention,
     TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, TerminalSessionStatusPatch, Vessel, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
-    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG,
-    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON,
-    TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
+    TerminalSessionSpec, TerminalSessionStatusPatch, TerminalSessionTarget, Vessel, ACTUATOR_HOST_REF_ANNOTATION,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG,
+    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
+    TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON, TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
@@ -94,19 +94,19 @@ pub trait TerminalRuntime: Send + Sync {
         Err("convoy reclaim verifier unavailable".to_string())
     }
 
-    async fn brief_ready(&self, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
+    async fn brief_ready(&self, _spec: TerminalSessionTarget<'_>) -> Result<bool, String> {
         Ok(true)
     }
     async fn ensure_session(
         &self,
         name: &str,
-        spec: &flotilla_resources::TerminalSessionSpec,
+        spec: TerminalSessionTarget<'_>,
         tags: &[TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String>;
-    async fn session_is_running(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
+    async fn session_is_running(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<bool, String> {
         Ok(true)
     }
-    async fn session_liveness(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalLiveness, String> {
+    async fn session_liveness(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<TerminalLiveness, String> {
         Ok(match self.session_is_running(session_id, spec).await {
             Ok(true) => TerminalLiveness::Running,
             Ok(false) => TerminalLiveness::Stopped,
@@ -115,7 +115,7 @@ pub trait TerminalRuntime: Send + Sync {
     }
     async fn agent_exit_code(
         &self,
-        _spec: &flotilla_resources::TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _crew: &flotilla_resources::CrewSessionStatus,
     ) -> Result<Option<i32>, String> {
         Ok(None)
@@ -123,7 +123,7 @@ pub trait TerminalRuntime: Send + Sync {
     async fn agent_exit_failure(
         &self,
         _session_id: &str,
-        _spec: &flotilla_resources::TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _exit_code: i32,
     ) -> Result<Option<String>, String> {
         Ok(None)
@@ -131,44 +131,40 @@ pub trait TerminalRuntime: Send + Sync {
     async fn cleat_endpoint(
         &self,
         _session_id: &str,
-        _spec: &flotilla_resources::TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
     ) -> Result<Option<flotilla_protocol::result_set::CleatEndpoint>, String> {
         Ok(None)
     }
-    async fn observe_attention(
-        &self,
-        _session_id: &str,
-        _spec: &flotilla_resources::TerminalSessionSpec,
-    ) -> Result<Option<TerminalObservation>, String> {
+    async fn observe_attention(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<Option<TerminalObservation>, String> {
         Ok(None)
     }
     /// Why a running session's crew cannot reach its controlling daemon, if it
     /// cannot. Actuators without a separate daemon path report reachable.
-    async fn daemon_reach(&self, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<Option<String>, String> {
+    async fn daemon_reach(&self, _spec: TerminalSessionTarget<'_>) -> Result<Option<String>, String> {
         Ok(None)
     }
-    async fn observe_failure(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<Option<String>, String> {
+    async fn observe_failure(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<Option<String>, String> {
         Ok(None)
     }
-    async fn cleanup_failed_session(&self, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+    async fn cleanup_failed_session(&self, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
     async fn deliver_message(
         &self,
         _session_id: &str,
-        _spec: &flotilla_resources::TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _message: &str,
         _readiness: TerminalDeliveryReadiness,
     ) -> Result<TerminalDeliveryOutcome, String> {
         Err("terminal runtime does not support crew message delivery".to_string())
     }
-    async fn kill_session(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String>;
+    async fn kill_session(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<(), String>;
     /// Receipt-backed runtimes remove exactly this launch. Provider-native
     /// process observers without receipt files may keep the no-op default.
-    async fn remove_exit_receipt(&self, _spec: &flotilla_resources::TerminalSessionSpec, _launch_id: &str) -> Result<(), String> {
+    async fn remove_exit_receipt(&self, _spec: TerminalSessionTarget<'_>, _launch_id: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn cleanup_session_artifacts(&self, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+    async fn cleanup_session_artifacts(&self, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -471,7 +467,7 @@ where
             let status = obj.status.as_ref().expect("retirement requires status");
             let mut retired = true;
             for launch in &status.retired_launches {
-                if let Err(error) = self.runtime.remove_exit_receipt(&obj.spec, launch).await {
+                if let Err(error) = self.runtime.remove_exit_receipt(obj.into(), launch).await {
                     // Keep the durable obligation, but never let housekeeping
                     // suppress positive exit or liveness evidence for its replacement.
                     tracing::warn!(%error, launch, session = %obj.metadata.name, "retired exit receipt cleanup will retry");
@@ -483,7 +479,7 @@ where
             }
         }
         if phase == TerminalSessionPhase::Failed {
-            self.runtime.cleanup_failed_session(&obj.spec).await.map_err(ResourceError::other)?;
+            self.runtime.cleanup_failed_session(obj.into()).await.map_err(ResourceError::other)?;
             return Ok(TerminalPrepared::None);
         }
         // Observe usage exits before liveness so Lost recovery cannot relaunch them.
@@ -491,12 +487,13 @@ where
             && matches!(obj.spec.source, TerminalSessionSource::Agent { .. })
         {
             if let Some(crew) = obj.status.as_ref().and_then(|status| status.crew.as_ref()) {
-                let Some(exit_code) = held_observation(self.runtime.agent_exit_code(&obj.spec, crew).await, hold_overdue)? else {
+                let Some(exit_code) = held_observation(self.runtime.agent_exit_code(obj.into(), crew).await, hold_overdue)? else {
                     return Ok(TerminalPrepared::MessageDeliveryPending);
                 };
                 if let Some(code) = exit_code {
                     let session_id = obj.status.as_ref().and_then(|status| status.session_id.as_deref()).unwrap_or_default();
-                    let Some(failure) = held_observation(self.runtime.agent_exit_failure(session_id, &obj.spec, code).await, hold_overdue)?
+                    let Some(failure) =
+                        held_observation(self.runtime.agent_exit_failure(session_id, obj.into(), code).await, hold_overdue)?
                     else {
                         return Ok(TerminalPrepared::MessageDeliveryPending);
                     };
@@ -515,7 +512,7 @@ where
                 .as_ref()
                 .and_then(|status| status.session_id.as_deref())
                 .ok_or_else(|| ResourceError::other("running terminal session has no session id"))?;
-            let Some(liveness) = held_observation(self.runtime.session_liveness(session_id, &obj.spec).await, hold_overdue)? else {
+            let Some(liveness) = held_observation(self.runtime.session_liveness(session_id, obj.into()).await, hold_overdue)? else {
                 return Ok(TerminalPrepared::MessageDeliveryPending);
             };
             match liveness {
@@ -525,7 +522,7 @@ where
                 TerminalLiveness::Unavailable(_) if hold_overdue => return Ok(TerminalPrepared::MessageDeliveryPending),
                 TerminalLiveness::Unavailable(message) => return Err(ResourceError::other(message)),
             }
-            let Some(failure) = held_observation(self.runtime.observe_failure(session_id, &obj.spec).await, hold_overdue)? else {
+            let Some(failure) = held_observation(self.runtime.observe_failure(session_id, obj.into()).await, hold_overdue)? else {
                 return Ok(TerminalPrepared::MessageDeliveryPending);
             };
             if let Some(message) = failure {
@@ -546,7 +543,7 @@ where
                                             < chrono::Duration::from_std(delivery_retry_delay(condition.consecutive_failures))
                                                 .unwrap_or(chrono::Duration::MAX))))
                     }) {
-                        return Ok(match self.runtime.observe_attention(session_id, &obj.spec).await {
+                        return Ok(match self.runtime.observe_attention(session_id, obj.into()).await {
                             Ok(Some(observation)) => TerminalPrepared::Attention(observation),
                             Ok(None) => TerminalPrepared::MessageDeliveryPending,
                             Err(error) => {
@@ -576,7 +573,7 @@ where
                     };
                     let outcome = self
                         .runtime
-                        .deliver_message(session_id, &obj.spec, &message.text, readiness)
+                        .deliver_message(session_id, obj.into(), &message.text, readiness)
                         .await
                         .map_err(ResourceError::other)?;
                     let attention = obj.status.as_ref().and_then(|status| status.attention.as_ref());
@@ -607,7 +604,7 @@ where
                     return Ok(match outcome {
                         // Waiting for a turn boundary must not suppress the
                         // observation that releases other queued deliveries.
-                        TerminalDeliveryOutcome::Pending => match self.runtime.observe_attention(session_id, &obj.spec).await {
+                        TerminalDeliveryOutcome::Pending => match self.runtime.observe_attention(session_id, obj.into()).await {
                             Ok(Some(observation)) => TerminalPrepared::Attention(observation),
                             Ok(None) => TerminalPrepared::MessageDeliveryPending,
                             Err(error) => {
@@ -632,7 +629,7 @@ where
                     });
                 }
             }
-            match self.runtime.cleat_endpoint(session_id, &obj.spec).await {
+            match self.runtime.cleat_endpoint(session_id, obj.into()).await {
                 Ok(endpoint) if obj.status.as_ref().and_then(|status| status.cleat_endpoint.as_ref()) != endpoint.as_ref() => {
                     return Ok(TerminalPrepared::CleatEndpoint(endpoint));
                 }
@@ -646,14 +643,14 @@ where
             // #3618: a session's own liveness says nothing about its crew's
             // path back to the daemon; record that separately so a vessel
             // shows why hooks and settlement stopped.
-            match self.runtime.daemon_reach(&obj.spec).await {
+            match self.runtime.daemon_reach(obj.into()).await {
                 Ok(unreachable) if obj.status.as_ref().and_then(|status| status.daemon_unreachable.as_ref()) != unreachable.as_ref() => {
                     return Ok(TerminalPrepared::DaemonReach(unreachable));
                 }
                 Err(error) => tracing::warn!(%session_id, %error, "daemon reach observation failed"),
                 Ok(_) => {}
             }
-            if let Some(observation) = self.runtime.observe_attention(session_id, &obj.spec).await.map_err(ResourceError::other)? {
+            if let Some(observation) = self.runtime.observe_attention(session_id, obj.into()).await.map_err(ResourceError::other)? {
                 return Ok(TerminalPrepared::Attention(observation));
             }
             if obj
@@ -668,7 +665,7 @@ where
         }
         if phase == TerminalSessionPhase::Lost {
             if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
-                match self.runtime.session_liveness(session_id, &obj.spec).await.map_err(ResourceError::other)? {
+                match self.runtime.session_liveness(session_id, obj.into()).await.map_err(ResourceError::other)? {
                     TerminalLiveness::Running => return Ok(TerminalPrepared::Revived),
                     TerminalLiveness::Unavailable(message) => return Err(ResourceError::other(message)),
                     TerminalLiveness::Stopped | TerminalLiveness::Lost(_) => {}
@@ -696,7 +693,7 @@ where
         if !environment_ready {
             return Ok(TerminalPrepared::Waiting);
         }
-        if !self.runtime.brief_ready(&obj.spec).await.map_err(ResourceError::other)? {
+        if !self.runtime.brief_ready(obj.into()).await.map_err(ResourceError::other)? {
             return Ok(TerminalPrepared::BriefWaiting);
         }
 
@@ -718,7 +715,7 @@ where
         if let Some(encoded) = obj.metadata.annotations.get(CREDENTIAL_PERMISSIONS_ANNOTATION) {
             tags.push(TerminalSessionTag::new(CREDENTIAL_PERMISSIONS_SESSION_TAG, encoded));
         }
-        Ok(match self.runtime.ensure_session(&obj.metadata.name, &obj.spec, &tags).await {
+        Ok(match self.runtime.ensure_session(&obj.metadata.name, obj.into(), &tags).await {
             Ok(state) => TerminalPrepared::Running(state),
             Err(err) => TerminalPrepared::Failed(err),
         })
@@ -1046,7 +1043,7 @@ where
         // available, so there is nothing left for either runtime hook to clean.
         if environment_exists {
             if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
-                if let Err(error) = self.runtime.kill_session(session_id, &obj.spec).await {
+                if let Err(error) = self.runtime.kill_session(session_id, obj.into()).await {
                     errors.push(error);
                 }
             }
@@ -1055,13 +1052,13 @@ where
             if errors.is_empty() {
                 if let Some(status) = &obj.status {
                     for launch in status.retired_launches.iter().chain(status.crew.iter().map(|crew| &crew.id)) {
-                        if let Err(error) = self.runtime.remove_exit_receipt(&obj.spec, launch).await {
+                        if let Err(error) = self.runtime.remove_exit_receipt(obj.into(), launch).await {
                             errors.push(error);
                         }
                     }
                 }
             }
-            if let Err(error) = self.runtime.cleanup_session_artifacts(&obj.spec).await {
+            if let Err(error) = self.runtime.cleanup_session_artifacts(obj.into()).await {
                 errors.push(error);
             }
         }

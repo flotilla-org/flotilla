@@ -12,7 +12,7 @@ use flotilla_provider_runtime::{
     host_environment::{HostEnvironment, HostSupply},
     ProcessCommandRunner,
 };
-use flotilla_resources::{FulfilmentFacts, Selector, TerminalBrief, TerminalCrewContext};
+use flotilla_resources::{FulfilmentFacts, Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSource, TerminalSessionSpec};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
@@ -428,14 +428,6 @@ fn vessel_environment_is_composed_from_the_layer_supplies_and_forward() {
     );
 }
 
-#[test]
-fn only_crew_sessions_name_a_vessel() {
-    let crew = crew_spec("convoy-1-work");
-    assert_eq!(session_vessel(&crew), Some("convoy-1-work"));
-    let tool = TerminalSessionSpec { source: TerminalSessionSource::Tool { command: "sh".into() }, ..crew };
-    assert_eq!(session_vessel(&tool), None);
-}
-
 fn crew_spec(vessel: &str) -> TerminalSessionSpec {
     TerminalSessionSpec::builder()
         .env_ref(ENVIRONMENT.to_string())
@@ -455,15 +447,18 @@ fn crew_spec(vessel: &str) -> TerminalSessionSpec {
 // agentless host: its replicated session keeps the vessel's agent alive.
 // Mutation check: listing local records only retires that agent.
 #[tokio::test]
-async fn a_replicated_session_keeps_its_vessel_live() {
+async fn a_replicated_tool_session_keeps_its_vessel_live() {
     use flotilla_protocol::NodeId;
     let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("home"));
     let actuator = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("actuator"));
     let sessions = home.clone().using::<TerminalSession>("flotilla");
     sessions
         .create(
-            &flotilla_resources::InputMeta::builder().name("terminal-convoy-9-work-coder".to_string()).build(),
-            &crew_spec("convoy-9-work"),
+            &flotilla_resources::InputMeta::builder()
+                .name("terminal-convoy-9-work-coder".to_string())
+                .labels(BTreeMap::from([(flotilla_resources::VESSEL_REF_LABEL.to_string(), "convoy-9-work".to_string())]))
+                .build(),
+            &TerminalSessionSpec { source: TerminalSessionSource::Tool { command: "sh".into() }, ..crew_spec("convoy-9-work") },
         )
         .await
         .expect("home session");

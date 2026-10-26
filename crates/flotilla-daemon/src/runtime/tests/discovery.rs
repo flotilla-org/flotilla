@@ -214,6 +214,14 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
     assert!(!unreachable_status.ready);
     assert!(unreachable_status.fulfilment_facts.is_empty(), "unreachable SSH host must not retain or probe facts");
     apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("restore SSH observation");
+    let vessel_pool = Arc::new(AttachableToolPool(FakeTerminalPool::new()));
+    let mut vessel_registry = ProviderRegistry::new();
+    vessel_registry.terminal_pools.insert(
+        "cleat",
+        ProviderDescriptor::named(ProviderCategory::TerminalPool, "cleat"),
+        vessel_pool.clone() as Arc<dyn TerminalPool>,
+    );
+    let agents = RunnerVesselAgents::new(Arc::new(ProcessCommandRunner), Arc::new(vessel_registry));
     let state = Arc::new(
         ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -224,10 +232,7 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
             format!("host-direct-{local_host_id}"),
         )
         .with_agentless_ssh(vec![profile])
-        .with_agentless_vessels(Some(vessels_over(
-            RunnerVesselAgents::new(Arc::new(ProcessCommandRunner), Arc::new(ProviderRegistry::new())),
-            temp.path(),
-        )))
+        .with_agentless_vessels(Some(vessels_over(agents.clone(), temp.path())))
         .with_environment_tools(EnvironmentToolProvisioner::new(Vec::new())),
     );
     // The SSH host's host-direct Environment resolves to the provider in the
@@ -292,25 +297,63 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         let commands = commands.lock().expect("command log");
         assert!(commands.iter().any(|command| command == "git"));
     }
-    // #3792: only crew sessions run on an agentless host, each in its
-    // vessel's agent; a tool session names no vessel and is refused.
+    // #3804: a tool's identity label selects its vessel for launch, observation,
+    // attach and teardown. Unlabelled or empty identities cannot use the host pool.
     let terminal = TerminalControllerRuntime { state: Arc::clone(&state) };
-    let error = terminal
-        .ensure_session(
-            "ssh-crew",
-            &flotilla_resources::TerminalSessionSpec::builder()
-                .env_ref(environment_id.to_string())
-                .role("shell".to_string())
-                .source(TerminalSessionSource::Tool { command: "sh".to_string() })
-                .cwd(worktree_path.display().to_string())
-                .pool("cleat".to_string())
-                .build(),
-            &[],
-        )
-        .await
-        .expect_err("a tool session on an agentless host has no vessel");
-    assert!(error.contains("runs only crew sessions"), "{error}");
-    assert!(pool.ensured.lock().await.is_empty());
+    let sessions = daemon.resource_backend().using::<TerminalSession>(NAMESPACE);
+    let identity = flotilla_resources::TerminalSessionIdentity::builder()
+        .vessel_ref("ssh-crew-work".to_string())
+        .convoy("ssh-crew".to_string())
+        .vessel("work".to_string())
+        .role("shell".to_string())
+        .vessel_index(0)
+        .crew_index(0)
+        .build();
+    let spec = TerminalSessionSpec::builder()
+        .env_ref(environment_id.to_string())
+        .role("shell".to_string())
+        .source(TerminalSessionSource::Tool { command: "sh".to_string() })
+        .cwd(worktree_path.display().to_string())
+        .pool("cleat".to_string())
+        .build();
+    let session = sessions.create(&identity.input_meta(), &spec).await.expect("tool session");
+    for label in [None, Some("")] {
+        let mut unowned = session.clone();
+        unowned.metadata.labels.remove(flotilla_resources::VESSEL_REF_LABEL);
+        if let Some(label) = label {
+            unowned.metadata.labels.insert(flotilla_resources::VESSEL_REF_LABEL.to_string(), label.to_string());
+        }
+        let error = terminal.ensure_session("unowned", (&unowned).into(), &[]).await.expect_err("missing vessel");
+        assert!(error.contains("requires a session vessel identity"), "{error}");
+    }
+    let launched = terminal.ensure_session(&identity.name(), (&session).into(), &[]).await.expect("tool in vessel");
+    let session_id = launched.session_id;
+    assert_eq!(vessel_pool.0.ensured.lock().await.len(), 1);
+    assert!(pool.ensured.lock().await.is_empty(), "host pool must not launch tool crews");
+    assert_eq!(terminal.session_liveness(&session_id, (&session).into()).await.unwrap(), TerminalLiveness::Running);
+    let paths = super::agentless_vessels::VesselPaths::new(
+        &state.agentless_ssh[environment_id.as_str()].env_bag,
+        &super::agentless_vessels::VesselKey::new(&environment_id, "ssh-crew-work"),
+    )
+    .unwrap();
+    assert_eq!(agents.recorded(&paths).tool_pushes, 1);
+    // Attach forwards the Cleat socket through this vessel's agent.
+    let access = super::agentless_vessels::VesselSessions { state: Arc::downgrade(&state) };
+    let attached = flotilla_core::in_process::AgentlessVesselAccess::attach(
+        &access,
+        (&session).into(),
+        &session_id,
+        flotilla_protocol::commands::AttachMode::Default,
+    )
+    .await
+    .expect("vessel attach route")
+    .expect("vessel attach");
+    assert_eq!(attached, (paths.agent.join("attach.sock"), session_id.clone()));
+    assert_eq!(agents.recorded(&paths).attach_forwards, [PathBuf::from("/vessel/cleat/vessel-daemon/socket")]);
+    terminal.kill_session(&session_id, (&session).into()).await.expect("kill in vessel");
+    assert_eq!(vessel_pool.0.killed.lock().await.as_slice(), std::slice::from_ref(&session_id));
+    assert!(pool.killed.lock().await.is_empty(), "host pool must not kill tool crews");
+    assert_eq!(terminal.session_liveness(&session_id, (&session).into()).await.unwrap(), TerminalLiveness::Stopped);
     environments.cleanup(environment_id.as_str()).await.expect("host-direct Environment is released on the SSH host");
 }
 

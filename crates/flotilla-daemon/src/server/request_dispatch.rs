@@ -177,7 +177,7 @@ impl<'a> RequestDispatcher<'a> {
             // agent on an agentless host (#3792).
             let runner = self
                 .daemon
-                .command_runner_for_session(&session.spec)
+                .command_runner_for_session((&session).into())
                 .await
                 .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?
                 .map_err(|error| format!("artifact environment {}: {error}", session.spec.env_ref))?;
@@ -263,7 +263,7 @@ impl<'a> RequestDispatcher<'a> {
                 let session = service.caller_session(caller).await?;
                 let runner = self
                     .daemon
-                    .command_runner_for_session(&session.spec)
+                    .command_runner_for_session((&session).into())
                     .await
                     .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?
                     .map_err(|error| format!("artifact environment {}: {error}", session.spec.env_ref))?;

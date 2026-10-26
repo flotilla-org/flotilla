@@ -139,7 +139,7 @@ async fn contained_terminal_session_never_falls_back_from_the_requested_interior
     };
 
     let error = runtime
-        .ensure_session("terminal-contained-work-coder", &spec, &[])
+        .ensure_session("terminal-contained-work-coder", (&spec).into(), &[])
         .await
         .expect_err("a missing interior cleat must fail instead of launching through passthrough");
 
@@ -371,7 +371,7 @@ async fn starting_agent_replaces_a_pool_session_left_by_a_previous_daemon_runtim
         pool: "fake-terminals".to_string(),
     };
 
-    let launched = runtime.ensure_session(session_name, &spec, &[]).await.expect("replace stale session");
+    let launched = runtime.ensure_session(session_name, (&spec).into(), &[]).await.expect("replace stale session");
 
     assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()]);
     assert_eq!(pool.ensured.lock().await.len(), 1, "the fresh agent command must actually be launched");
@@ -391,7 +391,7 @@ async fn starting_agent_replaces_a_pool_session_left_by_a_previous_daemon_runtim
         "Implement the issue."
     );
 
-    runtime.cleanup_session_artifacts(&spec).await.expect("cleanup generated briefs");
+    runtime.cleanup_session_artifacts((&spec).into()).await.expect("cleanup generated briefs");
     assert!(!session_cwd.join(".flotilla/briefs/coder.md").exists(), "session brief should be removed");
     assert!(!durable_checkout.join(".flotilla/briefs/coder.md").exists(), "durable brief copy should be removed");
     assert!(!durable_checkout.join(".flotilla/briefs").exists(), "empty durable brief directory should be removed");
@@ -434,7 +434,7 @@ async fn terminal_teardown_kills_a_persisted_session_after_runtime_restart() {
         .build()])
         .await;
 
-    runtime.kill_session(session_name, &spec).await.expect("teardown should resolve the persisted session pool");
+    runtime.kill_session(session_name, (&spec).into()).await.expect("teardown should resolve the persisted session pool");
 
     assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()]);
 }
@@ -513,24 +513,27 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
         pool: "fake-terminals".to_string(),
     };
 
-    let observation = runtime.observe_attention(session_name, &spec).await.expect("observe prompt").expect("attention observation");
+    let observation =
+        runtime.observe_attention(session_name, (&spec).into()).await.expect("observe prompt").expect("attention observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::NeedsInput);
 
     pool.set_captured_screen(session_name, "› Ask Codex to do anything\n\ngpt-5.6-sol high · /workspace").await;
     let observation =
-        runtime.observe_attention(session_name, &spec).await.expect("observe normal composer").expect("attention observation");
+        runtime.observe_attention(session_name, (&spec).into()).await.expect("observe normal composer").expect("attention observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Idle);
 
     // #2560: stable pixels alone do not end a Codex turn. An interrupt
     // returning to the composer is a boundary even without a notify hook.
     pool.set_captured_screen(session_name, "• Working (2h 12m • esc to interrupt)\n\n› Ask Codex to do anything").await;
-    let observation = runtime.observe_attention(session_name, &spec).await.expect("observe quiet working turn").expect("observation");
+    let observation =
+        runtime.observe_attention(session_name, (&spec).into()).await.expect("observe quiet working turn").expect("observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Working);
     pool.set_captured_screen(session_name, "■ Conversation interrupted\n\n› Ask Codex to do anything").await;
-    let observation = runtime.observe_attention(session_name, &spec).await.expect("observe interrupted prompt").expect("observation");
+    let observation =
+        runtime.observe_attention(session_name, (&spec).into()).await.expect("observe interrupted prompt").expect("observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Idle);
     pool.set_captured_screen(session_name, "Loading unknown screen").await;
-    let observation = runtime.observe_attention(session_name, &spec).await.expect("observe unknown screen").expect("observation");
+    let observation = runtime.observe_attention(session_name, (&spec).into()).await.expect("observe unknown screen").expect("observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Unobservable);
 
     pool.set_captured_screen(
@@ -538,7 +541,7 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
         "codex_apps failed: HTTP 401 token_expired\nYour access token could not be refreshed. Please log out and sign in again.",
     )
     .await;
-    let failure = runtime.observe_failure(session_name, &spec).await.expect("observe auth failure").expect("fatal auth failure");
+    let failure = runtime.observe_failure(session_name, (&spec).into()).await.expect("observe auth failure").expect("fatal auth failure");
     assert!(failure.contains("token_expired"));
     assert!(failure.contains("selected credential"), "the refusal must not guess which account supplied the credential: {failure}");
     material
@@ -576,7 +579,7 @@ async fn terminal_teardown_skips_a_session_absent_from_the_pool() {
         pool: "fake-terminals".to_string(),
     };
 
-    runtime.kill_session("terminal-demo-implement-coder", &spec).await.expect("missing sessions should be idempotent");
+    runtime.kill_session("terminal-demo-implement-coder", (&spec).into()).await.expect("missing sessions should be idempotent");
 
     assert!(pool.killed.lock().await.is_empty(), "teardown must not invoke the pool for an already-gone session");
 }
@@ -650,7 +653,10 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
             .create(&flotilla_resources::InputMeta::builder().name(session_name.to_string()).build(), &spec)
             .await
             .expect("session");
-        TerminalControllerRuntime { state }.ensure_session(session_name, &spec, &[]).await.expect("launch host-direct Claude Code");
+        TerminalControllerRuntime { state }
+            .ensure_session(session_name, (&spec).into(), &[])
+            .await
+            .expect("launch host-direct Claude Code");
 
         let ensured = pool.ensured.lock().await;
         let [launch] = ensured.as_slice() else { panic!("expected one launch") };

@@ -181,7 +181,7 @@ impl TerminalPool for HooklessComposerPool {
 pub(super) async fn refresh_message_test_attention(runtime: &TerminalControllerRuntime, backend: &ResourceBackend, name: &str) {
     let sessions = backend.using::<TerminalSession>(NAMESPACE);
     let holder = sessions.get(name).await.expect("attention holder");
-    let observation = runtime.observe_attention(name, &holder.spec).await.expect("terminal observation").expect("observed attention");
+    let observation = runtime.observe_attention(name, (&holder).into()).await.expect("terminal observation").expect("observed attention");
     flotilla_store::apply_status_patch(
         &sessions,
         name,
@@ -270,7 +270,7 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool, refusals:
         let sessions = backend.using::<TerminalSession>(NAMESPACE);
         let holder = sessions.get("agent").await.expect("attention holder");
         let observation =
-            runtime.observe_attention("agent", &holder.spec).await.expect("terminal observation").expect("observed attention");
+            runtime.observe_attention("agent", (&holder).into()).await.expect("terminal observation").expect("observed attention");
         flotilla_store::apply_status_patch(
             &sessions,
             "agent",
@@ -536,3 +536,46 @@ pub(super) async fn daemon_with_transient_terminal_pool(
 }
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
+
+// The vessel pool's process boundary exposes a Cleat endpoint; lifecycle behavior
+// uses the shared in-memory terminal pool, with no subprocess or live host.
+pub(super) struct AttachableToolPool(pub(super) FakeTerminalPool);
+
+#[async_trait]
+impl TerminalPool for AttachableToolPool {
+    fn tracks_session_liveness(&self) -> bool {
+        true
+    }
+    async fn list_sessions(&self) -> Result<Vec<ProviderTerminalSession>, String> {
+        self.0.list_sessions().await
+    }
+    async fn ensure_session(
+        &self,
+        name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env: &TerminalEnvVars,
+        tags: &[TerminalSessionTag],
+    ) -> Result<(), String> {
+        self.0.ensure_session(name, command, cwd, env, tags).await
+    }
+    async fn kill_session(&self, name: &str) -> Result<(), String> {
+        self.0.kill_session(name).await
+    }
+    fn attach_args(
+        &self,
+        name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env: &TerminalEnvVars,
+    ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+        self.0.attach_args(name, command, cwd, env)
+    }
+    async fn cleat_endpoint(&self, session: &str) -> Result<Option<flotilla_protocol::result_set::CleatEndpoint>, String> {
+        Ok(Some(flotilla_protocol::result_set::CleatEndpoint {
+            runtime_root: "/vessel/cleat".into(),
+            daemon: "vessel-daemon".into(),
+            session: session.into(),
+        }))
+    }
+}

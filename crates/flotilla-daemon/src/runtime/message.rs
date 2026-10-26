@@ -297,16 +297,16 @@ impl AgentTransport for TerminalControllerRuntime {
         {
             return TransportOutcome::NotSubmitted { reason: "receiver changed before submission".into() };
         }
-        match self.adapter_for_spec(&holder.spec).await {
+        match self.adapter_for_spec((&holder).into()).await {
             Ok(Some(_)) => {}
             Ok(None) => return TransportOutcome::NotSubmitted { reason: "agent acceptance observations unavailable".into() },
             Err(reason) => return TransportOutcome::NotSubmitted { reason },
         }
-        let pool = match self.pool_for_spec(&holder.spec).await {
+        let pool = match self.pool_for_spec((&holder).into()).await {
             Ok(pool) => pool,
             Err(reason) => return TransportOutcome::NotSubmitted { reason },
         };
-        let adapter = match self.adapter_for_spec(&holder.spec).await {
+        let adapter = match self.adapter_for_spec((&holder).into()).await {
             Ok(adapter) => adapter,
             Err(reason) => return TransportOutcome::NotSubmitted { reason },
         };

@@ -853,12 +853,12 @@ async fn held_pool_delivery_scenario(mode: &str) {
     });
     let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend.clone(), NAMESPACE);
     assert_eq!(
-        runtime.deliver_message("agent", &spec, "wake", TerminalDeliveryReadiness::Startup).await.expect("begin write"),
+        runtime.deliver_message("agent", (&spec).into(), "wake", TerminalDeliveryReadiness::Startup).await.expect("begin write"),
         TerminalDeliveryOutcome::Pending
     );
     tokio::task::yield_now().await;
     assert_eq!(
-        runtime.deliver_message("agent", &spec, "wake", TerminalDeliveryReadiness::Startup).await.expect("ambiguous result"),
+        runtime.deliver_message("agent", (&spec).into(), "wake", TerminalDeliveryReadiness::Startup).await.expect("ambiguous result"),
         TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)
     );
     let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryUnconfirmed {

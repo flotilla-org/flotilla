@@ -25,7 +25,7 @@ use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId, TerminalStatus}
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     Checkout, Convoy, Environment, FulfilmentKind, ResourceError, ResourceObject, TerminalAttentionSource, TerminalAttentionState,
-    TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel,
+    TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionTarget, Vessel,
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_SESSION_TAG,
 };
 use flotilla_store::ResourceBackend;
@@ -348,7 +348,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         self.state.daemon.verify_convoy_teardown_gate_for_checkouts(convoy, &checkouts, false).await
     }
 
-    async fn brief_ready(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
+    async fn brief_ready(&self, spec: TerminalSessionTarget<'_>) -> Result<bool, String> {
         let TerminalSessionSource::Agent { brief, .. } = &spec.source else { return Ok(true) };
         let Some(digest) = &brief.artifact_digest else { return Ok(true) };
         let store = self.state.blob_store.as_ref().ok_or("brief blob store unavailable")?;
@@ -358,7 +358,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn cleat_endpoint(
         &self,
         session_id: &str,
-        spec: &TerminalSessionSpec,
+        spec: TerminalSessionTarget<'_>,
     ) -> Result<Option<flotilla_protocol::result_set::CleatEndpoint>, String> {
         let pool = self.pool_for_spec(spec).await?;
         pool.cleat_endpoint(session_id).await
@@ -367,7 +367,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn ensure_session(
         &self,
         name: &str,
-        spec: &TerminalSessionSpec,
+        spec: TerminalSessionTarget<'_>,
         tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         // #3792: a crew on an agentless host runs in its vessel's own agent:
@@ -520,7 +520,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                             &self.state.daemon.resource_backend(),
                             &context.namespace,
                             &context.convoy,
-                            spec,
+                            spec.spec,
                             &credentials,
                             &RuntimeSessionCapabilities { state: Arc::downgrade(&self.state) }.endpoints(&spec.env_ref, name).await?,
                         )
@@ -660,7 +660,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .build())
     }
 
-    async fn session_liveness(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalLiveness, String> {
+    async fn session_liveness(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<TerminalLiveness, String> {
         let pool = match self.pool_for_spec(spec).await {
             Ok(pool) => pool,
             Err(message) => return Ok(TerminalLiveness::Unavailable(message)),
@@ -673,7 +673,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
 
     async fn agent_exit_code(
         &self,
-        spec: &TerminalSessionSpec,
+        spec: TerminalSessionTarget<'_>,
         crew: &flotilla_resources::CrewSessionStatus,
     ) -> Result<Option<i32>, String> {
         let runner = self.runner_for_spec(spec).await?;
@@ -701,7 +701,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     .filter_map(|session| {
                         if session.spec.env_ref != spec.env_ref
                             || !matches!(session.spec.source, TerminalSessionSource::Agent { .. })
-                            || vessel.is_some_and(|vessel| session_vessel(&session.spec) != Some(vessel))
+                            || vessel.is_some_and(|vessel| session_vessel((&session).into()) != Some(vessel))
                         {
                             return None;
                         }
@@ -716,12 +716,12 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .await
     }
 
-    async fn remove_exit_receipt(&self, spec: &TerminalSessionSpec, launch_id: &str) -> Result<(), String> {
+    async fn remove_exit_receipt(&self, spec: TerminalSessionTarget<'_>, launch_id: &str) -> Result<(), String> {
         let runner = self.runner_for_spec(spec).await?;
         flotilla_agent::process::remove_exit_receipt(&*runner, Path::new(&spec.cwd), launch_id).await
     }
 
-    async fn daemon_reach(&self, spec: &TerminalSessionSpec) -> Result<Option<String>, String> {
+    async fn daemon_reach(&self, spec: TerminalSessionTarget<'_>) -> Result<Option<String>, String> {
         if !self.state.agentless_ssh.contains_key(&spec.env_ref) {
             return Ok(None);
         }
@@ -734,13 +734,18 @@ impl TerminalRuntime for TerminalControllerRuntime {
         }
     }
 
-    async fn observe_attention(&self, session_id: &str, spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {
+    async fn observe_attention(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<Option<TerminalObservation>, String> {
         let pool = self.pool_for_spec(spec).await?;
         let adapter = self.adapter_for_spec(spec).await?;
         observe_terminal_screen(&*pool, adapter.as_deref(), session_id, Utc::now()).await
     }
 
-    async fn agent_exit_failure(&self, session_id: &str, spec: &TerminalSessionSpec, exit_code: i32) -> Result<Option<String>, String> {
+    async fn agent_exit_failure(
+        &self,
+        session_id: &str,
+        spec: TerminalSessionTarget<'_>,
+        exit_code: i32,
+    ) -> Result<Option<String>, String> {
         if exit_code == 0 {
             return Ok(None);
         }
@@ -767,7 +772,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         Ok(adapter.classify_exit_failure(exit_code, &screen))
     }
 
-    async fn observe_failure(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<Option<String>, String> {
+    async fn observe_failure(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<Option<String>, String> {
         let TerminalSessionSource::Agent { selector, .. } = &spec.source else { return Ok(None) };
         let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
         let registry = self.registry_for_spec(spec).await?;
@@ -805,7 +810,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn deliver_message(
         &self,
         session_id: &str,
-        spec: &TerminalSessionSpec,
+        spec: TerminalSessionTarget<'_>,
         message: &str,
         readiness: TerminalDeliveryReadiness,
     ) -> Result<TerminalDeliveryOutcome, String> {
@@ -847,7 +852,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         Ok(TerminalDeliveryOutcome::Pending)
     }
 
-    async fn kill_session(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         if let Some(delivery) = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned").remove(session_id) {
             delivery.task.abort();
         }
@@ -872,7 +877,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         pool.kill_session(session_id).await
     }
 
-    async fn cleanup_session_artifacts(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+    async fn cleanup_session_artifacts(&self, spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         let TerminalSessionSource::Agent { selector, brief, .. } = &spec.source else {
             return Ok(());
         };
@@ -911,33 +916,28 @@ impl TerminalControllerRuntime {
     }
 
     /// #3792: the prepared vessel a session on an agentless host runs in, and
-    /// `None` on every other environment. Only crew sessions name a vessel,
-    /// so only they run on agentless hosts.
-    pub(super) async fn vessel_for_spec(&self, spec: &TerminalSessionSpec) -> Result<Option<Arc<VesselAccess>>, String> {
+    /// `None` on every other environment. Both agent and tool crews name a vessel.
+    pub(super) async fn vessel_for_spec(&self, spec: TerminalSessionTarget<'_>) -> Result<Option<Arc<VesselAccess>>, String> {
         let Some(profile) = self.state.agentless_ssh.get(&spec.env_ref) else { return Ok(None) };
-        let vessel = session_vessel(spec)
-            .ok_or_else(|| format!("agentless host {} runs only crew sessions, in their vessel's agent", spec.env_ref))?;
+        let vessel = session_vessel(spec).ok_or_else(|| format!("agentless host {} requires a session vessel identity", spec.env_ref))?;
         self.state.vessel_access(profile, vessel).await.map(Some)
     }
 
-    pub(super) async fn runner_for_spec(&self, spec: &TerminalSessionSpec) -> Result<Arc<dyn CommandRunner>, String> {
+    pub(super) async fn runner_for_spec(&self, spec: TerminalSessionTarget<'_>) -> Result<Arc<dyn CommandRunner>, String> {
         match self.vessel_for_spec(spec).await? {
             Some(access) => Ok(access.runner()),
             None => self.runner_for_env(&spec.env_ref),
         }
     }
 
-    pub(super) async fn registry_for_spec(&self, spec: &TerminalSessionSpec) -> Result<Arc<ProviderRegistry>, String> {
+    pub(super) async fn registry_for_spec(&self, spec: TerminalSessionTarget<'_>) -> Result<Arc<ProviderRegistry>, String> {
         match self.vessel_for_spec(spec).await? {
             Some(access) => Ok(Arc::clone(&access.registry)),
             None => self.registry_for_env(&spec.env_ref),
         }
     }
 
-    pub(super) async fn adapter_for_spec(
-        &self,
-        spec: &flotilla_resources::TerminalSessionSpec,
-    ) -> Result<Option<Arc<dyn AgentAdapter>>, String> {
+    pub(super) async fn adapter_for_spec(&self, spec: TerminalSessionTarget<'_>) -> Result<Option<Arc<dyn AgentAdapter>>, String> {
         let TerminalSessionSource::Agent { selector, .. } = &spec.source else { return Ok(None) };
         let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
         let registry = self.registry_for_spec(spec).await?;
@@ -949,7 +949,7 @@ impl TerminalControllerRuntime {
             .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))
     }
 
-    pub(super) async fn pool_for_spec(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<Arc<dyn TerminalPool>, String> {
+    pub(super) async fn pool_for_spec(&self, spec: TerminalSessionTarget<'_>) -> Result<Arc<dyn TerminalPool>, String> {
         let registry = self.registry_for_spec(spec).await?;
         registry
             .terminal_pools

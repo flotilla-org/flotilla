@@ -40,6 +40,7 @@ use flotilla_resources::TerminalSessionPhase;
 use flotilla_resources::TerminalSessionSpec;
 use flotilla_resources::TerminalSessionStatus;
 use flotilla_resources::TerminalSessionStatusPatch;
+use flotilla_resources::TerminalSessionTarget;
 use flotilla_resources::Vessel;
 use flotilla_resources::VesselSpec;
 use flotilla_resources::ACTUATOR_HOST_REF_ANNOTATION;
@@ -101,7 +102,7 @@ impl TerminalRuntime for DeadThenRestoredRuntime {
     async fn ensure_session(
         &self,
         _name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         Ok(TerminalRuntimeState::builder()
@@ -114,7 +115,7 @@ impl TerminalRuntime for DeadThenRestoredRuntime {
             .build())
     }
 
-    async fn session_liveness(&self, session_id: &str, _spec: &TerminalSessionSpec) -> Result<TerminalLiveness, String> {
+    async fn session_liveness(&self, session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<TerminalLiveness, String> {
         Ok(if session_id == "old-generation" {
             TerminalLiveness::Lost("daemon generation is dead; session is recreatable".into())
         } else {
@@ -125,7 +126,7 @@ impl TerminalRuntime for DeadThenRestoredRuntime {
     async fn deliver_message(
         &self,
         _session_id: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         message: &str,
         _readiness: TerminalDeliveryReadiness,
     ) -> Result<TerminalDeliveryOutcome, String> {
@@ -133,7 +134,7 @@ impl TerminalRuntime for DeadThenRestoredRuntime {
         Ok(TerminalDeliveryOutcome::Confirmed)
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -234,13 +235,13 @@ impl TerminalRuntime for BrieflyMissingRuntime {
     async fn ensure_session(
         &self,
         _name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("a revived session must not be launched again")
     }
 
-    async fn session_liveness(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<TerminalLiveness, String> {
+    async fn session_liveness(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<TerminalLiveness, String> {
         Ok(if self.probes.fetch_add(1, Ordering::SeqCst) == 0 {
             TerminalLiveness::Lost("session absent from list".into())
         } else {
@@ -248,7 +249,7 @@ impl TerminalRuntime for BrieflyMissingRuntime {
         })
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -369,13 +370,13 @@ impl TerminalRuntime for FailingTerminalRuntime {
     async fn ensure_session(
         &self,
         _name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         Err("boom".to_string())
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -418,17 +419,17 @@ impl TerminalRuntime for GoneEnvironmentTerminalRuntime {
     async fn ensure_session(
         &self,
         _name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("deleted environments cannot launch sessions")
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Err("provider registry unavailable for deleted environment".to_string())
     }
 
-    async fn cleanup_session_artifacts(&self, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn cleanup_session_artifacts(&self, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Err("agent adapter unavailable for deleted environment".to_string())
     }
 }
@@ -747,13 +748,13 @@ impl TerminalRuntime for UnavailableRunningRuntime {
     async fn ensure_session(
         &self,
         _name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("a running session must be probed, not ensured")
     }
 
-    async fn session_is_running(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<bool, String> {
+    async fn session_is_running(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<bool, String> {
         self.probes.fetch_add(1, Ordering::SeqCst);
         if self.available.load(Ordering::SeqCst) {
             Ok(true)
@@ -762,7 +763,7 @@ impl TerminalRuntime for UnavailableRunningRuntime {
         }
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -1059,7 +1060,7 @@ impl TerminalRuntime for GhostRecoveryRuntime {
     async fn ensure_session(
         &self,
         name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         self.ensure_calls.fetch_add(1, Ordering::SeqCst);
@@ -1074,7 +1075,7 @@ impl TerminalRuntime for GhostRecoveryRuntime {
         })
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -1241,14 +1242,14 @@ impl TerminalRuntime for RecordingTerminalRuntime {
     async fn ensure_session(
         &self,
         _name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("terminal finalization must not ensure a new session")
     }
 
-    async fn kill_session(&self, session_id: &str, spec: &TerminalSessionSpec) -> Result<(), String> {
-        self.killed.lock().expect("killed mutex").push((session_id.to_string(), spec.clone()));
+    async fn kill_session(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<(), String> {
+        self.killed.lock().expect("killed mutex").push((session_id.to_string(), spec.spec.clone()));
         Ok(())
     }
 }
@@ -1329,14 +1330,14 @@ struct BriefGateRuntime {
 
 #[async_trait]
 impl TerminalRuntime for BriefGateRuntime {
-    async fn brief_ready(&self, _spec: &TerminalSessionSpec) -> Result<bool, String> {
+    async fn brief_ready(&self, _spec: TerminalSessionTarget<'_>) -> Result<bool, String> {
         Ok(self.available.load(Ordering::SeqCst))
     }
 
     async fn ensure_session(
         &self,
         name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         self.launches.fetch_add(1, Ordering::SeqCst);
@@ -1351,7 +1352,7 @@ impl TerminalRuntime for BriefGateRuntime {
         })
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -1419,7 +1420,7 @@ impl TerminalRuntime for TagRecordingRuntime {
     async fn ensure_session(
         &self,
         name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         *self.tags.lock().expect("tags mutex") = tags.to_vec();
@@ -1434,7 +1435,7 @@ impl TerminalRuntime for TagRecordingRuntime {
         })
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -1509,21 +1510,21 @@ impl TerminalRuntime for ReachRuntime {
     async fn ensure_session(
         &self,
         _name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("running sessions should be observed, not ensured")
     }
 
-    async fn session_is_running(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<bool, String> {
+    async fn session_is_running(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<bool, String> {
         Ok(true)
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 
-    async fn daemon_reach(&self, _spec: &TerminalSessionSpec) -> Result<Option<String>, String> {
+    async fn daemon_reach(&self, _spec: TerminalSessionTarget<'_>) -> Result<Option<String>, String> {
         Ok(self.0.lock().expect("reach").clone())
     }
 }
@@ -1660,17 +1661,17 @@ impl TerminalRuntime for MissingTerminalRuntime {
     async fn ensure_session(
         &self,
         _name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("running sessions should be observed, not ensured")
     }
 
-    async fn session_is_running(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<bool, String> {
+    async fn session_is_running(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<bool, String> {
         Ok(false)
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -2426,18 +2427,18 @@ impl TerminalRuntime for CleanupRecordingTerminalRuntime {
     async fn ensure_session(
         &self,
         _name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("finalizer should not ensure sessions")
     }
 
-    async fn kill_session(&self, session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         self.killed.lock().expect("killed mutex").push(session_id.to_string());
         Ok(())
     }
 
-    async fn cleanup_session_artifacts(&self, spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn cleanup_session_artifacts(&self, spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         if let flotilla_resources::TerminalSessionSource::Agent { brief, .. } = &spec.source {
             self.cleaned.lock().expect("cleaned mutex").push(brief.path.clone());
         }
@@ -2450,13 +2451,13 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
     async fn ensure_session(
         &self,
         _name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("running sessions should not be ensured")
     }
 
-    async fn session_liveness(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<TerminalLiveness, String> {
+    async fn session_liveness(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<TerminalLiveness, String> {
         match self.pool_failure.load(Ordering::SeqCst) {
             1 => Ok(TerminalLiveness::Unavailable("pool unavailable".into())),
             2 => Err("pool lookup unavailable".into()),
@@ -2464,7 +2465,7 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
         }
     }
 
-    async fn observe_failure(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<String>, String> {
+    async fn observe_failure(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<Option<String>, String> {
         if self.pool_failure.load(Ordering::SeqCst) == 3 {
             Err("screen capture unavailable".into())
         } else {
@@ -2475,7 +2476,7 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
     async fn deliver_message(
         &self,
         session_id: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         message: &str,
         readiness: TerminalDeliveryReadiness,
     ) -> Result<TerminalDeliveryOutcome, String> {
@@ -2494,7 +2495,7 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
         })
     }
 
-    async fn observe_attention(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {
+    async fn observe_attention(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<Option<TerminalObservation>, String> {
         if self.observation_failed.load(Ordering::SeqCst) {
             return Err("attention observation unavailable".into());
         }
@@ -2513,7 +2514,7 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
         }))
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -2574,13 +2575,13 @@ impl TerminalRuntime for HooklessTerminalRuntime {
     async fn ensure_session(
         &self,
         _name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("running sessions should not be ensured")
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -2592,19 +2593,19 @@ impl TerminalRuntime for AuthFailedTerminalRuntime {
     async fn ensure_session(
         &self,
         _name: &str,
-        _spec: &TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("running sessions should not be ensured")
     }
 
-    async fn observe_failure(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<String>, String> {
+    async fn observe_failure(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<Option<String>, String> {
         Ok(Some(
             "Codex authentication failed for the central Codex credential /var/lib/flotilla/.config/flotilla/credentials/codex-central/auth.json in environment env-a: token_expired".into(),
         ))
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -2783,19 +2784,23 @@ impl TerminalRuntime for ExitedAgentRuntime {
     async fn ensure_session(
         &self,
         _: &str,
-        _: &TerminalSessionSpec,
+        _: TerminalSessionTarget<'_>,
         _: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("running shell must not provision a replacement before exit is observed")
     }
-    async fn session_liveness(&self, _: &str, _: &TerminalSessionSpec) -> Result<TerminalLiveness, String> {
+    async fn session_liveness(&self, _: &str, _: TerminalSessionTarget<'_>) -> Result<TerminalLiveness, String> {
         Ok(TerminalLiveness::Running)
     }
     // Inject the process boundary: the parent shell has observed the child exit.
-    async fn agent_exit_code(&self, _: &TerminalSessionSpec, _: &flotilla_resources::CrewSessionStatus) -> Result<Option<i32>, String> {
+    async fn agent_exit_code(
+        &self,
+        _: TerminalSessionTarget<'_>,
+        _: &flotilla_resources::CrewSessionStatus,
+    ) -> Result<Option<i32>, String> {
         Ok(Some(self.0))
     }
-    async fn agent_exit_failure(&self, _: &str, _: &TerminalSessionSpec, code: i32) -> Result<Option<String>, String> {
+    async fn agent_exit_failure(&self, _: &str, _: TerminalSessionTarget<'_>, code: i32) -> Result<Option<String>, String> {
         use flotilla_agent::adapter::AgentAdapterRegistry;
         use flotilla_discovery_api::EnvironmentAssertion;
         use flotilla_discovery_api::EnvironmentBag;
@@ -2806,7 +2811,7 @@ impl TerminalRuntime for ExitedAgentRuntime {
         );
         Ok(registry.get(self.2).expect("adapter").classify_exit_failure(code, self.1))
     }
-    async fn kill_session(&self, _: &str, _: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _: &str, _: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -2942,7 +2947,10 @@ async fn typed_unavailability_preserves_lost_session_until_provider_recovers() {
         .await
         .expect("lost terminal");
     let runtime = Arc::new(UnavailableRunningRuntime::default());
-    assert!(matches!(runtime.session_liveness("existing-session", &spec).await.expect("typed outcome"), TerminalLiveness::Unavailable(_)));
+    assert!(matches!(
+        runtime.session_liveness("existing-session", (&spec).into()).await.expect("typed outcome"),
+        TerminalLiveness::Unavailable(_)
+    ));
     let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend, "flotilla");
     assert!(reconciler.prepare(&lost).await.is_err(), "outage cannot authorize recovery based only on elapsed time");
     runtime.available.store(true, Ordering::SeqCst);
@@ -2965,7 +2973,7 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
     async fn ensure_session(
         &self,
         name: &str,
-        spec: &TerminalSessionSpec,
+        spec: TerminalSessionTarget<'_>,
         _: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         if self.fail_launch.load(Ordering::SeqCst) {
@@ -2999,7 +3007,7 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
     }
     async fn agent_exit_code(
         &self,
-        spec: &TerminalSessionSpec,
+        spec: TerminalSessionTarget<'_>,
         crew: &flotilla_resources::CrewSessionStatus,
     ) -> Result<Option<i32>, String> {
         use flotilla_agent::process::exit_receipt;
@@ -3011,7 +3019,7 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
             })
             .await
     }
-    async fn remove_exit_receipt(&self, spec: &TerminalSessionSpec, launch_id: &str) -> Result<(), String> {
+    async fn remove_exit_receipt(&self, spec: TerminalSessionTarget<'_>, launch_id: &str) -> Result<(), String> {
         if self.fail_cleanup.swap(false, Ordering::SeqCst) {
             return Err("cleanup transport unavailable".into());
         }
@@ -3022,7 +3030,7 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
         )
         .await
     }
-    async fn kill_session(&self, _: &str, _: &TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _: &str, _: TerminalSessionTarget<'_>) -> Result<(), String> {
         if self.fail_kill.load(Ordering::SeqCst) {
             return Err("terminal kill unavailable".into());
         }
