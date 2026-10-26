@@ -246,9 +246,9 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                 "FLOTILLA_REQUIRED_AGENT_ADAPTERS"
                     | "FLOTILLA_CLOUD_IMAGE_NEEDS"
                     | "FLOTILLA_DRYDOCK_LAB_FORWARD"
-                    | "FLOTILLA_CREDENTIAL_REFS"
-                    | "FLOTILLA_CREDENTIAL_SCOPES"
-                    | "FLOTILLA_CREDENTIAL_PERMISSIONS"
+                    | flotilla_resources::CREDENTIAL_REFS_ENV
+                    | flotilla_resources::CREDENTIAL_SCOPES_ENV
+                    | flotilla_resources::CREDENTIAL_PERMISSIONS_ENV
                     | flotilla_resources::CREW_SKILLS_ENV
             )
         });

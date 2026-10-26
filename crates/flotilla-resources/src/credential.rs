@@ -6,10 +6,6 @@ use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationC
 
 pub const CREDENTIAL_REFS_ANNOTATION: &str = "flotilla.work/credential-refs";
 pub const CREDENTIAL_REFS_ENV: &str = "FLOTILLA_CREDENTIAL_REFS";
-/// Per-role skill selections composed at crew launch, never stored in an Environment recipe.
-pub const CREW_SKILLS_ENV: &str = "FLOTILLA_CREW_SKILLS";
-/// Selected skills delivered to one crew at launch.
-pub const RESOLVED_SKILLS_ENV: &str = "FLOTILLA_RESOLVED_SKILLS";
 pub const CREDENTIAL_REF_SESSION_TAG: &str = "flotilla-credential";
 pub const CREDENTIAL_SCOPES_ANNOTATION: &str = "flotilla.work/credential-scopes";
 pub const CREDENTIAL_SCOPES_ENV: &str = "FLOTILLA_CREDENTIAL_SCOPES";
@@ -17,6 +13,10 @@ pub const CREDENTIAL_SCOPES_SESSION_TAG: &str = "flotilla-credential-scopes";
 pub const CREDENTIAL_PERMISSIONS_ANNOTATION: &str = "flotilla.work/credential-permissions";
 pub const CREDENTIAL_PERMISSIONS_ENV: &str = "FLOTILLA_CREDENTIAL_PERMISSIONS";
 pub const CREDENTIAL_PERMISSIONS_SESSION_TAG: &str = "flotilla-credential-permissions";
+/// Per-role skill selections composed at crew launch, never stored in an Environment recipe.
+pub const CREW_SKILLS_ENV: &str = "FLOTILLA_CREW_SKILLS";
+/// Selected skills delivered to one crew at launch.
+pub const RESOLVED_SKILLS_ENV: &str = "FLOTILLA_RESOLVED_SKILLS";
 
 define_resource!(
     CredentialSpec,
