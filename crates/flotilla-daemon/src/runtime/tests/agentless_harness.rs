@@ -414,7 +414,8 @@ impl AgentlessRuntime {
     async fn launch(&self) -> Result<LaunchedSession, String> {
         let AgentlessRuntime { state, pool, agents, vessel, spec, .. } = self;
         let before = pool.ensured.lock().await.len();
-        let launched = TerminalControllerRuntime { state: Arc::clone(state) }.ensure_session("terminal-demo-work-coder", spec.into(), &[]).await;
+        let launched =
+            TerminalControllerRuntime { state: Arc::clone(state) }.ensure_session("terminal-demo-work-coder", spec.into(), &[]).await;
         let ensured = pool.ensured.lock().await;
         if let Err(error) = launched {
             assert_eq!(ensured.len(), before, "a refused launch started a session");

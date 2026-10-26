@@ -215,7 +215,7 @@ async fn place_runner(
 ) -> Result<Arc<dyn CommandRunner>, String> {
     let runtime = super::terminal::TerminalControllerRuntime { state: Arc::clone(state) };
     match sessions.first() {
-        Some(session) => runtime.runner_for_spec(&session.spec).await,
+        Some(session) => runtime.runner_for_spec((&session.spec).into()).await,
         None => runtime.runner_for_env(place),
     }
 }
