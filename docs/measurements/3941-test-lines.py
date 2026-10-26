@@ -22,6 +22,10 @@ module named `tests`, `test_support`, `fixtures`, `snapshots`, `testdata` or
 printed as `-` when production is under 100 lines, where the ratio says
 nothing (testkit and test-only crates).
 
+Only `mod` items count as unit-test code: a `#[cfg(test)]` `use`, `fn` or
+`impl` outside a test module counts as production, so unit lines are slightly
+undercounted.
+
 `--self-test` checks the masking and module scan on small snippets.
 `ci/<area>` rows count `test_*.py` and `test-*.sh` as tests and other Python,
 shell and shebang scripts as production; Markdown and data files outside
