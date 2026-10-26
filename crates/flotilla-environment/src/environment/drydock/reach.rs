@@ -434,7 +434,12 @@ mod tests {
             drop(owner);
             let n = tokio::time::timeout(Duration::from_secs(2), guest.read(&mut reply)).await.unwrap().unwrap();
             assert_eq!(n, 0);
-            assert!(tokio::net::UnixStream::connect(&guest_path).await.is_err());
+            // Aborting the listener task drops its socket on a later poll.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while tokio::net::UnixStream::connect(&guest_path).await.is_ok() {
+                assert!(std::time::Instant::now() < deadline, "the guest listener must close");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
     }
     // Delivered trees keep executable bits, private modes and relative links,
