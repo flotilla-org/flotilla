@@ -176,14 +176,12 @@ impl DockerControllerRuntime {
         let (mut environment_spec, instance, convoy) =
             match self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(name).await {
                 Ok(environment) => {
-                    // Contained Environments are owned by a Vessel on the placement host.
+                    // Contained Environments reference their owning Vessel on the placement host.
                     // Its spec carries convoy identity even when the Environment has no convoy label.
                     let convoy = if let Some(convoy) = environment.metadata.labels.get(flotilla_resources::CONVOY_LABEL) {
                         Some(convoy.clone())
-                    } else if let Some(owner) =
-                        environment.metadata.owner_references.iter().find(|owner| owner.controller && owner.kind == Vessel::API_PATHS.kind)
-                    {
-                        match self.state.daemon.resource_backend().using::<Vessel>(&self.state.namespace).get(&owner.name).await {
+                    } else if let Some(vessel_ref) = environment.metadata.labels.get(flotilla_resources::VESSEL_REF_LABEL) {
+                        match self.state.daemon.resource_backend().using::<Vessel>(&self.state.namespace).get(vessel_ref).await {
                             Ok(vessel) => Some(vessel.spec.convoy_ref),
                             Err(ResourceError::NotFound { .. }) => None,
                             Err(error) => return Err(error.to_string().into()),
@@ -206,7 +204,7 @@ impl DockerControllerRuntime {
             };
         if convoy.as_deref().is_none_or(str::is_empty) && spec.required_agent_adapters.contains("claude-code") {
             return Err(format!(
-                "RequesterConvoyUnavailable: contained Claude environment `{name}` has no resolvable convoy; expected an Environment convoy label or its controller Vessel's convoy_ref"
+                "RequesterConvoyUnavailable: contained Claude environment `{name}` has no resolvable convoy; expected an Environment convoy label or its referenced Vessel's convoy_ref"
             ).into());
         }
         if environment_spec.cloud_sandbox.is_none() {

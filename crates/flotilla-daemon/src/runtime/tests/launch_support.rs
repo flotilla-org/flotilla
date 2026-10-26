@@ -17,28 +17,23 @@ pub(super) async fn bind_account(backend: &ResourceBackend, convoy: &str, role: 
     let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
     let mut epochs = flotilla_schema::Records::new();
     epochs.append(1, EpochEntry { epoch: "1".into(), observed_at: now }).expect("epoch");
+    let spec = AccountBindingSpec {
+        requester: requester_address(Some("flotilla"), convoy, role).expect("requester"),
+        item: "claude-code".into(),
+        requirement: access.clone(),
+        credential: CredentialName(credential.into()),
+        account: Some(account.into()),
+        grants: BTreeMap::from([(GrantName("claude-max-contained".into()), GrantScope { scope: "account".into() })]),
+        candidates: BTreeSet::from([CredentialName(credential.into())]),
+        exclusions: BTreeMap::new(),
+        selection: Selection::Pin { pinned_by: "test".into() },
+        epochs,
+        opened_at: now,
+        state: flotilla_schema::State::new(BindingState::Open, now),
+    };
     backend
         .using::<flotilla_resources::AccountBinding>(NAMESPACE)
-        .create(
-            &InputMeta::builder()
-                .name(binding_name(convoy, role, &access))
-                .labels(BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), convoy.to_string())]))
-                .build(),
-            &AccountBindingSpec {
-                requester: requester_address(Some("flotilla"), convoy, role).expect("requester"),
-                item: "claude-code".into(),
-                requirement: access,
-                credential: CredentialName(credential.into()),
-                account: Some(account.into()),
-                grants: BTreeMap::from([(GrantName("claude-max-contained".into()), GrantScope { scope: "account".into() })]),
-                candidates: BTreeSet::from([CredentialName(credential.into())]),
-                exclusions: BTreeMap::new(),
-                selection: Selection::Pin { pinned_by: "test".into() },
-                epochs,
-                opened_at: now,
-                state: flotilla_schema::State::new(BindingState::Open, now),
-            },
-        )
+        .create(&flotilla_admission::account_access::binding_meta(&binding_name(convoy, role, &access), &spec), &spec)
         .await
         .expect("account binding");
 }
@@ -104,11 +99,24 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("workspace");
     let env_id = EnvironmentId::new("contained-claude");
+    let vessel = backend
+        .using::<Vessel>(NAMESPACE)
+        .create(
+            &empty_meta("demo-work"),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "demo".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "policy".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
+        .await
+        .expect("vessel");
     if !matches!(observation, LaunchObservationRecord::MissingEnvironment) {
         backend
             .using::<Environment>(NAMESPACE)
             .create(
-                &empty_meta(env_id.as_str()),
+                &flotilla_crew::reconcilers::vessel::owned_child_meta(env_id.as_str(), &vessel, BTreeMap::new()),
                 &EnvironmentSpec {
                     cloud_sandbox: None,
                     provider_address: None,
@@ -224,19 +232,6 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
             .await
             .expect("convoy");
     }
-    backend
-        .using::<Vessel>(NAMESPACE)
-        .create(
-            &empty_meta("demo-work"),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "demo".into(),
-                vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("vessel");
     let terminal_meta = empty_meta("terminal-demo-work-coder");
     if matches!(observation, LaunchObservationRecord::Present) {
         backend.using::<TerminalSession>(NAMESPACE).create(&terminal_meta, &spec).await.expect("terminal context");

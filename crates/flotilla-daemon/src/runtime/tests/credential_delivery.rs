@@ -763,6 +763,7 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
     // Removing requester ownership must refuse a relaunch before creating a backing.
     let mut orphan = InputMeta::from(&environment.metadata);
     orphan.owner_references.clear();
+    orphan.labels.remove(flotilla_resources::VESSEL_REF_LABEL);
     backend
         .using::<Environment>(NAMESPACE)
         .update(&orphan, &environment.metadata.resource_version, &environment.spec)
