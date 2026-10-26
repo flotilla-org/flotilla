@@ -33,7 +33,7 @@ use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, T
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::agentless_vessels::{apply_reach_environment, compose_session_environment, session_vessel, VesselAccess};
+use super::agentless_vessels::{apply_reach_environment, compose_session_environment, VesselAccess};
 use super::credentials::{agent_material_environment, RuntimeSessionCapabilities};
 use super::state::ControllerRuntimeState;
 use crate::blob_store::BlobDigest;
@@ -679,7 +679,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let runner = self.runner_for_spec(spec).await?;
         // Receipts are read in batches per runner: an agentless host's
         // vessels each read through their own agent.
-        let vessel = self.state.agentless_ssh.contains_key(&spec.env_ref).then(|| session_vessel(spec)).flatten();
+        let vessel = self.state.agentless_ssh.contains_key(&spec.env_ref).then_some(spec.vessel_ref).flatten();
         let batch = match vessel {
             Some(vessel) => format!("{}/{vessel}", spec.env_ref),
             None => spec.env_ref.clone(),
@@ -701,7 +701,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     .filter_map(|session| {
                         if session.spec.env_ref != spec.env_ref
                             || !matches!(session.spec.source, TerminalSessionSource::Agent { .. })
-                            || vessel.is_some_and(|vessel| session_vessel((&session).into()) != Some(vessel))
+                            || vessel.is_some_and(|vessel| TerminalSessionTarget::from(&session).vessel_ref != Some(vessel))
                         {
                             return None;
                         }
@@ -919,7 +919,7 @@ impl TerminalControllerRuntime {
     /// `None` on every other environment. Both agent and tool crews name a vessel.
     pub(super) async fn vessel_for_spec(&self, spec: TerminalSessionTarget<'_>) -> Result<Option<Arc<VesselAccess>>, String> {
         let Some(profile) = self.state.agentless_ssh.get(&spec.env_ref) else { return Ok(None) };
-        let vessel = session_vessel(spec).ok_or_else(|| format!("agentless host {} requires a session vessel identity", spec.env_ref))?;
+        let vessel = spec.vessel_ref.ok_or_else(|| format!("agentless host {} requires a session vessel identity", spec.env_ref))?;
         self.state.vessel_access(profile, vessel).await.map(Some)
     }
 

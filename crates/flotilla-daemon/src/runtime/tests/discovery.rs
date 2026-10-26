@@ -326,6 +326,25 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         let error = terminal.ensure_session("unowned", (&unowned).into(), &[]).await.expect_err("missing vessel");
         assert!(error.contains("requires a session vessel identity"), "{error}");
     }
+    // An empty agent context must be refused even if metadata names a vessel.
+    let mut unowned_agent = session.clone();
+    unowned_agent.spec.source = TerminalSessionSource::Agent {
+        selector: Selector { capability: "code".into(), adapter: None, model: None },
+        brief: flotilla_resources::TerminalBrief {
+            path: "brief.md".into(),
+            content: String::new(),
+            artifact_digest: None,
+            copies: Vec::new(),
+        },
+        context: Box::new(flotilla_resources::TerminalCrewContext {
+            namespace: NAMESPACE.into(),
+            convoy: "ssh-crew".into(),
+            vessel_ref: String::new(),
+        }),
+        message: None,
+    };
+    let error = terminal.ensure_session("unowned-agent", (&unowned_agent).into(), &[]).await.expect_err("empty agent vessel");
+    assert!(error.contains("requires a session vessel identity"), "{error}");
     let launched = terminal.ensure_session(&identity.name(), (&session).into(), &[]).await.expect("tool in vessel");
     let session_id = launched.session_id;
     assert_eq!(vessel_pool.0.ensured.lock().await.len(), 1);

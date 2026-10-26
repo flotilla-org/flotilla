@@ -782,15 +782,9 @@ pub(super) async fn live_vessels(backend: &ResourceBackend, namespace: &str, env
             .items
             .iter()
             .filter(|session| session.object.spec.env_ref == environment)
-            .filter_map(|session| session_vessel((&session.object).into()).map(str::to_string)),
+            .filter_map(|session| TerminalSessionTarget::from(&session.object).vessel_ref.map(str::to_string)),
     );
     Ok(live)
-}
-
-/// Agent sessions carry their vessel in their context; tool sessions use the
-/// vessel label written by TerminalSessionIdentity.
-pub(super) fn session_vessel(spec: TerminalSessionTarget<'_>) -> Option<&str> {
-    spec.vessel_ref
 }
 
 /// Core's way into sessions on agentless hosts: their files and attach go
@@ -803,7 +797,7 @@ impl VesselSessions {
     async fn access(&self, spec: TerminalSessionTarget<'_>) -> Option<Result<Arc<VesselAccess>, String>> {
         let state = self.state.upgrade()?;
         let profile = state.agentless_ssh.get(&spec.env_ref)?;
-        let Some(vessel) = session_vessel(spec) else {
+        let Some(vessel) = spec.vessel_ref else {
             return Some(Err(format!("agentless host {} requires a session vessel identity", spec.env_ref)));
         };
         Some(state.vessel_access(profile, vessel).await)

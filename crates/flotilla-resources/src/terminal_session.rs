@@ -122,13 +122,15 @@ pub struct TerminalSessionTarget<'a> {
     pub vessel_ref: Option<&'a str>,
 }
 
+/// Spec-only conversion preserves agent context; tool sessions need the
+/// ResourceObject conversion to read their vessel label.
 impl<'a> From<&'a TerminalSessionSpec> for TerminalSessionTarget<'a> {
     fn from(spec: &'a TerminalSessionSpec) -> Self {
         let vessel_ref = match &spec.source {
             TerminalSessionSource::Agent { context, .. } => Some(context.vessel_ref.as_str()),
             TerminalSessionSource::Tool { .. } => None,
         };
-        Self { spec, vessel_ref }
+        Self { spec, vessel_ref: vessel_ref.filter(|value| !value.is_empty()) }
     }
 }
 
