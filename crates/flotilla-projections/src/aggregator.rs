@@ -2479,15 +2479,11 @@ impl Aggregator {
 
     /// A held lifecycle decides the phase; interrupted roles are an observation of a realised lease.
     #[cfg(test)]
-    pub(crate) fn vessel_phase(&self, vessel: &ReadResourceObject<Vessel>) -> VesselPhase {
+    pub(crate) fn vessel_phase(&self, vessel: &ReadResourceObject<Vessel>) -> Result<VesselPhase, String> {
         let origin = readiness::engine_origin(&vessel.provenance);
-        match self.lifecycle_reads.try_reading(crate::ports::ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref()) {
-            Ok(reading) => Self::vessel_phase_from_reading(vessel, reading.as_ref()),
-            Err(error) => {
-                tracing::warn!(%error, "vessel lifecycle read failed");
-                VesselPhase::Lost
-            }
-        }
+        self.lifecycle_reads
+            .try_reading(crate::ports::ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref())
+            .map(|reading| Self::vessel_phase_from_reading(vessel, reading.as_ref()))
     }
 
     pub(super) fn vessel_phase_from_reading(
@@ -2504,6 +2500,7 @@ impl Aggregator {
                 }
             }
             Some(LifecycleReading::InProgress | LifecycleReading::Retrying { .. }) => VesselPhase::Provisioning,
+            // Exhaustion is a failed judgement while the engine finishes the terminal GiveUp write.
             Some(LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. } | LifecycleReading::Exhausted { .. }) => {
                 VesselPhase::Failed
             }
@@ -6889,13 +6886,13 @@ mod tests {
         assert!(aggregator.session_running(&session));
     }
 
-    // Every stored ending decides the view despite stale lifecycle phase and message.
+    // Engine readings decide readiness despite stale lifecycle phase/message; interrupted roles remain observations.
     #[hegel::test]
-    fn the_engine_ending_decides_a_vessel_view(tc: hegel::TestCase) {
+    fn the_engine_reading_decides_a_vessel_view(tc: hegel::TestCase) {
         use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
         use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
         use flotilla_resources::{VesselSpec, VesselStatus};
-        // Every old phase and ending, with empty and Unicode causes; no old copy is published.
+        // Every old phase, live readings and endings, with empty and Unicode causes; no old copy is published.
         let old = [
             VesselPhase::Pending,
             VesselPhase::Provisioning,
@@ -6905,11 +6902,15 @@ mod tests {
             VesselPhase::Lost,
         ][tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(5))];
         let reason = ["", "backing failed", "失敗"][tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2))];
-        let (ending, expected, reason) = match tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3)) {
-            0 => (Ending::Released, VesselPhase::Lost, "released"),
-            1 => (Ending::Lost("env"), VesselPhase::Lost, "observed absent"),
-            2 => (Ending::Failed(reason), VesselPhase::Failed, reason),
-            _ => (Ending::GaveUp(reason), VesselPhase::Failed, reason),
+        let mode = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(6));
+        let (ending, expected, reason) = match mode {
+            0 => (Some(Ending::Released), VesselPhase::Lost, "released"),
+            1 => (Some(Ending::Lost("env")), VesselPhase::Lost, "observed absent"),
+            2 => (Some(Ending::Failed(reason)), VesselPhase::Failed, reason),
+            3 => (Some(Ending::GaveUp(reason)), VesselPhase::Failed, reason),
+            4 => (None, VesselPhase::Provisioning, "being realised"),
+            5 => (Some(Ending::Ready("env")), VesselPhase::Interrupted, "crew roles are interrupted: coder"),
+            _ => (None, VesselPhase::Provisioning, "provider is busy (1 failed; next try at 1970-01-01T00:00:03+00:00)"),
         };
         let convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
         let status = convoy.status.as_ref().expect("status");
@@ -6926,6 +6927,7 @@ mod tests {
             VesselStatus {
                 phase: old,
                 message: Some("stale".into()),
+                interrupted_roles: BTreeSet::from(["coder".into()]),
                 checkout_refs: BTreeMap::from([(flotilla_resources::RepositoryKey("stale".into()), "missing".into())]),
                 placement_decision: Some(
                     PlacementDecision::builder()
@@ -6937,19 +6939,30 @@ mod tests {
             },
         );
         fixture.request(&vessel);
-        fixture.finish(&vessel, ending);
+        if mode == 6 {
+            fixture.retry(&vessel, "provider is busy");
+        }
+        if let Some(ending) = ending {
+            fixture.finish(&vessel, ending);
+        }
         let (events, _) = broadcast::channel(8);
         let mut aggregator =
             Aggregator::new(AggregatorProjectionState::new(), HostName::new("host"), events).with_lifecycle_reads(fixture.reads.clone());
         let read = ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local };
-        assert_eq!(aggregator.vessel_phase(&read), expected);
-        apply_readiness_event(&mut aggregator.readiness_vessels, ReadWatchEvent::Added(read));
+        assert_eq!(aggregator.vessel_phase(&read).expect("reading"), expected);
+        apply_readiness_event(&mut aggregator.readiness_vessels, ReadWatchEvent::Added(read.clone()));
         let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("host"));
         let (readiness, _) =
             aggregator.vessel_readiness(&reference, definition, status.work.get(&definition.name), None, &HostName::new("host"));
         assert_eq!(readiness.blockers.len(), 1, "stale checkout refs are not combined with engine evidence");
         assert_eq!(readiness.blockers[0].reason, reason);
         assert_eq!(readiness.blockers[0].phase, format!("{expected:?}"));
+        fixture.poison();
+        assert!(aggregator.vessel_phase(&read).unwrap_err().contains("poisoned"));
+        let (readiness, _) =
+            aggregator.vessel_readiness(&reference, definition, status.work.get(&definition.name), None, &HostName::new("host"));
+        assert_eq!(readiness.blockers[0].phase, "Unknown");
+        assert!(readiness.blockers[0].reason.contains("poisoned"));
     }
 
     // #1961: Active plus pending agent work must remain provisioning, even

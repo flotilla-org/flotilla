@@ -99,6 +99,21 @@ impl Aggregator {
                     reason: engine
                         .as_ref()
                         .and_then(LifecycleReading::reason)
+                        .or_else(|| {
+                            (engine.is_some() && vessel_phase == VesselPhase::Interrupted).then(|| {
+                                format!(
+                                    "crew roles are interrupted: {}",
+                                    vessel
+                                        .object
+                                        .status
+                                        .iter()
+                                        .flat_map(|status| status.interrupted_roles.iter())
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            })
+                        })
                         .or_else(|| status.and_then(|status| status.message.clone()))
                         .unwrap_or_else(|| {
                             if vessel_phase == VesselPhase::Lost {

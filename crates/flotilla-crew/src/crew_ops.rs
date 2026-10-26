@@ -79,7 +79,10 @@ fn vessel_ending_reason(
             | LifecycleReading::Failed { .. }
             | LifecycleReading::GaveUp { .. }),
         ) => reading.reason().map(|reason| (reading, reason)),
+        // Exhausted remains Requested until GiveUp commits. This helper reports completed endings;
+        // environment guards separately reject an exhausted backing before admitting work.
         Some(_) => None,
+        // Primitives-off and current unplaced vessels have no engine resource; retain their status read.
         None => vessel
             .object
             .status
