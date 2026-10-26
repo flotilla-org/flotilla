@@ -3,6 +3,7 @@
 // Remove when async_trait or Clippy stops producing this warning.
 #![allow(clippy::double_must_use)]
 
+pub mod account_access;
 #[doc(hidden)]
 pub mod address;
 pub mod artifact;

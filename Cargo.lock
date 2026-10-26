@@ -3318,6 +3318,7 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-protocol",
+ "flotilla-schema",
  "futures",
  "hegeltest",
  "indexmap",
