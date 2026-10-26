@@ -20,8 +20,9 @@ round transactionally. A disconnected round rolls back to its last committed pre
 The listener-independent `Service` owns the new store. The daemon exposes
 `GET /apis/flotilla.work/v1/change-stream[?after=<home_seq>]` on the existing resource HTTP API.
 Its chunked response sends a snapshot when needed, tails ordered frames, and sends idle
-keepalives. Peers request finite rounds every five seconds, with a 15-second network
-read/write deadline. There is no peer-count semaphore or encoded tail cache: each round opens
+keepalives. Peers request finite rounds every five seconds, with a 15-second
+frame-production deadline and a 20-second network read deadline. Both transports share
+one pool of 16 blocking workers and one current session per peer; each round opens
 one read-only WAL connection, reads `changes_since` pages, encodes them, and closes the
 connection. A brief writer barrier before the read cut waits for the transaction currently
 holding the mutex; it does not impose FIFO order on queued writers. The writer lock is
@@ -42,7 +43,16 @@ production `read_record` routes one local miss there and marks it remote with it
 age. Gates receive no remote transport capability.
 
 Peer connection generations own their follower tasks. Homes with forwarded resource sockets
-use HTTP; homes reached through command routing use `QueryChangeStream`. A routed session
+use HTTP; homes reached through command routing use `QueryChangeStream`. To authenticate
+HTTP without treating the forwarded Unix socket as an interactive user, every peer first
+opens a round through peer-only routed dispatch. The returned opaque session token is a
+capability carried in the `x-flotilla-change-stream-session` header over the forwarded
+socket. HTTP resolves its originating peer and continues that same producer; it cannot
+open a worker of its own. The follower stages the first routed frame before the HTTP
+continuation. An empty tail ending in that first frame needs no HTTP request. Bearer,
+browser-session and environment callers are refused even with a token; an ordinary
+socket caller without a peer-issued capability is refused too. Tokens are never sent in
+URLs, and expire with the cursor. A routed session
 retains one consistent read cut and pulls one base64-wrapped CBOR frame per request, applying
 backpressure independently of the daemon event broadcast ring. Two bounded channels each
 hold at most two frames. A producer or abandoned session expires after 15 seconds without
@@ -70,8 +80,8 @@ the session and the next round resumes from committed progress. Displacement/dis
 cancels the matching follower task. Failed links resume from committed
 progress. The persisted watermark row, including zero, identifies a completed baseline after
 restart. Home point reads reuse the HTTP client for each currently connected socket. The old replicator is unchanged. No decided store is opened lazily: before a kind
-migration installs its registered Service with `install_decided_store`, both routes answer
-503 and no followers start. #3317 installs the first kind before peer tasks start and verifies
+migration installs its registered Service with `install_decided_store`, point reads and
+peer cursor creation refuse service and no followers start. #3317 installs the first kind before peer tasks start and verifies
 the complete production path. Tests exercise the generic mechanism before that integration.
 
 ## Readable table views

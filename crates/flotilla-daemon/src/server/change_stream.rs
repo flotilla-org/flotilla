@@ -9,16 +9,13 @@ use flotilla_schema_sqlite::{
     StoreError,
 };
 use futures::StreamExt;
-use tokio::{io::AsyncWriteExt, sync::mpsc};
+use tokio::io::AsyncWriteExt;
 
 const CADENCE: Duration = Duration::from_secs(5);
 const IO_DEADLINE: Duration = Duration::from_secs(15);
 // The producer waits 15 seconds for a frame. Allow another five seconds for the
 // routed request and response so its specific failure reaches the follower.
 const ROUTED_PULL_DEADLINE: Duration = Duration::from_secs(20);
-/// How long the router's change-stream body waits on a consumer that stopped reading.
-pub(super) const CONSUMER_DEADLINE: Duration = IO_DEADLINE;
-const QUEUED_FRAMES: usize = 2;
 
 fn transport(error: impl std::fmt::Display) -> StoreError {
     StoreError::Stream(error.to_string())
@@ -26,60 +23,26 @@ fn transport(error: impl std::fmt::Display) -> StoreError {
 
 pub(super) const CONTENT_TYPE: &str = "application/vnd.flotilla.log+cbor";
 
-/// Router seam: the frames as a response body. A consumer that stops reading for
-/// `deadline` ([`CONSUMER_DEADLINE`] in production) fails the stream: the producer gives up, releases the store, and the body
-/// ends with an error, so the client sees a failed stream rather than a clean end.
+/// The cursor is issued by peer-only routed dispatch; HTTP continues that same
+/// worker. No HTTP request can spawn an additional blocking producer.
+pub(super) use flotilla_protocol::peer::CHANGE_STREAM_SESSION_HEADER as SESSION_HEADER;
+
 pub(super) fn body(
-    service: Arc<Service>,
-    after: Option<u64>,
-    clock: Arc<dyn flotilla_resources::Clock>,
-    deadline: Duration,
+    daemon: Arc<flotilla_core::in_process::InProcessDaemon>,
+    peer: String,
+    session: String,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
-    let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(QUEUED_FRAMES);
-    let failure = Arc::new(std::sync::Mutex::new(None::<String>));
-    let failed = Arc::clone(&failure);
-    tokio::spawn(async move {
-        if let Err(error) = frames(service, after, clock, &tx, deadline).await {
-            // Never wait on a stalled consumer: the channel may be full. Record the failure
-            // for the body to report once it drains, then drop the sender.
-            *failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+    futures::stream::try_unfold((daemon, peer, session, false), |(daemon, peer, session, done)| async move {
+        if done {
+            return Ok(None);
         }
-    });
-    futures::stream::unfold((rx, failure), |(mut rx, failure)| async move {
-        match rx.recv().await {
-            Some(item) => Some((item, (rx, failure))),
-            None => {
-                let error = failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
-                Some((Err(std::io::Error::other(error)), (rx, failure)))
-            }
-        }
+        let value = daemon.next_change_stream_frame(&peer, None, Some(session.clone())).await.map_err(std::io::Error::other)?;
+        let flotilla_protocol::CommandValue::ChangeStreamFrame { frame, .. } = value else {
+            return Err(std::io::Error::other("unexpected stream response"));
+        };
+        let done = matches!(Frame::decode(&frame).map_err(std::io::Error::other)?, Frame::Keepalive { .. });
+        Ok(Some((bytes::Bytes::from(frame), (daemon, peer, session, done))))
     })
-}
-
-/// Queue one frame for the body, failing when the consumer stops reading for `deadline`.
-async fn emit(tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>, frame: Vec<u8>, deadline: Duration) -> Result<(), String> {
-    tokio::time::timeout(deadline, tx.send(Ok(frame.into())))
-        .await
-        .map_err(|_| "stream consumer stalled".to_owned())?
-        .map_err(|_| "stream consumer closed".to_owned())
-}
-
-/// One bounded delivery round; followers poll from the committed cursor.
-async fn frames(
-    service: Arc<Service>,
-    after: Option<u64>,
-    clock: Arc<dyn flotilla_resources::Clock>,
-    body: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
-    deadline: Duration,
-) -> Result<(), String> {
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(QUEUED_FRAMES);
-    let at = Timestamp::from_datetime(&clock.now());
-    let task = tokio::task::spawn_blocking(move || service.serve(after, at, |frame| tx.blocking_send(frame.to_vec()).map_err(transport)));
-    while let Some(frame) = rx.recv().await {
-        emit(body, frame, deadline).await?;
-    }
-    task.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 /// One encoded point read, as the record route's body.
@@ -186,7 +149,24 @@ pub(super) async fn follow_round(
     router: &super::remote_commands::RemoteCommandRouter,
 ) -> Result<(), String> {
     match client {
-        Some(client) => follow_connection(service, home, client).await,
+        Some(client) => {
+            use flotilla_protocol::{Command, CommandAction, CommandValue, NodeId};
+            let after = service
+                .has_watermark(home)
+                .then(|| service.watermark(home))
+                .transpose()
+                .map_err(|e| e.to_string())?
+                .map(|mark| mark.home_seq);
+            let command =
+                Command::builder().node_id(NodeId::new(home)).action(CommandAction::QueryChangeStream { after, session: None }).build();
+            let value = tokio::time::timeout(ROUTED_PULL_DEADLINE, router.dispatch_replication_query(command))
+                .await
+                .map_err(|_| "routed stream timed out")??;
+            let CommandValue::ChangeStreamFrame { session, frame } = value else {
+                return Err(format!("unexpected routed stream response: {value:?}"));
+            };
+            follow_connection(service, home, client, &session, &frame).await
+        }
         None => routed_round(service, home, router).await,
     }
 }
@@ -255,22 +235,30 @@ fn http_client(socket: &std::path::Path) -> Result<reqwest::Client, String> {
     rigging_tls::client_builder()
         .unix_socket(socket)
         .connect_timeout(IO_DEADLINE)
-        .read_timeout(IO_DEADLINE)
+        .read_timeout(ROUTED_PULL_DEADLINE)
         .build()
         .map_err(|e| e.to_string())
 }
 
-async fn follow_connection(service: Arc<Service>, home: &str, client: &reqwest::Client) -> Result<(), String> {
-    let after = service.watermark(home).map_err(|e| e.to_string())?;
-    let target = if !service.has_watermark(home) {
-        format!("http://flotilla.local{}", stream::PATH)
-    } else {
-        format!("http://flotilla.local{}?after={}", stream::PATH, after.home_seq)
-    };
-    let response = client.get(target).send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?;
+async fn follow_connection(service: Arc<Service>, home: &str, client: &reqwest::Client, session: &str, first: &[u8]) -> Result<(), String> {
+    // The peer-issued session fixes the cursor; HTTP only continues that round.
+    let target = format!("http://flotilla.local{}", stream::PATH);
+    let mut spool = tokio::fs::File::from_std(tempfile::tempfile().map_err(|e| e.to_string())?);
+    spool.write_all(first).await.map_err(|e| e.to_string())?;
+    if matches!(Frame::decode(first).map_err(|e| e.to_string())?, Frame::Keepalive { .. }) {
+        spool.flush().await.map_err(|e| e.to_string())?;
+        return install_spool(service, home, spool.into_std().await).await;
+    }
+    let response = client
+        .get(target)
+        .header(SESSION_HEADER, session)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
     // Stage a complete round on disk before acquiring the writer. This keeps frame memory
     // bounded and preserves atomic snapshot install without holding a lock over network waits.
-    let mut spool = tokio::fs::File::from_std(tempfile::tempfile().map_err(|e| e.to_string())?);
     let mut body = response.bytes_stream();
     let mut pending = Vec::new();
     let mut expected = HEADER_LEN;
@@ -335,10 +323,7 @@ async fn install_spool(service: Arc<Service>, home: &str, mut spool: std::fs::Fi
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{empty_daemon, empty_remote_command_router};
     use super::*;
-    use crate::peer::PeerManager;
-    use flotilla_protocol::NodeId;
     use flotilla_schema::KindRegistry;
     use flotilla_schema_sqlite::stream::Watermark;
     use flotilla_test_support::TestSocketDir;
@@ -378,15 +363,9 @@ mod tests {
                     request.push(byte[0]);
                 }
                 let request = String::from_utf8(request).expect("UTF-8");
-                assert_eq!(
-                    request.lines().next(),
-                    Some(match known {
-                        false => "GET /apis/flotilla.work/v1/change-stream HTTP/1.1",
-                        true => "GET /apis/flotilla.work/v1/change-stream?after=0 HTTP/1.1",
-                    })
-                );
+                assert_eq!(request.lines().next(), Some("GET /apis/flotilla.work/v1/change-stream HTTP/1.1"));
+                assert!(request.contains("x-flotilla-change-stream-session: peer-session"));
                 let frames = [
-                    Frame::Begin { home: "home".into(), home_seq: 0 },
                     Frame::End { home: "home".into(), home_seq: 0 },
                     Frame::Keepalive { home: "home".into(), watermark: Watermark { home_seq: 0, applied_through: Timestamp(7) } },
                 ];
@@ -397,12 +376,15 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
             });
-            let (_daemon_dir, daemon) = empty_daemon().await;
-            let pm = Arc::new(tokio::sync::Mutex::new(PeerManager::new(NodeId::new("local"))));
-            let router = empty_remote_command_router(&daemon, &pm);
-            follow_round(Arc::clone(&service), "home", Some(&http_client(&socket).unwrap()), &router)
-                .await
-                .expect("prefer HTTP socket to missing command route");
+            follow_connection(
+                Arc::clone(&service),
+                "home",
+                &http_client(&socket).unwrap(),
+                "peer-session",
+                &Frame::Begin { home: "home".into(), home_seq: 0 }.encode().unwrap(),
+            )
+            .await
+            .expect("HTTP continuation");
             peer.await.expect("stand-in");
             assert_eq!(service.with_store(|store| store.read()?.watermark("home")).expect("mark").applied_through, Timestamp(7));
         }
@@ -432,7 +414,6 @@ mod tests {
                 socket.read_exact(&mut byte).await.expect("request");
                 request.push(byte[0]);
             }
-            let begin = Frame::Begin { home: "home".into(), home_seq: 0 }.encode().expect("begin");
             let rest: Vec<u8> = [
                 Frame::End { home: "home".into(), home_seq: 0 },
                 Frame::Keepalive { home: "home".into(), watermark: Watermark { home_seq: 0, applied_through: Timestamp(7) } },
@@ -441,18 +422,24 @@ mod tests {
             .flat_map(|frame| frame.encode().expect("frame"))
             .collect();
             socket
-                .write_all(
-                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", begin.len() + rest.len()).as_bytes(),
-                )
+                .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", rest.len()).as_bytes())
                 .await
                 .expect("headers");
-            socket.write_all(&begin).await.expect("begin");
             sent.send(()).expect("sent");
             wait.await.expect("release");
             socket.write_all(&rest).await.expect("rest");
         });
         let target = Arc::clone(&service);
-        let follow = tokio::spawn(async move { follow_connection(target, "home", &http_client(&socket).unwrap()).await });
+        let follow = tokio::spawn(async move {
+            follow_connection(
+                target,
+                "home",
+                &http_client(&socket).unwrap(),
+                "peer-session",
+                &Frame::Begin { home: "home".into(), home_seq: 0 }.encode().unwrap(),
+            )
+            .await
+        });
         first.await.expect("first frame sent");
         // Let the client consume Begin and block on the deliberately withheld next frame.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -477,17 +464,6 @@ mod tests {
         progress.expect("network wait must not hold writer").expect("concurrent task").expect("local operations");
         assert_eq!(service.watermark("home").expect("mark").applied_through, Timestamp(7));
         assert_eq!(service.watermark("other").expect("other mark").applied_through, Timestamp(3));
-    }
-
-    // The router's body carries the snapshot and keepalive frames, one per chunk, and a
-    // A round ends cleanly after its snapshot and keepalive.
-    #[tokio::test]
-    async fn router_seam_sends_snapshot_and_keepalive_and_ends() {
-        let store_dir = tempfile::tempdir().expect("dir");
-        let service = Arc::new(Service::open(&store_dir.path().join("store.sqlite"), "home", KindRegistry::new()).expect("store"));
-        let chunks: Vec<_> = body(service, None, Arc::new(flotilla_resources::SystemClock), CONSUMER_DEADLINE).collect().await;
-        let frames = chunks.into_iter().map(|chunk| Frame::decode(&chunk.expect("chunk")).expect("frame")).collect::<Vec<_>>();
-        assert!(matches!(frames.as_slice(), [Frame::Begin { .. }, Frame::End { .. }, Frame::Keepalive { .. }]), "{frames:?}");
     }
 
     // A routed miss is exactly one encoded point query to the home. Even an absent result

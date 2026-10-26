@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CommandValue, HostIdentity, NodeId, RepoIdentity, Step, StepOutcome, StepStatus};
 
+/// Opaque cursor issued through peer-only query dispatch before HTTP continuation.
+/// Keep this handoff in the fingerprinted protocol source so older peers cannot mix it.
+pub const CHANGE_STREAM_SESSION_HEADER: &str = "x-flotilla-change-stream-session";
+
 /// Unified peer-to-peer wire payload used inside `Message::Peer`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // Windows type layouts have triggered this lint for the legacy peer payload. Keep its

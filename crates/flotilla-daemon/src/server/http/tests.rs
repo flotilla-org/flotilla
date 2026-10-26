@@ -602,63 +602,94 @@ async fn tcp_origin_rules_close_rebinding_hijacking_and_csrf() {
     assert_eq!(send("GET", "/v1/hello", vec![("Cookie", cookie)]).await, 401, "logged out");
 }
 
-// The change stream's body fails a consumer that stops reading. After the deadline the
-// producer gives up, releasing the store and ending its task, rather than waiting forever
-// to queue its error behind frames the consumer will not read. Nothing reads the body
-// until the producer has gone, so only a non-blocking failure path lets it go.
-#[tokio::test]
-async fn a_stalled_change_stream_consumer_is_released() {
-    use flotilla_schema_sqlite::stream::Service;
+#[derive(flotilla_schema::Stored)]
+#[store(kind = "HttpStreamSample", code = "hs")]
+struct HttpStreamSample {
+    value: String,
+}
 
-    let dir = tempfile::tempdir().expect("dir");
-    std::fs::create_dir_all(dir.path().join("config")).expect("config dir");
-    std::fs::write(dir.path().join("config/daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon.toml");
-    let daemon = flotilla_core::in_process::InProcessDaemon::new(
-        vec![],
-        Arc::new(flotilla_config::ConfigStore::with_base(dir.path().join("config"))),
-        flotilla_discovery_testkit::fake_discovery(false),
-        flotilla_protocol::HostName::new("local"),
-        Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-    let service = Arc::new(
-        Service::open(&dir.path().join("decided.sqlite"), "home", flotilla_engine_store::registry().expect("registry")).expect("store"),
-    );
-    daemon.install_decided_store(Arc::clone(&service)).expect("install decided store");
-    let idle_store = Arc::strong_count(&service);
-    // A short deadline keeps the test fast; production waits CONSUMER_DEADLINE.
-    let router = HttpRouter::builder()
-        .backend(daemon.resource_backend())
-        .daemon(daemon)
-        .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
-        .change_stream_deadline(std::time::Duration::from_millis(200))
-        .build()
-        .into_router();
-    let tasks = tokio::runtime::Handle::current().metrics();
-    let idle_tasks = tasks.num_alive_tasks();
+// Replication cursors require a peer-issued capability on every transport. The same
+// global budget bounds HTTP and routed workers, leaving capacity for unrelated SQLite work.
+#[tokio::test]
+async fn http_change_stream_requires_peer_session() {
+    use flotilla_protocol::CommandValue;
+    use flotilla_schema::{KindRegistry, Origin, Timestamp};
+    use flotilla_schema_sqlite::stream::Service;
+    let (_dir, daemon) = super::super::tests::empty_daemon().await;
+    let files = tempfile::tempdir().expect("files");
+    let mut kinds = KindRegistry::new();
+    kinds.register::<HttpStreamSample>().expect("kind");
+    let service = Arc::new(Service::open(&files.path().join("home.db"), "home", kinds).expect("service"));
+    service
+        .with_store(|store| {
+            let mut write = store.write()?;
+            for index in 0..20 {
+                write.insert(
+                    &format!("sample-{index}"),
+                    &HttpStreamSample { value: "sample".into() },
+                    &Origin::new("test", Timestamp(1)),
+                )?;
+            }
+            write.commit()
+        })
+        .expect("seed more frames than the producer queues");
+    daemon.install_decided_store(Arc::clone(&service)).expect("store");
+    let router =
+        HttpRouter::for_daemon(Arc::clone(&daemon), Arc::new(LoginStore::new(daemon.clock_for_scenarios())), ListenerOrigin::default())
+            .into_router();
+    // Non-GET requests do not consult the session map, including unissued tokens.
     let mut request = get(flotilla_schema_sqlite::stream::PATH);
+    *request.method_mut() = axum::http::Method::POST;
     request.extensions_mut().insert(CallerAuth::Socket(None));
-    // The router (and through it the daemon's store slot) stays alive for the whole test.
-    let response = router.clone().oneshot(request).await.expect("router");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(Arc::strong_count(&service) > idle_store, "the stream holds the store while it runs");
-    assert!(tasks.num_alive_tasks() > idle_tasks, "the stream has a producer task");
-    // Hold the body without reading it: the consumer has stalled.
-    let body = response.into_body();
-    let mut released = false;
-    for _ in 0..100 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if Arc::strong_count(&service) == idle_store && tasks.num_alive_tasks() == idle_tasks {
-            released = true;
-            break;
-        }
+    request.headers_mut().insert(super::super::change_stream::SESSION_HEADER, "unissued-session".parse().expect("token"));
+    assert_eq!(router.clone().oneshot(request).await.expect("method refusal").status(), StatusCode::METHOD_NOT_ALLOWED);
+    let login = Incarnation::new();
+    let session = login.session_of(&login.login_cookie().await).expect("session");
+    for caller in [CallerAuth::Socket(None), CallerAuth::Bearer, CallerAuth::Session(session), environment()] {
+        let mut request = get(flotilla_schema_sqlite::stream::PATH);
+        request.extensions_mut().insert(caller);
+        request.headers_mut().insert(super::super::change_stream::SESSION_HEADER, "unissued-session".parse().expect("token"));
+        assert_eq!(router.clone().oneshot(request).await.expect("refusal").status(), StatusCode::FORBIDDEN);
     }
-    assert!(released, "the producer is still alive after the stall deadline");
-    let chunks: Vec<_> = tokio::time::timeout(std::time::Duration::from_secs(5), futures::StreamExt::collect(body.into_data_stream()))
-        .await
-        .expect("a released stream ends");
-    assert!(chunks.last().is_some_and(Result::is_err), "a stalled stream ends failed, not cleanly");
-    drop(router);
+    let mut bodies = Vec::new();
+    for index in 0..16 {
+        let CommandValue::ChangeStreamFrame { session, .. } =
+            daemon.next_change_stream_frame(&format!("peer-{index}"), None, None).await.expect("peer-issued cursor")
+        else {
+            panic!("frame")
+        };
+        let mut request = get(flotilla_schema_sqlite::stream::PATH);
+        request.extensions_mut().insert(CallerAuth::Socket(None));
+        request.headers_mut().insert(super::super::change_stream::SESSION_HEADER, session.parse().expect("token"));
+        let response = router.clone().oneshot(request).await.expect("peer HTTP continuation");
+        assert_eq!(response.status(), StatusCode::OK);
+        bodies.push(response.into_body());
+    }
+    assert!(daemon.next_change_stream_frame("peer-17", None, None).await.expect_err("global cap").contains("too many"));
+    let read = tokio::task::spawn_blocking(move || service.with_store(|store| store.read()?.last_sequence("home")));
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), read)
+            .await
+            .expect("unrelated SQLite read progresses")
+            .expect("reader task")
+            .expect("read"),
+        20
+    );
+    // HTTP continues after the routed Begin and ends at the same Keepalive.
+    let chunks: Vec<_> = futures::StreamExt::collect(bodies.remove(0).into_data_stream()).await;
+    assert_eq!(chunks.len(), 22, "20 resources, End and Keepalive");
+    assert!(matches!(
+        flotilla_schema_sqlite::stream::Frame::decode(chunks.last().expect("keepalive").as_ref().expect("chunk")).expect("frame"),
+        flotilla_schema_sqlite::stream::Frame::Keepalive { .. }
+    ));
+    // Both transports use the same idle expiry. Explicit advance also works with
+    // the blocked producers, which prevent automatic paused-time advancement.
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(16)).await;
+    let first = bodies.remove(0);
+    let mut stream = first.into_data_stream();
+    assert!(futures::StreamExt::next(&mut stream).await.expect("expired cursor error").is_err());
+    tokio::time::resume();
 }
 
 // The listen address must be loopback, and a hostname must resolve only to loopback.
