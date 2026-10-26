@@ -2206,11 +2206,11 @@ pub async fn account_binding_evidence(
 ) -> Result<Vec<flotilla_protocol::ExplainedAccountBinding>, String> {
     use flotilla_resources::account_access::{requester_parts, BindingState, UpdateMode};
     use flotilla_resources::{AccountBinding, AccountProvision};
+    let by_convoy = BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), convoy.to_string())]);
     let bindings = backend
-        .including_replicas::<AccountBinding>(namespace)
-        .list()
+        .query_declared::<AccountBinding>(namespace, &StoreQuery::labels(&by_convoy, true, false))
         .await
-        .map_err(|error| format!("list account bindings: {error}"))?
+        .map_err(|error| format!("read account bindings: {error}"))?
         .items
         .into_iter()
         .map(|binding| binding.object)
@@ -2220,10 +2220,19 @@ pub async fn account_binding_evidence(
         return Ok(Vec::new());
     }
     let provisions = backend
-        .including_replicas::<AccountProvision>(namespace)
-        .list()
+        .query_declared::<AccountProvision>(
+            namespace,
+            &StoreQuery {
+                field_values: BTreeMap::from([(
+                    "spec.binding.name".to_string(),
+                    bindings.iter().map(|binding| binding.metadata.name.clone()).collect(),
+                )]),
+                include_replicas: true,
+                ..Default::default()
+            },
+        )
         .await
-        .map_err(|error| format!("list account provisions: {error}"))?;
+        .map_err(|error| format!("read account provisions: {error}"))?;
     let mut explained = Vec::new();
     for binding in bindings {
         let spec = &binding.spec;

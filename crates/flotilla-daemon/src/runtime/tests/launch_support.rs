@@ -20,7 +20,10 @@ pub(super) async fn bind_account(backend: &ResourceBackend, convoy: &str, role: 
     backend
         .using::<flotilla_resources::AccountBinding>(NAMESPACE)
         .create(
-            &empty_meta(&binding_name(convoy, role, &access)),
+            &InputMeta::builder()
+                .name(binding_name(convoy, role, &access))
+                .labels(BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), convoy.to_string())]))
+                .build(),
             &AccountBindingSpec {
                 requester: requester_address(Some("flotilla"), convoy, role).expect("requester"),
                 item: "claude-code".into(),

@@ -412,6 +412,15 @@ pub async fn choose_bindings(
     Ok(pending)
 }
 
+/// A binding's metadata: labelled with its requester's convoy, so explain and the capability
+/// card read a convoy's bindings by index.
+pub fn binding_meta(name: &str, spec: &AccountBindingSpec) -> InputMeta {
+    let labels = requester_parts(&spec.requester)
+        .map(|(convoy, _)| std::collections::BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), convoy)]))
+        .unwrap_or_default();
+    InputMeta::builder().name(name.to_string()).labels(labels).build()
+}
+
 /// Write chosen bindings. A requester that already holds an open binding keeps it: bindings are
 /// sticky and only rebind or an authorization change moves them (#3882).
 pub async fn write_bindings(backend: &ResourceBackend, namespace: &str, pending: Vec<PendingBinding>) -> Result<(), String> {
@@ -421,13 +430,13 @@ pub async fn write_bindings(backend: &ResourceBackend, namespace: &str, pending:
             Ok(existing) if existing.spec.state.value.is_open() => continue,
             Ok(existing) => {
                 bindings
-                    .update(&InputMeta::builder().name(binding.name.clone()).build(), &existing.metadata.resource_version, &binding.spec)
+                    .update(&binding_meta(&binding.name, &binding.spec), &existing.metadata.resource_version, &binding.spec)
                     .await
                     .map_err(|error| format!("reopen account binding `{}`: {error}", binding.name))?;
             }
             Err(ResourceError::NotFound { .. }) => {
                 bindings
-                    .create(&InputMeta::builder().name(binding.name.clone()).build(), &binding.spec)
+                    .create(&binding_meta(&binding.name, &binding.spec), &binding.spec)
                     .await
                     .map_err(|error| format!("write account binding `{}`: {error}", binding.name))?;
             }
@@ -562,7 +571,7 @@ pub async fn reconcile_home_bindings(
         }
         if let Some(change) = change {
             bindings
-                .update(&InputMeta::builder().name(name.clone()).build(), &binding.metadata.resource_version, &spec)
+                .update(&binding_meta(&name, &spec), &binding.metadata.resource_version, &spec)
                 .await
                 .map_err(|error| format!("update account binding `{name}`: {error}"))?;
             changes.push((name, change));
@@ -610,7 +619,7 @@ async fn close(
     let mut spec = binding.spec.clone();
     spec.state = State::new(state, now);
     bindings
-        .update(&InputMeta::builder().name(binding.metadata.name.clone()).build(), &binding.metadata.resource_version, &spec)
+        .update(&binding_meta(&binding.metadata.name, &spec), &binding.metadata.resource_version, &spec)
         .await
         .map(|_| ())
         .map_err(|error| format!("update account binding `{}`: {error}", binding.metadata.name))
@@ -651,17 +660,17 @@ pub async fn rebind(
             }
             let retired_name = format!("{}.closed-{}", opened.name, existing.spec.opened_at.micros());
             bindings
-                .create(&InputMeta::builder().name(retired_name.clone()).build(), &retired)
+                .create(&binding_meta(&retired_name, &retired), &retired)
                 .await
                 .map_err(|error| format!("retire account binding as `{retired_name}`: {error}"))?;
             bindings
-                .update(&InputMeta::builder().name(opened.name.clone()).build(), &existing.metadata.resource_version, &opened.spec)
+                .update(&binding_meta(&opened.name, &opened.spec), &existing.metadata.resource_version, &opened.spec)
                 .await
                 .map_err(|error| format!("open account binding `{}`: {error}", opened.name))?;
         }
         Err(ResourceError::NotFound { .. }) => {
             bindings
-                .create(&InputMeta::builder().name(opened.name.clone()).build(), &opened.spec)
+                .create(&binding_meta(&opened.name, &opened.spec), &opened.spec)
                 .await
                 .map_err(|error| format!("open account binding `{}`: {error}", opened.name))?;
         }

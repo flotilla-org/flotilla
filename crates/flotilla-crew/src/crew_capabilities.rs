@@ -121,11 +121,11 @@ pub async fn session_card(
 /// harness runs on, and how it was chosen. Never material.
 async fn account_card(backend: &ResourceBackend, namespace: &str, convoy: &str, role: &str) -> Result<String, String> {
     use flotilla_resources::account_access::requester_parts;
+    let by_convoy = BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), convoy.to_string())]);
     let bindings = backend
-        .including_replicas::<flotilla_resources::AccountBinding>(namespace)
-        .list()
+        .query_declared::<flotilla_resources::AccountBinding>(namespace, &flotilla_store::StoreQuery::labels(&by_convoy, true, false))
         .await
-        .map_err(|error| format!("list account bindings: {error}"))?;
+        .map_err(|error| format!("read account bindings: {error}"))?;
     let mut lines = bindings
         .items
         .iter()

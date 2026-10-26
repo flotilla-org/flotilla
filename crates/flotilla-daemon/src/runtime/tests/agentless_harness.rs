@@ -15,6 +15,7 @@ use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 use flotilla_provider_runtime::host_environment::{HostEnvironment, HostSupply};
 use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 
+use super::super::account_access::reconcile_place_provisions;
 use super::agentless_vessels::{VesselKey, VesselPaths};
 use super::vessel_support::{vessels_over, RunnerVesselAgents};
 
@@ -845,7 +846,7 @@ async fn a_refreshed_token_is_pushed_into_the_bound_home_without_moving_the_bind
     assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), Some(HostEntry::File("generation-one".into())));
 
     fs::write(&token, "generation-two\n").expect("refreshed token");
-    crate::runtime::account_access::reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
+    reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
     assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), Some(HostEntry::File("generation-two".into())));
     let pushed = provision(&backend).await.expect("provision kept");
@@ -879,7 +880,7 @@ async fn a_revoked_binding_stops_the_session_and_deletes_its_copy() {
     );
     bindings.update(&empty_meta(BINDING), &binding.metadata.resource_version, &revoked).await.expect("revoke");
 
-    crate::runtime::account_access::reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
+    reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
     assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), None, "the delivered copy is deleted");
     assert!(provision(&backend).await.is_none(), "the provision record is removed");
@@ -906,7 +907,7 @@ async fn a_rebound_requester_loses_its_old_copy_and_session() {
     reopened.opened_at = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + chrono::Duration::seconds(1)));
     bindings.update(&empty_meta(BINDING), &binding.metadata.resource_version, &reopened).await.expect("rebind");
 
-    crate::runtime::account_access::reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
+    reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
     assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), None);
     assert!(provision(&backend).await.is_none());
@@ -937,7 +938,7 @@ async fn a_restart_keeps_the_account_and_a_gone_place_is_swept() {
     let restarted = runtime.launch().await.expect("restart");
     let token_file = restarted.env_vars.iter().find(|(name, _)| name == "FLOTILLA_CLAUDE_OAUTH_TOKEN_FILE").map(|(_, value)| value.clone());
     assert_eq!(token_file.as_deref(), Some(format!("{BOUND_HOME}/.flotilla-oauth-token").as_str()));
-    crate::runtime::account_access::reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
+    reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
     let provisions = backend.using::<flotilla_resources::AccountProvision>(NAMESPACE).list().await.expect("provisions").items;
     assert_eq!(provisions.iter().map(|record| record.spec.place.as_str()).collect::<Vec<_>>(), [ENVIRONMENT]);
