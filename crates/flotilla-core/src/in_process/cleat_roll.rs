@@ -129,18 +129,7 @@ impl InProcessDaemon {
                 .and_then(|release| {
                     flotilla_environment::guest_tools::GuestTools::resolve(release, &flotilla_environment::guest_tools::linux_amd64())
                 })
-                .and_then(|tools| {
-                    flotilla_environment::tools::publish(
-                        root.as_path(),
-                        &flotilla_environment::tools::ToolsSource {
-                            flotilla: &tools.flotilla(),
-                            cleat: &tools.cleat(),
-                            library: &tools.library(),
-                            terminfo: &tools.terminfo(),
-                        },
-                    )
-                    .map_err(|error| error.to_string())
-                });
+                .and_then(|tools| flotilla_environment::tools::publish(root.as_path(), (&tools).into()).map_err(|error| error.to_string()));
             if let Err(error) = result {
                 inventory.errors.push(format!("publish vessel tools: {error}"));
             }

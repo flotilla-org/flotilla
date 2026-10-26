@@ -1,18 +1,29 @@
 //! Provider-owned generation delivery. Mount/copy stable real directories,
 //! preserving relative links. Never mount a resolved generation or mask the
 //! image's sibling harnesses. Publish a complete tree before flipping current.
+//! What is published, and where, comes from the layer's composition
+//! declaration ([`crate::composition`]); nothing here names a tool.
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs, io,
     path::{Path, PathBuf},
 };
 
-/// Complete candidate assets. No image or Docker dependency is involved.
-pub struct ToolsSource<'a> {
-    pub flotilla: &'a Path,
-    pub cleat: &'a Path,
-    pub library: &'a Path,
-    pub terminfo: &'a Path,
+use crate::composition::{Composition, Source};
+
+/// A complete verified payload: its declaration and the tree its members'
+/// generation paths are relative to. No image or Docker dependency is involved.
+#[derive(Clone, Copy)]
+pub struct Payload<'a> {
+    pub composition: &'a Composition,
+    pub root: &'a Path,
+}
+
+impl<'a> From<&'a crate::guest_tools::GuestTools> for Payload<'a> {
+    fn from(tools: &'a crate::guest_tools::GuestTools) -> Self {
+        Self { composition: tools.composition(), root: tools.root() }
+    }
 }
 
 /// Cache generation publication by source file identity. One publisher is
@@ -22,14 +33,14 @@ pub struct Publisher {
     published: std::sync::Mutex<Option<(String, PathBuf)>>,
 }
 impl Publisher {
-    pub fn publish(&self, root: &Path, source: &ToolsSource<'_>) -> io::Result<PathBuf> {
+    pub fn publish(&self, root: &Path, source: Payload<'_>) -> io::Result<PathBuf> {
         self.publish_with(root, source, |input, output, hash, expected| copy_asset(input, output, hash, expected))
     }
 
     fn publish_with(
         &self,
         root: &Path,
-        source: &ToolsSource<'_>,
+        source: Payload<'_>,
         transfer: impl FnMut(&mut fs::File, &mut fs::File, &mut Sha256, u64) -> io::Result<()>,
     ) -> io::Result<PathBuf> {
         use std::os::unix::fs::MetadataExt;
@@ -59,7 +70,7 @@ impl Publisher {
         if let Some((previous, target)) = cached.as_ref() {
             if previous == &identity {
                 let _lock = publication_lock(root)?;
-                if published_links_intact(root, target) {
+                if published_links_intact(root, target, source.composition) {
                     clear_staging(root)?;
                     return Ok(target.clone());
                 }
@@ -71,39 +82,62 @@ impl Publisher {
     }
 }
 
-fn published_links_intact(root: &Path, target: &Path) -> bool {
+/// The relative target of a stable entry point at `link` (root-relative) for
+/// the published path `path` inside the current generation.
+fn current_target(link: &Path, path: &Path) -> PathBuf {
+    let depth = link.parent().map_or(0, |parent| parent.components().count());
+    let mut target = PathBuf::new();
+    for _ in 0..depth {
+        target.push("..");
+    }
+    target.join("tools/current").join(path)
+}
+
+/// Every stable entry point of a published generation: one link per published
+/// file, and one per top-level entry of each published tree.
+fn entry_points(target: &Path, composition: &Composition) -> io::Result<Vec<PathBuf>> {
+    let mut links = Vec::new();
+    for (member, install) in composition.published() {
+        match member.source() {
+            Source::File(_) => links.push(PathBuf::from(install)),
+            Source::Tree(_) => {
+                for entry in fs::read_dir(target.join(install))? {
+                    links.push(Path::new(install).join(entry?.file_name()));
+                }
+            }
+        }
+    }
+    links.sort();
+    Ok(links)
+}
+
+fn published_links_intact(root: &Path, target: &Path, composition: &Composition) -> bool {
     let matches = |path: PathBuf, expected: &Path| fs::read_link(path).is_ok_and(|actual| actual == expected);
     if !target.is_dir() || !matches(root.join("tools/current"), Path::new(target.file_name().expect("generation"))) {
         return false;
     }
-    for name in ["flotilla", "cleat"] {
-        if !matches(root.join("bin").join(name), &Path::new("../tools/current/bin").join(name)) {
-            return false;
-        }
-    }
-    if !matches(root.join("lib/libghostty-vt.so.0"), Path::new("../tools/current/lib/libghostty-vt.so.0")) {
-        return false;
-    }
-    let Ok(mut entries) = fs::read_dir(target.join("share/terminfo")) else { return false };
-    entries.all(|entry| {
-        entry.is_ok_and(|entry| {
-            matches(
-                root.join("share/terminfo").join(entry.file_name()),
-                &Path::new("../../tools/current/share/terminfo").join(entry.file_name()),
-            )
-        })
-    })
+    let Ok(links) = entry_points(target, composition) else { return false };
+    links.iter().all(|link| matches(root.join(link), &current_target(link, link)))
 }
 
-fn source_files(source: &ToolsSource<'_>) -> io::Result<Vec<(PathBuf, PathBuf)>> {
-    let mut files = vec![
-        (PathBuf::from("bin/flotilla"), source.flotilla.to_path_buf()),
-        (PathBuf::from("bin/cleat"), source.cleat.to_path_buf()),
-        (PathBuf::from("lib/libghostty-vt.so.0"), source.library.to_path_buf()),
-    ];
-    collect(source.terminfo, Path::new("share/terminfo"), &mut files)?;
-    if !files.iter().any(|(name, _)| name == Path::new("share/terminfo/x/xterm-ghostty")) {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "cleat release lacks xterm-ghostty terminfo"));
+fn source_files(source: Payload<'_>) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    let mut files = Vec::new();
+    for (member, install) in source.composition.published() {
+        match member.source() {
+            Source::File(file) => files.push((PathBuf::from(install), source.root.join(file))),
+            Source::Tree(tree) => {
+                collect(&source.root.join(tree), Path::new(install), &mut files)?;
+                for required in &member.requires {
+                    let name = Path::new(install).join(&required.path);
+                    if !files.iter().any(|(published, _)| published == &name) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("{} lacks required entry {}", member.role, required.path),
+                        ));
+                    }
+                }
+            }
+        }
     }
     files.sort();
     Ok(files)
@@ -112,13 +146,13 @@ fn source_files(source: &ToolsSource<'_>) -> io::Result<Vec<(PathBuf, PathBuf)>>
 /// Stage a complete immutable generation before publishing it atomically.
 /// A provider-root filesystem lock serializes publication and pruning across
 /// daemon restarts and concurrent provisioning requests.
-pub fn publish(root: &Path, source: &ToolsSource<'_>) -> io::Result<PathBuf> {
+pub fn publish(root: &Path, source: Payload<'_>) -> io::Result<PathBuf> {
     publish_with(root, source, |input, output, hash, expected| copy_asset(input, output, hash, expected))
 }
 
 fn publish_with(
     root: &Path,
-    source: &ToolsSource<'_>,
+    source: Payload<'_>,
     mut transfer: impl FnMut(&mut fs::File, &mut fs::File, &mut Sha256, u64) -> io::Result<()>,
 ) -> io::Result<PathBuf> {
     let _lock = publication_lock(root)?;
@@ -161,28 +195,41 @@ fn publish_with(
     let generation = target.file_name().expect("generation name");
     // Mount these real directories separately, leaving image-owned harnesses
     // under /opt/flotilla visible. Relative links resolve on both host and guest.
-    for directory in ["bin", "lib", "share/terminfo"] {
+    let exposed = source.composition.exposed_directories();
+    for directory in &exposed {
         fs::create_dir_all(root.join(directory))?;
     }
-    for name in ["flotilla", "cleat"] {
-        link(&root.join("bin"), name, &Path::new("../tools/current/bin").join(name))?;
-    }
-    link(&root.join("lib"), "libghostty-vt.so.0", Path::new("../tools/current/lib/libghostty-vt.so.0"))?;
-    for entry in fs::read_dir(target.join("share/terminfo"))? {
-        let entry = entry?;
-        let name = entry.file_name();
-        link(&root.join("share/terminfo"), &name, &Path::new("../../tools/current/share/terminfo").join(&name))?;
+    let links = entry_points(&target, source.composition)?;
+    for path in &links {
+        let parent = root.join(path.parent().unwrap_or(Path::new("")));
+        link(&parent, path.file_name().expect("entry point name"), &current_target(path, path))?;
     }
     link(&root.join("tools"), "current", Path::new(generation))?;
-    // Remove retired top-level links only after current is published; active
-    // readers still resolve old entries until the atomic generation flip.
-    for entry in fs::read_dir(root.join("share/terminfo"))? {
+    // Remove retired entry points only after current is published; active
+    // readers still resolve old entries until the atomic generation flip. A
+    // retired member's directory may no longer be exposed, so walk the root.
+    let links = links.into_iter().collect::<BTreeSet<_>>();
+    remove_retired_links(root, Path::new(""), &links)?;
+    Ok(target)
+}
+
+/// Remove every entry point into `tools/current` under `relative` that the
+/// current declaration does not publish. Never follows links.
+fn remove_retired_links(root: &Path, relative: &Path, current: &BTreeSet<PathBuf>) -> io::Result<()> {
+    for entry in fs::read_dir(root.join(relative))? {
         let entry = entry?;
-        if !target.join("share/terminfo").join(entry.file_name()).exists() && entry.file_type()?.is_symlink() {
+        let path = relative.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() && path != Path::new("tools") {
+            remove_retired_links(root, &path, current)?;
+        } else if kind.is_symlink()
+            && !current.contains(&path)
+            && fs::read_link(entry.path())?.starts_with(current_target(&path, Path::new("")))
+        {
             fs::remove_file(entry.path())?;
         }
     }
-    Ok(target)
+    Ok(())
 }
 
 fn copy_asset(mut source: impl io::Read, mut output: impl io::Write, hash: &mut Sha256, expected: u64) -> io::Result<()> {
@@ -367,6 +414,36 @@ fn prune_local_for(root: &Path, processes: &Path, owner: u32) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A source tree laid out by the shipped declaration's generation paths.
+    fn write_source(source: &Path, contents: &[u8]) {
+        for file in
+            ["bin/flotilla-vessel", "bin/cleat", "lib/libghostty-vt.so.0", "share/terminfo/x/xterm-ghostty", "share/terminfo/LICENSE"]
+        {
+            fs::create_dir_all(source.join(file).parent().unwrap()).unwrap();
+            fs::write(source.join(file), contents).unwrap();
+        }
+    }
+
+    struct Assets {
+        root: PathBuf,
+        flotilla: PathBuf,
+        cleat: PathBuf,
+        terminfo: PathBuf,
+    }
+    impl Assets {
+        fn new(source: &Path) -> Self {
+            Self {
+                root: source.into(),
+                flotilla: source.join("bin/flotilla-vessel"),
+                cleat: source.join("bin/cleat"),
+                terminfo: source.join("share/terminfo"),
+            }
+        }
+        fn payload(&self) -> Payload<'_> {
+            Payload { composition: crate::composition::flotilla_tools(), root: &self.root }
+        }
+    }
     // Scenario: repeated preparation across vessels reuses the published hash
     // without transferring binary bytes. Equal-size replacement invalidates it;
     // removing a stable entry point still causes publication to repair it.
@@ -375,41 +452,66 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("provider");
         let source = temp.path().join("source");
-        fs::create_dir_all(source.join("terminfo/x")).unwrap();
-        for file in ["flotilla", "cleat", "library", "terminfo/x/xterm-ghostty"] {
-            fs::write(source.join(file), b"old").unwrap();
-        }
-        let assets = ToolsSource {
-            flotilla: &source.join("flotilla"),
-            cleat: &source.join("cleat"),
-            library: &source.join("library"),
-            terminfo: &source.join("terminfo"),
-        };
+        write_source(&source, b"old");
+        let assets = Assets::new(&source);
         let publisher = Publisher::default();
         let transfers = std::cell::Cell::new(0);
         let transfer = |input: &mut fs::File, output: &mut fs::File, hash: &mut Sha256, expected| {
             transfers.set(transfers.get() + 1);
             copy_asset(input, output, hash, expected)
         };
-        let first = publisher.publish_with(&root, &assets, transfer).unwrap();
-        assert_eq!(transfers.get(), 4);
+        let first = publisher.publish_with(&root, assets.payload(), transfer).unwrap();
+        assert_eq!(transfers.get(), 5);
         let abandoned = root.join("tools/.staging-interrupted");
         fs::create_dir_all(&abandoned).unwrap();
         fs::write(abandoned.join("partial"), b"interrupted").unwrap();
-        assert_eq!(publisher.publish_with(&root, &assets, transfer).unwrap(), first);
+        assert_eq!(publisher.publish_with(&root, assets.payload(), transfer).unwrap(), first);
         assert!(!abandoned.exists(), "cached publication still reclaims abandoned staging under the root lock");
-        assert_eq!(transfers.get(), 4, "unchanged preparation never rereads binary content");
+        assert_eq!(transfers.get(), 5, "unchanged preparation never rereads binary content");
         let replacement = source.join("replacement");
         fs::write(&replacement, b"new").unwrap();
-        fs::rename(replacement, assets.flotilla).unwrap();
-        let updated = publisher.publish_with(&root, &assets, transfer).unwrap();
+        fs::rename(replacement, &assets.flotilla).unwrap();
+        let updated = publisher.publish_with(&root, assets.payload(), transfer).unwrap();
         assert_ne!(first, updated);
         assert_eq!(fs::read(root.join("bin/flotilla")).unwrap(), b"new");
-        assert_eq!(transfers.get(), 8);
+        assert_eq!(transfers.get(), 10);
         fs::remove_file(root.join("bin/flotilla")).unwrap();
-        assert_eq!(publisher.publish_with(&root, &assets, transfer).unwrap(), updated);
+        assert_eq!(publisher.publish_with(&root, assets.payload(), transfer).unwrap(), updated);
         assert_eq!(fs::read(root.join("bin/flotilla")).unwrap(), b"new");
-        assert_eq!(transfers.get(), 12);
+        assert_eq!(transfers.get(), 15);
+    }
+
+    // #3874 acceptance: a tool and a companion tree added only to the
+    // declaration are published through the same entry-point rules, and a
+    // later declaration without them retires their entry points.
+    #[test]
+    fn declared_additions_publish_without_publisher_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("provider");
+        let source = temp.path().join("source");
+        write_source(&source, b"tools");
+        fs::create_dir_all(source.join("share/extra/data")).unwrap();
+        fs::write(source.join("bin/extra"), b"extra").unwrap();
+        fs::write(source.join("share/extra/data/manifest"), b"companion").unwrap();
+        let mut extended = serde_json::to_value(crate::composition::flotilla_tools()).unwrap();
+        let members = extended["members"].as_array_mut().unwrap();
+        members.push(serde_json::json!({"role": "extra", "file": "bin/extra", "install": "bin/extra"}));
+        members.push(serde_json::json!({"role": "extra-data", "tree": "share/extra", "install": "share/extra", "requires": [{"path": "data/manifest"}]}));
+        let extended = crate::composition::Composition::parse(&extended.to_string()).unwrap();
+        let publisher = Publisher::default();
+        publisher.publish(&root, Payload { composition: &extended, root: &source }).unwrap();
+        assert_eq!(fs::read_link(root.join("bin/extra")).unwrap(), Path::new("../tools/current/bin/extra"));
+        assert_eq!(fs::read(root.join("bin/extra")).unwrap(), b"extra");
+        assert_eq!(fs::read_link(root.join("share/extra/data")).unwrap(), Path::new("../../tools/current/share/extra/data"));
+        assert_eq!(fs::read(root.join("share/extra/data/manifest")).unwrap(), b"companion");
+        assert_eq!(fs::read(root.join("bin/flotilla")).unwrap(), b"tools");
+        fs::remove_file(source.join("share/extra/data/manifest")).unwrap();
+        let error = publish(&root, Payload { composition: &extended, root: &source }).unwrap_err();
+        assert!(error.to_string().contains("extra-data lacks required entry data/manifest"), "{error}");
+        publisher.publish(&root, Assets::new(&source).payload()).unwrap();
+        assert!(fs::symlink_metadata(root.join("bin/extra")).is_err(), "retired entry point removed");
+        assert!(fs::symlink_metadata(root.join("share/extra/data")).is_err(), "retired companion removed");
+        assert_eq!(fs::read(root.join("bin/cleat")).unwrap(), b"tools");
     }
 
     // Mode-only rolls must publish the requested executable permissions.
@@ -420,23 +522,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("provider");
         let source = temp.path().join("source");
-        fs::create_dir_all(source.join("terminfo/x")).unwrap();
-        for file in ["flotilla", "cleat", "library", "terminfo/x/xterm-ghostty"] {
-            fs::write(source.join(file), b"unchanged").unwrap();
-        }
-        let assets = ToolsSource {
-            flotilla: &source.join("flotilla"),
-            cleat: &source.join("cleat"),
-            library: &source.join("library"),
-            terminfo: &source.join("terminfo"),
-        };
-        fs::set_permissions(assets.cleat, fs::Permissions::from_mode(0o644)).unwrap();
-        let previous = publish(&root, &assets).unwrap();
+        write_source(&source, b"unchanged");
+        let assets = Assets::new(&source);
+        fs::set_permissions(&assets.cleat, fs::Permissions::from_mode(0o644)).unwrap();
+        let previous = publish(&root, assets.payload()).unwrap();
         let crashed = root.join("tools/.staging-crashed");
         fs::create_dir_all(&crashed).unwrap();
         fs::write(crashed.join("partial"), b"partial").unwrap();
-        fs::set_permissions(assets.cleat, fs::Permissions::from_mode(0o755)).unwrap();
-        let current = publish(&root, &assets).unwrap();
+        fs::set_permissions(&assets.cleat, fs::Permissions::from_mode(0o755)).unwrap();
+        let current = publish(&root, assets.payload()).unwrap();
         assert_ne!(previous, current);
         assert_eq!(fs::metadata(root.join("bin/cleat")).unwrap().permissions().mode() & 0o777, 0o755);
         assert!(!crashed.exists());
@@ -456,21 +550,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("provider");
         let source = temp.path().join("source");
-        fs::create_dir_all(source.join("terminfo/x")).unwrap();
-        for file in ["flotilla", "cleat", "library", "terminfo/x/xterm-ghostty"] {
-            fs::write(source.join(file), b"initial").unwrap();
-        }
-        let assets = ToolsSource {
-            flotilla: &source.join("flotilla"),
-            cleat: &source.join("cleat"),
-            library: &source.join("library"),
-            terminfo: &source.join("terminfo"),
-        };
-        let current = publish(&root, &assets).unwrap();
+        write_source(&source, b"initial");
+        let assets = Assets::new(&source);
+        let current = publish(&root, assets.payload()).unwrap();
         for failure in ["shrink", "grow", "io"] {
-            fs::write(assets.cleat, failure).unwrap();
+            fs::write(&assets.cleat, failure).unwrap();
             let mut count = 0;
-            let error = publish_with(&root, &assets, |input, output, hash, expected| {
+            let error = publish_with(&root, assets.payload(), |input, output, hash, expected| {
                 count += 1;
                 if count != 2 {
                     return copy_asset(input, output, hash, expected);
@@ -502,21 +588,16 @@ mod tests {
         let root = temp.path().join("provider");
         prune(&root, |_| panic!("no generation was published")).unwrap();
         let source = temp.path().join("source");
-        fs::create_dir_all(source.join("terminfo/x")).unwrap();
-        for file in ["flotilla", "cleat", "library", "terminfo/x/xterm-ghostty", "terminfo/LICENSE"] {
-            fs::write(source.join(file), b"contents").unwrap();
-        }
-        let assets = ToolsSource {
-            flotilla: &source.join("flotilla"),
-            cleat: &source.join("cleat"),
-            library: &source.join("library"),
-            terminfo: &source.join("terminfo"),
-        };
-        publish(&root, &assets).unwrap();
+        write_source(&source, b"contents");
+        let assets = Assets::new(&source);
+        publish(&root, assets.payload()).unwrap();
+        fs::write(source.join("share/terminfo/retired"), b"contents").unwrap();
+        publish(&root, assets.payload()).unwrap();
+        assert!(root.join("share/terminfo/retired").is_file());
+        fs::remove_file(source.join("share/terminfo/retired")).unwrap();
+        publish(&root, assets.payload()).unwrap();
+        assert!(fs::symlink_metadata(root.join("share/terminfo/retired")).is_err());
         assert!(root.join("share/terminfo/LICENSE").is_file());
-        fs::remove_file(source.join("terminfo/LICENSE")).unwrap();
-        publish(&root, &assets).unwrap();
-        assert!(fs::symlink_metadata(root.join("share/terminfo/LICENSE")).is_err());
         assert_eq!(fs::read(root.join("share/terminfo/x/xterm-ghostty")).unwrap(), b"contents");
     }
 
@@ -528,31 +609,23 @@ mod tests {
         use hegel::generators as gs;
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
-        fs::create_dir_all(source.join("terminfo/x")).unwrap();
-        for file in ["flotilla", "cleat", "lib", "terminfo/x/xterm-ghostty"] {
-            fs::write(source.join(file), b"initial").unwrap();
-        }
+        write_source(&source, b"initial");
         let root = temp.path().join("provider");
-        let assets = ToolsSource {
-            flotilla: &source.join("flotilla"),
-            cleat: &source.join("cleat"),
-            library: &source.join("lib"),
-            terminfo: &source.join("terminfo"),
-        };
-        let mut current = publish(&root, &assets).unwrap();
+        let assets = Assets::new(&source);
+        let mut current = publish(&root, assets.payload()).unwrap();
         let mut leases = vec![current.clone()];
         let length = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
         for index in 0..length {
             match tc.draw(gs::integers::<u8>().min_value(0).max_value(3)) {
-                0 => assert_eq!(publish(&root, &assets).unwrap(), current),
+                0 => assert_eq!(publish(&root, assets.payload()).unwrap(), current),
                 1 => {
-                    fs::write(assets.cleat, format!("build-{index}")).unwrap();
-                    current = publish(&root, &assets).unwrap();
+                    fs::write(&assets.cleat, format!("build-{index}")).unwrap();
+                    current = publish(&root, assets.payload()).unwrap();
                     leases.push(current.clone());
                 }
                 2 => {
                     fs::remove_file(assets.terminfo.join("x/xterm-ghostty")).unwrap();
-                    assert!(publish(&root, &assets).is_err());
+                    assert!(publish(&root, assets.payload()).is_err());
                     fs::write(assets.terminfo.join("x/xterm-ghostty"), b"initial").unwrap();
                 }
                 _ => {
@@ -562,7 +635,7 @@ mod tests {
             prune(&root, |generation| !leases.iter().any(|lease| lease == generation)).unwrap();
             assert!(leases.iter().all(|lease| lease.exists()));
             assert_eq!(fs::read_link(root.join("tools/current")).unwrap(), current.strip_prefix(root.join("tools")).unwrap());
-            assert_eq!(fs::read(root.join("bin/cleat")).unwrap(), fs::read(assets.cleat).unwrap());
+            assert_eq!(fs::read(root.join("bin/cleat")).unwrap(), fs::read(&assets.cleat).unwrap());
             assert!(root.join("share/terminfo/x/xterm-ghostty").is_file());
         }
     }
@@ -573,24 +646,16 @@ mod tests {
     fn concurrent_publishers_reuse_one_complete_generation() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
-        fs::create_dir_all(source.join("terminfo/x")).unwrap();
-        for file in ["flotilla", "cleat", "lib", "terminfo/x/xterm-ghostty"] {
-            fs::write(source.join(file), b"candidate").unwrap();
-        }
+        write_source(&source, b"candidate");
         let root = temp.path().join("provider");
-        let assets = ToolsSource {
-            flotilla: &source.join("flotilla"),
-            cleat: &source.join("cleat"),
-            library: &source.join("lib"),
-            terminfo: &source.join("terminfo"),
-        };
+        let assets = Assets::new(&source);
         let barrier = std::sync::Barrier::new(4);
         let generations = std::thread::scope(|scope| {
             let threads: Vec<_> = (0..4)
                 .map(|_| {
                     scope.spawn(|| {
                         barrier.wait();
-                        publish(&root, &assets).unwrap()
+                        publish(&root, assets.payload()).unwrap()
                     })
                 })
                 .collect();
@@ -611,20 +676,12 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
-        fs::create_dir_all(source.join("terminfo/x")).unwrap();
-        for file in ["flotilla", "cleat", "lib", "terminfo/x/xterm-ghostty"] {
-            fs::write(source.join(file), b"old").unwrap();
-        }
+        write_source(&source, b"old");
         let root = temp.path().join("provider");
-        let assets = ToolsSource {
-            flotilla: &source.join("flotilla"),
-            cleat: &source.join("cleat"),
-            library: &source.join("lib"),
-            terminfo: &source.join("terminfo"),
-        };
-        let old = publish(&root, &assets).unwrap();
-        fs::write(assets.cleat, b"new").unwrap();
-        let new = publish(&root, &assets).unwrap();
+        let assets = Assets::new(&source);
+        let old = publish(&root, assets.payload()).unwrap();
+        fs::write(&assets.cleat, b"new").unwrap();
+        let new = publish(&root, assets.payload()).unwrap();
         let processes = temp.path().join("proc");
         let process = processes.join("123");
         fs::create_dir_all(process.join("fd")).unwrap();
@@ -662,28 +719,20 @@ mod tests {
     fn roll_is_atomic_and_pruning_respects_live_users() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
-        fs::create_dir_all(source.join("terminfo/x")).unwrap();
-        for file in ["flotilla", "cleat", "lib", "terminfo/x/xterm-ghostty"] {
-            fs::write(source.join(file), b"old").unwrap();
-        }
+        write_source(&source, b"old");
         let root = temp.path().join("provider");
-        let assets = ToolsSource {
-            flotilla: &source.join("flotilla"),
-            cleat: &source.join("cleat"),
-            library: &source.join("lib"),
-            terminfo: &source.join("terminfo"),
-        };
-        let old = publish(&root, &assets).unwrap();
-        assert_eq!(publish(&root, &assets).unwrap(), old);
-        fs::write(assets.cleat, b"new").unwrap();
-        let new = publish(&root, &assets).unwrap();
+        let assets = Assets::new(&source);
+        let old = publish(&root, assets.payload()).unwrap();
+        assert_eq!(publish(&root, assets.payload()).unwrap(), old);
+        fs::write(&assets.cleat, b"new").unwrap();
+        let new = publish(&root, assets.payload()).unwrap();
         assert_ne!(old, new);
         assert_eq!(fs::read(root.join("bin/cleat")).unwrap(), b"new");
         assert_eq!(fs::read(root.join("share/terminfo/x/xterm-ghostty")).unwrap(), b"old");
         prune(&root, |_| false).unwrap();
         assert!(old.exists());
         fs::remove_file(assets.terminfo.join("x/xterm-ghostty")).unwrap();
-        assert!(publish(&root, &assets).is_err());
+        assert!(publish(&root, assets.payload()).is_err());
         assert_eq!(fs::read_link(root.join("tools/current")).unwrap(), new.strip_prefix(root.join("tools")).unwrap());
         prune(&root, |_| true).unwrap();
         assert!(!old.exists());

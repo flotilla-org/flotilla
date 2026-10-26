@@ -20,6 +20,7 @@ use tokio::{
 };
 
 use super::{EntryKind, EnvironmentTool, VesselAgent};
+use crate::composition::role;
 
 pub mod host;
 
@@ -55,7 +56,7 @@ impl AgentConnector for UnixAgentConnector {
                 let bytes = tokio::fs::read(&self.executable)
                     .await
                     .map_err(|e| format!("read current drydock agent {}: {e}", self.executable.display()))?;
-                crate::guest_tools::validate_native(&bytes, "bin/drydock-agent")?;
+                crate::guest_tools::validate_native(&bytes, role::AGENT, &self.platform)?;
                 Ok::<_, String>(bytes)
             })
             .await?;

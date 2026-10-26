@@ -9,4 +9,7 @@ mod test_config;
 pub mod tools;
 
 #[cfg(unix)]
+pub mod composition;
+
+#[cfg(unix)]
 pub mod guest_tools;

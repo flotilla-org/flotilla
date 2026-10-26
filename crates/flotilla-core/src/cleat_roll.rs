@@ -153,8 +153,10 @@ struct IncomingTools {
 #[cfg(unix)]
 fn contained_incoming(incoming: &Path) -> Result<IncomingTools, String> {
     let release = incoming.parent().and_then(Path::parent).ok_or("incoming cleat has no release root")?;
-    flotilla_environment::guest_tools::GuestTools::resolve(release, &flotilla_environment::guest_tools::linux_amd64())
-        .map(|tools| IncomingTools { cleat: tools.cleat(), library: tools.library() })
+    flotilla_environment::guest_tools::GuestTools::resolve(release, &flotilla_environment::guest_tools::linux_amd64()).map(|tools| {
+        use flotilla_environment::composition::role;
+        IncomingTools { cleat: tools.file(role::CLEAT), library: tools.file(role::CLEAT_LIBRARY) }
+    })
 }
 
 #[cfg(not(unix))]

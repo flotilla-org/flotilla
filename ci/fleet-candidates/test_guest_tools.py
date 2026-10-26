@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import re
 import tarfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ from pathlib import Path
 import generation_validation as validation
 
 ROOT = Path(__file__).parent
+DECLARATIONS = ROOT.parent.parent / 'stdlib/guest-layers'
 
 
 def fixture():
@@ -31,7 +33,8 @@ class GuestToolsTests(unittest.TestCase):
         # Guest payload identity is independent of the controller architecture.
         # Exhaust the finite controller/fault space, including aliases and old builds.
         for controller in validation.PLATFORMS:
-            for fault in ('none', 'missing-agent', 'machine', 'digest', 'sources', 'cohort', 'library', 'alias', 'loader', 'missing-catalog'):
+            for fault in ('none', 'missing-agent', 'machine', 'digest', 'sources', 'cohort', 'library', 'alias', 'loader', 'missing-catalog',
+                          'undeclared', 'self-described', 'unindexed'):
                 with self.subTest(controller=controller, fault=fault):
                     files = fixture()
                     catalog = json.loads(files[validation.GUEST_CATALOG])
@@ -58,14 +61,88 @@ class GuestToolsTests(unittest.TestCase):
                         del files[target + 'lib/libghostty-vt.so.0']
                     elif fault == 'alias':
                         del files[target + 'share/terminfo/x/xterm-ghostty-alias']
+                    elif fault in ('undeclared', 'self-described'):
+                        # An indexed extra member, and the same payload whose
+                        # embedded composition declares it: production's source
+                        # declaration still refuses the self-description.
+                        files[target + 'bin/extra'] = b'extra'
+                        catalog['platforms'][validation.GUEST_TARGET]['files'].append(
+                            {'path': 'bin/extra', 'sha256': hashlib.sha256(b'extra').hexdigest(), 'size_bytes': 5})
+                        if fault == 'self-described':
+                            catalog['layers'][0]['members'].append({'role': 'extra', 'file': 'bin/extra', 'install': 'bin/extra'})
+                    elif fault == 'unindexed':
+                        files[target + 'share/terminfo/unindexed'] = b'unverified'
                     files[validation.GUEST_CATALOG] = json.dumps(catalog).encode()
                     if fault == 'missing-catalog':
                         del files[validation.GUEST_CATALOG]
+                    layers = validation.load_guest_layers(DECLARATIONS)
                     if fault == 'none':
                         self.assertEqual(validation.validate_guest_tools(files, sources, '42', required=True), catalog)
+                        self.assertEqual(validation.validate_guest_tools(files, sources, '42', required=True, layers=layers), catalog)
                     else:
                         with self.assertRaisesRegex(ValueError, 'linux/amd64'):
-                            validation.validate_guest_tools(files, sources, '42', required=True)
+                            validation.validate_guest_tools(files, sources, '42', required=True, layers=layers)
+                        if fault != 'self-described':
+                            with self.assertRaisesRegex(ValueError, 'linux/amd64'):
+                                validation.validate_guest_tools(files, sources, '42', required=True)
+
+    def test_fixture_and_legacy_catalogs_follow_the_source_declaration(self):
+        # The shared fixture embeds exactly the stdlib declaration Rust compiles
+        # in; a pre-#3874 catalog without `layers` validates against the legacy
+        # composition it was built with (ADR 0047 shim).
+        files = fixture()
+        catalog = json.loads(files[validation.GUEST_CATALOG])
+        self.assertEqual(catalog['layers'], validation.load_guest_layers(DECLARATIONS))
+        self.assertEqual(validation.LEGACY_GUEST_LAYERS, validation.load_guest_layers(DECLARATIONS))
+        sources = catalog['sources']
+        del catalog['layers']
+        files[validation.GUEST_CATALOG] = json.dumps(catalog).encode()
+        self.assertEqual(validation.validate_guest_tools(files, sources, '42', required=True), catalog)
+        with self.assertRaisesRegex(ValueError, 'differs from the source declaration'):
+            validation.validate_guest_tools(files, sources, '42', required=True, layers=validation.load_guest_layers(DECLARATIONS))
+        self.assertEqual(validation.load_guest_layers(ROOT / 'no-such-directory'), validation.LEGACY_GUEST_LAYERS)
+
+    def test_added_tool_and_companion_validate_through_the_declaration_alone(self):
+        # #3874 acceptance, matching the Rust runtime case: an added tool and
+        # companion tree need only declaration entries; a missing required
+        # companion entry is refused by name.
+        files = fixture()
+        catalog = json.loads(files[validation.GUEST_CATALOG])
+        sources = catalog['sources']
+        layers = validation.load_guest_layers(DECLARATIONS)
+        layers[0]['members'] += [{'role': 'extra', 'file': 'bin/extra', 'install': 'bin/extra'},
+                                 {'role': 'extra-data', 'tree': 'share/extra', 'install': 'share/extra',
+                                  'requires': [{'path': 'data/manifest'}]}]
+        for path, content in (('bin/extra', b'#!/bin/sh\n'), ('share/extra/data/manifest', b'companion')):
+            files[f'{validation.GUEST_TREE}/{path}'] = content
+            catalog['platforms'][validation.GUEST_TARGET]['files'].append(
+                {'path': path, 'sha256': hashlib.sha256(content).hexdigest(), 'size_bytes': len(content)})
+        catalog['layers'] = layers
+        files[validation.GUEST_CATALOG] = json.dumps(catalog).encode()
+        self.assertEqual(validation.validate_guest_tools(files, sources, '42', required=True, layers=layers), catalog)
+        del files[f'{validation.GUEST_TREE}/share/extra/data/manifest']
+        catalog['platforms'][validation.GUEST_TARGET]['files'].pop()
+        files[validation.GUEST_CATALOG] = json.dumps(catalog).encode()
+        with self.assertRaisesRegex(ValueError, 'missing extra-data artifact share/extra/data/manifest'):
+            validation.validate_guest_tools(files, sources, '42', required=True, layers=layers)
+
+    def test_invalid_declarations_are_refused_with_the_runtime_reasons(self):
+        # The same static cases and reasons as Rust's `Composition::validate`.
+        cases = (
+            ('duplicate role', lambda layer: layer['members'][1].update(role='agent')),
+            ('exactly one of', lambda layer: layer['members'][0].update(tree='share')),
+            ('normalised', lambda layer: layer['members'][1].update(install='../bin/flotilla')),
+            ('overlaps', lambda layer: layer['members'][4].update(install='bin')),
+            ('no published native member installs `lib/libghostty-vt.so.0`', lambda layer: layer['members'][3].update(install='lib/other.so')),
+            ('not origin-relative', lambda layer: layer['members'][2]['loads'].update(runpath='/usr/lib')),
+            ('reserved `tools`', lambda layer: layer['members'][1].update(install='tools/flotilla')),
+        )
+        for reason, mutate in cases:
+            with self.subTest(reason=reason):
+                layer = validation.load_guest_layers(DECLARATIONS)[0]
+                mutate(layer)
+                with self.assertRaisesRegex(ValueError, re.escape(reason)):
+                    validation.check_guest_layer(layer)
 
     def test_previous_generation_remains_decodable_but_has_no_guest_build(self):
         # Consuming prior archives is allowed; producing a new incomplete build is refused.
@@ -138,7 +215,7 @@ class GuestToolsTests(unittest.TestCase):
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(content)
             (root / "share/terminfo/78").symlink_to("x", target_is_directory=True)
-            validation.produce_guest_tools(root, sources, '42')
+            validation.produce_guest_tools(root, sources, '42', validation.load_guest_layers(DECLARATIONS))
             produced = {str(path.relative_to(root)): path.read_bytes()
                         for path in (root / validation.GUEST_PREFIX).rglob('*') if path.is_file()}
             self.assertEqual({name: content for name, content in produced.items() if name != validation.GUEST_CATALOG and '/share/terminfo/78/' not in name},

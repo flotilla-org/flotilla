@@ -193,24 +193,18 @@ impl EnvironmentToolFactory for FleetToolsTool {
             None => flotilla_environment::guest_tools::GuestTools::installed(&context.guest_platform())?,
         };
         self.publisher
-            .publish(
-                &self.root,
-                &flotilla_environment::tools::ToolsSource {
-                    flotilla: &tools.flotilla(),
-                    cleat: &tools.cleat(),
-                    library: &tools.library(),
-                    terminfo: &tools.terminfo(),
-                },
-            )
+            .publish(&self.root, (&tools).into())
             .map_err(|error| format!("publish guest platform {} tools: {error}", context.guest_platform()))?;
+        let composition = tools.composition();
         if let Some(prefix) = context.tools_prefix() {
-            return Ok(generation_layer(&self.root, prefix));
+            return Ok(generation_layer(&self.root, prefix, composition));
         }
+        let mount = Path::new("/opt/flotilla");
         cli.assets.remove(0);
-        for directory in ["tools", "bin", "lib", "share/terminfo"] {
+        for directory in published_directories(composition) {
             cli.assets.push(EnvironmentToolAsset::new(
-                self.root.join(directory),
-                Path::new("/opt/flotilla").join(directory),
+                self.root.join(&directory),
+                mount.join(&directory),
                 EnvironmentToolAssetKind::Directory,
                 EnvironmentToolAssetAccess::ReadOnly,
                 "generation tools",
@@ -223,26 +217,34 @@ impl EnvironmentToolFactory for FleetToolsTool {
         }));
         // Candidate cleat uses $ORIGIN/../lib. A current-link LD_LIBRARY_PATH
         // would mix an already-selected old binary with a newly-flipped library.
-        cli.environment.push(EnvironmentVariableUpdate::prepend_path("PATH", "/opt/flotilla/bin"));
-        cli.environment.push(EnvironmentVariableUpdate::set(
-            "TERMINFO_DIRS",
-            "/opt/flotilla/share/terminfo:/usr/share/terminfo",
-            "cleat terminfo",
-        ));
+        for directory in composition.path_entries(mount) {
+            cli.environment.push(EnvironmentVariableUpdate::prepend_path("PATH", directory.to_string_lossy()));
+        }
+        for (name, value) in composition.variables(mount) {
+            cli.environment.push(EnvironmentVariableUpdate::set(name, value, "generation tools"));
+        }
         Ok(cli)
     }
 }
 
-/// The published generation (CLI, cleat, its library and terminfo) under
-/// `prefix`, as real directories of relative links: nothing that needs a mount
-/// or root. The environment composes its own variables around it (#3792).
+/// The real directories a published layer occupies: its generations under
+/// `tools` and each directory of stable entry points the declaration exposes.
 #[cfg(unix)]
-fn generation_layer(root: &Path, prefix: &Path) -> EnvironmentTool {
-    let mut layer = EnvironmentTool::new("flotilla", prefix.join("bin/flotilla"));
-    for directory in ["tools", "bin", "lib", "share/terminfo"] {
+fn published_directories(composition: &flotilla_environment::composition::Composition) -> Vec<PathBuf> {
+    std::iter::once(PathBuf::from("tools")).chain(composition.exposed_directories()).collect()
+}
+
+/// The published generation under `prefix`, as real directories of relative
+/// links: nothing that needs a mount or root. Which directories, and the
+/// environment around them, come from the composition (#3792, #3874).
+#[cfg(unix)]
+fn generation_layer(root: &Path, prefix: &Path, composition: &flotilla_environment::composition::Composition) -> EnvironmentTool {
+    let cli = composition.member(flotilla_environment::composition::role::CLI).and_then(|member| member.install.as_deref());
+    let mut layer = EnvironmentTool::new("flotilla", prefix.join(cli.unwrap_or("bin/flotilla")));
+    for directory in published_directories(composition) {
         layer = layer.with_asset(EnvironmentToolAsset::new(
-            root.join(directory),
-            prefix.join(directory),
+            root.join(&directory),
+            prefix.join(&directory),
             EnvironmentToolAssetKind::Directory,
             EnvironmentToolAssetAccess::ReadOnly,
             "generation tools",
@@ -503,7 +505,7 @@ fn running_daemon_flotilla_binary() -> Result<DaemonHostPath, String> {
     #[cfg(unix)]
     {
         flotilla_environment::guest_tools::GuestTools::installed(&flotilla_environment::guest_tools::linux_amd64())
-            .map(|tools| DaemonHostPath::new(tools.flotilla()))
+            .map(|tools| DaemonHostPath::new(tools.file(flotilla_environment::composition::role::CLI)))
     }
     #[cfg(not(unix))]
     {
@@ -673,7 +675,7 @@ impl CleatTool {
                 #[cfg(unix)]
                 {
                     flotilla_environment::guest_tools::GuestTools::installed(&flotilla_environment::guest_tools::linux_amd64())
-                        .map(|tools| DaemonHostPath::new(tools.cleat()))
+                        .map(|tools| DaemonHostPath::new(tools.file(flotilla_environment::composition::role::CLEAT)))
                 }
                 #[cfg(not(unix))]
                 {

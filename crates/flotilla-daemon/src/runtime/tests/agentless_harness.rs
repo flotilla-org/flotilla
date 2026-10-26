@@ -687,8 +687,9 @@ async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
 
     // The vessel's generation layer holds the delivered CLI.
     let vessel = VesselPaths::new(&bag, &VesselKey::new(&EnvironmentId::new(ENVIRONMENT), "demo-work")).expect("vessel paths");
-    let cli_dir = vessel.cli_directory();
-    write_executable(&cli_dir.join("flotilla"), "#!/bin/sh\necho generation-cli\n");
+    let cli = vessel.cli();
+    let cli_dir = cli.parent().expect("CLI directory").to_path_buf();
+    write_executable(&cli, "#!/bin/sh\necho generation-cli\n");
 
     let session = launch_agentless(
         // A real shell stands in for the host here, so the crew selects no skills to fetch.

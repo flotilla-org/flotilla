@@ -1,7 +1,8 @@
 # Verified guest build lookup
 
 The query is one complete native tool set by OCI guest platform, before connection
-or delivery. The admitted matrix has one guest target and two controller targets;
+or delivery. The set is the composition declared in `stdlib/guest-layers` and
+compiled into the daemon (#3874); the payload never states its own requirements. The admitted matrix has one guest target and two controller targets;
 this is independent of convoy history or resource counts. The catalog and payload
 live locally in the already verified immutable controller generation. There are
 zero durable-resource-store reads and zero network requests in lookup.

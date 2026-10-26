@@ -601,19 +601,24 @@ async fn pushes_complete_generations_and_retains_old_cleat_files(memory: Arc<dyn
     let runner = runner_for(&memory, guest.path());
     let sources = host.path().join("source");
     std::fs::create_dir(&sources).unwrap();
-    let cli = sources.join("flotilla");
-    let cleat = sources.join("cleat");
-    let library = sources.join("lib");
-    let terminfo = sources.join("terminfo");
+    let composition = crate::composition::flotilla_tools();
+    let cli = sources.join("bin/flotilla-vessel");
+    let cleat = sources.join("bin/cleat");
+    let library = sources.join("lib/libghostty-vt.so.0");
+    let terminfo = sources.join("share/terminfo");
+    for path in [&cli, &cleat, &library] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    }
     std::fs::create_dir_all(terminfo.join("x")).unwrap();
     std::fs::write(terminfo.join("x/xterm-ghostty"), b"terminfo").unwrap();
+    std::fs::write(terminfo.join("LICENSE"), b"license").unwrap();
     let fleet = host.path().join("fleet");
     let destination = guest.path().join("fleet");
     let mut tool = EnvironmentTool::new("fleet", destination.join("bin/flotilla"));
-    for name in ["tools", "bin", "lib", "share/terminfo"] {
+    for name in std::iter::once(PathBuf::from("tools")).chain(composition.exposed_directories()) {
         tool = tool.with_asset(EnvironmentToolAsset::new(
-            fleet.join(name),
-            destination.join(name),
+            fleet.join(&name),
+            destination.join(&name),
             EnvironmentToolAssetKind::Directory,
             EnvironmentToolAssetAccess::ReadOnly,
             "generation tools",
@@ -624,11 +629,7 @@ async fn pushes_complete_generations_and_retains_old_cleat_files(memory: Arc<dyn
         for path in [&cli, &cleat, &library] {
             std::fs::write(path, bytes).unwrap();
         }
-        let generation = crate::tools::publish(
-            &fleet,
-            &crate::tools::ToolsSource { flotilla: &cli, cleat: &cleat, library: &library, terminfo: &terminfo },
-        )
-        .unwrap();
+        let generation = crate::tools::publish(&fleet, crate::tools::Payload { composition, root: &sources }).unwrap();
         runner.push_tools(std::slice::from_ref(&tool)).await.unwrap();
         assert_eq!(std::fs::read(destination.join("bin/flotilla")).unwrap(), bytes);
         assert_eq!(std::fs::read(destination.join("bin/cleat")).unwrap(), bytes);

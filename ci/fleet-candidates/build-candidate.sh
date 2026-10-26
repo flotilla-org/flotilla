@@ -242,6 +242,8 @@ export FLEET_CLEAT_SHA="$cleat_sha"
 export FLEET_MATTPOCOCK_SKILLS_SHA="$mattpocock_skills_sha"
 export FLEET_RJW_SKILLS_SHA="$rjw_skills_sha"
 export FLEET_PROTOCOL_VERSION="$protocol_version"
+# The built source's guest composition declaration (#3874), embedded in the catalog.
+export FLEET_GUEST_LAYERS="$flotilla_root/stdlib/guest-layers"
 python3 - <<'PY'
 import hashlib
 import json
@@ -263,7 +265,7 @@ if os.environ["FLEET_PLATFORM"] == "linux-x86_64-gnu2.36":
         "cleat": os.environ["FLEET_CLEAT_SHA"],
         "mattpocock-skills": os.environ["FLEET_MATTPOCOCK_SKILLS_SHA"],
         "rjw-skills": os.environ["FLEET_RJW_SKILLS_SHA"],
-    }, cohort)
+    }, cohort, generation_validation.load_guest_layers(os.environ["FLEET_GUEST_LAYERS"]))
 files = []
 for path in sorted(bundle.rglob("*")):
     if not path.is_file() or path.name == "manifest.json":
