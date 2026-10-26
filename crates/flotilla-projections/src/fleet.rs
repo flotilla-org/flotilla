@@ -23,6 +23,15 @@ use crate::host_registry::HostRegistry;
 
 pub const FLEET_REPLICA_FRESH_SECS: i64 = 90;
 
+/// A stopped Message controller affects every receiver on this host.
+/// Use the durable host condition for explain and fleet attention alike.
+pub fn message_controller_failure(status: &ResourceHostStatus) -> Option<&flotilla_resources::HostCondition> {
+    status.conditions.iter().find(|condition| {
+        matches!(condition.condition_type.as_str(), "Controller/Message" | "ControllerLoop/Message")
+            && condition.value == flotilla_resources::ConditionValue::False
+    })
+}
+
 pub fn replica_sync_is_fresh(last_sync: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     now.signed_duration_since(last_sync).num_seconds() <= FLEET_REPLICA_FRESH_SECS
 }
@@ -502,7 +511,7 @@ fn append_crewless_convoy_rows(
     }
 }
 
-fn resource_environment_host_ref(environment: &flotilla_resources::ResourceObject<ResourceEnvironment>) -> Option<&str> {
+pub(crate) fn resource_environment_host_ref(environment: &flotilla_resources::ResourceObject<ResourceEnvironment>) -> Option<&str> {
     environment
         .spec
         .host_direct
@@ -588,5 +597,45 @@ mod tests {
             fleet_observation_agreement(&PeerConnectionState::Disconnected, Some(now), true, Some("a"), true),
             FleetObservationAgreement::Agree
         );
+    }
+}
+
+#[cfg(test)]
+mod message_health_tests {
+    use super::*;
+
+    // Only an unhealthy Message controller raises this host-wide attention;
+    // absent, healthy and unrelated controller conditions must not do so.
+    #[test]
+    fn message_controller_attention_tracks_durable_health() {
+        use flotilla_resources::ConditionValue::{False, True};
+        assert!(message_controller_failure(&ResourceHostStatus::default()).is_none());
+        // Literal expectations cover both Message health producers, healthy
+        // observations, and an unrelated unhealthy controller.
+        for (condition_type, value, expected) in [
+            ("Controller/Message", False, true),
+            ("ControllerLoop/Message", False, true),
+            ("Controller/Message", True, false),
+            ("ControllerLoop/Message", True, false),
+            ("Controller/Checkout", False, false),
+            ("Controller/Checkout", True, false),
+        ] {
+            let status = ResourceHostStatus {
+                conditions: vec![flotilla_resources::HostCondition::builder()
+                    .condition_type(condition_type)
+                    .value(value)
+                    .reason("RestartBudgetExhausted")
+                    .message("Message controller exhausted its restart budget")
+                    .observed_at(DateTime::from_timestamp(1_700_000_000, 0).unwrap())
+                    .blocks_forge_observation(false)
+                    .build()],
+                ..Default::default()
+            };
+            assert_eq!(message_controller_failure(&status).is_some(), expected);
+            if let Some(condition) = message_controller_failure(&status) {
+                assert_eq!(condition.message, "Message controller exhausted its restart budget");
+                assert_eq!(condition.reason, "RestartBudgetExhausted");
+            }
+        }
     }
 }
