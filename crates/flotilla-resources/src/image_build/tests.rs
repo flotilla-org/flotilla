@@ -288,4 +288,9 @@ fn attempt_observation_respects_retry_deadline(tc: hegel::TestCase) {
     status.started_at = None;
     status.finished_at = None;
     assert!(!status.attempt_started_since(None));
+    // A new Start clears the previous finish, so reconciler and report see the same running attempt.
+    status.finished_at = Some(at);
+    ImageBuildStatusPatch::Start { at, attempt: 2 }.apply(&mut status);
+    assert!(status.finished_at.is_none());
+    assert!(status.attempt_started_since(Some(at)));
 }

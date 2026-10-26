@@ -351,6 +351,8 @@ pub enum ImageBuildAction {
 }
 
 pub struct FinishedAttempt {
+    /// The collected job's attempt; only the reconciler assigns retry ownership.
+    attempt: u32,
     pub outcome: Result<BuiltImage, FailedImageBuild>,
     pub log_ref: Result<String, String>,
 }
@@ -425,7 +427,7 @@ impl ImageBuildReconciler {
                 let job = jobs.remove(&current.metadata.name).expect("finished job");
                 match job.handle.await {
                     Ok(Some(JobResult { outcome, log_ref })) => {
-                        Ok(ImageBuildAction::Finished(Box::new(FinishedAttempt { outcome, log_ref })))
+                        Ok(ImageBuildAction::Finished(Box::new(FinishedAttempt { attempt: job.attempt, outcome, log_ref })))
                     }
                     Ok(None) => Ok(ImageBuildAction::None),
                     // This reconciler aborts only jobs it has already removed
@@ -434,6 +436,7 @@ impl ImageBuildReconciler {
                     // infrastructure failure: backoff and the attempt ceiling
                     // apply, instead of re-spawning the same attempt forever.
                     Err(error) => Ok(ImageBuildAction::Finished(Box::new(FinishedAttempt {
+                        attempt: job.attempt,
                         outcome: Err(FailedImageBuild {
                             failure: ImageBuildFailure {
                                 class: ImageBuildFailureClass::Infrastructure,
@@ -456,9 +459,19 @@ impl Reconciler for ImageBuildReconciler {
 
     async fn prepare(&self, obj: &ResourceObject<ImageBuild>) -> Result<Self::Prepared, ResourceError> {
         let execution = Arc::clone(&self.execution).lock_owned().await;
-        let action = self.prepare_build(obj).await?;
+        let mut action = self.prepare_build(obj).await?;
         // Refresh after job collection: the engine may have ended it while the job ran.
         let reading = self.reading(obj).await;
+        if reading.is_err() {
+            if let ImageBuildAction::Finished(finished) = std::mem::replace(&mut action, ImageBuildAction::None) {
+                // A failed authority read must not consume an expensive completed attempt.
+                let FinishedAttempt { attempt, outcome, log_ref } = *finished;
+                self.jobs.lock().await.insert(
+                    obj.metadata.name.clone(),
+                    Job { attempt, handle: tokio::spawn(async move { Some(JobResult { outcome, log_ref }) }) },
+                );
+            }
+        }
         Ok(ImageBuildPrepared { action, reading, _execution: execution })
     }
 

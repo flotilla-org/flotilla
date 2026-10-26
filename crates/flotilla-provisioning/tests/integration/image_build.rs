@@ -996,3 +996,59 @@ fn off_runtime_reads(reads: Arc<dyn LifecycleReads>) -> Arc<dyn LifecycleReads> 
     }
     Arc::new(OffRuntime { reads, runtime_thread: std::thread::current().id() })
 }
+
+// A transient authority error after completion must retain the result, not execute the attempt again.
+#[tokio::test]
+async fn completed_build_survives_post_collection_read_failure() {
+    use flotilla_provisioning::engine::image_build::ImageBuildBinding;
+    use flotilla_provisioning_testkit::LifecycleFixture;
+    struct FailOnce {
+        inner: Arc<dyn LifecycleReads>,
+        countdown: AtomicUsize,
+    }
+    impl LifecycleReads for FailOnce {
+        fn try_reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Result<Option<LifecycleReading>, String> {
+            if self.countdown.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)) == Ok(1) {
+                return Err("transient post-collection read".into());
+            }
+            self.inner.try_reading(kind, name, origin)
+        }
+    }
+    let backend = ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open_in_memory().expect("resource store"));
+    host(&backend, "amd64", None).await;
+    let spec = build_spec(layers(701, &[]), "amd64", ImageDelivery::Local, 1);
+    let name = create(&backend, &spec).await;
+    let builds = backend.using::<ImageBuild>(NS);
+    let obj = builds.get(&name).await.expect("build");
+    let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
+    fixture.request(&obj);
+    let reads = Arc::new(FailOnce { inner: fixture.reads.clone(), countdown: AtomicUsize::new(0) });
+    let service = BuildService::new(Behaviour::Gate);
+    service.expect(&spec);
+    let materials = Arc::new(Materials::default());
+    let clock = Arc::new(VirtualClock::new(Utc::now()));
+    let reconciler = reconciler(&backend, &service, &materials, &clock).with_lifecycle_reads(reads.clone());
+    tick(&backend, &reconciler, &clock, &name).await;
+    tick(&backend, &reconciler, &clock, &name).await;
+    service.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while materials.logs.lock().expect("logs").is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed build log");
+    tokio::task::yield_now().await;
+    // Building reads authority once before collecting, then refreshes after collection.
+    // Fail the refresh; failing the gate would return a prepare error rather than this frame.
+    reads.countdown.store(2, Ordering::SeqCst);
+    let obj = builds.get(&name).await.expect("build");
+    let prepared = reconciler.prepare(&obj).await.expect("read error frame");
+    let outcome = reconciler.reconcile(&obj, &prepared, Utc::now());
+    assert!(outcome.patch.is_none());
+    assert!(outcome.events.iter().any(|event| event.reason == "LifecycleReadFailed" && event.message == "transient post-collection read"));
+    drop(prepared);
+    settle(&backend, &reconciler, &clock, &name).await;
+    assert_eq!(status(&backend, &name).await.phase, ImageBuildPhase::Built);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1, "the finished attempt is retained across the failed read");
+}
