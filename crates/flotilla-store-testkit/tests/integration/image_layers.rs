@@ -11,12 +11,14 @@ use flotilla_resources::{
 use flotilla_store::{apply_resource_document, ResourceBackend};
 use rstest::rstest;
 
+/// An installation layer: the shipped stdlib layers are code-backed and always listed, so a test
+/// layer named like one shadows it rather than colliding with it.
 fn layer(name: &str, tier: ImageLayerTier, provides: &[&str]) -> ImageLayerSpec {
     ImageLayerSpec::builder()
         .name(name.into())
         .version("1.0.0".into())
         .tier(tier)
-        .source(ImageLayerSource::Stdlib)
+        .source(ImageLayerSource::Installation)
         .maybe_from((tier == ImageLayerTier::Base).then(|| format!("ubuntu@sha256:{}", "a".repeat(64))))
         .fragment(format!("FROM ${{BASE}}\nRUN echo {name}\n"))
         .provides(provides.iter().map(|capability| capability.to_string()).collect())
@@ -85,7 +87,14 @@ async fn layer_definition_contract(#[case] backend: ResourceBackend) {
     )
     .await
     .expect("retired record applies");
-    let all = layers.list().await.expect("list");
+    // The shipped stdlib layers are always listed beside the stored ones; only the stored ones are under test.
+    let all: Vec<_> = layers
+        .list()
+        .await
+        .expect("list")
+        .into_iter()
+        .filter(|layer| !flotilla_resources::builtins::is_builtin("ImageLayer", &layer.metadata.name))
+        .collect();
     assert_eq!(all.len(), 2);
     assert!(all.iter().any(|layer| layer.spec.is_retired()));
     let catalogue = ImageCatalogue::from_specs(all.iter().map(|layer| &layer.spec));
@@ -99,7 +108,7 @@ async fn replicated_layers_resolve_with_the_authored_identity() {
     let local = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     let remote = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-b"));
     let authored = [
-        layer("base-ubuntu", ImageLayerTier::Base, &["os:ubuntu"]),
+        layer("base-ubuntu-24.04", ImageLayerTier::Base, &["os:ubuntu"]),
         layer("crew-utilities", ImageLayerTier::AgentRuntime, &["crew:utilities"]),
         layer("display-x11", ImageLayerTier::Shared, &["display:x11"]),
     ];
@@ -121,7 +130,7 @@ async fn replicated_layers_resolve_with_the_authored_identity() {
     let resolved = resolve_image(&catalogue, &request).expect("resolve from replicas");
     assert_eq!(
         resolved.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(),
-        ["base-ubuntu", "display-x11", "crew-utilities"]
+        ["base-ubuntu-24.04", "display-x11", "crew-utilities"]
     );
     let expected = [authored[0].clone(), authored[2].clone(), authored[1].clone()];
     assert_eq!(resolved.identity, image_identity(&expected));

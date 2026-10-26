@@ -13,7 +13,7 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, PrincipalRef};
 use flotilla_resources::{
-    single_agent_workflow_spec, Convoy, ConvoyPhase, CrewSource, InputMeta, PlacementPolicy, WatchEvent, WatchStart, WorkflowTemplate,
+    single_agent_workflow_spec, Convoy, ConvoyPhase, CrewSource, PlacementPolicy, WatchEvent, WatchStart, WorkflowTemplate,
     MANAGED_BY_LABEL, ROLE_LABEL,
 };
 use flotilla_store::ResourceBackend;
@@ -107,16 +107,16 @@ async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEv
 }
 
 #[tokio::test]
-async fn scratch_workflow_template_is_seeded_at_startup() {
+async fn builtin_workflow_templates_are_readable_at_startup() {
     let (_daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
-    let templates = backend.using::<WorkflowTemplate>("flotilla");
-    let scratch = templates.get("scratch").await.expect("scratch template should be seeded");
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
+    let scratch = templates.get("scratch").await.expect("scratch template should be built in");
     assert_eq!(scratch.metadata.name, "scratch");
     assert_eq!(scratch.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("builtin"));
     assert_eq!(scratch.spec.vessels.len(), 1);
     assert_eq!(scratch.spec.vessels[0].name, "work");
 
-    let single_agent = templates.get("single-agent").await.expect("single-agent template should be seeded");
+    let single_agent = templates.get("single-agent").await.expect("single-agent template should be built in");
     assert_eq!(single_agent.spec.vessels.len(), 1);
     assert!(matches!(
         single_agent.spec.vessels[0].crew.as_slice(),
@@ -125,7 +125,7 @@ async fn scratch_workflow_template_is_seeded_at_startup() {
                 && matches!(&crew.source, CrewSource::Agent { selector, .. } if selector.capability == "code")
     ));
 
-    let interactive = templates.get("interactive-single").await.expect("interactive template should be seeded");
+    let interactive = templates.get("interactive-single").await.expect("interactive template should be built in");
     assert_eq!(interactive.spec.vessels.len(), 1);
     assert_eq!(interactive.spec.vessels[0].name, "work");
     assert!(matches!(
@@ -144,20 +144,13 @@ async fn scratch_workflow_template_is_seeded_at_startup() {
 }
 
 #[tokio::test]
-async fn stale_builtin_is_reconciled_before_dispatch() {
+async fn builtin_template_is_the_code_spec_at_dispatch() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
-    let mut stale = single_agent_workflow_spec();
-    stale.vessels[0].crew[0].role = "obsolete".to_string();
-
-    templates
-        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &stale)
-        .await
-        .expect("stale template should be created");
+    let templates = backend.clone().definitions::<WorkflowTemplate>("flotilla");
 
     let (daemon, backend, _config, _runtime, _tmp) = start_daemon_with_backend(backend).await;
-    let reconciled = templates.get("single-agent").await.expect("builtin should remain");
-    assert_eq!(reconciled.spec, single_agent_workflow_spec());
+    let builtin = templates.get("single-agent").await.expect("builtin should be readable");
+    assert_eq!(builtin.spec, single_agent_workflow_spec());
 
     let host_direct_policy = backend
         .using::<PlacementPolicy>("flotilla")

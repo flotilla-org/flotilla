@@ -95,12 +95,15 @@ async fn workflow_template_definitions_migration_wipes_legacy_local_authorities_
 
     migrated
         .definitions::<WorkflowTemplate>("flotilla")
-        .apply(&InputMeta::builder().name("single-agent".to_string()).build(), &WorkflowTemplateSpec::builder().vessels(Vec::new()).build())
+        .apply(
+            &InputMeta::builder().name("test-single-agent".to_string()).build(),
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
         .await
         .expect("new global definition");
     drop(migrated);
     let reopened = ResourceBackend::new(SqliteBackend::open(&path).expect("reopen migrated store"));
-    assert!(reopened.definitions::<WorkflowTemplate>("flotilla").get("single-agent").await.is_ok());
+    assert!(reopened.definitions::<WorkflowTemplate>("flotilla").get("test-single-agent").await.is_ok());
 }
 
 #[tokio::test]

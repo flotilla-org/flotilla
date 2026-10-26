@@ -123,7 +123,10 @@ mod tests {
             if builtin {
                 meta.labels.insert(MANAGED_BY_LABEL.into(), "builtin".into());
             }
-            templates.apply(&meta, &WorkflowTemplateSpec::builder().build()).await.expect("seed template");
+            // `scratch` is a current builtin: code-backed and always listed, never stored.
+            if name != "scratch" {
+                templates.apply(&meta, &WorkflowTemplateSpec::builder().build()).await.expect("seed template");
+            }
             projects
                 .create(
                     &InputMeta::builder().name(name.to_string()).build(),

@@ -2049,12 +2049,6 @@ async fn create_test_convoy_project(backend: &flotilla_store::ResourceBackend, i
         .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
         .await
         .expect("repository create");
-    backend
-        .clone()
-        .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &single_agent_workflow_spec())
-        .await
-        .expect("workflow create");
     create_test_contained_policy(backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
@@ -2111,14 +2105,6 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
         .await
         .expect("repository create");
-    for (name, workflow) in [("single-agent", single_agent_workflow_spec()), ("implement-review", implement_review_workflow_spec())] {
-        backend
-            .clone()
-            .using::<WorkflowTemplate>("flotilla")
-            .create(&InputMeta::builder().name(name.to_string()).build(), &workflow)
-            .await
-            .expect("workflow create");
-    }
     create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string(), "claude-code".to_string()])).await;
     backend
         .clone()
@@ -2261,7 +2247,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
     );
     let convoy = admitted_convoy(&backend, "reviewed").await;
     assert_eq!(convoy.spec.workflow_ref, "implement-review");
-    let workflow = backend.using::<WorkflowTemplate>("flotilla").get("implement-review").await.expect("implement-review workflow");
+    let workflow = backend.definitions::<WorkflowTemplate>("flotilla").get("implement-review").await.expect("implement-review workflow");
     assert_eq!(workflow.spec.vessels[0].crew.len(), 2);
     assert!(matches!(
         &workflow.spec.vessels[0].crew[1].source,
@@ -2323,12 +2309,6 @@ async fn exercise_existing_pr_admission(continuing: bool) {
         .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
         .expect("gh available for discovery");
     let backend = daemon.resource_backend();
-    backend
-        .clone()
-        .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("single-agent-shepherd".to_string()).build(), &single_agent_shepherd_workflow_spec())
-        .await
-        .expect("shepherd workflow create");
     let repository_spec = RepositorySpec::remote("https://github.com/owner/repo").expect("repository spec");
     let repository_key = repository_spec.key();
     backend
@@ -3638,14 +3618,6 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
         .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
         .await
         .expect("repository create");
-    let workflow = single_agent_workflow_spec();
-
-    backend
-        .clone()
-        .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &workflow)
-        .await
-        .expect("workflow create");
     backend
         .clone()
         .using::<Project>("flotilla")
@@ -3812,12 +3784,6 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
         .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
         .await
         .expect("repository create");
-    backend
-        .clone()
-        .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &single_agent_workflow_spec())
-        .await
-        .expect("workflow create");
     create_test_contained_policy(&backend, "ubuntu:24.04", BTreeSet::new()).await;
     backend
         .clone()
@@ -3966,12 +3932,6 @@ async fn convoy_start_accepts_project_list_identifier() {
         .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
         .await
         .expect("repository create");
-    backend
-        .clone()
-        .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &single_agent_workflow_spec())
-        .await
-        .expect("workflow create");
     create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
@@ -4089,14 +4049,12 @@ async fn convoy_start_freezes_dispatch_promises_and_refuses_unresolvable_ones() 
         .expect("repository create");
     let mut no_deliverer = single_agent_workflow_spec();
     no_deliverer.vessels[0].crew[0].deliverer = false;
-    for (name, workflow) in [("single-agent", single_agent_workflow_spec()), ("no-deliverer", no_deliverer)] {
-        backend
-            .clone()
-            .using::<WorkflowTemplate>("flotilla")
-            .create(&InputMeta::builder().name(name.to_string()).build(), &workflow)
-            .await
-            .expect("workflow create");
-    }
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("no-deliverer".to_string()).build(), &no_deliverer)
+        .await
+        .expect("workflow create");
     create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
@@ -4285,12 +4243,6 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             .await
             .expect("repository create");
     }
-    backend
-        .clone()
-        .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &single_agent_workflow_spec())
-        .await
-        .expect("workflow create");
     create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
@@ -4920,12 +4872,6 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
         .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
         .await
         .expect("repository create");
-    backend
-        .clone()
-        .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &single_agent_workflow_spec())
-        .await
-        .expect("workflow create");
     create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()

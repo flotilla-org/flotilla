@@ -8,6 +8,11 @@ use flotilla_store_testkit::fixtures::{
 };
 use rstest::rstest;
 
+/// The stored templates of a list: the built-in templates are code-backed and always listed.
+fn stored(listed: Vec<flotilla_resources::ResourceObject<WorkflowTemplate>>) -> Vec<flotilla_resources::ResourceObject<WorkflowTemplate>> {
+    listed.into_iter().filter(|template| !flotilla_resources::builtins::is_builtin("WorkflowTemplate", &template.metadata.name)).collect()
+}
+
 // Keep the rstest shape even with a single fixture so this suite can grow into
 // shared backend contract coverage without restructuring each test.
 #[rstest]
@@ -20,7 +25,7 @@ async fn create_get_list_roundtrip_for_workflow_templates(#[case] _fixture: Work
 
     let fetched = templates.get("alpha").await.expect("get should succeed");
     assert_eq!(fetched.metadata.resource_version, created.metadata.resource_version);
-    let listed = templates.list().await.expect("list should succeed");
+    let listed = stored(templates.list().await.expect("list should succeed"));
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].metadata.resource_version, created.metadata.resource_version);
 }
@@ -41,7 +46,7 @@ async fn delete_removes_workflow_template_definition(#[case] _fixture: WorkflowT
     templates.apply(&workflow_template_meta("alpha"), &valid_workflow_template_spec()).await.expect("apply should succeed");
 
     templates.delete("alpha").await.expect("delete should succeed");
-    assert!(templates.list().await.expect("list should succeed").is_empty());
+    assert!(stored(templates.list().await.expect("list should succeed")).is_empty());
 }
 
 #[rstest]

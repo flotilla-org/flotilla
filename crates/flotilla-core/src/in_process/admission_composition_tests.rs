@@ -22,7 +22,6 @@ async fn retired_project_workflow_admits_current_turn_rules() {
     .await;
     let templates = daemon.resource_backend().definitions::<WorkflowTemplate>("flotilla");
     let current = flotilla_resources::single_agent_workflow_spec();
-    templates.create(&InputMeta::builder().name("single-agent".into()).build(), &current).await.expect("current workflow");
     for retired in ["single-agent-contained", "single-agent-trusted"] {
         let mut stale = current.clone();
         stale.turn_delivery.shift_remove("checks-settled");

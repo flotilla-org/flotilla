@@ -36,6 +36,8 @@ pub use image_build::{
     PlacedImageIdentity, IMAGE_BUILD_MAX_ATTEMPTS,
 };
 mod image_layer;
+pub use image_layer::stdlib;
+pub mod builtins;
 pub use image_layer::{
     capability_satisfies, image_identity, parse_layer_directory, parse_layer_directory_with_executables, resolve_image,
     validate_capability, EffectiveImageCatalogue, ImageCatalogue, ImageContextFile, ImageLayer, ImageLayerPin, ImageLayerResourceSpec,

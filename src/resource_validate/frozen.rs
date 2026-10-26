@@ -632,11 +632,9 @@ mod tests {
         inventory[0]["status"]["phase"] = serde_json::json!("Pending");
         inventory[0]["status"]["workflow_snapshot"] = Value::Null;
         inventory[0]["spec"]["workflow_ref"] = serde_json::json!("single-agent-contained");
-        let template = backend
-            .definitions::<flotilla_resources::WorkflowTemplate>("fleet")
-            .apply(&InputMeta::builder().name("single-agent".into()).build(), &WorkflowTemplateSpec::builder().build())
-            .await
-            .expect("canonical template");
+        // The canonical template is built in: the merged inventory carries it without a stored copy.
+        let template =
+            backend.definitions::<flotilla_resources::WorkflowTemplate>("fleet").get("single-agent").await.expect("canonical template");
         inventory.push(serde_json::to_value(template.to_k8s_object()).expect("document"));
         let supply = Supply { revision: "1".repeat(40), image_available: true };
         assert!(check(&inventory, &BTreeSet::new(), &supply).await.expect("check").failures.is_empty());

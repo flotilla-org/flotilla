@@ -901,3 +901,58 @@ async fn legacy_environment_instance_survives_read_write_and_noop(#[case] adapte
         flotilla_store::resource_document_spec_hash(&current_document).expect("current hash")
     );
 }
+
+// Behaviour (#3824 layer 2a, owner ruling 2026-10-26): built-in definitions come from the code.
+// Every merged read sees each built-in workflow template and stdlib image layer at the built-in
+// version, with nothing stored; a stored copy an earlier generation seeded is shadowed; a write,
+// metadata edit or delete under a built-in's name is refused; other definitions read beside them.
+// (An HTTP backend authors no definitions, so this runs on the local adapters.)
+#[rstest::rstest]
+#[case("memory")]
+#[case("sqlite")]
+#[tokio::test]
+async fn built_in_definitions_are_read_from_the_code_and_never_written(#[case] adapter: &str) {
+    use flotilla_resources::{builtins::builtin_definitions, ImageLayer, WorkflowTemplate};
+    let (backend, _server) = backend(adapter).await;
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
+    let builtin_names = |kind: &str| builtin_definitions(kind).iter().map(|builtin| builtin.name.clone()).collect::<Vec<_>>();
+    let template_names = builtin_names("WorkflowTemplate");
+    assert!(template_names.contains(&"single-agent".to_string()));
+    let single = templates.get("single-agent").await.expect("a built-in reads with nothing stored");
+    assert_eq!(single.spec, flotilla_resources::single_agent_workflow_spec());
+    assert_eq!(single.metadata.resource_version, flotilla_store::BUILTIN_VERSION);
+    // A user template reads beside the built-ins; listing and a named read see both.
+    let user = flotilla_resources::single_agent_workflow_spec();
+    templates.apply(&InputMeta::builder().name("variant".to_string()).build(), &user).await.expect("a new name is stored");
+    let mut listed: Vec<_> = templates.list().await.expect("list").into_iter().map(|template| template.metadata.name).collect();
+    listed.sort();
+    let mut expected = template_names.clone();
+    expected.push("variant".into());
+    expected.sort();
+    assert_eq!(listed, expected);
+    let named = templates.list_names(["single-agent".to_string(), "variant".to_string()]).await.expect("named");
+    assert_eq!(named.len(), 2);
+    // Writes under a built-in's name are refused, whatever the path.
+    let refused = templates.apply(&InputMeta::builder().name("single-agent".to_string()).build(), &user).await;
+    assert!(matches!(refused, Err(ResourceError::Invalid { .. })), "{refused:?}");
+    assert!(templates.delete("single-agent").await.is_err());
+    assert!(templates.update_metadata(&InputMeta::builder().name("single-agent".to_string()).build()).await.is_err());
+    // A copy an earlier generation seeded under a built-in's name is shadowed by the built-in.
+    let mut stale = flotilla_resources::single_agent_workflow_spec();
+    stale.roles.clear();
+    let stale = serde_json::to_value(&stale).expect("stale spec");
+    let seeded = InputMeta::builder().name("single-agent-shepherd".to_string()).build();
+    backend.store().create_raw(ResourceKind::of::<WorkflowTemplate>(), "flotilla", &seeded, &stale).await.expect("a legacy stored copy");
+    let shadowed = templates.get("single-agent-shepherd").await.expect("read");
+    assert_eq!(shadowed.spec, flotilla_resources::single_agent_shepherd_workflow_spec());
+    assert_eq!(
+        templates.list().await.expect("list").iter().filter(|template| template.metadata.name == "single-agent-shepherd").count(),
+        1
+    );
+    // The stdlib image layers read the same way.
+    let layers = backend.definitions::<ImageLayer>("flotilla");
+    let layer_names = builtin_names("ImageLayer");
+    assert!(!layer_names.is_empty(), "the release ships stdlib layers");
+    assert!(layers.get(&layer_names[0]).await.is_ok());
+    assert_eq!(layers.list().await.expect("list").len(), layer_names.len());
+}

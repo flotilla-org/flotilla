@@ -425,22 +425,6 @@ pub fn repository_matches_target(repository: &ResourceObject<Repository>, target
     repository.metadata.name == target || repository.spec.matches_catalog_target(target)
 }
 
-pub async fn ensure_default_workflows(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
-    let templates = backend.clone().using::<WorkflowTemplate>(namespace);
-    for (name, spec) in [
-        ("single-agent", flotilla_resources::single_agent_workflow_spec()),
-        ("single-agent-shepherd", flotilla_resources::single_agent_shepherd_workflow_spec()),
-        ("implement-review", flotilla_resources::implement_review_workflow_spec()),
-    ] {
-        let meta = InputMeta::builder().name(name.to_string()).build();
-        match templates.create(&meta, &spec).await {
-            Ok(_) | Err(ResourceError::Conflict { .. }) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Ok(())
-}
-
 pub fn prepared_snapshot_name(kind: &str, spec: &serde_json::Value) -> Result<String, String> {
     let suffix = flotilla_resources::content_hash(spec).map_err(|error| error.to_string())?;
     Ok(format!("{kind}-snapshot-{suffix}"))
@@ -513,7 +497,6 @@ pub async fn ensure_repository_and_default_project_workflow(
     flotilla_store::ensure_repository(&backend.clone().using::<Repository>(namespace), repository_key, repository_spec)
         .await
         .map_err(|error| error.to_string())?;
-    ensure_default_workflows(backend, namespace).await?;
     flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), namespace)
         .collect(None)
         .await

@@ -13,6 +13,7 @@ use crate::{ApiPaths, InputMeta, NoStatusPatch, ReplicationClass, Resource, Reso
 
 mod directory;
 mod resolve;
+pub mod stdlib;
 
 pub use directory::{parse_layer_directory, parse_layer_directory_with_executables, LAYER_DEFINITION_FILE, LAYER_FRAGMENT_FILE};
 pub use resolve::{

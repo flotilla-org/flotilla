@@ -534,6 +534,8 @@ mod tests {
             operations: &operations,
         };
         let layers = backend.using::<ImageLayer>("flotilla");
+        // The shipped stdlib layers are always visible beside the stored ones; only the stored
+        // (project) layers are under test here.
         let names = || async {
             backend
                 .definitions::<ImageLayer>("flotilla")
@@ -542,6 +544,7 @@ mod tests {
                 .expect("layers")
                 .into_iter()
                 .map(|layer| layer.metadata.name)
+                .filter(|name| !flotilla_resources::builtins::is_builtin("ImageLayer", name))
                 .collect::<Vec<_>>()
         };
 

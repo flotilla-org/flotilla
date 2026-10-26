@@ -3508,7 +3508,7 @@ impl Store for SqliteBackend {
     async fn query_raw(&self, kind: ResourceKind, namespace: &str, query: &crate::StoreQuery) -> Result<crate::QueryResult, ResourceError> {
         let (items, position) = self.query_rows(kind, namespace, query, RowForm::serialized).await?;
         let items = items.into_iter().map(|(object, provenance)| ReadResourceObject { object, provenance }).collect();
-        let mut items = crate::merge_query_definitions(query, items, &self.local_root())?;
+        let mut items = crate::merge_query_definitions(&kind, namespace, query, items, &self.local_root())?;
         crate::sort_query_items(&mut items);
         Ok(crate::QueryResult { items, position, local_root: Some(self.local_root()) })
     }
