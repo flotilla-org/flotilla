@@ -43,7 +43,8 @@ the harnesses baked into their pinned crew images.
   entries.
 - This changes the stored `ImageLayerSpec`. The previous `url` plus
   per-architecture `sha256` shape decodes for one generation.
-- Schema look-over happens before any code reads the new shape.
+- The owner approved the schema on 2026-10-26, keeping previous-shape `{arch}`
+  URLs verbatim for the shim roll (option a).
 
 **Skills are not part of this work (decision 4).**
 - The fleet generation carries infrastructure only.
@@ -97,8 +98,9 @@ variables whose values may name install paths.
   directories and the retired-link cleanup from the declaration.
 - Docker mounts those directories and agentless vessels push them.
 - Both take the layer environment from the same declaration. The agentless
-  vessel's `PATH` and `TERMINFO_DIRS` come from it, which is the seam #3908's
-  base layer consumes as "generation layers".
+  vessel's `PATH` entries go to #3913's prepared base layer as its generation
+  layers (`ExecutionPreparer::with_generation`), and its `TERMINFO_DIRS` is set
+  with flotilla's own variables, so a host supply cannot override it.
 
 **Deployment obligations.**
 - Installed generations remain immutable, and a roll restarts the daemon.
@@ -107,3 +109,34 @@ variables whose values may name install paths.
   refused by an older daemon's Cleat-roll publication, as it is on main today.
 - Adding a member is a declaration edit plus a candidate build. No validator
   code changes.
+
+## Step 2: explicit per-architecture pins
+
+**Stored shape.** `ImageLayerPin` is `{version, artifacts}`. `artifacts` is
+keyed by architecture, or by the single key `any` for architecture-independent
+bytes. Each artifact has a `url`, a lowercase hex `sha256` and an `unpack` kind
+(`file`, `tar.gz` or `tar.xz`). `ImageLayer` has no generated tables, so the DDL
+is unchanged.
+
+**Shim (ADR 0047, remove one roll after this lands).**
+- The previous `url` plus `sha256` shape decodes and is written back as
+  `artifacts`.
+- A previous `{arch}` template keeps its text in each architecture's entry, so
+  an out-of-repo layer's own fragment can still substitute it. The vessel
+  agent's fetch refuses such entries (`is_legacy_template`).
+- An `{arch}` template under `any` is refused, as the old single-digest rule
+  refused it.
+
+**Builds.** The image generator emits `PIN_<NAME>_URL`, `_SHA256` and `_UNPACK`
+for the target architecture's entry, or for `any`. A pin with no entry for the
+target refuses the build. The stdlib fragments fetch the URL as given; only
+rust still maps the architecture, for its toolchain triple.
+
+## Not built here
+
+- **Harness fetch by the vessel agent.** This is blocked on drydock#84's
+  octet-stream file operations and on a fetch-by-digest agent operation that
+  has no ticket yet. Until both exist, agentless vessels get no harness layer
+  from this work, and no stand-in transfer is built. The pins above are the
+  entries that fetch will read.
+- **Skills.** These move to #3663.
