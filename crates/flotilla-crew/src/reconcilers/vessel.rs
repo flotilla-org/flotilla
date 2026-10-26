@@ -45,6 +45,30 @@ const VESSEL_INTERRUPTED_REQUEUE_AFTER: Duration = Duration::from_millis(250);
 const VESSEL_PROVISIONING_STUCK_SECONDS: i64 = 2 * 60;
 const CHECKOUT_RECREATE_BACKOFF: Duration = Duration::from_secs(60);
 
+// Interim caller-home transport; #3956 replaces this label/env-map bridge.
+struct CrewHomeTransport<'a>(&'a BTreeMap<String, String>);
+
+impl CrewHomeTransport<'_> {
+    fn insert_into(&self, environment: &mut BTreeMap<String, String>) {
+        environment.insert(
+            flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(),
+            serde_json::to_string(self.0).expect("recorded home keys serialize"),
+        );
+    }
+
+    fn update_existing(&self, name: &str, spec: &EnvironmentSpec) -> Option<Actuation> {
+        let current_keys = spec
+            .cloud_sandbox
+            .as_ref()
+            .map(|cloud| &cloud.env)
+            .or_else(|| spec.docker.as_ref().map(|docker| &docker.env))
+            .and_then(|env| env.get(flotilla_resources::account_access::CREW_HOME_KEYS_ENV))
+            .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok());
+        (!self.0.is_empty() && current_keys.as_ref() != Some(self.0))
+            .then(|| Actuation::UpdateEnvironmentHomeKeys { name: name.into(), keys: self.0.clone() })
+    }
+}
+
 // Compare the grants we own, independent of serialization order and unrelated
 // policy mounts. Legacy config/hooks overlays identify old shared roots too, so
 // removing an entire repository still detects its stale writable grants.
@@ -649,6 +673,7 @@ impl VesselReconciler {
                 crew.labels.get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL).map(|key| (crew.role.clone(), key.clone()))
             })
             .collect::<BTreeMap<_, _>>();
+        let home_transport = CrewHomeTransport(&home_keys);
         for crew in &requirement.crew {
             let CrewSource::Agent { selector, .. } = &crew.source else { continue };
             let account = flotilla_agent::adapter::CapabilityTable::seeded()
@@ -750,16 +775,8 @@ impl VesselReconciler {
                 let env_name = environment_name(&obj.metadata.name);
                 let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
-                        let current_keys = existing
-                            .spec
-                            .cloud_sandbox
-                            .as_ref()
-                            .map(|cloud| &cloud.env)
-                            .or_else(|| existing.spec.docker.as_ref().map(|docker| &docker.env))
-                            .and_then(|env| env.get(flotilla_resources::account_access::CREW_HOME_KEYS_ENV))
-                            .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok());
-                        if !home_keys.is_empty() && current_keys.as_ref() != Some(&home_keys) {
-                            actuations.push(Actuation::UpdateEnvironmentHomeKeys { name: env_name.clone(), keys: home_keys.clone() });
+                        if let Some(update) = home_transport.update_existing(&env_name, &existing.spec) {
+                            actuations.push(update);
                             return Ok(VesselPrepared::provisioning(
                                 &placement_policy,
                                 placement_decision.clone(),
@@ -843,10 +860,7 @@ impl VesselReconciler {
                                         env: environment_with_credentials(
                                             {
                                                 let mut env = env.clone();
-                                                env.insert(
-                                                    flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(),
-                                                    serde_json::to_string(&home_keys).expect("recorded home keys serialize"),
-                                                );
+                                                home_transport.insert_into(&mut env);
                                                 env.insert(
                                                     flotilla_resources::CREW_SKILLS_ENV.to_string(),
                                                     serde_json::to_string(
@@ -1211,16 +1225,8 @@ impl VesselReconciler {
                 let env_name = environment_name(&obj.metadata.name);
                 let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
-                        let current_keys = existing
-                            .spec
-                            .cloud_sandbox
-                            .as_ref()
-                            .map(|cloud| &cloud.env)
-                            .or_else(|| existing.spec.docker.as_ref().map(|docker| &docker.env))
-                            .and_then(|env| env.get(flotilla_resources::account_access::CREW_HOME_KEYS_ENV))
-                            .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok());
-                        if !home_keys.is_empty() && current_keys.as_ref() != Some(&home_keys) {
-                            actuations.push(Actuation::UpdateEnvironmentHomeKeys { name: env_name.clone(), keys: home_keys.clone() });
+                        if let Some(update) = home_transport.update_existing(&env_name, &existing.spec) {
+                            actuations.push(update);
                             return Ok(VesselPrepared::provisioning(
                                 &placement_policy,
                                 placement_decision.clone(),
@@ -1358,10 +1364,7 @@ impl VesselReconciler {
                                         env: environment_with_credentials(
                                             {
                                                 let mut env = env.clone();
-                                                env.insert(
-                                                    flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(),
-                                                    serde_json::to_string(&home_keys).expect("recorded home keys serialize"),
-                                                );
+                                                home_transport.insert_into(&mut env);
                                                 env.insert(
                                                     flotilla_resources::CREW_SKILLS_ENV.to_string(),
                                                     serde_json::to_string(
