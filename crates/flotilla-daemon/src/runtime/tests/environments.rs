@@ -579,3 +579,86 @@ async fn cloud_unknown_does_not_abort_gone_sibling() {
     assert_eq!(stale.phase, EnvironmentPhase::Ready);
     assert!(stale.message.unwrap().contains("checkpoint stale"));
 }
+
+// #3780: bound active cloud work, admit queued siblings in order as slots free,
+// and cancel timed-out jobs without letting Unknown/slow jobs abort siblings.
+// The jobs stand in for provider/SSH IO; the actual production scheduler runs.
+#[tokio::test(start_paused = true)]
+async fn cloud_scheduler_bounds_refills_and_cancels_without_starving_siblings() {
+    use crate::runtime::environments::{start_cloud_reconciliations, CLOUD_RECONCILIATION_LIMIT, ENVIRONMENT_ADOPTION_TIMEOUT};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+    struct Active {
+        count: Arc<AtomicUsize>,
+        cancelled: Arc<AtomicUsize>,
+        completed: bool,
+    }
+    impl Drop for Active {
+        fn drop(&mut self) {
+            self.count.fetch_sub(1, Ordering::SeqCst);
+            if !self.completed {
+                self.cancelled.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+    let count = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    async fn next_start(starts: &mut tokio::sync::mpsc::UnboundedReceiver<usize>) -> usize {
+        tokio::time::timeout(Duration::from_secs(1), starts.recv()).await.unwrap().unwrap()
+    }
+    let healthy_and_gone = Arc::new(Mutex::new(Vec::new()));
+    let release_unknown = Arc::new(tokio::sync::Notify::new());
+    let jobs = (0..CLOUD_RECONCILIATION_LIMIT + 3)
+        .map(|id| {
+            let (count, peak, cancelled, started, healthy_and_gone, release_unknown) =
+                (count.clone(), peak.clone(), cancelled.clone(), started.clone(), healthy_and_gone.clone(), release_unknown.clone());
+            (id.to_string(), async move {
+                let mut guard = Active { count: count.clone(), cancelled, completed: false };
+                peak.fetch_max(count.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                started.send(id).unwrap();
+                if id == CLOUD_RECONCILIATION_LIMIT - 1 {
+                    release_unknown.notified().await;
+                    guard.completed = true;
+                    Err("Unknown: provider unresponsive".into())
+                } else if id == CLOUD_RECONCILIATION_LIMIT || id == CLOUD_RECONCILIATION_LIMIT + 1 {
+                    healthy_and_gone.lock().unwrap().push(id);
+                    guard.completed = true;
+                    Ok(())
+                } else {
+                    std::future::pending().await
+                }
+            })
+        })
+        .collect();
+    drop(started);
+    let mut batch = start_cloud_reconciliations(jobs);
+    for id in 0..CLOUD_RECONCILIATION_LIMIT {
+        assert_eq!(next_start(&mut starts).await, id);
+    }
+    // Let runnable jobs settle before asserting that queued work stays queued.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(starts.try_recv().is_err());
+    assert_eq!(count.load(Ordering::SeqCst), CLOUD_RECONCILIATION_LIMIT);
+    // One Unknown completion must refill repeatedly: healthy and Gone jobs
+    // queued behind blocked peers finish before any timeout or peer release.
+    release_unknown.notify_one();
+    for id in CLOUD_RECONCILIATION_LIMIT..CLOUD_RECONCILIATION_LIMIT + 3 {
+        assert_eq!(next_start(&mut starts).await, id);
+    }
+    let last_admitted = tokio::time::Instant::now();
+    assert_eq!(*healthy_and_gone.lock().unwrap(), vec![CLOUD_RECONCILIATION_LIMIT, CLOUD_RECONCILIATION_LIMIT + 1]);
+    assert_eq!(peak.load(Ordering::SeqCst), CLOUD_RECONCILIATION_LIMIT);
+    assert_eq!(cancelled.load(Ordering::SeqCst), 0);
+    tokio::time::advance(ENVIRONMENT_ADOPTION_TIMEOUT).await;
+    let errors = batch.join_next().await.unwrap().unwrap().unwrap_err();
+    assert!(errors.contains("Unknown: provider unresponsive"));
+    assert_eq!(errors.matches("timed out").count(), CLOUD_RECONCILIATION_LIMIT);
+    assert_eq!(cancelled.load(Ordering::SeqCst), CLOUD_RECONCILIATION_LIMIT);
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert_eq!(last_admitted.elapsed(), ENVIRONMENT_ADOPTION_TIMEOUT);
+    assert!(batch.join_next().await.is_none());
+}

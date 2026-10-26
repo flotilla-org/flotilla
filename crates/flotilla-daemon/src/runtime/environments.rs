@@ -94,31 +94,26 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
         .items;
     let local_host_id = CanonicalHostId::resolved(&state.local_host_ref);
     let mut environments = Vec::new();
-    let mut cloud_reconciliations = tokio::task::JoinSet::new();
     // Lifecycle read errors abort candidate selection: skipping an unreadable environment
     // could publish the inventory-complete barrier below from incomplete backing evidence.
     // Keep adoption and that teardown evidence pending until every candidate can be judged.
-    for environment in candidates {
-        if environment.spec.cloud_sandbox.is_some() {
-            if environment.spec.provider_address.as_ref().is_some_and(|address| state.environment_providers.get(address).is_ok())
-                && environment_readiness(&state.daemon, &environment).await?.is_ready()
-            {
-                let state = Arc::clone(state);
-                let namespace = namespace.to_owned();
-                cloud_reconciliations.spawn(async move {
-                    match tokio::time::timeout(ENVIRONMENT_ADOPTION_TIMEOUT, reconcile_cloud_environment(&state, &namespace, &environment))
-                        .await
-                    {
-                        Ok(result) => result,
-                        // Cancellation may follow provider creation but precede
-                        // local publication. Drop never destroys the backing;
-                        // the next pass label-adopts it via HTTP 200.
-                        Err(_) => Err(format!("cloud environment {} adoption timed out; will retry", environment.metadata.name)),
-                    }
-                });
-            }
+    let (cloud, candidates): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|environment| environment.spec.cloud_sandbox.is_some());
+    let mut cloud_jobs = Vec::new();
+    for environment in cloud {
+        if !environment.spec.provider_address.as_ref().is_some_and(|address| state.environment_providers.get(address).is_ok())
+            || !environment_readiness(&state.daemon, &environment).await?.is_ready()
+        {
             continue;
         }
+        let state = Arc::clone(state);
+        let namespace = namespace.to_owned();
+        cloud_jobs
+            .push((environment.metadata.name.clone(), async move { reconcile_cloud_environment(&state, &namespace, &environment).await }));
+    }
+    // Start cloud work before any Docker inventory/SSH awaits. Dropping this
+    // JoinSet aborts its coordinator, which in turn aborts its active jobs.
+    let cloud_reconciliations = start_cloud_reconciliations(cloud_jobs);
+    for environment in candidates {
         let Some(spec) = environment.spec.docker.as_ref() else {
             continue;
         };
@@ -220,6 +215,54 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     } else {
         Err(errors.join("; "))
     }
+}
+
+/// Each cloud job can hold provider HTTP and SSH preparation work. Sixteen
+/// permits ordinary siblings to progress while bounding both kinds of load.
+/// FIFO admission in listing order, with immediate refill on any completion,
+/// lets fast jobs refill slots without waiting for an entire slow wave.
+pub(super) const CLOUD_RECONCILIATION_LIMIT: usize = 16;
+
+/// Admit jobs in FIFO listing order and refill each completed slot.
+/// Each deadline starts at admission; the returned set owns the coordinator
+/// and its children, so dropping it cancels all outstanding work.
+pub(super) fn start_cloud_reconciliations<F>(jobs: Vec<(String, F)>) -> tokio::task::JoinSet<Result<(), String>>
+where
+    F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    let mut batch = tokio::task::JoinSet::new();
+    batch.spawn(async move {
+        let mut queued = jobs.into_iter();
+        let mut active = tokio::task::JoinSet::new();
+        let mut errors = Vec::new();
+        loop {
+            while active.len() < CLOUD_RECONCILIATION_LIMIT {
+                let Some((name, job)) = queued.next() else {
+                    break;
+                };
+                active.spawn(async move {
+                    match tokio::time::timeout(ENVIRONMENT_ADOPTION_TIMEOUT, job).await {
+                        Ok(result) => result,
+                        // Drop never destroys backing; the next pass label-adopts
+                        // it if timeout followed creation but preceded publication.
+                        Err(_) => Err(format!("cloud environment {name} adoption timed out; will retry")),
+                    }
+                });
+            }
+            match active.join_next().await {
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(error))) => errors.push(error),
+                Some(Err(error)) => errors.push(error.to_string()),
+                None => break,
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    });
+    batch
 }
 
 async fn collect_cloud_reconciliations(mut jobs: tokio::task::JoinSet<Result<(), String>>, mut errors: Vec<String>) -> Result<(), String> {
