@@ -111,22 +111,151 @@ impl MessageInbox {
     /// the next pass repairs it from current holders and active Messages.
     pub async fn reconcile_delivery(&self, router: &TransportRouter, now: DateTime<Utc>) -> Result<(), ResourceError> {
         let _delivery = self.delivery.lock().await;
+        let mut by_receiver: BTreeMap<String, Vec<ResourceObject<Message>>> = BTreeMap::new();
+        let messages = self.messages.query(&MessageQuery::active()).await?;
+        // Keep the normal path to one frozen, addressed snapshot. If a bad
+        // receiver prevents loading it, retry within each isolated boundary.
+        let snapshot = self.load_delivery_receivers(&messages).await.ok();
+        let mut receiver_keys: BTreeMap<(String, String), String> = BTreeMap::new();
+        for message in messages {
+            let address = (message.spec.receiver.clone(), message.spec.sender.clone());
+            let key = match receiver_keys.get(&address) {
+                Some(key) => key.clone(),
+                None => {
+                    // Aliases and topics that resolve to the same terminal
+                    // still share one FIFO transport batch and failure boundary.
+                    let key = match snapshot.as_ref() {
+                        Some(snapshot) => match self.resolve_receiver(snapshot, &message).await {
+                            Ok(Some(holder)) => format!("terminal/{}", holder.object.metadata.name),
+                            _ => format!("address/{}", message.spec.receiver),
+                        },
+                        None => format!("address/{}", message.spec.receiver),
+                    };
+                    receiver_keys.insert(address, key.clone());
+                    key
+                }
+            };
+            by_receiver.entry(key).or_default().push(message);
+        }
+        let mut persistence_error = None;
+        for (receiver, messages) in by_receiver {
+            if let Err(error) = self.reconcile_receiver(router, snapshot.as_ref(), &messages, now).await {
+                tracing::warn!(%receiver, %error, "message receiver pass failed");
+                // Failure reporting can itself lose the store. Keep trying other
+                // receivers before returning that infrastructure failure.
+                if let Err(error) = self.record_receiver_failure(&messages, &error, now).await {
+                    persistence_error.get_or_insert(error);
+                }
+            }
+        }
+        self.cleanup_delivery_gates(snapshot.as_ref()).await?;
+        tokio::time::timeout(TRANSPORT_CALL_BOUND, router.release_closed()).await.ok();
+        match persistence_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn record_receiver_failure(
+        &self,
+        messages: &[ResourceObject<Message>],
+        error: &ResourceError,
+        now: DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        let reason = format!("Message receiver pass failed: {error}");
+        for message in messages {
+            let current = self.messages.get(&message.metadata.name).await?;
+            let mut status = status_for(&current);
+            if status.phase.is_terminal() {
+                continue;
+            }
+            status.reason = Some(reason.clone());
+            self.write(&current, &status).await?;
+        }
+        let receivers = match self.load_delivery_receivers(messages).await {
+            Ok(receivers) => receivers,
+            Err(error) => {
+                // The failure is durable on the addressed Messages even when
+                // routing cannot identify a unique terminal to raise attention.
+                tracing::warn!(%error, "cannot resolve receiver for recorded inbox failure");
+                return Ok(());
+            }
+        };
+        if let Some(first) = messages.first() {
+            let holder = match self.resolve_receiver(&receivers, first).await {
+                Ok(holder) => holder,
+                Err(error) => {
+                    tracing::warn!(receiver = %first.spec.receiver, %error, "cannot resolve receiver for recorded inbox failure");
+                    return Ok(());
+                }
+            };
+            if let Some(holder) = holder {
+                let terminals = self.backend.using::<TerminalSession>(&self.namespace);
+                let current = terminals.get(&holder.object.metadata.name).await?;
+                let mut status = current.status.clone().unwrap_or_default();
+                // Preserve the fence's original proof and observation time:
+                // an inbox error is not another transport attempt.
+                if let Some(condition) = status.degraded.as_mut().filter(|condition| condition.is_delivery()) {
+                    condition.message = reason.clone();
+                    status.message = Some(reason.clone());
+                    if current.status.as_ref() != Some(&status) {
+                        terminals.update_status(&current.metadata.name, &current.metadata.resource_version, &status).await?;
+                    }
+                } else {
+                    apply_status_patch(
+                        &terminals,
+                        &holder.object.metadata.name,
+                        &crate::TerminalSessionStatusPatch::MarkDeliveryUnconfirmed {
+                            message_id: first.metadata.name.clone(),
+                            message: reason,
+                            observed_at: now,
+                        },
+                    )
+                    .await?;
+                }
+                let current = self.messages.get(&first.metadata.name).await?;
+                self.signal(&receivers, &current, now).await?;
+            }
+        }
+        Ok(())
+    }
+
+    // Every receiver-dependent read, admission repair and transport operation
+    // stays inside this boundary. A malformed receiver cannot abort its peers.
+    async fn reconcile_receiver(
+        &self,
+        router: &TransportRouter,
+        snapshot: Option<&MessageReceiverSnapshot>,
+        input: &[ResourceObject<Message>],
+        now: DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
         {
             let _admission = self.admission.lock().await;
             // A created record with no status is an interrupted admission. Finish
             // its predecessor cleanup before selecting any batch for transport.
-            for message in self.messages.query(&MessageQuery::active()).await?.into_iter().filter(|message| message.status.is_none()) {
+            for message in input.iter().filter(|message| message.status.is_none()) {
                 self.accept_locked(&InputMeta::from(&message.metadata), &message.spec, now).await?;
             }
         }
-        let mut messages = self.messages.query(&MessageQuery::active()).await?;
+        let repaired_admission = input.iter().any(|message| message.status.is_none());
+        let mut messages = Vec::new();
+        for message in input {
+            let current = if repaired_admission { self.messages.get(&message.metadata.name).await? } else { message.clone() };
+            if current.status.as_ref().is_none_or(|status| !status.phase.is_terminal()) {
+                messages.push(current);
+            }
+        }
         if messages.is_empty() {
-            self.cleanup_delivery_gates(None).await?;
-            tokio::time::timeout(TRANSPORT_CALL_BOUND, router.release_closed()).await.ok();
             return Ok(());
         }
-        let snapshot = self.load_delivery_receivers(&messages).await?;
-        let receivers = &snapshot;
+        let loaded;
+        let receivers = match snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                loaded = self.load_delivery_receivers(&messages).await?;
+                &loaded
+            }
+        };
         messages.sort_by_key(|message| {
             (
                 message.metadata.creation_timestamp,
@@ -259,12 +388,15 @@ impl MessageInbox {
         let member_names: BTreeSet<_> = messages
             .iter()
             .flat_map(|message| {
-                message
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.submission.as_ref())
-                    .into_iter()
-                    .flat_map(|submission| submission.members.iter().cloned())
+                message.status.as_ref().into_iter().flat_map(|status| {
+                    status
+                        .submission
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|submission| submission.members.iter())
+                        .chain(status.failed_batch_members.iter())
+                        .cloned()
+                })
             })
             .collect();
         for name in member_names {
@@ -275,8 +407,6 @@ impl MessageInbox {
         for (_, (holder, pending)) in groups {
             self.deliver_group(receivers, router, &holder, &pending, &messages, now).await?;
         }
-        self.cleanup_delivery_gates(Some(receivers)).await?;
-        tokio::time::timeout(TRANSPORT_CALL_BOUND, router.release_closed()).await.ok();
         Ok(())
     }
 
@@ -576,7 +706,15 @@ impl MessageInbox {
             .and_then(|status| status.degraded.as_ref())
             .filter(|condition| condition.is_controller_fence_unverifiable())
         {
-            if let Some(rejected) = pending.iter().find(|message| condition.message_id.as_deref() == Some(message.metadata.name.as_str())) {
+            if let Some(rejected) = pending.iter().find(|message| {
+                condition.message_id.as_ref().is_some_and(|id| {
+                    message.metadata.name == *id
+                        || message.status.as_ref().is_some_and(|status| {
+                            status.failed_batch_members.contains(id)
+                                || status.submission.as_ref().is_some_and(|submission| submission.members.contains(id))
+                        })
+                })
+            }) {
                 let status = status_for(rejected);
                 let names = status.submission.as_ref().map(|submission| &submission.members).unwrap_or(&status.failed_batch_members);
                 let members = names
@@ -1259,13 +1397,14 @@ impl MessageInbox {
             .filter(|message| {
                 message.status.as_ref().is_some_and(|status| {
                     !status.phase.is_terminal()
-                        && status.resolved_receiver.is_none()
-                        && (status.operator_delivery.is_some()
-                            || status.submission.as_ref().is_some_and(|submission| submission.operator_reason.is_some())
-                            || status
-                                .retry
-                                .as_ref()
-                                .is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. })))
+                        && ((status.resolved_receiver.is_none()
+                            && (status.operator_delivery.is_some()
+                                || status.submission.as_ref().is_some_and(|submission| submission.operator_reason.is_some())
+                                || status
+                                    .retry
+                                    .as_ref()
+                                    .is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }))))
+                            || status.reason.as_deref().is_some_and(|reason| reason.starts_with("Message receiver pass failed:")))
                 })
             })
             .collect();
@@ -1277,51 +1416,101 @@ impl MessageInbox {
                 None => {
                     // The idle caller saw no active Messages; this query can
                     // find one only if admission raced with gate cleanup.
-                    loaded = self.load_delivery_receivers(&active).await?;
+                    loaded = match self.load_delivery_receivers(&active).await {
+                        Ok(receivers) => receivers,
+                        Err(error) => {
+                            for message in &active {
+                                if let Err(error) = self.load_delivery_receivers(std::slice::from_ref(message)).await {
+                                    self.record_receiver_failure(std::slice::from_ref(message), &error, Utc::now()).await?;
+                                }
+                            }
+                            tracing::warn!(%error, "retaining delivery gates while receiver evidence is unavailable");
+                            return Ok(());
+                        }
+                    };
                     &loaded
                 }
             };
             for message in active {
-                if let Some(holder) = self.resolve_receiver(receivers, &message).await? {
-                    retained.insert(delivery_demand_name(&holder.object));
+                match self.resolve_receiver(receivers, &message).await {
+                    Ok(Some(holder)) => {
+                        retained.insert(delivery_demand_name(&holder.object));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.record_receiver_failure(std::slice::from_ref(&message), &error, Utc::now()).await?;
+                        // Unknown ownership cannot justify deleting another
+                        // receiver's gate. Retry cleanup with fresh evidence.
+                        retained.extend(gates.iter().map(|gate| gate.metadata.name.clone()));
+                    }
                 }
             }
         }
+        let mut persistence_error = None;
         for gate in gates {
             if retained.contains(&gate.metadata.name) {
                 continue;
             }
-            if let Some(owner) = gate.metadata.owner_references.iter().find(|owner| owner.kind == "TerminalSession" && owner.controller) {
-                let terminals = self.backend.using::<TerminalSession>(&self.namespace);
-                match terminals.get(&owner.name).await {
-                    Ok(holder) => {
-                        // The legacy queue shares this receiver gate and can still own it.
-                        if flotilla_resources::delivery_hold::legacy_delivery_gate_needed(&holder) {
-                            continue;
-                        }
-                        if let Some(id) = holder
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.degraded.as_ref())
-                            .filter(|condition| condition.is_delivery())
-                            .and_then(|condition| condition.message_id.clone())
-                        {
-                            apply_status_patch(
-                                &terminals,
-                                &owner.name,
-                                &crate::TerminalSessionStatusPatch::ClearMessageDeliveryHold { message_id: id },
-                            )
-                            .await?;
-                        }
+            if let Err(error) = self.cleanup_delivery_gate(&gate).await {
+                tracing::warn!(gate = %gate.metadata.name, %error, "message receiver gate cleanup failed");
+                // The receiver's existing attention gate is also the durable
+                // failure record when a malformed terminal cannot be read.
+                let current = match demands.get(&gate.metadata.name).await {
+                    Ok(current) => current,
+                    Err(ResourceError::NotFound { .. }) => continue,
+                    Err(error) => {
+                        persistence_error.get_or_insert(error);
+                        continue;
                     }
-                    Err(ResourceError::NotFound { .. }) => {}
-                    Err(error) => return Err(error),
+                };
+                let mut meta = InputMeta::from(&current.metadata);
+                let reason = format!("Message receiver gate cleanup failed: {error}");
+                if meta.annotations.get(DELIVERY_HOLD_REASON_ANNOTATION) != Some(&reason) {
+                    meta.annotations.insert(DELIVERY_HOLD_REASON_ANNOTATION.into(), reason);
+                    if let Err(error) = demands.update(&meta, &current.metadata.resource_version, &current.spec).await {
+                        persistence_error.get_or_insert(error);
+                    }
                 }
             }
-            match demands.delete(&gate.metadata.name).await {
-                Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+        }
+        match persistence_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn cleanup_delivery_gate(&self, gate: &ResourceObject<Demand>) -> Result<(), ResourceError> {
+        let demands = self.backend.using::<Demand>(&self.namespace);
+        if let Some(owner) = gate.metadata.owner_references.iter().find(|owner| owner.kind == "TerminalSession" && owner.controller) {
+            let terminals = self.backend.using::<TerminalSession>(&self.namespace);
+            match terminals.get(&owner.name).await {
+                Ok(holder) => {
+                    // The legacy queue shares this receiver gate and can still own it.
+                    if flotilla_resources::delivery_hold::legacy_delivery_gate_needed(&holder) {
+                        return Ok(());
+                    }
+                    if let Some(id) = holder
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.degraded.as_ref())
+                        .filter(|condition| condition.is_delivery())
+                        .and_then(|condition| condition.message_id.clone())
+                    {
+                        apply_status_patch(
+                            &terminals,
+                            &owner.name,
+                            &crate::TerminalSessionStatusPatch::ClearMessageDeliveryHold { message_id: id },
+                        )
+                        .await?;
+                    }
+                }
+                Err(ResourceError::NotFound { .. }) => {}
                 Err(error) => return Err(error),
             }
+        }
+        match demands.delete(&gate.metadata.name).await {
+            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
         }
         Ok(())
     }
@@ -1340,7 +1529,10 @@ impl MessageInbox {
             condition.is_delivery()
                 && condition.message_id.as_deref() == Some(message.metadata.name.as_str())
                 && (!condition.is_controller_fence_unverifiable()
-                    || message.status.as_ref().is_none_or(|status| status.submission.is_none()))
+                    || message.status.as_ref().is_none_or(|status| {
+                        status.submission.is_none()
+                            || status.reason.as_deref().is_some_and(|reason| reason.starts_with("Message receiver pass failed:"))
+                    }))
         }) {
             apply_status_patch(
                 &self.backend.using::<TerminalSession>(&self.namespace),
@@ -1355,7 +1547,13 @@ impl MessageInbox {
         }
         let demands = self.backend.using::<Demand>(&self.namespace);
         let (mut meta, spec) = delivery_demand(&holder.object);
-        let description = HeldMessageBatch::collect([message]).first().map(|batch| batch.describe(&self.namespace));
+        let description = HeldMessageBatch::collect([message]).first().map(|batch| batch.describe(&self.namespace)).or_else(|| {
+            message
+                .status
+                .as_ref()
+                .and_then(|status| status.reason.clone())
+                .filter(|reason| reason.starts_with("Message receiver pass failed:"))
+        });
         match demands.get(&meta.name).await {
             Ok(existing) => {
                 // Keep the gate's description current as the held reason changes,

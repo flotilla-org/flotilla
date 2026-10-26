@@ -3456,3 +3456,103 @@ async fn persistent_controller_fence_rechecks_back_off() {
         now += delay;
     }
 }
+
+// A terminal member is settled even when the surviving held batch still names it.
+#[hegel::test]
+fn superseded_fence_batch_member_does_not_break_repair(tc: hegel::TestCase) {
+    // Cover the proof's first member and both later positions, and repeated passes.
+    let member = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let passes = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let superseded = format!("message-{member}");
+        let (backend, inbox) = delivery_inbox().await;
+        let refused = named(
+            KEYSTROKE,
+            TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
+        );
+        inbox.reconcile_delivery(&router(&refused), at(20)).await.unwrap();
+        let mut replacement = spec(None, MessageExpectation::None);
+        replacement.supersedes = Some(superseded.clone());
+        inbox.accept(&InputMeta::builder().name("replacement".into()).build(), &replacement, at(21)).await.unwrap();
+        assert_eq!(backend.using::<Message>("flotilla").get(&superseded).await.unwrap().status.unwrap().phase, MessagePhase::Superseded);
+        for pass in 0..passes {
+            inbox.reconcile_delivery(&router(&refused), at(22 + pass as i64)).await.expect("settled members cannot poison a held batch");
+            for message in backend.using::<Message>("flotilla").list().await.unwrap().items {
+                let status = message.status.unwrap();
+                if message.metadata.name == superseded {
+                    assert_eq!(status.phase, MessagePhase::Superseded);
+                } else {
+                    assert!(status.resolved_receiver.is_none());
+                    assert!(!status.reason.unwrap_or_default().contains("receiver pass failed"));
+                }
+            }
+        }
+        let accepted = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "recovered".into() });
+        inbox.reconcile_delivery(&router(&accepted), at(100)).await.unwrap();
+        for message in backend.using::<Message>("flotilla").list().await.unwrap().items {
+            let status = message.status.unwrap();
+            if message.metadata.name == superseded {
+                assert_eq!(status.phase, MessagePhase::Superseded);
+            } else {
+                assert!(status.resolved_receiver.is_some(), "surviving batch recovers");
+            }
+        }
+    });
+}
+
+// A broken receiver records its failure and attention while another receives
+// its turn in the very same pass, regardless of the broken batch's ordering.
+#[hegel::test]
+fn inconsistent_held_receiver_does_not_block_another_receiver(tc: hegel::TestCase) {
+    // Healthy receivers sort before or after the corrupt receiver; exercise both.
+    let other_role = if tc.draw(gs::booleans()) { "aaa" } else { "zzz" };
+    let partial = tc.draw(gs::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        use flotilla_resources::*;
+        let (backend, inbox) = delivery_inbox().await;
+        let refused =
+            named(KEYSTROKE, TransportOutcome::ControllerFenceUnverifiable { reason: CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() });
+        inbox.reconcile_delivery(&router(&refused), at(20)).await.unwrap();
+        let messages = backend.using::<Message>("flotilla");
+        let message = messages.get("message-0").await.unwrap();
+        let mut status = message.status.unwrap();
+        status.failed_batch_members.push("missing-member".into());
+        // A crash can leave the same rejected batch's old submission on a member.
+        if partial {
+            status.submission = Some(
+                MessageSubmission::builder()
+                    .batch_id("held".into())
+                    .crew_id("crew".into())
+                    .session("session".into())
+                    .started_at(at(20))
+                    .members(status.failed_batch_members.clone())
+                    .build(),
+            );
+        }
+        messages.update_status("message-0", &message.metadata.resource_version, &status).await.unwrap();
+        let terminals = backend.using::<TerminalSession>("flotilla");
+        let original = terminals.get("terminal").await.unwrap();
+        let mut meta = InputMeta::from(&original.metadata);
+        meta.name = other_role.into();
+        meta.labels.insert(ROLE_LABEL.into(), other_role.into());
+        let other = terminals.create(&meta, &original.spec).await.unwrap();
+        let mut status = original.status.unwrap();
+        status.degraded = None;
+        terminals.update_status(other_role, &other.metadata.resource_version, &status).await.unwrap();
+        let mut intent = spec(None, MessageExpectation::None);
+        intent.receiver = format!("flotilla/convoy/work/{other_role}");
+        inbox.accept(&InputMeta::builder().name("other-message".into()).build(), &intent, at(21)).await.unwrap();
+        let accepted = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "received".into() });
+        inbox.reconcile_delivery(&router(&accepted), at(22)).await.expect("receiver failure is isolated");
+        assert!(messages.get("other-message").await.unwrap().status.unwrap().resolved_receiver.is_some());
+        let broken = messages.get("message-0").await.unwrap().status.unwrap();
+        assert!(broken.reason.unwrap().contains("missing-member"));
+        let condition = terminals.get("terminal").await.unwrap().status.unwrap().degraded.unwrap();
+        assert!(condition.message.contains("missing-member"));
+        assert!(condition.is_controller_fence_unverifiable(), "failure recording preserves known-unsent proof");
+        assert_eq!(condition.observed_at, at(20));
+        assert_eq!(condition.consecutive_failures, 1);
+    });
+}

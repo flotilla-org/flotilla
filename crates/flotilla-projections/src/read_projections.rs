@@ -54,7 +54,8 @@ use crate::resource_explain::{explain_condition, explained_provenance, observed_
 use crate::{
     fleet::{
         accumulate_fleet_health_counts, fleet_observation_agreement, format_resource_replication_failures, host_credential_attention,
-        join_replica_errors, replica_sync_is_fresh, replicated_host_reports, FleetService, ResourceReplicationFailure,
+        join_replica_errors, message_controller_failure, replica_sync_is_fresh, replicated_host_reports, FleetService,
+        ResourceReplicationFailure,
     },
     host_registry::HostCounts,
 };
@@ -584,7 +585,8 @@ impl ReadProjections<'_> {
                         .iter()
                         .filter(|((row_host, _), state)| row_host == &host && state.needs_attention())
                         .count()
-                        + manifest_needs_by_host.get(&host).copied().unwrap_or_default(),
+                        + manifest_needs_by_host.get(&host).copied().unwrap_or_default()
+                        + usize::from(status.and_then(message_controller_failure).is_some()),
                 };
                 let mut degraded_conditions: Vec<String> = status
                     .into_iter()
@@ -1711,8 +1713,43 @@ impl ReadProjections<'_> {
         artifacts.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.address.cmp(&b.address)));
 
         let (messages, held) = message_evidence(self.backend, namespace, receivers.as_ref(), Some(&convoy), &receiver_aliases).await?;
+        let mut warnings: Vec<_> = convoy.spec.issues.iter().flat_map(|issue| issue.placement_needs().1).collect();
+        let mut host_names = selected_vessels
+            .values()
+            .filter_map(|vessel| {
+                vessel.status.as_ref()?.placement_decision.as_ref().map(|decision| decision.target_host.reference.to_string())
+            })
+            .collect::<BTreeSet<_>>();
+        if let Some(decision) = convoy.status.as_ref().and_then(|status| status.placement_decision.as_ref()) {
+            host_names.insert(decision.target_host.reference.to_string());
+        }
+        let home_environment = match &convoy_source.provenance {
+            ResourceProvenance::Local => Some(self.host_registry.local_host_summary().await.environment_id),
+            ResourceProvenance::Replica { origin_root, .. } => self.host_registry.environment_id_for_node(origin_root).await,
+        };
+        if let Some(host) = home_environment.as_ref().and_then(|environment| environment.host_id()) {
+            host_names.insert(host.to_string());
+        }
+        // Sessions can predate placement evidence. Include their realized
+        // environment hosts, without attributing an unrelated host's failure.
+        let environments = self
+            .backend
+            .query_declared::<flotilla_resources::Environment>(
+                namespace,
+                &StoreQuery::names(selected_sessions.values().map(|session| session.spec.env_ref.clone()), true),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        for environment in environments.items {
+            if let Some(host) = crate::fleet::resource_environment_host_ref(&environment.object) {
+                host_names.insert(host.to_string());
+            }
+        }
+        warnings.extend(message_controller_warnings(self.backend, namespace, host_names).await?);
+        warnings.sort();
+        warnings.dedup();
         let explanation = ConvoyExplanation {
-            warnings: convoy.spec.issues.iter().flat_map(|issue| issue.placement_needs().1).collect(),
+            warnings,
             dispatch_scores: BTreeMap::new(),
             dispatch_score_error: None,
             degraded_checkouts: selected_vessels
@@ -2279,4 +2316,52 @@ pub async fn message_evidence(
 /// host-spelled service through `forges`.
 fn spec_record_name(spec: &flotilla_resources::ChangeRequestSpec, forges: &[flotilla_resources::ForgeSpec]) -> Option<String> {
     spec.address(forges).ok().and_then(|address| record_name(&address))
+}
+
+/// Read only the hosts that can affect this convoy's inboxes.
+async fn message_controller_warnings(backend: &ResourceBackend, namespace: &str, hosts: BTreeSet<String>) -> Result<Vec<String>, String> {
+    let sources =
+        backend.query_declared::<ResourceHost>(namespace, &StoreQuery::names(hosts, true)).await.map_err(|error| error.to_string())?;
+    Ok(sources
+        .items
+        .into_iter()
+        .filter_map(|host| {
+            let condition = host.object.status.as_ref().and_then(message_controller_failure)?;
+            Some(format!("host {}: {} ({}): {}", host.object.metadata.name, condition.condition_type, condition.reason, condition.message))
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod message_health_tests {
+    use super::*;
+
+    // Explain names the stopped Message controller only on an affected host,
+    // and clears the warning when that host's durable condition clears.
+    #[tokio::test]
+    async fn explanation_names_message_controller_exhaustion_and_recovery() {
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let hosts = backend.using::<ResourceHost>("flotilla");
+        let host = hosts
+            .create(&flotilla_resources::InputMeta::builder().name("feta".into()).build(), &flotilla_resources::HostSpec::default())
+            .await
+            .unwrap();
+        let status = ResourceHostStatus {
+            conditions: vec![flotilla_resources::HostCondition::builder()
+                .condition_type("Controller/Message")
+                .value(ConditionValue::False)
+                .reason("RestartBudgetExhausted")
+                .message("Message controller stopped after 10 failures")
+                .observed_at(Utc::now())
+                .blocks_forge_observation(false)
+                .build()],
+            ..Default::default()
+        };
+        let host = hosts.update_status("feta", &host.metadata.resource_version, &status).await.unwrap();
+        assert!(message_controller_warnings(&backend, "flotilla", ["other-host".into()].into()).await.unwrap().is_empty());
+        let warnings = message_controller_warnings(&backend, "flotilla", ["feta".into()].into()).await.unwrap();
+        assert_eq!(warnings, ["host feta: Controller/Message (RestartBudgetExhausted): Message controller stopped after 10 failures"]);
+        hosts.update_status("feta", &host.metadata.resource_version, &ResourceHostStatus::default()).await.unwrap();
+        assert!(message_controller_warnings(&backend, "flotilla", ["feta".into()].into()).await.unwrap().is_empty());
+    }
 }
