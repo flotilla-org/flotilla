@@ -161,9 +161,7 @@ def expand_test_dirs(test_files):
     extra = set()
     for f in list(test_files):
         d = module_dir(Path(f))
-        if f.name not in ("mod.rs",) and d.is_dir():
-            extra.update(p.resolve() for p in d.rglob("*.rs"))
-        elif f.name == "mod.rs":
+        if d.is_dir():
             extra.update(p.resolve() for p in d.rglob("*.rs"))
     return test_files | extra
 
