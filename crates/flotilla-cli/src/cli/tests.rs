@@ -52,6 +52,7 @@ fn fleet_list_displays_replication_failure_and_last_successful_sync() {
         declaration_attention: Vec::new(),
         rows: vec![],
         replicas: vec![FleetReplicaStatus {
+            change_stream: None,
             host: HostName::new("remote"),
             reachable: false,
             last_sync: Some(last_sync),
@@ -670,6 +671,11 @@ fn blob_sync_diagnostics_render_in_host_list_and_status() {
     assert!(list.contains("2 pending; endpoint unavailable"));
 
     let status = flotilla_protocol::HostStatusResponse {
+        change_stream: Some(flotilla_protocol::ChangeStreamStatus {
+            watermark: 7,
+            last_error: Some("home/rs/large: resource exceeds assembly limit".into()),
+            consecutive_failures: 2,
+        }),
         environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("local")),
         host_name: HostName::new("local"),
         node: NodeInfo::new(NodeId::new("local-node"), "Local"),
@@ -682,6 +688,8 @@ fn blob_sync_diagnostics_render_in_host_list_and_status() {
         blob_sync: Some(sync),
     };
     let output = super::format_host_status_human(&status);
+    assert!(output.contains("Change stream: watermark 7, 2 consecutive failures"));
+    assert!(output.contains("Change stream error: home/rs/large"));
     assert!(output.contains("Blob sync: 2 pending"));
     assert!(output.contains("Blob sync error: endpoint unavailable"));
 }

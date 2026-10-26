@@ -771,6 +771,7 @@ impl ReadProjections<'_> {
         if environment_id == &local_summary.environment_id && !self.host_registry.has_resource_description(environment_id).await {
             response.visible_environments = self.environment_manager.visible_environments().await;
         }
+        response.change_stream = self.fleet.change_streams().remove(&response.node.node_id);
         Ok(response)
     }
 
@@ -807,6 +808,11 @@ impl ReadProjections<'_> {
         let failures = self.fleet.replication_failures().await;
         let mut replication_failures_by_host = HashMap::<HostName, Vec<ResourceReplicationFailure>>::new();
         for (peer, peer_failures) in failures {
+            // Source-local snapshot alarms belong to host status, not a remote
+            // replica row that would incorrectly mark this home's rows unreachable.
+            if &peer == self.node_id {
+                continue;
+            }
             let host = self.host_registry.host_name_for_node(&peer).await.unwrap_or_else(|| HostName::new(peer.as_str()));
             replication_failures_by_host
                 .entry(host)
@@ -827,12 +833,13 @@ impl ReadProjections<'_> {
                     (false, None, None, join_replica_errors(Some(&unsynced), replication_error.as_deref()))
                 }
             };
-            replicas.push(FleetReplicaStatus { host, reachable, last_sync, generation, message });
+            replicas.push(FleetReplicaStatus { change_stream: None, host, reachable, last_sync, generation, message });
         }
         for (host, (last_sync, generation)) in replicated_hosts {
             let replication_error =
                 replication_failures_by_host.remove(&host).and_then(|failures| format_resource_replication_failures(&failures));
             replicas.push(FleetReplicaStatus {
+                change_stream: None,
                 host,
                 reachable: replica_sync_is_fresh(last_sync, now) && replication_error.is_none(),
                 last_sync: Some(last_sync),
@@ -842,12 +849,22 @@ impl ReadProjections<'_> {
         }
         for (host, failures) in replication_failures_by_host {
             replicas.push(FleetReplicaStatus {
+                change_stream: None,
                 host,
                 reachable: false,
                 last_sync: None,
                 generation: None,
                 message: format_resource_replication_failures(&failures),
             });
+        }
+
+        for (peer, state) in self.fleet.change_streams() {
+            let host = self.host_registry.host_name_for_node(&peer).await.unwrap_or_else(|| HostName::new(peer.as_str()));
+            // Health alone does not establish replica inventory or reachability.
+            // Unmatched healthy homes retain resident health without creating a row.
+            if let Some(replica) = replicas.iter_mut().find(|replica| replica.host == host) {
+                replica.change_stream = Some(state);
+            }
         }
 
         for row in &mut rows {

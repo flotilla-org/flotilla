@@ -36,7 +36,13 @@ pub(super) fn body(
         if done {
             return Ok(None);
         }
-        let value = daemon.next_change_stream_frame(&peer, None, Some(session.clone())).await.map_err(std::io::Error::other)?;
+        let value = match daemon.next_change_stream_frame(&peer, None, Some(session.clone())).await {
+            Ok(value) => value,
+            Err(message) => {
+                let frame = Frame::Failure { message }.encode().map_err(std::io::Error::other)?;
+                return Ok(Some((bytes::Bytes::from(frame), (daemon, peer, session, true))));
+            }
+        };
         let flotilla_protocol::CommandValue::ChangeStreamFrame { frame, .. } = value else {
             return Err(std::io::Error::other("unexpected stream response"));
         };
@@ -222,15 +228,23 @@ async fn routed_round(service: Arc<Service>, home: &str, router: &super::remote_
 /// Every reachable home is followed over its socket or command route. Dropping the
 /// returned task cancels this generation; failures retry from the last committed prefix.
 pub(super) fn follow(
-    service: Arc<Service>,
+    daemon: Arc<flotilla_core::in_process::InProcessDaemon>,
     home: String,
     socket: Option<PathBuf>,
     router: super::remote_commands::RemoteCommandRouter,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        use flotilla_projections::fleet::ChangeStreamUpdate;
+        let service = match daemon.decided_store() {
+            Ok(service) => service,
+            Err(_) => return,
+        };
+        let peer = flotilla_protocol::NodeId::new(&home);
+        daemon.report_change_stream(&peer, ChangeStreamUpdate::Progress(service.watermark(&home).expect("cached watermark").home_seq));
         let client = match socket.as_deref().map(http_client).transpose() {
             Ok(client) => client,
             Err(error) => {
+                daemon.report_change_stream(&peer, ChangeStreamUpdate::Failure { watermark: None, message: error.clone() });
                 tracing::warn!(%home, %error, "home client unavailable");
                 return;
             }
@@ -238,6 +252,13 @@ pub(super) fn follow(
         let mut failures: u64 = 0;
         loop {
             let result = follow_round(Arc::clone(&service), &home, client.as_ref(), &router).await;
+            let watermark = service.watermark(&home).expect("cached watermark").home_seq;
+            match &result {
+                Ok(()) => daemon.report_change_stream(&peer, ChangeStreamUpdate::Healthy(watermark)),
+                Err(error) => {
+                    daemon.report_change_stream(&peer, ChangeStreamUpdate::Failure { watermark: Some(watermark), message: error.clone() })
+                }
+            }
             if result.is_ok() {
                 failures = 0;
             }
@@ -330,7 +351,11 @@ async fn follow_connection(
                 }
             }
             if pending.len() == expected {
-                complete = matches!(Frame::decode(&pending).map_err(|e| e.to_string())?, Frame::Keepalive { .. });
+                let frame = Frame::decode(&pending).map_err(|e| e.to_string())?;
+                if let Frame::Failure { message } = frame {
+                    return Err(message.into());
+                }
+                complete = matches!(frame, Frame::Keepalive { .. });
                 spool.write_all(&pending).await.map_err(|e| e.to_string())?;
                 pending.clear();
                 expected = HEADER_LEN;
@@ -382,7 +407,7 @@ mod tests {
     // and delivers deliberately fragmented ADR 0063 frames. No TCP listener or external daemon.
     #[tokio::test]
     async fn http_client_obeys_route_and_applies_fragmented_frames() {
-        for known in [false, true] {
+        for (known, failed) in [(false, false), (true, false), (true, true)] {
             let dir = TestSocketDir::new();
             let socket = dir.socket_path("stream.sock");
             let listener = match tokio::net::UnixListener::bind(&socket) {
@@ -414,10 +439,14 @@ mod tests {
                 let request = String::from_utf8(request).expect("UTF-8");
                 assert_eq!(request.lines().next(), Some("GET /apis/flotilla.work/v1/change-stream HTTP/1.1"));
                 assert!(request.contains("x-flotilla-change-stream-session: peer-session"));
-                let frames = [
-                    Frame::End { home: "home".into(), home_seq: 0 },
-                    Frame::Keepalive { home: "home".into(), watermark: Watermark { home_seq: 0, applied_through: Timestamp(7) } },
-                ];
+                let frames = if failed {
+                    vec![Frame::Failure { message: "home/rs/large: resource exceeds assembly limit".into() }]
+                } else {
+                    vec![
+                        Frame::End { home: "home".into(), home_seq: 0 },
+                        Frame::Keepalive { home: "home".into(), watermark: Watermark { home_seq: 0, applied_through: Timestamp(7) } },
+                    ]
+                };
                 let bytes: Vec<u8> = frames.iter().flat_map(|frame| frame.encode().expect("encode")).collect();
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.flotilla.log+cbor\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len()).as_bytes()).await.expect("headers");
                 for chunk in bytes.chunks(3) {
@@ -425,17 +454,26 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
             });
-            follow_connection(
+            let result = follow_connection(
                 Arc::clone(&service),
                 "home",
                 &http_client(&socket).unwrap(),
                 "peer-session",
                 &Frame::Begin { home: "home".into(), home_seq: 0 }.encode().unwrap(),
             )
-            .await
-            .expect("HTTP continuation");
+            .await;
+            if failed {
+                assert!(
+                    matches!(result, Err(HttpRoundError::Failed(ref message)) if message == "home/rs/large: resource exceeds assembly limit")
+                );
+            } else {
+                result.expect("HTTP continuation");
+            }
             peer.await.expect("stand-in");
-            assert_eq!(service.with_store(|store| store.read()?.watermark("home")).expect("mark").applied_through, Timestamp(7));
+            assert_eq!(
+                service.with_store(|store| store.read()?.watermark("home")).expect("mark").applied_through,
+                if failed { Timestamp::ZERO } else { Timestamp(7) }
+            );
         }
     }
 

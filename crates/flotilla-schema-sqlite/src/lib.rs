@@ -51,7 +51,7 @@ mod store;
 pub mod stream;
 
 pub use audit::audit_domains;
-pub use error::{Malformed, StoreError};
+pub use error::{Malformed, StoreError, StreamResourceLimit};
 pub use query::{Cursor, Page, MAX_PAGE};
 pub use shared::schema_ddl;
 pub use store::{

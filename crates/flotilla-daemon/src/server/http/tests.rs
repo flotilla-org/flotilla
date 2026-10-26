@@ -688,7 +688,9 @@ async fn http_change_stream_requires_peer_session() {
     tokio::time::advance(std::time::Duration::from_secs(16)).await;
     let first = bodies.remove(0);
     let mut stream = first.into_data_stream();
-    assert!(futures::StreamExt::next(&mut stream).await.expect("expired cursor error").is_err());
+    let failure = futures::StreamExt::next(&mut stream).await.expect("expired cursor frame").expect("encoded failure");
+    assert!(matches!(flotilla_schema_sqlite::stream::Frame::decode(&failure).expect("frame"),
+        flotilla_schema_sqlite::stream::Frame::Failure { message } if message == "change-stream session expired"));
     tokio::time::resume();
 }
 

@@ -601,19 +601,19 @@ impl PeerRuntime {
                 match event {
                     PeerConnectionEvent::Connected(notice) => {
                         debug!(peer = %notice.peer, generation = notice.generation, "starting peer resource replication");
-                        if decided_followers.get(&notice.peer).is_none_or(|(generation, _)| *generation < notice.generation) {
-                            if let Ok(service) = outbound_daemon.decided_store() {
-                                let home = notice.peer.as_str().to_owned();
-                                decided_peers.lock().expect("decided peers").insert(home.clone(), notice.resource_socket_path.clone());
-                                let task = super::change_stream::follow(
-                                    service,
-                                    home,
-                                    notice.resource_socket_path.clone(),
-                                    outbound_remote_command_router.clone(),
-                                );
-                                decided_followers
-                                    .insert(notice.peer.clone(), (notice.generation, tokio_util::task::AbortOnDropHandle::new(task)));
-                            }
+                        if decided_followers.get(&notice.peer).is_none_or(|(generation, _)| *generation < notice.generation)
+                            && outbound_daemon.decided_store().is_ok()
+                        {
+                            let home = notice.peer.as_str().to_owned();
+                            decided_peers.lock().expect("decided peers").insert(home.clone(), notice.resource_socket_path.clone());
+                            let task = super::change_stream::follow(
+                                Arc::clone(&outbound_daemon),
+                                home,
+                                notice.resource_socket_path.clone(),
+                                outbound_remote_command_router.clone(),
+                            );
+                            decided_followers
+                                .insert(notice.peer.clone(), (notice.generation, tokio_util::task::AbortOnDropHandle::new(task)));
                         }
                         peer_replicators.peer_connected(notice.peer.clone(), notice.generation, notice.resource_socket_path).await;
                         send_link_state(&outbound_daemon, &outbound_peer_manager, &notice.peer, notice.generation).await;

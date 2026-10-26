@@ -633,6 +633,8 @@ pub enum FleetStaleness {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetReplicaStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_stream: Option<ChangeStreamStatus>,
     pub host: HostName,
     pub reachable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -641,6 +643,15 @@ pub struct FleetReplicaStatus {
     pub generation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// Committed decided-stream progress and the latest consecutive round failures.
+/// Query health only: this is not a stored resource schema.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeStreamStatus {
+    pub watermark: u64,
+    pub last_error: Option<String>,
+    pub consecutive_failures: u64,
 }
 
 // --- host / topology ---
@@ -681,6 +692,8 @@ pub struct PeerReconnectStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostStatusResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_stream: Option<ChangeStreamStatus>,
     pub environment_id: crate::EnvironmentId,
     pub host_name: HostName,
     pub node: NodeInfo,
@@ -910,6 +923,7 @@ mod tests {
     #[test]
     fn host_status_response_roundtrips_with_summary() {
         let response = HostStatusResponse {
+            change_stream: None,
             environment_id: EnvironmentId::host(HostId::new("desktop-host")),
             host_name: HostName::new("desktop"),
             node: NodeInfo::new(NodeId::new("node-desktop-1"), "Desktop Workstation"),
@@ -950,6 +964,7 @@ mod tests {
     #[test]
     fn host_status_response_defaults_missing_visible_environments() {
         let mut value = serde_json::to_value(HostStatusResponse {
+            change_stream: None,
             environment_id: EnvironmentId::host(HostId::new("desktop-host")),
             host_name: HostName::new("desktop"),
             node: NodeInfo::new(NodeId::new("node-desktop-1"), "Desktop Workstation"),

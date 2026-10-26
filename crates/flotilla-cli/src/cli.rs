@@ -479,6 +479,12 @@ fn format_host_status_human(response: &HostStatusResponse) -> String {
     out.push_str(&format!("Status: {}\n", format_connection_status(&response.connection_status)));
     out.push_str(&format!("Configured: {}\n", if response.configured { "yes" } else { "no" }));
     out.push_str(&format!("Repositories: {}\n", response.repo_count));
+    if let Some(stream) = &response.change_stream {
+        out.push_str(&format!("Change stream: watermark {}, {} consecutive failures\n", stream.watermark, stream.consecutive_failures));
+        if let Some(error) = &stream.last_error {
+            out.push_str(&format!("Change stream error: {error}\n"));
+        }
+    }
     if let Some(sync) = &response.blob_sync {
         out.push_str(&format!("Blob sync: {} pending\n", sync.pending_count));
         if let Some(error) = &sync.last_error {

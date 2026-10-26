@@ -95,6 +95,29 @@ migration installs its registered Service with `install_decided_store`, point re
 peer cursor creation refuse service and no followers start. #3317 installs the first kind before peer tasks start and verifies
 the complete production path. Tests exercise the generic mechanism before that integration.
 
+## Stream health and unservable resources
+
+Each decided follower reports its last committed sequence, last error and consecutive
+failed rounds through the existing replication-health projection. Host status includes
+`change_stream`; fleet replica failures identify the home, committed watermark and error.
+Successful follower rounds clear the error and failure count. Connection generations retain
+the last state until a new round completes; restarting a task does not hide a stuck home.
+
+Before emitting exceptional row chunks, the sender encodes them once for validation and
+counts their cumulative framed bytes against the follower's 64 MiB assembly budget. A
+second pass sends the validated chunks, retaining at most one encoded row at a time.
+An unencodable row or excessive assembly produces `StoreError::ResourceLimit`, naming the
+home, kind and resource. This does not cap an entire snapshot or its disk spool. The home
+reports these refusals in its own health; successful tails advance its sequence without
+clearing an unservable-snapshot error. A successful full snapshot clears that error.
+If all peers keep tailing after the resource is removed, the source alarm remains until a fresh snapshot is requested;
+tail success alone cannot prove snapshot servability. The alarm remains in host
+status and never creates an unreachable replica for the local home.
+HTTP continuations encode producer failures as a terminal `Failure` frame so the follower
+sees the same reason as routed dispatch, rather than a generic broken-body error. Failed
+rounds never commit progress. These are query/wire types, not stored resource changes;
+the protocol fingerprint changes with the query health fields.
+
 ## Readable table views
 
 | Table | Columns | Primary key | Other indexes |
