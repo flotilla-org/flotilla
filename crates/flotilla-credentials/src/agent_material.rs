@@ -14,6 +14,7 @@ use flotilla_environment::environment::ProvisionedMountMode;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
+use flotilla_resources::account_access::{requester_home, REQUESTER_CONVOY_ENV};
 use flotilla_vcs::providers::skill_source::stage_git_skill_sources;
 use flotilla_vcs::providers::skill_source::STAGE_DIAGNOSTIC_PREFIX;
 use flotilla_vcs::providers::skill_source::STAGE_RETRYABLE_PREFIX;
@@ -77,6 +78,11 @@ trait AgentMaterialAdapter: Send + Sync {
     fn config_home_variable(&self) -> &'static str;
     fn is_managed_config_home(&self, config_home: &Path, config_base: &Path) -> bool;
     fn externally_managed_home_opts_out_of_skills(&self) -> bool;
+
+    /// Whether this harness's crews run in their requesters' bound homes (#3907).
+    fn requester_bound(&self) -> bool {
+        false
+    }
 
     fn skill_destination(&self, environment: &[(String, String)], config_base: &Path) -> Result<Option<PathBuf>, String> {
         let variable = self.config_home_variable();
@@ -291,9 +297,32 @@ impl AgentMaterialRegistry {
             }
             let config_base = runner.writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE)).await?;
             let mut result = environment.to_vec();
+            let convoy = environment.iter().find(|(name, _)| name == REQUESTER_CONVOY_ENV).map(|(_, value)| value.as_str());
             for adapter in required_adapters.iter().filter_map(|id| self.adapters.get(id.as_str())) {
+                let variable = adapter.config_home_variable();
+                // Provisioning stages a requester's skills into the home its binding will
+                // deliver into, so launch and staging use one directory.
+                if let Some(convoy) = convoy.filter(|_| adapter.requester_bound()) {
+                    let home = requester_home(&config_base, convoy, role, adapter.host_home_name()).to_string_lossy().into_owned();
+                    runner
+                        .run(
+                            "sh",
+                            &["-c", "umask 077 && mkdir -p \"$1\"", "flotilla-requester-home", &home],
+                            Path::new("/"),
+                            &ChannelLabel::Default,
+                        )
+                        .await?;
+                    result.retain(|(key, _)| key != variable);
+                    result.push((variable.into(), home));
+                    continue;
+                }
                 let Some(destination) = adapter.skill_destination(environment, &config_base)? else { continue };
                 let base = destination.parent().expect("skill directory has a parent");
+                // A requester's bound home (#3907) is already this crew's own: it is used as
+                // recorded, never nested a level below.
+                if base.starts_with(config_base.join("agent-homes").join("requesters")) {
+                    continue;
+                }
                 let home = base.join("crews").join(role);
                 // Static config seeds scratch once: later base edits intentionally do
                 // not overwrite crew-owned config or state. Auth follows atomic
@@ -322,7 +351,6 @@ done"#,
                         &ChannelLabel::Default,
                     )
                     .await?;
-                let variable = adapter.config_home_variable();
                 result.retain(|(key, _)| key != variable);
                 result.push((variable.into(), home.to_string_lossy().into_owned()));
             }
@@ -429,8 +457,9 @@ done"#,
                 .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
                 .await
                 .map_err(|error| format!("resolve contained agent skill base: {error}"))?;
+            let requesters = environment.iter().any(|(name, _)| name == REQUESTER_CONVOY_ENV);
             for adapter in adapters {
-                if adapter.skill_destination(environment, &config_base)?.is_some() {
+                if (requesters && adapter.requester_bound()) || adapter.skill_destination(environment, &config_base)?.is_some() {
                     return Ok(true);
                 }
             }
@@ -1277,6 +1306,10 @@ impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
 
     fn host_home_name(&self) -> &'static str {
         "claude"
+    }
+
+    fn requester_bound(&self) -> bool {
+        true
     }
 
     fn externally_managed_home_opts_out_of_skills(&self) -> bool {

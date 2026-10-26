@@ -141,8 +141,8 @@ pub struct ConvoyAdmission {
     host_name: HostName,
     clock: Arc<dyn Clock>,
     /// The draw that selects a requester's account (#3884); tests fix the seed.
-    #[builder(default = std::sync::RwLock::new(Arc::new(flotilla_resources::SeededRandom::from_entropy())))]
-    random: std::sync::RwLock<Arc<dyn flotilla_resources::RandomSource>>,
+    #[builder(default = std::sync::RwLock::new(Arc::new(crate::random::SeededRandom::from_entropy())))]
+    random: std::sync::RwLock<Arc<dyn crate::random::RandomSource>>,
     fulfilment_decider: Arc<dyn FulfilmentDecider>,
     /// Serializes the identity selector check with Convoy creation on the owner host.
     #[builder(default)]
@@ -1662,20 +1662,44 @@ impl ConvoyAdmission {
         .await
     }
 
-    fn account_random(&self) -> Arc<dyn flotilla_resources::RandomSource> {
+    fn account_random(&self) -> Arc<dyn crate::random::RandomSource> {
         Arc::clone(&self.random.read().unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
 
     /// Replace the account draw's random source; tests fix its seed (#3884).
-    pub fn set_account_random(&self, random: Arc<dyn flotilla_resources::RandomSource>) {
+    pub fn set_account_random(&self, random: Arc<dyn crate::random::RandomSource>) {
         *self.random.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = random;
     }
 
-    /// The home pass over this daemon's account bindings (#3882 lifecycle).
-    pub async fn reconcile_account_bindings(&self, namespace: &str) -> Result<Vec<(String, crate::account_access::BindingChange)>, String> {
-        let _admission_guard = self.lock().await;
+    /// The home pass over one convoy's account bindings (#3882 lifecycle). Only binding a
+    /// requester that has none is serialised against admission; the rest is per convoy.
+    pub async fn reconcile_convoy_accounts(
+        &self,
+        namespace: &str,
+        convoy: &str,
+    ) -> Result<Vec<(String, crate::account_access::BindingChange)>, String> {
+        let convoy = match self.backend.clone().using::<ResourceConvoy>(namespace).get(convoy).await {
+            Ok(convoy) => convoy,
+            Err(ResourceError::NotFound { .. }) => return Ok(Vec::new()),
+            Err(error) => return Err(format!("read convoy `{convoy}`: {error}")),
+        };
         let now = flotilla_schema::Timestamp::from_datetime(&self.clock.now());
-        crate::account_access::reconcile_home_bindings(&self.backend, namespace, &*self.account_random(), now).await
+        let (mut changes, unbound) = crate::account_access::reconcile_convoy_bindings(&self.backend, namespace, &convoy, now).await?;
+        if !unbound.is_empty() {
+            let _admission_guard = self.lock().await;
+            // Re-read under the lock: the convoy may have ended since. A requester another path
+            // (admission, a rebind) bound meanwhile keeps that binding: `write_bindings` keeps an
+            // open one.
+            let convoy = match self.backend.clone().using::<ResourceConvoy>(namespace).get(&convoy.metadata.name).await {
+                Ok(convoy) if !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) => convoy,
+                Ok(_) | Err(ResourceError::NotFound { .. }) => return Ok(changes),
+                Err(error) => return Err(format!("read convoy `{}`: {error}", convoy.metadata.name)),
+            };
+            changes.extend(
+                crate::account_access::bind_unbound(&self.backend, namespace, &convoy, unbound, &*self.account_random(), now).await?,
+            );
+        }
+        Ok(changes)
     }
 
     /// An explicit rebind of one requester's account (#3882).
@@ -2729,18 +2753,10 @@ impl AdmissionReadContext<'_> {
             let policy_name = kind.metadata.name.clone();
             let refusal = |reason: String| PlacementRefusal { policy_name: policy_name.clone(), target_host: target_host.clone(), reason };
             // #3907: a kind where some requester's access has no plan drops out.
-            let environment_kind = match &kind.spec.realisation {
-                flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { .. } => {
-                    flotilla_agent::account_access::environment_kind::CLOUD_SANDBOX
-                }
-                flotilla_resources::FulfilmentRealisation::DockerPerVessel { .. } => {
-                    flotilla_agent::account_access::environment_kind::DOCKER
-                }
-                flotilla_resources::FulfilmentRealisation::HostDirect if host.is_some_and(is_agentless_ssh_host) => {
-                    flotilla_agent::account_access::environment_kind::AGENTLESS_SSH
-                }
-                flotilla_resources::FulfilmentRealisation::HostDirect => flotilla_agent::account_access::environment_kind::HOST_DIRECT,
-            };
+            let environment_kind = flotilla_agent::account_access::EnvironmentKind::of_realisation(
+                &kind.spec.realisation,
+                host.is_some_and(is_agentless_ssh_host),
+            );
             if let Some(reason) = crate::account_access::plan_refusal(workflow, environment_kind)? {
                 rejected.push(refusal(reason));
                 continue;
@@ -4809,15 +4825,7 @@ pub async fn resolve_and_validate_workflow_credentials_for_capability_admission(
     workflow: &mut WorkflowTemplateSpec,
 ) -> Result<(), String> {
     resolve_workflow_credentials(backend, namespace, project_ref, repositories, workflow).await?;
-    validate_workflow_credentials_with_capabilities_for_admission(
-        backend,
-        namespace,
-        workflow,
-        placement,
-        &CapabilityTable::seeded(),
-        true,
-    )
-    .await?;
+    validate_workflow_credentials_for_admission(backend, namespace, workflow, placement, true).await?;
     crate::account_access::validate_account_access(backend, namespace, project_ref, repositories, workflow, placement).await.map(|_| ())
 }
 
@@ -4827,71 +4835,46 @@ pub async fn validate_workflow_credentials(
     workflow: &WorkflowTemplateSpec,
     placement: Option<&ResourceObject<PlacementPolicy>>,
 ) -> Result<(), String> {
-    validate_workflow_credentials_with_capabilities(backend, namespace, workflow, placement, &CapabilityTable::seeded()).await
+    validate_workflow_credentials_for_admission(backend, namespace, workflow, placement, false).await
 }
 
-pub async fn validate_workflow_credentials_with_capabilities(
+pub async fn validate_workflow_credentials_for_admission(
     backend: &ResourceBackend,
     namespace: &str,
     workflow: &WorkflowTemplateSpec,
     placement: Option<&ResourceObject<PlacementPolicy>>,
-    capabilities: &CapabilityTable,
-) -> Result<(), String> {
-    validate_workflow_credentials_with_capabilities_for_admission(backend, namespace, workflow, placement, capabilities, false).await
-}
-
-pub async fn validate_workflow_credentials_with_capabilities_for_admission(
-    backend: &ResourceBackend,
-    namespace: &str,
-    workflow: &WorkflowTemplateSpec,
-    placement: Option<&ResourceObject<PlacementPolicy>>,
-    capabilities: &CapabilityTable,
     allow_unready: bool,
 ) -> Result<(), String> {
     let required = workflow.vessels.iter().flat_map(|vessel| vessel.credential_refs.iter().cloned()).collect::<BTreeSet<_>>();
-    let ambient_dependent_vessels =
-        ambient_credential_dependent_vessels(capabilities, workflow, placement.is_some_and(|policy| policy.spec.host_direct.is_some()))?;
-    if required.is_empty() && ambient_dependent_vessels.is_empty() {
-        return Ok(());
-    }
+    let Some(first) = required.first() else { return Ok(()) };
     let Some(placement) = placement else {
-        if let Some(first) = required.first() {
-            return Err(format!("workflow requires credential `{first}`, but no placement is available"));
-        }
-        // Ambient-dependent vessels without a placement have no target host to
-        // check expiry against; admission proceeds as before.
-        return Ok(());
+        return Err(format!("workflow requires credential `{first}`, but no placement is available"));
     };
     let target_host = placement_target_host(backend, namespace, placement).await?;
     let host = authoritative_placement_host(backend, namespace, &target_host, &placement.metadata.name).await?;
     let host_label = target_host.display_name;
     let generation = host_generation(host.status.as_ref()).to_string();
     let Some(mut status) = host.status else {
-        if required.is_empty() {
-            return Ok(());
-        }
         return Err(format!(
             "placement `{}` host `{host_label}` generation `{generation}` has no observed status",
             placement.metadata.name
         ));
     };
     status.apply_heartbeat_readiness(Utc::now());
-    if !required.is_empty() {
-        if !status.ready && !allow_unready {
-            return Err(placement_host_not_ready_reason(&placement.metadata.name, &host_label, &generation, &status));
-        }
-        let held = status.held_credentials().map_err(|error| {
-            format!(
-                "placement `{}` host `{host_label}` generation `{generation}` has invalid held-credential capability: {error}",
-                placement.metadata.name
-            )
-        })?;
-        if let Some(missing) = required.iter().find(|credential| !held.contains(*credential)) {
-            return Err(format!(
-                "workflow requires credential `{missing}`, which placement `{}` host `{host_label}` generation `{generation}` does not hold",
-                placement.metadata.name
-            ));
-        }
+    if !status.ready && !allow_unready {
+        return Err(placement_host_not_ready_reason(&placement.metadata.name, &host_label, &generation, &status));
+    }
+    let held = status.held_credentials().map_err(|error| {
+        format!(
+            "placement `{}` host `{host_label}` generation `{generation}` has invalid held-credential capability: {error}",
+            placement.metadata.name
+        )
+    })?;
+    if let Some(missing) = required.iter().find(|credential| !held.contains(*credential)) {
+        return Err(format!(
+            "workflow requires credential `{missing}`, which placement `{}` host `{host_label}` generation `{generation}` does not hold",
+            placement.metadata.name
+        ));
     }
     let expiry = status.credential_expiry().map_err(|error| {
         format!("placement `{}` host `{host_label}` has invalid credential expiry capability: {error}", placement.metadata.name)
@@ -4905,42 +4888,7 @@ pub async fn validate_workflow_credentials_with_capabilities_for_admission(
             ));
         }
     }
-    for (vessel, scope) in &ambient_dependent_vessels {
-        if let Some(expired_at) = expiry.get(*scope).and_then(|entry| entry.expired_at(now)) {
-            return Err(format!(
-                "vessel `{vessel}` depends on the ambient claude login on host `{host_label}`, which expired on {} — \
-                 log in again on that host or grant a delivered claude credential",
-                expired_at.format("%Y-%m-%d")
-            ));
-        }
-    }
     Ok(())
-}
-
-/// Vessels whose agent crews authenticate through a host's ambient login:
-/// host-direct vessels with a crew on an ambient-only adapter. Returns
-/// `(vessel name, ambient scope)` pairs, the scope being the entry name under
-/// the Host `credential_expiry` capability. No seeded adapter is ambient-only:
-/// Claude resolves through its binding (#3907), so this is forward-provisioned.
-pub fn ambient_credential_dependent_vessels<'workflow>(
-    capabilities: &CapabilityTable,
-    workflow: &'workflow WorkflowTemplateSpec,
-    host_direct: bool,
-) -> Result<Vec<(&'workflow str, &'static str)>, String> {
-    let mut vessels = Vec::new();
-    for vessel in workflow.vessels.iter().filter(|_| host_direct) {
-        for crew in &vessel.crew {
-            let CrewSource::Agent { selector, .. } = &crew.source else {
-                continue;
-            };
-            let requirement = capabilities.resolve_selector(selector)?;
-            if let Some(scope) = requirement.ambient_credential_scope() {
-                vessels.push((vessel.name.as_str(), scope));
-                break;
-            }
-        }
-    }
-    Ok(vessels)
 }
 
 /// Write dispatch-time agent choices into the workflow spec that is about to

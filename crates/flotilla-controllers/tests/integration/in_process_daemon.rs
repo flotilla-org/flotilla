@@ -10588,8 +10588,9 @@ async fn convoy_resume_milliseconds_after_complete_still_lands() {
 mod account_bindings {
     use super::*;
     use flotilla_admission::account_access::BindingChange;
+    use flotilla_admission::random::{RandomSource, SeededRandom};
     use flotilla_resources::account_access::{requester_parts, BindingState, Selection};
-    use flotilla_resources::{AccountBinding, RandomSource, SeededRandom};
+    use flotilla_resources::AccountBinding;
 
     const BOX_GRANT: &str = "claude-box-accounts";
 
@@ -10690,6 +10691,12 @@ mod account_bindings {
         let [binding, ..] = bindings.as_slice() else { panic!("no binding for {role}") };
         assert!(binding.spec.state.value.is_open());
         binding.clone()
+    }
+
+    /// The binding controller's reconcile of one convoy, as it runs on the convoy's home.
+    async fn home_pass(daemon: &InProcessDaemon, name: &str) -> Vec<(String, BindingChange)> {
+        let convoy = admitted_convoy(&daemon.resource_backend(), name).await.metadata.name;
+        daemon.reconcile_convoy_accounts("flotilla", &convoy).await.expect("home pass")
     }
 
     async fn explain(daemon: &InProcessDaemon, name: &str) -> flotilla_protocol::ConvoyExplanation {
@@ -10794,14 +10801,14 @@ mod account_bindings {
         assert_eq!(binding.spec.grants.len(), 2);
 
         backend.clone().using::<CredentialGrant>("flotilla").delete(BOX_GRANT).await.expect("withdraw one grant");
-        let changes = daemon.reconcile_account_bindings("flotilla").await.expect("home pass");
+        let changes = home_pass(&daemon, "withdrawn").await;
         assert_eq!(changes, vec![(binding.metadata.name.clone(), BindingChange::GrantsUpdated)]);
         let kept = open_binding(&backend, "withdrawn").await;
         assert_eq!(kept.spec.credential, binding.spec.credential);
         assert_eq!(kept.spec.grants.keys().map(|grant| grant.0.as_str()).collect::<Vec<_>>(), ["claude-max-contained"]);
 
         backend.clone().using::<CredentialGrant>("flotilla").delete("claude-max-contained").await.expect("withdraw the last grant");
-        let changes = daemon.reconcile_account_bindings("flotilla").await.expect("home pass");
+        let changes = home_pass(&daemon, "withdrawn").await;
         assert_eq!(changes, vec![(binding.metadata.name.clone(), BindingChange::Revoked("binding revoked: no authorizing grant".into()))]);
         let revoked = backend.clone().using::<AccountBinding>("flotilla").get(&binding.metadata.name).await.expect("binding kept");
         assert!(matches!(
@@ -10824,19 +10831,19 @@ mod account_bindings {
         assert!(matches!(start_claude(&daemon, "sticky", &[]).await, CommandValue::ConvoyStarted { .. }));
         let binding = open_binding(&backend, "sticky").await;
         for _ in 0..3 {
-            assert_eq!(daemon.reconcile_account_bindings("flotilla").await.expect("home pass"), Vec::new());
+            assert_eq!(home_pass(&daemon, "sticky").await, Vec::new());
         }
         assert_eq!(open_binding(&backend, "sticky").await.spec, binding.spec);
 
         declare(&backend, "claude-max", "max@example.com", 2).await;
-        let changes = daemon.reconcile_account_bindings("flotilla").await.expect("home pass");
+        let changes = home_pass(&daemon, "sticky").await;
         assert_eq!(changes, vec![(binding.metadata.name.clone(), BindingChange::EpochAppended("2".into()))]);
         let renewed = open_binding(&backend, "sticky").await;
         assert_eq!(renewed.spec.credential, binding.spec.credential);
         assert_eq!(renewed.spec.epochs.iter().map(|row| row.record.epoch.as_str()).collect::<Vec<_>>(), ["1", "2"]);
 
         declare(&backend, "claude-max", "someone-else@example.com", 3).await;
-        let changes = daemon.reconcile_account_bindings("flotilla").await.expect("home pass");
+        let changes = home_pass(&daemon, "sticky").await;
         let [(_, BindingChange::Revoked(reason))] = changes.as_slice() else { panic!("{changes:?}") };
         assert_eq!(
             reason,
@@ -10925,10 +10932,10 @@ mod account_bindings {
         let binding = open_binding(&backend, "legacy").await;
         backend.clone().using::<AccountBinding>("flotilla").delete(&binding.metadata.name).await.expect("as before bindings");
 
-        let changes = daemon.reconcile_account_bindings("flotilla").await.expect("home pass");
+        let changes = home_pass(&daemon, "legacy").await;
         assert_eq!(changes, vec![(binding.metadata.name.clone(), BindingChange::Opened)]);
         assert_eq!(open_binding(&backend, "legacy").await.spec.credential.0, "claude-max");
-        assert_eq!(daemon.reconcile_account_bindings("flotilla").await.expect("home pass"), Vec::new());
+        assert_eq!(home_pass(&daemon, "legacy").await, Vec::new());
     }
 
     // Acceptance: the existing claude-max-contained grant keeps working: its single

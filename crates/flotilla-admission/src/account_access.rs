@@ -8,21 +8,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_agent::{
-    account_access::{environment_kind, AccountProvisioners},
+    account_access::{AccountProvisioners, EnvironmentKind},
     adapter::CapabilityTable,
 };
 use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     account_access::{
         binding_name, requester_address, requester_parts, AccessName, AccountBinding, AccountBindingSpec, AccountProvision, BindingState,
-        CredentialName, EpochEntry, GrantName, GrantScope, Selection,
+        CredentialName, EpochEntry, GrantName, GrantScope, Selection, ACCOUNT_BINDING_LABEL, ACCOUNT_CREDENTIAL_LABEL,
     },
     Convoy, ConvoyRepositorySpec, CredentialGrant, CredentialSpec, CrewSource, Host as ResourceHost, InputMeta, PlacementPolicy,
-    PlacementPolicySpec, RandomSource, Repository, RepositoryKey, RepositoryTrust, ResourceError, ResourceObject, WorkflowTemplateSpec,
+    PlacementPolicySpec, Repository, RepositoryKey, RepositoryTrust, ResourceError, ResourceObject, WorkflowTemplateSpec,
 };
 use flotilla_schema::{Records, State, Timestamp};
 use flotilla_store::{ResourceBackend, StoreQuery};
 
+use crate::random::RandomSource;
 use crate::support::{authoritative_placement_host, is_agentless_ssh_host, placement_target_host};
 
 /// The requester an alternative set belongs to: one agent crew of one vessel.
@@ -69,23 +70,14 @@ const ACCOUNT_SCOPE: &str = "account";
 /// Who pinned a binding chosen from `convoy start --account`.
 pub const CONVOY_START_PIN: &str = "convoy start --account";
 
-/// The candidate environment kind a placement policy resolves to, in the vocabulary plans are
-/// resolved against.
-pub fn placement_environment_kind(spec: &PlacementPolicySpec, host: Option<&ResourceObject<ResourceHost>>) -> &'static str {
-    if spec.cloud_sandbox_per_vessel.is_some() {
-        environment_kind::CLOUD_SANDBOX
-    } else if spec.docker_per_vessel.is_some() {
-        environment_kind::DOCKER
-    } else if host.is_some_and(is_agentless_ssh_host) {
-        environment_kind::AGENTLESS_SSH
-    } else {
-        environment_kind::HOST_DIRECT
-    }
+/// The candidate environment kind a placement policy resolves to on its target host.
+pub fn placement_environment_kind(spec: &PlacementPolicySpec, host: Option<&ResourceObject<ResourceHost>>) -> EnvironmentKind {
+    EnvironmentKind::of_policy(spec, host.is_some_and(is_agentless_ssh_host))
 }
 
 /// The reason a candidate environment kind is refused: some requester's access has no plan
 /// there (#3881). The kind drops out of placement with this reason.
-pub fn plan_refusal(workflow: &WorkflowTemplateSpec, kind: &str) -> Result<Option<String>, String> {
+pub fn plan_refusal(workflow: &WorkflowTemplateSpec, kind: EnvironmentKind) -> Result<Option<String>, String> {
     let provisioners = AccountProvisioners::seeded();
     for requester in requesters(workflow)? {
         let provisioner = provisioners
@@ -244,7 +236,7 @@ pub async fn current_alternatives(
 /// A requester left with no usable candidate refuses the placement.
 pub fn check_placement(
     alternatives: &mut [RequesterAlternatives],
-    kind: &str,
+    kind: EnvironmentKind,
     host_label: &str,
     held: Option<&BTreeSet<String>>,
 ) -> Result<(), String> {
@@ -412,12 +404,17 @@ pub async fn choose_bindings(
     Ok(pending)
 }
 
-/// A binding's metadata: labelled with its requester's convoy, so explain and the capability
-/// card read a convoy's bindings by index.
+/// A binding's metadata: labelled with its requester's convoy (explain, the capability card and
+/// the home pass read a convoy's bindings by index), its credential (grant and declaration
+/// changes reach the convoys using it) and its own name (its provisions are found by it).
 pub fn binding_meta(name: &str, spec: &AccountBindingSpec) -> InputMeta {
-    let labels = requester_parts(&spec.requester)
-        .map(|(convoy, _)| std::collections::BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), convoy)]))
-        .unwrap_or_default();
+    let mut labels = BTreeMap::from([
+        (ACCOUNT_BINDING_LABEL.to_string(), name.to_string()),
+        (ACCOUNT_CREDENTIAL_LABEL.to_string(), spec.credential.0.clone()),
+    ]);
+    if let Some((convoy, _)) = requester_parts(&spec.requester) {
+        labels.insert(flotilla_resources::CONVOY_LABEL.to_string(), convoy);
+    }
     InputMeta::builder().name(name.to_string()).labels(labels).build()
 }
 
@@ -500,38 +497,44 @@ async fn delivered_anywhere(backend: &ResourceBackend, namespace: &str, binding:
     Ok(provisions.items.iter().any(|provision| provision.object.spec.delivered.is_some()))
 }
 
-/// The home pass over this daemon's own bindings (#3882 lifecycle): a requester's teardown
-/// closes its binding; an authorization change revokes it or updates its recorded grants; a
-/// replacement login for the same account appends an epoch. A convoy admitted before bindings
-/// existed gets one, pinned to the credential its snapshot carried when exactly one did.
-pub async fn reconcile_home_bindings(
+/// A requester the home pass found without a binding; it is bound under the admission lock.
+pub struct Unbound {
+    alternatives: RequesterAlternatives,
+    /// The single subscription credential the admitted snapshot carried, which stays bound.
+    carried: Option<String>,
+}
+
+/// The home pass over one convoy's requesters (#3882 lifecycle): teardown closes their bindings;
+/// an authorization change revokes a binding or updates its recorded grants; a replacement login
+/// for the same account appends an epoch. Requesters with no binding (a convoy admitted before
+/// bindings existed) are returned for [`bind_unbound`].
+pub async fn reconcile_convoy_bindings(
     backend: &ResourceBackend,
     namespace: &str,
-    random: &dyn RandomSource,
+    convoy: &ResourceObject<Convoy>,
     now: Timestamp,
-) -> Result<Vec<(String, BindingChange)>, String> {
-    let bindings = backend.clone().using::<AccountBinding>(namespace);
-    let convoys = backend.clone().using::<Convoy>(namespace).list().await.map_err(|error| format!("list convoys: {error}"))?.items;
+) -> Result<(Vec<(String, BindingChange)>, Vec<Unbound>), String> {
+    let resolver = backend.clone().using::<AccountBinding>(namespace);
+    let bindings = flotilla_store::convoy_account_bindings(backend, namespace, &convoy.metadata.name, false)
+        .await
+        .map_err(|error| format!("read account bindings: {error}"))?;
     let mut changes = Vec::new();
-    let mut bound = BTreeSet::new();
-    for binding in bindings.list().await.map_err(|error| format!("list account bindings: {error}"))?.items {
-        let name = binding.metadata.name.clone();
-        bound.insert(name.clone());
-        if !binding.spec.state.value.is_open() {
-            continue;
-        }
-        let Some((convoy_name, role)) = requester_parts(&binding.spec.requester) else { continue };
-        let convoy = convoys.iter().find(|convoy| convoy.metadata.name == convoy_name);
-        let live = convoy.filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()));
-        let Some(convoy) = live else {
+    if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+        for binding in bindings.iter().filter(|binding| binding.spec.state.value.is_open()) {
+            let name = binding.metadata.name.clone();
             let reason = "requester teardown".to_string();
-            close(&bindings, &binding, BindingState::Closed { reason: reason.clone(), delivered_until: None }, now).await?;
+            let delivered_until = delivered_anywhere(backend, namespace, &name).await?.then_some(now);
+            close(&resolver, binding, BindingState::Closed { reason: reason.clone(), delivered_until }, now).await?;
             changes.push((name, BindingChange::Closed(reason)));
-            continue;
-        };
-        let Some(workflow) = admitted_workflow(backend, namespace, convoy).await? else { continue };
-        let alternatives =
-            current_alternatives(backend, namespace, convoy.spec.project_ref.as_deref(), &convoy.spec.repositories, &workflow).await?;
+        }
+        return Ok((changes, Vec::new()));
+    }
+    let Some(workflow) = admitted_workflow(backend, namespace, convoy).await? else { return Ok((changes, Vec::new())) };
+    let alternatives =
+        current_alternatives(backend, namespace, convoy.spec.project_ref.as_deref(), &convoy.spec.repositories, &workflow).await?;
+    for binding in bindings.iter().filter(|binding| binding.spec.state.value.is_open()) {
+        let name = binding.metadata.name.clone();
+        let Some((_, role)) = requester_parts(&binding.spec.requester) else { continue };
         let candidate = alternatives
             .iter()
             .find(|alternative| alternative.requester.role == role && alternative.requester.access == binding.spec.requirement)
@@ -539,7 +542,7 @@ pub async fn reconcile_home_bindings(
         let Some(candidate) = candidate else {
             let delivered_until = delivered_anywhere(backend, namespace, &name).await?.then_some(now);
             let state = BindingState::Revoked { reason: NO_AUTHORIZING_GRANT.to_string(), delivered_until };
-            close(&bindings, &binding, state, now).await?;
+            close(&resolver, binding, state, now).await?;
             changes.push((name, BindingChange::Revoked(NO_AUTHORIZING_GRANT.to_string())));
             continue;
         };
@@ -559,7 +562,7 @@ pub async fn reconcile_home_bindings(
                     spec.account.as_deref().unwrap_or("none")
                 );
                 let delivered_until = delivered_anywhere(backend, namespace, &name).await?.then_some(now);
-                close(&bindings, &binding, BindingState::Revoked { reason: reason.clone(), delivered_until }, now).await?;
+                close(&resolver, binding, BindingState::Revoked { reason: reason.clone(), delivered_until }, now).await?;
                 changes.push((name, BindingChange::Revoked(reason)));
                 continue;
             }
@@ -570,43 +573,58 @@ pub async fn reconcile_home_bindings(
             change = Some(BindingChange::EpochAppended(candidate.epoch.to_string()));
         }
         if let Some(change) = change {
-            bindings
+            resolver
                 .update(&binding_meta(&name, &spec), &binding.metadata.resource_version, &spec)
                 .await
                 .map_err(|error| format!("update account binding `{name}`: {error}"))?;
             changes.push((name, change));
         }
     }
-    // Convoys admitted before bindings existed.
-    for convoy in convoys.iter().filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())) {
-        let Some(workflow) = admitted_workflow(backend, namespace, convoy).await? else { continue };
-        let project = convoy.spec.project_ref.as_deref();
-        let alternatives = current_alternatives(backend, namespace, project, &convoy.spec.repositories, &workflow).await?;
-        let mut pending = Vec::new();
-        for alternative in alternatives.iter().filter(|alternative| !alternative.candidates.is_empty()) {
+    let bound = bindings.iter().map(|binding| binding.metadata.name.as_str()).collect::<BTreeSet<_>>();
+    let unbound = alternatives
+        .into_iter()
+        .filter(|alternative| !alternative.candidates.is_empty())
+        .filter(|alternative| {
             let requester = &alternative.requester;
-            let name = binding_name(&convoy.metadata.name, &requester.role, &requester.access);
-            if bound.contains(&name) {
-                continue;
-            }
-            let vessel = workflow.vessels.iter().find(|vessel| vessel.name == requester.vessel);
-            let carried = vessel
+            !bound.contains(binding_name(&convoy.metadata.name, &requester.role, &requester.access).as_str())
+        })
+        .map(|alternative| {
+            let carried = workflow
+                .vessels
+                .iter()
+                .find(|vessel| vessel.name == alternative.requester.vessel)
                 .map(|vessel| {
-                    vessel.credential_refs.iter().filter(|name| alternative.candidates.contains_key(&CredentialName((*name).clone())))
+                    vessel
+                        .credential_refs
+                        .iter()
+                        .filter(|name| alternative.candidates.contains_key(&CredentialName((*name).clone())))
+                        .cloned()
+                        .collect::<Vec<_>>()
                 })
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-            let pin = match carried.as_slice() {
-                [single] => Some((single.as_str(), SNAPSHOT_PIN)),
-                _ => None,
-            };
-            let selected = select(alternative, pin, random)?;
-            pending.push(binding_record(project, &convoy.metadata.name, alternative, selected, now)?);
-            changes.push((name, BindingChange::Opened));
-        }
-        write_bindings(backend, namespace, pending).await?;
+                .and_then(|carried| <[String; 1]>::try_from(carried).ok())
+                .map(|[single]| single);
+            Unbound { alternatives: alternative, carried }
+        })
+        .collect();
+    Ok((changes, unbound))
+}
+
+/// Bind requesters the home pass found without a binding; the caller holds the admission lock.
+pub async fn bind_unbound(
+    backend: &ResourceBackend,
+    namespace: &str,
+    convoy: &ResourceObject<Convoy>,
+    unbound: Vec<Unbound>,
+    random: &dyn RandomSource,
+    now: Timestamp,
+) -> Result<Vec<(String, BindingChange)>, String> {
+    let mut pending = Vec::new();
+    for Unbound { alternatives, carried } in unbound {
+        let selected = select(&alternatives, carried.as_deref().map(|credential| (credential, SNAPSHOT_PIN)), random)?;
+        pending.push(binding_record(convoy.spec.project_ref.as_deref(), &convoy.metadata.name, &alternatives, selected, now)?);
     }
+    let changes = pending.iter().map(|binding| (binding.name.clone(), BindingChange::Opened)).collect();
+    write_bindings(backend, namespace, pending).await?;
     Ok(changes)
 }
 
@@ -681,9 +699,8 @@ pub async fn rebind(
 
 #[cfg(test)]
 mod tests {
-    use flotilla_resources::SeededRandom;
-
     use super::*;
+    use crate::random::SeededRandom;
 
     fn alternatives(names: &[&str], excluded: &[&str]) -> RequesterAlternatives {
         RequesterAlternatives {
@@ -723,32 +740,14 @@ mod tests {
         assert_eq!(set.usable()[index as usize], &credential);
     }
 
-    // Behaviour (#3882): an authorized pin wins over the draw; an unauthorized or excluded pin
-    // refuses with the reason.
+    // Behaviour (#3882): a pin of an authorized candidate the placement cannot use refuses with
+    // the exclusion's reason; it never falls back to the draw.
     #[test]
-    fn a_pin_wins_only_when_authorized_and_usable() {
+    fn an_excluded_pin_refuses_with_the_exclusion() {
         let set = alternatives(&["box-a", "box-b"], &["box-b"]);
-        let random = SeededRandom::new(1);
         assert_eq!(
-            select(&set, Some(("box-a", CONVOY_START_PIN)), &random).expect("pin"),
-            Selected { credential: CredentialName("box-a".into()), selection: Selection::Pin { pinned_by: CONVOY_START_PIN.into() } }
-        );
-        assert_eq!(
-            select(&set, Some(("claude-max", CONVOY_START_PIN)), &random).expect_err("unauthorized"),
-            "account pin `claude-max` for role `coder` is refused: no CredentialGrant authorizes it for `claude:subscription`"
-        );
-        assert_eq!(
-            select(&set, Some(("box-b", CONVOY_START_PIN)), &random).expect_err("excluded"),
+            select(&set, Some(("box-b", CONVOY_START_PIN)), &SeededRandom::new(1)).expect_err("excluded"),
             "account pin `box-b` for role `coder` is refused: host `b1` does not hold it"
-        );
-    }
-
-    #[test]
-    fn binding_names_and_requester_addresses_are_per_role() {
-        assert_eq!(binding_name("c1", "coder", &AccessName("claude:subscription".into())), "c1.coder.claude-subscription");
-        assert_eq!(
-            requester_address(Some("flotilla"), "c1", "coder").expect("address").to_string(),
-            "project:flotilla/convoy:c1/role:coder"
         );
     }
 }

@@ -84,7 +84,6 @@ pub mod prepared_snapshot;
 mod principal_attention;
 mod project;
 mod provisioning_identity;
-pub mod random;
 mod replica;
 #[doc(hidden)]
 pub mod repository;
@@ -212,7 +211,6 @@ pub use project::{
     DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, forge_clone_key, forge_repo_key, repo_key};
-pub use random::{RandomSource, SeededRandom};
 pub use replica::{
     compare_replica_reads, pick_replica_read, ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass,
     ResourceProvenance, ORIGIN_ROOT_ANNOTATION,

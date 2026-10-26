@@ -269,14 +269,7 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
         && value == &crew_config_dir.join(".flotilla-oauth-token").display().to_string()));
     assert!(launch.command.contains(&claude_token_prefix(&crew_config_dir.display().to_string())), "{}", launch.command);
     assert!(
-        launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR"
-            && value
-                == if private_home {
-                    crew_config_dir.join("crews/coder").display().to_string()
-                } else {
-                    crew_config_dir.display().to_string()
-                }
-                .as_str()),
+        launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == crew_config_dir.display().to_string().as_str()),
         "the contained Claude process must receive the config directory owned by its adapter"
     );
     // The first turn includes the assignment and its capability card, never token material.

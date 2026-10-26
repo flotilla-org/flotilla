@@ -552,18 +552,33 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
         env: BTreeMap::from([
             (CREDENTIAL_REFS_ENV.to_string(), serde_json::to_string(&credential_refs).expect("encode credential refs")),
             (
-                flotilla_resources::RESOLVED_SKILLS_ENV.to_string(),
-                serde_json::to_string(&vec![flotilla_resources::SkillCatalogEntry {
-                    source: "mattpocock-skills".to_string(),
-                    repository: "flotilla-org/mattpocock-skills".to_string(),
-                    revision: "1".repeat(40),
-                    name: "research".to_string(),
-                    path: "skills/research".to_string(),
-                }])
+                flotilla_resources::CREW_SKILLS_ENV.to_string(),
+                serde_json::to_string(&BTreeMap::from([(
+                    "coder",
+                    vec![flotilla_resources::SkillCatalogEntry {
+                        source: "mattpocock-skills".to_string(),
+                        repository: "flotilla-org/mattpocock-skills".to_string(),
+                        revision: "1".repeat(40),
+                        name: "research".to_string(),
+                        path: "skills/research".to_string(),
+                    }],
+                )]))
                 .expect("encode frozen skill selection"),
             ),
         ]),
     };
+    // #3907: a Claude crew's skills are staged in its requester's home, named by its convoy.
+    backend
+        .using::<Environment>(NAMESPACE)
+        .create(
+            &InputMeta::builder()
+                .name("contained-claude".to_string())
+                .labels(BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), "demo".to_string())]))
+                .build(),
+            &EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) },
+        )
+        .await
+        .expect("environment record");
 
     DockerControllerRuntime { state }.provision_docker("contained-claude", &spec).await.expect("provision Claude vessel");
 

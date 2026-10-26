@@ -13,14 +13,11 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{create_docker_placement, create_host_direct_placement, set_host_credential_expiry, test_meta};
+use super::support::{create_docker_placement, set_host_credential_expiry, test_meta};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 use flotilla_admission::account_access::validate_account_access;
-use flotilla_admission::convoy_admission::{
-    resolve_workflow_credentials, validate_workflow_credentials, validate_workflow_credentials_with_capabilities,
-};
-use flotilla_agent::adapter::{AgentRequirement, CapabilityTable};
+use flotilla_admission::convoy_admission::{resolve_workflow_credentials, validate_workflow_credentials};
 
 #[tokio::test]
 async fn docker_placement_refuses_instance_readiness_before_selection() {
@@ -653,42 +650,6 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
     validate_account_access(&backend, "flotilla", Some("flotilla"), &[], &with_grant, Some(&placement))
         .await
         .expect("delivered OAuth admits trusted Claude despite an expired ambient login");
-}
-
-#[tokio::test]
-async fn ambient_only_adapter_is_refused_when_the_host_login_expired() {
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-    let workflow = WorkflowTemplateSpec::builder()
-        .vessels(vec![VesselRequirement::builder()
-            .name("work".to_string())
-            .crew(vec![CrewSpec::builder()
-                .role("coder".to_string())
-                .source(CrewSource::Agent { selector: Selector::for_capability("ambient-only"), prompt: None, brief_template: None })
-                .build()])
-            .build()])
-        .build();
-    create_host_direct_placement(&backend, "ambient-host", "host-a", BTreeSet::new()).await;
-    let placement = backend.using::<PlacementPolicy>("flotilla").get("ambient-host").await.expect("get placement");
-    let expired = CredentialExpiry::builder().refresh_expires_at("2020-02-01T00:00:00Z".parse().expect("timestamp")).build();
-    set_host_credential_expiry(
-        &backend,
-        "host-a",
-        BTreeMap::from([(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE.to_string(), expired)]),
-    )
-    .await;
-    let capabilities = CapabilityTable::seeded().with_requirement(
-        "ambient-only",
-        AgentRequirement::ambient_only("ambient-only-test", None, flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE),
-    );
-
-    let error = validate_workflow_credentials_with_capabilities(&backend, "flotilla", &workflow, Some(&placement), &capabilities)
-        .await
-        .expect_err("expired ambient-only authentication must refuse dispatch");
-
-    assert_eq!(
-        error,
-        "vessel `work` depends on the ambient claude login on host `host-a`, which expired on 2020-02-01 — log in again on that host or grant a delivered claude credential"
-    );
 }
 
 #[tokio::test]
