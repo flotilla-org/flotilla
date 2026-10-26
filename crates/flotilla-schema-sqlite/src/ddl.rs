@@ -249,6 +249,7 @@ pub(crate) fn column(column: &ColumnDef) -> String {
             let _ = write!(out, " CHECK ({name} IN (0, 1))");
         }
         ColumnType::Code(codes) => {
+            // `check_kind_codes` (shared.rs) parses this spelling back at open; keep the two in step.
             let codes: Vec<String> = codes.iter().map(|code| text_literal(code)).collect();
             let _ = write!(out, " CHECK ({name} IN ({}))", codes.join(", "));
         }
