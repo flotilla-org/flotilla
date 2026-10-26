@@ -71,6 +71,8 @@ echo 'Model checking completed. No error has been found'
 ''')
         for step in ('frames', 'compile', 'tlc', 'replay'):
             with self.subTest(step=step):
+                # Each fixture owns its output; the parent runner may already have populated its directory.
+                self.env['QUINT_RUN_DIR'] = str(self.root / f'{step}-run')
                 self.env['FAIL_STEP'] = step
                 result = self.run_script(script, '--skip-store')
                 self.assertEqual(result.returncode, 17, result.stderr)
