@@ -1,4 +1,4 @@
-"""Exercise shared CI event/stack selection through real Git and Cargo."""
+"""Exercise shared CI selection through real Git/Cargo (Python >=3.11; CI pins 3.12)."""
 import os
 from pathlib import Path
 import subprocess
