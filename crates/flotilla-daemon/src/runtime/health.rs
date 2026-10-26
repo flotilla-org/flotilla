@@ -36,6 +36,62 @@ use crate::{
     supervisor::RestartBudgetExhausted,
 };
 
+/// An engine-held build's failure and cause come from the same judgement.
+pub(super) fn image_build_failure_condition(
+    build: &flotilla_resources::ResourceObject<flotilla_resources::ImageBuild>,
+    lifecycles: &dyn flotilla_resources::lifecycle_reads::LifecycleReads,
+) -> Option<HostCondition> {
+    use flotilla_protocol::LifecycleReading;
+    use flotilla_resources::lifecycle_reads::ProvisioningKind;
+    let (reason, message) = match lifecycles.try_reading(ProvisioningKind::ImageBuild, &build.metadata.name, None) {
+        // A failed read must remain visible without suppressing the other heartbeat observations.
+        Err(error) => ("LifecycleReadFailed", error),
+        Ok(Some(
+            LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause } | LifecycleReading::Failed { reason: cause },
+        )) => ("ImageBuildFailed", cause),
+        // Absence or release makes the image unusable, but does not establish a failed build execution.
+        Ok(Some(LifecycleReading::Lost | LifecycleReading::Released)) => return None,
+        Ok(Some(_)) => return None,
+        Ok(None) => {
+            let status = build.status.as_ref().filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Failed)?;
+            ("ImageBuildFailed", status.failure.as_ref().map(|failure| failure.reason.clone()).unwrap_or_default())
+        }
+    };
+    Some(
+        HostCondition::builder()
+            .condition_type(format!("ImageBuild/{}", build.metadata.name))
+            .value(ConditionValue::False)
+            .reason(reason)
+            .message(message)
+            .observed_at(Utc::now())
+            .blocks_readiness(false)
+            // A failed image build or read does not disable forge reads.
+            .blocks_forge_observation(false)
+            .build(),
+    )
+}
+
+/// A shared reader failure is one heartbeat fault, regardless of the number of image records.
+fn image_build_failure_conditions<'a>(
+    builds: impl Iterator<Item = &'a flotilla_resources::ResourceObject<flotilla_resources::ImageBuild>>,
+    lifecycles: &dyn flotilla_resources::lifecycle_reads::LifecycleReads,
+) -> Vec<HostCondition> {
+    let mut read_failed = false;
+    builds
+        .filter_map(|build| {
+            let mut condition = image_build_failure_condition(build, lifecycles)?;
+            if condition.reason == "LifecycleReadFailed" {
+                if read_failed {
+                    return None;
+                }
+                read_failed = true;
+                condition.condition_type = "ImageBuild/LifecycleReads".into();
+            }
+            Some(condition)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct DaemonHealthIdentity {
     pub(super) generation: Option<String>,
@@ -441,28 +497,18 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
         );
     }
     let build_records = backend.using::<flotilla_resources::ImageBuild>(namespace).list().await.map_err(|error| error.to_string())?;
-    // Infrastructure failures retry in place; a Failed build is terminal
-    // until an operator deletes it. Retired records are ignored.
-    for build in &build_records.items {
-        if build.spec.current().is_some_and(|spec| spec.host_ref == profile.host_id)
-            && build.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ImageBuildPhase::Failed)
-        {
-            let reason =
-                build.status.as_ref().and_then(|status| status.failure.as_ref()).map(|failure| failure.reason.clone()).unwrap_or_default();
-            conditions.push(
-                HostCondition::builder()
-                    .condition_type(format!("ImageBuild/{}", build.metadata.name))
-                    .value(ConditionValue::False)
-                    .reason("ImageBuildFailed")
-                    .message(reason)
-                    .observed_at(Utc::now())
-                    .blocks_readiness(false)
-                    // A failed image build does not disable forge reads.
-                    .blocks_forge_observation(false)
-                    .build(),
-            );
-        }
-    }
+    let lifecycles = daemon.lifecycle_reads();
+    let local_host = profile.host_id.clone();
+    conditions.extend(
+        tokio::task::spawn_blocking(move || {
+            image_build_failure_conditions(
+                build_records.items.iter().filter(|build| build.spec.current().is_some_and(|spec| spec.host_ref == local_host)),
+                lifecycles.as_ref(),
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())?,
+    );
 
     conditions.extend(file_descriptor_pressure_condition());
     if let Some(condition) = daemon.cleat_build_skew_condition().await {
@@ -932,5 +978,45 @@ mod read_retry_health_tests {
         }
         snapshot.get_mut("controller").unwrap().prolonged = 0;
         assert!(store_read_retry_condition(&snapshot).is_none());
+    }
+}
+
+#[cfg(test)]
+mod image_health_tests {
+    use super::*;
+
+    // Build execution failures raise health conditions; release and absence only invalidate the artifact.
+    #[test]
+    fn image_health_follows_engine_without_a_copy() {
+        use flotilla_provisioning::engine::image_build::ImageBuildBinding;
+        use flotilla_provisioning_testkit::{image_build, Ending, LifecycleFixture};
+        let build = image_build(flotilla_resources::ImageBuildPhase::Failed);
+        for (ending, failed) in [
+            (Ending::GaveUp("engine cause"), true),
+            (Ending::Failed("engine cause"), true),
+            (Ending::Lost("digest"), false),
+            (Ending::Released, false),
+        ] {
+            let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
+            fixture.request(&build);
+            assert!(image_build_failure_condition(&build, fixture.reads.as_ref()).is_none());
+            fixture.finish(&build, ending);
+            let condition = image_build_failure_condition(&build, fixture.reads.as_ref());
+            assert_eq!(condition.is_some(), failed);
+            if let Some(condition) = condition {
+                assert_eq!(condition.reason, "ImageBuildFailed");
+                assert_eq!(condition.message, "engine cause");
+                assert!(!condition.blocks_readiness);
+                assert!(!condition.blocks_forge_observation);
+            }
+            fixture.poison();
+            let mut other = build.clone();
+            other.metadata.name = "other-image".into();
+            let conditions = image_build_failure_conditions([&build, &other].into_iter(), fixture.reads.as_ref());
+            assert_eq!(conditions.len(), 1, "one unavailable reader, not one fault per image");
+            assert_eq!(conditions[0].condition_type, "ImageBuild/LifecycleReads");
+            assert_eq!(conditions[0].reason, "LifecycleReadFailed");
+            assert!(conditions[0].message.contains("poisoned"));
+        }
     }
 }

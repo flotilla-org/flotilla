@@ -140,7 +140,7 @@ fn request(git_ref: &str) -> ImageCheckRequest {
 }
 
 async fn check(backend: &ResourceBackend, branches: &Branches, request: &ImageCheckRequest) -> ImageCheckReport {
-    check_image(backend, NS, HOST, branches, request).await.expect("check")
+    check_image(backend, NS, HOST, branches, request, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads)).await.expect("check")
 }
 
 async fn build_names(backend: &ResourceBackend) -> Vec<String> {
@@ -196,7 +196,9 @@ async fn a_branch_layer_change_builds_a_new_identity() {
 
     let service = BuildService::new(Behaviour::Succeed);
     execute(&backend, &service, &build.name).await;
-    let built = image_build_report(&backend, NS, &build.name).await.expect("report");
+    let built = image_build_report(&backend, NS, &build.name, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
+        .await
+        .expect("report");
     assert_eq!((built.phase, built.settled), (ImageBuildReportPhase::Built, true));
     assert!(built.digest.is_some() && built.log_ref.is_some());
     let table = built.layers.iter().map(|layer| (layer.layer.as_str(), layer.source.as_str(), layer.version.as_str())).collect::<Vec<_>>();
@@ -308,9 +310,16 @@ async fn refusals_create_no_build() {
 #[tokio::test]
 async fn another_architecture_needs_the_fleet_image_cache() {
     let (backend, branches) = fixture().await;
-    let error = check_image(&backend, NS, HOST, &*branches, &ImageCheckRequest { architecture: Some("arm64".into()), ..request("main") })
-        .await
-        .expect_err("refused");
+    let error = check_image(
+        &backend,
+        NS,
+        HOST,
+        &*branches,
+        &ImageCheckRequest { architecture: Some("arm64".into()), ..request("main") },
+        Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+    )
+    .await
+    .expect_err("refused");
     assert!(error.contains("no fleet image cache") && error.contains("arm64"), "{error}");
     assert!(build_names(&backend).await.is_empty());
 }
@@ -369,16 +378,30 @@ async fn a_missing_ref_is_an_error_not_an_absent_layer() {
         repository: root.to_str().expect("repository path").to_string(),
     };
 
-    let main = check_image(&backend, NS, HOST, &sources, &request("main")).await.expect("main");
+    let main = check_image(&backend, NS, HOST, &sources, &request("main"), Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
+        .await
+        .expect("main");
     assert_eq!(main.project_layer.as_deref(), Some("app-native@1.0"));
     assert!(main.revision.is_some());
 
-    let bare = check_image(&backend, NS, HOST, &sources, &request("no-layer")).await.expect("a branch without a layer");
+    let bare =
+        check_image(&backend, NS, HOST, &sources, &request("no-layer"), Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
+            .await
+            .expect("a branch without a layer");
     assert_eq!(bare.project_layer, None);
     assert!(bare.revision.is_none() && bare.refusals.is_empty() && bare.build.is_some(), "{bare:?}");
 
     let builds = build_names(&backend).await;
-    let error = check_image(&backend, NS, HOST, &sources, &request("no-such-branch")).await.expect_err("a missing ref is an error");
+    let error = check_image(
+        &backend,
+        NS,
+        HOST,
+        &sources,
+        &request("no-such-branch"),
+        Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+    )
+    .await
+    .expect_err("a missing ref is an error");
     assert!(error.contains(&format!("`{PROJECT_IMAGE_LAYER_PATH}/` at no-such-branch")), "{error}");
     assert!(error.contains("refs/heads/no-such-branch"), "the fetch failure is reported: {error}");
     assert_eq!(build_names(&backend).await, builds, "a missing ref creates no build");

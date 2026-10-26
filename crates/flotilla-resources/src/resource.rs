@@ -247,6 +247,14 @@ pub trait Resource: Send + Sync + 'static {
         Ok(())
     }
 
+    /// A lifecycle that can replace legacy phase validation for local controller observations.
+    const STATUS_LIFECYCLE_KIND: Option<crate::lifecycle_reads::ProvisioningKind> = None;
+
+    /// Non-lifecycle constraints remain in force when the engine owns the phase.
+    fn validate_engine_status_update(current: Option<&Self::Status>, requested: &Self::Status) -> Result<(), ResourceError> {
+        Self::validate_status_update(current, requested)
+    }
+
     /// Validates a status write against the currently stored status after
     /// optimistic concurrency has established which version is current.
     fn validate_status_update(_current: Option<&Self::Status>, _requested: &Self::Status) -> Result<(), ResourceError> {

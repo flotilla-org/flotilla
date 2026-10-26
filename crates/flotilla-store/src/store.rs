@@ -172,6 +172,12 @@ impl ResourceKind {
     pub fn validate_spec_update(self, current: &Value, requested: &Value) -> Result<(), ResourceError> {
         (self.validate_spec_update_fn)(current, requested)
     }
+    pub(crate) fn with_engine_status_validator<T: Resource>(mut self) -> Self {
+        self.validate_status_update_fn =
+            |current, requested| T::validate_engine_status_update(current.map(transcode).transpose()?.as_ref(), &transcode(requested)?);
+        self
+    }
+
     pub fn validate_status_update(self, current: Option<&Value>, requested: &Value) -> Result<(), ResourceError> {
         (self.validate_status_update_fn)(current, requested)
     }
@@ -952,7 +958,7 @@ fn clone_object<T: Resource>(object: &ResourceObject<T>) -> ResourceObject<T> {
     ResourceObject { metadata: object.metadata.clone(), spec: object.spec.clone(), status: object.status.clone() }
 }
 /// Preserve synchronous memory/HTTP encoding and SQLite worker-thread encoding.
-async fn transcode_request<A: Serialize + Send + 'static, B: DeserializeOwned + Send + 'static>(
+pub(crate) async fn transcode_request<A: Serialize + Send + 'static, B: DeserializeOwned + Send + 'static>(
     blocking: bool,
     value: A,
 ) -> Result<B, ResourceError> {

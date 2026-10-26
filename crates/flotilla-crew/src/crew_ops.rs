@@ -859,6 +859,7 @@ impl CrewService {
             &session.spec,
             &credentials,
             &source.endpoints(&session.spec.env_ref, &session.metadata.name).await?,
+            Arc::clone(&self.lifecycle_reads),
         )
         .await
     }

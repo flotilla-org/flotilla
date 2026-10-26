@@ -43,6 +43,16 @@ impl Resource for ImageBuild {
         Ok(())
     }
 
+    const STATUS_LIFECYCLE_KIND: Option<crate::lifecycle_reads::ProvisioningKind> =
+        Some(crate::lifecycle_reads::ProvisioningKind::ImageBuild);
+
+    fn validate_engine_status_update(_current: Option<&Self::Status>, _requested: &Self::Status) -> Result<(), ResourceError> {
+        // The legacy validator has only phase immutability and phase/class/attempt retry gates;
+        // it imposes no independent digest or monotonic-attempt invariant. The engine owns
+        // those lifecycle decisions; this snapshot retains actuator observations.
+        Ok(())
+    }
+
     fn validate_status_update(current: Option<&Self::Status>, requested: &Self::Status) -> Result<(), ResourceError> {
         let Some(current) = current else { return Ok(()) };
         if current == requested {
@@ -323,6 +333,11 @@ pub struct ImageBuildStatus {
 }
 
 impl ImageBuildStatus {
+    /// Whether an unfinished attempt was observed starting at or after the optional retry deadline.
+    pub fn attempt_started_since(&self, not_before: Option<DateTime<Utc>>) -> bool {
+        self.started_at.is_some_and(|started| not_before.is_none_or(|next| started >= next)) && self.finished_at.is_none()
+    }
+
     /// Whether this status returns to Queued: a bounded infrastructure
     /// failure with attempts remaining. Recipe failures, failures without a
     /// recorded class and exhausted attempts are terminal.

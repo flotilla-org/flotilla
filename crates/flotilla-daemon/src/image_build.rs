@@ -267,7 +267,14 @@ mod tests {
             .await
             .expect("replicate evidence");
         assert_eq!(
-            read_image_build(&home, "test", &name).await.expect("read execution").status.expect("evidence").phase,
+            read_image_build(&home, "test", &name, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
+                .await
+                .expect("read execution")
+                .build
+                .object
+                .status
+                .expect("evidence")
+                .phase,
             ImageBuildPhase::Built
         );
         assert!(home.using::<ImageBuild>("test").get(&name).await.expect("original demand").status.is_none());
