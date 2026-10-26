@@ -1046,7 +1046,7 @@ async fn completed_build_survives_post_collection_read_failure() {
     let prepared = reconciler.prepare(&obj).await.expect("read error frame");
     let outcome = reconciler.reconcile(&obj, &prepared, Utc::now());
     assert!(outcome.patch.is_none());
-    assert!(outcome.events.iter().any(|event| event.reason == "LifecycleReadFailed"));
+    assert!(outcome.events.iter().any(|event| event.reason == "LifecycleReadFailed" && event.message == "transient post-collection read"));
     drop(prepared);
     settle(&backend, &reconciler, &clock, &name).await;
     assert_eq!(status(&backend, &name).await.phase, ImageBuildPhase::Built);
