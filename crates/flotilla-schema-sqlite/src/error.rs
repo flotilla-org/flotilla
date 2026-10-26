@@ -21,6 +21,12 @@ pub enum StoreError {
     /// `message.receiver_kind` before the Person consumer (#3938). Opening cannot change a CHECK.
     #[error("kind table {table} column {column} refuses codes {missing:?}: the database predates this schema and has no migration; open a new store")]
     KindCodeDrift { table: String, column: String, missing: Vec<String> },
+    /// A kind table's coded column has no stored `CHECK (<column> IN (...))` this store can read,
+    /// so whether it accepts the kind's codes is unknown; refused rather than assumed current.
+    #[error(
+        "kind table {table} column {column} has no readable code CHECK: the database predates this schema or was altered; open a new store"
+    )]
+    KindCodeUnreadable { table: String, column: String },
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]

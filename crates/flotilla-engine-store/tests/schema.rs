@@ -83,6 +83,16 @@ fn a_store_whose_receiver_kinds_predate_the_person_consumer_is_refused_at_open()
         }
         other => panic!("refused at open, not {:?}", other.map(|_| "opened")),
     }
+    // A CHECK that cannot be read fails closed rather than passing as current.
+    let unchecked = current.replace(r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'co', 'pe'))"#, r#""receiver_kind" TEXT"#);
+    let connection = rusqlite::Connection::open_in_memory().expect("connection");
+    connection.execute_batch(&unchecked).expect("unchecked schema");
+    match Store::open(connection, "home", registry().expect("registry")) {
+        Err(StoreError::KindCodeUnreadable { table, column }) => {
+            assert_eq!((table.as_str(), column.as_str()), ("message", "receiver_kind"))
+        }
+        other => panic!("refused at open, not {:?}", other.map(|_| "opened")),
+    }
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
     connection.execute_batch(&current).expect("current schema");
     Store::open(connection, "home", registry().expect("registry")).expect("a current store opens");

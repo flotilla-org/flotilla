@@ -282,8 +282,8 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
 
 /// Refuses a kind table whose stored CHECK on a coded column lacks one of its kind's codes, such
 /// as a message table created before a consumer kind was added. Opening only creates missing
-/// tables, so the old CHECK would otherwise refuse the first write of the new code. A column whose
-/// stored CHECK cannot be found is left to the column guard.
+/// tables, so the old CHECK would otherwise refuse the first write of the new code. A coded column
+/// whose stored CHECK cannot be read fails closed: an unread constraint is never taken as current.
 pub(crate) fn check_kind_codes(conn: &Connection, kinds: &KindRegistry) -> Result<(), StoreError> {
     let mut statement = conn.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1")?;
     for set in kinds.iter() {
@@ -291,7 +291,9 @@ pub(crate) fn check_kind_codes(conn: &Connection, kinds: &KindRegistry) -> Resul
             let Some(sql) = statement.query_row([&table.name], |row| row.get::<_, String>(0)).optional()? else { continue };
             for column in table.key.iter().chain(&table.columns) {
                 let flotilla_schema::ColumnType::Code(codes) = &column.ty else { continue };
-                let Some(stored) = stored_codes(&sql, &column.name) else { continue };
+                let Some(stored) = stored_codes(&sql, &column.name) else {
+                    return Err(StoreError::KindCodeUnreadable { table: table.name.clone(), column: column.name.clone() });
+                };
                 let missing: Vec<String> =
                     codes.iter().filter(|code| !stored.contains(code.as_str())).map(|code| code.to_string()).collect();
                 if !missing.is_empty() {
