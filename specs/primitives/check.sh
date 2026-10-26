@@ -32,21 +32,36 @@ if [ -n "${QUINT_RUN_DIR:-}" ]; then
 else
   run=$(mktemp -d "$PWD/build/fast.XXXXXX")
 fi
+# Keep subprocess diagnostics visible even when CI does not retain the run directory.
+step_log() {
+  local log=$1
+  shift
+  local status=0
+  "$@" > "$log" 2>&1 || status=$?
+  if [ "$status" -ne 0 ]; then
+    printf 'Failed step: %s (exit %s)\n' "$log" "$status" >&2
+    tail -n 80 "$log" >&2
+    return "$status"
+  fi
+}
 for scenario in agent_activity convoy_deliver ensure_bind inbox_delivery message_race controller_delivery machine_edges admission_placement reply_exchange; do
   # Assignment coverage is mandatory even for branches unreachable at depth one.
   # Simulation/typecheck alone can silently lose an unassigned world variable.
-  quint verify "scenarios/$scenario.qnt" --invariant safety --max-steps 1 > "$run/$scenario.frames.log" 2>&1
-  quint compile "scenarios/$scenario.qnt" --target tlaplus --invariant safety > "$run/$scenario.compile.log"
+  step_log "$run/$scenario.frames.log" quint verify "scenarios/$scenario.qnt" --invariant safety --max-steps 1
+  step_log "$run/$scenario.compile.log" quint compile "scenarios/$scenario.qnt" --target tlaplus --invariant safety
   awk '/^-+ MODULE/{found=1} found' "$run/$scenario.compile.log" > "$run/$scenario.tla"
   printf 'INIT q_init\nNEXT q_step\nINVARIANT q_inv\nVIEW view\n' > "$run/$scenario.cfg"
-  java -Xmx2g -Xss512k -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock \
+  step_log "$run/$scenario.tlc.log" java -Xmx2g -Xss512k -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock \
     -workers "${TLC_WORKERS:-4}" -metadir "$run/$scenario.states" \
-    -config "$run/$scenario.cfg" "$run/$scenario.tla" > "$run/$scenario.tlc.log" 2>&1
-  grep -q 'Model checking completed. No error has been found' "$run/$scenario.tlc.log"
+    -config "$run/$scenario.cfg" "$run/$scenario.tla"
+  if ! grep -q 'Model checking completed. No error has been found' "$run/$scenario.tlc.log"; then
+    tail -n 80 "$run/$scenario.tlc.log" >&2
+    exit 1
+  fi
   # Activity has full-graph conformance; the shared replay runner handles the existing compositions.
   if [ "$scenario" != agent_activity ]; then
-  quint run "scenarios/$scenario.qnt" --backend typescript --mbt --invariant safety --seed 3220 \
-    --max-samples 128 --n-traces 128 --max-steps 80 --out-itf "$run/$scenario-{seq}.itf.json" > "$run/$scenario.replay.log"
+  step_log "$run/$scenario.replay.log" quint run "scenarios/$scenario.qnt" --backend typescript --mbt --invariant safety --seed 3220 \
+    --max-samples 128 --n-traces 128 --max-steps 80 --out-itf "$run/$scenario-{seq}.itf.json"
   fi
 done
 # Full-graph conformance: TLC dumps every reachable state of each machine's

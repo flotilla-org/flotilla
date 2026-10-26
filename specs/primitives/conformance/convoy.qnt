@@ -23,6 +23,14 @@ module convoy_conformance {
   import convoy(IDS = Set(), SEAT_LIMIT = 4, REPLACEMENT_LIMIT = 1) as C from "../machines/convoy"
   type Probe = Admitted({ request: C::ConvoyRequest, result: C::Next })
     | Stepped({ from: C::State, event: C::Event, result: C::Next })
+  type QuotaObservation = Unadmitted | AdmittedQuota(C::VesselClass -> int)
+  pure def quotaOf(s: C::Slot): QuotaObservation = match s {
+    | Absent => Unadmitted
+    | Present(state) => AdmittedQuota(C::work(state).quota)
+  }
+  type QuotaStep = Admission | Readmission | Other
+  var quotaStep: QuotaStep
+  var previousQuota: QuotaObservation
   var slot: C::Slot
   var probe: Probe
   pure val definition = { kind: "opaque", target: "target" }
@@ -91,14 +99,26 @@ module convoy_conformance {
   action init = {
     nondet r = requests.oneOf()
     val n = C::admit(r)
-    all { slot' = C::target(n, C::Absent), probe' = Admitted({ request: r, result: n }) }
+    all { quotaStep' = Admission, previousQuota' = Unadmitted, slot' = C::target(n, C::Absent), probe' = Admitted({ request: r, result: n }) }
   }
   action step = match slot {
-    | Absent => all { slot' = slot, probe' = probe }
+    | Absent => all { quotaStep' = Other, previousQuota' = quotaOf(slot), slot' = slot, probe' = probe }
     | Present(s) => {
         nondet e = events(C::work(s)).oneOf()
         val n = C::step(s, e)
-        all { slot' = C::target(n, slot), probe' = Stepped({ from: s, event: e, result: n }) }
+        all { quotaStep' = (match e { | Readmit(_) => Readmission | _ => Other }), previousQuota' = quotaOf(slot), slot' = C::target(n, slot), probe' = Stepped({ from: s, event: e, result: n }) }
       }
   }
+  // The placement abstraction may observe only an unchanged quota, admission,
+  // or an authorised readmission that raises counts over the same class keys.
+  val currentQuota = quotaOf(slot)
+  val quotaRefinesPlacement = currentQuota == previousQuota or
+    (quotaStep == Admission and previousQuota == Unadmitted) or
+    (quotaStep == Readmission and match previousQuota {
+      | Unadmitted => false
+      | AdmittedQuota(before) => match currentQuota {
+          | Unadmitted => false
+          | AdmittedQuota(after) => after.keys() == before.keys() and after.keys().forall(k => after.get(k) >= before.get(k))
+        }
+    })
 }

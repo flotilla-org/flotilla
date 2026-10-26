@@ -1032,11 +1032,11 @@ struct Placed {
     evidence: Evidence,
 }
 
-/// The scenario's world: convoys, the ledger, vessel lifecycles, and what
+/// The scenario's world: admission quotas, the ledger, vessel lifecycles, and what
 /// the harness keeps beyond them (each placement's evidence, and the leases
 /// the ledger returned and forgot).
 struct Fleet {
-    convoys: Home<Convoy>,
+    quotas: BTreeMap<i64, Quota>,
     ledger: Ledger,
     vessels: Home<Lifecycle<VesselKind>>,
     placed: BTreeMap<i64, Placed>,
@@ -1055,7 +1055,7 @@ impl Fleet {
         ledger.add_host(Host::new("1"), BTreeMap::from([(Dimension(0), 2), (Dimension(1), 1)])).expect("host 1");
         ledger.add_host(Host::new("2"), BTreeMap::from([(Dimension(0), 1), (Dimension(1), 2)])).expect("host 2");
         Fleet {
-            convoys: Home::new("home").expect("declaration"),
+            quotas: BTreeMap::new(),
             ledger,
             vessels: Home::new("home").expect("declaration"),
             placed: BTreeMap::new(),
@@ -1066,7 +1066,7 @@ impl Fleet {
     /// The ledger's caps follow the convoy's quota in force.
     fn sync_caps(&mut self, convoy: i64) {
         let name = convoy.to_string();
-        let quota = self.convoys.get(&name).expect("admitted convoy").state().quota().clone();
+        let quota = self.quotas.get(&convoy).expect("admitted quota").clone();
         self.ledger.set_caps(ConvoyId::new(name, "home"), quota);
     }
 
@@ -1104,10 +1104,11 @@ impl Fleet {
         }))
     }
 
-    /// Convoys, vessels and the recorded placement evidence equal the model's,
+    /// Quotas, vessels and the recorded placement evidence equal the model's,
     /// and every live lease keeps `queuePriority` over the evidence it read.
     fn check(&self, state: &Value, step: &Step) {
-        check_convoys(&self.convoys, state, step);
+        let observed = map_of(self.quotas.iter().map(|(id, quota)| (int(*id), quota_value(quota))));
+        same(&observed, &state["quotas"], step, "admission quotas");
         let model = store(state, "::vessels");
         same(&slots(model, |id| self.vessel_value(id, step)), model, step, "vessel");
         same(&self.placed_value(), &state["placedOn"], step, "placedOn");
@@ -1182,14 +1183,19 @@ fn admission_placement(trace: &Trace, tally: &mut Tally) {
         };
         match step.action() {
             "admitRequest" => {
-                admit(&mut fleet.convoys, &step, convoy, tally);
+                assert!(!fleet.quotas.contains_key(&convoy), "{step}: admission sets a previously absent quota");
+                fleet.quotas.insert(convoy, BTreeMap::from([(class(0), 1), (class(1), 1)]));
+                tally.writes += 1;
                 fleet.sync_caps(convoy);
             }
             // The scenario readmits authorised, with `Map(0 -> count, 1 -> 1)`.
             "readmit" => {
                 let quota = BTreeMap::from([(class(0), small(step.pick("count"))), (class(1), 1)]);
-                let edge = convoy::Readmit { quota, by: by(), authority: owner() };
-                accept(&mut fleet.convoys, &convoy.to_string(), edge, &convoy_world(true, true), now, &step, tally);
+                let before = fleet.quotas.get(&convoy).expect("admitted quota");
+                assert_eq!(before.keys().collect::<Vec<_>>(), quota.keys().collect::<Vec<_>>(), "{step}: same quota keys");
+                assert!(before.iter().all(|(key, count)| quota[key] >= *count), "{step}: quota only rises");
+                fleet.quotas.insert(convoy, quota);
+                tally.writes += 1;
                 fleet.sync_caps(convoy);
             }
             "request" => {
@@ -1220,7 +1226,6 @@ fn admission_placement(trace: &Trace, tally: &mut Tally) {
             other => panic!("{step}: admission_placement operation {other}"),
         }
         fleet.check(step.after, &step);
-        probe_convoys(&mut fleet.convoys, step.after, now, &step, tally);
         fleet.probe(step.after, &step, tally);
         fleet.gone_refuses(step.after, now, &step, tally);
     }

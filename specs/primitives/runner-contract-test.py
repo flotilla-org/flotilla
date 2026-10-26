@@ -41,6 +41,43 @@ class RunnerContracts(unittest.TestCase):
             if tool != 'jar':
                 self.stub(tool, 'exit 99')
 
+    def test_quick_scenario_failures_print_the_step_log(self):
+        copy = self.root / 'quick'
+        copy.mkdir()
+        script = copy / 'check.sh'
+        shutil.copy(HERE / 'check.sh', script)
+        jar = self.root / 'apalache.jar'
+        jar.touch()
+        self.env['APALACHE_JAR'] = str(jar)
+        self.stub('quint', r'''case "$1" in
+  test) exit 0 ;;
+  verify) step=frames ;;
+  compile) step=compile ;;
+  run) step=replay ;;
+esac
+if [ "$FAIL_STEP" = "$step" ]; then
+  echo "diagnostic-$step-stdout"
+  echo "diagnostic-$step-stderr" >&2
+  exit 17
+fi
+echo '---- MODULE fixture ----'
+''')
+        self.stub('java', r'''if [ "$FAIL_STEP" = tlc ]; then
+  echo diagnostic-tlc-stdout
+  echo diagnostic-tlc-stderr >&2
+  exit 17
+fi
+echo 'Model checking completed. No error has been found'
+''')
+        for step in ('frames', 'compile', 'tlc', 'replay'):
+            with self.subTest(step=step):
+                self.env['FAIL_STEP'] = step
+                result = self.run_script(script, '--skip-store')
+                self.assertEqual(result.returncode, 17, result.stderr)
+                self.assertIn(f'.{step}.log', result.stderr)
+                self.assertIn(f'diagnostic-{step}-stdout', result.stderr)
+                self.assertIn(f'diagnostic-{step}-stderr', result.stderr)
+
     def test_deep_bound_change_is_verified_before_quint(self):
         copy = self.root / 'specs'
         shutil.copytree(HERE / 'scenarios', copy / 'scenarios')
