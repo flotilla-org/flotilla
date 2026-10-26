@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 
@@ -12,11 +13,15 @@ class JobSelection(unittest.TestCase):
         # ordinary PRs with no Rust inputs skip; main and stack tops stay full.
         script = Path(__file__).with_name('select-job.sh').resolve()
         selector = Path(__file__).with_name('selection.py').resolve()
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as runner_temp:
             root = Path(directory)
             (root / 'ci/affected').mkdir(parents=True)
             (root / 'ci/affected/selection.py').write_text(selector.read_text())
             (root / 'Cargo.toml').write_text('[package]\nname="fixture"\nversion="0.1.0"\nedition="2024"\n')
+            # Cargo must resolve the repository compiler pin, as it does in CI;
+            # optional components/targets are installed by the setup action.
+            pin = tomllib.loads((script.parents[2] / 'rust-toolchain.toml').read_text())['toolchain']['channel']
+            (root / 'rust-toolchain.toml').write_text(f'[toolchain]\nchannel="{pin}"\nprofile="minimal"\n')
             (root / 'src').mkdir()
             (root / 'src/lib.rs').write_text('')
             (root / 'bin').mkdir()
@@ -49,10 +54,10 @@ class JobSelection(unittest.TestCase):
                     ('pull_request', '{"position":1,"size":2}', '', '0', 'none' if path == 'README.md' else '-p fixture'),
                 ):
                     with self.subTest(path=path, event=event, stack=stack, label=label, error=error):
-                        output = root / 'output'
+                        output = Path(runner_temp) / 'output'
                         output.write_text('')
                         env = dict(os.environ, EVENT=event, STACK=stack, PR='1', GITHUB_REPOSITORY='fixture/repo',
-                                   TEST_LABEL=label, TEST_GH_EXIT=error, RUNNER_TEMP=directory,
+                                   TEST_LABEL=label, TEST_GH_EXIT=error, RUNNER_TEMP=runner_temp,
                                    GITHUB_OUTPUT=str(output), PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'])
                         subprocess.run(['bash', str(script)], cwd=root, env=env, check=True, capture_output=True)
                         self.assertEqual(output.read_text(), f'selection={expected}\n')

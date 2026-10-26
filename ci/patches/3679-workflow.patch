@@ -8,13 +8,15 @@
            python3 -m pip install -r ci/platform-tests/requirements.txt
            ci/platform-tests/test-run.sh
            python3 -m unittest discover -s ci/toolchain -p test_action.py
-@@ -238,15 +239,30 @@
+@@ -238,15 +239,29 @@
      name: Clippy
      runs-on: ubuntu-latest
      needs: fmt
 -    steps:
 -      - uses: actions/checkout@v7
 -      - name: Set up pinned Rust
+-        id: rust-pin
+-        uses: ./ci/toolchain/action
 +    permissions:
 +      contents: read
 +      pull-requests: read
@@ -22,6 +24,9 @@
 +      - uses: actions/checkout@v7
 +        with:
 +          fetch-depth: 2
++      - name: Set up pinned Rust
++        id: rust-pin
++        uses: ./ci/toolchain/action
 +      - name: Select Clippy packages
 +        id: packages
 +        env:
@@ -30,10 +35,6 @@
 +          STACK: ${{ toJSON(github.event.pull_request.stack) }}
 +          GH_TOKEN: ${{ github.token }}
 +        run: bash ci/affected/select-job.sh
-+      - name: Set up pinned Rust
-+        if: steps.packages.outputs.selection != 'none'
-         id: rust-pin
-         uses: ./ci/toolchain/action
        # Caches dependency artifacts only (workspace-member artifacts are
        # pruned before save) — the previous whole-target cache reached 4.5GB
        # and thrashed the repo's 10GB cache pool against compose's blobs.
@@ -42,7 +43,7 @@
          with:
            # Key on the repository's pin alone: rust-cache's environment hash also
            # lists every toolchain the runner image preinstalls, so two image
-@@ -255,8 +271,10 @@
+@@ -255,8 +270,10 @@
            add-rust-environment-hash-key: false
            save-if: ${{ github.ref == 'refs/heads/main' }}
            shared-key: "clippy"
@@ -54,7 +55,7 @@
          env:
            RUSTFLAGS: "-D warnings"
          run: |
-@@ -292,8 +310,8 @@
+@@ -292,8 +309,8 @@
      # Normal runs take about 10 minutes. A hung test (#3097) otherwise holds a
      # runner for GitHub's six-hour default.
      timeout-minutes: 40
@@ -65,7 +66,7 @@
      permissions:
        contents: read
        pull-requests: read
-@@ -318,28 +336,7 @@
+@@ -318,28 +335,7 @@
            PR: ${{ github.event.pull_request.number }}
            STACK: ${{ toJSON(github.event.pull_request.stack) }}
            GH_TOKEN: ${{ github.token }}
