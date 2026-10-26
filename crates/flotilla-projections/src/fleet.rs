@@ -74,9 +74,12 @@ pub async fn replicated_host_reports(
     }
     reports
 }
+
+#[derive(Debug, Clone)]
 pub enum ChangeStreamUpdate {
     /// A source tail advanced, but does not prove its full snapshot is servable.
     Progress(u64),
+    /// A complete follower round, or a source snapshot, clears prior failures.
     Healthy(u64),
     Failure {
         watermark: Option<u64>,

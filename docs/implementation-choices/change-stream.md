@@ -110,6 +110,9 @@ An unencodable row or excessive assembly produces `StoreError::ResourceLimit`, n
 home, kind and resource. This does not cap an entire snapshot or its disk spool. The home
 reports these refusals in its own health; successful tails advance its sequence without
 clearing an unservable-snapshot error. A successful full snapshot clears that error.
+If all peers keep tailing after the resource is removed, the source alarm remains until a fresh snapshot is requested;
+tail success alone cannot prove snapshot servability. The alarm remains in host
+status and never creates an unreachable replica for the local home.
 HTTP continuations encode producer failures as a terminal `Failure` frame so the follower
 sees the same reason as routed dispatch, rather than a generic broken-body error. Failed
 rounds never commit progress. These are query/wire types, not stored resource changes;

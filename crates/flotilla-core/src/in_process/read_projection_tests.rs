@@ -572,6 +572,31 @@ mod tests {
             FleetStaleness::Unreachable { last_sync: Some(sync), message }
                 if *sync == last_sync && message.contains("convoys: connection lost")
         ));
+
+        // A local source alarm stays visible in host status, but cannot create an
+        // unreachable replica or replace a local row's Local staleness.
+        fixture.fleet.report_change_stream(
+            &fixture.node_id,
+            flotilla_projections::fleet::ChangeStreamUpdate::Failure {
+                watermark: Some(3),
+                message: "local/rs/large: resource exceeds assembly limit".into(),
+            },
+        );
+        let local = FleetListRow::builder()
+            .convoy("local-source")
+            .vessel("work")
+            .crew("coder")
+            .crew_state("active")
+            .host(fixture.host_name.clone())
+            .namespace("flotilla")
+            .staleness(FleetStaleness::Local)
+            .build();
+        let response = fixture.projections().fleet_list("flotilla", vec![local], now).await.expect("local fleet row");
+        assert!(response.replicas.iter().all(|replica| replica.host != fixture.host_name));
+        assert_eq!(response.rows[0].staleness, FleetStaleness::Local);
+        let summary = fixture.registry.local_host_summary().await;
+        let status = fixture.projections().get_host_status(&summary.environment_id, &HashMap::new(), &summary).await.expect("local status");
+        assert!(status.change_stream.unwrap().last_error.unwrap().contains("local/rs/large"));
     }
 
     #[tokio::test]

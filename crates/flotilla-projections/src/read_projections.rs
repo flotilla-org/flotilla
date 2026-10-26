@@ -805,6 +805,11 @@ impl ReadProjections<'_> {
         let failures = self.fleet.replication_failures().await;
         let mut replication_failures_by_host = HashMap::<HostName, Vec<ResourceReplicationFailure>>::new();
         for (peer, peer_failures) in failures {
+            // Source-local snapshot alarms belong to host status, not a remote
+            // replica row that would incorrectly mark this home's rows unreachable.
+            if &peer == self.node_id {
+                continue;
+            }
             let host = self.host_registry.host_name_for_node(&peer).await.unwrap_or_else(|| HostName::new(peer.as_str()));
             replication_failures_by_host
                 .entry(host)
@@ -852,6 +857,8 @@ impl ReadProjections<'_> {
 
         for (peer, state) in self.fleet.change_streams() {
             let host = self.host_registry.host_name_for_node(&peer).await.unwrap_or_else(|| HostName::new(peer.as_str()));
+            // Health alone does not establish replica inventory or reachability.
+            // Unmatched healthy homes retain resident health without creating a row.
             if let Some(replica) = replicas.iter_mut().find(|replica| replica.host == host) {
                 replica.change_stream = Some(state);
             }

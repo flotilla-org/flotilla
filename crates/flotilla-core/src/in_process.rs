@@ -2169,6 +2169,8 @@ impl InProcessDaemon {
                 Err(error @ flotilla_schema_sqlite::StoreError::ResourceLimit { .. }) => {
                     ChangeStreamUpdate::Failure { watermark: None, message: error.to_string() }
                 }
+                // Source health here diagnoses unservable resources only. Consumer
+                // disconnects and transport errors are reported by each follower.
                 Err(_) => return,
             };
             fleet.report_change_stream(&node, update);
