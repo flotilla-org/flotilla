@@ -211,7 +211,10 @@ impl ArchiveShipper {
                         Ok(true) => report.expunged.push(identity),
                         // Still referenced: the identity stays as the tombstone, retried next pass.
                         Ok(false) => {}
-                        Err(error) => report.failed.push((identity, error)),
+                        Err(error) => {
+                            tracing::warn!(kind = %identity.kind, name = %identity.name, %error, "archive expunge failed; retried next pass");
+                            report.failed.push((identity, error));
+                        }
                     }
                 }
             }
@@ -361,7 +364,10 @@ pub(crate) fn readable(bundle: &Bundle, kinds: &KindRegistry) -> Result<Value, S
             Cell::Text(value) | Cell::Str(value) => json!(value),
             Cell::Blob(bytes) => match column.map(|column| &column.ty) {
                 Some(flotilla_schema::ColumnType::Cbor) => {
-                    flotilla_cbor::from_slice::<Value>(bytes, &Default::default()).unwrap_or_else(|_| json!(bytes))
+                    flotilla_cbor::from_slice::<Value>(bytes, &Default::default()).unwrap_or_else(|_| {
+                        use base64::Engine;
+                        json!({ "undecodable_cbor": base64::engine::general_purpose::STANDARD.encode(bytes) })
+                    })
                 }
                 _ => {
                     use base64::Engine;

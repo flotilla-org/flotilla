@@ -15,7 +15,9 @@
 //! The guarantee before the local, irreversible delete is that every configured store answered
 //! the upload and then served back the exact bytes (same SHA-256). It is not a proof of the
 //! store's own replication or durability; that is the object store's, and configuring more than
-//! one `[[blob_stores]]` store keeps more than one copy.
+//! one `[[blob_stores]]` store keeps more than one copy. Stores are written in turn, so a failure
+//! at a later store leaves the bundle at the earlier ones while the resource stays home; the next
+//! attempt writes the same key again, which is idempotent.
 //!
 //! Bundles are named by the resource's identity ([`bundle_key`]), so a reader holding only the
 //! kind, name and home finds one. The [`Archiver`] keeps no state of its own that a restart would
