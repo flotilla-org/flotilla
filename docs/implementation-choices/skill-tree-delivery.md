@@ -32,11 +32,17 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
   A cache hit never skips these checks. For a private source, the narrowed read token is minted on every staging. The mint is the live authority check, even when the bytes come from the cache. The token is used only by the host-side fetch, and never leaves the host.
 - **One daemon-private object cache per repository URL.** It sits under the daemon's state directory with mode 0700, in the same `revision_cache` layout as charter fetches, but in a separate root. A new `Vcs` method, `fetch_commit(cache, repo, sha, auth)`, keeps `fetch_revision`'s writer-owns-exclusion and deadline rules, and leaves its branch semantics unchanged. It works in two steps:
   1. **Exact want.** `git fetch --depth=1 --no-tags -- <repo> <sha>`. GitHub and protocol-v2 servers that allow reachable wants serve this.
-  2. **Fallback for servers that refuse an unadvertised want.** Some self-hosted Forgejo, Gitea or plain Git servers reject such a want, without `uploadpack.allowReachableSHA1InWant` or `allowAnySHA1InWant`. For those, the fallback fetches every advertised head, `+refs/heads/*:refs/flotilla/heads/*`, **without** a partial-clone filter, then checks `cat-file -e <sha>^{commit}`. A server that refuses unadvertised wants usually also refuses the lazy blob fetches a promisor clone would need later. Those reads would also fall outside the fetch's credential helper, exclusion window and error classification. So every object that the later tree reads use is local by the time `fetch_commit` returns.
+  2. **Fallback for servers that refuse an unadvertised want.** Some self-hosted Forgejo, Gitea or plain Git servers reject such a want, without `uploadpack.allowReachableSHA1InWant` or `allowAnySHA1InWant`. For those, the fallback fetches every advertised branch and tag, `+refs/heads/*:refs/flotilla/heads/*` and `+refs/tags/*:refs/flotilla/tags/*`, **without** a partial-clone filter, then checks `cat-file -e <sha>^{commit}`. A server that refuses unadvertised wants usually also refuses the lazy blob fetches a promisor clone would need later. Those reads would also fall outside the fetch's credential helper, exclusion window and error classification. So every object that the later tree reads use is local by the time `fetch_commit` returns.
+
+     The fallback's cost is bounded by the same 300 s writer deadline as every fetch. Hitting the deadline is transient. Each fallback run emits a `warn!` naming the source and the repository, and increments a `skill_source_fetch_fallback` counter, so a monorepo on a restrictive server shows up in the logs and the metrics.
 
   Afterwards, `FETCH_HEAD`, or the object found by the fallback, must be exactly `<sha>`.
   - Public sources run with ambient credentials disabled: `GIT_CONFIG_GLOBAL=/dev/null`, an empty `credential.helper`, `GIT_TERMINAL_PROMPT=0`, and no askpass.
-  - A private source gets a per-command credential helper that reads the minted token file.
+  - A private source gets a per-command credential helper that reads the minted token file:
+    - The token file is `0600`, inside a `0700` per-attempt directory under the daemon's private state.
+    - It is removed when `fetch_commit` returns, on success or failure.
+    - The token value never appears in argv or in the environment. Only the file's path is passed, and the helper prints the value to Git on stdin and stdout.
+    - Tests assert this against the recorded runner calls.
 - **Cache key and private content.** The key is the repository URL, not the source name. Bytes are served only for an entry that the current supply has just authorized for that repository. The cache stores Git objects and nothing derived from a selection.
 - **Retention.** Each staging touches `<cache>/flotilla-last-use` while it holds the cache's exclusion. Retirement takes the same exclusion and tombstone-renames caches whose last use is more than 7 days old. The daemon's `flotillad-lifecycle.lock` already excludes a second daemon on the same state directory, so a staging can never overlap retirement of its cache. A retired cache costs one refetch, never a refusal.
 - **Old pins on standing convoys are always fetched from source.** There is no generation artifact, which is the ruling.
@@ -44,12 +50,12 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
 
   | Evidence | Disposition |
   |---|---|
-  | Both fetch steps succeed, but the commit is absent | **Permanent:** `skill source <name> revision <sha>: <repository> could not serve this pinned revision (not reachable from any advertised branch, and the server refuses fetch by SHA); re-pin the crew's skills to a revision the server serves` |
+  | Both fetch steps succeed, but the commit is absent | **Permanent:** `skill source <name> revision <sha>: <repository> could not serve this pinned revision (not reachable from any advertised branch or tag, and the server refuses fetch by SHA); re-pin the crew's skills to a revision the server serves` |
   | The forge rejects a freshly minted token, or the public request, with 401, 403, `Permission denied (publickey)` or `repository not found` | **Permanent:** authority refusal (today's `is_auth_failure` patterns) |
   | Supply authorization or the credential mint refuses | **Permanent** |
   | Anything else, including an unclassified Git exit | **Transient** |
 
-  "Not our ref" from step 1 is never a refusal; it only selects step 2. The permanent row can also be a server limit rather than a missing commit, for example an old pin that a force-push orphaned, or one reachable only from a tag or a PR ref. The diagnostic therefore says the server could not serve the SHA, not that it does not exist, and it names re-pinning as the operator's remedy. The default being transient means a misclassification costs retries, not a broken standing convoy.
+  "Not our ref" from step 1 is never a refusal; it only selects step 2. The permanent row can also be a server limit rather than a missing commit, for example an old pin that a force-push orphaned, or one reachable only from a PR ref or another unadvertised ref. The diagnostic therefore says the server could not serve the SHA, not that it does not exist, and it names re-pinning as the operator's remedy. The default being transient means a misclassification costs retries, not a broken standing convoy.
 - **Alternative considered:** retaining source artifacts produced with the catalog (the issue's option 2). The owner's ruling that skills stay out of the generation rules it out.
 
 ## Decision 2: supported tree metadata
@@ -58,13 +64,16 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
 
 | Git entry | Policy |
 |---|---|
-| `100644` blob | Delivered as a regular file, read-only to the crew (`0444`, in a `0555` directory) |
-| `100755` blob | Delivered with the execute bit (`0555`) |
+| `100644` blob | Delivered as a private regular file (`0600`, in a `0700` directory) |
+| `100755` blob | Delivered with the owner's execute bit (`0700`) |
 | `120000` symlink, internal or escaping | **Refused**, naming the source, revision and path |
 | `160000` gitlink (submodule) | **Refused**, with the same diagnostic |
 | Anything outside the selected path | Never read |
 
-- **Read-only, immutable material.** A tree is immutable once published, and its digest names it. Crew writes go to the crew home, not into skills. This keeps the agent's digest index honest.
+- **Immutable by contract, owner-writable by mode.** A published tree is never modified by Flotilla, and its digest names it. Its modes are private but owner-writable, which matches today's `umask 077` stager.
+  - Read-only modes would protect nothing against the owning user, who can `chmod`.
+  - They would break every existing removal of a crew or harness home that uses plain `rm -rf` or `remove_dir_all`. That includes `RemoteStaging`'s drop and the agentless vessel retirement of its local root.
+  - A crew that edits its own published tree affects only itself. That edit is not repaired until the next new digest. Repairing it would need a full rehash on every hit, which the owner's digest-index ruling rejects.
 - **Name check.** The selected path must contain `SKILL.md` at its root, and the frontmatter `name` must equal the frozen name. Imports are not discovered, and only the selected directories are included.
 - **Bounds.** At most 4,096 entries per tree, a depth of 16, 16 MiB per file and 64 MiB per crew tree. Exceeding any bound is a permanent refusal. These match the existing order of magnitude for guest material, and skills are small.
 - **Why refuse links rather than allow internal ones:**
@@ -74,7 +83,7 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
 - **Archive form.** The archive is a canonical uncompressed POSIX tar:
   - entries sorted by path;
   - only directories and regular files;
-  - mode 0555 or 0444;
+  - mode 0700 for directories and executables, 0600 for other files;
   - uid/gid 0, mtime 0, empty owner names.
 
   The bytes are a pure function of the selection and the source bytes. Rust builds the archive, so the guest unpacks only entries that Rust already validated.
@@ -97,7 +106,7 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
 - **Guest toolset.** The admitted guest matrix is Linux only. The runner path needs:
   - `mv -T`, which has been in GNU coreutils since 2004 and is in BusyBox;
   - `tar -x -o`, meaning no-same-owner;
-  - `sha256sum`, `find -mmin`, `readlink`, `chmod` and `ln -s`.
+  - `cat`, `sha256sum`, `find -mmin`, `readlink` and `ln -s`.
 
   This is unlike `mv --exchange`, which needs coreutils 9.5. Before the first publication, the runner probes for these tools. A missing tool is a permanent refusal that names it.
 
@@ -105,14 +114,25 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
 - **Ownership.** Everything is unpacked, flipped and reaped by the runner's user, which also owns the crew home. Extraction uses `-o`, so the tar's uid/gid 0 is never applied.
 - **Publication, per destination:**
   1. If `<digest>/` exists and contains `.flotilla-sources.json`, it is complete, because the rename in step 2 is its only creator. Run `touch <digest>`, then skip to step 3.
-  2. Unpack into `<digest>.partial-<attempt>` and check the archive digest, then `chmod` the trees to their final modes and `rename` the partial to `<digest>`, then `touch` the directory. A rename onto an existing `<digest>/` can fail with `ENOTEMPTY` or `EEXIST`. Because only complete trees ever carry that name, the attempt then counts as success, removes its partial and continues to step 3.
+  2. Unpack into `<digest>.partial-<attempt>` and check the archive digest, then `rename` the partial to `<digest>`, then `touch` the directory. A rename onto an existing `<digest>/` can fail with `ENOTEMPTY` or `EEXIST`. Because only complete trees ever carry that name, the attempt then counts as success, removes its partial and continues to step 3.
      - With drydock#84, this step is the agent's digest-checked streamed unpack.
-     - Before drydock#84, the runner pipes the tar to `tar -xof - -C <partial>` on stdin. That works for Docker exec, the SSH runner and the agent exec alike. The guest then hashes the received bytes with `sha256sum` against the expected digest.
+     - Before drydock#84, the runner checks the digest **before** extraction, in plain `sh` without process substitution:
+       1. `cat > <partial>.tar` reads stdin into a file.
+       2. `sha256sum` hashes that file, and the guest compares the result with the expected digest.
+       3. Only on a match does `tar -xof <partial>.tar -C <partial>` run.
+       4. The `.tar` file is removed.
+
+       This works for Docker exec, the SSH runner and the agent exec alike. The archive is at most 64 MiB, so it can be buffered on disk.
+       - A mismatch removes the file and the partial and never extracts; it is a transient failure.
+       - When `tar` fails after a matching digest, the partial is left unrenamed for step 5 to reap. That failure is also transient.
+       - In no case is a `.partial-*` renamed unless both the digest and the extraction succeeded.
   3. Flip `skills` to the new tree.
      - If `skills` already names a different digest, first record that digest: `ln -s <old target> skills.prev.<attempt> && mv -Tf skills.prev.<attempt> skills.prev`.
      - Then run `ln -s .flotilla-skills/<digest> skills.<attempt> && mv -Tf skills.<attempt> skills`.
 
      A single `rename(2)` means a reader resolving `skills` sees the complete old tree or the complete new one. `skills.prev` is never read by a harness; it records only what step 5 must keep.
+
+     The order, `skills.prev` first and then `skills`, is intentional. A crash between the two leaves `skills.prev` naming the tree that is still current. That only protects that tree from reaping, which is harmless, and the next flip corrects it.
   4. Verify that `readlink skills` equals the target, **and** that `skills/.flotilla-sources.json` resolves through the link. This is the completion record.
      - A link text that matches but points at a missing tree means a concurrent reaper won. The attempt returns to step 2 once, which runs a fresh unpack and `touch`, then fails as transient.
      - Each of the three outer retries (see "Retry and cancellation") restarts at step 1 with a new `<attempt>` id and a fresh `touch`. A reaper-induced failure therefore always gets a newly protected tree, and it cannot exhaust the retries on one stale tree.
@@ -129,13 +149,20 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
      - `*.partial-*` directories;
      - `skills.<attempt>` and `skills.prev.<attempt>` temporary links, left behind when `mv -T` failed or an exec was cut off.
 
-     Removal is `chmod -R u+w -- <dir> && rm -rf -- <dir>`, because the trees are read-only. Legacy directories are removed the same way.
+     Removal is `rm -rf -- <dir>`. Legacy directories and `*.partial-*.tar` files are removed the same way.
+- **Harnesses follow the link.** Claude Code 2.1.287 was checked with `CLAUDE_CONFIG_DIR` pointing at a home whose `skills` is a relative link to `.flotilla-skills/<digest>`. Its debug log reports `Loading skills from: … user=<home>/skills` and then `Loaded 1 unique skills (… user: 1 …)`, and it watches the linked directory for changes.
+  - Codex is not installed in this vessel. The build adds a harness-level check for both adapters, which launches skill discovery against a linked home in each pinned harness image, as build evidence.
+  - The link is relative, and its target is a sibling inside the same home. It therefore resolves wherever the home is mounted, with no dependence on host paths.
 - **Ambiguous activation.** When an exec disconnects or times out, the next attempt starts by reading the link. If it already names the target digest, the attempt reports success without writing anything. Activation is therefore reconcilable by identity alone.
 - **Retained previous tree.** Step 5 keeps the `skills.prev` target, so a reader that resolved `skills` just before a flip keeps finding sibling files through one flip. This is a per-resolution guarantee. No multi-open snapshot across repeated flips is claimed.
 - **Pre-existing real directory.** This is a vessel staged by today's stager and restaged on cloud adoption. `rename(2)` cannot replace a non-empty directory with a link.
   - The real directory is first renamed to `.flotilla-skills/legacy-<attempt>`, and then the link is created.
   - Between those two renames, `skills` is briefly absent. This is the one stated exception to old-or-new, and it occurs only on the first restage of a pre-upgrade vessel.
   - `renameat2(RENAME_EXCHANGE)` would close the gap, but it needs coreutils 9.5's `mv --exchange` or a guest helper. Agentless SSH hosts cannot be assumed to have either.
+- **Which selection is authoritative.** The authoritative selection is the crew's admission-frozen selection in the environment spec's `FLOTILLA_CREW_SKILLS`.
+  - Live attempts for one destination are serialized by the daemon's keyed mutex, held across retries.
+  - A cancelled attempt's flip exec can still land after a newer attempt has run. So before launching a harness, `crew_environment` checks that `readlink skills` names the digest of the current selection. If it does not, it republishes that selection, and the launch is the final check.
+  - Same-digest writers need none of this. It covers only the rare case where the desired digest changed, for example after a roll that changes canonicalization.
 - **Retry and cancellation.**
   - Transient failures are retried three times with backoff 1 s, 2 s and 3 s: Git transport errors, runner or exec transport errors, and unpack I/O errors.
   - Permanent refusals are not retried: authority, missing pin, tree policy, bounds and name mismatch.
@@ -179,7 +206,7 @@ The build's test budget is in the PR description. The coverage that the review a
   - a reaper racing a `touch`;
   - retention of the `skills.prev` target past 60 minutes;
   - a leaked `skills.<attempt>` link being reaped;
-  - read-only reaping;
+  - ordinary `rm -rf` removal of a crew home holding published trees;
   - legacy-directory migration;
   - a failed unpack;
   - a disconnected attempt racing its retry.
