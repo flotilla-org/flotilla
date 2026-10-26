@@ -321,32 +321,115 @@ async fn missing_host_binary_is_not_ready() {
     .unwrap();
 }
 
-// Failed refreshes must neither replace the recovery floor nor leave a partial
-// archive. Credential-bearing survivors remain private and explicitly retained.
+// #3745: transport EOF without Exit must fail asset delivery without
+// replacing a recovery archive; cancellation must remove the temporary archive.
 #[tokio::test]
-async fn failed_checkpoint_retains_last_archive_and_removes_partial() {
-    struct Broken;
-    #[async_trait]
-    impl CommandRunner for Broken {
-        async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
-            unreachable!()
-        }
-        async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
-            unreachable!()
-        }
-        async fn exists(&self, _: &str, _: &[&str]) -> bool {
-            false
-        }
-        async fn run_to_file(&self, _: &str, _: &[&str], _: &Path, destination: &Path) -> Result<(), String> {
-            tokio::fs::write(destination, b"partial").await.unwrap();
-            Err("connection lost".into())
+async fn truncated_agent_streams_preserve_recovery_and_reject_assets() {
+    use axum::{
+        body::{Body, Bytes},
+        routing::{get, post},
+        Router,
+    };
+    use drydock_agent::ExecEvent;
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // Fake only the guest's HTTP response boundary; use real yamux, HTTP/2,
+    // agent framing, AgentRunner, upload, and checkpoint publication/cleanup.
+    const COMPLETE: u8 = 0;
+    const TRUNCATED: u8 = 1;
+    const STALLED: u8 = 2;
+    // Requests are sequential across phases, so each handler reads its phase mode.
+    let mode = Arc::new(AtomicU8::new(COMPLETE));
+    let (host, guest) = tokio::io::duplex(64 * 1024);
+    let (host, guest) = tokio::join!(
+        drydock_transport::Transport::yamux(Box::new(host), true, Default::default()),
+        drydock_transport::Transport::yamux(Box::new(guest), false, Default::default())
+    );
+    let mut guest = guest.unwrap();
+    let state = mode.clone();
+    let server = tokio::spawn(async move {
+        let router = Router::new()
+            .route(
+                "/hello",
+                get(|| async {
+                    axum::Json(drydock_agent::Hello { fingerprint: "fault-fixture".into(), features: vec![], platform: None })
+                }),
+            )
+            .route(
+                "/exec",
+                post(move || {
+                    let mode = state.load(Ordering::SeqCst);
+                    async move {
+                        let bytes = if mode == COMPLETE { b"archive bytes".as_slice() } else { b"partial replacement".as_slice() };
+                        let mut events = vec![ExecEvent::Stdout(bytes.to_vec()), ExecEvent::Stderr(b"secret guest stderr".to_vec())];
+                        if mode == COMPLETE {
+                            events.push(ExecEvent::Exit { code: Some(0) });
+                        }
+                        let bytes = events
+                            .into_iter()
+                            .flat_map(|event| {
+                                let mut bytes = serde_json::to_vec(&event).unwrap();
+                                bytes.push(b'\n');
+                                bytes
+                            })
+                            .collect::<Vec<_>>();
+                        let end = if mode == STALLED { futures::stream::pending().boxed() } else { futures::stream::empty().boxed() };
+                        Body::from_stream(futures::stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(bytes)) }).chain(end))
+                    }
+                }),
+            );
+        drydock_transport::http2::serve(guest.accept().await.unwrap().unwrap(), router).await.unwrap();
+    });
+    struct Server(tokio::task::JoinHandle<()>);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.0.abort();
         }
     }
+    let _server = Server(server);
+    let agent = Arc::new(drydock_agent::Client::connect(host.unwrap(), "fault-fixture").await.unwrap());
+    let runner = Arc::new(runner::AgentRunner(agent.clone()));
     let directory = tempfile::tempdir().unwrap();
     let target = directory.path().join("checkpoint.tar");
-    tokio::fs::write(&target, b"last complete").await.unwrap();
-    assert!(write_checkpoint(Arc::new(Broken), &target, Path::new("/work")).await.is_err());
-    assert_eq!(tokio::fs::read(&target).await.unwrap(), b"last complete");
+    write_checkpoint(runner.clone(), &target, Path::new("/work")).await.unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"archive bytes");
+    mode.store(TRUNCATED, Ordering::SeqCst);
+    let assets = tempfile::tempdir().unwrap();
+    let folder = assets.path().join("folder");
+    std::fs::create_dir(&folder).unwrap();
+    let link = assets.path().join("link");
+    std::os::unix::fs::symlink("folder", &link).unwrap();
+    for source in [&folder, &link] {
+        let error = reach::upload(&agent, source, Path::new("/asset")).await.unwrap_err();
+        assert_eq!(error, "drydock guest operation failed (UnexpectedEof)");
+    }
+    let error = write_checkpoint(runner.clone(), &target, Path::new("/work")).await.unwrap_err();
+    assert_eq!(error, "drydock guest operation failed (UnexpectedEof)");
+    assert_eq!(std::fs::read(&target).unwrap(), b"archive bytes");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    mode.store(STALLED, Ordering::SeqCst);
+    let capture = tokio::spawn({
+        let target = target.clone();
+        async move { write_checkpoint(runner, &target, Path::new("/work")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut entries = tokio::fs::read_dir(directory.path()).await.unwrap();
+            let mut partial_exists = false;
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                partial_exists |= entry.path() != target;
+            }
+            if partial_exists {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    capture.abort();
+    assert!(capture.await.unwrap_err().is_cancelled());
+    assert_eq!(std::fs::read(&target).unwrap(), b"archive bytes");
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
 }
 
@@ -548,44 +631,6 @@ async fn closed_session_reconnects_on_liveness() {
     handle.observe().await;
     assert_eq!(recovery.connects.load(Ordering::SeqCst), 2);
     handle.destroy().await.unwrap();
-}
-
-// #3765 F3: cancelling a streaming checkpoint removes partial host material
-// while preserving the last complete survivor. Fake the remote stream boundary.
-#[tokio::test]
-async fn cancelled_checkpoint_removes_partial_material() {
-    struct Stream(tokio::sync::Notify);
-    #[async_trait]
-    impl CommandRunner for Stream {
-        async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
-            unreachable!()
-        }
-        async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
-            unreachable!()
-        }
-        async fn exists(&self, _: &str, _: &[&str]) -> bool {
-            false
-        }
-        async fn run_to_file(&self, _: &str, _: &[&str], _: &Path, destination: &Path) -> Result<(), String> {
-            tokio::fs::write(destination, b"partial credential material").await.unwrap();
-            self.0.notify_one();
-            std::future::pending().await
-        }
-    }
-    let directory = tempfile::tempdir().unwrap();
-    let target = directory.path().join("checkpoint.tar");
-    tokio::fs::write(&target, b"complete").await.unwrap();
-    let runner = Arc::new(Stream(Default::default()));
-    let task = tokio::spawn({
-        let runner = runner.clone();
-        let target = target.clone();
-        async move { write_checkpoint(runner, &target, Path::new("/workspace")).await }
-    });
-    runner.0.notified().await;
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
-    assert_eq!(std::fs::read(target).unwrap(), b"complete");
 }
 
 // #3765 S2: build caches do not consume the survivor budget, and an oversized
