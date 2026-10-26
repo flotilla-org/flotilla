@@ -396,8 +396,20 @@ pub fn git_process_discovery(_legacy_mode: bool) -> flotilla_discovery::Discover
     minimal_discovery_runtime(std::sync::Arc::new(flotilla_provider_runtime::ProcessCommandRunner))
 }
 
+// Process boundary: ordinary discovery fixtures model a controller with valid forge credentials.
+struct AvailableObservationCredential;
+#[async_trait]
+impl flotilla_discovery::observation_credentials::ObservationCredentialProbe for AvailableObservationCredential {
+    async fn available(&self, _: &dyn CommandRunner, _: &str) -> bool {
+        true
+    }
+}
+
 fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> flotilla_discovery::DiscoveryRuntime {
     DiscoveryRuntime::builder()
+        .observation_credentials(flotilla_discovery::observation_credentials::ObservationCredentials::new(Arc::new(
+            AvailableObservationCredential,
+        )))
         .runner(runner)
         .env(std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")])))
         .available_space_probe(fixed_available_space_probe())
@@ -1283,6 +1295,9 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
     }
 
     DiscoveryRuntime::builder()
+        .observation_credentials(flotilla_discovery::observation_credentials::ObservationCredentials::new(Arc::new(
+            AvailableObservationCredential,
+        )))
         .runner(runner)
         .env(Arc::new(TestEnvVars::default()))
         .available_space_probe(fixed_available_space_probe())

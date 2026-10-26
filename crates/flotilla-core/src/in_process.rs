@@ -282,6 +282,7 @@ impl IssueQueryPort for ProviderIssueQueryPort {
             .environment_manager
             .environment_runner(&self.local_environment_id)
             .ok_or_else(|| format!("environment runner not found: {}", self.local_environment_id))?;
+        self.discovery.observation_credentials.require_for_bag(runner.as_ref(), &bag).await?;
         // Source observers retain a strong lease. Re-resolving a host-only
         // capability must not recreate its ETag cache while that lease lives.
         // Environment or configuration changes invalidate the old capability.
@@ -5556,11 +5557,54 @@ impl InProcessDaemon {
     pub async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String> {
         let namespace = requested_namespace.map(ToOwned::to_owned).unwrap_or(self.provisioning_namespace().await);
         let (mut explanation, convoy) = self.read_projections().explain_convoy_with_resource(&namespace, name).await?;
+        let failures = self.discovery.observation_credentials.failures();
+        if !failures.is_empty() {
+            let repositories = self
+                .resource_backend
+                .query_declared::<Repository>(
+                    &namespace,
+                    &flotilla_store::StoreQuery::names(
+                        convoy.spec.repositories.iter().map(|repository| repository.repo_ref.to_string()),
+                        true,
+                    ),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let forges = self.resource_backend.definitions::<Forge>(&namespace).list().await.map_err(|error| error.to_string())?;
+            let forges = forges.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
+            let mut services = flotilla_discovery::observation_credentials::ObservationCredentials::repository_services(
+                repositories.items.iter().map(|repository| &repository.object.spec),
+                &forges,
+            )?;
+            services.extend(convoy.spec.issues.iter().map(|issue| issue.reference.source.service.trim_end_matches('/').to_string()));
+            explanation.warnings.extend(failures.into_iter().filter(|(service, _)| services.contains(service)).map(|(_, error)| error));
+        }
         match self.convoy_dispatch_scores(&namespace, &convoy).await {
             Ok(scores) => explanation.dispatch_scores = scores,
             Err(error) => explanation.dispatch_score_error = Some(error),
         }
         Ok(explanation)
+    }
+
+    /// Source-specific credential failures are advisory on the Host; admission checks the selected forge directly.
+    pub async fn observation_credential_conditions(&self) -> Vec<flotilla_resources::HostCondition> {
+        self.discovery.observation_credentials.refresh_known(self.discovery.runner.as_ref()).await;
+        self.discovery
+            .observation_credentials
+            .failures()
+            .into_iter()
+            .map(|(service, error)| {
+                flotilla_resources::HostCondition::builder()
+                    .condition_type(format!("ForgeObservationCredential/{service}"))
+                    .value(flotilla_resources::ConditionValue::False)
+                    .reason("ObservationCredentialUnavailable")
+                    .message(error)
+                    .observed_at(self.clock.now())
+                    .blocks_readiness(false)
+                    .blocks_forge_observation(false)
+                    .build()
+            })
+            .collect()
     }
 
     async fn convoy_dispatch_scores(
