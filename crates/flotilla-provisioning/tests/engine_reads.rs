@@ -327,7 +327,7 @@ fn a_vessel_written_through_the_binding_reads_by_its_old_name() {
     assert_eq!(view.name, obj.metadata.name);
     assert_eq!(view.judgement, Judgement::InProgress);
 
-    // Failure before readiness is read from the engine, even when no old-status patch is applied.
+    // Failure is visible only through the engine: this snapshot deliberately receives no status patch.
     let failure = VesselStatusPatch::MarkFailed { message: "provider refused provisioning".into() };
     let decision = decide::<VesselBinding>(vessels.as_ref(), &obj, Some(failure), chrono::Utc::now());
     assert!(decision.ended);
