@@ -177,6 +177,7 @@ ADR 0064 §"Roles, inboxes and delivery" records that addresses never carry a ho
   An `interrupting` flag and a body digest are not carried over.
 - **The body is kept until expunge** (#3424 ruling 5). A message record is immutable, so its body is never compacted. Retention is the archive's job; trimming, if disk ever forces it, is per-kind deletion in the archive, never an edit of a record.
 - **Senders are declared roles** (#3424 ruling 6). A person sends as their declared role, and each `system:` producer (turn rules, nudges, the stall judge, capabilities, the fleet store, holds) becomes a declared fleet role. There is no `system` address kind.
+- **Roles by context** (owner ruling on #3457, 2026-10-26, [6423395763](https://github.com/flotilla-org/flotilla/issues/3457#issuecomment-6423395763)): escalations, gates and person-sent messages address roles in their own context (project, else fleet); a person consumer may hold many role inboxes; gate targets are chosen by context rules and may be agents.
 - **Dead letters** go to the sender's supervisor, unless the sender is that supervisor.
 
 ### Admission and capacity

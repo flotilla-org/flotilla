@@ -207,13 +207,39 @@ fn dead_lettered_imports_as_dropped_undeliverable() {
     );
 }
 
-// Behaviour: a person sender, a successor-less supersession and a missing
-// delivered session are refused with the record named, never guessed.
+// Behaviour (#3938): a person at either end imports as the role they hold
+// in the message's context: the operator role of the crew's project, or of
+// the fleet when neither end has a project.
+#[test]
+fn person_records_import_as_the_operator_role_of_their_context() {
+    let records = [
+        record("message-to", spec(RECEIVER, "principal:implicit", MessageExpectation::None), status(MessagePhase::Accepted, Some(1), None)),
+        record(
+            "message-from",
+            spec("principal:operator", RECEIVER, MessageExpectation::None),
+            status(MessagePhase::Deliverable, Some(2), None),
+        ),
+        record(
+            "message-fleet",
+            spec("principal:alice", "system:stall-judge", MessageExpectation::None),
+            status(MessagePhase::DeadLettered, Some(3), None),
+        ),
+    ];
+    let to = import_named(&records, "message-to").unwrap_or_else(|refusal| panic!("{refusal}"));
+    assert_eq!(to.resource.spec().sender.as_str(), "project:flotilla/role:operator");
+    let from = import_named(&records, "message-from").unwrap_or_else(|refusal| panic!("{refusal}"));
+    assert_eq!(from.resource.name(), "project:flotilla/role:operator/message:message-from");
+    let fleet = import_named(&records, "message-fleet").unwrap_or_else(|refusal| panic!("{refusal}"));
+    assert_eq!(fleet.resource.spec().inbox.as_str(), "fleet:fleet/role:operator");
+    for imported in [to, from, fleet] {
+        check(&imported.resource).expect("the machine accepts the restored state");
+    }
+}
+
+// Behaviour: a successor-less supersession and a missing delivered session
+// are refused with the record named, never guessed.
 #[test]
 fn unmappable_records_are_refused_by_name() {
-    let person =
-        [record("message-p", spec(RECEIVER, "principal:alice", MessageExpectation::None), status(MessagePhase::Accepted, Some(1), None))];
-    assert_eq!(import_named(&person, "message-p").expect_err("person sender").record, "message-p");
     let orphan = [record(
         "message-s",
         spec(RECEIVER, "system:turn-rules", MessageExpectation::None),
@@ -289,7 +315,7 @@ fn generated_records_import_or_are_refused_by_name(tc: TestCase) {
                 assert!(records.iter().any(|record| record.metadata.name == refusal.record), "{refusal}");
                 // A waiting record needs no evidence: only an unmappable address refuses it.
                 let record = records.iter().find(|record| record.metadata.name == refusal.record).expect("named");
-                let mappable = |address: &str| !address.starts_with("principal:") && !address.starts_with("topic:");
+                let mappable = |address: &str| !address.starts_with("topic:");
                 let waiting = record.status.as_ref().is_some_and(|status| status.phase.is_waiting());
                 assert!(
                     !(waiting && mappable(&record.spec.receiver) && mappable(&record.spec.sender) && record.spec.supersedes.is_none()),

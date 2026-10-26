@@ -1392,6 +1392,30 @@ fn format_stall_evidence(text: &str, full: bool) -> String {
     abbreviated
 }
 
+/// One block per waiting message: its name, inbox, sender, home and what
+/// settles it, then its body.
+fn format_person_inbox_human(inbox: &flotilla_protocol::PersonInboxResponse) -> String {
+    if inbox.items.is_empty() {
+        return "no messages wait for you".into();
+    }
+    let blocks: Vec<_> = inbox
+        .items
+        .iter()
+        .map(|item| {
+            format!(
+                "{}\n  to {} from {} at {}, expects {}\n\n{}",
+                item.message,
+                item.inbox,
+                item.sender,
+                item.home,
+                item.expects,
+                item.body.lines().map(|line| format!("  {line}")).collect::<Vec<_>>().join("\n")
+            )
+        })
+        .collect();
+    blocks.join("\n\n")
+}
+
 /// Format a `CommandValue` as a short human-readable string.
 fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> String {
     use flotilla_protocol::commands::CommandValue;
@@ -1540,6 +1564,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::CrewCapabilities { card } => card.clone(),
         CommandValue::MessageContacts { text, .. } => text.clone(),
         CommandValue::CrewList(crew) => format_crew_list_human(crew),
+        CommandValue::PersonInbox(inbox) => format_person_inbox_human(inbox),
         CommandValue::DaemonLogs { lines } => lines.join("\n"),
         CommandValue::ProjectExplanation(explanation) => serde_json::to_string_pretty(explanation).expect("serialize project explanation"),
         CommandValue::ConvoyExplanation(explanation) => format_convoy_explanation_human(explanation),

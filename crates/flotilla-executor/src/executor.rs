@@ -148,6 +148,9 @@ pub async fn build_plan(
         | CommandAction::ResourceReconcileNow { .. }
         | CommandAction::MessageDeliverBatch { .. }
         | CommandAction::MessageFailBatch { .. }
+        | CommandAction::PersonInbox { .. }
+        | CommandAction::PersonAcknowledge { .. }
+        | CommandAction::PersonAnswer { .. }
         | CommandAction::ResourceStatusPatch { .. }
         | CommandAction::ResourceDelete { .. }
         | CommandAction::ResourceWatch { .. } => {

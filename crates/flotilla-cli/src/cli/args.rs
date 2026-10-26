@@ -337,21 +337,48 @@ pub enum MessageVerb {
         #[arg(long)]
         role: Option<String>,
     },
+    /// List the messages waiting for you in your role inboxes; listing takes none of them
+    Inbox {
+        #[arg(long)]
+        namespace: Option<String>,
+    },
+    /// Acknowledge a message waiting for you: your receipt
+    Acknowledge {
+        /// The message, as `message inbox` names it
+        message: String,
+        #[arg(long)]
+        namespace: Option<String>,
+    },
+    /// Answer a message waiting for you: your receipt, then your reply to its sender
+    Answer {
+        /// The message, as `message inbox` names it
+        message: String,
+        /// The reply
+        body: String,
+        #[arg(long)]
+        namespace: Option<String>,
+    },
 }
 
 impl MessageNoun {
     pub fn resolve(self) -> std::result::Result<flotilla_commands::Resolved, String> {
-        let MessageVerb::Contacts { crew_id, namespace, convoy, vessel, role } = self.verb;
-        let context = flotilla_protocol::CrewCommandContext {
-            crew_id: crew_id.or_else(|| std::env::var("FLOTILLA_CREW_ID").ok()),
-            namespace,
-            convoy,
-            vessel_ref: vessel,
-            role,
+        use flotilla_protocol::CommandAction;
+        let action = match self.verb {
+            MessageVerb::Contacts { crew_id, namespace, convoy, vessel, role } => {
+                let context = flotilla_protocol::CrewCommandContext {
+                    crew_id: crew_id.or_else(|| std::env::var("FLOTILLA_CREW_ID").ok()),
+                    namespace,
+                    convoy,
+                    vessel_ref: vessel,
+                    role,
+                };
+                CommandAction::QueryMessageContacts { context }
+            }
+            MessageVerb::Inbox { namespace } => CommandAction::PersonInbox { namespace },
+            MessageVerb::Acknowledge { message, namespace } => CommandAction::PersonAcknowledge { namespace, message },
+            MessageVerb::Answer { message, body, namespace } => CommandAction::PersonAnswer { namespace, message, body },
         };
-        Ok(flotilla_commands::Resolved::Ready(
-            flotilla_protocol::Command::builder().action(flotilla_protocol::CommandAction::QueryMessageContacts { context }).build(),
-        ))
+        Ok(flotilla_commands::Resolved::Ready(flotilla_protocol::Command::builder().action(action).build()))
     }
 }
 

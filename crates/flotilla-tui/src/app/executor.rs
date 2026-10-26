@@ -227,6 +227,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::CrewCapabilities { .. }
         | CommandValue::MessageContacts { .. }
         | CommandValue::CrewList(_)
+        | CommandValue::PersonInbox(_)
         | CommandValue::DaemonLogs { .. }
         | CommandValue::ProjectExplanation(_)
         | CommandValue::ConvoyExplanation(_)

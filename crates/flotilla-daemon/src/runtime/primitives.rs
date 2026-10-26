@@ -9,6 +9,10 @@
 //! and the inbox records the message's `deliver`. The same pass settles and
 //! drops open messages on the evidence the gates read.
 //!
+//! The person consumer (#3938) is bound each pass to every person role's
+//! inbox. Nothing is typed for it: a person takes a message by acknowledging
+//! or answering it through the CLI, which writes the receipt.
+//!
 //! Mode rules are declared here, never stored (owner ruling, 2026-10-19):
 //! every message is a turn; the backend sends dead letters as Notify.
 
@@ -106,7 +110,9 @@ impl MessageDelivery {
     pub(super) async fn pass(&mut self) -> Result<(), String> {
         let now = Timestamp::from_datetime(&Utc::now());
         let holders = self.holders(now).await?;
-        self.rebind(&holders, now).await?;
+        let person = self.primitives.register_person(now).await?;
+        let people = self.primitives.person_inboxes(&self.namespace).await?.into_iter().map(|inbox| (inbox, person.clone()));
+        self.rebind(&holders, people.collect(), now).await?;
         self.collect_turns().await;
         for holder in holders.values() {
             if !self.inflight.contains_key(&holder.session_id) {
@@ -141,11 +147,18 @@ impl MessageDelivery {
         Ok(holders)
     }
 
-    /// Binds each live session's record to the inboxes it holds, unbinds the
-    /// rest, and ends the records of sessions no longer live.
-    async fn rebind(&mut self, holders: &BTreeMap<String, Holder>, now: Timestamp) -> Result<(), String> {
-        let desired: BTreeSet<_> =
+    /// Binds each live session's record to the inboxes it holds, and the
+    /// person consumer to `people`, unbinds the rest, and ends the records of
+    /// sessions no longer live.
+    async fn rebind(
+        &mut self,
+        holders: &BTreeMap<String, Holder>,
+        people: BTreeSet<(Address, Receiver)>,
+        now: Timestamp,
+    ) -> Result<(), String> {
+        let mut desired: BTreeSet<_> =
             holders.values().flat_map(|holder| holder.inboxes.iter().map(|inbox| (inbox.clone(), holder.consumer.clone()))).collect();
+        desired.extend(people);
         let inbox = self.primitives.inbox();
         for (address, consumer) in self.bound.difference(&desired).cloned().collect::<Vec<_>>() {
             inbox.unbind(&address, &consumer).await.map_err(|error| error.to_string())?;

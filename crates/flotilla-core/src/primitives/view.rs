@@ -32,6 +32,10 @@ pub trait ViewLookups {
     fn session(&self, receiver: &Receiver) -> Option<(String, String)>;
     /// The old reference to a record-backed address (a commit, ref, artifact or convoy).
     fn record(&self, address: &Address, revision: &str) -> Option<OldReference>;
+    /// The principal `project`'s charter declares holds `role`, if one does.
+    fn principal_of(&self, _project: &str, _role: &str) -> Option<String> {
+        None
+    }
 }
 
 /// An engine message's id under its inbox: the old record name.
@@ -40,13 +44,23 @@ pub fn record_name(message: &str) -> Option<String> {
     (address.kind() == Kind::Message).then(|| address.name().to_owned())
 }
 
-/// The old spelling of an inbox or sender address.
+/// The old spelling of an inbox or sender address. A person's role is spelled
+/// as the principal its charter declares, else as `principal:<role>`, which
+/// the conversion reads back to the same role in the same context.
 pub fn old_address(address: &Address, roles: &FleetRoles, lookups: &dyn ViewLookups) -> Result<String, String> {
     if let Some(role) = roles.role_of(address) {
         return Ok(format!("system:{role}"));
     }
     if address.kind() != Kind::Role {
         return Err(format!("`{address}` is not a role"));
+    }
+    if address.get(Kind::Convoy).is_none() {
+        if let Some(principal) = address.get(Kind::Project).and_then(|project| lookups.principal_of(project, address.name())) {
+            return Ok(principal);
+        }
+        if let Some(role) = roles.person_role_of(address) {
+            return Ok(format!("principal:{role}"));
+        }
     }
     let project = address.get(Kind::Project).ok_or_else(|| format!("`{address}` has no project"))?;
     match address.get(Kind::Convoy) {
@@ -254,4 +268,47 @@ pub fn old_view(
             fence_recheck_at: None,
         }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives::convert::{Conversion, NoRecords};
+
+    struct Charter;
+    impl ViewLookups for Charter {
+        fn vessel(&self, _: &str, _: &str) -> Option<String> {
+            None
+        }
+        fn session(&self, _: &Receiver) -> Option<(String, String)> {
+            None
+        }
+        fn record(&self, _: &Address, _: &str) -> Option<OldReference> {
+            None
+        }
+        fn principal_of(&self, project: &str, role: &str) -> Option<String> {
+            (project == "flotilla" && role == "owner").then(|| "principal:bob".into())
+        }
+    }
+
+    // Behaviour (#3938): a person role is spelled as the principal its charter
+    // declares, else as `principal:<role>`, which converts back to the same
+    // role in the same context.
+    #[test]
+    fn person_roles_spell_as_principals_that_convert_back() {
+        let roles = FleetRoles::declared("fleet").expect("roles");
+        let spell = |address: &str| old_address(&address.parse().expect("address"), &roles, &Charter).expect("spelled");
+        assert_eq!(spell("project:flotilla/role:owner"), "principal:bob");
+        assert_eq!(spell("project:flotilla/role:approver"), "principal:approver");
+        assert_eq!(spell("fleet:fleet/role:operator"), "principal:operator");
+        assert_eq!(spell("project:flotilla/role:gui-approver"), "flotilla/gui-approver");
+        let conversion = Conversion { roles: &roles, forges: &[], records: &NoRecords };
+        let reply = OldSpec::builder()
+            .sender(spell("project:flotilla/role:approver"))
+            .receiver("flotilla/gui-approver".into())
+            .relation(MessageRelation::Supervisor)
+            .body("approved".into())
+            .build();
+        assert_eq!(conversion.sender_of(&reply).expect("approver").as_str(), "project:flotilla/role:approver");
+    }
 }

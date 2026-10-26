@@ -13,12 +13,13 @@ use flotilla_core::primitives::{
     OldStoreRecords,
 };
 use flotilla_resources::{
-    Artifact, Convoy, FleetDesignation, Forge, K8sResourceObject, Message, Repository, Resource, ResourceObject, TerminalSession,
+    Artifact, Convoy, FleetDesignation, Forge, K8sResourceObject, Message, Project, Repository, Resource, ResourceObject, TerminalSession,
 };
 use serde_json::Value;
 
 /// The kinds a rehearsal reads, by their plural.
-pub(super) const KINDS: [&str; 7] = ["messages", "terminalsessions", "fleetdesignations", "forges", "convoys", "artifacts", "repositories"];
+pub(super) const KINDS: [&str; 8] =
+    ["messages", "terminalsessions", "fleetdesignations", "forges", "convoys", "artifacts", "repositories", "projects"];
 
 /// Raw documents of one namespace, by kind plural.
 #[derive(Default)]
@@ -94,6 +95,7 @@ impl Documents {
             terminals.into_iter().map(|(terminal, _)| terminal).collect(),
             self.decoded::<Artifact>("artifacts", &mut report).into_iter().map(|(artifact, _)| artifact).collect(),
             self.decoded::<Repository>("repositories", &mut report).into_iter().map(|(repository, _)| repository).collect(),
+            self.decoded::<Project>("projects", &mut report).into_iter().map(|(project, _)| project).collect(),
         );
         let conversion = Conversion { roles: &roles, forges: &records.forges, records: &records };
         let world = ReadRecords {
@@ -179,7 +181,7 @@ mod tests {
     // Exhaust the finite set of supporting kinds; no transport is involved.
     #[test]
     fn undecodable_supporting_records_are_refused_beside_a_good_message() {
-        for kind in ["forges", "convoys", "artifacts", "repositories", "terminalsessions"] {
+        for kind in ["forges", "convoys", "artifacts", "repositories", "terminalsessions", "projects"] {
             let mut documents = Documents::default();
             documents.0.insert(
                 "fleetdesignations".into(),
@@ -229,9 +231,10 @@ mod tests {
             ],
         );
         let report = documents.rehearse("flotilla");
-        assert_eq!(report.imported.get("pending"), Some(&1), "{report:?}");
+        // A person sends as the operator role of the crew's project (#3938).
+        assert_eq!(report.imported.get("pending"), Some(&2), "{report:?}");
         let refused: Vec<_> = report.refused.iter().map(|refusal| refusal.record.as_str()).collect();
-        assert_eq!(refused, ["from-a-person", "orphan-reply"], "{report:?}");
+        assert_eq!(refused, ["orphan-reply"], "{report:?}");
         // A designation prerequisite refusal must preserve earlier Message decode
         // diagnostics, and report the missing identity once rather than per Message.
         documents.0.get_mut("messages").expect("messages").push(serde_json::json!({"metadata":{"name":"broken"},"spec":7}));

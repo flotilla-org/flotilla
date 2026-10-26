@@ -84,7 +84,7 @@ pub fn import_message(
     let refuse = |reason: String| ImportRefusal { record: record.clone(), reason };
     let reference = |name: &str| -> Result<MessageRef, String> {
         let other = world.message(name).ok_or_else(|| format!("referenced message `{name}` was not read"))?;
-        let inbox = conversion.inbox(&other.record.spec.receiver)?;
+        let inbox = conversion.receiver(&other.record.spec)?;
         Ok(MessageRef::new(imported_name(&inbox, name)?, other.home.clone()))
     };
     let mut spec = conversion.spec(&old.record.spec, &reference).map_err(refuse)?;
@@ -113,7 +113,7 @@ pub fn import_message(
                     .ok_or_else(|| refuse("superseded with no recorded successor".into()))?,
             };
             let successor = world.message(&by).ok_or_else(|| refuse(format!("its successor `{by}` was not read")))?;
-            let inbox = conversion.inbox(&successor.record.spec.receiver).map_err(refuse)?;
+            let inbox = conversion.receiver(&successor.record.spec).map_err(refuse)?;
             let by =
                 imported_name(&inbox, &by).map_err(refuse)?.parse().map_err(|error: flotilla_address::Error| refuse(error.to_string()))?;
             MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: kept()?, watermark: None }

@@ -8,7 +8,8 @@ use crate::{
     qualified_path::QualifiedPath,
     query::{
         CrewCommandContext, CrewListResponse, CrewStallsResponse, DispatchQueueResponse, FleetHealthResponse, FleetListResponse,
-        FulfilmentListResponse, HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoProvidersResponse,
+        FulfilmentListResponse, HostListResponse, HostProvidersResponse, HostStatusResponse, PersonInboxResponse, ProjectListResponse,
+        RepoProvidersResponse,
     },
     IssueRef, PlacementDecision, PrincipalRef, RepoIdentity,
 };
@@ -1334,6 +1335,25 @@ pub enum CommandAction {
         name: String,
         reason: String,
     },
+    /// The person consumer's pending messages across its role inboxes (#3938).
+    PersonInbox {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+    },
+    /// The person acknowledges a message in one of their role inboxes: their receipt.
+    PersonAcknowledge {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        message: String,
+    },
+    /// The person answers a message in one of their role inboxes: their
+    /// receipt, then a reply sent as the role it was addressed to.
+    PersonAnswer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        message: String,
+        body: String,
+    },
     ResourceStatusPatch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_resource_version: Option<String>,
@@ -1489,6 +1509,9 @@ impl Command {
             CommandAction::ResourceReconcileNow { .. } => "reconcile resource now",
             CommandAction::MessageDeliverBatch { .. } => "deliver held Message batch",
             CommandAction::MessageFailBatch { .. } => "fail held Message batch",
+            CommandAction::PersonInbox { .. } => "list the person's inbox",
+            CommandAction::PersonAcknowledge { .. } => "acknowledge a message",
+            CommandAction::PersonAnswer { .. } => "answer a message",
             CommandAction::ResourceStatusPatch { .. } => "patch resource status",
             CommandAction::ResourceDelete { .. } => "delete resource",
             CommandAction::ResourceWatch { .. } => "watch resources",
@@ -1675,6 +1698,7 @@ pub enum CommandValue {
         card: String,
     },
     CrewList(Box<CrewListResponse>),
+    PersonInbox(Box<PersonInboxResponse>),
     MessageContacts {
         book: serde_json::Value,
         text: String,
