@@ -151,14 +151,16 @@ impl AwaitingReplies {
         message: &Resource<Message>,
         now: Timestamp,
     ) -> Result<(), String> {
-        let Some(reason) = message.state().drop_reason() else { return Ok(()) };
+        if message.state().drop_reason().is_none() {
+            return Ok(());
+        }
         let name = record_name(&MessageRef::new(message.name(), message_home));
         let Some(record) = home.get(&name) else { return Ok(()) };
         if record.spec().sender != message.spec().sender {
             return Ok(());
         }
         let sender = record.spec().sender.clone();
-        Self::withdraw_open(home, &name, &sender, &format!("awaited message dropped: {reason:?}"), now)
+        Self::withdraw_open(home, &name, &sender, "awaited message dropped", now)
     }
 
     /// Whether the sender still awaits this message, without loading ended history.
