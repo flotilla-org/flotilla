@@ -422,6 +422,9 @@ async fn agent_environment_is_staged_at_the_runner_writable_config_base() {
     assert!(!path.starts_with("/run/flotilla"));
 }
 
+// A contained Claude crew admitted by convoy start stages pinned skills in its bound
+// requester home and preserves that home at launch; missing ownership refuses relaunch.
+// Glue: one sequential admission-to-provisioning handoff, with real account delivery.
 #[tokio::test]
 async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
     let temp = TempDir::new().expect("tempdir");
@@ -429,7 +432,27 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
     fs::create_dir_all(&config_base).expect("config directory");
     fs::write(config_base.join("daemon.toml"), "machine_id = \"claude-skills-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
-    let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+    let skill_sources = write_test_credentialed_skill_sources(temp.path());
+    let selected = vec![flotilla_resources::SkillCatalogEntry {
+        source: "mattpocock-skills".into(),
+        repository: "flotilla-org/mattpocock-skills".into(),
+        revision: "1".repeat(40),
+        name: "research".into(),
+        path: "skills/research".into(),
+    }];
+    fs::write(skill_sources.join(".flotilla-skill-catalog.json"), serde_json::to_vec(&selected).expect("catalog")).expect("catalog file");
+    let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+    discovery.host_detectors = Arc::new(flotilla_discovery::detectors::default_host_detectors());
+    discovery.env = Arc::new(TestEnvVars::new([(FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string())]));
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::clone(&config),
+        discovery,
+        HostName::new("test-host"),
+        ResourceBackend::new(InMemoryBackend::default()),
+        Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let backend = daemon.resource_backend();
     let app_id_path = temp.path().join("github-app.id");
     let private_key_path = temp.path().join("github-app.pem");
@@ -479,12 +502,176 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
         .await
         .expect("skill credential declaration");
 
-    let staged = Arc::new(AtomicBool::new(false));
-    let runner: Arc<dyn CommandRunner> =
-        Arc::new(CredentialInteriorRunner(DiscoveryMockRunner::builder().tool_exists("claude", true).build(), Some(Arc::clone(&staged))));
+    let hosts = backend.using::<Host>(NAMESPACE);
+    let host = hosts.create(&empty_meta(daemon.local_host_id().expect("host").as_str()), &HostSpec::default()).await.expect("host");
+    hosts
+        .update_status(
+            &host.metadata.name,
+            &host.metadata.resource_version,
+            &HostStatus {
+                ready: true,
+                heartbeat_at: Some(Utc::now()),
+                admission_free_space_floor_bytes: Some(0),
+                capabilities: BTreeMap::from([
+                    (
+                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                    ),
+                    (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.into(), json!(["claude-max"])),
+                    ("docker".into(), json!(true)),
+                    ("os".into(), json!("linux")),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("host status");
+    let repositories = backend.using::<Repository>(NAMESPACE);
+    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    let repository = flotilla_store::ensure_repository(&repositories, &repository_spec.key(), &repository_spec).await.expect("repository");
+    repositories
+        .update_status(
+            &repository.metadata.name,
+            &repository.metadata.resource_version,
+            &flotilla_resources::RepositoryStatus { default_branch: Some("main".into()), ..Default::default() },
+        )
+        .await
+        .expect("default branch");
+    let image = Some(flotilla_resources::DockerImageSource::Literal("crew@sha256:abc".into()));
+    backend
+        .using::<PlacementPolicy>(NAMESPACE)
+        .create(
+            &empty_meta("crew-policy"),
+            &PlacementPolicySpec::builder()
+                .pool("cleat".into())
+                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    legacy_image_baseline_ref: None,
+                    host_ref: daemon.local_host_id().expect("host").to_string(),
+                    image,
+                    pull_policy: flotilla_resources::DockerImagePullPolicy::IfNotPresent,
+                    memory_policy: Default::default(),
+                    agent_adapters: BTreeSet::from(["claude-code".into()]),
+                    default_cwd: None,
+                    env: Default::default(),
+                    checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".into() },
+                })
+                .build(),
+        )
+        .await
+        .expect("policy");
+    backend
+        .using::<WorkflowTemplate>(NAMESPACE)
+        .create(
+            &empty_meta("skills-workflow"),
+            &WorkflowTemplateSpec::builder()
+                .vessels(vec![VesselRequirement::builder()
+                    .name("work".into())
+                    .crew(vec![CrewSpec::builder()
+                        .role("coder".into())
+                        .source(CrewSource::Agent {
+                            selector: Selector { capability: "code".into(), adapter: Some("claude-code".into()), model: None },
+                            prompt: None,
+                            brief_template: None,
+                        })
+                        .build()])
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("workflow");
+    backend
+        .definitions::<flotilla_resources::Project>(NAMESPACE)
+        .create(
+            &empty_meta("skills-project"),
+            &flotilla_resources::ProjectSpec::builder()
+                .display_name("Skills".into())
+                .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(repository_spec.key()).build()])
+                .build(),
+        )
+        .await
+        .expect("project");
+    backend
+        .definitions::<flotilla_resources::CredentialGrant>(NAMESPACE)
+        .create(
+            &empty_meta("claude-grant"),
+            &flotilla_resources::CredentialGrantSpec::builder()
+                .selector(
+                    flotilla_resources::CredentialGrantSelector::builder().projects(BTreeSet::from(["skills-project".into()])).build(),
+                )
+                .credentials(BTreeSet::from(["claude-max".into()]))
+                .build(),
+        )
+        .await
+        .expect("grant");
+    let mut events = daemon.subscribe();
+    let id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        flotilla_protocol::ConvoyStartIntent::builder()
+                            .project_ref("skills-project".into())
+                            .name("skills-convoy".into())
+                            .branch("test/skills".into())
+                            .workflow_ref("skills-workflow".into())
+                            .placement_policy("crew-policy".into())
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .skills(vec!["research".into()])
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
+        .await
+        .expect("admit");
+    let result = wait_for_command_result(&mut events, id).await;
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "admission: {result:?}");
+    let convoys = backend.using::<Convoy>(NAMESPACE);
+    let name = convoy_record_name(&backend, "skills-convoy").await;
+    let convoy_reconciler =
+        ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE)).with_vessels(backend.using::<Vessel>(NAMESPACE));
+    let mut created_vessel = None;
+    for _ in 0..4 {
+        let convoy = convoys.get(&name).await.expect("convoy");
+        let prepared = convoy_reconciler.prepare(&convoy).await.expect("prepare convoy");
+        let outcome = convoy_reconciler.reconcile(&convoy, &prepared, Utc::now());
+        if let Some((meta, spec)) = outcome.actuations.into_iter().find_map(|actuation| match actuation {
+            Actuation::CreateVessel { meta, spec } => Some((meta, spec)),
+            _ => None,
+        }) {
+            created_vessel = Some(backend.using::<Vessel>(NAMESPACE).create(&meta, &spec).await.expect("vessel"));
+            break;
+        }
+        let patch = outcome.patch.expect("convoy must advance toward Vessel");
+        flotilla_store::apply_status_patch(&convoys, &name, &patch).await.expect("advance convoy");
+    }
+    let vessel = created_vessel.expect("convoy must create a Vessel within four transitions");
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let prepared = reconciler.prepare(&vessel).await.expect("prepare vessel");
+    let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
+    let (meta, spec) = outcome
+        .actuations
+        .into_iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateEnvironment { meta, spec } => Some((meta, spec)),
+            _ => None,
+        })
+        .expect("admitted vessel creates Environment");
+    let environment = backend.using::<Environment>(NAMESPACE).create(&meta, &spec).await.expect("environment");
+    let spec = environment.spec.docker.as_ref().expect("Docker environment");
+
+    let staged = Arc::new(StdMutex::new(Vec::new()));
+    let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
+        DiscoveryMockRunner::builder()
+            .tool_exists("claude", true)
+            .on_run("claude", &["--version"], Ok("2.1.0 (Claude Code)\n".into()))
+            .on_run("sh", &["-c", "command -v \"$1\"", "flotilla-binary-discovery", "claude"], Ok("/tools/claude\n".into()))
+            .build(),
+        Some(Arc::clone(&staged)),
+    ));
     let destroyed = Arc::new(AtomicBool::new(false));
     let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
-        id: EnvironmentId::new("contained-claude"),
+        id: EnvironmentId::new(&environment.metadata.name),
         image: ImageId::new("contained-image"),
         runner: Arc::clone(&runner),
         env_vars: HashMap::from([("HOME".to_string(), "/home/crew".to_string())]),
@@ -492,8 +679,8 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
     });
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
-        "docker",
-        ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
+        "fixture-1",
+        ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "fixture-1"),
         Arc::new(TestInteriorEnvironmentProvider { handle: Mutex::new(Some(handle)) }),
     );
     let host_env = Arc::new(TestEnvVars::new([
@@ -523,67 +710,67 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
     ));
     let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([
         ("HOME", temp.path().join("home").display().to_string()),
-        (FLOTILLA_SKILLS_DIR_ENV, write_test_credentialed_skill_sources(temp.path()).display().to_string()),
+        (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
     ]))));
     let state = Arc::new(
         ControllerRuntimeState::new(
-            daemon,
+            daemon.clone(),
             Arc::clone(&config),
             Arc::new(local_registry),
             Some(DaemonHostPath::new("/tmp/flotilla.sock")),
-            "host-test".to_string(),
+            daemon.local_host_id().expect("host").to_string(),
             "host-direct-host-test".to_string(),
         )
         .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
         .with_credential_store(credential_store)
-        .with_agent_material(agent_material),
+        .with_agent_material(agent_material.clone()),
     );
-    let credential_refs = BTreeSet::from(["claude-max".to_string(), "github-crew-pr".to_string()]);
-    let spec = flotilla_resources::DockerEnvironmentSpec {
-        image_build_ref: None,
-        memory_policy: Default::default(),
-        host_ref: "host-test".to_string(),
-        image: "contained-image".to_string(),
-        declared_agent_adapters: BTreeSet::new(),
-        required_agent_adapters: BTreeSet::from(["claude-code".to_string()]),
-        pull_policy: Default::default(),
-        mounts: Vec::new(),
-        // Intended: provisioning mints only the explicitly selected source's token.
-        env: BTreeMap::from([
-            (CREDENTIAL_REFS_ENV.to_string(), serde_json::to_string(&credential_refs).expect("encode credential refs")),
-            (
-                flotilla_resources::CREW_SKILLS_ENV.to_string(),
-                serde_json::to_string(&BTreeMap::from([(
-                    "coder",
-                    vec![flotilla_resources::SkillCatalogEntry {
-                        source: "mattpocock-skills".to_string(),
-                        repository: "flotilla-org/mattpocock-skills".to_string(),
-                        revision: "1".repeat(40),
-                        name: "research".to_string(),
-                        path: "skills/research".to_string(),
-                    }],
-                )]))
-                .expect("encode frozen skill selection"),
-            ),
-        ]),
-    };
-    // #3907: a Claude crew's skills are staged in its requester's home, named by its convoy.
+    // A Claude crew admitted by convoy start stages skills in the requester's home;
+    // the same home must be selected when that crew launches. This is sequential
+    // admission glue; retries, concurrent binding changes and launch authorization
+    // have their own lifecycle scenarios.
+    DockerControllerRuntime { state: Arc::clone(&state) }
+        .provision_docker(&environment.metadata.name, spec)
+        .await
+        .expect("provision admitted Claude vessel");
+    let access = flotilla_resources::account_access::AccessName(flotilla_agent::account_access::CLAUDE_SUBSCRIPTION.into());
+    let bound_environment = super::super::account_access::deliver_bound_account(
+        &state,
+        &super::super::account_access::AccountLaunch {
+            namespace: NAMESPACE,
+            convoy: &name,
+            role: "coder",
+            env_ref: &environment.metadata.name,
+            agentless: false,
+        },
+        &access,
+        Arc::clone(&runner),
+    )
+    .await
+    .expect("launch delivers admitted account binding");
+    let launch_environment = agent_material
+        .crew_environment("coder", &spec.required_agent_adapters, &bound_environment, &*runner)
+        .await
+        .expect("launch preserves bound home");
+    let launch_home = launch_environment.iter().find(|(key, _)| key == "CLAUDE_CONFIG_DIR").expect("Claude launch home").1.clone();
+    assert_eq!(
+        *staged.lock().expect("staged paths"),
+        vec![PathBuf::from(launch_home).join("skills")],
+        "skills must reach the launched requester home"
+    );
+
+    assert!(!destroyed.load(Ordering::SeqCst), "successful skill staging must keep the fresh vessel");
+    // Removing requester ownership must refuse a relaunch before creating a backing.
+    let mut orphan = InputMeta::from(&environment.metadata);
+    orphan.owner_references.clear();
     backend
         .using::<Environment>(NAMESPACE)
-        .create(
-            &InputMeta::builder()
-                .name("contained-claude".to_string())
-                .labels(BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), "demo".to_string())]))
-                .build(),
-            &EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) },
-        )
+        .update(&orphan, &environment.metadata.resource_version, &environment.spec)
         .await
-        .expect("environment record");
-
-    DockerControllerRuntime { state }.provision_docker("contained-claude", &spec).await.expect("provision Claude vessel");
-
-    assert!(staged.load(Ordering::SeqCst), "provisioning must stage pinned skills before interior discovery");
-    assert!(!destroyed.load(Ordering::SeqCst), "successful skill staging must keep the fresh vessel");
+        .expect("orphan environment");
+    let error =
+        DockerControllerRuntime { state }.provision_docker(&environment.metadata.name, spec).await.expect_err("missing requester convoy");
+    assert!(error.to_string().starts_with("RequesterConvoyUnavailable:"), "{error}");
     mint_session.assert_complete();
 }
 

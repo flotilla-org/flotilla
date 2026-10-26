@@ -175,11 +175,28 @@ impl DockerControllerRuntime {
         let legacy_baseline = self.legacy_baseline_for_environment(name).await?;
         let (mut environment_spec, instance, convoy) =
             match self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(name).await {
-                Ok(environment) => (
-                    environment.spec,
-                    environment.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned(),
-                    environment.metadata.labels.get(flotilla_resources::CONVOY_LABEL).cloned(),
-                ),
+                Ok(environment) => {
+                    // Contained Environments are owned by a Vessel on the placement host.
+                    // Its spec carries convoy identity even when the Environment has no convoy label.
+                    let convoy = if let Some(convoy) = environment.metadata.labels.get(flotilla_resources::CONVOY_LABEL) {
+                        Some(convoy.clone())
+                    } else if let Some(owner) =
+                        environment.metadata.owner_references.iter().find(|owner| owner.controller && owner.kind == Vessel::API_PATHS.kind)
+                    {
+                        match self.state.daemon.resource_backend().using::<Vessel>(&self.state.namespace).get(&owner.name).await {
+                            Ok(vessel) => Some(vessel.spec.convoy_ref),
+                            Err(ResourceError::NotFound { .. }) => None,
+                            Err(error) => return Err(error.to_string().into()),
+                        }
+                    } else {
+                        None
+                    };
+                    (
+                        environment.spec,
+                        environment.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned(),
+                        convoy,
+                    )
+                }
                 Err(ResourceError::NotFound { .. }) => (
                     EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) },
                     None,
@@ -187,6 +204,11 @@ impl DockerControllerRuntime {
                 ),
                 Err(error) => return Err(error.to_string().into()),
             };
+        if convoy.as_deref().is_none_or(str::is_empty) && spec.required_agent_adapters.contains("claude-code") {
+            return Err(format!(
+                "RequesterConvoyUnavailable: contained Claude environment `{name}` has no resolvable convoy; expected an Environment convoy label or its controller Vessel's convoy_ref"
+            ).into());
+        }
         if environment_spec.cloud_sandbox.is_none() {
             environment_spec.docker = Some(spec.clone());
         }
@@ -532,11 +554,7 @@ impl DockerControllerRuntime {
                     environment.push((key.into(), selection.clone()));
                 }
             }
-            // #3907: requester-bound crews' skills are staged in their requesters' homes, named by
-            // the vessel's convoy. Without its Environment record that convoy is unknown.
-            if convoy.is_none() {
-                tracing::warn!(environment = name, "no convoy for this vessel; requester-bound skills cannot be staged in requester homes");
-            }
+            // Staging and account delivery select the same home from convoy and role.
             environment
                 .extend(convoy.iter().map(|convoy| (flotilla_resources::account_access::REQUESTER_CONVOY_ENV.to_string(), convoy.clone())));
             let mut source_token_files = BTreeMap::new();

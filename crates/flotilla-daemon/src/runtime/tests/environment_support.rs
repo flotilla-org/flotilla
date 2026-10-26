@@ -63,7 +63,7 @@ impl CommandRunner for SshProvisioningRecordingRunner {
     }
 }
 
-pub(super) struct CredentialInteriorRunner(pub(super) DiscoveryMockRunner, pub(super) Option<Arc<AtomicBool>>);
+pub(super) struct CredentialInteriorRunner(pub(super) DiscoveryMockRunner, pub(super) Option<Arc<StdMutex<Vec<PathBuf>>>>);
 
 #[derive(Default)]
 pub(super) struct PersistentPathRecordingRunner {
@@ -99,7 +99,8 @@ impl CommandRunner for CredentialInteriorRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         if cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-stage-skills")) {
             if let Some(staged) = &self.1 {
-                staged.store(true, Ordering::SeqCst);
+                let marker = args.iter().position(|arg| *arg == "flotilla-stage-skills").expect("staging marker");
+                staged.lock().expect("staged paths").push(PathBuf::from(args[marker + 2]));
             }
             Ok("ok".to_string())
         } else if cmd == "mkdir"
@@ -129,7 +130,8 @@ impl CommandRunner for CredentialInteriorRunner {
     async fn run_with_input(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel, _input: &[u8]) -> Result<String, String> {
         if cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-stage-skills")) {
             if let Some(staged) = &self.1 {
-                staged.store(true, Ordering::SeqCst);
+                let marker = args.iter().position(|arg| *arg == "flotilla-stage-skills").expect("staging marker");
+                staged.lock().expect("staged paths").push(PathBuf::from(args[marker + 2]));
             }
         }
         Ok("ok".to_string())
