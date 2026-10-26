@@ -119,6 +119,9 @@ impl<T: Resource> DefinitionResolver<T> {
 
     /// Select definition names through declared indexes, then merge every
     /// author of each selected name. Predicates may need checking after merge.
+    ///
+    /// The selection runs over stored rows, so it never selects a built-in definition
+    /// (#3824 layer 2a); a caller that wants the built-ins too reads them by name or by `list`.
     pub async fn list_selected(&self, mut selection: crate::StoreQuery) -> Result<Vec<ResourceObject<T>>, ResourceError> {
         ensure_definitions::<T>()?;
         selection.include_replicas = true;
