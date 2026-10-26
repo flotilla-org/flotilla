@@ -1,5 +1,5 @@
-# Node.js from the official release tarballs. The `{arch}` URL placeholder is
-# substituted by the fragment (x64 or arm64); sha256 values are the release's
+# Node.js from the official release tarballs (linux-x64 and linux-arm64);
+# sha256 values are the release's
 # SHASUMS256.txt entries. npm's caches default under the provider's $HOME.
 name: node
 version: 24.18.0
@@ -9,10 +9,15 @@ requires: []
 pins:
   node:
     version: 24.18.0
-    url: https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-{arch}.tar.xz
-    sha256:
-      amd64: 55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742
-      arm64: 58c9520501f6ae2b52d5b210444e24b9d0c029a58c5011b797bc1fe7105886f6
+    artifacts:
+      amd64:
+        url: https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz
+        sha256: 55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742
+        unpack: tar.xz
+      arm64:
+        url: https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-arm64.tar.xz
+        sha256: 58c9520501f6ae2b52d5b210444e24b9d0c029a58c5011b797bc1fe7105886f6
+        unpack: tar.xz
 probe: |
   set -eu
   test "$(node --version)" = v24.18.0

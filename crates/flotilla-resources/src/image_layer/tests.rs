@@ -66,10 +66,14 @@ fn validation_refuses_each_rule_violation() {
         layer.validate().expect("fixture is valid");
     }
     let shared = || layer("rust", "1.99.0", ImageLayerTier::Shared, &["toolchain:rust"], &[]);
-    let pin = |url: Option<&str>, sha: Option<ImagePinDigest>| ImageLayerPin {
+    let pin = |artifacts: &[(&str, &str, &str)]| ImageLayerPin {
         version: "1.28.2".into(),
-        url: url.map(str::to_owned),
-        sha256: sha,
+        artifacts: artifacts
+            .iter()
+            .map(|(architecture, url, sha256)| {
+                (architecture.to_string(), PinArtifact { url: url.to_string(), sha256: sha256.to_string(), unpack: PinUnpack::File })
+            })
+            .collect(),
     };
     let hex = "a".repeat(64);
     let cases: Vec<(&str, ImageLayerSpec)> = vec![
@@ -92,60 +96,40 @@ fn validation_refuses_each_rule_violation() {
         ("shared with from", ImageLayerSpec { from: Some(BASE_FROM.into()), ..shared() }),
         ("unnamespaced provide", ImageLayerSpec { provides: BTreeSet::from(["rust".into()]), ..shared() }),
         ("unnamespaced require", ImageLayerSpec { requires: BTreeSet::from(["node".into()]), ..shared() }),
-        ("pin name", ImageLayerSpec { pins: BTreeMap::from([("Rustup".into(), pin(None, None))]), ..shared() }),
+        ("pin name", ImageLayerSpec { pins: BTreeMap::from([("Rustup".into(), pin(&[]))]), ..shared() }),
         (
             "pin without version",
             ImageLayerSpec {
-                pins: BTreeMap::from([("rustup".into(), ImageLayerPin { version: " ".into(), url: None, sha256: None })]),
+                pins: BTreeMap::from([("rustup".into(), ImageLayerPin { version: " ".into(), artifacts: BTreeMap::new() })]),
                 ..shared()
             },
         ),
         (
             "url without sha256",
-            ImageLayerSpec { pins: BTreeMap::from([("rustup".into(), pin(Some("https://x.test/r"), None))]), ..shared() },
+            ImageLayerSpec { pins: BTreeMap::from([("rustup".into(), pin(&[("any", "https://x.test/r", "")]))]), ..shared() },
         ),
+        ("empty url", ImageLayerSpec { pins: BTreeMap::from([("rustup".into(), pin(&[("amd64", " ", &hex)]))]), ..shared() }),
         (
             "upper-case sha256",
-            ImageLayerSpec {
-                pins: BTreeMap::from([("rustup".into(), pin(Some("https://x.test/r"), Some(ImagePinDigest::Single("A".repeat(64)))))]),
-                ..shared()
-            },
+            ImageLayerSpec { pins: BTreeMap::from([("rustup".into(), pin(&[("any", "https://x.test/r", &"A".repeat(64))]))]), ..shared() },
         ),
         (
             "short per-arch sha256",
             ImageLayerSpec {
-                pins: BTreeMap::from([(
-                    "rustup".into(),
-                    pin(
-                        Some("https://x.test/r"),
-                        Some(ImagePinDigest::PerArchitecture(BTreeMap::from([
-                            ("amd64".into(), hex.clone()),
-                            ("arm64".into(), "ab".into()),
-                        ]))),
-                    ),
-                )]),
+                pins: BTreeMap::from([("rustup".into(), pin(&[("amd64", "https://x.test/a", &hex), ("arm64", "https://x.test/b", "ab")]))]),
                 ..shared()
             },
         ),
         (
-            "empty per-arch map",
+            "shared and per-arch artifacts",
             ImageLayerSpec {
-                pins: BTreeMap::from([(
-                    "rustup".into(),
-                    pin(Some("https://x.test/r"), Some(ImagePinDigest::PerArchitecture(BTreeMap::new()))),
-                )]),
+                pins: BTreeMap::from([("rustup".into(), pin(&[("any", "https://x.test/r", &hex), ("arm64", "https://x.test/b", &hex)]))]),
                 ..shared()
             },
         ),
         (
-            "arch placeholder with one sha256",
-            ImageLayerSpec {
-                pins: BTreeMap::from([(
-                    "rustup".into(),
-                    pin(Some("https://x.test/{arch}/rustup-init"), Some(ImagePinDigest::Single("a".repeat(64)))),
-                )]),
-                ..shared()
-            },
+            "upper-case architecture",
+            ImageLayerSpec { pins: BTreeMap::from([("rustup".into(), pin(&[("AMD64", "https://x.test/r", &hex)]))]), ..shared() },
         ),
         ("harness without its provide", layer("harness-codex", "1.0", ImageLayerTier::AgentRuntime, &["harness:claude"], &[])),
         ("crew utilities without its provide", layer("crew-utilities", "1.0", ImageLayerTier::AgentRuntime, &["tool:gh"], &[])),
@@ -171,19 +155,10 @@ fn validation_refuses_each_rule_violation() {
     }
     let valid_pins = ImageLayerSpec {
         pins: BTreeMap::from([
-            (
-                "rustup".into(),
-                pin(Some("https://x.test/r"), Some(ImagePinDigest::PerArchitecture(BTreeMap::from([("amd64".into(), hex.clone())])))),
-            ),
-            ("toolchain".into(), pin(None, None)),
-            ("tea".into(), pin(Some("https://x.test/t"), Some(ImagePinDigest::Single(hex.clone())))),
-            (
-                "gh".into(),
-                pin(
-                    Some("https://x.test/gh_{arch}.tar.gz"),
-                    Some(ImagePinDigest::PerArchitecture(BTreeMap::from([("amd64".into(), hex.clone()), ("arm64".into(), hex)]))),
-                ),
-            ),
+            ("rustup".into(), pin(&[("amd64", "https://x.test/r-x86_64", &hex)])),
+            ("toolchain".into(), pin(&[])),
+            ("tea".into(), pin(&[("any", "https://x.test/t", &hex)])),
+            ("gh".into(), pin(&[("amd64", "https://x.test/gh_amd64.tar.gz", &hex), ("arm64", "https://x.test/gh_arm64.tar.gz", &hex)])),
         ]),
         context_files: context("prelude.d/50-display-x11.sh"),
         build_secrets: BTreeSet::from(["forgejo-token".into()]),
@@ -314,7 +289,7 @@ fn identity_covers_exactly_the_included_fields(tc: hegel::TestCase) {
             3 => target.from = Some(format!("changed{}", target.from.clone().unwrap_or_default())),
             4 => target.fragment.push_str(&format!("\n#{text}")),
             5 => {
-                target.pins.insert(format!("p{}", text.len()), ImageLayerPin { version: text.clone(), url: None, sha256: None });
+                target.pins.insert(format!("p{}", text.len()), ImageLayerPin { version: text.clone(), artifacts: BTreeMap::new() });
             }
             6 => {
                 target.context_files.insert(format!("f{}", text.len()), ImageContextFile { content: text.clone(), executable: false });
@@ -710,7 +685,12 @@ fn layer_directory_parses_and_inlines_declared_files() {
     assert_eq!(spec.name, "display-x11");
     assert_eq!(spec.tier, ImageLayerTier::Shared);
     assert!(spec.fragment.starts_with("FROM ${BASE}"));
-    assert_eq!(spec.pins["mesa"].sha256.as_ref().and_then(|digest| digest.for_architecture("arm64")), Some("b".repeat(64).as_str()));
+    // The previous `url` + per-architecture `sha256` shape converts (ADR 0047).
+    let mesa = spec.pins["mesa"].artifact("arm64").expect("arm64 artifact");
+    assert_eq!(
+        (mesa.url.as_str(), mesa.sha256.as_str(), mesa.unpack),
+        ("https://example.test/mesa.tar.xz", "b".repeat(64).as_str(), PinUnpack::TarXz)
+    );
     assert_eq!(spec.context_files.keys().collect::<Vec<_>>(), ["prelude.d/50-display-x11.sh"]);
     assert!(spec.context_files["prelude.d/50-display-x11.sh"].executable);
     let plain = parse_layer_directory(&directory(DISPLAY_YAML), ImageLayerSource::Installation, None).expect("parse");
@@ -743,4 +723,56 @@ fn layer_directory_errors_name_the_problem() {
     )
     .expect("project layer");
     assert!(project.resource_name().starts_with("project-wheelhouse-display-x11-1.0.0-"));
+}
+
+// Decision 3 on #3909 (ADR 0047): a stored or authored pin in the previous
+// shape decodes into explicit artifacts and is written back only as
+// `artifacts`; the two shapes cannot be mixed, and unknown fields still refuse.
+#[test]
+fn previous_pin_shapes_decode_and_only_artifacts_are_written() {
+    let hex = |c: char| c.to_string().repeat(64);
+    let decode = |value: serde_json::Value| serde_json::from_value::<ImageLayerPin>(value);
+    let current = decode(serde_json::json!({
+        "version": "0.160.0",
+        "artifacts": {
+            "amd64": {"url": "https://x.test/codex-x86_64.tar.gz", "sha256": hex('a'), "unpack": "tar.gz"},
+            "arm64": {"url": "https://x.test/codex-aarch64.tar.gz", "sha256": hex('b'), "unpack": "tar.gz"}
+        }
+    }))
+    .expect("current shape");
+    assert_eq!(current.artifact("arm64").map(|artifact| artifact.url.as_str()), Some("https://x.test/codex-aarch64.tar.gz"));
+    assert_eq!(current.artifact("riscv64"), None);
+    let cases = [
+        (serde_json::json!({"version": "1"}), serde_json::json!({"version": "1"})),
+        (
+            serde_json::json!({"version": "1.7.4", "url": "https://x.test/tla2tools.jar", "sha256": hex('c')}),
+            serde_json::json!({"version": "1.7.4", "artifacts": {"any": {"url": "https://x.test/tla2tools.jar", "sha256": hex('c'), "unpack": "file"}}}),
+        ),
+        (
+            serde_json::json!({"version": "0.62.1", "url": "https://x.test/apalache.tgz", "sha256": hex('d')}),
+            serde_json::json!({"version": "0.62.1", "artifacts": {"any": {"url": "https://x.test/apalache.tgz", "sha256": hex('d'), "unpack": "tar.gz"}}}),
+        ),
+        (
+            serde_json::json!({"version": "0.16.0", "url": "https://x.test/zig-{arch}.tar.xz", "sha256": {"amd64": hex('a'), "arm64": hex('b')}}),
+            serde_json::json!({"version": "0.16.0", "artifacts": {
+                "amd64": {"url": "https://x.test/zig-{arch}.tar.xz", "sha256": hex('a'), "unpack": "tar.xz"},
+                "arm64": {"url": "https://x.test/zig-{arch}.tar.xz", "sha256": hex('b'), "unpack": "tar.xz"}
+            }}),
+        ),
+    ];
+    for (previous, written) in cases {
+        let pin = decode(previous.clone()).expect("previous shape decodes");
+        assert_eq!(serde_json::to_value(&pin).expect("encode"), written, "{previous}");
+        assert_eq!(decode(written).expect("written shape decodes"), pin);
+    }
+    let mixed = decode(serde_json::json!({"version": "1", "url": "https://x.test/r", "artifacts": {}})).expect_err("mixed shapes");
+    assert!(mixed.to_string().contains("together with the previous"), "{mixed}");
+    assert!(decode(serde_json::json!({"version": "1", "checksum": hex('a')})).is_err(), "unknown pin field");
+    assert!(
+        decode(serde_json::json!({"version": "1", "artifacts": {"any": {"url": "u", "sha256": hex('a'), "unpack": "zip"}}})).is_err(),
+        "unknown unpack kind"
+    );
+    let legacy =
+        decode(serde_json::json!({"version": "1", "url": "https://x.test/{arch}", "sha256": {"amd64": hex('a')}})).expect("legacy");
+    assert!(is_legacy_template(&legacy.artifacts["amd64"].url), "converted templates stay recognisable until the shim is removed");
 }

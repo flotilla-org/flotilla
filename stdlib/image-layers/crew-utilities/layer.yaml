@@ -1,8 +1,8 @@
 # Crew utilities (ADR 0062, A8 as amended by C1): what every crew needs beside
 # its harness. python3 and the small tools come from the base's dated apt
 # snapshot; gh, tea and uv are pinned release binaries. A project's own
-# Python belongs in a shared or project layer, not here. `{arch}` URL
-# placeholders are substituted by the fragment. The version is this
+# Python belongs in a shared or project layer, not here. Each architecture's
+# artifact is listed explicitly. The version is this
 # definition's revision: the layer bundles several independently versioned
 # tools.
 name: crew-utilities
@@ -21,24 +21,39 @@ pins:
   gh:
     # sha256 values from gh_2.102.0_checksums.txt in the cli/cli release.
     version: 2.102.0
-    url: https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_{arch}.tar.gz
-    sha256:
-      amd64: bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
-      arm64: 7862c86c72f43df3a2d93ddde6f473285b4e2af61b494849846827e513ef6484
+    artifacts:
+      amd64:
+        url: https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.tar.gz
+        sha256: bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
+        unpack: tar.gz
+      arm64:
+        url: https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_arm64.tar.gz
+        sha256: 7862c86c72f43df3a2d93ddde6f473285b4e2af61b494849846827e513ef6484
+        unpack: tar.gz
   tea:
     # sha256 values from the published <asset>.sha256 files.
     version: 0.16.0
-    url: https://dl.gitea.com/tea/0.16.0/tea-0.16.0-linux-{arch}
-    sha256:
-      amd64: 9c142c8a0b31485eea2387031c1c404f12b7141075eb4ffbd7ced49441590636
-      arm64: 0e14a036322eeb1fc55e266acafeb8490e523ed99f9232034ae74861e2339879
+    artifacts:
+      amd64:
+        url: https://dl.gitea.com/tea/0.16.0/tea-0.16.0-linux-amd64
+        sha256: 9c142c8a0b31485eea2387031c1c404f12b7141075eb4ffbd7ced49441590636
+        unpack: file
+      arm64:
+        url: https://dl.gitea.com/tea/0.16.0/tea-0.16.0-linux-arm64
+        sha256: 0e14a036322eeb1fc55e266acafeb8490e523ed99f9232034ae74861e2339879
+        unpack: file
   uv:
     # sha256 values from sha256.sum in the astral-sh/uv release.
     version: 0.13.0
-    url: https://github.com/astral-sh/uv/releases/download/0.13.0/uv-{arch}-unknown-linux-gnu.tar.gz
-    sha256:
-      amd64: 1468ebd5a5541121837c5a2817b9972ba6090fa6caa3d142620850a47fb75154
-      arm64: 3ccfb6af6e242433eb552f7d9676abd5412c6595c497e990d9c8cb7b5bd4d2c3
+    artifacts:
+      amd64:
+        url: https://github.com/astral-sh/uv/releases/download/0.13.0/uv-x86_64-unknown-linux-gnu.tar.gz
+        sha256: 1468ebd5a5541121837c5a2817b9972ba6090fa6caa3d142620850a47fb75154
+        unpack: tar.gz
+      arm64:
+        url: https://github.com/astral-sh/uv/releases/download/0.13.0/uv-aarch64-unknown-linux-gnu.tar.gz
+        sha256: 3ccfb6af6e242433eb552f7d9676abd5412c6595c497e990d9c8cb7b5bd4d2c3
+        unpack: tar.gz
 probe: |
   set -eu
   gh --version | grep -E '(^|[^0-9])2\.102\.0([^0-9.]|$)'
