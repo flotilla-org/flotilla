@@ -86,7 +86,7 @@ where
                 let name = names[name];
                 let result = log.create(name, &spec, "writer", at);
                 if model.contains_key(name) {
-                    assert!(matches!(result, Err(PlainError::Store(_))), "a live name is refused: {result:?}");
+                    assert!(matches!(result, Err(PlainError::Exists { .. })), "a live name is refused: {result:?}");
                 } else {
                     let version = result.expect("an absent name is created");
                     assert!(model.values().all(|(other, _)| *other < version), "a write takes the next home sequence");

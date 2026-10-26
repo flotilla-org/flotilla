@@ -25,7 +25,13 @@ pub struct Plain<K> {
 /// A plain write the store refused.
 #[derive(Debug)]
 pub enum PlainError {
-    /// No live resource of this kind and name at this home.
+    /// A create of a name live at this home.
+    Exists {
+        kind: &'static str,
+        name: String,
+    },
+    /// No live resource of this kind and name at this home. A resource homed elsewhere is
+    /// `Missing` here too: only its home writes it.
     Missing {
         kind: &'static str,
         name: String,
@@ -43,6 +49,7 @@ pub enum PlainError {
 impl std::fmt::Display for PlainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Exists { kind, name } => write!(f, "{kind} `{name}` already exists here"),
             Self::Missing { kind, name } => write!(f, "{kind} `{name}` is not stored here"),
             Self::Conflict { kind, name, expected, stored } => {
                 write!(f, "{kind} `{name}` is at version {stored}, not {expected}")
@@ -86,12 +93,15 @@ impl PlainLog {
     pub fn create<K: Kind>(&self, name: &str, spec: &K, writer: &str, at: Timestamp) -> Result<u64, PlainError> {
         let mut store = lock_store(&self.store);
         let mut write = store.write()?;
-        let stamp = write.insert(name, spec, &Origin::new(writer, at))?;
+        let stamp = write.insert(name, spec, &Origin::new(writer, at)).map_err(|error| match error {
+            StoreError::Exists { .. } => PlainError::Exists { kind: K::KIND, name: name.to_owned() },
+            error => PlainError::Store(error),
+        })?;
         write.commit()?;
         Ok(stamp.version)
     }
 
-    /// Replaces the spec of `name`, read at `version`. Only the changed fields and rows are
+    /// Replaces the spec of `name` homed here, read at `version`. Only the changed fields and rows are
     /// written; an edit that changes nothing logs nothing and keeps the version.
     pub fn edit<K: Kind>(&self, name: &str, version: u64, spec: &K, writer: &str, at: Timestamp) -> Result<u64, PlainError> {
         let mut store = lock_store(&self.store);
@@ -106,7 +116,7 @@ impl PlainLog {
         Ok(stamp.version)
     }
 
-    /// Deletes `name`, read at `version`. Its history and identity stay (ADR 0064, #3392 G9).
+    /// Deletes `name` homed here, read at `version`. Its history and identity stay (ADR 0064, #3392 G9).
     pub fn delete<K: Kind>(&self, name: &str, version: u64, writer: &str, at: Timestamp) -> Result<(), PlainError> {
         let mut store = lock_store(&self.store);
         let mut write = store.write()?;

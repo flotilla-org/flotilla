@@ -622,4 +622,19 @@ mod tests {
         let subject = ChangeRequestLeafSubject { change_request: &conflicting, now: observed_at, stale_after: Duration::from_secs(180) };
         assert_eq!(evaluate_leaf(&leaf, Some(&subject), None).expect("evaluate").result, ThreeValue::False);
     }
+
+    // ADR 0047 (#3824 layer 0): a condition the previous generation stored on a usage subject
+    // still decodes, and evaluating it is the admission refusal, since Usage retired.
+    #[test]
+    fn a_stored_usage_condition_decodes_and_is_refused() {
+        let stored = serde_json::json!({
+            "address": {"Usage": {"provider": "codex", "account": "user@example.com"}},
+            "field_path": ".windows.weekly.used-percent",
+            "operator": ">",
+            "literal": "90",
+        });
+        let leaf: Leaf = serde_json::from_value(stored).expect("a stored usage condition decodes");
+        let error = evaluate_leaf(&leaf, None, None).expect_err("a usage condition is no longer admitted");
+        assert!(error.contains("not admitted"), "{error}");
+    }
 }

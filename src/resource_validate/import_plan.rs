@@ -18,7 +18,9 @@ pub(super) enum Plan {
     Moving(&'static str),
 }
 
-/// Every kind the old store has held, by kind name, with its plan.
+/// Every kind the old store has held, by kind name, with its plan. A retired kind the store no
+/// longer registers (Usage, MaterialPool) is never listed by the daemon, so its rows are dropped
+/// without being counted; its entry records the ruling.
 pub(super) const PLAN: &[(&str, Plan)] = &[
     ("Message", Plan::Imported("Message import (#3317)")),
     ("Environment", Plan::Imported("lifecycle import (#3629)")),
@@ -130,6 +132,11 @@ mod tests {
         kinds.sort_unstable();
         kinds.dedup();
         assert_eq!(kinds.len(), PLAN.len(), "a kind is planned twice");
+        for (kind, plan) in PLAN {
+            if !REGISTERED_RESOURCE_KINDS.iter().any(|entry| entry.kind == *kind) {
+                assert!(matches!(plan, Plan::Retired(_)), "{kind} is not registered, so only a retired kind may be");
+            }
+        }
     }
 
     // Behaviour (#3824 layer 0, #3760 gate): retired rows are dropped and rows of a kind still
