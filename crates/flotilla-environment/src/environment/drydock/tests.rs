@@ -321,7 +321,7 @@ async fn missing_host_binary_is_not_ready() {
     .unwrap();
 }
 
-// #3745: transport EOF without Exit cannot acknowledge asset creation or
+// #3745: transport EOF without Exit must fail asset delivery or
 // replace a recovery archive; cancellation must remove streamed partial bytes.
 #[tokio::test]
 async fn truncated_agent_streams_preserve_recovery_and_reject_assets() {
@@ -335,7 +335,10 @@ async fn truncated_agent_streams_preserve_recovery_and_reject_assets() {
     use std::sync::atomic::{AtomicU8, Ordering};
     // Fake only the guest's HTTP response boundary; use real yamux, HTTP/2,
     // agent framing, AgentRunner, upload, and checkpoint publication/cleanup.
-    let mode = Arc::new(AtomicU8::new(0)); // complete, truncated, stalled
+    const COMPLETE: u8 = 0;
+    const TRUNCATED: u8 = 1;
+    const STALLED: u8 = 2;
+    let mode = Arc::new(AtomicU8::new(COMPLETE));
     let (host, guest) = tokio::io::duplex(64 * 1024);
     let (host, guest) = tokio::join!(
         drydock_transport::Transport::yamux(Box::new(host), true, Default::default()),
@@ -356,9 +359,9 @@ async fn truncated_agent_streams_preserve_recovery_and_reject_assets() {
                 post(move || {
                     let mode = state.load(Ordering::SeqCst);
                     async move {
-                        let bytes = if mode == 0 { b"archive bytes".as_slice() } else { b"partial replacement".as_slice() };
+                        let bytes = if mode == COMPLETE { b"archive bytes".as_slice() } else { b"partial replacement".as_slice() };
                         let mut events = vec![ExecEvent::Stdout(bytes.to_vec()), ExecEvent::Stderr(b"secret guest stderr".to_vec())];
-                        if mode == 0 {
+                        if mode == COMPLETE {
                             events.push(ExecEvent::Exit { code: Some(0) });
                         }
                         let bytes = events
@@ -369,7 +372,7 @@ async fn truncated_agent_streams_preserve_recovery_and_reject_assets() {
                                 bytes
                             })
                             .collect::<Vec<_>>();
-                        let end = if mode == 2 { futures::stream::pending().boxed() } else { futures::stream::empty().boxed() };
+                        let end = if mode == STALLED { futures::stream::pending().boxed() } else { futures::stream::empty().boxed() };
                         Body::from_stream(futures::stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(bytes)) }).chain(end))
                     }
                 }),
@@ -389,7 +392,7 @@ async fn truncated_agent_streams_preserve_recovery_and_reject_assets() {
     let target = directory.path().join("checkpoint.tar");
     write_checkpoint(runner.clone(), &target, Path::new("/work")).await.unwrap();
     assert_eq!(std::fs::read(&target).unwrap(), b"archive bytes");
-    mode.store(1, Ordering::SeqCst);
+    mode.store(TRUNCATED, Ordering::SeqCst);
     let assets = tempfile::tempdir().unwrap();
     let folder = assets.path().join("folder");
     std::fs::create_dir(&folder).unwrap();
@@ -397,26 +400,28 @@ async fn truncated_agent_streams_preserve_recovery_and_reject_assets() {
     std::os::unix::fs::symlink("folder", &link).unwrap();
     for source in [&folder, &link] {
         let error = reach::upload(&agent, source, Path::new("/asset")).await.unwrap_err();
-        assert!(!error.contains("secret guest stderr"));
+        assert_eq!(error, "drydock guest operation failed (UnexpectedEof)");
     }
     let error = write_checkpoint(runner.clone(), &target, Path::new("/work")).await.unwrap_err();
-    assert!(!error.contains("secret guest stderr"));
+    assert_eq!(error, "drydock guest operation failed (UnexpectedEof)");
     assert_eq!(std::fs::read(&target).unwrap(), b"archive bytes");
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
-    mode.store(2, Ordering::SeqCst);
+    mode.store(STALLED, Ordering::SeqCst);
     let capture = tokio::spawn({
         let target = target.clone();
         async move { write_checkpoint(runner, &target, Path::new("/work")).await }
     });
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if std::fs::read_dir(directory.path()).unwrap().any(|entry| {
-                let entry = entry.unwrap();
-                entry.path() != target && entry.metadata().unwrap().len() > 0
-            }) {
+            let mut entries = tokio::fs::read_dir(directory.path()).await.unwrap();
+            let mut partial_exists = false;
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                partial_exists |= entry.path() != target;
+            }
+            if partial_exists {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
