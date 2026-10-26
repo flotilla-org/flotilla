@@ -575,6 +575,10 @@ fn validate_pin(name: &str, pin: &ImageLayerPin) -> Result<(), String> {
         if artifact.url.trim().is_empty() {
             return Err(format!("pin `{name}` has an empty url for `{architecture}`"));
         }
+        // A previous-shape template with one digest names no fetchable bytes.
+        if architecture == ANY_ARCHITECTURE && is_legacy_template(&artifact.url) {
+            return Err(format!("pin `{name}` shares an `{{arch}}` url across architectures"));
+        }
         if !is_lower_hex_sha256(&artifact.sha256) {
             return Err(format!("pin `{name}` downloads a url without a sha256 (64 lowercase hex) for `{architecture}`"));
         }

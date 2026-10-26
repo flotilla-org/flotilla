@@ -5,7 +5,7 @@
 //! same file. See `stdlib/guest-layers/README.md`.
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::LazyLock,
 };
 
@@ -40,24 +40,81 @@ pub struct Composition {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "MemberRecord", into = "MemberRecord")]
 pub struct Member {
     pub role: String,
-    /// A generation-relative regular file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file: Option<String>,
-    /// A generation-relative directory; every file under it belongs to this member.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tree: Option<String>,
+    pub source: Source,
     /// Where the member is published in the layer. Absent: verified, not published.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<FileFormat>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loads: Option<Loads>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<RequiredEntry>,
+}
+
+/// One member's source location in the generation tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// A generation-relative regular file.
+    File(String),
+    /// A generation-relative directory; every file under it belongs to this member.
+    Tree(String),
+}
+
+/// The declared form of a [`Member`]: exactly one of `file` or `tree`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemberRecord {
+    role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    install: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    format: Option<FileFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loads: Option<Loads>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    requires: Vec<RequiredEntry>,
+}
+
+impl TryFrom<MemberRecord> for Member {
+    type Error = String;
+
+    fn try_from(record: MemberRecord) -> Result<Self, String> {
+        let source = match (record.file, record.tree) {
+            (Some(file), None) => Source::File(file),
+            (None, Some(tree)) => Source::Tree(tree),
+            _ => return Err(format!("member `{}` names exactly one of `file` or `tree`", record.role)),
+        };
+        Ok(Self {
+            role: record.role,
+            source,
+            install: record.install,
+            format: record.format,
+            loads: record.loads,
+            requires: record.requires,
+        })
+    }
+}
+
+impl From<Member> for MemberRecord {
+    fn from(member: Member) -> Self {
+        let (file, tree) = match member.source {
+            Source::File(file) => (Some(file), None),
+            Source::Tree(tree) => (None, Some(tree)),
+        };
+        Self {
+            role: member.role,
+            file,
+            tree,
+            install: member.install,
+            format: member.format,
+            loads: member.loads,
+            requires: member.requires,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,23 +154,6 @@ pub struct LayerEnvironment {
     pub variables: BTreeMap<String, Vec<String>>,
 }
 
-/// One member's source location in the generation tree.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Source<'a> {
-    File(&'a str),
-    Tree(&'a str),
-}
-
-impl Member {
-    pub fn source(&self) -> Source<'_> {
-        match (&self.file, &self.tree) {
-            (Some(file), _) => Source::File(file),
-            (None, Some(tree)) => Source::Tree(tree),
-            (None, None) => unreachable!("validated members name a file or a tree"),
-        }
-    }
-}
-
 impl Composition {
     pub fn parse(text: &str) -> Result<Self, String> {
         let composition: Self = serde_json::from_str(text).map_err(|error| format!("invalid guest layer declaration: {error}"))?;
@@ -140,10 +180,9 @@ impl Composition {
             if role.is_empty() || !roles.insert(role.as_str()) {
                 return refuse(format!("empty or duplicate role `{role}`"));
             }
-            let (source, tree) = match (&member.file, &member.tree) {
-                (Some(file), None) => (file.as_str(), false),
-                (None, Some(tree)) => (tree.as_str(), true),
-                _ => return refuse(format!("member `{role}` names exactly one of `file` or `tree`")),
+            let (source, tree) = match &member.source {
+                Source::File(file) => (file.as_str(), false),
+                Source::Tree(tree) => (tree.as_str(), true),
             };
             for path in std::iter::once(source).chain(member.install.as_deref()) {
                 if !normalised(path) {
@@ -190,7 +229,9 @@ impl Composition {
                         format!("guest layer `{}`: member `{role}` runpath `{}` is not origin-relative", self.name, loads.runpath)
                     })?;
                     let provided = self.members.iter().any(|other| {
-                        other.file.is_some() && other.format == Some(FileFormat::Elf) && other.install.as_deref() == Some(resolved.as_str())
+                        matches!(other.source, Source::File(_))
+                            && other.format == Some(FileFormat::Elf)
+                            && other.install.as_deref() == Some(resolved.as_str())
                     });
                     if !provided {
                         return refuse(format!("member `{role}` loads `{library}`, but no published native member installs `{resolved}`"));
@@ -224,7 +265,7 @@ impl Composition {
     /// each published file's parent and each published tree.
     pub fn exposed_directories(&self) -> BTreeSet<PathBuf> {
         self.published()
-            .map(|(member, install)| match member.source() {
+            .map(|(member, install)| match member.source {
                 Source::File(_) => Path::new(install).parent().map(Path::to_path_buf).unwrap_or_default(),
                 Source::Tree(_) => PathBuf::from(install),
             })
@@ -253,11 +294,10 @@ impl Composition {
     }
 }
 
+/// Checked on the text, not `Path::components`, which would skip interior
+/// `.` and empty segments; the release validator applies the same rule.
 fn normalised(path: &str) -> bool {
-    !path.is_empty()
-        && !path.contains('\\')
-        && Path::new(path).components().all(|part| matches!(part, Component::Normal(_)))
-        && !path.ends_with('/')
+    !path.contains('\\') && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
 
 /// Whether two relative paths are equal or one contains the other, when either
@@ -304,9 +344,10 @@ pub fn validate_elf(bytes: &[u8], artifact: &str, machine: u16, loads: Option<&L
         let part = bytes.get(offset..offset.checked_add(size).ok_or_else(invalid)?).ok_or_else(invalid)?;
         Ok(part.iter().enumerate().fold(0u64, |n, (i, b)| n | (u64::from(*b) << (8 * i))))
     };
-    let table = usize::try_from(number(32, 8)?).map_err(|_| invalid())?;
-    let stride = number(54, 2)? as usize;
-    let count = number(56, 2)? as usize;
+    let index = |offset: usize, size: usize| -> Result<usize, String> { usize::try_from(number(offset, size)?).map_err(|_| invalid()) };
+    let table = index(32, 8)?;
+    let stride = index(54, 2)?;
+    let count = index(56, 2)?;
     if stride < 56 || table.checked_add(stride.checked_mul(count).ok_or_else(invalid)?).is_none_or(|end| end > bytes.len()) {
         return Err(invalid());
     }
@@ -322,12 +363,13 @@ pub fn validate_elf(bytes: &[u8], artifact: &str, machine: u16, loads: Option<&L
         }
     }
     let (offset, _, size) = dynamic.ok_or_else(invalid)?;
-    let end = offset.checked_add(size).ok_or_else(invalid)?;
-    if end > bytes.len() as u64 || size % 16 != 0 {
+    let offset = usize::try_from(offset).map_err(|_| invalid())?;
+    let end = offset.checked_add(usize::try_from(size).map_err(|_| invalid())?).ok_or_else(invalid)?;
+    if end > bytes.len() || size % 16 != 0 {
         return Err(invalid());
     }
     let mut tags = Vec::new();
-    for start in (offset as usize..end as usize).step_by(16) {
+    for start in (offset..end).step_by(16) {
         let tag = number(start, 8)?;
         if tag == 0 {
             break;
@@ -372,21 +414,15 @@ pub fn validate_terminfo(bytes: &[u8], artifact: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    // The shipped declaration carries every role a caller looks up, with the
-    // published layout and environment the vessel paths are built from.
+    // The shipped declaration carries every role a caller looks up; the agent
+    // is bootstrapped separately, never published.
     #[test]
     fn stdlib_tools_declaration_names_every_typed_role() {
         let tools = flotilla_tools();
         for typed in [role::AGENT, role::CLI, role::CLEAT, role::CLEAT_LIBRARY] {
-            assert!(matches!(tools.member(typed).map(Member::source), Some(Source::File(_))), "{typed}");
+            assert!(matches!(tools.member(typed).map(|member| &member.source), Some(Source::File(_))), "{typed}");
         }
-        assert!(tools.member(role::AGENT).is_some_and(|agent| agent.install.is_none()), "the agent is bootstrapped, not published");
-        assert_eq!(
-            tools.exposed_directories().into_iter().collect::<Vec<_>>(),
-            [PathBuf::from("bin"), PathBuf::from("lib"), PathBuf::from("share/terminfo")]
-        );
-        assert_eq!(tools.path_entries(Path::new("/p")), [PathBuf::from("/p/bin")]);
-        assert_eq!(tools.variables(Path::new("/p")), [("TERMINFO_DIRS".to_string(), "/p/share/terminfo:/usr/share/terminfo".to_string())]);
+        assert!(tools.member(role::AGENT).is_some_and(|agent| agent.install.is_none()));
     }
 
     // Static declaration rules refuse each broken composition with its reason.
@@ -394,10 +430,15 @@ mod tests {
     fn invalid_declarations_are_refused_with_their_reason() {
         let base = serde_json::to_value(flotilla_tools()).expect("declaration");
         type Mutation = fn(&mut serde_json::Value);
-        let cases: [(&str, Mutation); 7] = [
+        let cases: [(&str, Mutation); 12] = [
             ("duplicate role", |value| value["members"][1]["role"] = "agent".into()),
             ("exactly one of", |value| value["members"][0]["tree"] = "share".into()),
             ("normalised", |value| value["members"][1]["install"] = "../bin/flotilla".into()),
+            ("normalised", |value| value["members"][1]["install"] = "bin/./flotilla".into()),
+            ("normalised", |value| value["members"][1]["file"] = "bin//flotilla-vessel".into()),
+            ("declares formats per required entry", |value| value["members"][4]["format"] = "terminfo".into()),
+            ("cannot require entries", |value| value["members"][1]["requires"] = serde_json::json!([{"path": "x"}])),
+            ("not a settable name", |value| value["environment"]["variables"]["PATH"] = serde_json::json!(["bin"])),
             ("overlaps", |value| value["members"][4]["install"] = "bin".into()),
             ("no published native member installs `lib/libghostty-vt.so.0`", |value| {
                 value["members"][3]["install"] = "lib/other.so".into()

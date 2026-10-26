@@ -151,6 +151,7 @@ fn pin_args(layer: &ImageLayerSpec, architecture: &str) -> Result<Vec<String>, S
             .ok_or_else(|| format!("image layer `{}`: pin `{pin}` has no artifact for architecture `{architecture}`", layer.name))?;
         args.push(arg_line(&format!("PIN_{name}_URL"), &artifact.url, &layer.name)?);
         args.push(arg_line(&format!("PIN_{name}_SHA256"), &artifact.sha256, &layer.name)?);
+        args.push(arg_line(&format!("PIN_{name}_UNPACK"), artifact.unpack.as_str(), &layer.name)?);
     }
     Ok(args)
 }

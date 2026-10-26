@@ -98,7 +98,7 @@ fn current_target(link: &Path, path: &Path) -> PathBuf {
 fn entry_points(target: &Path, composition: &Composition) -> io::Result<Vec<PathBuf>> {
     let mut links = Vec::new();
     for (member, install) in composition.published() {
-        match member.source() {
+        match &member.source {
             Source::File(_) => links.push(PathBuf::from(install)),
             Source::Tree(_) => {
                 for entry in fs::read_dir(target.join(install))? {
@@ -123,7 +123,7 @@ fn published_links_intact(root: &Path, target: &Path, composition: &Composition)
 fn source_files(source: Payload<'_>) -> io::Result<Vec<(PathBuf, PathBuf)>> {
     let mut files = Vec::new();
     for (member, install) in source.composition.published() {
-        match member.source() {
+        match &member.source {
             Source::File(file) => files.push((PathBuf::from(install), source.root.join(file))),
             Source::Tree(tree) => {
                 collect(&source.root.join(tree), Path::new(install), &mut files)?;

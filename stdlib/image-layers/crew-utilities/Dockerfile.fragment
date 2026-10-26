@@ -4,7 +4,6 @@
 # config under $HOME before running the real binary (/usr/local/bin/tea-real).
 # Caches (uv, gh) default under the provider's $HOME.
 FROM ${BASE}
-ARG TARGETARCH
 ARG DEBIAN_FRONTEND=noninteractive
 RUN set -eu; \
     apt-get update; \
@@ -19,20 +18,15 @@ RUN set -eu; \
         zsh; \
     rm -rf /var/lib/apt/lists/*
 RUN set -eu; \
-    case "${TARGETARCH}" in \
-        amd64) gh_arch=amd64; tea_arch=amd64; uv_arch=x86_64 ;; \
-        arm64) gh_arch=arm64; tea_arch=arm64; uv_arch=aarch64 ;; \
-        *) echo "unsupported crew-utilities architecture: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
     work="$(mktemp -d)"; \
-    curl -fsSL "$(printf '%s' "${PIN_GH_URL}" | sed "s/{arch}/${gh_arch}/g")" -o "${work}/gh.tar.gz"; \
+    curl -fsSL "${PIN_GH_URL}" -o "${work}/gh.tar.gz"; \
     printf '%s  %s\n' "${PIN_GH_SHA256}" "${work}/gh.tar.gz" | sha256sum --check --strict -; \
     tar -xzf "${work}/gh.tar.gz" -C "${work}" --strip-components=1 --no-same-owner; \
     install -m 0755 "${work}/bin/gh" /usr/local/bin/gh; \
-    curl -fsSL "$(printf '%s' "${PIN_TEA_URL}" | sed "s/{arch}/${tea_arch}/g")" -o "${work}/tea"; \
+    curl -fsSL "${PIN_TEA_URL}" -o "${work}/tea"; \
     printf '%s  %s\n' "${PIN_TEA_SHA256}" "${work}/tea" | sha256sum --check --strict -; \
     install -m 0755 "${work}/tea" /usr/local/bin/tea-real; \
-    curl -fsSL "$(printf '%s' "${PIN_UV_URL}" | sed "s/{arch}/${uv_arch}/g")" -o "${work}/uv.tar.gz"; \
+    curl -fsSL "${PIN_UV_URL}" -o "${work}/uv.tar.gz"; \
     printf '%s  %s\n' "${PIN_UV_SHA256}" "${work}/uv.tar.gz" | sha256sum --check --strict -; \
     tar -xzf "${work}/uv.tar.gz" -C "${work}" --strip-components=1 --no-same-owner; \
     install -m 0755 "${work}/uv" "${work}/uvx" /usr/local/bin/; \

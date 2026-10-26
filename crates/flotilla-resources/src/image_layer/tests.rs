@@ -110,6 +110,10 @@ fn validation_refuses_each_rule_violation() {
         ),
         ("empty url", ImageLayerSpec { pins: BTreeMap::from([("rustup".into(), pin(&[("amd64", " ", &hex)]))]), ..shared() }),
         (
+            "template shared by every architecture",
+            ImageLayerSpec { pins: BTreeMap::from([("rustup".into(), pin(&[("any", "https://x.test/{arch}", &hex)]))]), ..shared() },
+        ),
+        (
             "upper-case sha256",
             ImageLayerSpec { pins: BTreeMap::from([("rustup".into(), pin(&[("any", "https://x.test/r", &"A".repeat(64))]))]), ..shared() },
         ),
@@ -766,7 +770,10 @@ fn previous_pin_shapes_decode_and_only_artifacts_are_written() {
         assert_eq!(decode(written).expect("written shape decodes"), pin);
     }
     let mixed = decode(serde_json::json!({"version": "1", "url": "https://x.test/r", "artifacts": {}})).expect_err("mixed shapes");
-    assert!(mixed.to_string().contains("together with the previous"), "{mixed}");
+    let mixed_digest = decode(serde_json::json!({"version": "1", "sha256": hex('a'), "artifacts": {}})).expect_err("mixed shapes");
+    for error in [mixed, mixed_digest] {
+        assert!(error.to_string().contains("together with the previous"), "{error}");
+    }
     assert!(decode(serde_json::json!({"version": "1", "checksum": hex('a')})).is_err(), "unknown pin field");
     assert!(
         decode(serde_json::json!({"version": "1", "artifacts": {"any": {"url": "u", "sha256": hex('a'), "unpack": "zip"}}})).is_err(),

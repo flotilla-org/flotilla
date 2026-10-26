@@ -3,7 +3,6 @@
 # versioned backend distributions in place, so crews never download backends
 # into ~/.quint. Static environment is image ENV; there is no prelude.
 FROM ${BASE}
-ARG TARGETARCH
 ARG DEBIAN_FRONTEND=noninteractive
 RUN set -eu; \
     apt-get update; \
@@ -11,20 +10,15 @@ RUN set -eu; \
     rm -rf /var/lib/apt/lists/*
 COPY --from=formal-modelling --chmod=0644 package.json package-lock.json /opt/quint/npm/
 RUN set -eu; \
-    case "${TARGETARCH}" in \
-        amd64) java_arch=x64; evaluator_arch=x86_64 ;; \
-        arm64) java_arch=aarch64; evaluator_arch=aarch64 ;; \
-        *) echo "unsupported formal-modelling architecture: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
     java_home=/opt/java; \
     quint_home=/opt/quint; \
     evaluator_dir="${quint_home}/rust-evaluator-v${PIN_QUINT_EVALUATOR_VERSION}"; \
     apalache_dir="${quint_home}/apalache-dist-${PIN_APALACHE_VERSION}"; \
     mkdir -p "${java_home}" "${evaluator_dir}" "${apalache_dir}" "${quint_home}/bin"; \
-    curl -fsSL "$(printf '%s' "${PIN_JDK_URL}" | sed "s/{arch}/${java_arch}/g")" -o /tmp/jdk.tar.gz; \
+    curl -fsSL "${PIN_JDK_URL}" -o /tmp/jdk.tar.gz; \
     printf '%s  %s\n' "${PIN_JDK_SHA256}" /tmp/jdk.tar.gz | sha256sum --check --strict -; \
     tar -xzf /tmp/jdk.tar.gz -C "${java_home}" --strip-components=1 --no-same-owner; \
-    curl -fsSL "$(printf '%s' "${PIN_QUINT_EVALUATOR_URL}" | sed "s/{arch}/${evaluator_arch}/g")" -o /tmp/evaluator.tar.gz; \
+    curl -fsSL "${PIN_QUINT_EVALUATOR_URL}" -o /tmp/evaluator.tar.gz; \
     printf '%s  %s\n' "${PIN_QUINT_EVALUATOR_SHA256}" /tmp/evaluator.tar.gz | sha256sum --check --strict -; \
     tar -xzf /tmp/evaluator.tar.gz -C "${evaluator_dir}" --no-same-owner; \
     curl -fsSL "${PIN_APALACHE_URL}" -o /tmp/apalache.tgz; \

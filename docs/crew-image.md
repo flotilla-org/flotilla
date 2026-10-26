@@ -105,10 +105,12 @@ build_secrets: []
   such as a harness fetch stage, use prefixed aliases. Nothing else in the
   fragment is inspected.
 - **Pins** become build arguments emitted after every `FROM` line of the layer:
-  `PIN_<NAME>_VERSION`, `PIN_<NAME>_URL` and `PIN_<NAME>_SHA256`, where
-  `<NAME>` is the upper-snake pin name. The URL and SHA-256 are the target
-  architecture's artifact, or the shared `any` artifact. Fragments use those
-  names and never declare their own defaults.
+  `PIN_<NAME>_VERSION`, `PIN_<NAME>_URL`, `PIN_<NAME>_SHA256` and
+  `PIN_<NAME>_UNPACK`, where `<NAME>` is the upper-snake pin name. The last
+  three are the target architecture's artifact, or the shared `any` artifact;
+  a pin with no artifact for the target refuses the build. Fragments use those
+  names as given, never declare their own defaults, and need no architecture
+  mapping to choose a download.
 - **Each architecture's artifact is explicit.** It names a full URL, its
   `sha256` and its `unpack` kind (`file`, `tar.gz` or `tar.xz`). There are no
   URL templates. Image builds and the vessel agent's digest fetch read the same

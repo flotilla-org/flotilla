@@ -56,6 +56,7 @@ fn expected_args(layer: &ImageLayerSpec, architecture: &str) -> Vec<String> {
         if let Some(artifact) = pin.artifacts.get(architecture).or_else(|| pin.artifacts.get("any")) {
             args.push(format!("ARG PIN_{key}_URL={}\n", artifact.url));
             args.push(format!("ARG PIN_{key}_SHA256={}\n", artifact.sha256));
+            args.push(format!("ARG PIN_{key}_UNPACK={}\n", artifact.unpack.as_str()));
         }
     }
     args
@@ -123,7 +124,7 @@ fn small_composition_renders_golden_dockerfile() {
     tool.build_secrets.insert("npm-token".into());
     let generated = generate_build(&[base, tool.clone()], "arm64").expect("generate");
     let tool_args =
-        format!("ARG PIN_TOOL_VERSION=2.0\nARG PIN_TOOL_URL=https://example.test/tool-aarch64.tar.gz\nARG PIN_TOOL_SHA256={}\n", hex('b'));
+        format!("ARG PIN_TOOL_VERSION=2.0\nARG PIN_TOOL_URL=https://example.test/tool-aarch64.tar.gz\nARG PIN_TOOL_SHA256={}\nARG PIN_TOOL_UNPACK=tar.gz\n", hex('b'));
     let expected = format!(
         "# syntax=docker/dockerfile:1.17\n\
          \n# flotilla layer 0: base 1.0\n\
@@ -359,10 +360,9 @@ fn stdlib_base_bounds_apt_fetches_before_bootstrap() {
 
 // The shipped stdlib layers (`stdlib/image-layers/` at the workspace root,
 // the same directories the daemon embeds) compose into one Dockerfile per
-// architecture: the
-// structural contract holds, `{arch}` pin URLs are emitted verbatim, the
-// architecture's checksum is selected, and declared context files (with
-// their executable bits) become one named context per layer.
+// architecture: the structural contract holds, every pin has an artifact for
+// the target, and declared context files (with their executable bits) become
+// one named context per layer.
 #[test]
 fn stdlib_layers_generate_for_both_architectures() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stdlib/image-layers");
@@ -382,12 +382,6 @@ fn stdlib_layers_generate_for_both_architectures() {
     for architecture in ["amd64", "arm64"] {
         let generated = generate_build(&layers, architecture).expect("stdlib generates");
         assert_structure(&layers, architecture, &generated.dockerfile);
-        let codex = &layers[8].pins["codex"];
-        let artifact = codex.artifact(architecture).expect("codex artifact");
-        let target = if architecture == "amd64" { "x86_64" } else { "aarch64" };
-        assert!(generated.dockerfile.contains(&format!("ARG PIN_CODEX_URL={}\n", artifact.url)));
-        assert!(generated.dockerfile.contains(&format!("codex-package-{target}-unknown-linux-musl.tar.gz")));
-        assert!(generated.dockerfile.contains(&format!("ARG PIN_CODEX_SHA256={}\n", artifact.sha256)));
         assert!(generated.dockerfile.contains("FROM flotilla-layer-7 AS harness-codex-fetch\n"));
         assert!(generated.dockerfile.contains("FROM flotilla-layer-7 AS flotilla-layer-8\n"));
         let contexts: Vec<_> = generated.contexts.iter().map(|context| context.name.as_str()).collect();

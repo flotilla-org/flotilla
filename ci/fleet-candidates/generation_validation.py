@@ -228,7 +228,7 @@ def guest_native(content, name, loads=None):
     segments = [struct.unpack_from('<IIQQQQQQ', content, offset + size * i) for i in range(count)]
     loads_segments = [p for p in segments if p[0] == 1]
     dynamic = next((p for p in segments if p[0] == 2), None)
-    if dynamic is None or dynamic[2] + dynamic[5] > len(content):
+    if dynamic is None or dynamic[2] + dynamic[5] > len(content) or dynamic[5] % 16:
         raise ValueError(f'{GUEST_TARGET}: {name} lacks dynamic loader metadata')
     tags = [struct.unpack_from('<QQ', content, i) for i in range(dynamic[2], dynamic[2] + dynamic[5], 16)]
     strings = next((value for tag, value in tags if tag == 5), None)

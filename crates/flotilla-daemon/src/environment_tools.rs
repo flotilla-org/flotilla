@@ -30,6 +30,9 @@ pub(crate) const DOCKER_PROVIDER_KIND: EnvironmentToolProviderKind = Environment
 /// published under the vessel's own prefix, since nothing there is mounted.
 pub(crate) const AGENTLESS_SSH_PROVIDER_KIND: EnvironmentToolProviderKind = EnvironmentToolProviderKind("agentless-ssh");
 
+/// Where a Docker vessel mounts the generation layer; declared members are
+/// relative to it.
+const ENVIRONMENT_GUEST_PREFIX: &str = "/opt/flotilla";
 pub(crate) const ENVIRONMENT_FLOTILLA_DIRECTORY: &str = "/opt/flotilla/bin";
 pub(crate) const ENVIRONMENT_FLOTILLA_PATH: &str = "/opt/flotilla/crew-bin/flotilla";
 const FLOTILLA_LAUNCHER_NAME: &str = "contained-flotilla-launcher";
@@ -199,7 +202,7 @@ impl EnvironmentToolFactory for FleetToolsTool {
         if let Some(prefix) = context.tools_prefix() {
             return Ok(generation_layer(&self.root, prefix, composition));
         }
-        let mount = Path::new("/opt/flotilla");
+        let mount = Path::new(ENVIRONMENT_GUEST_PREFIX);
         cli.assets.remove(0);
         for directory in published_directories(composition) {
             cli.assets.push(EnvironmentToolAsset::new(

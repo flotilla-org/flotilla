@@ -2,14 +2,8 @@
 # native package; the output stage copies only that directory with
 # COPY --link, so the layer's blob is independent of the layers beneath it.
 FROM ${BASE} AS harness-codex-fetch
-ARG TARGETARCH
 RUN set -eu; \
-    case "${TARGETARCH}" in \
-        amd64) arch=x86_64 ;; \
-        arm64) arch=aarch64 ;; \
-        *) echo "unsupported Codex architecture: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "$(printf '%s' "${PIN_CODEX_URL}" | sed "s/{arch}/${arch}/g")" -o /tmp/codex.tar.gz; \
+    curl -fsSL "${PIN_CODEX_URL}" -o /tmp/codex.tar.gz; \
     printf '%s  %s\n' "${PIN_CODEX_SHA256}" /tmp/codex.tar.gz | sha256sum --check --strict -; \
     dest="/opt/flotilla/harnesses/codex/${PIN_CODEX_VERSION}"; \
     mkdir -p "${dest}"; \

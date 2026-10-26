@@ -128,7 +128,7 @@ impl GuestTools {
             if content.len() as u64 != file.size_bytes || format!("{:x}", Sha256::digest(&content)) != file.sha256 {
                 return Err(refuse(format!("digest/size mismatch: {}", file.path)));
             }
-            match (member.source(), member.format) {
+            match (&member.source, member.format) {
                 (Source::File(_), Some(FileFormat::Elf)) => {
                     composition::validate_elf(&content, &file.path, machine, member.loads.as_ref()).map_err(refuse)?;
                     use std::os::unix::fs::PermissionsExt;
@@ -151,8 +151,8 @@ impl GuestTools {
             }
         }
         for member in &composition.members {
-            let required: Vec<String> = match member.source() {
-                Source::File(file) => vec![file.to_string()],
+            let required: Vec<String> = match &member.source {
+                Source::File(file) => vec![file.clone()],
                 Source::Tree(tree) => member.requires.iter().map(|entry| format!("{tree}/{}", entry.path)).collect(),
             };
             if let Some(missing) = required.into_iter().find(|name| !declared.contains(name)) {
@@ -186,7 +186,7 @@ impl GuestTools {
     }
     /// The verified file a typed caller needs, by its declared role.
     pub fn file(&self, role: &str) -> PathBuf {
-        match self.composition.member(role).map(|member| member.source()) {
+        match self.composition.member(role).map(|member| &member.source) {
             Some(Source::File(file)) => self.root.join(file),
             _ => unreachable!("the composition declares file role `{role}`"),
         }
@@ -205,7 +205,7 @@ impl GuestTools {
 
 /// The member whose file or tree contains `path`.
 fn owner<'a>(composition: &'a Composition, path: &str) -> Option<&'a composition::Member> {
-    composition.members.iter().find(|member| match member.source() {
+    composition.members.iter().find(|member| match &member.source {
         Source::File(file) => file == path,
         Source::Tree(tree) => Path::new(path).starts_with(tree) && path != tree,
     })
@@ -220,7 +220,9 @@ pub fn linux_amd64() -> Platform {
 pub fn validate_native(bytes: &[u8], role: &str, platform: &Platform) -> Result<(), String> {
     let member = composition::flotilla_tools().member(role).ok_or_else(|| format!("no guest member `{role}`"))?;
     let machine = composition::elf_machine(&platform.architecture).ok_or_else(|| format!("guest platform {platform}: no native format"))?;
-    let name = member.file.as_deref().unwrap_or(role);
+    let name = match &member.source {
+        Source::File(file) | Source::Tree(file) => file,
+    };
     composition::validate_elf(bytes, name, machine, member.loads.as_ref())
 }
 
@@ -236,7 +238,7 @@ mod tests {
     fn controller_identity_cannot_replace_guest_build(tc: hegel::TestCase) {
         use hegel::generators as gs;
         let controller = tc.draw(gs::integers::<usize>().min_value(0).max_value(1));
-        let fault = tc.draw(gs::integers::<usize>().min_value(0).max_value(11));
+        let fault = tc.draw(gs::integers::<usize>().min_value(0).max_value(13));
         let temporary = tempfile::tempdir().expect("generation");
         let root = temporary.path();
         let files = write_guest_fixture(root);
@@ -273,13 +275,25 @@ mod tests {
             }
             6 => fs::remove_file(root.join(TREE).join("lib/libghostty-vt.so.0")).expect("library"),
             7 => fs::remove_file(root.join(TREE).join("share/terminfo/x/xterm-ghostty-alias")).expect("alias"),
-            8 | 9 => {
+            8 | 9 | 12 | 13 => {
                 let mut bytes = fs::read(&native).expect("native fixture");
-                if fault == 8 {
-                    bytes[18] = 183;
-                } else {
-                    let start = bytes.windows(b"$ORIGIN/../lib".len()).position(|part| part == b"$ORIGIN/../lib").expect("rpath");
-                    bytes[start] = b'/';
+                let field =
+                    |bytes: &[u8], at: usize, size: usize| bytes[at..at + size].iter().rev().fold(0, |n, b| n << 8 | usize::from(*b));
+                match fault {
+                    8 => bytes[18] = 183,
+                    9 => {
+                        let start = bytes.windows(b"$ORIGIN/../lib".len()).position(|part| part == b"$ORIGIN/../lib").expect("rpath");
+                        bytes[start] = b'/';
+                    }
+                    // Program headers past the end of the file.
+                    12 => bytes.truncate(field(&bytes, 32, 8) + 8),
+                    // A dynamic section that is not a whole number of entries.
+                    _ => {
+                        let (table, stride) = (field(&bytes, 32, 8), field(&bytes, 54, 2));
+                        let dynamic =
+                            (0..field(&bytes, 56, 2)).map(|i| table + stride * i).find(|&at| field(&bytes, at, 4) == 2).expect("dynamic");
+                        bytes[dynamic + 32] ^= 8;
+                    }
                 }
                 fs::write(&native, &bytes).expect("native mutation");
                 rewrite_catalog("bin/cleat", &bytes);
