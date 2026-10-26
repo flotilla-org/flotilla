@@ -1,5 +1,6 @@
-use super::super::docker::REQUESTER_CONVOY_UNAVAILABLE;
 use super::*;
+use flotilla_provisioning::reconcilers::EnvironmentRuntime;
+use flotilla_resources::account_access::REQUESTER_HOME_UNAVAILABLE;
 use flotilla_store_memory::InMemoryBackend;
 
 #[tokio::test]
@@ -424,7 +425,7 @@ async fn agent_environment_is_staged_at_the_runner_writable_config_base() {
 }
 
 // A contained Claude crew admitted by convoy start stages pinned skills in its bound
-// requester home and preserves that home at launch; missing ownership refuses relaunch.
+// requester home and preserves that home at launch; missing supplied homes refuse relaunch.
 // Glue: one sequential admission-to-provisioning handoff, with real account delivery.
 #[tokio::test]
 async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
@@ -646,20 +647,91 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
         let patch = outcome.patch.expect("convoy must advance toward Vessel");
         flotilla_store::apply_status_patch(&convoys, &name, &patch).await.expect("advance convoy");
     }
-    let vessel = created_vessel.expect("convoy must create a Vessel within four transitions");
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
-    let prepared = reconciler.prepare(&vessel).await.expect("prepare vessel");
-    let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
-    let (meta, spec) = outcome
-        .actuations
-        .into_iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateEnvironment { meta, spec } => Some((meta, spec)),
-            _ => None,
-        })
-        .expect("admitted vessel creates Environment");
-    let environment = backend.using::<Environment>(NAMESPACE).create(&meta, &spec).await.expect("environment");
+    created_vessel.expect("convoy must create a Vessel within four transitions");
+    // Older snapshots and bindings have no recorded key; only the account authority repairs them.
+    let bindings = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE);
+    let binding = bindings.list().await.expect("bindings").items.into_iter().next().expect("admitted binding");
+    let admitted_home_key = binding
+        .metadata
+        .labels
+        .get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL)
+        .expect("admission records the bound home key")
+        .clone();
+    let mut old_binding = InputMeta::from(&binding.metadata);
+    old_binding.labels.remove(flotilla_resources::account_access::CREW_HOME_KEY_LABEL);
+    bindings.update(&old_binding, &binding.metadata.resource_version, &binding.spec).await.expect("old binding metadata");
+    let mut convoy = convoys.get(&name).await.expect("convoy snapshot");
+    let mut status = convoy.status.take().expect("admitted status");
+    for crew in status.workflow_snapshot.as_mut().expect("frozen workflow").vessels.iter_mut().flat_map(|vessel| &mut vessel.crew) {
+        crew.labels.remove(flotilla_resources::account_access::CREW_HOME_KEY_LABEL);
+    }
+    convoys.update_status(&name, &convoy.metadata.resource_version, &status).await.expect("old snapshot metadata");
+    daemon.reconcile_convoy_accounts(NAMESPACE, &name).await.expect("account authority recovers recorded homes");
+    let environments = backend.using::<Environment>(NAMESPACE);
+    let start_vessel = || {
+        let controller = flotilla_store::controller::ControllerLoop {
+            primary: backend.using::<Vessel>(NAMESPACE),
+            secondaries: Vec::new(),
+            reconciler: VesselReconciler::new(backend.clone(), NAMESPACE),
+            resync_interval: Duration::from_millis(25),
+            backend: backend.clone(),
+        };
+        tokio::spawn(controller.run())
+    };
+    let controller = start_vessel();
+    let fresh = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(environment) =
+                environments.list().await.expect("environments").items.into_iter().find(|environment| environment.spec.docker.is_some())
+            {
+                break environment;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("real Vessel controller creates Environment");
+    controller.abort();
+    let _ = controller.await;
+    // The real writer must transport admission's key even before legacy recovery is exercised.
+    let fresh_homes: BTreeMap<String, String> = serde_json::from_str(
+        fresh
+            .spec
+            .docker
+            .as_ref()
+            .expect("Docker")
+            .env
+            .get(flotilla_resources::account_access::CREW_HOME_KEYS_ENV)
+            .expect("fresh Environment receives caller homes"),
+    )
+    .expect("caller homes");
+    assert_eq!(fresh_homes.get("coder"), Some(&admitted_home_key), "the fresh writer passes the authority's key unchanged");
+    // A previous-generation Environment retains its identity but lacks the supplied home map.
+    let mut old_spec = fresh.spec.clone();
+    old_spec.docker.as_mut().expect("Docker").env.remove(flotilla_resources::account_access::CREW_HOME_KEYS_ENV);
+    environments
+        .update(&InputMeta::from(&fresh.metadata), &fresh.metadata.resource_version, &old_spec)
+        .await
+        .expect("old Environment spec");
+    let controller = start_vessel();
+    let environment = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let current = environments.get(&fresh.metadata.name).await.expect("environment");
+            if current.spec.docker.as_ref().expect("Docker").env.contains_key(flotilla_resources::account_access::CREW_HOME_KEYS_ENV) {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Vessel controller repairs old Environment home map");
+    controller.abort();
+    let _ = controller.await;
     let spec = environment.spec.docker.as_ref().expect("Docker environment");
+    let recovered_homes: BTreeMap<String, String> =
+        serde_json::from_str(spec.env.get(flotilla_resources::account_access::CREW_HOME_KEYS_ENV).expect("recovered homes"))
+            .expect("caller homes");
+    assert_eq!(recovered_homes, fresh_homes, "old Environment recovery preserves the admitted homes");
 
     let staged = Arc::new(StdMutex::new(Vec::new()));
     let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
@@ -731,7 +803,7 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
     // admission glue; retries, concurrent binding changes and launch authorization
     // have their own lifecycle scenarios.
     DockerControllerRuntime { state: Arc::clone(&state) }
-        .provision_docker(&environment.metadata.name, spec)
+        .provision_environment(&environment.metadata.name, &environment.spec)
         .await
         .expect("provision admitted Claude vessel");
     let access = flotilla_resources::account_access::AccessName(flotilla_agent::account_access::CLAUDE_SUBSCRIPTION.into());
@@ -756,23 +828,38 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
     let launch_home = launch_environment.iter().find(|(key, _)| key == "CLAUDE_CONFIG_DIR").expect("Claude launch home").1.clone();
     assert_eq!(
         *staged.lock().expect("staged paths"),
-        vec![PathBuf::from(launch_home).join("skills")],
+        vec![PathBuf::from(&launch_home).join("skills")],
         "skills must reach the launched requester home"
     );
 
     assert!(!destroyed.load(Ordering::SeqCst), "successful skill staging must keep the fresh vessel");
-    // Removing requester ownership must refuse a relaunch before creating a backing.
-    let mut orphan = InputMeta::from(&environment.metadata);
-    orphan.owner_references.clear();
-    orphan.labels.remove(flotilla_resources::VESSEL_REF_LABEL);
-    backend
-        .using::<Environment>(NAMESPACE)
-        .update(&orphan, &environment.metadata.resource_version, &environment.spec)
+    let provision = backend
+        .using::<flotilla_resources::AccountProvision>(NAMESPACE)
+        .list()
         .await
-        .expect("orphan environment");
-    let error =
-        DockerControllerRuntime { state }.provision_docker(&environment.metadata.name, spec).await.expect_err("missing requester convoy");
-    assert!(error.to_string().starts_with(REQUESTER_CONVOY_UNAVAILABLE), "{error}");
+        .expect("provisions")
+        .items
+        .into_iter()
+        .next()
+        .expect("recorded account provision");
+    // The provision keeps its existing absolute-directory contract for refresh and withdrawal.
+    assert_eq!(provision.spec.home, launch_home, "the provision records the delivered launch directory");
+    // Missing or invalid caller-supplied homes refuse before another backing is created.
+    for key in [None, Some(""), Some("../escape"), Some("/escape")] {
+        let mut missing_home = spec.clone();
+        if let Some(key) = key {
+            missing_home
+                .env
+                .insert(flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(), serde_json::json!({"coder":key}).to_string());
+        } else {
+            missing_home.env.remove(flotilla_resources::account_access::CREW_HOME_KEYS_ENV);
+        }
+        let error = DockerControllerRuntime { state: Arc::clone(&state) }
+            .provision_environment(&environment.metadata.name, &EnvironmentSpec { docker: Some(missing_home), ..environment.spec.clone() })
+            .await
+            .expect_err("missing or invalid requester home");
+        assert!(error.to_string().starts_with(REQUESTER_HOME_UNAVAILABLE), "{error}");
+    }
     mint_session.assert_complete();
 }
 

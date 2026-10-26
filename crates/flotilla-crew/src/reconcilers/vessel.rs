@@ -642,6 +642,33 @@ impl VesselReconciler {
             Ok(adapters) => adapters,
             Err(message) => return Ok(VesselPrepared::failed(message)),
         };
+        let home_keys = requirement
+            .crew
+            .iter()
+            .filter_map(|crew| {
+                crew.labels.get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL).map(|key| (crew.role.clone(), key.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for crew in &requirement.crew {
+            let CrewSource::Agent { selector, .. } = &crew.source else { continue };
+            let account = flotilla_agent::adapter::CapabilityTable::seeded()
+                .resolve_selector(selector)
+                .map_err(ResourceError::other)?
+                .account_access()
+                .is_some();
+            if account && !home_keys.contains_key(&crew.role) {
+                return Ok(VesselPrepared::provisioning(
+                    &placement_policy,
+                    placement_decision.clone(),
+                    format!(
+                        "{} waiting for crew `{}` recorded home key",
+                        flotilla_resources::account_access::REQUESTER_HOME_UNAVAILABLE,
+                        crew.role
+                    ),
+                    Vec::new(),
+                ));
+            }
+        }
         // A composed image installs exactly the harnesses its roles resolve
         // to; interior discovery verifies them instead of the policy's list.
         if composed_image(&placement_policy, None).is_some() || placement_policy.spec.cloud_sandbox_per_vessel.is_some() {
@@ -723,6 +750,23 @@ impl VesselReconciler {
                 let env_name = environment_name(&obj.metadata.name);
                 let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
+                        let current_keys = existing
+                            .spec
+                            .cloud_sandbox
+                            .as_ref()
+                            .map(|cloud| &cloud.env)
+                            .or_else(|| existing.spec.docker.as_ref().map(|docker| &docker.env))
+                            .and_then(|env| env.get(flotilla_resources::account_access::CREW_HOME_KEYS_ENV))
+                            .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok());
+                        if !home_keys.is_empty() && current_keys.as_ref() != Some(&home_keys) {
+                            actuations.push(Actuation::UpdateEnvironmentHomeKeys { name: env_name.clone(), keys: home_keys.clone() });
+                            return Ok(VesselPrepared::provisioning(
+                                &placement_policy,
+                                placement_decision.clone(),
+                                "updating recorded crew homes",
+                                actuations,
+                            ));
+                        }
                         let dependency = self.environment_dependency(&existing)?;
                         if let Some(prepared) = dependency.unavailable {
                             return Ok(prepared);
@@ -799,6 +843,10 @@ impl VesselReconciler {
                                         env: environment_with_credentials(
                                             {
                                                 let mut env = env.clone();
+                                                env.insert(
+                                                    flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(),
+                                                    serde_json::to_string(&home_keys).expect("recorded home keys serialize"),
+                                                );
                                                 env.insert(
                                                     flotilla_resources::CREW_SKILLS_ENV.to_string(),
                                                     serde_json::to_string(
@@ -1163,6 +1211,23 @@ impl VesselReconciler {
                 let env_name = environment_name(&obj.metadata.name);
                 let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
+                        let current_keys = existing
+                            .spec
+                            .cloud_sandbox
+                            .as_ref()
+                            .map(|cloud| &cloud.env)
+                            .or_else(|| existing.spec.docker.as_ref().map(|docker| &docker.env))
+                            .and_then(|env| env.get(flotilla_resources::account_access::CREW_HOME_KEYS_ENV))
+                            .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok());
+                        if !home_keys.is_empty() && current_keys.as_ref() != Some(&home_keys) {
+                            actuations.push(Actuation::UpdateEnvironmentHomeKeys { name: env_name.clone(), keys: home_keys.clone() });
+                            return Ok(VesselPrepared::provisioning(
+                                &placement_policy,
+                                placement_decision.clone(),
+                                "updating recorded crew homes",
+                                actuations,
+                            ));
+                        }
                         // Docker bind mounts cannot change in place. Refuse a stale
                         // grant set until the environment is explicitly recreated.
                         let existing_git_mounts = existing
@@ -1293,6 +1358,10 @@ impl VesselReconciler {
                                         env: environment_with_credentials(
                                             {
                                                 let mut env = env.clone();
+                                                env.insert(
+                                                    flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(),
+                                                    serde_json::to_string(&home_keys).expect("recorded home keys serialize"),
+                                                );
                                                 env.insert(
                                                     flotilla_resources::CREW_SKILLS_ENV.to_string(),
                                                     serde_json::to_string(
@@ -1563,7 +1632,16 @@ impl VesselReconciler {
                             role: process.role.clone(),
                             source,
                             cwd: terminal_cwd.clone(),
-                            env: Default::default(),
+                            env: process
+                                .labels
+                                .get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL)
+                                .map(|key| {
+                                    BTreeMap::from([(
+                                        flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(),
+                                        serde_json::json!({ &process.role: key }).to_string(),
+                                    )])
+                                })
+                                .unwrap_or_default(),
                             pool: strategy.pool().to_string(),
                         },
                     });

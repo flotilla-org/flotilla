@@ -329,9 +329,20 @@ pub fn requester_home(base: &std::path::Path, convoy: &str, role: &str, harness:
     base.join("agent-homes").join("requesters").join(component(convoy)).join(component(role)).join(harness)
 }
 
-/// Names the convoy whose requesters a vessel's crews are, in the environment its provisioning
-/// stages skills with, so each crew's skills land in the home its binding delivers into.
-pub const REQUESTER_CONVOY_ENV: &str = "FLOTILLA_REQUESTER_CONVOY";
+/// Admission-owned key on a recorded crew entry; consumers never derive it from identity.
+pub const CREW_HOME_KEY_LABEL: &str = "flotilla.work/requester-home-key";
+/// Role-to-relative-home-key map supplied alongside frozen skills.
+pub const CREW_HOME_KEYS_ENV: &str = "FLOTILLA_CREW_HOME_KEYS";
+pub const REQUESTER_HOME_UNAVAILABLE: &str = "RequesterHomeUnavailable:";
+
+pub fn join_crew_home(base: &std::path::Path, key: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    let path = std::path::Path::new(key);
+    if key.is_empty() || !path.components().all(|part| matches!(part, Component::Normal(_))) {
+        return Err(format!("{REQUESTER_HOME_UNAVAILABLE} invalid relative home key `{key}`"));
+    }
+    Ok(base.join(path))
+}
 
 /// The material generation a delivery records (#3910 owner ruling 3): a short digest of the
 /// published material, so a refreshed file is told apart without storing or logging it.

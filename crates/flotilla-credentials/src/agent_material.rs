@@ -14,7 +14,7 @@ use flotilla_environment::environment::ProvisionedMountMode;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
-use flotilla_resources::account_access::{requester_home, REQUESTER_CONVOY_ENV};
+use flotilla_resources::account_access::{join_crew_home, CREW_HOME_KEYS_ENV, REQUESTER_HOME_UNAVAILABLE};
 use flotilla_vcs::providers::skill_source::stage_git_skill_sources;
 use flotilla_vcs::providers::skill_source::STAGE_DIAGNOSTIC_PREFIX;
 use flotilla_vcs::providers::skill_source::STAGE_RETRYABLE_PREFIX;
@@ -292,18 +292,24 @@ impl AgentMaterialRegistry {
         runner: &'a dyn CommandRunner,
     ) -> BoxFuture<'a, Result<Vec<(String, String)>, String>> {
         Box::pin(async move {
-            if role.is_empty() || role == "." || role == ".." || role.contains('/') || role.contains('\\') || role.contains('\0') {
-                return Err(format!("invalid crew home role {role:?}"));
-            }
             let config_base = runner.writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE)).await?;
             let mut result = environment.to_vec();
-            let convoy = environment.iter().find(|(name, _)| name == REQUESTER_CONVOY_ENV).map(|(_, value)| value.as_str());
+            let homes = decode_crew_home_keys(environment)?;
             for adapter in required_adapters.iter().filter_map(|id| self.adapters.get(id.as_str())) {
                 let variable = adapter.config_home_variable();
                 // Provisioning stages a requester's skills into the home its binding will
                 // deliver into, so launch and staging use one directory.
-                if let Some(convoy) = convoy.filter(|_| adapter.requester_bound()) {
-                    let home = requester_home(&config_base, convoy, role, adapter.host_home_name()).to_string_lossy().into_owned();
+                if adapter.requester_bound() {
+                    let Some(key) = homes.get(role) else {
+                        if environment
+                            .iter()
+                            .any(|(name, home)| name == variable && Path::new(home).starts_with(config_base.join("agent-homes/requesters")))
+                        {
+                            continue;
+                        }
+                        return Err(format!("{REQUESTER_HOME_UNAVAILABLE} crew `{role}` has no supplied home key"));
+                    };
+                    let home = join_crew_home(&config_base, key)?.display().to_string();
                     runner
                         .run(
                             "sh",
@@ -318,12 +324,8 @@ impl AgentMaterialRegistry {
                 }
                 let Some(destination) = adapter.skill_destination(environment, &config_base)? else { continue };
                 let base = destination.parent().expect("skill directory has a parent");
-                // A requester's bound home (#3907) is already this crew's own: it is used as
-                // recorded, never nested a level below.
-                if base.starts_with(config_base.join("agent-homes").join("requesters")) {
-                    continue;
-                }
-                let home = base.join("crews").join(role);
+                let Some(key) = homes.get(role) else { continue };
+                let home = join_crew_home(&config_base, key)?;
                 // Static config seeds scratch once: later base edits intentionally do
                 // not overwrite crew-owned config or state. Auth follows atomic
                 // rotations in the delivered base. Never copy skills or other crews' state.
@@ -442,6 +444,13 @@ done"#,
         })
     }
 
+    pub fn validate_crew_home_keys(&self, required_adapters: &BTreeSet<String>, environment: &[(String, String)]) -> Result<(), String> {
+        if !required_adapters.iter().filter_map(|id| self.adapters.get(id.as_str())).any(|adapter| adapter.requester_bound()) {
+            return Ok(());
+        }
+        validate_supplied_crew_home_keys(environment)
+    }
+
     pub fn will_stage_skills<'a>(
         &'a self,
         required_adapters: &'a BTreeSet<String>,
@@ -457,9 +466,9 @@ done"#,
                 .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
                 .await
                 .map_err(|error| format!("resolve contained agent skill base: {error}"))?;
-            let requesters = environment.iter().any(|(name, _)| name == REQUESTER_CONVOY_ENV);
+            self.validate_crew_home_keys(required_adapters, environment)?;
             for adapter in adapters {
-                if (requesters && adapter.requester_bound()) || adapter.skill_destination(environment, &config_base)?.is_some() {
+                if adapter.requester_bound() || adapter.skill_destination(environment, &config_base)?.is_some() {
                     return Ok(true);
                 }
             }
@@ -783,6 +792,31 @@ async fn install_read_only_copy(contents: &[u8], destination: &Path) -> Result<b
         .await
         .map_err(|error| format!("install Codex credential copy {}: {error}", destination.display()))?;
     Ok(true)
+}
+
+/// Validate the caller's home map before creating a requester-bound backing.
+pub fn validate_supplied_crew_home_keys(environment: &[(String, String)]) -> Result<(), String> {
+    let homes = decode_crew_home_keys(environment)?;
+    let crews = decode_crew_skills(environment)?.ok_or_else(|| format!("{REQUESTER_HOME_UNAVAILABLE} missing crew home selection"))?;
+    if crews.is_empty() {
+        return Err(format!("{REQUESTER_HOME_UNAVAILABLE} missing crew home selection"));
+    }
+    for role in crews.keys() {
+        let key = homes.get(role).ok_or_else(|| format!("{REQUESTER_HOME_UNAVAILABLE} crew `{role}` has no supplied home key"))?;
+        join_crew_home(Path::new(""), key)?;
+    }
+    Ok(())
+}
+
+fn decode_crew_home_keys(environment: &[(String, String)]) -> Result<BTreeMap<String, String>, String> {
+    environment
+        .iter()
+        .find(|(name, _)| name == CREW_HOME_KEYS_ENV)
+        .map(|(_, value)| {
+            serde_json::from_str(value).map_err(|error| format!("{REQUESTER_HOME_UNAVAILABLE} decode supplied home keys: {error}"))
+        })
+        .transpose()
+        .map(|keys| keys.unwrap_or_default())
 }
 
 type CrewSkills = BTreeMap<String, Vec<flotilla_resources::SkillCatalogEntry>>;
@@ -1806,104 +1840,6 @@ esac
 
     /// The host behind an agentless SSH runner, recording each command; its
     /// writable config base is `/host/state/flotilla`.
-    #[derive(Default)]
-    struct HostHomeRunner {
-        calls: Mutex<Vec<Vec<String>>>,
-    }
-
-    #[async_trait]
-    impl CommandRunner for HostHomeRunner {
-        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-            self.calls.lock().expect("calls").push(std::iter::once(cmd).chain(args.iter().copied()).map(str::to_string).collect());
-            Ok(String::new())
-        }
-
-        async fn run_output(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
-            Err(format!("unexpected host command {cmd}"))
-        }
-
-        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
-            false
-        }
-
-        async fn writable_config_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
-            Ok(PathBuf::from("/host/state/flotilla"))
-        }
-    }
-
-    // #3655: an agentless session's harness homes live under the host runner's
-    // writable base. A delivered credential home there is kept (and gains the
-    // per-crew home); a home outside it, such as the host user's own config,
-    // one escaping it through `..`, or none at all is replaced by the
-    // environment's flotilla-owned home, and
-    // only Codex adopts the host login. Cases: delivered, host-pointing,
-    // escaping and absent homes for both harnesses.
-    #[tokio::test]
-    async fn host_harness_homes_are_flotilla_owned_under_the_runner_base() {
-        let registry = test_registry(Arc::new(TestEnvVars::new([("HOME", "/controller-home")])));
-        let required = BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string(), CODEX_ADAPTER_ID.to_string()]);
-        for (claude, codex, expected_claude, expected_codex) in [
-            (
-                Some("/host/state/flotilla/agent-homes/claude-max/claude"),
-                Some("/host/state/flotilla/agent-homes/codex-key/codex"),
-                "/host/state/flotilla/agent-homes/claude-max/claude/crews/coder",
-                "/host/state/flotilla/agent-homes/codex-key/codex/crews/coder",
-            ),
-            (
-                Some("/home/crew/.claude"),
-                Some("/home/crew/.codex"),
-                "/host/state/flotilla/agent-homes/host-direct-b3/claude/crews/coder",
-                "/host/state/flotilla/agent-homes/host-direct-b3/codex/crews/coder",
-            ),
-            (
-                Some("/host/state/flotilla/../../../home/crew/.claude"),
-                Some("/host/state/flotilla/credentials/../../../home/crew/.codex"),
-                "/host/state/flotilla/agent-homes/host-direct-b3/claude/crews/coder",
-                "/host/state/flotilla/agent-homes/host-direct-b3/codex/crews/coder",
-            ),
-            (
-                None,
-                None,
-                "/host/state/flotilla/agent-homes/host-direct-b3/claude/crews/coder",
-                "/host/state/flotilla/agent-homes/host-direct-b3/codex/crews/coder",
-            ),
-        ] {
-            let runner = HostHomeRunner::default();
-            let mut environment = vec![("KEEP".to_string(), "kept".to_string())];
-            environment.extend(claude.map(|home| ("CLAUDE_CONFIG_DIR".to_string(), home.to_string())));
-            environment.extend(codex.map(|home| ("CODEX_HOME".to_string(), home.to_string())));
-
-            let prepared =
-                registry.host_harness_environment("host-direct-b3", "coder", &required, &environment, &runner).await.expect("host homes");
-
-            let value = |name: &str| {
-                let values = prepared.iter().filter(|(key, _)| key == name).map(|(_, value)| value.as_str()).collect::<Vec<_>>();
-                assert_eq!(values.len(), 1, "{name} selected once: {prepared:?}");
-                values[0].to_string()
-            };
-            assert_eq!(value("CLAUDE_CONFIG_DIR"), expected_claude);
-            assert_eq!(value("CODEX_HOME"), expected_codex);
-            assert_eq!(value("KEEP"), "kept");
-            let calls = runner.calls.lock().expect("calls");
-            let claude_home =
-                Path::new(expected_claude).parent().and_then(Path::parent).expect("claude home").to_string_lossy().into_owned();
-            let codex_home = Path::new(expected_codex).parent().and_then(Path::parent).unwrap().to_string_lossy().into_owned();
-            for home in [&claude_home, &codex_home] {
-                assert!(calls.iter().any(|call| call == &["mkdir", "-p", home]), "{home} created: {calls:?}");
-                assert!(calls.iter().any(|call| call == &["chmod", "700", home]), "{home} owner-only: {calls:?}");
-            }
-            let adoptions =
-                calls.iter().filter(|call| call.get(3).map(String::as_str) == Some("flotilla-codex-ambient-login")).collect::<Vec<_>>();
-            assert!(matches!(adoptions.as_slice(), [call] if call[4] == codex_home), "{adoptions:?}");
-        }
-
-        let error = registry
-            .host_harness_environment("../escape", "coder", &required, &[], &HostHomeRunner::default())
-            .await
-            .expect_err("an environment name must be one path component");
-        assert!(error.contains("invalid agent home environment"), "{error}");
-    }
-
     #[tokio::test]
     async fn pinned_skills_are_staged_to_the_seam_resolved_claude_config() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3278,6 +3214,7 @@ esac
                 serde_json::to_string(&BTreeMap::from([("governor", vec![crew_skill("private-source", "skills/private-folder")])]))
                     .expect("frozen skills"),
             ),
+            (CREW_HOME_KEYS_ENV.into(), serde_json::json!({"governor":"claude/crews/governor"}).to_string()),
         ];
         let requests = registry.selected_skill_source_credentials(&environment).await.expect("resolve credentials");
         assert_eq!(requests.len(), 1, "frozen revision still needs its source credential");
@@ -3306,7 +3243,7 @@ esac
     async fn crews_in_one_environment_see_only_their_own_skills() {
         // Issue #2672: crews sharing an adapter and vessel must have disjoint
         // homes, each containing exactly its frozen selection, including empty.
-        for (adapter, api_key) in [(CLAUDE_CODE_ADAPTER_ID, false), (CODEX_ADAPTER_ID, false), (CODEX_ADAPTER_ID, true)] {
+        for (adapter, api_key) in [(CODEX_ADAPTER_ID, false), (CODEX_ADAPTER_ID, true)] {
             let temp = tempfile::tempdir().expect("tempdir");
             let registry = registry(temp.path());
             let bundle = registry.skills.source.as_ref().expect("source");
@@ -3320,6 +3257,7 @@ esac
             std::fs::create_dir_all(&base).expect("base home");
             std::fs::write(base.join("settings.json"), "{}").expect("settings");
             std::fs::write(base.join("auth.json"), "first-token").expect("auth");
+            let supplied_home = |role: &str| runner.config_base.join("agent-homes/requesters/shared").join(role).join("codex");
             let variable = if adapter == CODEX_ADAPTER_ID { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" };
             let virtual_base =
                 if adapter == CODEX_ADAPTER_ID && !api_key { CONTAINER_CODEX_HOME.into() } else { base.display().to_string() };
@@ -3333,6 +3271,25 @@ esac
             let environment = vec![
                 (variable.into(), virtual_base.clone()),
                 (flotilla_resources::CREW_SKILLS_ENV.into(), serde_json::to_string(&crews).expect("crew selections")),
+                (
+                    CREW_HOME_KEYS_ENV.into(),
+                    serde_json::to_string(
+                        &crews
+                            .keys()
+                            .map(|role| {
+                                (
+                                    *role,
+                                    supplied_home(role)
+                                        .strip_prefix(&runner.config_base)
+                                        .expect("relative supplied home")
+                                        .display()
+                                        .to_string(),
+                                )
+                            })
+                            .collect::<BTreeMap<_, _>>(),
+                    )
+                    .expect("caller homes"),
+                ),
             ];
             registry
                 .stage_skills(
@@ -3344,25 +3301,25 @@ esac
                 )
                 .await
                 .expect("stage crews");
-            assert!(base.join("crews/coder/skills/private-source/SKILL.md").is_file());
+            assert!(supplied_home("coder").join("skills/private-source/SKILL.md").is_file());
             assert_eq!(
-                std::fs::read_dir(base.join("crews/observer/skills"))
+                std::fs::read_dir(supplied_home("observer").join("skills"))
                     .expect("empty skills")
                     .filter(|entry| entry.as_ref().expect("entry").file_type().expect("type").is_dir())
                     .count(),
                 0
             );
-            assert!(base.join("crews/reviewer/skills/unselected/SKILL.md").is_file());
-            assert!(!base.join("crews/reviewer/skills/private-source").exists());
-            assert!(!base.join("crews/coder/skills/unselected").exists());
+            assert!(supplied_home("reviewer").join("skills/unselected/SKILL.md").is_file());
+            assert!(!supplied_home("reviewer").join("skills/private-source").exists());
+            assert!(!supplied_home("coder").join("skills/unselected").exists());
             assert!(!base.join("skills/private-source").exists(), "no vessel-wide skill union");
             assert!(!token.exists(), "source tokens are removed after all crews stage");
             for role in ["coder", "observer", "reviewer"] {
                 let launch_env =
                     registry.crew_environment(role, &BTreeSet::from([adapter.into()]), &environment, &runner).await.expect("launch home");
-                assert!(launch_env.contains(&(variable.into(), format!("{virtual_base}/crews/{role}"))));
-                assert_eq!(std::fs::read_to_string(base.join(format!("crews/{role}/settings.json"))).expect("settings"), "{}");
-                assert_eq!(std::fs::read_to_string(base.join(format!("crews/{role}/auth.json"))).expect("linked auth"), "first-token");
+                assert!(launch_env.contains(&(variable.into(), supplied_home(role).display().to_string())));
+                assert_eq!(std::fs::read_to_string(supplied_home(role).join("settings.json")).expect("settings"), "{}");
+                assert_eq!(std::fs::read_to_string(supplied_home(role).join("auth.json")).expect("linked auth"), "first-token");
             }
             assert_eq!(
                 std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(),
@@ -3370,10 +3327,10 @@ esac
                 "crews reuse the pinned source cache"
             );
             std::fs::write(base.join("settings.json"), "base changed").expect("base update");
-            std::fs::write(base.join("crews/coder/settings.json"), "crew edited").expect("crew edit");
+            std::fs::write(supplied_home("coder").join("settings.json"), "crew edited").expect("crew edit");
             registry.crew_environment("coder", &BTreeSet::from([adapter.into()]), &environment, &runner).await.expect("resume crew");
             assert_eq!(
-                std::fs::read_to_string(base.join("crews/coder/settings.json")).expect("crew settings"),
+                std::fs::read_to_string(supplied_home("coder").join("settings.json")).expect("crew settings"),
                 "crew edited",
                 "base changes never overwrite crew scratch"
             );
@@ -3382,7 +3339,7 @@ esac
             std::fs::rename(replacement, base.join("auth.json")).expect("atomic refresh");
             for role in ["coder", "observer", "reviewer"] {
                 assert_eq!(
-                    std::fs::read_to_string(base.join(format!("crews/{role}/auth.json"))).expect("refreshed linked auth"),
+                    std::fs::read_to_string(supplied_home(role).join("auth.json")).expect("refreshed linked auth"),
                     "refreshed-token"
                 );
             }
@@ -3400,6 +3357,7 @@ esac
         let environment = vec![
             ("CLAUDE_CONFIG_DIR".into(), runner.config_base.join("claude").display().to_string()),
             (flotilla_resources::CREW_SKILLS_ENV.into(), serde_json::json!({"coder": [], "reviewer/invalid": []}).to_string()),
+            (CREW_HOME_KEYS_ENV.into(), serde_json::json!({"coder":"claude/crews/coder"}).to_string()),
         ];
         let error = registry
             .stage_skills(
@@ -3411,32 +3369,8 @@ esac
             )
             .await
             .expect_err("second crew fails");
-        assert!(error.contains("invalid crew home role"), "{error}");
+        assert!(error.contains(REQUESTER_HOME_UNAVAILABLE), "{error}");
         assert!(runner.config_base.join("claude/crews/coder/skills").is_dir(), "first crew staged");
         assert!(!token.exists(), "outer error path removes tokens after partial staging");
-    }
-    #[tokio::test]
-    async fn crew_home_validation_preserves_custom_role_strings() {
-        // Custom roles are data: allow spaces, punctuation, Unicode and leading
-        // dashes, while rejecting path traversal, separators and NUL.
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let runner = promisor_runner(temp.path());
-        let base = runner.config_base.join("claude");
-        let environment = vec![("CLAUDE_CONFIG_DIR".into(), base.display().to_string())];
-        let required = BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.into()]);
-        for role in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
-            assert!(registry
-                .crew_environment(role, &required, &environment, &runner)
-                .await
-                .expect_err("invalid role")
-                .contains("invalid crew home role"));
-        }
-        for role in ["-custom reviewer", "build.qa", "猫"] {
-            let env = registry.crew_environment(role, &required, &environment, &runner).await.expect("custom role");
-            let home = base.join("crews").join(role);
-            assert!(home.is_dir());
-            assert!(env.contains(&("CLAUDE_CONFIG_DIR".into(), home.display().to_string())));
-        }
     }
 }

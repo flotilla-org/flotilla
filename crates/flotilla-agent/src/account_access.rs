@@ -47,6 +47,11 @@ pub fn declared_account_access(item: &str) -> Option<AccessName> {
         .map(|declaration| AccessName(declaration.account_access.to_string()))
 }
 
+/// Admission's home assignment for a managed crew without an account binding.
+pub fn unbound_crew_home_key(convoy: &str, role: &str, adapter: &str) -> String {
+    flotilla_resources::account_access::requester_home(Path::new(""), convoy, role, adapter).display().to_string()
+}
+
 /// What a declared credential supplies for a family's access: the account it belongs to, as the
 /// declaration states it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,8 +130,10 @@ pub trait AccountProvisioner: Send + Sync {
     fn supplies(&self, consumer: &CredentialConsumer) -> Option<SuppliedAccess>;
     /// The plan for an environment kind, or the reason there is none.
     fn plan(&self, kind: EnvironmentKind) -> Result<ProvisionPlan, String>;
-    /// The requester's home under a place's writable base.
-    fn home(&self, writable_base: &Path, convoy: &str, role: &str) -> String;
+    /// Assign the requester's relative home key at admission.
+    fn home_key(&self, binding: &flotilla_resources::AccountBindingSpec) -> Result<String, String>;
+    /// Resolve the recorded key under this target's writable base.
+    fn home(&self, writable_base: &Path, key: &str) -> Result<String, String>;
     /// Write the material into the home at a place; returns the session variables that point
     /// the harness at it. Never returns the material itself.
     async fn deliver(&self, home: &str, material: &str, runner: &dyn CommandRunner) -> Result<Vec<(String, String)>, String>;
@@ -228,8 +235,14 @@ impl AccountProvisioner for ClaudeDirect {
         })
     }
 
-    fn home(&self, writable_base: &Path, convoy: &str, role: &str) -> String {
-        flotilla_resources::account_access::requester_home(writable_base, convoy, role, "claude").display().to_string()
+    fn home_key(&self, binding: &flotilla_resources::AccountBindingSpec) -> Result<String, String> {
+        let (convoy, role) = flotilla_resources::account_access::requester_parts(&binding.requester)
+            .ok_or("requester has no convoy/role identity for account home assignment")?;
+        Ok(flotilla_resources::account_access::requester_home(Path::new(""), &convoy, &role, "claude").display().to_string())
+    }
+
+    fn home(&self, writable_base: &Path, key: &str) -> Result<String, String> {
+        flotilla_resources::account_access::join_crew_home(writable_base, key).map(|home| home.display().to_string())
     }
 
     async fn deliver(&self, home: &str, material: &str, runner: &dyn CommandRunner) -> Result<Vec<(String, String)>, String> {
@@ -279,7 +292,9 @@ mod tests {
     #[test]
     fn requester_homes_never_collide() {
         let base = Path::new("/base");
-        let home = |convoy: &str, role: &str| ClaudeDirect.home(base, convoy, role);
+        let home = |convoy: &str, role: &str| {
+            flotilla_resources::account_access::requester_home(base, convoy, role, "claude").display().to_string()
+        };
         assert_eq!(home("convoy-1", "coder"), "/base/agent-homes/requesters/convoy-1/coder/claude");
         let homes = [home("a.b", "coder"), home("a-b", "coder"), home("a/b", "coder"), home("a-b", "x.y"), home("a-b", "x-y")];
         assert_eq!(homes.iter().collect::<std::collections::BTreeSet<_>>().len(), homes.len(), "{homes:?}");

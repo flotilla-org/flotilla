@@ -1240,7 +1240,7 @@ fn validate_vessel(
         }
 
         for key in process.labels.keys() {
-            if key.starts_with(crate::labels::RESERVED_PREFIX) {
+            if key.starts_with(crate::labels::RESERVED_PREFIX) && key != crate::account_access::CREW_HOME_KEY_LABEL {
                 push_error(
                     errors,
                     ValidationError::ReservedLabelKey { vessel: vessel.name.clone(), role: process.role.clone(), key: key.clone() },

@@ -415,7 +415,83 @@ pub fn binding_meta(name: &str, spec: &AccountBindingSpec) -> InputMeta {
     if let Some((convoy, _)) = requester_parts(&spec.requester) {
         labels.insert(flotilla_resources::CONVOY_LABEL.to_string(), convoy);
     }
+    if let Some(provisioner) = flotilla_agent::account_access::AccountProvisioners::seeded().for_access(&spec.requirement) {
+        if let Ok(key) = provisioner.home_key(spec) {
+            labels.insert(flotilla_resources::account_access::CREW_HOME_KEY_LABEL.into(), key);
+        }
+    }
     InputMeta::builder().name(name.to_string()).labels(labels).build()
+}
+
+fn binding_update_meta(binding: &ResourceObject<AccountBinding>, spec: &AccountBindingSpec) -> InputMeta {
+    let mut meta = binding_meta(&binding.metadata.name, spec);
+    if let Some(key) = binding.metadata.labels.get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL) {
+        meta.labels.insert(flotilla_resources::account_access::CREW_HOME_KEY_LABEL.into(), key.clone());
+    }
+    meta
+}
+
+/// Copy the account authority's recorded keys into the frozen per-crew entries.
+pub fn apply_crew_home_keys(
+    convoy: &str,
+    vessels: &mut [flotilla_resources::VesselRequirement],
+    keys: &BTreeMap<String, String>,
+) -> Result<bool, String> {
+    let mut changed = false;
+    for crew in vessels.iter_mut().flat_map(|vessel| &mut vessel.crew) {
+        let CrewSource::Agent { selector, .. } = &crew.source else { continue };
+        let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
+        let key = if requirement.account_access().is_some() {
+            keys.get(&crew.role).cloned()
+        } else {
+            Some(flotilla_agent::account_access::unbound_crew_home_key(convoy, &crew.role, &requirement.adapter))
+        };
+        let before = crew.labels.remove(flotilla_resources::account_access::CREW_HOME_KEY_LABEL);
+        if let Some(key) = &key {
+            crew.labels.insert(flotilla_resources::account_access::CREW_HOME_KEY_LABEL.into(), key.clone());
+        }
+        changed |= before != key;
+    }
+    Ok(changed)
+}
+
+pub fn pending_home_keys(bindings: &[PendingBinding]) -> BTreeMap<String, String> {
+    bindings
+        .iter()
+        .filter_map(|binding| {
+            let (_, role) = flotilla_resources::account_access::requester_parts(&binding.spec.requester)?;
+            let key =
+                binding_meta(&binding.name, &binding.spec).labels.get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL)?.clone();
+            Some((role, key))
+        })
+        .collect()
+}
+
+/// Recover previous-generation bindings at their authority before publishing caller home keys.
+pub async fn recover_home_keys(backend: &ResourceBackend, namespace: &str, convoy: &str) -> Result<BTreeMap<String, String>, String> {
+    let bindings = backend.using::<AccountBinding>(namespace);
+    let records = bindings
+        .list_matching_labels(&BTreeMap::from([(flotilla_resources::CONVOY_LABEL.into(), convoy.into())]))
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut keys = BTreeMap::new();
+    for mut binding in records.items {
+        if !binding.spec.state.value.is_open() {
+            continue;
+        }
+        if !binding.metadata.labels.contains_key(flotilla_resources::account_access::CREW_HOME_KEY_LABEL) {
+            binding = bindings
+                .update(&binding_meta(&binding.metadata.name, &binding.spec), &binding.metadata.resource_version, &binding.spec)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some((_, role)) = flotilla_resources::account_access::requester_parts(&binding.spec.requester) {
+            if let Some(key) = binding.metadata.labels.get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL) {
+                keys.insert(role, key.clone());
+            }
+        }
+    }
+    Ok(keys)
 }
 
 /// Write chosen bindings. A requester that already holds an open binding keeps it: bindings are
@@ -427,7 +503,7 @@ pub async fn write_bindings(backend: &ResourceBackend, namespace: &str, pending:
             Ok(existing) if existing.spec.state.value.is_open() => continue,
             Ok(existing) => {
                 bindings
-                    .update(&binding_meta(&binding.name, &binding.spec), &existing.metadata.resource_version, &binding.spec)
+                    .update(&binding_update_meta(&existing, &binding.spec), &existing.metadata.resource_version, &binding.spec)
                     .await
                     .map_err(|error| format!("reopen account binding `{}`: {error}", binding.name))?;
             }
@@ -574,7 +650,7 @@ pub async fn reconcile_convoy_bindings(
         }
         if let Some(change) = change {
             resolver
-                .update(&binding_meta(&name, &spec), &binding.metadata.resource_version, &spec)
+                .update(&binding_update_meta(binding, &spec), &binding.metadata.resource_version, &spec)
                 .await
                 .map_err(|error| format!("update account binding `{name}`: {error}"))?;
             changes.push((name, change));
@@ -637,7 +713,7 @@ async fn close(
     let mut spec = binding.spec.clone();
     spec.state = State::new(state, now);
     bindings
-        .update(&binding_meta(&binding.metadata.name, &spec), &binding.metadata.resource_version, &spec)
+        .update(&binding_update_meta(binding, &spec), &binding.metadata.resource_version, &spec)
         .await
         .map(|_| ())
         .map_err(|error| format!("update account binding `{}`: {error}", binding.metadata.name))
@@ -677,12 +753,15 @@ pub async fn rebind(
                 retired.state = State::new(BindingState::Closed { reason: "rebind".to_string(), delivered_until }, now);
             }
             let retired_name = format!("{}.closed-{}", opened.name, existing.spec.opened_at.micros());
+            let mut retired_meta = binding_update_meta(&existing, &retired);
+            retired_meta.name = retired_name.clone();
+            retired_meta.labels.insert(ACCOUNT_BINDING_LABEL.into(), retired_name.clone());
             bindings
-                .create(&binding_meta(&retired_name, &retired), &retired)
+                .create(&retired_meta, &retired)
                 .await
                 .map_err(|error| format!("retire account binding as `{retired_name}`: {error}"))?;
             bindings
-                .update(&binding_meta(&opened.name, &opened.spec), &existing.metadata.resource_version, &opened.spec)
+                .update(&binding_update_meta(&existing, &opened.spec), &existing.metadata.resource_version, &opened.spec)
                 .await
                 .map_err(|error| format!("open account binding `{}`: {error}", opened.name))?;
         }
