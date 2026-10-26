@@ -109,6 +109,9 @@ mod tests {
     }
     #[async_trait]
     impl ProviderApi for Api {
+        async fn hello(&self) -> Result<wire::Hello, Error> {
+            Err(Error::Transport)
+        }
         async fn observe(&self, since: Option<&str>) -> Result<::drydock::api::ObservationStream, Error> {
             self.cursors.lock().unwrap().push(since.map(str::to_owned));
             self.streams.lock().await.recv().await.ok_or(Error::Transport)

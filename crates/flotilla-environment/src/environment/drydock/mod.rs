@@ -309,15 +309,7 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
             let environment = handle.env.read().expect("environment").clone();
             connection.configure(environment).await?;
             connection.configure_lab(self.lab_reach.clone()).await?;
-            connection
-                .runner()
-                .run(
-                    "mkdir",
-                    &["-p", &handle.capabilities.workspace_root.to_string_lossy()],
-                    Path::new("/"),
-                    &flotilla_provider_runtime::ChannelLabel::Default,
-                )
-                .await?;
+            connection.make_directories(&handle.capabilities.workspace_root).await?;
             // Checkpoints are advisory recovery material. Neither the first archive
             // nor a refresh may delay adoption or trigger setup rollback.
             let checkpoint = keydir.join("checkpoint.tar");

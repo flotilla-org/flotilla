@@ -9,7 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use drydock_agent::{Client, Configuration, Endpoint, Exec, ExecEvent, GuestForward};
+use drydock_agent::{Client, Configuration, Endpoint, Exec, ExecEvent, ExitStatus, FileOptions, GuestForward, HostForward};
 use drydock_protocol::Platform;
 use drydock_transport::{Limits, Transport};
 use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
@@ -109,10 +109,46 @@ where
 struct Connection {
     client: Option<Arc<Client>>,
     configuration: Configuration,
+    /// The tag the agent gave `configuration`. It changes when the agent
+    /// restarts, even behind a link that survived the restart.
+    etag: Option<String>,
     targets: BTreeMap<String, PathBuf>,
-    /// Host endpoints behind `configuration.forwards`, claimed again by every
-    /// new client before the configuration that names them is pushed.
-    guest_endpoints: BTreeMap<String, Endpoint>,
+    /// Each guest forward with the host endpoint it reaches, pushed again
+    /// with the configuration to every new client or restarted agent.
+    guest_forwards: BTreeMap<String, (GuestForward, Endpoint)>,
+}
+impl Connection {
+    async fn push(&mut self, client: &Client) -> Result<(), String> {
+        self.etag = Some(client.configure(self.configuration.clone()).await.map_err(|e| e.to_string())?);
+        for (forward, endpoint) in self.guest_forwards.values() {
+            client.put_guest_forward(forward.clone(), endpoint.clone()).await.map_err(|e| format!("guest forward {}: {e}", forward.id))?;
+        }
+        for (id, path) in &self.targets {
+            client
+                .put_host_forward(HostForward { id: id.clone(), endpoint: Endpoint::Unix(path.clone()) })
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+/// Files flotilla ensures are small configuration.
+const ENSURED_FILE_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Run `exec` with `input` on its stdin. Input is written while output is
+/// read, so neither side fills its pipe. A process may exit without reading
+/// all of its input, as it may with a redirect.
+pub(crate) async fn exec_with_input(client: &Client, exec: Exec, input: &[u8]) -> io::Result<(Vec<u8>, Vec<u8>, ExitStatus)> {
+    let process = client.spawn(Exec { stdin: true, ..exec }).await?;
+    let (written, collected) =
+        tokio::join!(process.write_stdin_bytes(input.to_vec()), async { process.output().await?.collect(usize::MAX).await });
+    // Forget the handle, so the agent holds no output for it.
+    let removed = process.remove().await;
+    match written {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
+        _ => collected.and_then(|collected| removed.map(|()| collected)),
+    }
 }
 
 /// Where a vessel's writable state lives. A contained vessel owns its whole
@@ -230,8 +266,9 @@ impl AgentRunner {
             state: Mutex::new(Connection {
                 client: None,
                 configuration: Configuration::default(),
+                etag: None,
                 targets: BTreeMap::new(),
-                guest_endpoints: BTreeMap::new(),
+                guest_forwards: BTreeMap::new(),
             }),
             forwards: Mutex::default(),
             host_directory,
@@ -255,24 +292,27 @@ impl AgentRunner {
             return Ok(client.clone());
         }
         let client = Arc::new(self.connector.connect().await?);
-        for (id, endpoint) in &state.guest_endpoints {
-            client.register_host_endpoint(id.clone(), endpoint.clone()).map_err(|e| format!("claim host endpoint {id}: {e}"))?;
-        }
-        client.configure(state.configuration.clone()).await.map_err(|e| e.to_string())?;
-        for (id, path) in &state.targets {
-            client.add_host_forward(id.clone(), Endpoint::Unix(path.clone())).await.map_err(|e| e.to_string())?;
-        }
+        state.push(&client).await?;
         state.client = Some(client.clone());
         Ok(client)
     }
 
     /// Explicit health boundary, used by readiness and the supervisor watcher.
     /// Command/file operations use the cached client without a liveness RPC.
+    /// A configuration tag this handle did not set means the agent restarted
+    /// (or was reconfigured) behind a live link: it gets its state again.
     pub async fn healthy(&self) -> bool {
         let client = self.state.lock().await.client.clone();
         let Some(client) = client else { return false };
-        if tokio::time::timeout(Duration::from_secs(2), client.configuration()).await.is_ok_and(|result| result.is_ok()) {
-            return true;
+        if let Ok(Ok(current)) = tokio::time::timeout(Duration::from_secs(2), client.configuration()).await {
+            let mut state = self.state.lock().await;
+            if !state.client.as_ref().is_some_and(|cached| Arc::ptr_eq(cached, &client)) || state.etag.as_ref() == Some(&current.etag) {
+                return true;
+            }
+            tracing::info!("vessel agent lost its configuration; pushing it again");
+            if state.push(&client).await.is_ok() {
+                return true;
+            }
         }
         let mut state = self.state.lock().await;
         if state.client.as_ref().is_some_and(|cached| Arc::ptr_eq(cached, &client)) {
@@ -286,7 +326,7 @@ impl AgentRunner {
         let mut state = self.state.lock().await;
         let mut config = state.configuration.clone();
         config.environment = environment;
-        client.configure(config.clone()).await.map_err(|e| e.to_string())?;
+        state.etag = Some(client.configure(config.clone()).await.map_err(|e| e.to_string())?);
         state.configuration = config;
         Ok(())
     }
@@ -304,38 +344,31 @@ impl AgentRunner {
         let client = self.client().await?;
         let mut state = self.state.lock().await;
         let forward = GuestForward { id: id.into(), unix: guest.into(), tcp: None };
-        match state.guest_endpoints.get(id) {
-            Some(existing) if *existing == host && state.configuration.forwards.contains(&forward) => return Ok(()),
+        match state.guest_forwards.get(id) {
+            Some(existing) if *existing == (forward.clone(), host.clone()) => return Ok(()),
             Some(_) => return Err(format!("guest forward {id} already serves another endpoint")),
             None => {}
         }
         // The cached client may have been replaced while this call waited.
         let current = state.client.clone().unwrap_or(client);
-        current.register_host_endpoint(id.into(), host.clone()).map_err(|e| format!("claim host endpoint {id}: {e}"))?;
-        let mut config = state.configuration.clone();
-        config.forwards.retain(|existing| existing.id != id);
-        config.forwards.push(forward);
-        if let Err(error) = current.configure(config.clone()).await {
-            // Release the claim with the client: reconnecting re-claims only
-            // committed endpoints.
-            state.client = None;
-            return Err(error.to_string());
-        }
-        state.configuration = config;
-        state.guest_endpoints.insert(id.into(), host);
+        // A refused upsert releases its endpoint claim.
+        current.put_guest_forward(forward.clone(), host.clone()).await.map_err(|e| format!("guest forward {id}: {e}"))?;
+        state.guest_forwards.insert(id.into(), (forward, host));
         Ok(())
     }
 
     pub async fn remove_guest_forward(&self, id: &str) -> Result<(), String> {
         let client = self.client().await?;
         let mut state = self.state.lock().await;
-        if !state.guest_endpoints.contains_key(id) {
+        if !state.guest_forwards.contains_key(id) {
             return Ok(());
         }
         let current = state.client.clone().unwrap_or(client);
-        current.remove_guest_forward(id).await.map_err(|e| e.to_string())?;
-        state.configuration.forwards.retain(|forward| forward.id != id);
-        state.guest_endpoints.remove(id);
+        match current.remove_guest_forward(id).await {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.to_string()),
+            _ => {}
+        }
+        state.guest_forwards.remove(id);
         Ok(())
     }
 
@@ -353,22 +386,9 @@ impl AgentRunner {
         self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    async fn bytes(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<(Vec<u8>, Vec<u8>, Option<i32>), String> {
-        let mut stream = self
-            .client()
-            .await?
-            .exec(Exec { program: cmd.into(), args: args.iter().map(|s| (*s).into()).collect(), cwd: Some(absolute_cwd(cwd)?) })
-            .await
-            .map_err(|e| e.to_string())?;
-        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        while let Some(event) = stream.next().await.map_err(|e| e.to_string())? {
-            match event {
-                ExecEvent::Stdout(bytes) => stdout.extend(bytes),
-                ExecEvent::Stderr(bytes) => stderr.extend(bytes),
-                ExecEvent::Exit { code } => return Ok((stdout, stderr, code)),
-            }
-        }
-        Err("agent exec ended without an exit event".into())
+    async fn bytes(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<(Vec<u8>, Vec<u8>, ExitStatus), String> {
+        let exec = Exec { cwd: Some(absolute_cwd(cwd)?), ..Exec::new(cmd, args.iter().copied()) };
+        self.client().await?.run(exec, usize::MAX).await.map_err(|e| e.to_string())
     }
 
     async fn shell(&self, script: &str, args: &[&str]) -> Result<String, String> {
@@ -377,32 +397,21 @@ impl AgentRunner {
         self.run("sh", &words, Path::new("/"), &ChannelLabel::Default).await
     }
 
-    // A unique private directory owns all intermediates, including a stdin
-    // spool. Cancellation drops the guard and schedules cleanup without secrets
-    // in argv. The final name is replaced only after its mode has been applied.
-    async fn staging(&self, parent: &Path) -> Result<RemoteStaging, String> {
-        let path = parent.join(format!(".flotilla-{}", uuid::Uuid::new_v4()));
-        self.shell("mkdir -p -- \"$1\"; umask 077; mkdir -- \"$2\"", &[&parent.to_string_lossy(), &path.to_string_lossy()]).await?;
-        Ok(RemoteStaging { client: self.client().await?, path })
-    }
-
-    async fn publish(&self, path: &Path, bytes: Vec<u8>, mode: Option<u32>) -> Result<(), String> {
+    fn file_options(path: &Path, mode: Option<u32>) -> Result<FileOptions, String> {
         if !path.is_absolute() {
             return Err("agent file path must be absolute".into());
         }
         if mode.is_some_and(|m| m > 0o777) {
             return Err("file mode must contain only permission bits".into());
         }
-        let staging = self.staging(path.parent().ok_or("file path requires a parent")?).await?;
-        let temporary = staging.path.join("file");
-        staging.client.write(temporary.clone(), bytes, false).await.map_err(|e| e.to_string())?;
-        let mode = mode.map(|m| format!("{m:o}"));
-        self.shell(
-            "if [ -n \"$1\" ]; then chmod \"$1\" \"$2\" || exit; fi; mv -f -- \"$2\" \"$3\"",
-            &[mode.as_deref().unwrap_or(""), &temporary.to_string_lossy(), &path.to_string_lossy()],
-        )
-        .await?;
-        Ok(())
+        // Without a mode, a new file takes the agent's private default (0600), so
+        // a credential written through a runner is never world-readable.
+        Ok(FileOptions { mode, parents: true, ..FileOptions::default() })
+    }
+
+    async fn publish(&self, path: &Path, bytes: Vec<u8>, mode: Option<u32>) -> Result<(), String> {
+        let options = Self::file_options(path, mode)?;
+        self.client().await?.write_bytes(path, bytes, &options).await.map(drop).map_err(|e| e.to_string())
     }
 
     /// Push each regular asset through files/write, then replace generation
@@ -446,14 +455,10 @@ impl AgentRunner {
         }
         // Flip current last, after every file and every stable entry point exists.
         links.sort_by_key(|(_, destination)| destination.file_name().is_some_and(|n| n == "current"));
+        let client = self.client().await?;
+        let options = FileOptions { parents: true, ..FileOptions::default() };
         for (target, destination) in links {
-            let staging = self.staging(destination.parent().ok_or("link requires parent")?).await?;
-            let temporary = staging.path.join("link");
-            self.shell(
-                "ln -s -- \"$1\" \"$2\" && mv -Tf -- \"$2\" \"$3\"",
-                &[&target.to_string_lossy(), &temporary.to_string_lossy(), &destination.to_string_lossy()],
-            )
-            .await?;
+            client.symlink(&destination, &target, &options).await.map_err(|e| e.to_string())?;
         }
         *layer = Some(PublishedLayer { sources, content: identity });
         Ok(())
@@ -470,24 +475,6 @@ impl AgentRunner {
             return Err("find writable directory on host: probe returned an empty path".into());
         }
         Ok(base.into())
-    }
-}
-
-struct RemoteStaging {
-    client: Arc<Client>,
-    path: PathBuf,
-}
-impl Drop for RemoteStaging {
-    fn drop(&mut self) {
-        let client = self.client.clone();
-        let path = self.path.to_string_lossy().into_owned();
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
-        runtime.spawn(async move {
-            if let Ok(mut output) = client.exec(Exec { program: "rm".into(), args: vec!["-rf".into(), "--".into(), path], cwd: None }).await
-            {
-                while output.next().await.is_ok_and(|event| event.is_some()) {}
-            }
-        });
     }
 }
 
@@ -573,7 +560,7 @@ impl VesselAgent for Arc<AgentRunner> {
         let mut cleanup = SocketCleanup(Some(path.clone()));
         drydock_agent::socket::protect(&path).map_err(|e| e.to_string())?;
         let client = self.client().await?;
-        client.add_host_forward(id.clone(), Endpoint::Unix(guest.into())).await.map_err(|e| e.to_string())?;
+        client.put_host_forward(HostForward { id: id.clone(), endpoint: Endpoint::Unix(guest.into()) }).await.map_err(|e| e.to_string())?;
         self.state.lock().await.targets.insert(id.clone(), guest.into());
         let weak = Arc::downgrade(self);
         let task = tokio::spawn(async move {
@@ -615,11 +602,11 @@ impl CommandRunner for AgentRunner {
         }
     }
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
-        let (stdout, stderr, exit_code) = self.bytes(cmd, args, cwd).await?;
+        let (stdout, stderr, status) = self.bytes(cmd, args, cwd).await?;
         Ok(CommandOutput {
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            exit_code,
+            exit_code: status.code,
         })
     }
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
@@ -632,27 +619,27 @@ impl CommandRunner for AgentRunner {
         self.publish(path, content.as_bytes().to_vec(), Some(mode)).await
     }
     async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {
-        let bytes = self.client().await?.read(source.into()).await.map_err(|e| e.to_string())?;
-        tokio::fs::write(destination, bytes).await.map_err(|e| e.to_string())
+        let download = self.client().await?.read(source).await.map_err(|e| e.to_string())?;
+        let mut file = tokio::fs::File::create(destination).await.map_err(|e| e.to_string())?;
+        download.copy_to(&mut file).await.map(drop).map_err(|e| e.to_string())
     }
     async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
-        self.publish(destination, tokio::fs::read(source).await.map_err(|e| e.to_string())?, None).await
+        let options = Self::file_options(destination, None)?;
+        let file = tokio::fs::File::open(source).await.map_err(|e| e.to_string())?;
+        self.client().await?.write(destination, file, &options).await.map(drop).map_err(|e| e.to_string())
     }
     async fn run_to_file(&self, cmd: &str, args: &[&str], cwd: &Path, destination: &Path) -> Result<(), String> {
         use tokio::io::AsyncWriteExt;
-        let client = self.client().await?;
-        let mut stream = client
-            .exec(Exec { program: cmd.into(), args: args.iter().map(|s| (*s).into()).collect(), cwd: Some(absolute_cwd(cwd)?) })
-            .await
-            .map_err(|e| e.to_string())?;
+        let exec = Exec { cwd: Some(absolute_cwd(cwd)?), ..Exec::new(cmd, args.iter().copied()) };
+        let mut stream = self.client().await?.exec(exec).await.map_err(|e| e.to_string())?;
         let mut file = tokio::fs::File::create(destination).await.map_err(|e| e.to_string())?;
         let mut stderr = Vec::new();
         while let Some(event) = stream.next().await.map_err(|e| e.to_string())? {
             match event {
                 ExecEvent::Stdout(bytes) => file.write_all(&bytes).await.map_err(|e| e.to_string())?,
                 ExecEvent::Stderr(bytes) => stderr.extend(bytes.into_iter().take((64 * 1024_usize).saturating_sub(stderr.len()))),
-                ExecEvent::Exit { code: Some(0) } => return file.flush().await.map_err(|e| e.to_string()),
-                ExecEvent::Exit { code } => return Err(format!("{cmd} exited {code:?}: {}", String::from_utf8_lossy(&stderr))),
+                ExecEvent::Exit(status) if status.success() => return file.flush().await.map_err(|e| e.to_string()),
+                ExecEvent::Exit(status) => return Err(format!("{cmd} exited {:?}: {}", status.code, String::from_utf8_lossy(&stderr))),
             }
         }
         Err("agent file stream ended without exit status".into())
@@ -662,14 +649,14 @@ impl CommandRunner for AgentRunner {
             .await
             .map(|_| ())
     }
-    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
-        let staging = self.staging(Path::new("/tmp")).await?;
-        let file = staging.path.join("stdin");
-        staging.client.write(file.clone(), input.to_vec(), false).await.map_err(|e| e.to_string())?;
-        let file = file.to_string_lossy();
-        let mut words = vec!["-c", "input=$1; shift; exec \"$@\" < \"$input\"", "flotilla-stdin", &file, cmd];
-        words.extend_from_slice(args);
-        self.run("sh", &words, cwd, label).await
+    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        let exec = Exec { cwd: Some(absolute_cwd(cwd)?), ..Exec::new(cmd, args.iter().copied()) };
+        let (stdout, stderr, status) = exec_with_input(&*self.client().await?, exec, input).await.map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(String::from_utf8_lossy(&stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&stderr).into_owned())
+        }
     }
     async fn writable_scratch_base(&self, _: Option<&Path>, _: &Path) -> Result<PathBuf, String> {
         if self.bases == WritableBases::Host {
@@ -687,11 +674,16 @@ impl CommandRunner for AgentRunner {
         Ok(super::runner::CONTAINED_WRITABLE_CONFIG_BASE.into())
     }
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
-        let staging = self.staging(path.parent().ok_or("file path requires parent")?).await?;
-        let file = staging.path.join("file");
-        staging.client.write(file.clone(), content.as_bytes().to_vec(), false).await.map_err(|e| e.to_string())?;
-        self.shell("ln -- \"$1\" \"$2\" 2>/dev/null || test -f \"$2\"", &[&file.to_string_lossy(), &path.to_string_lossy()]).await?;
-        String::from_utf8(self.client().await?.read(path.into()).await.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        let options = FileOptions { exclusive: true, ..Self::file_options(path, None)? };
+        let client = self.client().await?;
+        match client.write_bytes(path, content.as_bytes().to_vec(), &options).await {
+            Ok(_) => Ok(content.into()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let bytes = client.read_bytes(path, ENSURED_FILE_LIMIT).await.map_err(|e| e.to_string())?;
+                String::from_utf8(bytes).map_err(|e| e.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 }
 

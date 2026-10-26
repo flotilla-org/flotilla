@@ -33,6 +33,9 @@ pub(super) struct Connection {
     pub agent: Arc<drydock_agent::Client>,
     forwards: Forwarder,
     lab_configured: tokio::sync::Mutex<bool>,
+    /// The tag of the last configuration pushed. The agent's tag changes when
+    /// it restarts, which a native link may survive.
+    etag: std::sync::Mutex<Option<String>>,
 }
 struct Forwarder {
     session: Arc<dyn SshSession>,
@@ -92,6 +95,7 @@ impl Connection {
         let session = sessions.lock().await.take().ok_or("SSH session missing")?;
         Ok(Self {
             lab_configured: Default::default(),
+            etag: Default::default(),
             agent: Arc::new(agent),
             forwards: Forwarder { session, tasks: Default::default(), sockets: Default::default() },
         })
@@ -135,63 +139,47 @@ pub(super) fn upload<'a>(
     target: &'a Path,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
     Box::pin(async move {
+        use std::os::unix::fs::PermissionsExt;
         let metadata = tokio::fs::symlink_metadata(source).await.map_err(error)?;
+        let source_mode = metadata.permissions().mode();
+        let private = source_mode & 0o077 == 0;
         if metadata.is_file() {
-            use std::os::unix::fs::PermissionsExt;
-            let source_mode = metadata.permissions().mode();
-            let mode = if source_mode & 0o077 == 0 {
-                if source_mode & 0o100 != 0 {
-                    0o700
-                } else {
-                    0o600
-                }
-            } else if source_mode & 0o111 != 0 {
-                0o755
-            } else {
-                0o644
+            let mode = match (private, source_mode & 0o111 != 0) {
+                (true, true) => 0o700,
+                (true, false) => 0o600,
+                (false, true) => 0o755,
+                (false, false) => 0o644,
             };
-            AgentRunner(agent.clone()).write_bytes(target, tokio::fs::read(source).await.map_err(error)?, mode).await?;
+            AgentRunner(agent.clone()).write_from(source, target, mode).await
+        } else if metadata.file_type().is_symlink() {
+            let link = tokio::fs::read_link(source).await.map_err(error)?;
+            agent.symlink(target, &link, &drydock_agent::FileOptions { parents: true, ..Default::default() }).await.map_err(error)
+        } else if metadata.is_dir() {
+            let options =
+                drydock_agent::FileOptions { mode: Some(if private { 0o700 } else { 0o755 }), parents: true, ..Default::default() };
+            agent.create_dir(target, &options).await.map_err(error)?;
+            let mut entries = tokio::fs::read_dir(source).await.map_err(error)?;
+            while let Some(entry) = entries.next_entry().await.map_err(error)? {
+                upload(agent, &entry.path(), &target.join(entry.file_name())).await?;
+            }
+            Ok(())
         } else {
-            let args = if metadata.is_dir() {
-                vec!["mkdir".into(), "-p".into(), target.to_string_lossy().into_owned()]
-            } else if metadata.file_type().is_symlink() {
-                vec![
-                    "ln".into(),
-                    "-sfn".into(),
-                    tokio::fs::read_link(source).await.map_err(error)?.to_string_lossy().into_owned(),
-                    target.to_string_lossy().into_owned(),
-                ]
-            } else {
-                return Err("unsupported tool asset type".into());
-            };
-            let mut exec =
-                agent.exec(drydock_agent::Exec { program: args[0].clone(), args: args[1..].to_vec(), cwd: None }).await.map_err(error)?;
-            let mut exited = false;
-            while let Some(event) = exec.next().await.map_err(error)? {
-                if let drydock_agent::ExecEvent::Exit { code } = event {
-                    exited = true;
-                    if code != Some(0) {
-                        return Err("tool material creation failed".into());
-                    }
-                }
-            }
-            if !exited {
-                return Err("tool material creation ended without exit status".into());
-            }
-            if metadata.is_dir() {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = if metadata.permissions().mode() & 0o077 == 0 { "700" } else { "755" };
-                AgentRunner(agent.clone())
-                    .run("chmod", &[mode, &target.to_string_lossy()], Path::new("/"), &flotilla_provider_runtime::ChannelLabel::Default)
-                    .await?;
-                let mut entries = tokio::fs::read_dir(source).await.map_err(error)?;
-                while let Some(entry) = entries.next_entry().await.map_err(error)? {
-                    upload(agent, &entry.path(), &target.join(entry.file_name())).await?;
-                }
-            }
+            Err("unsupported tool asset type".into())
         }
-        Ok(())
     })
+}
+
+/// `mkdir -p`: missing directories are created 0755; an existing one keeps its mode.
+pub(super) async fn make_directories(agent: &drydock_agent::Client, path: &Path) -> Result<(), String> {
+    let options = drydock_agent::FileOptions { mode: Some(0o755), parents: true, exclusive: true, ..Default::default() };
+    match agent.create_dir(path, &options).await {
+        Ok(_) => Ok(()),
+        Err(cause) if cause.kind() == io::ErrorKind::AlreadyExists => match agent.stat(path).await.map_err(error)?.kind {
+            drydock_agent::EntryKind::Directory | drydock_agent::EntryKind::Symlink => Ok(()),
+            _ => Err(format!("{} is not a directory", path.display())),
+        },
+        Err(cause) => Err(error(cause)),
+    }
 }
 
 #[async_trait]
@@ -206,6 +194,13 @@ pub(super) trait Guest: Send + Sync {
     fn runner(&self) -> Arc<dyn CommandRunner>;
     async fn configure(&self, environment: BTreeMap<String, String>) -> Result<(), String>;
     async fn deliver(&self, asset: EnvironmentToolAsset) -> Result<(), String>;
+    /// `mkdir -p` in the guest.
+    async fn make_directories(&self, path: &Path) -> Result<(), String> {
+        self.runner()
+            .run("mkdir", &["-p", &path.to_string_lossy()], Path::new("/"), &flotilla_provider_runtime::ChannelLabel::Default)
+            .await
+            .map(drop)
+    }
 }
 #[async_trait]
 pub(super) trait Connector: Send + Sync {
@@ -261,14 +256,23 @@ impl Connector for SshConnector {
 impl Guest for Connection {
     async fn closed(&self) -> bool {
         use futures::FutureExt;
-        self.forwards.session.closed().now_or_never().is_some()
+        if self.forwards.session.closed().now_or_never().is_some() {
+            return true;
+        }
+        let Some(expected) = self.etag.lock().expect("configuration tag").clone() else { return false };
+        // A tag this connection did not set means the agent restarted (or was
+        // reconfigured) and lost its configuration: reconnect and push it again.
+        let current = tokio::time::timeout(Duration::from_secs(2), self.agent.configuration()).await;
+        !current.is_ok_and(|current| current.is_ok_and(|current| current.etag == expected))
     }
 
     fn runner(&self) -> Arc<dyn CommandRunner> {
         Arc::new(AgentRunner(self.agent.clone()))
     }
     async fn configure(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
-        self.agent.configure(drydock_agent::Configuration { environment, ..Default::default() }).await.map_err(error)
+        let etag = self.agent.configure(drydock_agent::Configuration { environment, ..Default::default() }).await.map_err(error)?;
+        *self.etag.lock().expect("configuration tag") = Some(etag);
+        Ok(())
     }
     async fn configure_lab(&self, reach: Option<(String, u16)>) -> Result<(), String> {
         let Some((hostname, port)) = reach else {
@@ -292,11 +296,10 @@ impl Guest for Connection {
             .await?;
         let mut events = self
             .agent
-            .exec(drydock_agent::Exec {
-                program: "socat".into(),
-                args: vec!["TCP-LISTEN:443,bind=127.0.0.1,reuseaddr,fork".into(), "UNIX-CONNECT:/run/drydock/flotilla-forgejo.sock".into()],
-                cwd: None,
-            })
+            .exec(drydock_agent::Exec::new(
+                "socat",
+                ["TCP-LISTEN:443,bind=127.0.0.1,reuseaddr,fork", "UNIX-CONNECT:/run/drydock/flotilla-forgejo.sock"],
+            ))
             .await
             .map_err(error)?;
         self.forwards
@@ -307,12 +310,13 @@ impl Guest for Connection {
         *lab_configured = true;
         Ok(())
     }
+    async fn make_directories(&self, path: &Path) -> Result<(), String> {
+        make_directories(&self.agent, path).await
+    }
     async fn deliver(&self, asset: EnvironmentToolAsset) -> Result<(), String> {
         if asset.kind == EnvironmentToolAssetKind::UnixSocket {
             let parent = asset.environment_path.as_path().parent().ok_or("socket path has no parent")?;
-            self.runner()
-                .run("mkdir", &["-p", &parent.to_string_lossy()], Path::new("/"), &flotilla_provider_runtime::ChannelLabel::Default)
-                .await?;
+            make_directories(&self.agent, parent).await?;
             self.forwards.forward(asset.environment_path.as_path(), Destination::Unix(asset.host_path.as_path().into())).await
         } else {
             upload(&self.agent, asset.host_path.as_path(), asset.environment_path.as_path()).await
@@ -425,5 +429,65 @@ mod tests {
             assert_eq!(n, 0);
             assert!(tokio::net::UnixStream::connect(&guest_path).await.is_err());
         }
+    }
+    // Delivered trees keep executable bits, private modes and relative links,
+    // and mkdir -p semantics hold, all through file operations: the real agent
+    // runs no guest process for them.
+    #[tokio::test]
+    async fn upload_and_directories_use_agent_file_operations() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let (host, guest) = tokio::io::duplex(4096);
+        let (host, guest) = tokio::join!(
+            drydock_transport::Transport::yamux(Box::new(host), true, Default::default()),
+            drydock_transport::Transport::yamux(Box::new(guest), false, Default::default())
+        );
+        let task = tokio::spawn(drydock_agent::Agent::new(guest.unwrap(), "reach-test".into(), directory.path().join("agent")).run());
+        let agent = Arc::new(drydock_agent::Client::connect(host.unwrap(), "reach-test").await.unwrap());
+        let source = directory.path().join("source");
+        std::fs::create_dir_all(source.join("bin")).unwrap();
+        std::fs::create_dir(source.join("private")).unwrap();
+        std::fs::set_permissions(source.join("private"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (path, mode) in [("bin/tool", 0o755), ("bin/data", 0o644), ("private/key", 0o600), ("private/run", 0o700)] {
+            std::fs::write(source.join(path), path).unwrap();
+            std::fs::set_permissions(source.join(path), std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        std::os::unix::fs::symlink("bin/tool", source.join("current")).unwrap();
+        let target = directory.path().join("guest/fleet");
+        for _ in 0..2 {
+            upload(&agent, &source, &target).await.unwrap();
+        }
+        let mode = |path: &str| std::fs::symlink_metadata(target.join(path)).unwrap().permissions().mode() & 0o777;
+        for (path, expected) in [("bin/tool", 0o755), ("bin/data", 0o644), ("private/key", 0o600), ("private/run", 0o700)] {
+            assert_eq!(mode(path), expected, "{path}");
+            assert_eq!(std::fs::read_to_string(target.join(path)).unwrap(), path);
+        }
+        assert_eq!((mode("bin"), mode("private")), (0o755, 0o700));
+        assert_eq!(std::fs::read_link(target.join("current")).unwrap(), Path::new("bin/tool"));
+        let existing = directory.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o700)).unwrap();
+        make_directories(&agent, &existing).await.unwrap();
+        assert_eq!(std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777, 0o700);
+        let created = existing.join("a/b");
+        make_directories(&agent, &created).await.unwrap();
+        assert_eq!(std::fs::metadata(&created).unwrap().permissions().mode() & 0o777, 0o755);
+        std::fs::write(existing.join("file"), b"").unwrap();
+        assert!(make_directories(&agent, &existing.join("file")).await.is_err());
+        assert!(agent.processes().await.unwrap().is_empty());
+        // A configuration tag the connection did not set (the agent restarted
+        // behind the live session) makes it stale, so the provider reconnects.
+        let connection = Connection {
+            agent: agent.clone(),
+            forwards: Forwarder { session: Arc::new(LocalSsh), tasks: Default::default(), sockets: Default::default() },
+            lab_configured: Default::default(),
+            etag: Default::default(),
+        };
+        assert!(!connection.closed().await);
+        connection.configure(BTreeMap::from([("A".into(), "1".into())])).await.unwrap();
+        assert!(!connection.closed().await);
+        agent.configure(drydock_agent::Configuration::default()).await.unwrap();
+        assert!(connection.closed().await);
+        task.abort();
     }
 }
