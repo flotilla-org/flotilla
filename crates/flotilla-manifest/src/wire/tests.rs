@@ -9,14 +9,14 @@ fn fixture(name: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|error| panic!("read fixture {path}: {error}"))
 }
 
-/// Deserialize a fixture produced by andamento-shared's serde, re-serialize
+/// Deserialize a fixture produced by wheelhouse-core's serde, re-serialize
 /// it with the mirrored types, and require value-identical JSON.
 fn assert_patch_round_trips(name: &str) -> MetadataPatch {
     let raw = fixture(name);
     let original: Value = serde_json::from_str(&raw).expect("fixture is valid JSON");
     let message: WireMessage = serde_json::from_str(&raw).unwrap_or_else(|error| panic!("mirror deserializes {name}: {error}"));
     let round_tripped = serde_json::to_value(&message).expect("mirror serializes");
-    assert_eq!(round_tripped, original, "mirrored serde diverges from andamento-shared on {name}");
+    assert_eq!(round_tripped, original, "mirrored serde diverges from wheelhouse-core on {name}");
     let WireMessage::MetadataPatch(patch) = message;
     patch
 }

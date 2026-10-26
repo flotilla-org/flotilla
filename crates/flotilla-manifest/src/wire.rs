@@ -1,6 +1,6 @@
 //! Mirror of andamento's metadata-patch wire types.
 //!
-//! Existing value kinds replicate `andamento-shared`'s serde exactly (verified
+//! Existing value kinds replicate `wheelhouse-core`'s serde exactly (verified
 //! by the fixture round-trip tests in this module — fixtures are generated from
 //! andamento's real serde, see `fixtures/README.md`). `entity-refs` is the
 //! coordinated next wire kind for andamento and wheelhouse. They are a deliberate

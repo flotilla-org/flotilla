@@ -1,10 +1,10 @@
 //! Generates wire fixtures for flotilla-manifest round-trip tests using
-//! andamento-shared's actual serde implementations. Output goes to the
+//! wheelhouse-core's actual serde implementations. Output goes to the
 //! directory given as argv[1].
 
 use std::{collections::BTreeMap, env, fs, path::Path};
 
-use andamento_shared::{
+use wheelhouse_core::{
     EntityRef, ExternalMessage, MetadataIdentity, MetadataPatch, MetadataTarget,
     MetadataValue, MetadataValueUpdate, ObservedMetadataIdentity, PaneTarget,
 };
