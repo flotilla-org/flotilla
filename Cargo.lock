@@ -2499,6 +2499,7 @@ dependencies = [
  "flotilla-schema",
  "flotilla-schema-sqlite",
  "flotilla-state-machines",
+ "hegeltest",
  "rusqlite",
  "serde",
  "serde_json",

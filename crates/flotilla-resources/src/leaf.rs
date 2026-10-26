@@ -3,7 +3,7 @@ use std::{cmp::Ordering, time::Duration};
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress, LeafKind, LeafOperator};
 
-use crate::{Artifact, ChangeRequest, Convoy, CrewWorkPhase, CrewWorkState, Issue, ResourceObject, Usage, Vessel, WorkState};
+use crate::{Artifact, ChangeRequest, Convoy, CrewWorkPhase, CrewWorkState, Issue, ResourceObject, Vessel, WorkState};
 
 pub const ADMITTED_LEAF_VOCABULARY: &[(&str, &str)] = &[
     ("convoy", ".status.phase"),
@@ -82,13 +82,11 @@ pub trait LeafSubject {
 
 pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
     let kind = leaf.address.kind();
-    let usage_field = kind == LeafKind::Usage && admitted_usage_field(&leaf.field_path);
     let crew_field = kind == LeafKind::Work && crew_role_path(&leaf.field_path).is_some();
     let issue_label = kind == LeafKind::Issue && issue_label_path(&leaf.field_path).is_some();
     let artifact_summary = kind == LeafKind::Artifact
         && leaf.field_path.strip_prefix(".summary.").is_some_and(|field| !field.is_empty() && !field.contains('.'));
-    let admitted = usage_field
-        || crew_field
+    let admitted = crew_field
         || issue_label
         || artifact_summary
         || ADMITTED_LEAF_VOCABULARY.iter().any(|(candidate_kind, path)| *candidate_kind == kind.to_string() && *path == leaf.field_path);
@@ -97,10 +95,6 @@ pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
         vocabulary.extend([
             "work.crew.<role>.phase".to_string(),
             "issue.labels.<label>".to_string(),
-            "usage.provider".to_string(),
-            "usage.plan".to_string(),
-            "usage.organization".to_string(),
-            "usage.windows.<name>.{used-percent,resets-at,window-minutes}".to_string(),
             "artifact.summary.<field>".to_string(),
         ]);
         let vocabulary = vocabulary.join(", ");
@@ -109,11 +103,8 @@ pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
     if kind == LeafKind::Artifact && leaf.field_path == ".exists" && (leaf.operator != LeafOperator::Equal || leaf.literal != "true") {
         return Err("artifact existence leaf must compare `.exists == true`".to_string());
     }
-    let ordered_usage_field = kind == LeafKind::Usage
-        && usage_window_path(&leaf.field_path).is_some_and(|(_, field)| matches!(field, "used-percent" | "window-minutes" | "resets-at"));
     if leaf.field_path != ".latest-claim.claimed-at"
         && leaf.field_path != ".updated-at"
-        && !ordered_usage_field
         && !matches!(leaf.operator, LeafOperator::Equal | LeafOperator::NotEqual)
     {
         return Err(format!("operator `{}` is not admitted for text leaf `{kind}{}`; use `==` or `!=`", leaf.operator, leaf.field_path));
@@ -124,20 +115,13 @@ pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
 /// Validate the typed value independently of an address, so template admission
 /// and concrete leaf admission use the same literal rules.
 pub fn validate_leaf_literal(kind: LeafKind, field_path: &str, literal: &str) -> Result<(), String> {
-    if field_path == ".latest-claim.claimed-at"
-        || field_path == ".updated-at"
-        || (kind == LeafKind::Usage && usage_window_path(field_path).is_some_and(|(_, field)| field == "resets-at"))
-    {
+    if field_path == ".latest-claim.claimed-at" || field_path == ".updated-at" {
         literal
             .parse::<DateTime<Utc>>()
             .map_err(|error| format!("invalid timestamp literal `{literal}` for {kind}{field_path}: {error}"))?;
     }
     if kind == LeafKind::Issue && issue_label_path(field_path).is_some() && !matches!(literal, "true" | "false") {
         return Err(format!("issue label leaf literal must be `true` or `false`, got `{literal}`"));
-    }
-    if kind == LeafKind::Usage && usage_window_path(field_path).is_some_and(|(_, field)| matches!(field, "used-percent" | "window-minutes"))
-    {
-        literal.parse::<f64>().map_err(|error| format!("invalid number literal `{literal}` for usage{field_path}: {error}"))?;
     }
     Ok(())
 }
@@ -185,15 +169,11 @@ pub fn evaluate_leaf(
 }
 
 fn bind_literal(path: &str, literal: &str) -> Result<LeafValue, String> {
-    if matches!(path, ".latest-claim.claimed-at" | ".updated-at") || usage_window_path(path).is_some_and(|(_, field)| field == "resets-at")
-    {
+    if matches!(path, ".latest-claim.claimed-at" | ".updated-at") {
         return literal
             .parse::<DateTime<Utc>>()
             .map(LeafValue::Timestamp)
             .map_err(|error| format!("invalid timestamp literal `{literal}`: {error}"));
-    }
-    if usage_window_path(path).is_some_and(|(_, field)| matches!(field, "used-percent" | "window-minutes")) {
-        return literal.parse::<f64>().map(LeafValue::Number).map_err(|error| format!("invalid number literal `{literal}`: {error}"));
     }
     Ok(LeafValue::Text(literal.to_string()))
 }
@@ -358,50 +338,6 @@ impl LeafSubject for IssueLeafSubject<'_> {
     fn observed_at(&self, field_path: &str) -> Option<DateTime<Utc>> {
         self.field_observed_at(field_path)
     }
-}
-
-pub struct UsageLeafSubject<'a>(pub &'a ResourceObject<Usage>);
-
-impl LeafSubject for UsageLeafSubject<'_> {
-    fn kind(&self) -> LeafKind {
-        LeafKind::Usage
-    }
-
-    fn value(&self, field_path: &str) -> Option<LeafValue> {
-        if field_path == ".provider" {
-            return Some(LeafValue::Text(self.0.spec.provider.clone()));
-        }
-        let status = self.0.status.as_ref()?;
-        match field_path {
-            ".plan" => status.plan.clone().map(LeafValue::Text),
-            ".organization" => status.organization.clone().map(LeafValue::Text),
-            path => {
-                let (window_name, field) = usage_window_path(path)?;
-                let window = status.windows.iter().find(|window| window.name == window_name)?;
-                match field {
-                    "used-percent" => Some(LeafValue::Number(window.used_percent)),
-                    "resets-at" => window.resets_at.map(LeafValue::Timestamp),
-                    "window-minutes" => window.window_minutes.map(|minutes| LeafValue::Number(minutes as f64)),
-                    _ => None,
-                }
-            }
-        }
-    }
-
-    fn observed_at(&self, _field_path: &str) -> Option<DateTime<Utc>> {
-        self.0.status.as_ref().map(|status| status.observed_at)
-    }
-}
-
-fn usage_window_path(path: &str) -> Option<(&str, &str)> {
-    let path = path.strip_prefix(".windows.")?;
-    let (window, field) = path.rsplit_once('.')?;
-    (!window.is_empty() && !field.is_empty()).then_some((window, field))
-}
-
-fn admitted_usage_field(path: &str) -> bool {
-    matches!(path, ".provider" | ".plan" | ".organization")
-        || usage_window_path(path).is_some_and(|(_, field)| matches!(field, "used-percent" | "resets-at" | "window-minutes"))
 }
 
 impl ChangeRequestLeafSubject<'_> {
@@ -685,46 +621,5 @@ mod tests {
             crate::Observation::known(crate::ObservedMergeability::Conflicting, observed_at);
         let subject = ChangeRequestLeafSubject { change_request: &conflicting, now: observed_at, stale_after: Duration::from_secs(180) };
         assert_eq!(evaluate_leaf(&leaf, Some(&subject), None).expect("evaluate").result, ThreeValue::False);
-    }
-
-    #[test]
-    fn usage_leaf_selects_named_window_without_collapsing_the_set() {
-        let observed_at = "2026-08-06T10:39:55Z".parse().expect("timestamp");
-        let object = ResourceObject::<Usage> {
-            metadata: crate::ObjectMeta {
-                name: "usage-account".to_string(),
-                namespace: "flotilla".to_string(),
-                resource_version: "1".to_string(),
-                labels: Default::default(),
-                annotations: Default::default(),
-                owner_references: Vec::new(),
-                finalizers: Vec::new(),
-                deletion_timestamp: None,
-                creation_timestamp: observed_at,
-                merge: None,
-            },
-            spec: crate::UsageSpec { provider: "codex".to_string(), account: "user@example.com".to_string() },
-            status: Some(
-                crate::UsageStatus::builder()
-                    .windows(vec![
-                        crate::UsageWindow::builder().name("session").used_percent(8.0).build(),
-                        crate::UsageWindow::builder().name("weekly").used_percent(100.0).build(),
-                    ])
-                    .observed_at(observed_at)
-                    .build(),
-            ),
-        };
-        let subject = UsageLeafSubject(&object);
-        let leaf = Leaf {
-            address: LeafAddress::Usage { provider: "codex".to_string(), account: "user@example.com".to_string() },
-            field_path: ".windows.weekly.used-percent".to_string(),
-            operator: LeafOperator::GreaterThan,
-            literal: "90".to_string(),
-        };
-
-        let evaluation = evaluate_leaf(&leaf, Some(&subject), None).expect("evaluate usage window");
-        assert_eq!(evaluation.result, ThreeValue::True);
-        assert_eq!(evaluation.value, Some(LeafValue::Number(100.0)));
-        assert_eq!(subject.observed_at(&leaf.field_path), Some(observed_at));
     }
 }

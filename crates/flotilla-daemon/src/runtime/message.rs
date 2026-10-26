@@ -66,7 +66,6 @@ impl MessageController {
         watch!(flotilla_resources::ChangeRequest);
         watch!(flotilla_resources::Issue);
         watch!(flotilla_resources::Artifact);
-        watch!(flotilla_resources::Usage);
         watch!(flotilla_resources::Vessel);
         drop(wake);
         let inbox = self.state.daemon.message_inbox(&self.namespace).await;

@@ -21,8 +21,8 @@ use flotilla_resources::{
     external_patches, Artifact, ChangeRequest, Checkout, Convoy, ConvoyAttention, ConvoyEnsure, CrewCompletionRefusal,
     CrewCompletionRefusalCause, HoldAct, Issue, LeafMaker, NudgeObligation, ObservedChecks, Project, ResourceError, RetryCeiling,
     StallEvidenceSource, StallRung, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage,
-    Vessel, WatchEvent, WatchStart, ROLE_LABEL, VESSEL_LABEL,
+    TerminalSessionPhase, TerminalSessionSource, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Vessel,
+    WatchEvent, WatchStart, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_resources::{
     BoundChangeRequest, ChangeRequestObservation, ChangeRequestState, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
@@ -946,7 +946,6 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
             convoys: &objects,
             vessels: &empty,
             change_requests: &change_requests,
-            usages: &HashMap::new(),
             issues: &HashMap::new(),
             artifacts: &HashMap::new(),
         };
@@ -1257,7 +1256,6 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
                     convoys: &objects,
                     vessels: &empty,
                     change_requests: &change_requests,
-                    usages: &HashMap::new(),
                     issues: &HashMap::new(),
                     artifacts: &HashMap::new(),
                 },

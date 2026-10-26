@@ -19,8 +19,7 @@ use crate::{
     FieldOwnedResource, FleetDesignation, Forge, ForgeRead, ForgeReadHeartbeat, FulfilmentKind, Host, ImageBuild, ImageLayer, InputMeta,
     Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, PlacementPolicy, Project, ReadResourceList, ReadWatchEvent, Regard,
     ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
-    ResourceProvenance, TerminalSession, Usage, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 
 pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
@@ -70,7 +69,6 @@ enum RegisteredResource {
     Regard,
     Repository,
     TerminalSession,
-    Usage,
     Vessel,
     WorkflowTemplate,
 }
@@ -170,7 +168,6 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
         RegisteredResource::TerminalSession,
         &["terminalsession", "terminal_session", "terminal_sessions", "terminal-session", "terminal-sessions"],
     ),
-    kind::<Usage>(RegisteredResource::Usage, &[]),
     kind::<Vessel>(RegisteredResource::Vessel, &[]),
     kind::<WorkflowTemplate>(
         RegisteredResource::WorkflowTemplate,
@@ -233,7 +230,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::Regard => poll_typed_resource!($body::<Regard>($($arg),*)),
             RegisteredResource::Repository => poll_typed_resource!($body::<Repository>($($arg),*)),
             RegisteredResource::TerminalSession => poll_typed_resource!($body::<TerminalSession>($($arg),*)),
-            RegisteredResource::Usage => poll_typed_resource!($body::<Usage>($($arg),*)),
             RegisteredResource::Vessel => poll_typed_resource!($body::<Vessel>($($arg),*)),
             RegisteredResource::WorkflowTemplate => poll_typed_resource!($body::<WorkflowTemplate>($($arg),*)),
         }
@@ -274,7 +270,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::Regard => $body::<Regard>(),
             RegisteredResource::Repository => $body::<Repository>(),
             RegisteredResource::TerminalSession => $body::<TerminalSession>(),
-            RegisteredResource::Usage => $body::<Usage>(),
             RegisteredResource::Vessel => $body::<Vessel>(),
             RegisteredResource::WorkflowTemplate => $body::<WorkflowTemplate>(),
         }
@@ -315,7 +310,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::Regard => $body::<Regard>($($arg),*),
             RegisteredResource::Repository => $body::<Repository>($($arg),*),
             RegisteredResource::TerminalSession => $body::<TerminalSession>($($arg),*),
-            RegisteredResource::Usage => $body::<Usage>($($arg),*),
             RegisteredResource::Vessel => $body::<Vessel>($($arg),*),
             RegisteredResource::WorkflowTemplate => $body::<WorkflowTemplate>($($arg),*),
         }
@@ -438,7 +432,6 @@ pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
             RegisteredResource::Regard => crate::ResourceKind::of::<Regard>(),
             RegisteredResource::Repository => crate::ResourceKind::of::<Repository>(),
             RegisteredResource::TerminalSession => crate::ResourceKind::of::<TerminalSession>(),
-            RegisteredResource::Usage => crate::ResourceKind::of::<Usage>(),
             RegisteredResource::Vessel => crate::ResourceKind::of::<Vessel>(),
             RegisteredResource::WorkflowTemplate => crate::ResourceKind::of::<WorkflowTemplate>(),
         })
@@ -1793,40 +1786,6 @@ mod tests {
         assert_eq!(listed.value["items"][0]["apiVersion"], "flotilla.work/v1");
         assert_eq!(listed.value["items"][0]["kind"], "Convoy");
         assert_eq!(listed.value["items"][0]["metadata"]["name"], "demo");
-    }
-
-    #[tokio::test]
-    async fn patch_resource_status_decodes_the_registered_kind() {
-        let backend = ResourceBackend::new(crate::test_store::memory_backend());
-        backend
-            .using::<Usage>("flotilla")
-            .create(
-                &InputMeta::builder().name("usage-account".to_string()).build(),
-                &crate::UsageSpec { provider: "codex".to_string(), account: "ada@example.com".to_string() },
-            )
-            .await
-            .expect("create usage");
-
-        let patched = patch_resource_status(
-            &backend,
-            "flotilla",
-            "usages",
-            "usage-account",
-            serde_json::json!({
-                "windows": [{"name": "weekly", "used_percent": 42.0}],
-                "observed_at": "2026-08-10T10:00:00Z",
-            }),
-        )
-        .await
-        .expect("patch typed Usage status");
-
-        assert_eq!(patched.kind, "Usage");
-        assert_eq!(patched.value["status"]["windows"][0]["used_percent"], 42.0);
-
-        let error = patch_resource_status(&backend, "flotilla", "usages", "usage-account", serde_json::json!({"windows": []}))
-            .await
-            .expect_err("malformed status should fail typed decoding");
-        assert!(error.to_string().contains("decode Usage status"));
     }
 
     #[tokio::test]

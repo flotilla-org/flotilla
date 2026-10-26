@@ -9,7 +9,7 @@ use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_protocol::LeafAddress;
 use flotilla_resources::{
     address::{leaf_address, record_name},
-    Artifact, ChangeRequest, Convoy, ForgeSpec, Issue, ReadWatchEvent, Resource, ResourceError, Usage, Vessel,
+    Artifact, ChangeRequest, Convoy, ForgeSpec, Issue, ReadWatchEvent, Resource, ResourceError, Vessel,
 };
 use flotilla_store::ResourceBackend;
 use futures::{
@@ -28,7 +28,6 @@ pub(super) enum ObjectKind {
     Vessel,
     ChangeRequest,
     Issue,
-    Usage,
     Artifact,
 }
 
@@ -82,8 +81,9 @@ impl RowDependencies {
                     }
                     ObjectKind::Issue
                 }
-                LeafAddress::Usage { .. } => ObjectKind::Usage,
                 LeafAddress::Artifact { .. } => ObjectKind::Artifact,
+                // Usage retired (#3824): nothing to watch; admission refuses a usage leaf.
+                LeafAddress::Usage { .. } => continue,
             };
             match address.and_then(|address| record_name(&address).ok_or_else(|| format!("{address} names no record"))) {
                 Ok(name) => {
@@ -177,7 +177,6 @@ async fn open_watches(backend: &ResourceBackend, namespace: &str) -> Result<Obje
     streams.push(object_watch::<Convoy>(backend, namespace, ObjectKind::Convoy).await?);
     streams.push(object_watch::<Vessel>(backend, namespace, ObjectKind::Vessel).await?);
     streams.push(object_watch::<ChangeRequest>(backend, namespace, ObjectKind::ChangeRequest).await?);
-    streams.push(object_watch::<Usage>(backend, namespace, ObjectKind::Usage).await?);
     streams.push(object_watch::<Issue>(backend, namespace, ObjectKind::Issue).await?);
     streams.push(object_watch::<Artifact>(backend, namespace, ObjectKind::Artifact).await?);
     Ok(streams)
