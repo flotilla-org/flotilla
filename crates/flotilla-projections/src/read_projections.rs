@@ -2352,7 +2352,7 @@ mod message_health_tests {
                 .value(ConditionValue::False)
                 .reason("RestartBudgetExhausted")
                 .message("Message controller stopped after 10 failures")
-                .observed_at(Utc::now())
+                .observed_at(DateTime::from_timestamp(1_700_000_000, 0).unwrap())
                 .blocks_forge_observation(false)
                 .build()],
             ..Default::default()

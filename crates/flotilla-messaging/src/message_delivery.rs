@@ -1748,7 +1748,7 @@ mod framing_tests {
         let stored = backend.using::<Message>("project");
         let mut intent = messages().remove(0);
         intent.receiver = "project/convoy/work/coder".into();
-        let now = Utc::now();
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let mut snapshot = Vec::new();
         for name in ["deleted", "surviving"] {
             let meta = InputMeta::builder().name(name.into()).build();
