@@ -791,6 +791,30 @@ migrated. #3885 decides the order, the interfaces and the issues.
 
 ---
 
+## Citation check
+
+Run these from the flotilla checkout at the pinned commit, with drydock checked out next to it.
+They check that every cited repository path exists and that every backticked identifier still
+appears in the source. Line numbers are not checked, so they can drift without failing the
+check.
+
+```bash
+f=docs/research/2026-10-26-account-access-current-state.md
+grep -oE '`(crates|docs|scripts)/[A-Za-z0-9_./{},-]+' "$f" | tr -d '`' | sed 's/:.*//' | sort -u |
+  while read -r p; do case "$p" in *"{"*) continue;; esac; [ -e "$p" ] || echo "MISSING PATH $p"; done
+grep -oE '`[a-z][a-z0-9_]{6,}`' "$f" | tr -d '`' | sort -u |
+  while read -r id; do grep -rqw "$id" crates src scripts || echo "MISSING ID $id"; done
+grep -oE '`[A-Z][A-Za-z0-9]{5,}(::[A-Za-z_]+)?`' "$f" | tr -d '`' | sed 's/::.*//' | sort -u |
+  while read -r id; do grep -rqw "$id" crates src ../drydock/crates || echo "MISSING ID $id"; done
+```
+
+At `7511b8c` the check reports exactly three misses, all expected:
+- `crates/flotilla-daemon/src/agent_material.rs`, the stale pointer that §8.10 reports;
+- `MaterialPool`, which was deleted;
+- `fc203b8`, the drydock commit hash.
+
+---
+
 ## Sources
 
 - **Code:** the files and functions cited inline, at the commits listed in the header.
