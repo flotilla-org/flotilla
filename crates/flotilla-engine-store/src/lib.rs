@@ -5,6 +5,8 @@
 //! [`MessageLog`] adds Message admission, assigned inside the create's
 //! transaction. Receipts are served as a [`ReceiptLog`] from `Read::about`.
 
+pub mod archive;
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use flotilla_schema::{Cbor, Event, Identity, Kind, KindRegistry, KindSpec, Labelled, Origin, RegistryError, StateData, Timestamp};

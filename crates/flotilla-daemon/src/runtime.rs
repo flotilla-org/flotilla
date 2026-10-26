@@ -2,6 +2,7 @@
 
 mod account_access;
 pub(crate) mod agentless_vessels;
+pub(crate) mod archive;
 mod credentials;
 mod discovery;
 mod docker;
@@ -390,6 +391,9 @@ impl DaemonRuntime {
                 runtime_health.clone(),
             ),
         ];
+        if let Some(shipper) = archive_shipper(&daemon, &daemon_config.blob_stores, &runtime_health)? {
+            tasks.push(tokio::spawn(shipper.run(archive::PASS_INTERVAL)));
+        }
         if let Some(relay) = relay {
             tasks.push(crate::event_relay::spawn(Arc::clone(&daemon), relay, config.state_dir().as_path().to_path_buf())?);
         }
@@ -1227,6 +1231,29 @@ async fn open_message_primitives(daemon: &Arc<InProcessDaemon>, config: &ConfigS
     })
     .await?;
     daemon.install_message_primitives(Arc::new(primitives))
+}
+
+/// The archive shipper over the decided store (#3939), uploading to every configured fleet blob
+/// store. None without `[primitives]`, whose store it archives, or without a store to ship to.
+fn archive_shipper(
+    daemon: &Arc<InProcessDaemon>,
+    stores: &[flotilla_config::BlobStoreConfig],
+    health: &RuntimeHealth,
+) -> Result<Option<archive::ArchiveShipper>, String> {
+    let Ok(decided) = daemon.decided_store() else { return Ok(None) };
+    if stores.is_empty() {
+        info!("no [[blob_stores]] configured: ended engine resources stay local");
+        return Ok(None);
+    }
+    let targets = archive::targets(stores)?;
+    let health = health.clone();
+    Ok(Some(archive::ArchiveShipper::new(
+        decided.store(),
+        archive::archive_kinds(),
+        targets,
+        daemon.clock_for_scenarios(),
+        Arc::new(move |condition| health.report_archive(condition)),
+    )))
 }
 
 /// The provisioning kinds' engine homes over the decided store (#3629 layer 3), each restored

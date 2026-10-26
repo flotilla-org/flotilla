@@ -138,6 +138,7 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
         Some(SubCommand::Resource { command }) => run_resource_command(&cli, command, format).await,
         Some(SubCommand::Manifest { command }) => run_manifest_command(&cli, command, format).await,
         Some(SubCommand::Artifact { command }) => run_artifact_command(&cli, command, format).await,
+        Some(SubCommand::Archive { command }) => flotilla_cli::frontend::archive::run_archive_command(&cli, command, format).await,
         Some(SubCommand::Events(EventsArgs { namespace, host, local_only })) => {
             run_resource_command(
                 &cli,

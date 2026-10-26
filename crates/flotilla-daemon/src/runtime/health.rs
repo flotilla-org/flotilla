@@ -231,6 +231,19 @@ impl RuntimeHealth {
         }
     }
 
+    /// The archive's `Archive` condition (#3939): present while a bundle is overdue.
+    pub(super) fn report_archive(&self, condition: Option<HostCondition>) {
+        let mut failures = self.failures.lock().expect("runtime health lock poisoned");
+        match condition {
+            Some(condition) => {
+                failures.insert(condition.condition_type.clone(), condition);
+            }
+            None => {
+                failures.remove(super::archive::ARCHIVE_CONDITION);
+            }
+        }
+    }
+
     pub(super) fn report_convoy_ensure_timeout(&self, timeout: Duration) {
         let condition = HostCondition::builder()
             .condition_type(CONVOY_ENSURE_CONDITION_TYPE)

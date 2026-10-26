@@ -1,4 +1,5 @@
 //! CLI clients shared by the operator executable and the pushed vessel CLI.
+pub mod archive;
 pub mod artifact;
 pub mod attach;
 pub mod connection;

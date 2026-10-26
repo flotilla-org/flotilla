@@ -6,10 +6,12 @@ license.workspace = true
 description = "The ADR 0064 engine's storage port: Log and ReceiptLog over flotilla-schema-sqlite, one transaction per write"
 
 [dependencies]
+flotilla-cbor = { path = "../flotilla-cbor" }
 flotilla-schema = { path = "../flotilla-schema" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
+serde = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
