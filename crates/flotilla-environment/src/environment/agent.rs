@@ -134,7 +134,9 @@ impl Connection {
 }
 
 /// Files flotilla ensures are small configuration.
-const ENSURED_FILE_LIMIT: u64 = 16 * 1024 * 1024;
+pub(crate) const ENSURED_FILE_LIMIT: u64 = 16 * 1024 * 1024;
+/// Command output collected in memory, per stream. Generous, but finite.
+pub(crate) const OUTPUT_LIMIT: usize = 256 * 1024 * 1024;
 
 /// Run `exec` with `input` on its stdin. Input is written while output is
 /// read, so neither side fills its pipe. A process may exit without reading
@@ -142,7 +144,7 @@ const ENSURED_FILE_LIMIT: u64 = 16 * 1024 * 1024;
 pub(crate) async fn exec_with_input(client: &Client, exec: Exec, input: &[u8]) -> io::Result<(Vec<u8>, Vec<u8>, ExitStatus)> {
     let process = client.spawn(Exec { stdin: true, ..exec }).await?;
     let (written, collected) =
-        tokio::join!(process.write_stdin_bytes(input.to_vec()), async { process.output().await?.collect(usize::MAX).await });
+        tokio::join!(process.write_stdin_bytes(input.to_vec()), async { process.output().await?.collect(OUTPUT_LIMIT).await });
     // Forget the handle, so the agent holds no output for it.
     let removed = process.remove().await;
     match written {
@@ -388,7 +390,7 @@ impl AgentRunner {
 
     async fn bytes(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<(Vec<u8>, Vec<u8>, ExitStatus), String> {
         let exec = Exec { cwd: Some(absolute_cwd(cwd)?), ..Exec::new(cmd, args.iter().copied()) };
-        self.client().await?.run(exec, usize::MAX).await.map_err(|e| e.to_string())
+        self.client().await?.run(exec, OUTPUT_LIMIT).await.map_err(|e| e.to_string())
     }
 
     async fn shell(&self, script: &str, args: &[&str]) -> Result<String, String> {

@@ -885,7 +885,13 @@ async fn health_check_restores_state_an_agent_lost(agent: Arc<dyn TestAgent>) {
     let listener = UnixListener::bind(&endpoint).unwrap();
     let guest = directory.path().join("flotilla.sock");
     runner.add_guest_forward("flotilla-daemon", &guest, &endpoint).await.unwrap();
+    // Forwards are resources of their own: adding one leaves the configuration
+    // tag alone, so a health check after it sees no restart.
+    let pushed = runner.state.lock().await.etag.clone().unwrap();
+    let live = runner.state.lock().await.client.clone().unwrap();
+    assert_eq!(live.configuration().await.unwrap().etag, pushed);
     assert!(runner.healthy().await);
+    assert_eq!(runner.state.lock().await.etag.clone().unwrap(), pushed, "an unchanged tag pushes nothing");
     // What a restart leaves behind the same link: empty configuration and no forwards.
     let client = runner.state.lock().await.client.clone().unwrap();
     client.remove_guest_forward("flotilla-daemon").await.unwrap();
@@ -901,4 +907,22 @@ async fn health_check_restores_state_an_agent_lost(agent: Arc<dyn TestAgent>) {
     daemon.read_exact(&mut request).await.unwrap();
     assert_eq!(&request, b"ping");
     assert_eq!(agent.starts(), 1);
+}
+
+// A refused guest forward releases the host endpoint it claimed, on the same
+// client: correcting the request and retrying succeeds, and nothing is cached.
+over_each_transport!(refused_guest_forward_releases_its_endpoint);
+async fn refused_guest_forward_releases_its_endpoint(agent: Arc<dyn TestAgent>) {
+    let directory = tempfile::Builder::new().prefix("frg-").tempdir_in("/tmp").unwrap();
+    let runner = runner_for(&agent, directory.path());
+    let endpoint = directory.path().join("daemon.sock");
+    let _listener = UnixListener::bind(&endpoint).unwrap();
+    let occupied = directory.path().join("occupied");
+    std::fs::write(&occupied, b"not a socket").unwrap();
+    assert!(runner.add_guest_forward("flotilla-daemon", &occupied, &endpoint).await.is_err());
+    assert!(runner.state.lock().await.guest_forwards.is_empty());
+    let guest = directory.path().join("flotilla.sock");
+    runner.add_guest_forward("flotilla-daemon", &guest, &endpoint).await.unwrap();
+    UnixStream::connect(&guest).await.unwrap();
+    assert_eq!(agent.starts(), 1, "the refusal did not need a new client");
 }

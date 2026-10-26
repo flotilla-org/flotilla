@@ -175,7 +175,12 @@ pub(super) async fn make_directories(agent: &drydock_agent::Client, path: &Path)
     match agent.create_dir(path, &options).await {
         Ok(_) => Ok(()),
         Err(cause) if cause.kind() == io::ErrorKind::AlreadyExists => match agent.stat(path).await.map_err(error)?.kind {
-            drydock_agent::EntryKind::Directory | drydock_agent::EntryKind::Symlink => Ok(()),
+            drydock_agent::EntryKind::Directory => Ok(()),
+            // Like `mkdir -p`, a link is accepted only if it leads to a
+            // directory; listing it follows the link and refuses otherwise.
+            drydock_agent::EntryKind::Symlink => {
+                agent.list(path).await.map(drop).map_err(|cause| format!("{} is not a directory: {}", path.display(), error(cause)))
+            }
             _ => Err(format!("{} is not a directory", path.display())),
         },
         Err(cause) => Err(error(cause)),
@@ -262,8 +267,10 @@ impl Guest for Connection {
         let Some(expected) = self.etag.lock().expect("configuration tag").clone() else { return false };
         // A tag this connection did not set means the agent restarted (or was
         // reconfigured) and lost its configuration: reconnect and push it again.
+        // Only a definite mismatch is stale; a slow or failed read is not
+        // evidence of a restart, and the session check above stays in charge.
         let current = tokio::time::timeout(Duration::from_secs(2), self.agent.configuration()).await;
-        !current.is_ok_and(|current| current.is_ok_and(|current| current.etag == expected))
+        matches!(current, Ok(Ok(current)) if current.etag != expected)
     }
 
     fn runner(&self) -> Arc<dyn CommandRunner> {

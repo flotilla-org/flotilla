@@ -3,9 +3,6 @@ use super::*;
 use drydock_agent::{Client, Exec, ExecEvent, FileOptions};
 use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 
-/// Configuration files flotilla ensures are small.
-const ENSURED_FILE_LIMIT: u64 = 16 * 1024 * 1024;
-
 pub(crate) struct AgentRunner(pub Arc<Client>);
 impl AgentRunner {
     pub(super) async fn write_bytes(&self, path: &Path, bytes: Vec<u8>, mode: u32) -> Result<(), String> {
@@ -29,7 +26,7 @@ fn material(mode: u32) -> Result<FileOptions, String> {
 impl CommandRunner for AgentRunner {
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
         let exec = Exec { cwd: Some(cwd.into()), ..Exec::new(cmd, args.iter().copied()) };
-        let (stdout, stderr, status) = self.0.run(exec, usize::MAX).await.map_err(error)?;
+        let (stdout, stderr, status) = self.0.run(exec, super::super::agent::OUTPUT_LIMIT).await.map_err(error)?;
         Ok(CommandOutput {
             stdout: String::from_utf8_lossy(&stdout).into(),
             stderr: String::from_utf8_lossy(&stderr).into(),
@@ -41,7 +38,7 @@ impl CommandRunner for AgentRunner {
         if output.success() {
             Ok(output.stdout)
         } else {
-            Err(format!("guest command failed with exit {:?}", output.exit_code))
+            Err(format!("guest command failed with exit {:?}: {}", output.exit_code, output.stderr))
         }
     }
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
@@ -101,11 +98,11 @@ impl CommandRunner for AgentRunner {
     }
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         let exec = Exec { cwd: Some(cwd.into()), ..Exec::new(cmd, args.iter().copied()) };
-        let (stdout, _, status) = super::super::agent::exec_with_input(&self.0, exec, input).await.map_err(error)?;
+        let (stdout, stderr, status) = super::super::agent::exec_with_input(&self.0, exec, input).await.map_err(error)?;
         if status.success() {
             Ok(String::from_utf8_lossy(&stdout).into())
         } else {
-            Err(format!("guest command failed with exit {:?}", status.code))
+            Err(format!("guest command failed with exit {:?}: {}", status.code, String::from_utf8_lossy(&stderr)))
         }
     }
 
@@ -115,7 +112,8 @@ impl CommandRunner for AgentRunner {
         match self.0.write_bytes(path, content.as_bytes().to_vec(), &options).await {
             Ok(_) => Ok(content.into()),
             Err(cause) if cause.kind() == std::io::ErrorKind::AlreadyExists => {
-                String::from_utf8(self.0.read_bytes(path, ENSURED_FILE_LIMIT).await.map_err(error)?).map_err(|e| e.to_string())
+                String::from_utf8(self.0.read_bytes(path, super::super::agent::ENSURED_FILE_LIMIT).await.map_err(error)?)
+                    .map_err(|e| e.to_string())
             }
             Err(cause) => Err(error(cause)),
         }
