@@ -69,7 +69,8 @@
     "kind": "entity",
     "value": {
       "id": "feta/dev/terminal-impl-coder",
-      "kind": "session"
+      "kind": "session",
+      "provider": ""
     }
   },
   "type": "metadata-patch",

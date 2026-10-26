@@ -31,7 +31,7 @@
   "source_id": "flotilla-actuator",
   "target": {
     "kind": "tab",
-    "value": 7
+    "value": "01920a6b-7c3d-7e4f-8a1b-2c3d4e5f6a7b"
   },
   "type": "metadata-patch",
   "unset": []

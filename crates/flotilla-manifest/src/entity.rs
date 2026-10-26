@@ -9,13 +9,16 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EntityRef {
+    /// Connection-scoped provider; Wheelhouse assigns it for published catalogs.
+    #[serde(default)]
+    pub provider: String,
     pub kind: String,
     pub id: String,
 }
 
 impl EntityRef {
     pub fn new(kind: impl Into<String>, id: impl Into<String>) -> Self {
-        Self { kind: kind.into(), id: id.into() }
+        Self { provider: String::new(), kind: kind.into(), id: id.into() }
     }
 
     /// Stable value used by action facts and live-tab matching.
@@ -127,7 +130,7 @@ mod tests {
         let json = serde_json::to_string(&entity).expect("serialize novel kind");
         let decoded: EntityRef = serde_json::from_str(&json).expect("deserialize novel kind");
 
-        assert_eq!(json, r#"{"kind":"deployment","id":"prod/api"}"#);
+        assert_eq!(json, r#"{"provider":"","kind":"deployment","id":"prod/api"}"#);
         assert_eq!(decoded, entity);
     }
 }

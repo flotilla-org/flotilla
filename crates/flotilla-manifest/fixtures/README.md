@@ -6,18 +6,21 @@ implementations**, not written by hand. They pin the mirrored types in
 deserialize each fixture with the mirror and require value-identical JSON on
 re-serialization.
 
-- Generated: 2026-07-25
+- Generated: 2026-10-26
+- Wheelhouse revision: `526600d7d199795e9c8d2b64751c93c023df93dd`
 - Source of truth: the sibling `wheelhouse/crates/wheelhouse-core` checkout
 - Generator: `generator/` (not a workspace member — it path-depends on a
   sibling wheelhouse checkout)
 
-**Never hand-edit these files.** If a round-trip test fails after an
+**Never hand-edit these files.** If a round-trip test fails after a
 wheelhouse change, regenerate against wheelhouse and adapt the mirror:
 
 ```bash
 cd fixtures/generator && cargo run -- .. && git diff ..
 ```
 
-The mirror (and this whole fixture apparatus) is a v0 stopgap: at the Leg-1
-manifest extraction, flotilla depends on the shared `flotilla-org/manifest`
-crate directly and the mirrored types are deleted (flotilla-org/flotilla#708).
+The generator uses Wheelhouse's UUID workspace IDs for tab targets and includes
+provider-qualified entity references. Flotilla preserves incoming providers;
+its own entity constructors leave the provider empty for Wheelhouse to scope
+at the connection. Text uses `String` in the mirror and `Arc<str>` upstream;
+both have the same JSON string representation.

@@ -2466,7 +2466,7 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
             assert_eq!(
                 wire["set"]["flotilla.forge"]["value"],
                 serde_json::json!({
-                    "type": "entity-refs", "value": [{"kind": "forge", "id": expected_id}]
+                    "type": "entity-refs", "value": [{"provider": "", "kind": "forge", "id": expected_id}]
                 }),
                 "{mode:?}"
             );

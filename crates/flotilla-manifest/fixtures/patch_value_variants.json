@@ -1,5 +1,20 @@
 {
   "set": {
+    "entity.references": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "entity-refs",
+        "value": [
+          {
+            "id": "dev/example@fleet",
+            "kind": "vessel",
+            "provider": "fixture-provider"
+          }
+        ]
+      }
+    },
     "flotilla.crew.roles": {
       "ordinal": null,
       "precedence": null,

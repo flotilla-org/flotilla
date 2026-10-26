@@ -6,11 +6,11 @@ use std::{collections::BTreeMap, env, fs, path::Path};
 
 use wheelhouse_core::{
     EntityRef, ExternalMessage, MetadataIdentity, MetadataPatch, MetadataTarget,
-    MetadataValue, MetadataValueUpdate, ObservedMetadataIdentity, PaneTarget,
+    MetadataValue, MetadataValueUpdate, ObservedMetadataIdentity, PaneTarget, WorkspaceId,
 };
 
 fn text(value: &str) -> MetadataValue {
-    MetadataValue::Text(value.to_owned())
+    MetadataValue::Text(value.into())
 }
 
 fn update(value: MetadataValue, ttl_ms: Option<u64>) -> MetadataValueUpdate {
@@ -32,10 +32,7 @@ fn patch(target: MetadataTarget, source_id: &str, set: Vec<(&str, MetadataValueU
 }
 
 fn entity_target(kind: &str, id: &str) -> MetadataTarget {
-    MetadataTarget::Entity(EntityRef {
-        kind: kind.to_owned(),
-        id: id.to_owned(),
-    })
+    MetadataTarget::Entity(EntityRef::new("", kind, id))
 }
 
 fn main() {
@@ -104,7 +101,7 @@ fn main() {
 
     // 4. Tab stamp: the actuator's tab-id two-step — tab target, no TTL.
     let tab_patch = patch(
-        MetadataTarget::Tab(7),
+        MetadataTarget::Tab("01920a6b-7c3d-7e4f-8a1b-2c3d4e5f6a7b".parse::<WorkspaceId>().expect("fixture workspace UUID")),
         "flotilla-actuator",
         vec![
             ("entity.kind", update(text("vessel"), None)),
@@ -125,6 +122,7 @@ fn main() {
         vec![
             ("status.attention", update(MetadataValue::Bool(true), Some(30_000))),
             ("ordinal", ordinal_update),
+            ("entity.references", update(MetadataValue::EntityRefs(vec![EntityRef::new("fixture-provider", "vessel", "dev/example@fleet")]), None)),
             (
                 "flotilla.crew.roles",
                 update(MetadataValue::StringList(vec!["coder".to_owned(), "reviewer".to_owned()]), Some(30_000)),
