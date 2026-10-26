@@ -98,8 +98,9 @@ pub(super) async fn deliver_bound_account(
         delivered: None,
     };
     // Record the place before writing material there, so a copy is never left without a
-    // record the place pass would withdraw.
-    record_provision(state, launch.namespace, &record, &provision).await?;
+    // record the place pass would withdraw. A relaunch keeps its existing record, and with it
+    // the previous delivery, until this one succeeds.
+    ensure_provision(state, launch.namespace, &record, &provision).await?;
     let env = provisioner.deliver(&home, &material, &*runner).await?;
     provision.delivered = Some(Delivered {
         epoch: declaration.authorization_epoch.to_string(),
@@ -123,6 +124,19 @@ fn delivered_at(binding: &flotilla_resources::AccountBindingSpec) -> Timestamp {
 /// One provision record per (binding, place).
 pub(super) fn provision_name(binding: &str, place: &str) -> String {
     format!("{binding}.{place}")
+}
+
+async fn ensure_provision(state: &ControllerRuntimeState, namespace: &str, name: &str, spec: &AccountProvisionSpec) -> Result<(), String> {
+    let provisions = state.daemon.resource_backend().using::<AccountProvision>(namespace);
+    match provisions.get(name).await {
+        Ok(_) => Ok(()),
+        Err(ResourceError::NotFound { .. }) => provisions
+            .create(&InputMeta::builder().name(name.to_string()).build(), spec)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("record account provision `{name}`: {error}")),
+        Err(error) => Err(format!("read account provision `{name}`: {error}")),
+    }
 }
 
 async fn record_provision(state: &ControllerRuntimeState, namespace: &str, name: &str, spec: &AccountProvisionSpec) -> Result<(), String> {

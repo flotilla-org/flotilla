@@ -168,6 +168,8 @@ impl AccountProvisioner for ClaudeDirect {
     }
 
     fn plan(&self, environment_kind: &str) -> Result<ProvisionPlan, String> {
+        // Keep this list strict: it is the only guard against a wrong-kind placement, and the
+        // launch side treats a vessel whose Environment record it cannot read as Docker.
         use environment_kind::{AGENTLESS_SSH, DOCKER, HOST_DIRECT};
         if ![DOCKER, AGENTLESS_SSH, HOST_DIRECT].contains(&environment_kind) {
             return Err(format!(
