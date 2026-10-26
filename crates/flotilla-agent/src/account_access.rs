@@ -229,14 +229,7 @@ impl AccountProvisioner for ClaudeDirect {
     }
 
     fn home(&self, writable_base: &Path, convoy: &str, role: &str) -> String {
-        writable_base
-            .join("agent-homes")
-            .join("requesters")
-            .join(component(convoy))
-            .join(component(role))
-            .join("claude")
-            .display()
-            .to_string()
+        flotilla_resources::account_access::requester_home(writable_base, convoy, role, "claude").display().to_string()
     }
 
     async fn deliver(&self, home: &str, material: &str, runner: &dyn CommandRunner) -> Result<Vec<(String, String)>, String> {
@@ -257,20 +250,6 @@ impl AccountProvisioner for ClaudeDirect {
         let token_file = Path::new(home).join(CLAUDE_OAUTH_TOKEN_FILE).display().to_string();
         runner.run("rm", &["-f", "--", &token_file], Path::new("/"), &ChannelLabel::Default).await.map(|_| ())
     }
-}
-
-/// One path component from a name, injectively: a name of ASCII alphanumerics, `-` and `_`
-/// is used as it is; any other name has the rest replaced by `-` and a digest of the whole name
-/// appended, so `a.b` and `a-b` can never share a requester's home.
-fn component(name: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let plain = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
-    if !name.is_empty() && name.chars().all(plain) {
-        return name.to_string();
-    }
-    let sanitized = name.chars().map(|c| if plain(c) { c } else { '-' }).collect::<String>();
-    let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
-    format!("{sanitized}.{}", &digest[..12])
 }
 
 /// The shell prefix that hands the delivered token to the Claude process as it starts.

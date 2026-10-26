@@ -773,9 +773,9 @@ impl CredentialStore {
         let mut specs = Vec::new();
         for name in credential_refs {
             let spec = self.spec(name).await?;
-            if matches!(spec.consumer, CredentialConsumer::DockerRegistry { .. }) {
-                // Registry auth serves host image actions, never the session. Record the
-                // intentional absence so it cannot be confused with a reconstruction gap.
+            if never_session_delivered(&spec.consumer) {
+                // Recorded as an intentional absence so it cannot be confused with a
+                // reconstruction gap.
                 self.record_host_only_reference(environment_ref, name).await;
                 continue;
             }
@@ -827,7 +827,6 @@ impl CredentialStore {
                     | CredentialConsumer::GithubApp { .. }
                     | CredentialConsumer::Forgejo { .. }
                     | CredentialConsumer::GitHttpToken { .. }
-                    | CredentialConsumer::ClaudeOauth { .. }
                     | CredentialConsumer::Codex
                     | CredentialConsumer::ReviewBundleStore { .. }
             )
@@ -1398,7 +1397,7 @@ impl CredentialStore {
         Box::pin(async move {
             let mut delivered = BTreeSet::new();
             for name in granted {
-                if matches!(self.spec(name).await?.consumer, CredentialConsumer::DockerRegistry { .. }) {
+                if never_session_delivered(&self.spec(name).await?.consumer) {
                     self.record_host_only_reference(environment_ref, name).await;
                 } else {
                     delivered.insert(name.clone());
@@ -2064,20 +2063,6 @@ impl CredentialStore {
                 }
                 env.insert("ANTHROPIC_API_KEY".to_string(), material.to_string());
             }
-            // Delivery does not prove model entitlement. Only actual requested
-            // work may spend a turn; preparation checks the consumer binary.
-            CredentialConsumer::ClaudeOauth { .. } => {
-                let delivery_paths = delivery_paths.expect("Claude OAuth adapter resolves delivery paths");
-                if !runner
-                    .run_output("sh", &["-c", "command -v claude"], Path::new("/"), &ChannelLabel::Default)
-                    .await
-                    .is_ok_and(|output| output.success())
-                {
-                    return Err("consumer binary is unavailable".to_string());
-                }
-                env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), material.to_string());
-                env.insert("CLAUDE_CONFIG_DIR".to_string(), prepare_harness_home(delivery_paths, name, "claude", &*runner).await?);
-            }
             CredentialConsumer::Codex => {
                 let delivery_paths = delivery_paths.expect("Codex adapter resolves delivery paths");
                 let codex_home = delivery_paths.credential_dir(name).join("codex").to_string_lossy().into_owned();
@@ -2134,7 +2119,7 @@ impl CredentialStore {
                 env.insert("FLOTILLA_REVIEW_STORE_VIRTUAL_HOSTED_STYLE".to_string(), virtual_hosted_style.to_string());
                 env.insert("FLOTILLA_REVIEW_STORE_PREFIX".to_string(), format!("{}/", flotilla_resources::REVIEW_BUNDLE_ROOT));
             }
-            CredentialConsumer::DockerRegistry { .. } => {}
+            CredentialConsumer::DockerRegistry { .. } | CredentialConsumer::ClaudeOauth { .. } => {}
         }
         Ok(AdapterDelivery { env, git_credential })
     }
@@ -2144,6 +2129,13 @@ impl CredentialStore {
 // links. Same-filesystem staging lets physical hard links publish copied files
 // without replacing existing state. Expected collisions succeed; other IO errors
 // fail the batched find command before the import marker or auth links publish.
+/// Credentials a session's delivery never carries. Registry auth serves host image actions. A
+/// Claude subscription reaches a requester only through its account binding (#3907); a
+/// vessel-wide reference to one, from a workflow admitted before bindings, is left alone.
+fn never_session_delivered(consumer: &CredentialConsumer) -> bool {
+    matches!(consumer, CredentialConsumer::DockerRegistry { .. } | CredentialConsumer::ClaudeOauth { .. })
+}
+
 async fn prepare_harness_home(
     paths: &CredentialDeliveryPaths,
     name: &str,
@@ -5074,248 +5066,6 @@ interactions:
                 b"recoverable state"
             );
         }
-    }
-
-    async fn create_claude_oauth_spec(backend: &ResourceBackend, name: &str, account_email: &str, source_env: &str) {
-        backend
-            .clone()
-            .definitions::<CredentialSpec>("flotilla")
-            .create(
-                &InputMeta::builder().name(name.to_string()).build(),
-                &CredentialSpecSpec {
-                    consumer: CredentialConsumer::ClaudeOauth { account_email: account_email.to_string() },
-                    source: CredentialSource::Env { name: source_env.to_string() },
-                    lifecycle: CredentialLifecycle::Static,
-                    placement: CredentialPlacementRequirements::default(),
-                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
-                },
-            )
-            .await
-            .expect("create credential declaration");
-    }
-
-    #[tokio::test]
-    async fn claude_oauth_material_is_delivered_as_an_env_token_without_owning_agent_config() {
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
-        let secret = "sk-ant-oat01-test-token-never-in-argv";
-        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_CLAUDE_TOKEN".to_string(), secret.to_string())])));
-        let runner = Arc::new(RecordingRunner::default());
-        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
-        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
-        let credential_refs = BTreeSet::from(["claude-max".to_string()]);
-
-        assert!(
-            store.vessel_config_fragments(&credential_refs, &BTreeMap::new()).await.expect("Claude fragments").is_empty(),
-            "Claude config belongs to the agent adapter, not credential delivery"
-        );
-
-        assert!(
-            store.prepare("env-without-grant", &BTreeSet::new(), runner.clone()).await.expect("prepare without a grant").is_empty(),
-            "an ungranted session must receive no credential environment"
-        );
-        let delivered = store.prepare("env-a", &credential_refs, runner.clone()).await.expect("prepare claude-oauth credential");
-
-        assert_eq!(delivered.len(), 2);
-        assert!(
-            delivered.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == secret),
-            "the OAuth token must be delivered under CLAUDE_CODE_OAUTH_TOKEN"
-        );
-        assert!(delivered
-            .iter()
-            .any(|(name, value)| { name == "CLAUDE_CONFIG_DIR" && value == "/tmp/flotilla-test-state/agent-homes/claude-max/claude" }));
-        let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls.iter().all(|(_, args, _)| args.iter().all(|arg| !arg.contains(secret))));
-        assert!(calls.iter().all(|(cmd, args, _)| cmd != "sh" || !args.iter().any(|arg| arg.contains("claude -p"))));
-    }
-
-    #[tokio::test]
-    async fn claude_oauth_delivery_refuses_an_environment_without_the_claude_binary() {
-        struct NoClaudeRunner(RecordingRunner);
-
-        #[async_trait]
-        impl CommandRunner for NoClaudeRunner {
-            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-                self.0.run(cmd, args, cwd, label).await
-            }
-
-            async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-                if cmd == "sh" && args == ["-c", "command -v claude"] {
-                    return Err("consumer binary unavailable".into());
-                }
-                self.0.run_output(cmd, args, cwd, label).await
-            }
-
-            async fn exists(&self, cmd: &str, _args: &[&str]) -> bool {
-                cmd != "claude"
-            }
-        }
-
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
-        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string())])));
-        let recording = Arc::new(RecordingRunner::default());
-        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
-        let store = CredentialStore::new(backend, "flotilla", env, bag, recording.clone(), PathBuf::from("/tmp/flotilla-test-state"));
-
-        let error = store
-            .prepare("env-a", &BTreeSet::from(["claude-max".to_string()]), Arc::new(NoClaudeRunner(RecordingRunner::default())))
-            .await
-            .expect_err("a matching harness without its binary must still refuse");
-        assert!(error.contains("consumer binary is unavailable"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn two_claude_accounts_coexist_across_environments_but_never_share_one() {
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_claude_oauth_spec(&backend, "claude-alice", "alice@example.com", "TEST_CLAUDE_TOKEN_A").await;
-        create_claude_oauth_spec(&backend, "claude-bob", "bob@example.com", "TEST_CLAUDE_TOKEN_B").await;
-        backend
-            .clone()
-            .definitions::<CredentialSpec>("flotilla")
-            .create(
-                &InputMeta::builder().name("claude-api".to_string()).build(),
-                &CredentialSpecSpec {
-                    consumer: CredentialConsumer::Claude,
-                    source: CredentialSource::Env { name: "TEST_ANTHROPIC_KEY".to_string() },
-                    lifecycle: CredentialLifecycle::Static,
-                    placement: CredentialPlacementRequirements::default(),
-                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
-                },
-            )
-            .await
-            .expect("create API-key credential declaration");
-        let env = Arc::new(TestEnv(BTreeMap::from([
-            ("TEST_CLAUDE_TOKEN_A".to_string(), "token-alice".to_string()),
-            ("TEST_CLAUDE_TOKEN_B".to_string(), "token-bob".to_string()),
-            ("TEST_ANTHROPIC_KEY".to_string(), "api-key".to_string()),
-        ])));
-        let runner = Arc::new(RecordingRunner::default());
-        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
-        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
-
-        let alice: BTreeMap<String, String> = store
-            .prepare("env-a", &BTreeSet::from(["claude-alice".to_string()]), runner.clone())
-            .await
-            .expect("prepare alice")
-            .into_iter()
-            .collect();
-        let bob: BTreeMap<String, String> = store
-            .prepare("env-b", &BTreeSet::from(["claude-bob".to_string()]), runner.clone())
-            .await
-            .expect("prepare bob")
-            .into_iter()
-            .collect();
-
-        assert_eq!(alice.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-alice".to_string()));
-        assert_eq!(bob.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-bob".to_string()));
-        assert_eq!(alice.get("CLAUDE_CONFIG_DIR"), Some(&"/tmp/flotilla-test-state/agent-homes/claude-alice/claude".to_string()));
-        assert_eq!(bob.get("CLAUDE_CONFIG_DIR"), Some(&"/tmp/flotilla-test-state/agent-homes/claude-bob/claude".to_string()));
-
-        let error = store
-            .prepare("env-c", &BTreeSet::from(["claude-alice".to_string(), "claude-bob".to_string()]), runner.clone())
-            .await
-            .expect_err("two OAuth credentials in one environment would clobber CLAUDE_CODE_OAUTH_TOKEN");
-        assert!(error.contains("multiple granted credentials use this adapter"), "unexpected error: {error}");
-        let error = store
-            .prepare("env-d", &BTreeSet::from(["claude-alice".to_string(), "claude-api".to_string()]), runner.clone())
-            .await
-            .expect_err("ANTHROPIC_API_KEY outranks CLAUDE_CODE_OAUTH_TOKEN, so mixing them would silently drop the OAuth identity");
-        assert!(error.contains("multiple granted credentials use this adapter"), "unexpected error: {error}");
-    }
-
-    #[tokio::test]
-    async fn rotating_named_claude_oauth_material_reuses_the_stable_config_directory() {
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        backend
-            .clone()
-            .definitions::<CredentialSpec>("flotilla")
-            .create(
-                &InputMeta::builder().name("claude-max".to_string()).build(),
-                &CredentialSpecSpec {
-                    consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
-                    source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
-                    lifecycle: CredentialLifecycle::Refreshable,
-                    placement: CredentialPlacementRequirements::default(),
-                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
-                },
-            )
-            .await
-            .expect("create refreshable Claude credential declaration");
-        let env = Arc::new(RotatingTokenEnv(StdMutex::new(VecDeque::from([
-            "token-before-rotation".to_string(),
-            "token-after-rotation".to_string(),
-        ]))));
-        let runner = Arc::new(RecordingRunner::default());
-        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
-        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
-        let credential_refs = BTreeSet::from(["claude-max".to_string()]);
-
-        let before: BTreeMap<_, _> =
-            store.prepare("env-a", &credential_refs, runner.clone()).await.expect("prepare before rotation").into_iter().collect();
-        let after: BTreeMap<_, _> =
-            store.prepare("env-a", &credential_refs, runner.clone()).await.expect("prepare after rotation").into_iter().collect();
-
-        assert_eq!(before.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-before-rotation".to_string()));
-        assert_eq!(after.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-after-rotation".to_string()));
-        assert_eq!(before.get("CLAUDE_CONFIG_DIR"), after.get("CLAUDE_CONFIG_DIR"));
-        assert_eq!(after.get("CLAUDE_CONFIG_DIR"), Some(&"/tmp/flotilla-test-state/agent-homes/claude-max/claude".to_string()));
-        let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls.iter().all(|(command, args, _)| {
-            command != "rm" || args == &["-rf".to_string(), "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight".to_string()]
-        }));
-        assert!(calls
-            .iter()
-            .flat_map(|(_, args, _)| args)
-            .all(|arg| !arg.contains("token-before-rotation") && !arg.contains("token-after-rotation")));
-    }
-
-    // Subprocess seam: credential preparation must never request inference,
-    // regardless of the token's actual validity or inference quota.
-    struct NoInferenceRunner(RecordingRunner);
-    #[async_trait]
-    impl CommandRunner for NoInferenceRunner {
-        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-            assert!(!args.iter().any(|arg| arg.contains("claude -p")
-                || arg.contains("--print")
-                || arg.contains("/messages")
-                || arg.contains("/completions")));
-            self.0.run(cmd, args, cwd, label).await
-        }
-        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-            self.run(cmd, args, cwd, label).await?;
-            self.0.run_output(cmd, args, cwd, label).await
-        }
-        async fn run_with_input(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel, _: &[u8]) -> Result<String, String> {
-            panic!("OAuth delivery must not authenticate by sending a model turn")
-        }
-        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
-            self.0.exists(cmd, args).await
-        }
-        async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
-            self.0.write_file(path, content).await
-        }
-    }
-
-    // Unknown entitlement permits delivery of exactly the selected credential;
-    // preparation never spends a turn to learn whether it will be refused.
-    #[tokio::test]
-    async fn claude_oauth_preparation_never_requests_inference() {
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
-        let secret = "fake-selected-credential";
-        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_CLAUDE_TOKEN".to_string(), secret.to_string())])));
-        let runner = Arc::new(NoInferenceRunner(RecordingRunner::default()));
-        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
-        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
-        for environment in ["env-a", "env-a", "env-b"] {
-            let delivered = store
-                .prepare(environment, &BTreeSet::from(["claude-max".to_string()]), runner.clone())
-                .await
-                .expect("deliver unknown entitlement");
-            assert!(delivered.contains(&("CLAUDE_CODE_OAUTH_TOKEN".into(), secret.into())));
-        }
-        assert!(runner.0.calls.lock().expect("calls").iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
     }
 
     #[tokio::test]

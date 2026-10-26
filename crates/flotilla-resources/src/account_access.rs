@@ -312,6 +312,27 @@ impl AccountBindingSpec {
     }
 }
 
+/// A requester's home for one harness under a place's writable base:
+/// `<base>/agent-homes/requesters/<convoy>/<role>/<harness>` (#3910 ruling 4). Names are encoded
+/// injectively: a name of ASCII alphanumerics, `-` and `_` is used as it is; any other has the
+/// rest replaced by `-` and a digest of the whole name appended, so `a.b` and `a-b` never share.
+pub fn requester_home(base: &std::path::Path, convoy: &str, role: &str, harness: &str) -> std::path::PathBuf {
+    fn component(name: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let plain = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+        if !name.is_empty() && name.chars().all(plain) {
+            return name.to_string();
+        }
+        let sanitized = name.chars().map(|c| if plain(c) { c } else { '-' }).collect::<String>();
+        format!("{sanitized}.{}", &format!("{:x}", Sha256::digest(name.as_bytes()))[..12])
+    }
+    base.join("agent-homes").join("requesters").join(component(convoy)).join(component(role)).join(harness)
+}
+
+/// Names the convoy whose requesters a vessel's crews are, in the environment its provisioning
+/// stages skills with, so each crew's skills land in the home its binding delivers into.
+pub const REQUESTER_CONVOY_ENV: &str = "FLOTILLA_REQUESTER_CONVOY";
+
 /// The material generation a delivery records (#3910 owner ruling 3): a short digest of the
 /// published material, so a refreshed file is told apart without storing or logging it.
 pub fn material_generation(material: &str) -> String {

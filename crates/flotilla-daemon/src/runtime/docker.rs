@@ -173,15 +173,18 @@ impl DockerControllerRuntime {
         spec: &flotilla_resources::DockerEnvironmentSpec,
     ) -> Result<EnvironmentProvisioning, EnvironmentProvisionError> {
         let legacy_baseline = self.legacy_baseline_for_environment(name).await?;
-        let (mut environment_spec, instance) =
+        let (mut environment_spec, instance, convoy) =
             match self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(name).await {
                 Ok(environment) => (
                     environment.spec,
                     environment.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned(),
+                    environment.metadata.labels.get(flotilla_resources::CONVOY_LABEL).cloned(),
                 ),
-                Err(ResourceError::NotFound { .. }) => {
-                    (EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) }, None)
-                }
+                Err(ResourceError::NotFound { .. }) => (
+                    EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) },
+                    None,
+                    None,
+                ),
                 Err(error) => return Err(error.to_string().into()),
             };
         if environment_spec.cloud_sandbox.is_none() {
@@ -529,6 +532,9 @@ impl DockerControllerRuntime {
                     environment.push((key.into(), selection.clone()));
                 }
             }
+            // #3907: requester-bound crews' skills are staged in their requesters' homes.
+            environment
+                .extend(convoy.iter().map(|convoy| (flotilla_resources::account_access::REQUESTER_CONVOY_ENV.to_string(), convoy.clone())));
             let mut source_token_files = BTreeMap::new();
             let will_stage_skills =
                 match agent_material.will_stage_skills(&spec.required_agent_adapters, &environment, &*handle.runner()).await {

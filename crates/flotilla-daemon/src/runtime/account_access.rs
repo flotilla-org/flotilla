@@ -19,7 +19,7 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
-    sync::{atomic::AtomicU64, Arc},
+    sync::Arc,
     time::Duration,
 };
 
@@ -38,18 +38,13 @@ use flotilla_resources::{
 use flotilla_schema::{Ref, Timestamp};
 use flotilla_store::{
     controller::{
-        ControllerLoop, LabelMappedWatch, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileOutcome, Reconciler, SecondaryWatch,
-        WorkQueueSender,
+        LabelMappedWatch, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender,
     },
     ResourceBackend,
 };
 use futures::StreamExt;
-use tokio::task::JoinHandle;
 
-use super::health::{spawn_controller_loop_watchdog, RuntimeHealth};
 use super::state::ControllerRuntimeState;
-use super::tasks::supervise_controller;
-use crate::supervisor::ControllerSupervision;
 
 /// What a launch needs to know about the requester and its place.
 pub(super) struct AccountLaunch<'a> {
@@ -126,35 +121,34 @@ pub(super) async fn deliver_bound_account(
     let provisions = backend.using::<AccountProvision>(launch.namespace);
     let meta = provision_meta(&record, &name, launch.convoy);
     // Record the place before writing material there, so a copy is never left without a
-    // record the place pass would withdraw. A relaunch keeps its existing record, and with it
-    // the previous delivery, until this one succeeds.
-    match provisions.get(&record).await {
-        Ok(_) => {}
-        Err(ResourceError::NotFound { .. }) => {
-            provisions.create(&meta, &provision).await.map_err(|error| format!("record account provision `{record}`: {error}"))?;
-        }
-        Err(error) => return Err(format!("read account provision `{record}`: {error}")),
-    }
+    // record the provision controller would withdraw. A relaunch keeps its existing record,
+    // and with it the previous delivery, until this one succeeds.
+    write_provision(&provisions, &meta, &provision, false).await?;
     let env = provisioner.deliver(&home, &material, &*runner).await?;
     provision.delivered = Some(Delivered {
         epoch: declaration.authorization_epoch.to_string(),
         generation: material_generation(&material),
         at: delivered_at(state, &binding.object.spec),
     });
-    match provisions.get(&record).await {
-        Ok(existing) if existing.spec == provision => {}
-        Ok(existing) => {
-            provisions
-                .update(&meta, &existing.metadata.resource_version, &provision)
-                .await
-                .map_err(|error| format!("record account provision `{record}`: {error}"))?;
-        }
-        Err(ResourceError::NotFound { .. }) => {
-            provisions.create(&meta, &provision).await.map_err(|error| format!("record account provision `{record}`: {error}"))?;
-        }
-        Err(error) => return Err(format!("read account provision `{record}`: {error}")),
-    }
+    write_provision(&provisions, &meta, &provision, true).await?;
     Ok(env)
+}
+
+/// Create the provision record, or with `replace`, bring an existing one to `spec`.
+async fn write_provision(
+    provisions: &flotilla_store::TypedResolver<AccountProvision>,
+    meta: &InputMeta,
+    spec: &AccountProvisionSpec,
+    replace: bool,
+) -> Result<(), String> {
+    let name = &meta.name;
+    let written = match provisions.get(name).await {
+        Ok(existing) if !replace || existing.spec == *spec => return Ok(()),
+        Ok(existing) => provisions.update(meta, &existing.metadata.resource_version, spec).await.map(|_| ()),
+        Err(ResourceError::NotFound { .. }) => provisions.create(meta, spec).await.map(|_| ()),
+        Err(error) => return Err(format!("read account provision `{name}`: {error}")),
+    };
+    written.map_err(|error| format!("record account provision `{name}`: {error}"))
 }
 
 /// When a delivery under `binding` happened, on the runtime's clock, for the provision
@@ -181,7 +175,7 @@ fn provision_meta(name: &str, binding: &str, convoy: &str) -> InputMeta {
 }
 
 /// Reconciles one convoy's account bindings on the convoy's home.
-struct AccountBindingReconciler {
+pub(super) struct AccountBindingReconciler {
     daemon: Arc<InProcessDaemon>,
     namespace: String,
 }
@@ -220,7 +214,7 @@ impl Reconciler for AccountBindingReconciler {
 ///   withdrawn; a relaunch that recorded a new delivery first wins.
 /// - A place whose environment is gone: the record is removed; its copies went with it.
 /// - Otherwise a new material generation or epoch is pushed into the home (update mode push).
-struct AccountProvisionReconciler {
+pub(super) struct AccountProvisionReconciler {
     state: Arc<ControllerRuntimeState>,
     namespace: String,
 }
@@ -524,78 +518,27 @@ impl SecondaryWatch for BindingProvisionsWatch {
     }
 }
 
-/// Spawn the binding controller (keyed by convoy) and the provision controller (keyed by
-/// provision), each supervised like the resource controllers.
-pub(super) fn spawn_account_controllers(
-    state: Arc<ControllerRuntimeState>,
+/// The binding controller's parts: keyed by convoy, on the convoy's home.
+pub(super) fn binding_controller(
+    daemon: Arc<InProcessDaemon>,
     namespace: String,
-    resync_interval: Duration,
-    supervision: ControllerSupervision,
-    runtime_health: RuntimeHealth,
-) -> Vec<JoinHandle<()>> {
-    let bindings = {
-        let state = Arc::clone(&state);
-        let namespace = namespace.clone();
-        let supervision = supervision.clone();
-        let health = runtime_health.clone();
-        tokio::spawn(async move {
-            supervise_controller("AccountBinding", supervision, health.clone(), move || {
-                let backend = state.daemon.resource_backend();
-                let controller = ControllerLoop {
-                    primary: backend.clone().using::<Convoy>(&namespace),
-                    secondaries: vec![
-                        Box::new(LabelMappedWatch::<AccountBinding, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
-                        Box::new(CredentialConvoysWatch::<CredentialGrant> {
-                            credentials: |grant| grant.spec.credentials.iter().cloned().collect(),
-                        }),
-                        Box::new(CredentialConvoysWatch::<CredentialSpec> { credentials: |spec| vec![spec.metadata.name.clone()] }),
-                    ],
-                    reconciler: AccountBindingReconciler { daemon: Arc::clone(&state.daemon), namespace: namespace.clone() },
-                    resync_interval,
-                    backend,
-                };
-                run_observed(&state, "AccountBinding", controller, resync_interval, health.clone())
-            })
-            .await;
-        })
-    };
-    let provisions = tokio::spawn(async move {
-        let health = runtime_health.clone();
-        supervise_controller("AccountProvision", supervision, runtime_health, move || {
-            let backend = state.daemon.resource_backend();
-            let controller = ControllerLoop {
-                primary: backend.clone().using::<AccountProvision>(&namespace),
-                secondaries: vec![Box::new(BindingProvisionsWatch)],
-                reconciler: AccountProvisionReconciler { state: Arc::clone(&state), namespace: namespace.clone() },
-                resync_interval,
-                backend,
-            };
-            run_observed(&state, "AccountProvision", controller, resync_interval, health.clone())
-        })
-        .await;
-    });
-    vec![bindings, provisions]
+) -> (Vec<Box<dyn SecondaryWatch<Primary = Convoy>>>, AccountBindingReconciler) {
+    (
+        vec![
+            Box::new(LabelMappedWatch::<AccountBinding, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
+            Box::new(CredentialConvoysWatch::<CredentialGrant> { credentials: |grant| grant.spec.credentials.iter().cloned().collect() }),
+            Box::new(CredentialConvoysWatch::<CredentialSpec> { credentials: |spec| vec![spec.metadata.name.clone()] }),
+        ],
+        AccountBindingReconciler { daemon, namespace },
+    )
 }
 
-fn run_observed<R: Reconciler>(
-    state: &ControllerRuntimeState,
-    name: &'static str,
-    controller: ControllerLoop<R>,
-    resync_interval: Duration,
-    health: RuntimeHealth,
-) -> impl Future<Output = Result<(), ResourceError>>
-where
-    <R::Resource as flotilla_resources::Resource>::Status: Default,
-{
-    let heartbeat = Arc::new(AtomicU64::new(0));
-    let metrics = state.controller_metrics.for_kind(name);
-    async move {
-        let watchdog = spawn_controller_loop_watchdog(name, Arc::clone(&heartbeat), resync_interval, health.clone());
-        let result = controller.run_observed(heartbeat, metrics).await;
-        watchdog.abort();
-        health.clear_controller_loop_stall(name);
-        result
-    }
+/// The provision controller's parts: keyed by provision, at its place.
+pub(super) fn provision_controller(
+    state: Arc<ControllerRuntimeState>,
+    namespace: String,
+) -> (Vec<Box<dyn SecondaryWatch<Primary = AccountProvision>>>, AccountProvisionReconciler) {
+    (vec![Box::new(BindingProvisionsWatch)], AccountProvisionReconciler { state, namespace })
 }
 
 /// Reconcile every provision here, as the provision controller would; tests drive it directly.

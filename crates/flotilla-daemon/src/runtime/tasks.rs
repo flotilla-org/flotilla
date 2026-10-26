@@ -246,15 +246,32 @@ pub(super) fn spawn_resource_controller<T, F, Fut>(
     namespace: String,
     supervision: ControllerSupervision,
     runtime_health: RuntimeHealth,
-    mut make_run: F,
+    make_run: F,
 ) -> JoinHandle<()>
 where
     T: Resource,
     F: FnMut(ResourceBackend, String) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(), ResourceError>> + Send + 'static,
 {
+    spawn_named_controller(T::API_PATHS.kind, backend, namespace, supervision, runtime_health, make_run)
+}
+
+/// As [`spawn_resource_controller`], supervised under `name`: a second controller of one
+/// primary kind (the account bindings' over Convoy) keeps its own supervision and health.
+pub(super) fn spawn_named_controller<F, Fut>(
+    name: &'static str,
+    backend: ResourceBackend,
+    namespace: String,
+    supervision: ControllerSupervision,
+    runtime_health: RuntimeHealth,
+    mut make_run: F,
+) -> JoinHandle<()>
+where
+    F: FnMut(ResourceBackend, String) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), ResourceError>> + Send + 'static,
+{
     tokio::spawn(async move {
-        supervise_controller(T::API_PATHS.kind, supervision, runtime_health, move || make_run(backend.clone(), namespace.clone())).await;
+        supervise_controller(name, supervision, runtime_health, move || make_run(backend.clone(), namespace.clone())).await;
     })
 }
 

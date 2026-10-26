@@ -75,7 +75,7 @@ use self::tasks::{
     run_artifact_gc, run_checkout_archive_gc, spawn_adopted_checkout_reconciliation_task, spawn_aggregator_task,
     spawn_convoy_ensure_reconciler_task, spawn_demand_expiry_task, spawn_dispatch_reconciler_task, spawn_environment_orphan_sweep_task,
     spawn_event_expiry_task, spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task, spawn_liveness_watchdog_task,
-    spawn_local_fulfilment_probe_task, spawn_manifest_reconciler_task, spawn_periodic_task,
+    spawn_local_fulfilment_probe_task, spawn_manifest_reconciler_task, spawn_named_controller, spawn_periodic_task,
     spawn_provisioned_environment_reconciliation_task, spawn_resource_controller, spawn_sleep_inhibitor_task,
     spawn_ssh_fulfilment_probe_task, spawn_startup_restoration, spawn_vessel_placement_projector, supervise_controller,
     CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart, LIVENESS_WATCHDOG_INTERVAL, MANIFEST_RECONCILE_INTERVAL,
@@ -826,12 +826,16 @@ fn spawn_controller_loops(
     let namespace_string = namespace.to_string();
 
     macro_rules! controller {
-        ($primary:ty, $make_parts:expr) => {{
+        ($primary:ty, $make_parts:expr) => {
+            controller!($primary, <$primary>::API_PATHS.kind, $make_parts)
+        };
+        ($primary:ty, $name:expr, $make_parts:expr) => {{
             let make_parts = $make_parts;
             let write_lifecycle_reads = Arc::clone(&status_lifecycle_reads);
             let loop_health = runtime_health.clone();
             let loop_metrics = Arc::clone(&state.controller_metrics);
-            spawn_resource_controller::<$primary, _, _>(
+            spawn_named_controller(
+                $name,
                 backend.clone(),
                 namespace_string.clone(),
                 supervision.clone(),
@@ -850,17 +854,13 @@ fn spawn_controller_loops(
                     };
                     let heartbeat = Arc::new(AtomicU64::new(0));
                     let health = loop_health.clone();
-                    let metrics = loop_metrics.for_kind(<$primary>::API_PATHS.kind);
+                    let metrics = loop_metrics.for_kind($name);
                     async move {
-                        let watchdog = spawn_controller_loop_watchdog(
-                            <$primary>::API_PATHS.kind,
-                            Arc::clone(&heartbeat),
-                            controller_resync_interval,
-                            health.clone(),
-                        );
+                        let watchdog =
+                            spawn_controller_loop_watchdog($name, Arc::clone(&heartbeat), controller_resync_interval, health.clone());
                         let result = controller.run_observed(heartbeat, metrics).await;
                         watchdog.abort();
-                        health.clear_controller_loop_stall(<$primary>::API_PATHS.kind);
+                        health.clear_controller_loop_stall($name);
                         result
                     }
                 },
@@ -1156,13 +1156,14 @@ fn spawn_controller_loops(
         });
     }
     // #3907, #3929: bindings per convoy on its home, provisions per place.
-    controllers.extend(account_access::spawn_account_controllers(
-        Arc::clone(&state),
-        namespace_string.clone(),
-        controller_resync_interval,
-        supervision.clone(),
-        runtime_health.clone(),
-    ));
+    controllers.push(controller!(Convoy, "AccountBinding", {
+        let daemon = Arc::clone(&state.daemon);
+        move |_backend: ResourceBackend, namespace: String| account_access::binding_controller(Arc::clone(&daemon), namespace)
+    }));
+    controllers.push(controller!(flotilla_resources::AccountProvision, {
+        let state = Arc::clone(&state);
+        move |_backend: ResourceBackend, namespace: String| account_access::provision_controller(Arc::clone(&state), namespace)
+    }));
     controllers
 }
 
