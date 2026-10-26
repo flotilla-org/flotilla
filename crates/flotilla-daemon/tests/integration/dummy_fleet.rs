@@ -596,45 +596,50 @@ impl DummyDaemon {
 
 // Behaviour (#3938): an operator sends as the operator role of the convoy's
 // project. On the engine path a CLI message to a stalled crew and the
-// operator's ruling are both admitted and delivered to the crew's session as
-// engine Messages from that role, and the resumed engine Convoy delivers.
+// operator's ruling are each admitted and delivered to the crew's session as
+// an engine Message from that role, and the resumed engine Convoys deliver.
+// Each goes to its own stalled crew: whichever turn reaches a stalled crew
+// first resumes it, and a later one may find its session already ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn on_the_engine_an_operators_message_and_ruling_reach_the_crew_from_the_projects_operator() {
     use flotilla_state_machines::machines::convoy::ConvoyState;
 
     let fleet = DummyDaemon::start_on_primitives(&format!("{SCENARIO_AGENT}stall_rate = 1.0\n"), "").await;
-    fleet.dispatch("engine-stalled", CrewMix::Coder).await;
-    fleet.wait_for("engine-stalled", "stall accounting", |_| fleet.fleet.snapshot().crews_stalled > 0).await;
-    let convoy = fleet.wait_for_stall("engine-stalled").await;
     let primitives = fleet.daemon.message_primitives().expect("engine path");
-    let engine = primitives.convoys().get(&convoy.metadata.name).expect("admitted engine Convoy");
-    assert!(matches!(engine.state(), ConvoyState::Open { .. }), "the stalled convoy remains open: {engine:?}");
-    let note = CommandAction::ConvoyResume {
-        namespace: Some(NAMESPACE.into()),
-        name: convoy.metadata.name.clone(),
-        prompt: "Operator note: the API is stable now.".into(),
-        vessel: None,
-        role: None,
-        reopen: false,
-    };
-    let noted = fleet.execute_as_operator(note).await;
-    assert!(!matches!(noted, CommandValue::Error { .. }), "{noted:?}");
-    let resumed = fleet.execute_as_operator(supervise(&convoy, CrewSupervisionAction::Resume)).await;
-    assert_eq!(resumed, CommandValue::Ok);
-    fleet.wait_for_phase("engine-stalled", ConvoyPhase::Landed).await;
-    fleet.assert_engine_delivered(&convoy.metadata.name);
-    let operator = format!("project:{NAMESPACE}/role:operator");
-    let coder = format!("project:{NAMESPACE}/convoy:{}/role:coder", convoy.metadata.name);
-    let from_operator: Vec<_> = primitives
-        .messages()
-        .expect("engine messages")
-        .into_iter()
-        .filter(|(_, message)| message.spec().sender.as_str() == operator && message.spec().inbox.as_str() == coder)
-        .collect();
-    assert_eq!(from_operator.len(), 2, "the note and the ruling: {from_operator:?}");
-    for (_, message) in &from_operator {
-        let receiver = message.state().receiver().unwrap_or_else(|| panic!("delivered: {message:?}"));
-        assert!(primitives.sessions().get(&receiver.id).is_some(), "received by the crew's session: {message:?}");
+    for (role, noted) in [("engine-noted", true), ("engine-ruled", false)] {
+        fleet.dispatch(role, CrewMix::Coder).await;
+        let convoy = fleet.wait_for_stall(role).await;
+        let engine = primitives.convoys().get(&convoy.metadata.name).expect("admitted engine Convoy");
+        assert!(matches!(engine.state(), ConvoyState::Open { .. }), "the stalled convoy remains open: {engine:?}");
+        let sent = if noted {
+            fleet
+                .execute_as_operator(CommandAction::ConvoyResume {
+                    namespace: Some(NAMESPACE.into()),
+                    name: convoy.metadata.name.clone(),
+                    prompt: "Operator note: the API is stable now.".into(),
+                    vessel: None,
+                    role: None,
+                    reopen: false,
+                })
+                .await
+        } else {
+            fleet.execute_as_operator(supervise(&convoy, CrewSupervisionAction::Resume)).await
+        };
+        assert!(!matches!(sent, CommandValue::Error { .. }), "{role}: {sent:?}");
+        fleet.wait_for_phase(role, ConvoyPhase::Landed).await;
+        fleet.assert_engine_delivered(&convoy.metadata.name);
+        let operator = format!("project:{NAMESPACE}/role:operator");
+        let coder = format!("project:{NAMESPACE}/convoy:{}/role:coder", convoy.metadata.name);
+        let from_operator: Vec<_> = primitives
+            .messages()
+            .expect("engine messages")
+            .into_iter()
+            .filter(|(_, message)| message.spec().sender.as_str() == operator && message.spec().inbox.as_str() == coder)
+            .collect();
+        assert_eq!(from_operator.len(), 1, "{role}: {from_operator:?}");
+        let (_, message) = &from_operator[0];
+        let receiver = message.state().receiver().unwrap_or_else(|| panic!("{role} delivered: {message:?}"));
+        assert!(primitives.sessions().get(&receiver.id).is_some(), "{role} received by the crew's session: {message:?}");
     }
 }
 
