@@ -2043,6 +2043,7 @@ fn environment_provider_labels(policy: &ResourceObject<PlacementPolicy>) -> BTre
 }
 
 /// Metadata for a child actuated by a Vessel, retaining its placement authority and ownership.
+#[doc(hidden)]
 pub fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {
     extra_labels.insert(VESSEL_REF_LABEL.to_string(), workspace.metadata.name.clone());
     InputMeta::builder()

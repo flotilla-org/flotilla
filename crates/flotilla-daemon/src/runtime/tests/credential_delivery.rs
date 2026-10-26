@@ -570,6 +570,10 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
                     .name("work".into())
                     .crew(vec![CrewSpec::builder()
                         .role("coder".into())
+                        .labels(BTreeMap::from([(
+                            flotilla_resources::account_access::CREW_HOME_KEY_LABEL.into(),
+                            "authored/elsewhere".into(),
+                        )]))
                         .source(CrewSource::Agent {
                             selector: Selector { capability: "code".into(), adapter: Some("claude-code".into()), model: None },
                             prompt: None,
@@ -657,11 +661,18 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
         .get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL)
         .expect("admission records the bound home key")
         .clone();
+    assert_ne!(admitted_home_key, "authored/elsewhere", "admission replaces authored home selection with its authority-owned key");
     let mut old_binding = InputMeta::from(&binding.metadata);
     old_binding.labels.remove(flotilla_resources::account_access::CREW_HOME_KEY_LABEL);
     bindings.update(&old_binding, &binding.metadata.resource_version, &binding.spec).await.expect("old binding metadata");
     let mut convoy = convoys.get(&name).await.expect("convoy snapshot");
     let mut status = convoy.status.take().expect("admitted status");
+    let admitted_crew = &status.workflow_snapshot.as_ref().expect("frozen workflow").vessels[0].crew[0];
+    assert_eq!(
+        admitted_crew.labels.get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL),
+        Some(&admitted_home_key),
+        "the frozen crew receives the binding authority's key instead of the authored key"
+    );
     for crew in status.workflow_snapshot.as_mut().expect("frozen workflow").vessels.iter_mut().flat_map(|vessel| &mut vessel.crew) {
         crew.labels.remove(flotilla_resources::account_access::CREW_HOME_KEY_LABEL);
     }
@@ -844,6 +855,16 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
         .expect("recorded account provision");
     // The provision keeps its existing absolute-directory contract for refresh and withdrawal.
     assert_eq!(provision.spec.home, launch_home, "the provision records the delivered launch directory");
+    // Launch may keep a delivered bound home, but lexical traversal is never a bound home.
+    let mut escaping_delivery = bound_environment.clone();
+    escaping_delivery.retain(|(key, _)| key != "CLAUDE_CONFIG_DIR");
+    let base = runner.writable_config_base(None, Path::new("/unused")).await.expect("target base");
+    escaping_delivery.push(("CLAUDE_CONFIG_DIR".into(), base.join("agent-homes/requesters/../../escape").display().to_string()));
+    let error = agent_material
+        .crew_environment("coder", &spec.required_agent_adapters, &escaping_delivery, &*runner)
+        .await
+        .expect_err("escaping delivered home refuses without a supplied key");
+    assert!(error.starts_with(REQUESTER_HOME_UNAVAILABLE), "{error}");
     // Missing or invalid caller-supplied homes refuse before another backing is created.
     for key in [None, Some(""), Some("../escape"), Some("/escape")] {
         let mut missing_home = spec.clone();

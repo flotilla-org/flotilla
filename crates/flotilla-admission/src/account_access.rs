@@ -416,8 +416,11 @@ pub fn binding_meta(name: &str, spec: &AccountBindingSpec) -> InputMeta {
         labels.insert(flotilla_resources::CONVOY_LABEL.to_string(), convoy);
     }
     if let Some(provisioner) = flotilla_agent::account_access::AccountProvisioners::seeded().for_access(&spec.requirement) {
-        if let Ok(key) = provisioner.home_key(spec) {
-            labels.insert(flotilla_resources::account_access::CREW_HOME_KEY_LABEL.into(), key);
+        match provisioner.home_key(spec) {
+            Ok(key) => {
+                labels.insert(flotilla_resources::account_access::CREW_HOME_KEY_LABEL.into(), key);
+            }
+            Err(error) => tracing::warn!(binding = name, %error, "account authority could not assign requester home"),
         }
     }
     InputMeta::builder().name(name.to_string()).labels(labels).build()

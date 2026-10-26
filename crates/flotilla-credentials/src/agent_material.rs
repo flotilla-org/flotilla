@@ -301,10 +301,13 @@ impl AgentMaterialRegistry {
                 // deliver into, so launch and staging use one directory.
                 if adapter.requester_bound() {
                     let Some(key) = homes.get(role) else {
-                        if environment
-                            .iter()
-                            .any(|(name, home)| name == variable && Path::new(home).starts_with(config_base.join("agent-homes/requesters")))
-                        {
+                        if environment.iter().any(|(name, home)| {
+                            name == variable
+                                && Path::new(home).starts_with(config_base.join("agent-homes/requesters"))
+                                && Path::new(home)
+                                    .components()
+                                    .all(|part| matches!(part, std::path::Component::RootDir | std::path::Component::Normal(_)))
+                        }) {
                             continue;
                         }
                         return Err(format!("{REQUESTER_HOME_UNAVAILABLE} crew `{role}` has no supplied home key"));
@@ -324,7 +327,15 @@ impl AgentMaterialRegistry {
                 }
                 let Some(destination) = adapter.skill_destination(environment, &config_base)? else { continue };
                 let base = destination.parent().expect("skill directory has a parent");
-                let Some(key) = homes.get(role) else { continue };
+                let Some(key) = homes.get(role) else {
+                    // A role-keyed skill selection requires private destinations, even for Codex.
+                    if decode_crew_skills(environment)?.is_some() {
+                        return Err(format!("{REQUESTER_HOME_UNAVAILABLE} crew `{role}` has no supplied home key"));
+                    }
+                    // Legacy/non-managed callers keep their explicit adapter home. Only
+                    // relocation is skipped; stage_skills still stages into that home.
+                    continue;
+                };
                 let home = join_crew_home(&config_base, key)?;
                 // Static config seeds scratch once: later base edits intentionally do
                 // not overwrite crew-owned config or state. Auth follows atomic
@@ -3199,6 +3210,81 @@ esac
 
     // #2875: a standing governor's frozen selection survives a reboot into a
     // newer generation, retaining its revision and narrowed source credential.
+    // Fake host process boundary; home selection stays in the production registry.
+    #[derive(Default)]
+    struct HostHomeRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for HostHomeRunner {
+        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            self.calls.lock().expect("calls").push(std::iter::once(cmd).chain(args.iter().copied()).map(str::to_string).collect());
+            Ok(String::new())
+        }
+
+        async fn run_output(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            Err(format!("unexpected host command {cmd}"))
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+
+        async fn writable_config_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
+            Ok(PathBuf::from("/host/state/flotilla"))
+        }
+    }
+
+    // #3655: credential source homes remain host-owned for delivered, personal,
+    // escaping and absent inputs. The caller supplies the crew destination;
+    // only Codex adopts ambient login, from the safely selected source home.
+    #[tokio::test]
+    async fn host_harness_homes_are_flotilla_owned_under_the_runner_base() {
+        let registry = test_registry(Arc::new(TestEnvVars::new([("HOME", "/controller-home")])));
+        for (adapter, variable, harness) in
+            [(CLAUDE_CODE_ADAPTER_ID, "CLAUDE_CONFIG_DIR", "claude"), (CODEX_ADAPTER_ID, "CODEX_HOME", "codex")]
+        {
+            for delivered in [
+                Some("/host/state/flotilla/agent-homes/delivered"),
+                Some("/home/crew/personal"),
+                Some("/host/state/flotilla/../../escape"),
+                None,
+            ] {
+                let runner = HostHomeRunner::default();
+                let mut environment =
+                    vec![(CREW_HOME_KEYS_ENV.into(), serde_json::json!({"coder":"agent-homes/requesters/supplied/crew"}).to_string())];
+                environment.extend(delivered.map(|home| (variable.into(), home.into())));
+                let prepared = registry
+                    .host_harness_environment("host-direct-b3", "coder", &BTreeSet::from([adapter.into()]), &environment, &runner)
+                    .await
+                    .expect("host home selection");
+                let base = Path::new("/host/state/flotilla");
+                let selected = prepared.iter().find(|(name, _)| name == variable).expect("selected home");
+                assert_eq!(Path::new(&selected.1), base.join("agent-homes/requesters/supplied/crew"), "the supplied crew destination wins");
+                let source = match delivered {
+                    Some("/host/state/flotilla/agent-homes/delivered") => base.join("agent-homes/delivered"),
+                    _ => base.join("agent-homes/host-direct-b3").join(harness),
+                }
+                .display()
+                .to_string();
+                let calls = runner.calls.lock().expect("calls");
+                assert!(calls.iter().any(|call| call == &["mkdir", "-p", &source]), "safe credential home created: {calls:?}");
+                assert!(calls.iter().any(|call| call == &["chmod", "700", &source]), "credential home owner-only: {calls:?}");
+                let adoptions =
+                    calls.iter().filter(|call| call.get(3).map(String::as_str) == Some("flotilla-codex-ambient-login")).collect::<Vec<_>>();
+                if adapter == CODEX_ADAPTER_ID {
+                    assert!(
+                        matches!(adoptions.as_slice(), [call] if call[4] == source),
+                        "ambient login uses the safe source home: {adoptions:?}"
+                    );
+                } else {
+                    assert!(adoptions.is_empty(), "Claude never adopts ambient login");
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn governor_frozen_skills_resolve_after_generation_restart() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3291,6 +3377,13 @@ esac
                     .expect("caller homes"),
                 ),
             ];
+            // Missing private destinations must refuse, never merge role selections in the base home.
+            let missing_homes = environment.iter().filter(|(name, _)| name != CREW_HOME_KEYS_ENV).cloned().collect::<Vec<_>>();
+            let error = registry
+                .stage_skills("shared", &BTreeSet::from([adapter.into()]), &missing_homes, &BTreeMap::new(), &runner)
+                .await
+                .expect_err("managed crew staging requires caller homes");
+            assert!(error.starts_with(REQUESTER_HOME_UNAVAILABLE), "{error}");
             registry
                 .stage_skills(
                     "shared",
