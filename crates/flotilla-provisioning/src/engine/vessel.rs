@@ -1,5 +1,5 @@
 //! Vessel's binding: the old Vessel reconciler's patches as the placement lease's lifecycle
-//! (#3629 layer 7, owner's ruling Q6).
+//! on its pinned host.
 //!
 //! Until a capacity model is ruled, a vessel's lease is the host pinned at convoy admission,
 //! recorded as granted: the engine judges no capacity, class or priority. [`PlacementLifecycles`]
@@ -14,13 +14,12 @@
 //! | `MarkProvisioning`, first, with its pinned host | Request and Place: the lease is granted, Requested |
 //! | `MarkReady`, first | Realise, under the environment it runs in |
 //! | `MarkLost` / `MarkFailed`, once realised | Vanish: Gone |
-//! | `MarkLost` / `MarkFailed`, before it was realised | Release: Gone, the lease returned |
+//! | `MarkLost` / `MarkFailed`, before it was realised | Attempted then GiveUp: the cause is retained, the lease returned |
 //! | a later `MarkReady` (recovered, recreated), `MarkInterrupted` | none: the lease holds |
 //! | images, observations, credentials, recreation | none |
 //!
-//! A vessel takes no attempts and never gives up (Q3). A Lost or Failed vessel is never
-//! provisioned again under its name, and nothing replaces it today (#2872): the convoy's "may
-//! this seat be replaced?" check (Q7, #3587) belongs where a replacement vessel is requested.
+//! A vessel that fails before readiness gives up with its cause. An ended vessel is never
+//! provisioned again under its name; a replacement is a separate request.
 
 use std::{
     collections::BTreeMap,
@@ -32,17 +31,17 @@ use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyId, Priority, VesselClass},
-        lifecycle::{Lifecycle, LifecycleEdge, LifecycleRefusal, LifecycleState, Realise, Release, Vanish},
+        lifecycle::{Attempted, Lifecycle, LifecycleEdge, LifecycleState, Realise, Release, Vanish},
         vessel::{live_leases, Vessel, VesselKind, VesselSpec},
     },
     placement::{Host, LedgerError, PlacementError, Placements, Units, VesselId},
-    Home, Log, Ref, Resource,
+    Cause, CauseCategory, Home, Log, Outcome, Ref, Resource,
 };
 
 use super::{evidence, Binding, EngineError, Lifecycles, Step};
 
 /// The one class every pinned lease takes: the engine judges no class until a capacity model is
-/// ruled (Q6).
+/// available.
 pub const PINNED_CLASS: &str = "pinned";
 
 pub struct VesselBinding;
@@ -88,10 +87,13 @@ impl Binding for VesselBinding {
                 vec![Step::Realised { identity: environment_ref.clone().unwrap_or_else(|| obj.metadata.name.clone()) }]
             }
             VesselStatusPatch::MarkReady { .. } => vec![],
-            // A vessel that breaks after its lease ends Gone (Q3): observed absent once realised,
-            // its lease returned before.
+            // An observed backing can vanish; a failed provisioning attempt retains its cause.
             VesselStatusPatch::MarkLost { .. } | VesselStatusPatch::MarkFailed { .. } if realised(obj) => vec![Step::Vanished],
-            VesselStatusPatch::MarkLost { .. } | VesselStatusPatch::MarkFailed { .. } => vec![Step::Released],
+            VesselStatusPatch::MarkLost { message } | VesselStatusPatch::MarkFailed { message } => {
+                // Both reports come from outside the machine. Before realisation the same inputs
+                // cannot recover by retrying, so the failure spends the request immediately.
+                vec![Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, message), retryable: false })]
+            }
             // Interrupted roles, provisioning progress, images, observations and credentials are
             // no edge of the lease.
             VesselStatusPatch::MarkProvisioning { .. }
@@ -142,7 +144,7 @@ pub struct PlacementLifecycles<L: Log<Vessel>> {
 impl<L: Log<Vessel>> PlacementLifecycles<L> {
     /// The placements of `home`, named `name`, with the leases of its live vessels put back on
     /// their pinned hosts. Each host holds exactly the shapes leased on it, so every live lease
-    /// fits again: the engine judges no capacity (Q6), whatever shape a lease was granted with.
+    /// fits again: the engine judges no capacity, whatever shape a lease was granted with.
     pub fn new(name: impl Into<String>, home: Home<Vessel, L>) -> Result<Self, String> {
         let mut hosts: BTreeMap<Host, Units> = BTreeMap::new();
         for (_, lease) in live_leases(home.resources()) {
@@ -169,7 +171,6 @@ impl From<PlacementError> for EngineError {
     fn from(error: PlacementError) -> Self {
         match error {
             PlacementError::Write(error) => error.into(),
-            PlacementError::NotAVesselEdge => EngineError::Refused(LifecycleRefusal::WrongState),
             PlacementError::Ledger(LedgerError::UnknownVessel(_)) => EngineError::Unknown,
             PlacementError::Ledger(error) => EngineError::Failed(format!("placement: {error:?}")),
         }
@@ -193,7 +194,7 @@ where
         let lease = spec.lease();
         self.with_placements(|placements| {
             // The ledger admits the pinned lease: its host joins with no dimensions, and its convoy
-            // is uncapped for the pinned class (Q6).
+            // is uncapped for the pinned class.
             match placements.add_host(lease.host.clone(), Units::new()) {
                 Ok(()) | Err(PlacementError::Ledger(LedgerError::DuplicateHost(_))) => {}
                 Err(error) => return Err(error.into()),
@@ -215,10 +216,25 @@ where
             Step::Realised { identity } => Realise { identity: identity.clone(), observed: Ref::new(name) }.into(),
             Step::Released => Release { teardown: Ref::new(name) }.into(),
             Step::Vanished => Vanish { observed: Ref::new(name) }.into(),
-            // A vessel takes no attempts (Q3).
-            Step::Attempted(_) => return Err(PlacementError::NotAVesselEdge.into()),
+            Step::Attempted(outcome) => Attempted { outcome: outcome.clone() }.into(),
         };
         let world = evidence(name, step);
-        self.with_placements(|placements| Ok(placements.apply(&VesselId::new(name), edge, &world, at)?.clone()))
+        self.with_placements(|placements| {
+            let id = VesselId::new(name);
+            if let Step::Attempted(outcome) = step {
+                super::apply_attempt::<VesselKind, _, _>(
+                    placements,
+                    outcome,
+                    |placements| placements.get(&id).map(|resource| resource.state().clone()),
+                    |placements, edge| placements.apply(&id, edge, &world, at).map(|_| ()),
+                )?;
+            } else {
+                placements.apply(&id, edge, &world, at)?;
+            }
+            placements
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| EngineError::Failed(format!("vessel `{name}` is missing after applying its lifecycle step")))
+        })
     }
 }

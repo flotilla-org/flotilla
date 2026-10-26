@@ -22,7 +22,7 @@
 //!
 //! State mapping: Waiting is the request before any grant; Leased is the stored vessel's lease
 //! (its spec, the spec's `Placement = {request, host}`), which must equal the ledger's, with the
-//! lifecycle state (no attempts: a vessel has none); Gone is the stored lease of a Gone vessel,
+//! lifecycle state (the current graph probes no attempt events); Gone is the stored lease of a Gone vessel,
 //! which the ledger no longer holds.
 
 use std::marker::PhantomData;
@@ -107,12 +107,11 @@ fn refusal_name(r: flotilla_state_machines::placement::PlacementRefusal) -> &'st
     }
 }
 
-/// The lifecycle state in the spec's `lifecycle` shape: a vessel takes no attempts, so Requested's
-/// history is empty.
+/// The lifecycle state in the current vessel graph, whose event domain has no attempt probes.
 fn lifecycle_value(state: &LifecycleState) -> Value {
     match state {
         LifecycleState::Requested { failures, .. } => {
-            assert_eq!(*failures, 0, "a vessel takes no attempts");
+            assert_eq!(*failures, 0, "the vessel graph has no attempt probes");
             variant("Requested", Value::Array(vec![]))
         }
         LifecycleState::Realised { identity } => variant("Realised", Value::from(identity.as_str())),
