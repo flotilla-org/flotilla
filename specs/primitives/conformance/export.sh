@@ -16,7 +16,7 @@ for machine in ${MACHINES:-lifecycle agent_session convoy message ensure vessel 
   module="${machine}_conformance"
   invariant=()
   if [ "$machine" = convoy ]; then invariant=(--invariant quotaRefinesPlacement); fi
-  quint compile "${server[@]}" "$machine.qnt" --target tlaplus "${invariant[@]}" > "$out/$machine.compile.log"
+  quint compile ${server[@]+"${server[@]}"} "$machine.qnt" --target tlaplus ${invariant[@]+"${invariant[@]}"} > "$out/$machine.compile.log"
   awk '/^-+ MODULE/{found=1} found' "$out/$machine.compile.log" > "$out/$module.tla"
   printf 'INIT q_init\nNEXT q_step\n' > "$out/$module.cfg"
   if [ "$machine" = convoy ]; then printf 'INVARIANT q_inv\n' >> "$out/$module.cfg"; fi

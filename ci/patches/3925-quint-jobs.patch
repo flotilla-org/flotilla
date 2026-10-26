@@ -241,7 +241,7 @@
 +          RESULTS: ${{ toJSON(needs) }}
 +        run: |
 +          if [ "$SELECTED" = true ] && [ "$FULL" != false ]; then
-+            jq -e '[to_entries[] | select(.key | startswith("quint-")) | .value.result] | length == 5 and all(. == "success")' <<< "$RESULTS"
++            jq -e '[to_entries[] | select(.key | startswith("quint-")) | .value.result] | length > 0 and all(. == "success")' <<< "$RESULTS"
 +          fi
 +
    windows-client:

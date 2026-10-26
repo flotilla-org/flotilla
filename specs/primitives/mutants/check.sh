@@ -26,7 +26,7 @@ for mutant in activity_unchanged expiry_without_watermark release_only_realised 
   mkdir -p "$destination"
   cp -R machines world scenarios "$destination/"
   patch -s -d "$destination" -p1 < "mutants/$mutant.patch"
-  quint compile "${server[@]}" "$destination/scenarios/$scenario.qnt" --target tlaplus --invariant safety > "$destination/compile.log"
+  quint compile ${server[@]+"${server[@]}"} "$destination/scenarios/$scenario.qnt" --target tlaplus --invariant safety > "$destination/compile.log"
   awk '/^-+ MODULE/{found=1} found' "$destination/compile.log" > "$destination/$scenario.tla"
   printf 'INIT q_init\nNEXT q_step\nINVARIANT q_inv\nVIEW view\n' > "$destination/$scenario.cfg"
   if java -Xmx2g -Xss512k -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers "${TLC_WORKERS:-4}" \
