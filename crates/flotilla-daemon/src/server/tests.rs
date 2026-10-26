@@ -37,8 +37,8 @@ use flotilla_resources::{
     FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
     HostStatus, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, ResourceError,
     ResourceList, ResourceProvenance, Selector, StatusPatch, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart,
-    WorkflowTemplate,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTarget, Vessel,
+    WatchEvent, WatchStart, WorkflowTemplate,
 };
 use flotilla_store::{controller::ControllerLoop, list_resource_kind, ResourceBackend};
 use flotilla_test_support::TestSocketDir;
@@ -2623,7 +2623,7 @@ impl flotilla_crew::reconcilers::terminal_session::TerminalRuntime for RunningTe
     async fn ensure_session(
         &self,
         name: &str,
-        _spec: &flotilla_resources::TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<flotilla_crew::reconcilers::terminal_session::TerminalRuntimeState, String> {
         Ok(flotilla_crew::reconcilers::terminal_session::TerminalRuntimeState::builder()
@@ -2634,7 +2634,7 @@ impl flotilla_crew::reconcilers::terminal_session::TerminalRuntime for RunningTe
             .build())
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }

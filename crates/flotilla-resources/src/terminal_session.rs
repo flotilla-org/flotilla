@@ -114,6 +114,44 @@ pub fn terminal_session_attach_target_with_stale_status(
     Ok(TerminalSessionAttachTarget { session_id, launch_command })
 }
 
+/// Borrowed runtime input, retaining the vessel identity from session metadata.
+/// This view is never serialized; the stored session spec is unchanged.
+#[derive(Clone, Copy)]
+pub struct TerminalSessionTarget<'a> {
+    pub spec: &'a TerminalSessionSpec,
+    pub vessel_ref: Option<&'a str>,
+}
+
+/// Spec-only conversion preserves agent context; tool sessions need the
+/// ResourceObject conversion to read their vessel label.
+impl<'a> From<&'a TerminalSessionSpec> for TerminalSessionTarget<'a> {
+    fn from(spec: &'a TerminalSessionSpec) -> Self {
+        let vessel_ref = match &spec.source {
+            TerminalSessionSource::Agent { context, .. } => Some(context.vessel_ref.as_str()),
+            TerminalSessionSource::Tool { .. } => None,
+        };
+        Self { spec, vessel_ref: vessel_ref.filter(|value| !value.is_empty()) }
+    }
+}
+
+impl<'a> From<&'a ResourceObject<TerminalSession>> for TerminalSessionTarget<'a> {
+    fn from(session: &'a ResourceObject<TerminalSession>) -> Self {
+        let mut target = Self::from(&session.spec);
+        if matches!(session.spec.source, TerminalSessionSource::Tool { .. }) {
+            target.vessel_ref = session.metadata.labels.get(VESSEL_REF_LABEL).map(String::as_str).filter(|value| !value.is_empty());
+        }
+        target
+    }
+}
+
+impl std::ops::Deref for TerminalSessionTarget<'_> {
+    type Target = TerminalSessionSpec;
+
+    fn deref(&self) -> &Self::Target {
+        self.spec
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct TerminalSessionSpec {
     pub env_ref: String,

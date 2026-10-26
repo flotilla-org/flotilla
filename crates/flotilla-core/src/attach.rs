@@ -676,7 +676,7 @@ impl<'a> AttachResolver<'a> {
             // as a Docker vessel's does; the owning daemon resolves it.
             if let Some(access) = &self.agentless_vessels {
                 let target = terminal_session_attach_target_with_stale_status(session)?;
-                if let Some(attach) = access.attach(&session.spec, target.session_id, seat).await {
+                if let Some(attach) = access.attach(session.into(), target.session_id, seat).await {
                     let (socket, name) = attach?;
                     return Ok((cleat_socket_attach_plan(&socket, &name, seat), self.host_name.clone()));
                 }

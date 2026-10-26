@@ -94,8 +94,8 @@ use flotilla_resources::{
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec,
     CrewCompletionPending, Forge, ForgeKind, InputMeta, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope,
     LifecycleAuthority, ManifestRoot, ObservedChangeRequestState, PlacementPolicy, Project, Repository, RepositoryIdentity, RepositoryKey,
-    RepositorySpec, ResourceError, ResourceObject, ResourceProvenance, SystemClock, TurnDeliveryRung, WatchEvent, WatchStart,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    RepositorySpec, ResourceError, ResourceObject, ResourceProvenance, SystemClock, TerminalSessionTarget, TurnDeliveryRung, WatchEvent,
+    WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{
@@ -829,12 +829,12 @@ pub trait OperatorReconciler: Send + Sync {
 #[async_trait]
 pub trait AgentlessVesselAccess: Send + Sync {
     /// The runner for commands and files in the session's vessel.
-    async fn runner(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Option<Result<Arc<dyn CommandRunner>, String>>;
+    async fn runner(&self, spec: TerminalSessionTarget<'_>) -> Option<Result<Arc<dyn CommandRunner>, String>>;
     /// Attach to the session's cleat through its vessel's agent: a local
     /// socket forwarded to the vessel's cleat, and the session's name there.
     async fn attach(
         &self,
-        spec: &flotilla_resources::TerminalSessionSpec,
+        spec: TerminalSessionTarget<'_>,
         session_id: &str,
         seat: AttachMode,
     ) -> Option<Result<(std::path::PathBuf, String), String>>;
@@ -1552,10 +1552,7 @@ impl InProcessDaemon {
     /// The runner for a session's files: its vessel's agent on an agentless
     /// host (#3792), otherwise its environment's runner. `None` when neither
     /// is known; an error when the vessel's agent cannot be reached.
-    pub async fn command_runner_for_session(
-        &self,
-        spec: &flotilla_resources::TerminalSessionSpec,
-    ) -> Option<Result<Arc<dyn CommandRunner>, String>> {
+    pub async fn command_runner_for_session(&self, spec: TerminalSessionTarget<'_>) -> Option<Result<Arc<dyn CommandRunner>, String>> {
         let access = self.agentless_vessels.read().expect("agentless vessels lock poisoned").clone();
         if let Some(runner) = match access {
             Some(access) => access.runner(spec).await,

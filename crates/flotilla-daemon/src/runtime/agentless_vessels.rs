@@ -34,7 +34,7 @@ use flotilla_environment::environment::{VesselAgent, CONTAINED_DAEMON_REQUIRED_E
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::EnvironmentId;
 use flotilla_provider_runtime::{host_environment::export_lines, ChannelLabel, CommandOutput, CommandProcess, CommandRunner};
-use flotilla_resources::{TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel};
+use flotilla_resources::{TerminalSession, TerminalSessionTarget, Vessel};
 use flotilla_store::ResourceBackend;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -782,18 +782,9 @@ pub(super) async fn live_vessels(backend: &ResourceBackend, namespace: &str, env
             .items
             .iter()
             .filter(|session| session.object.spec.env_ref == environment)
-            .filter_map(|session| session_vessel(&session.object.spec).map(str::to_string)),
+            .filter_map(|session| TerminalSessionTarget::from(&session.object).vessel_ref.map(str::to_string)),
     );
     Ok(live)
-}
-
-/// The vessel a session runs in, when its spec names one. Crew sessions do;
-/// a tool session has no vessel context.
-pub(super) fn session_vessel(spec: &TerminalSessionSpec) -> Option<&str> {
-    match &spec.source {
-        TerminalSessionSource::Agent { context, .. } => Some(context.vessel_ref.as_str()),
-        TerminalSessionSource::Tool { .. } => None,
-    }
 }
 
 /// Core's way into sessions on agentless hosts: their files and attach go
@@ -803,23 +794,25 @@ pub(super) struct VesselSessions {
 }
 
 impl VesselSessions {
-    async fn access(&self, spec: &TerminalSessionSpec) -> Option<Result<Arc<VesselAccess>, String>> {
+    async fn access(&self, spec: TerminalSessionTarget<'_>) -> Option<Result<Arc<VesselAccess>, String>> {
         let state = self.state.upgrade()?;
         let profile = state.agentless_ssh.get(&spec.env_ref)?;
-        let vessel = session_vessel(spec)?;
+        let Some(vessel) = spec.vessel_ref else {
+            return Some(Err(format!("agentless host {} requires a session vessel identity", spec.env_ref)));
+        };
         Some(state.vessel_access(profile, vessel).await)
     }
 }
 
 #[async_trait]
 impl flotilla_core::in_process::AgentlessVesselAccess for VesselSessions {
-    async fn runner(&self, spec: &TerminalSessionSpec) -> Option<Result<Arc<dyn CommandRunner>, String>> {
+    async fn runner(&self, spec: TerminalSessionTarget<'_>) -> Option<Result<Arc<dyn CommandRunner>, String>> {
         Some(self.access(spec).await?.map(|access| access.runner()))
     }
 
     async fn attach(
         &self,
-        spec: &TerminalSessionSpec,
+        spec: TerminalSessionTarget<'_>,
         session_id: &str,
         seat: flotilla_protocol::commands::AttachMode,
     ) -> Option<Result<(PathBuf, String), String>> {

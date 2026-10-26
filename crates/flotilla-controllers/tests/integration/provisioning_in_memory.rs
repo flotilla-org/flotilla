@@ -25,7 +25,7 @@ use flotilla_resources::{
     ClonePhase, CloneSpec, CloneStatus, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
     DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host,
     HostDirectEnvironmentSpec, HostSpec, HostStatus, Repository, RepositorySpec, ResourceError, ResourceObject, TerminalSession,
-    TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, VESSEL_REF_LABEL,
+    TerminalSessionPhase, TerminalSessionTarget, Vessel, VesselPhase, VesselRequirement, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{ControllerLoop, ReconcileOutcome, Reconciler},
@@ -204,7 +204,7 @@ impl TerminalRuntime for FakeTerminalRuntime {
     async fn ensure_session(
         &self,
         name: &str,
-        _spec: &flotilla_resources::TerminalSessionSpec,
+        _spec: TerminalSessionTarget<'_>,
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         Ok(TerminalRuntimeState {
@@ -223,7 +223,7 @@ impl TerminalRuntime for FakeTerminalRuntime {
         })
     }
 
-    async fn kill_session(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         Ok(())
     }
 }

@@ -382,7 +382,7 @@ async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool
     } else {
         Vec::new()
     };
-    let launched = TerminalControllerRuntime { state }.ensure_session("terminal-demo-work-coder", &spec, &tags).await;
+    let launched = TerminalControllerRuntime { state }.ensure_session("terminal-demo-work-coder", (&spec).into(), &tags).await;
     let ensured = pool.ensured.lock().await;
     if let Err(error) = launched {
         assert!(ensured.is_empty(), "a refused launch started a session");

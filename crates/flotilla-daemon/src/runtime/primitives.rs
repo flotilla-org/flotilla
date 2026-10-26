@@ -381,8 +381,8 @@ impl MessageDelivery {
         }
         self.supersede_held_system_turns(&due, held, &roles, &records).await?;
         let runtime = TerminalControllerRuntime { state: Arc::clone(&self.state) };
-        let pool = runtime.pool_for_spec(&holder.terminal.spec).await?;
-        let adapter = runtime.adapter_for_spec(&holder.terminal.spec).await?;
+        let pool = runtime.pool_for_spec((&holder.terminal).into()).await?;
+        let adapter = runtime.adapter_for_spec((&holder.terminal).into()).await?;
         let text = texts.join("\n\n");
         let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
         if deliveries.contains_key(&holder.session_id) {

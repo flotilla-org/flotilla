@@ -16,6 +16,7 @@ pub(super) struct RecordedVessel {
     /// `(guest, host)` daemon forwards.
     pub(super) forwards: Vec<(PathBuf, PathBuf)>,
     pub(super) tool_pushes: usize,
+    pub(super) attach_forwards: Vec<PathBuf>,
     pub(super) closed: bool,
 }
 
@@ -59,8 +60,9 @@ impl VesselAgent for RunnerVessel {
         self.record(|vessel| vessel.tool_pushes += 1);
         Ok(())
     }
-    async fn forward_socket(&self, _guest: &Path) -> Result<PathBuf, String> {
-        Err("the runner vessel serves no attach".into())
+    async fn forward_socket(&self, guest: &Path) -> Result<PathBuf, String> {
+        self.record(|vessel| vessel.attach_forwards.push(guest.into()));
+        Ok(self.agent.join("attach.sock"))
     }
 }
 
