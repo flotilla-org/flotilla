@@ -54,7 +54,7 @@ async fn cross_host_message_has_connected_trace_and_correlated_logs() {
         .with(flotilla_tracing::layer().with_tracer(provider.tracer("proof")))
         .with(flotilla_tracing::json_layer(move || output.clone()))
         .init();
-    message_homes::messages_are_homed_at_the_receiver_and_replies_route_by_subject().await;
+    message_homes::messages_are_homed_at_the_receiver_and_replies_route_by_subject(&[]).await;
     provider.force_flush().expect("flush");
     let spans = exporter.get_finished_spans().expect("spans");
     let identity = flotilla_resources::message_record_name("flotilla/crew-b/work/coder", "system:turn-rules", "rule:checks@1");

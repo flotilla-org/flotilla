@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::Utc;
 use flotilla_core::{in_process::InProcessDaemon, primitives::MessagePrimitives};
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{
     Convoy, ConvoySpec, CrewSessionStatus, FleetDesignation, FleetDesignationSpec, InputMeta, MessageExpectation, MessageReference,
@@ -128,10 +129,25 @@ fn convoy_ref(name: &str) -> MessageReference {
     }
 }
 
+// The tracing proof includes this fixture with no cancellation steps.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(super) enum DropAction {
+    Supersede,
+    Withdraw,
+    Expire,
+}
+
+pub(super) struct DropStep {
+    pub action: DropAction,
+    pub late_record: bool,
+    pub restart: bool,
+}
+
 // Behaviour (#3317): the receiver's home holds the message; the other home
 // reads it from its replica, or at its home on a miss, marked remote with its
 // age; a reply to a fleet role is routed by subject.
-pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject() {
+pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject(operations: &[DropStep]) {
     let topology = flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful(
         super::empty_daemon_named("home-a").await,
         super::empty_daemon_named("home-b").await,
@@ -263,4 +279,90 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     engine_b.world().update(|world| world.reply.put(&flotilla_state_machines::Ref::new(sent.name()), ()));
     inbox_b.settle(sent.name(), Settle { by: Settlement::Answered }).await.expect("answered");
     assert!(matches!(homed(&engine_b, &request).expect("sent").1.state(), MessageState::Settled { .. }));
+    use flotilla_core::primitives::sweep::OpenMessages;
+    use flotilla_state_machines::machines::{awaiting_reply::AwaitingReplyLabel, message::MessageRef};
+    let mut observer = OpenMessages::default();
+    for (step, DropStep { action, late_record, restart }) in operations.iter().enumerate() {
+        let name = flotilla_resources::message_record_name(&intent.receiver, &intent.sender, &format!("cancel-{step}"));
+        let mut cancel = intent.clone();
+        cancel.deadline = matches!(action, DropAction::Expire).then(|| Utc::now() - chrono::Duration::seconds(1));
+        // Exercise receiver admission through the router, then resume the sender's
+        // record write separately to model a delayed or retried send continuation.
+        let mut events = a.subscribe();
+        let command = flotilla_protocol::Command::builder()
+            .action(flotilla_protocol::CommandAction::ResourceApply {
+                namespace: NS.into(),
+                document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name}, "spec":cancel}),
+            })
+            .build();
+        let id = topology.client.execute(command).await.expect("routed cancellable admission");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let flotilla_protocol::DaemonEvent::CommandFinished { command_id, node_id, result, .. } =
+                    events.recv().await.expect("admission event")
+                {
+                    if command_id == id {
+                        assert_eq!(node_id, *b.node_id());
+                        break result;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("receiver admission finishes");
+        assert!(matches!(result, flotilla_protocol::CommandValue::ResourceObject(_)), "{result:?}");
+
+        let (_, message) = homed(&engine_b, &name).expect("receiver admitted");
+        let reference = MessageRef::new(message.name(), &home_b);
+        assert!(engine_a.awaiting().get(&reference).is_none(), "sender continuation has not written its record yet");
+        if !*late_record {
+            engine_a.await_reply(NS, &name, &cancel, &home_b, "reply", None).await.expect("sender record");
+        }
+        pump(&store_b, &home_b, &store_a, &mut b_to_a);
+        engine_a.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut observer).await.expect("live observation");
+        match action {
+            DropAction::Supersede => {
+                let next = format!("{name}-successor");
+                let mut successor = cancel.clone();
+                successor.expectation = MessageExpectation::None;
+                successor.supersedes = Some(name.clone());
+                a.publish_message(NS, &next, &successor).await.expect("routed supersession");
+            }
+            DropAction::Withdraw => engine_b.withdraw(NS, &name, "crew-b").await.expect("receiver withdrawal"),
+            DropAction::Expire => {
+                engine_b.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut OpenMessages::default()).await.expect("receiver expiry");
+            }
+        }
+        assert!(matches!(homed(&engine_b, &name).expect("receiver message").1.state(), MessageState::Dropped { .. }));
+        if !*late_record {
+            assert_eq!(
+                engine_a.awaiting().get(&reference).expect("sender record").label(),
+                AwaitingReplyLabel::Open,
+                "no remote write before replication"
+            );
+        }
+        pump(&store_b, &home_b, &store_a, &mut b_to_a);
+        // A cold observer must also consume a drop before the sender record exists.
+        if *restart {
+            observer = OpenMessages::default();
+        }
+        if *late_record {
+            engine_a.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut observer).await.expect("drop arrives before the record");
+            engine_a.await_reply(NS, &name, &cancel, &home_b, "reply", None).await.expect("late sender record");
+            assert_eq!(engine_a.awaiting().get(&reference).expect("late record").label(), AwaitingReplyLabel::Withdrawn);
+        }
+        if *restart {
+            observer = OpenMessages::default();
+        }
+        for _ in 0..2 {
+            engine_a.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut observer).await.expect("sender observes receiver drop");
+            assert_eq!(engine_a.awaiting().get(&reference).expect("sender record").label(), AwaitingReplyLabel::Withdrawn);
+            assert!(!engine_a.await_reply(NS, &name, &cancel, &home_b, "reply", None).await.expect("repeat send"));
+            assert_eq!(engine_a.awaiting().get(&reference).expect("repeated record").label(), AwaitingReplyLabel::Withdrawn);
+            assert_eq!(
+                engine_a.awaiting().get(&MessageRef::new(sent.name(), &home_b)).expect("answered record").label(),
+                AwaitingReplyLabel::Answered
+            );
+        }
+    }
 }

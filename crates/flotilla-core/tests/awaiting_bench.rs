@@ -66,7 +66,7 @@ fn awaiting_replies_at_the_ceiling() {
         assert!(records.record(spec(n), Timestamp(1)).expect("record"));
     }
     let per = started.elapsed().as_secs_f64() * 1e6 / total as f64;
-    println!("{:>34}: {per:>8.1} µs/event over {total} records", "record (one transaction)");
+    println!("{:>34}: {per:>8.1} µs/event over {total} records", "record (write + drop lookup)");
 
     let started = Instant::now();
     let mut stalled = 0;
