@@ -2476,9 +2476,13 @@ mod tests {
         let reconciler = VesselReconciler::new(ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()), "flotilla")
             .with_lifecycle_reads(fixture.reads.clone());
         fixture.request(&vessel);
-        // Live engine state proceeds to the missing-convoy failure instead of trusting old Lost.
-        let prepared = reconciler.prepare(&vessel).await.expect("prepared");
-        assert!(reconciler.reconcile(&vessel, &prepared, chrono::Utc::now()).patch.is_some());
+        // A Requested lease is provisioning even beside stale ready or interrupted status.
+        for old_phase in [VesselPhase::Lost, VesselPhase::Ready, VesselPhase::Interrupted] {
+            vessel.status.as_mut().expect("status").phase = old_phase;
+            let prepared = reconciler.prepare(&vessel).await.expect("prepared");
+            assert_eq!(prepared.phase, Some(VesselPhase::Provisioning));
+            assert!(reconciler.reconcile(&vessel, &prepared, chrono::Utc::now()).patch.is_some());
+        }
         fixture.finish(&vessel, Ending::Released);
         vessel.status.as_mut().expect("status").phase = VesselPhase::Ready;
         let prepared = reconciler.prepare(&vessel).await.expect("ended");

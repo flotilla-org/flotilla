@@ -1809,9 +1809,8 @@ impl CrewService {
             .filter(|checkout| expected.contains(&checkout.metadata.name))
             .filter(|checkout| !(reclaim_sanctioned && checkout.metadata.deletion_timestamp.is_some()))
         {
-            // Gone means the checkout authority's host confirmed that the
-            // worktree no longer exists. Teardown cannot lose local work in
-            // that path, whether the checkout was managed or adopted.
+            // Committed Gone endings include Failed after realisation. A failure before
+            // realisation is GaveUp and still follows the protection checks below.
             let gone = match self.lifecycle_reads.try_reading(
                 ProvisioningKind::Checkout,
                 &checkout.metadata.name,
