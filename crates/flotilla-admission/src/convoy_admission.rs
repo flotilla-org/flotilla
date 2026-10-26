@@ -4825,15 +4825,7 @@ pub async fn resolve_and_validate_workflow_credentials_for_capability_admission(
     workflow: &mut WorkflowTemplateSpec,
 ) -> Result<(), String> {
     resolve_workflow_credentials(backend, namespace, project_ref, repositories, workflow).await?;
-    validate_workflow_credentials_with_capabilities_for_admission(
-        backend,
-        namespace,
-        workflow,
-        placement,
-        &CapabilityTable::seeded(),
-        true,
-    )
-    .await?;
+    validate_workflow_credentials_for_admission(backend, namespace, workflow, placement, true).await?;
     crate::account_access::validate_account_access(backend, namespace, project_ref, repositories, workflow, placement).await.map(|_| ())
 }
 
@@ -4843,71 +4835,46 @@ pub async fn validate_workflow_credentials(
     workflow: &WorkflowTemplateSpec,
     placement: Option<&ResourceObject<PlacementPolicy>>,
 ) -> Result<(), String> {
-    validate_workflow_credentials_with_capabilities(backend, namespace, workflow, placement, &CapabilityTable::seeded()).await
+    validate_workflow_credentials_for_admission(backend, namespace, workflow, placement, false).await
 }
 
-pub async fn validate_workflow_credentials_with_capabilities(
+pub async fn validate_workflow_credentials_for_admission(
     backend: &ResourceBackend,
     namespace: &str,
     workflow: &WorkflowTemplateSpec,
     placement: Option<&ResourceObject<PlacementPolicy>>,
-    capabilities: &CapabilityTable,
-) -> Result<(), String> {
-    validate_workflow_credentials_with_capabilities_for_admission(backend, namespace, workflow, placement, capabilities, false).await
-}
-
-pub async fn validate_workflow_credentials_with_capabilities_for_admission(
-    backend: &ResourceBackend,
-    namespace: &str,
-    workflow: &WorkflowTemplateSpec,
-    placement: Option<&ResourceObject<PlacementPolicy>>,
-    capabilities: &CapabilityTable,
     allow_unready: bool,
 ) -> Result<(), String> {
     let required = workflow.vessels.iter().flat_map(|vessel| vessel.credential_refs.iter().cloned()).collect::<BTreeSet<_>>();
-    let ambient_dependent_vessels =
-        ambient_credential_dependent_vessels(capabilities, workflow, placement.is_some_and(|policy| policy.spec.host_direct.is_some()))?;
-    if required.is_empty() && ambient_dependent_vessels.is_empty() {
-        return Ok(());
-    }
+    let Some(first) = required.first() else { return Ok(()) };
     let Some(placement) = placement else {
-        if let Some(first) = required.first() {
-            return Err(format!("workflow requires credential `{first}`, but no placement is available"));
-        }
-        // Ambient-dependent vessels without a placement have no target host to
-        // check expiry against; admission proceeds as before.
-        return Ok(());
+        return Err(format!("workflow requires credential `{first}`, but no placement is available"));
     };
     let target_host = placement_target_host(backend, namespace, placement).await?;
     let host = authoritative_placement_host(backend, namespace, &target_host, &placement.metadata.name).await?;
     let host_label = target_host.display_name;
     let generation = host_generation(host.status.as_ref()).to_string();
     let Some(mut status) = host.status else {
-        if required.is_empty() {
-            return Ok(());
-        }
         return Err(format!(
             "placement `{}` host `{host_label}` generation `{generation}` has no observed status",
             placement.metadata.name
         ));
     };
     status.apply_heartbeat_readiness(Utc::now());
-    if !required.is_empty() {
-        if !status.ready && !allow_unready {
-            return Err(placement_host_not_ready_reason(&placement.metadata.name, &host_label, &generation, &status));
-        }
-        let held = status.held_credentials().map_err(|error| {
-            format!(
-                "placement `{}` host `{host_label}` generation `{generation}` has invalid held-credential capability: {error}",
-                placement.metadata.name
-            )
-        })?;
-        if let Some(missing) = required.iter().find(|credential| !held.contains(*credential)) {
-            return Err(format!(
-                "workflow requires credential `{missing}`, which placement `{}` host `{host_label}` generation `{generation}` does not hold",
-                placement.metadata.name
-            ));
-        }
+    if !status.ready && !allow_unready {
+        return Err(placement_host_not_ready_reason(&placement.metadata.name, &host_label, &generation, &status));
+    }
+    let held = status.held_credentials().map_err(|error| {
+        format!(
+            "placement `{}` host `{host_label}` generation `{generation}` has invalid held-credential capability: {error}",
+            placement.metadata.name
+        )
+    })?;
+    if let Some(missing) = required.iter().find(|credential| !held.contains(*credential)) {
+        return Err(format!(
+            "workflow requires credential `{missing}`, which placement `{}` host `{host_label}` generation `{generation}` does not hold",
+            placement.metadata.name
+        ));
     }
     let expiry = status.credential_expiry().map_err(|error| {
         format!("placement `{}` host `{host_label}` has invalid credential expiry capability: {error}", placement.metadata.name)
@@ -4921,42 +4888,7 @@ pub async fn validate_workflow_credentials_with_capabilities_for_admission(
             ));
         }
     }
-    for (vessel, scope) in &ambient_dependent_vessels {
-        if let Some(expired_at) = expiry.get(*scope).and_then(|entry| entry.expired_at(now)) {
-            return Err(format!(
-                "vessel `{vessel}` depends on the ambient claude login on host `{host_label}`, which expired on {} — \
-                 log in again on that host or grant a delivered claude credential",
-                expired_at.format("%Y-%m-%d")
-            ));
-        }
-    }
     Ok(())
-}
-
-/// Vessels whose agent crews authenticate through a host's ambient login:
-/// host-direct vessels with a crew on an ambient-only adapter. Returns
-/// `(vessel name, ambient scope)` pairs, the scope being the entry name under
-/// the Host `credential_expiry` capability. No seeded adapter is ambient-only:
-/// Claude resolves through its binding (#3907), so this is forward-provisioned.
-pub fn ambient_credential_dependent_vessels<'workflow>(
-    capabilities: &CapabilityTable,
-    workflow: &'workflow WorkflowTemplateSpec,
-    host_direct: bool,
-) -> Result<Vec<(&'workflow str, &'static str)>, String> {
-    let mut vessels = Vec::new();
-    for vessel in workflow.vessels.iter().filter(|_| host_direct) {
-        for crew in &vessel.crew {
-            let CrewSource::Agent { selector, .. } = &crew.source else {
-                continue;
-            };
-            let requirement = capabilities.resolve_selector(selector)?;
-            if let Some(scope) = requirement.ambient_credential_scope() {
-                vessels.push((vessel.name.as_str(), scope));
-                break;
-            }
-        }
-    }
-    Ok(vessels)
 }
 
 /// Write dispatch-time agent choices into the workflow spec that is about to

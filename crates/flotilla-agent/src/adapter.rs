@@ -448,9 +448,6 @@ pub struct AgentRequirement {
     /// The account access the item declares in its registration (#3907),
     /// resolved through grants into a per-requester binding.
     account_access: Option<AccessName>,
-    /// Authenticates only through an ambient host login. No seeded adapter
-    /// uses this yet; admission is forward-provisioned for one.
-    ambient_scope: Option<&'static str>,
 }
 
 const CLAUDE_CODE_ADAPTER_ID: &str = "claude-code";
@@ -515,7 +512,6 @@ impl CapabilityTable {
             adapter: seeded.adapter.clone(),
             model: selector.model.clone().or_else(|| seeded.model.clone()),
             account_access: seeded.account_access.clone(),
-            ambient_scope: seeded.ambient_scope,
         })
     }
 }
@@ -539,13 +535,7 @@ impl AgentRequirement {
     fn new(adapter: impl Into<String>, model: Option<String>) -> Self {
         let adapter = adapter.into();
         let account_access = crate::account_access::declared_account_access(&adapter);
-        Self { adapter, model, account_access, ambient_scope: None }
-    }
-
-    /// A requirement for an adapter that has no deliverable credential form and
-    /// authenticates only through the named ambient host login scope.
-    pub fn ambient_only(adapter: impl Into<String>, model: Option<String>, scope: &'static str) -> Self {
-        Self { adapter: adapter.into(), model, account_access: None, ambient_scope: Some(scope) }
+        Self { adapter, model, account_access }
     }
 
     /// The account access this item declares. A session for it starts only
@@ -553,13 +543,6 @@ impl AgentRequirement {
     /// ambient or interactive login.
     pub fn account_access(&self) -> Option<&AccessName> {
         self.account_access.as_ref()
-    }
-
-    /// Ambient-login scope this adapter authenticates through, named as it
-    /// appears under the Host `credential_expiry` capability. `None` for
-    /// adapters with no ambient authentication path.
-    pub fn ambient_credential_scope(&self) -> Option<&'static str> {
-        self.ambient_scope
     }
 }
 
@@ -1331,7 +1314,6 @@ mod tests {
     use crate::adapter::build_crew_brief_with_options;
     use crate::adapter::AgentAdapterRegistry;
     use crate::adapter::AgentLaunchRequest;
-    use crate::adapter::AgentRequirement;
     use crate::adapter::CapabilityTable;
     use crate::adapter::CrewAssignment;
     use crate::adapter::CrewBriefMember;
@@ -2089,27 +2071,6 @@ mod tests {
         assert_eq!(table.resolve("code-review").expect("example review alias").adapter, "claude-code");
 
         assert_eq!(table.resolve("architect").expect_err("unknown capability must fail"), "unknown agent capability `architect`");
-    }
-
-    #[test]
-    fn ambient_only_requirements_resolve_to_their_scope_without_a_delivery_slot() {
-        let scope = flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE;
-        let table = CapabilityTable::seeded()
-            .with_requirement("ambient", AgentRequirement::ambient_only("ambient-harness", Some("m1".into()), scope))
-            .with_requirement("coding", AgentRequirement::ambient_only("replacement", None, scope));
-
-        let ambient = table.resolve("ambient").expect("added capability");
-        assert_eq!((ambient.adapter.as_str(), ambient.model.as_deref()), ("ambient-harness", Some("m1")));
-        assert_eq!(ambient.account_access(), None);
-        assert_eq!(ambient.ambient_credential_scope(), Some(scope));
-        assert_eq!(table.resolve("coding").expect("replaced capability").adapter, "replacement");
-
-        // A model-only override keeps the table's credential policy.
-        let mut reskinned = flotilla_resources::Selector::for_capability("ambient");
-        reskinned.model = Some("m2".to_string());
-        let requirement = table.resolve_selector(&reskinned).expect("model override");
-        assert_eq!((requirement.model.as_deref(), requirement.account_access()), (Some("m2"), None));
-        assert_eq!(requirement.ambient_credential_scope(), Some(scope));
     }
 
     #[test]
