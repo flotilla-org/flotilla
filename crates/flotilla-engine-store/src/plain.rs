@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use flotilla_schema::{Kind, KindRegistry, Origin, RegistryError, Timestamp};
-use flotilla_schema_sqlite::{Store, StoreError};
+use flotilla_schema_sqlite::{Loaded, Store, StoreError, Write};
 
 use crate::lock_store;
 
@@ -106,11 +106,7 @@ impl PlainLog {
     pub fn edit<K: Kind>(&self, name: &str, version: u64, spec: &K, writer: &str, at: Timestamp) -> Result<u64, PlainError> {
         let mut store = lock_store(&self.store);
         let mut write = store.write()?;
-        let id = write.resolve(K::CODE, name, &self.home)?.ok_or_else(|| missing::<K>(name))?;
-        let current = write.load::<K>(id)?.ok_or_else(|| missing::<K>(name))?;
-        if current.version != version {
-            return Err(PlainError::Conflict { kind: K::KIND, name: name.to_owned(), expected: version, stored: current.version });
-        }
+        let current = self.read_at::<K>(&mut write, name, version)?;
         let stamp = write.update(&current, spec, &Origin::new(writer, at))?;
         write.commit()?;
         Ok(stamp.version)
@@ -120,11 +116,7 @@ impl PlainLog {
     pub fn delete<K: Kind>(&self, name: &str, version: u64, writer: &str, at: Timestamp) -> Result<(), PlainError> {
         let mut store = lock_store(&self.store);
         let mut write = store.write()?;
-        let id = write.resolve(K::CODE, name, &self.home)?.ok_or_else(|| missing::<K>(name))?;
-        let current = write.load::<K>(id)?.ok_or_else(|| missing::<K>(name))?;
-        if current.version != version {
-            return Err(PlainError::Conflict { kind: K::KIND, name: name.to_owned(), expected: version, stored: current.version });
-        }
+        let current = self.read_at::<K>(&mut write, name, version)?;
         write.delete::<K>(current.stamp(), &Origin::new(writer, at))?;
         write.commit()?;
         Ok(())
@@ -157,10 +149,22 @@ impl PlainLog {
     }
 }
 
+impl PlainLog {
+    /// `name` homed here, refused unless it is live at `version`.
+    fn read_at<K: Kind>(&self, write: &mut Write<'_>, name: &str, version: u64) -> Result<Loaded<K>, PlainError> {
+        let id = write.resolve(K::CODE, name, &self.home)?.ok_or_else(|| missing::<K>(name))?;
+        let current = write.load::<K>(id)?.ok_or_else(|| missing::<K>(name))?;
+        if current.version != version {
+            return Err(PlainError::Conflict { kind: K::KIND, name: name.to_owned(), expected: version, stored: current.version });
+        }
+        Ok(current)
+    }
+}
+
 fn missing<K: Kind>(name: &str) -> PlainError {
     PlainError::Missing { kind: K::KIND, name: name.to_owned() }
 }
 
-fn plain<K>(loaded: flotilla_schema_sqlite::Loaded<K>) -> Plain<K> {
+fn plain<K>(loaded: Loaded<K>) -> Plain<K> {
     Plain { name: loaded.name, home: loaded.home, version: loaded.version, spec: loaded.value }
 }

@@ -109,7 +109,7 @@ pub(super) fn print(namespace: &str, report: &Report) {
     }
     if !report.moving.is_empty() {
         let counts = join(report.moving.iter().map(|(kind, (layer, rows))| format!("{kind} {rows} ({layer})")).collect());
-        println!("import plan {namespace}: not imported yet: {counts}");
+        println!("import plan {namespace}: not imported yet, stays on the old store: {counts}");
     }
     if !report.unplanned.is_empty() {
         let counts = join(report.unplanned.iter().map(|(plural, rows)| format!("{plural} {rows}")).collect());
