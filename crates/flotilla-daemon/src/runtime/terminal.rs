@@ -488,6 +488,10 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     };
                     let bound = deliver_bound_account(&self.state, &launch, access, launch_runner()?).await?;
                     credential_env.retain(|(key, _)| !bound.iter().any(|(name, _)| name == key));
+                    // #3913: the binding's home and token file are the crew's bound
+                    // layer; the prepared context sets them from there.
+                    bound_material.retain(|(key, _)| !bound.iter().any(|(name, _)| name == key));
+                    bound_material.extend(bound.iter().cloned());
                     credential_env.extend(bound);
                 }
                 if let Some(material) = &self.state.agent_material {

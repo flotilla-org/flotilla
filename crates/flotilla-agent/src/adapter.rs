@@ -1230,7 +1230,7 @@ pub trait AgentAdapterFactory: Send + Sync {
 /// authenticate it directly.
 pub const CLAUDE_CODE_ACCOUNT_STATE: AccountState = AccountState::new("claude-code")
     .homes(&["CLAUDE_CONFIG_DIR"])
-    .secrets(&["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"])
+    .secrets(&["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", crate::account_access::CLAUDE_OAUTH_TOKEN_FILE_ENV])
     .observation_defaults(&[("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")]);
 
 /// Codex's login and configuration home, and the variables that authenticate
