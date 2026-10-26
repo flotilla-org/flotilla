@@ -5,7 +5,6 @@ use tracing::Instrument;
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_resources::convoy_address::convoy_address;
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
-use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity, PROJECT_LABEL};
 use flotilla_resources::{Environment, EnvironmentPhase, ResumeIntent};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -92,26 +91,7 @@ fn vessel_ending_reason(
     })
 }
 
-/// Resolves a convoy address to its local record name.
-pub async fn resolve_local_convoy_name(backend: &ResourceBackend, namespace: &str, address: &str) -> Result<String, String> {
-    let convoys = backend.clone().using::<ResourceConvoy>(namespace);
-    let candidates = convoys.list().await.map_err(|error| error.to_string())?.items;
-    let identities = candidates
-        .iter()
-        .map(|convoy| ConvoyAddressIdentity {
-            record_name: &convoy.metadata.name,
-            role: convoy.metadata.labels.get(ROLE_LABEL).map(String::as_str),
-            project: convoy.metadata.labels.get(PROJECT_LABEL).map(String::as_str),
-            terminal: convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()),
-        })
-        .collect::<Vec<_>>();
-    let selected = resolve_convoy_candidate_indices(&identities, address)?;
-    match selected.as_slice() {
-        [index] => Ok(candidates[*index].metadata.name.clone()),
-        [] => Err(format!("no convoy matches `{address}`")),
-        _ => Err(format!("convoy record `{address}` is present from multiple sources")),
-    }
-}
+pub use flotilla_store::resolve_local_convoy_name;
 
 /// The sender's awaiting-reply record kind for a send (#3587 layer 7): none
 /// for a send expecting nothing, a stall for a stalled crew's supervision,

@@ -43,6 +43,8 @@ pub enum ConvoyVerb {
     Unlink(ConvoyUnlinkArgs),
     /// Abandon a convoy, archive best-effort, and tear it down
     Abandon(ConvoyAbandonArgs),
+    /// Close a crew's account binding and open a new one; its harness starts afresh
+    Rebind(ConvoyRebindArgs),
     /// Send crew a message; use --reopen to reactivate a settled completion
     Resume(ConvoyResumeArgs),
     /// Start a convoy through Project-scoped admission completion
@@ -87,6 +89,18 @@ pub struct ConvoyAbandonArgs {
     /// Human-readable reason for accepting loss of uncommitted work
     #[arg(long)]
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ConvoyRebindArgs {
+    /// Convoy role or role@project address
+    pub name: String,
+    /// The crew role whose account is rebound
+    #[arg(long)]
+    pub role: String,
+    /// Pin the new binding to this authorized credential; otherwise a random draw
+    #[arg(long)]
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
@@ -432,6 +446,21 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 })
             }
+            ConvoyVerb::Rebind(ConvoyRebindArgs { name, role, account }) => {
+                if self.subject.is_some() {
+                    return Err("convoy rebind takes its name after `rebind`".to_string());
+                }
+                Ok(Resolved::NeedsContext {
+                    command: Command {
+                        node_id: None,
+                        provisioning_target: None,
+                        context_repo: None,
+                        action: CommandAction::ConvoyRebind { namespace: None, name, role, account },
+                    },
+                    repo: RepoContext::None,
+                    host: HostResolution::Local,
+                })
+            }
             ConvoyVerb::Resume(ConvoyResumeArgs { name, prompt, withdraw, vessel, role, reopen }) => {
                 if self.subject.is_some() {
                     return Err("convoy resume takes its name after `resume`".to_string());
@@ -659,6 +688,12 @@ impl std::fmt::Display for ConvoyNoun {
             }
             ConvoyVerb::Abandon(ConvoyAbandonArgs { name, reason }) => {
                 write!(f, " abandon {} --reason {}", quote_value(name), quote_value(reason))?;
+            }
+            ConvoyVerb::Rebind(ConvoyRebindArgs { name, role, account }) => {
+                write!(f, " rebind {} --role {}", quote_value(name), quote_value(role))?;
+                if let Some(account) = account {
+                    write!(f, " --account {}", quote_value(account))?;
+                }
             }
             ConvoyVerb::Resume(ConvoyResumeArgs { name, prompt, withdraw, vessel, role, reopen }) => {
                 write!(f, " resume {}", quote_value(name))?;
@@ -1080,6 +1115,23 @@ mod tests {
         let error =
             ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--account", "coder"]).expect_err("malformed pin");
         assert!(error.to_string().contains("role=credential"));
+    }
+
+    // Glue (#3907): rebind names the convoy, the role and an optional pin.
+    #[test]
+    fn rebind_carries_role_and_pin() {
+        let args = ["convoy", "rebind", "coder@flotilla", "--role", "coder", "--account", "claude-jseo-oauth"];
+        assert_round_trip::<ConvoyNoun>(&args);
+        let Resolved::NeedsContext { command, .. } = parse(&args).resolve().expect("resolve rebind") else { panic!("command expected") };
+        assert_eq!(
+            command.action,
+            CommandAction::ConvoyRebind {
+                namespace: None,
+                name: "coder@flotilla".into(),
+                role: "coder".into(),
+                account: Some("claude-jseo-oauth".into())
+            }
+        );
     }
 
     // Glue: malformed exclusions explain the required authoring syntax. Kind

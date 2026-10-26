@@ -1543,6 +1543,10 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::IssuePage(page) => format_issue_page_human(page),
         CommandValue::IssuesByIds { items } => format!("issues by ids: {} items", items.len()),
         CommandValue::ConvoyCreated { name } => format!("convoy created: {name}"),
+        CommandValue::AccountRebound { convoy, role, credential, account, selection } => {
+            let account = account.as_deref().map(|account| format!(" (account {account})")).unwrap_or_default();
+            format!("account rebound: {convoy} {role} -> {credential}{account}, {selection}; its harness starts afresh")
+        }
         CommandValue::ConvoyAbandoned { name, archives } => {
             let mut output = format!("convoy abandoned: {name}");
             for archive in archives {

@@ -2633,6 +2633,7 @@ impl InProcessDaemon {
             | flotilla_protocol::CommandAction::ConvoyLink { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyUnlink { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, .. }
+            | flotilla_protocol::CommandAction::ConvoyRebind { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyResume { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyWithdrawPendingBrief { namespace, name }
             | flotilla_protocol::CommandAction::QueryExplainConvoy { namespace, name } => {
@@ -5501,6 +5502,7 @@ impl InProcessDaemon {
             CommandAction::ConvoyStart { .. } => {
                 return boxed_action!(admission.execute_action_convoy_start(id, &command, &dispatching_principal_ref))
             }
+            CommandAction::ConvoyRebind { .. } => return boxed_action!(admission.execute_action_convoy_rebind(id, &command)),
             CommandAction::ConvoyCreate { .. } => {
                 return boxed_action!(admission.execute_action_convoy_create(id, &command, &dispatching_principal_ref))
             }

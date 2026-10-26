@@ -650,6 +650,17 @@ pub async fn rebind(
     Ok(opened.spec)
 }
 
+/// How a binding was chosen, for display: `pinned by <who>` or `drawn: <i> of <n> usable`.
+pub fn describe_selection(binding: &AccountBindingSpec) -> String {
+    match &binding.selection {
+        Selection::Pin { pinned_by } => format!("pinned by {pinned_by}"),
+        Selection::Draw { index } => {
+            let usable = binding.candidates.iter().filter(|name| !binding.exclusions.contains_key(*name)).count();
+            format!("drawn: {} of {usable} usable", index + 1)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use flotilla_resources::SeededRandom;

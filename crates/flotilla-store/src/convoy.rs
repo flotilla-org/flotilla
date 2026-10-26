@@ -71,3 +71,24 @@ mod live_query_tests {
         assert_eq!(actual, expected);
     }
 }
+
+/// Resolves a convoy address to its local record name.
+pub async fn resolve_local_convoy_name(backend: &crate::ResourceBackend, namespace: &str, address: &str) -> Result<String, String> {
+    let convoys = backend.clone().using::<flotilla_resources::Convoy>(namespace);
+    let candidates = convoys.list().await.map_err(|error| error.to_string())?.items;
+    let identities = candidates
+        .iter()
+        .map(|convoy| flotilla_resources::ConvoyAddressIdentity {
+            record_name: &convoy.metadata.name,
+            role: convoy.metadata.labels.get(flotilla_resources::ROLE_LABEL).map(String::as_str),
+            project: convoy.metadata.labels.get(flotilla_resources::PROJECT_LABEL).map(String::as_str),
+            terminal: convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()),
+        })
+        .collect::<Vec<_>>();
+    let selected = flotilla_resources::resolve_convoy_candidate_indices(&identities, address)?;
+    match selected.as_slice() {
+        [index] => Ok(candidates[*index].metadata.name.clone()),
+        [] => Err(format!("no convoy matches `{address}`")),
+        _ => Err(format!("convoy record `{address}` is present from multiple sources")),
+    }
+}

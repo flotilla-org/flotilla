@@ -981,6 +981,16 @@ pub enum CommandAction {
         name: String,
         reason: String,
     },
+    /// Close a requester's account binding and open a new one, by pin or
+    /// draw; its harness starts afresh on the new account (#3907).
+    ConvoyRebind {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        name: String,
+        role: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+    },
     ConvoyResume {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
@@ -1334,6 +1344,7 @@ impl Command {
             CommandAction::ConvoyLink { .. } => "Linking convoy subject...",
             CommandAction::ConvoyUnlink { .. } => "Unlinking convoy subject...",
             CommandAction::ConvoyAbandon { .. } => "Abandoning convoy...",
+            CommandAction::ConvoyRebind { .. } => "Rebinding crew account...",
             CommandAction::ConvoyResume { .. } => "Resuming convoy crew...",
             CommandAction::ConvoyWithdrawPendingBrief { .. } => "Withdrawing pending convoy brief...",
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
@@ -1608,6 +1619,15 @@ pub enum CommandValue {
     ConvoyAbandoned {
         name: String,
         archives: Vec<CheckoutArchiveOutcome>,
+    },
+    AccountRebound {
+        convoy: String,
+        role: String,
+        credential: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+        /// How the new binding was chosen, for display.
+        selection: String,
     },
     ConvoyStarted {
         name: String,
@@ -2181,6 +2201,13 @@ mod tests {
                     .checkout("work".to_string())
                     .status(CheckoutArchiveStatus::NothingToArchive)
                     .build()],
+            },
+            CommandValue::AccountRebound {
+                convoy: "my-convoy".into(),
+                role: "coder".into(),
+                credential: "claude-jseo-oauth".into(),
+                account: Some("someone@example.com".into()),
+                selection: "pinned by convoy rebind --account".into(),
             },
             CommandValue::WorkflowTemplateApplied { name: "scratch".into() },
             CommandValue::ProjectAdded { name: "my-project".into() },

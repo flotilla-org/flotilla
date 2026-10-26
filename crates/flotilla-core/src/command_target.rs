@@ -90,6 +90,7 @@ impl InProcessDaemon {
             | A::ConvoyLink { .. }
             | A::ConvoyUnlink { .. }
             | A::ConvoyAbandon { .. }
+            | A::ConvoyRebind { .. }
             | A::ConvoyResume { .. }
             | A::ConvoyWithdrawPendingBrief { .. }
             | A::ConvoyWorkForceComplete { .. }
