@@ -45,6 +45,7 @@ impl FromStr for WorkspaceId {
 
     fn from_str(text: &str) -> Result<Self, String> {
         let invalid = || format!("invalid workspace ID {text:?}");
+        // UUID lengths count ASCII bytes; the hex check below rejects all non-ASCII input.
         let hex = match text.len() {
             32 => text.to_owned(),
             36 => {

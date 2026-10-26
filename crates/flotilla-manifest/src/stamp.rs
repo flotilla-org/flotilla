@@ -18,7 +18,7 @@ use crate::{
         KEY_ATTACH_REF, KEY_CONVOY, KEY_CREW_ROLE, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_HOST, KEY_NAMESPACE, KEY_SESSION, KEY_SOURCE,
         KEY_VESSEL, SOURCE_ACTUATOR, SOURCE_ATTACH, SOURCE_FLOTILLA,
     },
-    wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate, PaneTarget},
+    wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate, PaneTarget, WorkspaceId},
 };
 
 /// Parse a pane id as PMs expose it to child processes: a plain integer
@@ -83,7 +83,7 @@ pub struct WorkspaceStamp {
 
 /// The Tab-target patch published after workspace creation. No TTL — the
 /// stamp is a fact about the tab, not about any daemon being alive.
-pub fn tab_stamp(tab_id: crate::wire::WorkspaceId, stamp: &WorkspaceStamp) -> MetadataPatch {
+pub fn tab_stamp(tab_id: WorkspaceId, stamp: &WorkspaceStamp) -> MetadataPatch {
     let mut set = BTreeMap::new();
     set.insert(KEY_SOURCE.to_owned(), MetadataValueUpdate::new(MetadataValue::text(SOURCE_FLOTILLA), None));
     set.insert(KEY_ENTITY_KIND.to_owned(), MetadataValueUpdate::new(MetadataValue::text(stamp.entity.kind.clone()), None));

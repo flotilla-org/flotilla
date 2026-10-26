@@ -16,7 +16,11 @@ re-serialization.
 wheelhouse change, regenerate against wheelhouse and adapt the mirror:
 
 ```bash
-cd fixtures/generator && cargo run -- .. && git diff ..
+cd crates/flotilla-manifest/fixtures/generator
+# Record this revision in the README with every regeneration.
+git -C ../../../../../wheelhouse rev-parse HEAD
+cargo run -- ..
+git diff ..
 ```
 
 The generator uses Wheelhouse's UUID workspace IDs for tab targets and includes
