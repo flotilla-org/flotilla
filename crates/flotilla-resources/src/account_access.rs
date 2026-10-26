@@ -279,6 +279,33 @@ pub fn requester_address(project: Option<&str>, convoy: &str, role: &str) -> Res
     convoy.and_then(|address| address.child(AddressKind::Role, role)).map_err(|error| format!("requester address: {error:?}"))
 }
 
+/// The convoy and role a requester address names.
+pub fn requester_parts(requester: &Address) -> Option<(String, String)> {
+    let mut convoy = None;
+    let mut role = None;
+    for segment in requester.segments() {
+        match segment.kind() {
+            AddressKind::Convoy => convoy = Some(segment.value().to_string()),
+            AddressKind::Role => role = Some(segment.value().to_string()),
+            _ => {}
+        }
+    }
+    convoy.zip(role)
+}
+
+impl AccountBindingSpec {
+    /// How the binding was chosen, for display: `pinned by <who>` or `drawn: <i> of <n> usable`.
+    pub fn describe_selection(&self) -> String {
+        match &self.selection {
+            Selection::Pin { pinned_by } => format!("pinned by {pinned_by}"),
+            Selection::Draw { index } => {
+                let usable = self.candidates.iter().filter(|name| !self.exclusions.contains_key(*name)).count();
+                format!("drawn: {} of {usable} usable", index + 1)
+            }
+        }
+    }
+}
+
 /// The material generation a delivery records (#3910 owner ruling 3): a short digest of the
 /// published material, so a refreshed file is told apart without storing or logging it.
 pub fn material_generation(material: &str) -> String {

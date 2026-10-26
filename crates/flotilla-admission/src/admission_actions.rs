@@ -83,7 +83,7 @@ impl AdmissionActions<'_> {
                     role: role.clone(),
                     credential: binding.credential.0.clone(),
                     account: binding.account.clone(),
-                    selection: crate::account_access::describe_selection(&binding),
+                    selection: binding.describe_selection(),
                 },
                 Err(message) => CommandValue::Error { message },
             },

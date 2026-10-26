@@ -473,6 +473,9 @@ pub struct ConvoyExplanation {
     pub placement: Option<PlacementDecision>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub vessel_placements: std::collections::BTreeMap<String, PlacementDecision>,
+    /// Each requester's account bindings, open and retired (#3907).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_bindings: Vec<ExplainedAccountBinding>,
     pub evidence_ttl_seconds: u64,
     pub change_request_stale_after_seconds: u64,
     pub checkouts: Vec<ExplainedCheckout>,
@@ -500,6 +503,49 @@ pub struct ConvoyExplanation {
     pub recent_events: Vec<ExplainedEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_mutations: Vec<ExplainedLifecycleMutation>,
+}
+
+/// One requester's account binding (#3907): which managed credential and account it selected,
+/// how, from which candidates, under which grants, and where it is provisioned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedAccountBinding {
+    pub binding: String,
+    pub role: String,
+    pub requirement: String,
+    pub credential: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// `open`, `closed` or `revoked`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Directly delivered material was present until this time (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_until: Option<String>,
+    pub selection: String,
+    pub candidates: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub exclusions: std::collections::BTreeMap<String, String>,
+    pub grants: Vec<String>,
+    pub epochs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provisions: Vec<ExplainedAccountProvision>,
+}
+
+/// One binding's provision at one place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedAccountProvision {
+    pub place: String,
+    pub environment_kind: String,
+    pub implementation: String,
+    pub effective_access: String,
+    pub mechanism: String,
+    pub update_mode: String,
+    pub home: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_generation: Option<String>,
 }
 
 /// One held Message batch (#3455): what it is, why it is held, and the

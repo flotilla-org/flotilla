@@ -7,6 +7,44 @@ pub(super) enum LaunchObservationRecord {
     MissingEnvironment,
 }
 
+/// Bind a requester's Claude subscription to `credential`, as admission does (#3907).
+pub(super) async fn bind_account(backend: &ResourceBackend, convoy: &str, role: &str, credential: &str, account: &str) {
+    use flotilla_resources::account_access::{
+        binding_name, requester_address, AccessName, AccountBindingSpec, BindingState, CredentialName, EpochEntry, GrantName, GrantScope,
+        Selection,
+    };
+    let access = AccessName(flotilla_agent::account_access::CLAUDE_SUBSCRIPTION.to_string());
+    let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
+    let mut epochs = flotilla_schema::Records::new();
+    epochs.append(1, EpochEntry { epoch: "1".into(), observed_at: now }).expect("epoch");
+    backend
+        .using::<flotilla_resources::AccountBinding>(NAMESPACE)
+        .create(
+            &empty_meta(&binding_name(convoy, role, &access)),
+            &AccountBindingSpec {
+                requester: requester_address(Some("flotilla"), convoy, role).expect("requester"),
+                item: "claude-code".into(),
+                requirement: access,
+                credential: CredentialName(credential.into()),
+                account: Some(account.into()),
+                grants: BTreeMap::from([(GrantName("claude-max-contained".into()), GrantScope { scope: "account".into() })]),
+                candidates: BTreeSet::from([CredentialName(credential.into())]),
+                exclusions: BTreeMap::new(),
+                selection: Selection::Pin { pinned_by: "test".into() },
+                epochs,
+                opened_at: now,
+                state: flotilla_schema::State::new(BindingState::Open, now),
+            },
+        )
+        .await
+        .expect("account binding");
+}
+
+/// The token prefix a bound Claude launch starts with.
+pub(super) fn claude_token_prefix(home: &str) -> String {
+    format!("CLAUDE_CODE_OAUTH_TOKEN=\"$(cat -- '{home}/.flotilla-oauth-token')\" ")
+}
+
 pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, observation: LaunchObservationRecord) {
     let temp = TempDir::new().expect("tempdir");
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
@@ -62,7 +100,8 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
             .await
             .expect("environment");
     }
-    let crew_config_dir = PathBuf::from("/home/crew/flotilla/agent-homes/claude-max/claude");
+    // #3907: the requester's bound home, keyed by convoy and role.
+    let crew_config_dir = PathBuf::from("/home/crew/flotilla/agent-homes/requesters/demo/coder/claude");
     let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
         DiscoveryMockRunner::builder()
             .tool_exists("claude", true)
@@ -165,12 +204,12 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
         )
         .await
         .expect("vessel");
-    let mut terminal_meta = empty_meta("terminal-demo-work-coder");
-    terminal_meta.annotations.insert(flotilla_resources::CREDENTIAL_REFS_ANNOTATION.into(), "[\"claude-max\"]".into());
+    let terminal_meta = empty_meta("terminal-demo-work-coder");
     if matches!(observation, LaunchObservationRecord::Present) {
         backend.using::<TerminalSession>(NAMESPACE).create(&terminal_meta, &spec).await.expect("terminal context");
     }
-    let tags = [flotilla_terminal::TerminalSessionTag::new(CREDENTIAL_REF_SESSION_TAG, "claude-max")];
+    bind_account(&backend, "demo", "coder", "claude-max", "test@example.com").await;
+    let tags: [flotilla_terminal::TerminalSessionTag; 0] = [];
 
     let launched = TerminalControllerRuntime { state }
         .ensure_session("terminal-demo-work-coder", (&spec).into(), &tags)
@@ -188,10 +227,14 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
         !launch.env_vars.iter().any(|(name, _)| name == flotilla_agent::CLAUDE_CODE_HOOK_TOKEN_ENV),
         "a vessel session gets no hook token, so its overlay keeps command hooks"
     );
+    // #3907: the token reaches the process only from the plan's token file, read as it starts.
     assert!(
-        launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == "oauth-secret-material"),
-        "the contained Claude process must receive its OAuth token"
+        !launch.env_vars.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN"),
+        "the session environment carries no token; the plan's file is the only source"
     );
+    assert!(launch.env_vars.iter().any(|(name, value)| name == flotilla_agent::account_access::CLAUDE_OAUTH_TOKEN_FILE_ENV
+        && value == &crew_config_dir.join(".flotilla-oauth-token").display().to_string()));
+    assert!(launch.command.contains(&claude_token_prefix(&crew_config_dir.display().to_string())), "{}", launch.command);
     assert!(
         launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR"
             && value
@@ -210,7 +253,7 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
         assert!(launch.command.contains("Capabilities are currently unavailable"));
         assert!(launch.command.contains("flotilla crew capabilities"));
     } else {
-        assert!(launch.command.contains("claude-max"));
+        assert!(launch.command.contains("Account for `claude:subscription`: credential `claude-max` (account test@example.com)"));
     }
     assert!(!launch.command.contains("oauth-secret-material"));
     assert!(!launch.command.contains("superseded-spec-token"));

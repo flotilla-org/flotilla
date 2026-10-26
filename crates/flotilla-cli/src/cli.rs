@@ -984,6 +984,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         if let Some(reason) = &placement.escalation_reason {
             let _ = writeln!(output, "Escalation: {reason}");
         }
+        for refusal in &placement.refused_candidates {
+            let _ = writeln!(output, "  Refused {} on {}: {}", refusal.policy_name, refusal.target_host.display_name, refusal.reason);
+        }
         if let Some(allocation) = &placement.allocation {
             if let Some(reason) = &allocation.reservation_reason {
                 let _ = writeln!(output, "Reserved platform capacity used: {reason}");
@@ -1028,6 +1031,36 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
     } else {
         for (vessel, placement) in &explanation.vessel_placements {
             write_placement(&format!("Fulfilment for {vessel}"), placement);
+        }
+    }
+    for binding in &explanation.account_bindings {
+        let account = binding.account.as_deref().map(|account| format!(" ({account})")).unwrap_or_default();
+        let _ = writeln!(
+            output,
+            "Account for {}: {}{account} [{}] for {}, {}",
+            binding.role, binding.credential, binding.state, binding.requirement, binding.selection
+        );
+        if let Some(reason) = &binding.reason {
+            let until = binding.delivered_until.as_deref().map(|until| format!("; directly delivered until {until}")).unwrap_or_default();
+            let _ = writeln!(output, "  Reason: {reason}{until}");
+        }
+        let _ = writeln!(output, "  Grants: {}; epochs: {}", binding.grants.join(", "), binding.epochs.join(" -> "));
+        let _ = writeln!(output, "  Candidates: {}", binding.candidates.join(", "));
+        for (credential, reason) in &binding.exclusions {
+            let _ = writeln!(output, "  Excluded {credential}: {reason}");
+        }
+        for provision in &binding.provisions {
+            let _ = writeln!(
+                output,
+                "  Provisioned at {} ({}): {} {} into {}, update {}{}",
+                provision.place,
+                provision.environment_kind,
+                provision.implementation,
+                provision.mechanism,
+                provision.home,
+                provision.update_mode,
+                provision.delivered_epoch.as_deref().map(|epoch| format!(", delivered epoch {epoch}")).unwrap_or_default()
+            );
         }
     }
     if let Some(stalled) = &explanation.stalled {

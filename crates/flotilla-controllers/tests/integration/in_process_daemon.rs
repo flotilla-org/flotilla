@@ -3544,7 +3544,15 @@ async fn requested_model_ignores_legacy_account_evidence_and_uses_only_selected_
     let snapshot = backend.definitions::<WorkflowTemplate>("flotilla").get(snapshot_name).await.expect("workflow snapshot");
     let status = admitted.status.expect("admitted status");
     assert_eq!(status.placement_decision.expect("placement").policy_name, "host-direct-model");
-    assert_eq!(snapshot.spec.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
+    // #3907: the Claude account is the requester's binding, never a vessel-wide reference.
+    assert!(snapshot.spec.vessels[0].credential_refs.is_empty());
+    let binding = backend
+        .clone()
+        .using::<flotilla_resources::AccountBinding>("flotilla")
+        .get(&format!("{}.{}.claude-subscription", admitted.metadata.name, snapshot.spec.vessels[0].crew[0].role))
+        .await
+        .expect("the requester's binding");
+    assert_eq!(binding.spec.credential.0, "claude-max");
     let needs = &snapshot.spec.vessels[0].crew[0].needs;
     // A previous account request is no evidence about this credential or its harness floor.
     assert!(!needs

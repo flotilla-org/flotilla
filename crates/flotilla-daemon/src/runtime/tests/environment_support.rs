@@ -110,6 +110,7 @@ impl CommandRunner for CredentialInteriorRunner {
                 // real scratch copying and credential links are tested in agent_material.
                 || (cmd == "sh" && args.contains(&"flotilla-crew-home"))
                 || (cmd == "sh" && args.contains(&"flotilla-harness-home"))
+                || (cmd == "sh" && args.contains(&"flotilla-requester-home"))
         {
             Ok(String::new())
         } else {

@@ -336,7 +336,7 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
     let bare = backend.using::<PlacementPolicy>("flotilla").get("docker-bare").await.expect("get placement");
     assert_eq!(
         validate_account_access(&backend, "flotilla", Some("flotilla"), &[], &with_grant, Some(&bare)).await.expect_err("unheld"),
-        "role `coder` has no usable credential for `claude:subscription`: `claude-max`: not held by host `host-b`"
+        "role `coder` has no usable credential for `claude:subscription`: `claude-max`: host `host-b` does not hold it"
     );
 }
 

@@ -608,6 +608,32 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
             .expect("crew environment bag");
         let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
         let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
+        // #3907: even the daemon host's own Claude crew runs only in its bound home.
+        daemon
+            .resource_backend()
+            .definitions::<CredentialSpec>(NAMESPACE)
+            .create(
+                &empty_meta("claude-max"),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() },
+                    source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
+                },
+            )
+            .await
+            .expect("Claude credential declaration");
+        bind_account(&daemon.resource_backend(), "demo", "coder", "claude-max", "test@example.com").await;
+        let state_dir = temp.path().join("state");
+        let credential_store = Arc::new(CredentialStore::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("TEST_CLAUDE_TOKEN", "oauth-secret-material")])),
+            EnvironmentBag::new(),
+            Arc::new(ProcessCommandRunner),
+            state_dir.clone(),
+        ));
         let state = Arc::new(
             ControllerRuntimeState::new(
                 Arc::clone(&daemon),
@@ -617,7 +643,8 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
                 profile.host_id.clone(),
                 profile.host_direct_environment_name(),
             )
-            .with_hook_endpoint(endpoint.clone()),
+            .with_hook_endpoint(endpoint.clone())
+            .with_credential_store(credential_store),
         );
         let session_cwd = temp.path().join("session-cwd");
         std::fs::create_dir_all(&session_cwd).expect("session cwd");
@@ -680,12 +707,15 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
         }
         assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["type"], "command");
         // #3655: the daemon host's own host-direct session stays uncontained:
-        // it names no flotilla environment, keeps the host user's harness home
-        // and configuration (unwritten), keeps attribution, and takes no image
-        // harness environment.
-        for name in ["FLOTILLA_ENVIRONMENT_ID", "CLAUDE_CONFIG_DIR", "DISABLE_AUTOUPDATER", "LANG"] {
+        // it names no flotilla environment, leaves the host user's harness
+        // configuration unwritten, keeps attribution, and takes no image
+        // harness environment. #3907: its harness home is its bound home.
+        for name in ["FLOTILLA_ENVIRONMENT_ID", "DISABLE_AUTOUPDATER", "LANG", "CLAUDE_CODE_OAUTH_TOKEN"] {
             assert_eq!(value(name), None, "{name}");
         }
+        let bound_home = state_dir.join("agent-homes/requesters/demo/coder/claude");
+        assert_eq!(value("CLAUDE_CONFIG_DIR"), Some(bound_home.display().to_string()));
+        assert_eq!(std::fs::read_to_string(bound_home.join(".flotilla-oauth-token")).expect("delivered token"), "oauth-secret-material");
         assert!(settings.get("attribution").is_none());
         assert!(!home.join(".claude.json").exists(), "host-direct launch wrote the host user's Claude state");
     }

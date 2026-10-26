@@ -2726,6 +2726,23 @@ impl AdmissionReadContext<'_> {
             };
             let policy_name = kind.metadata.name.clone();
             let refusal = |reason: String| PlacementRefusal { policy_name: policy_name.clone(), target_host: target_host.clone(), reason };
+            // #3907: a kind where some requester's access has no plan drops out.
+            let environment_kind = match &kind.spec.realisation {
+                flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { .. } => {
+                    flotilla_agent::account_access::environment_kind::CLOUD_SANDBOX
+                }
+                flotilla_resources::FulfilmentRealisation::DockerPerVessel { .. } => {
+                    flotilla_agent::account_access::environment_kind::DOCKER
+                }
+                flotilla_resources::FulfilmentRealisation::HostDirect if host.is_some_and(is_agentless_ssh_host) => {
+                    flotilla_agent::account_access::environment_kind::AGENTLESS_SSH
+                }
+                flotilla_resources::FulfilmentRealisation::HostDirect => flotilla_agent::account_access::environment_kind::HOST_DIRECT,
+            };
+            if let Some(reason) = crate::account_access::plan_refusal(workflow, environment_kind)? {
+                rejected.push(refusal(reason));
+                continue;
+            }
             let canonical_kind_host = match canonical_kind_host {
                 Ok(host) => host,
                 Err(error) => {
@@ -4333,6 +4350,11 @@ async fn decide_default_placement(
             Some(AGENTLESS_SSH_PIN_ONLY.to_string())
         } else if purpose == PlacementPurpose::Routing {
             None
+        } else if let Some(reason) =
+            crate::account_access::plan_refusal(workflow, crate::account_access::placement_environment_kind(&policy.spec, None))?
+        {
+            // #3907: a kind where some requester's access has no plan drops out.
+            Some(reason)
         } else if let Err(reason) = resolve_placement_provider(backend, namespace, &mut policy).await {
             Some(reason)
         } else if let Err(reason) = validate_workflow_agent_adapters(backend, namespace, workflow, Some(&policy), false).await {

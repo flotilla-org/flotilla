@@ -1881,6 +1881,7 @@ impl ReadProjections<'_> {
             settlement,
             recent_events,
             lifecycle_mutations,
+            account_bindings: account_binding_evidence(self.backend, namespace, &convoy.metadata.name).await?,
         };
         Ok((explanation, convoy))
     }
@@ -2196,6 +2197,90 @@ pub async fn message_views(
 }
 
 /// [`message_views`], with the held batches among the same Messages (#3455).
+/// Every account binding of a convoy's requesters, open and retired, with its provisions
+/// (#3907): `convoy explain` shows the selected account, how it was chosen and where it is.
+pub async fn account_binding_evidence(
+    backend: &ResourceBackend,
+    namespace: &str,
+    convoy: &str,
+) -> Result<Vec<flotilla_protocol::ExplainedAccountBinding>, String> {
+    use flotilla_resources::account_access::{requester_parts, BindingState, UpdateMode};
+    use flotilla_resources::{AccountBinding, AccountProvision};
+    let bindings = backend
+        .including_replicas::<AccountBinding>(namespace)
+        .list()
+        .await
+        .map_err(|error| format!("list account bindings: {error}"))?
+        .items
+        .into_iter()
+        .map(|binding| binding.object)
+        .filter(|binding| requester_parts(&binding.spec.requester).is_some_and(|(owner, _)| owner == convoy))
+        .collect::<Vec<_>>();
+    if bindings.is_empty() {
+        return Ok(Vec::new());
+    }
+    let provisions = backend
+        .including_replicas::<AccountProvision>(namespace)
+        .list()
+        .await
+        .map_err(|error| format!("list account provisions: {error}"))?;
+    let mut explained = Vec::new();
+    for binding in bindings {
+        let spec = &binding.spec;
+        let role = requester_parts(&spec.requester).map(|(_, role)| role).unwrap_or_default();
+        let (state, delivered_until) = match &spec.state.value {
+            BindingState::Open => ("open", None),
+            BindingState::Closed { delivered_until, .. } => ("closed", *delivered_until),
+            BindingState::Revoked { delivered_until, .. } => ("revoked", *delivered_until),
+        };
+        let mut binding_provisions = provisions
+            .items
+            .iter()
+            .filter(|provision| provision.object.spec.binding.name == binding.metadata.name)
+            .map(|provision| {
+                let provision = &provision.object.spec;
+                flotilla_protocol::ExplainedAccountProvision {
+                    place: provision.place.clone(),
+                    environment_kind: provision.environment_kind.clone(),
+                    implementation: provision.plan.implementation.clone(),
+                    effective_access: provision.plan.effective_access.clone(),
+                    mechanism: provision.plan.mechanism.clone(),
+                    update_mode: match provision.plan.update_mode {
+                        UpdateMode::Push => "push",
+                        UpdateMode::Mechanism => "mechanism",
+                        UpdateMode::Restart => "restart",
+                    }
+                    .to_string(),
+                    home: provision.home.clone(),
+                    delivered_epoch: provision.delivered.as_ref().map(|delivered| delivered.epoch.clone()),
+                    delivered_generation: provision.delivered.as_ref().map(|delivered| delivered.generation.clone()),
+                }
+            })
+            .collect::<Vec<_>>();
+        binding_provisions.sort_by(|left, right| left.place.cmp(&right.place));
+        explained.push(flotilla_protocol::ExplainedAccountBinding {
+            binding: binding.metadata.name.clone(),
+            role,
+            requirement: spec.requirement.0.clone(),
+            credential: spec.credential.0.clone(),
+            account: spec.account.clone(),
+            state: state.to_string(),
+            reason: spec.state.value.reason().map(str::to_string),
+            delivered_until: delivered_until.and_then(|at| at.to_datetime()).map(|at| at.to_rfc3339()),
+            selection: spec.describe_selection(),
+            candidates: spec.candidates.iter().map(|name| name.0.clone()).collect(),
+            exclusions: spec.exclusions.iter().map(|(name, reason)| (name.0.clone(), reason.clone())).collect(),
+            grants: spec.grants.keys().map(|name| name.0.clone()).collect(),
+            epochs: spec.epochs.iter().map(|row| row.record.epoch.clone()).collect(),
+            provisions: binding_provisions,
+        });
+    }
+    explained.sort_by(|left, right| {
+        (left.state != "open", &left.role, &left.binding).cmp(&(right.state != "open", &right.role, &right.binding))
+    });
+    Ok(explained)
+}
+
 pub async fn message_evidence(
     backend: &flotilla_store::ResourceBackend,
     namespace: &str,

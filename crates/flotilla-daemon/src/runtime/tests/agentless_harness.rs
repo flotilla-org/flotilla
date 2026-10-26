@@ -106,7 +106,12 @@ fn ok() -> Result<String, String> {
 impl CommandRunner for FakeHost {
     async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
         match (cmd, args) {
+            ("rm", ["-f", "--", path]) => {
+                self.files.lock().expect("files").remove(Path::new(path));
+                ok()
+            }
             ("mkdir" | "chmod" | "mv" | "rm", _) => ok(),
+            ("sh", ["-c", _, "flotilla-requester-home", _]) => ok(),
             ("getconf", ["_NPROCESSORS_ONLN"]) => Ok("8\n".into()),
             // Executables and sockets lie outside the modelled filesystem: the
             // delivered CLI is present and the forwarded socket is listening.
@@ -379,12 +384,10 @@ async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool
         env: session_env,
         pool: "cleat".to_string(),
     };
-    let tags = if grant_claude {
-        vec![TerminalSessionTag { key: CREDENTIAL_REF_SESSION_TAG.to_string(), value: "claude-max".to_string() }]
-    } else {
-        Vec::new()
-    };
-    let launched = TerminalControllerRuntime { state }.ensure_session("terminal-demo-work-coder", (&spec).into(), &tags).await;
+    if grant_claude {
+        bind_account(&daemon.resource_backend(), "demo", "coder", "claude-max", "crew@example.com").await;
+    }
+    let launched = TerminalControllerRuntime { state }.ensure_session("terminal-demo-work-coder", (&spec).into(), &[]).await;
     let ensured = pool.ensured.lock().await;
     if let Err(error) = launched {
         assert!(ensured.is_empty(), "a refused launch started a session");
@@ -433,10 +436,15 @@ fn assert_image_harness_environment(launch: &AgentlessLaunch) {
 #[tokio::test]
 async fn agentless_claude_crew_starts_in_a_prepared_flotilla_home() {
     let launch = launch_on_agentless_host("claude-code").await;
-    let home = format!("{HOST_BASE}/agent-homes/claude-max/claude/crews/coder");
+    let bound = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/claude");
+    let home = format!("{bound}/crews/coder");
 
     assert_eq!(launch.value("CLAUDE_CONFIG_DIR").as_deref(), Some(home.as_str()));
-    assert_eq!(launch.value("CLAUDE_CODE_OAUTH_TOKEN").as_deref(), Some("oauth-secret-material"));
+    // #3907: the vessel agent wrote the bound token into the requester's home;
+    // the session environment carries no token of its own.
+    assert_eq!(launch.value("CLAUDE_CODE_OAUTH_TOKEN"), None);
+    assert_eq!(launch.host.entry(format!("{bound}/.flotilla-oauth-token")), Some(HostEntry::File("oauth-secret-material".into())));
+    assert!(launch.command.contains(&claude_token_prefix(&bound)), "{}", launch.command);
     assert_eq!(launch.value("FLOTILLA_ENVIRONMENT_ID").as_deref(), Some(ENVIRONMENT));
     let state = launch.host.json(format!("{home}/.claude.json"));
     assert_eq!(state["hasCompletedOnboarding"], true);
@@ -477,16 +485,15 @@ async fn agentless_codex_crew_starts_in_a_prepared_flotilla_home() {
     assert_host_harness_untouched(&launch);
 }
 
-// Review #3659: an agentless Claude crew has no ambient-login fallback, since
-// the host login's configuration is never selected. Without a delivered OAuth
-// credential the launch is refused with a reason naming the missing grant,
+// Review #3659, #3907 contract 8: an agentless Claude crew has no ambient-login
+// fallback. Without an account binding the launch is refused with the reason,
 // and nothing starts or touches the host's configuration.
 #[tokio::test]
 async fn agentless_claude_crew_without_a_delivered_credential_is_refused_with_the_reason() {
     let Err(error) = try_launch_on_agentless_host("claude-code", false).await else {
         panic!("an agentless Claude crew without a credential must not launch");
     };
-    assert!(error.contains("require a delivered Claude OAuth credential") && error.contains("claude-oauth"), "{error}");
+    assert_eq!(error, "crew `coder` has no account binding for `claude:subscription`: its harness home is never left to an ambient login");
 }
 
 /// Stands in for `ssh` to an agentless host and its sshd: the remote command

@@ -291,6 +291,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
             },
         ],
         settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
+        account_bindings: Vec::new(),
     };
 
     // Every claim renders the active-process marker, including a superseded
@@ -479,6 +480,7 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
         recent_events: Vec::new(),
         lifecycle_mutations: Vec::new(),
+        account_bindings: Vec::new(),
     };
 
     let output = format_convoy_explanation_human(&explanation);

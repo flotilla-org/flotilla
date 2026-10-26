@@ -84,6 +84,7 @@ pub async fn session_card(
         ));
     }
     text.push_str("\n### Credentials\n");
+    text.push_str(&account_card(backend, namespace, convoy_name, &spec.role).await?);
     text.push_str(&credential_card(credentials));
     text.push_str(&format!("\n### Session\nYou work at `{}` in environment `{}`.\n", spec.cwd, spec.env_ref));
     let environment =
@@ -114,6 +115,30 @@ pub async fn session_card(
     }
     text.push_str("\nScope: use the repositories and credential permissions listed above. Run `flotilla crew capabilities` when unsure; it reports the current delivery.\n");
     Ok(text)
+}
+
+/// The requester's open account bindings (#3907): which managed credential and account its
+/// harness runs on, and how it was chosen. Never material.
+async fn account_card(backend: &ResourceBackend, namespace: &str, convoy: &str, role: &str) -> Result<String, String> {
+    use flotilla_resources::account_access::requester_parts;
+    let bindings = backend
+        .including_replicas::<flotilla_resources::AccountBinding>(namespace)
+        .list()
+        .await
+        .map_err(|error| format!("list account bindings: {error}"))?;
+    let mut lines = bindings
+        .items
+        .iter()
+        .map(|binding| &binding.object.spec)
+        .filter(|spec| spec.state.value.is_open())
+        .filter(|spec| requester_parts(&spec.requester).is_some_and(|(owner, bound_role)| owner == convoy && bound_role == role))
+        .map(|spec| {
+            let account = spec.account.as_deref().map(|account| format!(" (account {account})")).unwrap_or_default();
+            format!("- Account for `{}`: credential `{}`{account}, {}.\n", spec.requirement, spec.credential, spec.describe_selection())
+        })
+        .collect::<Vec<_>>();
+    lines.sort();
+    Ok(lines.concat())
 }
 
 fn mount_mode(mode: EnvironmentMountMode) -> &'static str {

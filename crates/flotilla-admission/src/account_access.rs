@@ -14,8 +14,8 @@ use flotilla_agent::{
 use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     account_access::{
-        binding_name, requester_address, AccessName, AccountBinding, AccountBindingSpec, AccountProvision, BindingState, CredentialName,
-        EpochEntry, GrantName, GrantScope, Selection,
+        binding_name, requester_address, requester_parts, AccessName, AccountBinding, AccountBindingSpec, AccountProvision, BindingState,
+        CredentialName, EpochEntry, GrantName, GrantScope, Selection,
     },
     Convoy, ConvoyRepositorySpec, CredentialGrant, CredentialSpec, CrewSource, Host as ResourceHost, InputMeta, PlacementPolicy,
     PlacementPolicySpec, RandomSource, Repository, RepositoryKey, RepositoryTrust, ResourceError, ResourceObject, WorkflowTemplateSpec,
@@ -81,6 +81,21 @@ pub fn placement_environment_kind(spec: &PlacementPolicySpec, host: Option<&Reso
     } else {
         environment_kind::HOST_DIRECT
     }
+}
+
+/// The reason a candidate environment kind is refused: some requester's access has no plan
+/// there (#3881). The kind drops out of placement with this reason.
+pub fn plan_refusal(workflow: &WorkflowTemplateSpec, kind: &str) -> Result<Option<String>, String> {
+    let provisioners = AccountProvisioners::seeded();
+    for requester in requesters(workflow)? {
+        let provisioner = provisioners
+            .for_access(&requester.access)
+            .ok_or_else(|| format!("no registered implementation supplies `{}` for role `{}`", requester.access, requester.role))?;
+        if let Err(reason) = provisioner.plan(kind) {
+            return Ok(Some(format!("role `{}` needs `{}`: {reason}", requester.role, requester.access)));
+        }
+    }
+    Ok(None)
 }
 
 /// The requesters in a workflow whose items declare account access.
@@ -235,7 +250,7 @@ pub fn check_placement(
         if let Some(held) = held {
             for name in alternative.candidates.keys() {
                 if !held.contains(&name.0) {
-                    alternative.exclusions.insert(name.clone(), format!("not held by host `{host_label}`"));
+                    alternative.exclusions.insert(name.clone(), format!("host `{host_label}` does not hold it"));
                 }
             }
         }
@@ -584,20 +599,6 @@ async fn close(
         .map_err(|error| format!("update account binding `{}`: {error}", binding.metadata.name))
 }
 
-/// The convoy and role a requester address names.
-pub fn requester_parts(requester: &flotilla_schema::Address) -> Option<(String, String)> {
-    let mut convoy = None;
-    let mut role = None;
-    for segment in requester.segments() {
-        match segment.kind() {
-            flotilla_address::Kind::Convoy => convoy = Some(segment.value().to_string()),
-            flotilla_address::Kind::Role => role = Some(segment.value().to_string()),
-            _ => {}
-        }
-    }
-    convoy.zip(role)
-}
-
 /// An explicit rebind (#3882 lifecycle): the old binding is closed and kept under a retired
 /// name for attribution, and a new one opens by pin or draw under the requester's name. Its
 /// places see the new opening, remove the old copies and start a fresh harness session.
@@ -650,17 +651,6 @@ pub async fn rebind(
     Ok(opened.spec)
 }
 
-/// How a binding was chosen, for display: `pinned by <who>` or `drawn: <i> of <n> usable`.
-pub fn describe_selection(binding: &AccountBindingSpec) -> String {
-    match &binding.selection {
-        Selection::Pin { pinned_by } => format!("pinned by {pinned_by}"),
-        Selection::Draw { index } => {
-            let usable = binding.candidates.iter().filter(|name| !binding.exclusions.contains_key(*name)).count();
-            format!("drawn: {} of {usable} usable", index + 1)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use flotilla_resources::SeededRandom;
@@ -688,7 +678,7 @@ mod tests {
                     )
                 })
                 .collect(),
-            exclusions: excluded.iter().map(|name| (CredentialName((*name).into()), "not held by host `b1`".into())).collect(),
+            exclusions: excluded.iter().map(|name| (CredentialName((*name).into()), "host `b1` does not hold it".into())).collect(),
         }
     }
 
@@ -721,7 +711,7 @@ mod tests {
         );
         assert_eq!(
             select(&set, Some(("box-b", CONVOY_START_PIN)), &random).expect_err("excluded"),
-            "account pin `box-b` for role `coder` is refused: not held by host `b1`"
+            "account pin `box-b` for role `coder` is refused: host `b1` does not hold it"
         );
     }
 
