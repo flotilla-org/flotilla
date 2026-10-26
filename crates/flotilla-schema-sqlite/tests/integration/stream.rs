@@ -171,7 +171,9 @@ fn generated_partition_resume(tc: hegel::TestCase) {
 // per-resource protocol. The generator selects among all fixture kinds and their full shapes.
 #[hegel::test]
 fn snapshot_frames_preserve_all_kind_shapes(tc: hegel::TestCase) {
-    use crate::fixtures::{AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Pick, Referral, TerminalSession, Ticket, Vessel};
+    use crate::fixtures::{
+        AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Person, Pick, Referral, TerminalSession, Ticket, Vessel,
+    };
     fn check<K: Fixture>(tc: &hegel::TestCase) {
         let mut a = store("a");
         let mut b = store("b");
@@ -197,7 +199,7 @@ fn snapshot_frames_preserve_all_kind_shapes(tc: hegel::TestCase) {
         let id = read.resolve(K::CODE, "m", "a").expect("identity").expect("id");
         assert_eq!(read.load_snapshot(id).expect("snapshot"), expected);
     }
-    match tc.draw(gs::integers::<u8>().max_value(9)) {
+    match tc.draw(gs::integers::<u8>().max_value(10)) {
         0 => check::<Resource<Message>>(&tc),
         1 => check::<Resource<Convoy>>(&tc),
         2 => check::<Resource<Ensure>>(&tc),
@@ -207,6 +209,7 @@ fn snapshot_frames_preserve_all_kind_shapes(tc: hegel::TestCase) {
         6 => check::<Ticket>(&tc),
         7 => check::<Dossier>(&tc),
         8 => check::<Resource<AwaitingReply>>(&tc),
+        9 => check::<Resource<Person>>(&tc),
         _ => check::<Referral>(&tc),
     }
 }

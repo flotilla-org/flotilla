@@ -79,6 +79,14 @@ impl InProcessDaemon {
                     .in_reply_to(message.clone())
                     .build();
                 let name = flotilla_address::message_record_name(&reply.receiver, &reply.sender, &format!("answer:{message}"));
+                // One answer per message: repeating it is a no-op, and a different one is refused
+                // rather than dropped by the engine's keyed admission.
+                if let Some(sent) = primitives.view(&namespace, &name).await.map_err(|error| error.to_string())? {
+                    if sent.object.spec.body != reply.body {
+                        return Err(format!("message `{message}` was already answered as `{name}`; one answer per message"));
+                    }
+                    return Ok(CommandValue::Ok);
+                }
                 self.publish_message(&namespace, &name, &reply).await?;
                 Ok(CommandValue::Ok)
             }

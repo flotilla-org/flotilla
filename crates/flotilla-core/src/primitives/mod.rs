@@ -466,10 +466,14 @@ impl MessagePrimitives {
     /// Registers the person consumer: its record exists, and the inbox writes
     /// its receipts there.
     pub async fn register_person(&self, now: Timestamp) -> Result<Receiver, String> {
+        let consumer = self.person();
+        // Registered consumers already have their record; skip the blocking hop.
+        if self.consumers.lock().expect("consumers").contains(&consumer) {
+            return Ok(consumer);
+        }
         let people = Arc::clone(&self.people);
         // A SQLite write: off the async workers.
         tokio::task::spawn_blocking(move || people.ensure(PERSON, now)).await.map_err(|error| error.to_string())??;
-        let consumer = self.person();
         if self.consumers.lock().expect("consumers").insert(consumer.clone()) {
             let port = PersonReceipts { people: Arc::clone(&self.people), name: PERSON.to_owned(), scope: self.receipts.receipt_scope() };
             if let Err(error) = self.inbox.register_async(consumer.clone(), port).await {

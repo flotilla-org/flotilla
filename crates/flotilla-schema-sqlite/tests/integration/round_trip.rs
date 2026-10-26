@@ -7,8 +7,8 @@ use hegel::{generators as gs, TestCase};
 
 use crate::fixtures::terminal::Terminal;
 use crate::fixtures::{
-    origin, store, AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession,
-    Ticket, Vessel, LOCAL,
+    origin, store, AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource,
+    TerminalSession, Ticket, Vessel, LOCAL,
 };
 
 /// Inserts `first`, then evolves it through `steps` writes: mostly generated edges, and a spec
@@ -88,6 +88,11 @@ fn agent_session_evolves_by_edges_and_spec_edits(tc: TestCase) {
 }
 
 #[hegel::test]
+fn person_evolves_by_edges_and_spec_edits(tc: TestCase) {
+    drawn::<Resource<Person>>(&tc);
+}
+
+#[hegel::test]
 fn awaiting_reply_evolves_by_edges_and_spec_edits(tc: TestCase) {
     drawn::<Resource<AwaitingReply>>(&tc);
 }
@@ -131,6 +136,7 @@ fn ticket_evolves_by_transitions_and_spec_edits(tc: TestCase) {
 fn every_variant_round_trips_and_switches_through_writes(tc: TestCase) {
     covering::<Resource<Message>>(&tc);
     covering::<Resource<AgentSession>>(&tc);
+    covering::<Resource<Person>>(&tc);
     covering::<Resource<AwaitingReply>>(&tc);
     covering::<Resource<Convoy>>(&tc);
     covering::<Resource<Ensure>>(&tc);

@@ -17,6 +17,10 @@ pub enum StoreError {
     /// would read as empty rather than fail; reject it at open.
     #[error("kind table {table} has columns {found:?}, not {expected:?}: the database predates this schema and has no migration; open a new store")]
     KindTableDrift { table: String, expected: Vec<String>, found: Vec<String> },
+    /// A kind table's stored CHECK on a coded column predates codes its kind now declares, such as
+    /// `message.receiver_kind` before the Person consumer (#3938). Opening cannot change a CHECK.
+    #[error("kind table {table} column {column} refuses codes {missing:?}: the database predates this schema and has no migration; open a new store")]
+    KindCodeDrift { table: String, column: String, missing: Vec<String> },
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]

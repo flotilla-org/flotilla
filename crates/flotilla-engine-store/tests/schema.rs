@@ -62,3 +62,28 @@ fn convoy_store_codes_are_the_production_codes() {
         assert_eq!(held.map(|set| set.kind.as_str()), Some(kind.kind.as_str()), "{} has no production code", kind.kind);
     }
 }
+
+// Behaviour (#3938): a decided store created before the Person consumer keeps the old CHECK on
+// `message.receiver_kind`, which opening cannot change. It is refused at open, naming the codes,
+// rather than at a person's first acknowledgement; a current store opens.
+#[test]
+fn a_store_whose_receiver_kinds_predate_the_person_consumer_is_refused_at_open() {
+    use flotilla_schema_sqlite::{Store, StoreError};
+    let current = schema_ddl(&registry().expect("registry"), DdlMode::IfNotExists);
+    let previous = current.replace(
+        r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'co', 'pe'))"#,
+        r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'co'))"#,
+    );
+    assert_ne!(previous, current, "the previous generation's CHECK is reconstructed");
+    let connection = rusqlite::Connection::open_in_memory().expect("connection");
+    connection.execute_batch(&previous).expect("previous schema");
+    match Store::open(connection, "home", registry().expect("registry")) {
+        Err(StoreError::KindCodeDrift { table, column, missing }) => {
+            assert_eq!((table.as_str(), column.as_str(), missing), ("message", "receiver_kind", vec!["pe".to_owned()]));
+        }
+        other => panic!("refused at open, not {:?}", other.map(|_| "opened")),
+    }
+    let connection = rusqlite::Connection::open_in_memory().expect("connection");
+    connection.execute_batch(&current).expect("current schema");
+    Store::open(connection, "home", registry().expect("registry")).expect("a current store opens");
+}

@@ -20,7 +20,8 @@ use crate::fixtures::{
     engine::{step, NAME},
     ensure, message, origin, registry, store,
     synthetic::{workflow, Deliverable, DeliverableState, Evidence, InputValue, PromiseKind, PromiseSource},
-    AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, Vessel, LOCAL,
+    AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource, TerminalSession, Vessel,
+    LOCAL,
 };
 
 fn evidence(reference: &str) -> Evidence {
@@ -328,6 +329,7 @@ fn owned_rows_in(conn: &Connection, table: &Table) -> i64 {
 fn deleting_a_resource_empties_every_table(tc: TestCase) {
     delete_cascades::<Resource<Message>>(&tc);
     delete_cascades::<Resource<AgentSession>>(&tc);
+    delete_cascades::<Resource<Person>>(&tc);
     delete_cascades::<Resource<AwaitingReply>>(&tc);
     delete_cascades::<Resource<Convoy>>(&tc);
     delete_cascades::<Resource<Ensure>>(&tc);

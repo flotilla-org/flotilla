@@ -697,7 +697,19 @@ async fn on_the_engine_a_stall_past_every_supervisor_reaches_the_projects_operat
         message: item.message.clone(),
         body: "Carry on with the stable API.".into(),
     };
-    assert_eq!(fleet.execute_as_operator(answer).await, CommandValue::Ok);
+    assert_eq!(fleet.execute_as_operator(answer.clone()).await, CommandValue::Ok);
+    assert_eq!(fleet.execute_as_operator(answer).await, CommandValue::Ok, "the same answer again is the reply already sent");
+    let CommandValue::Error { message } = fleet
+        .execute_as_operator(CommandAction::PersonAnswer {
+            namespace: Some(NAMESPACE.into()),
+            message: item.message.clone(),
+            body: "A different answer.".into(),
+        })
+        .await
+    else {
+        panic!("a different answer to the same message is refused")
+    };
+    assert!(message.contains("already answered"), "{message}");
     let reply = primitives
         .messages()
         .expect("engine messages")

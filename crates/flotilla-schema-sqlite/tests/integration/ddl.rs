@@ -90,6 +90,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "message",
             "message_references",
             "objects",
+            "person",
             "referral",
             "referral_references",
             "resource_identity",
