@@ -141,7 +141,8 @@
     "kind": "entity",
     "value": {
       "id": "dev/manifest-extraction/implement@feta",
-      "kind": "vessel"
+      "kind": "vessel",
+      "provider": ""
     }
   },
   "type": "metadata-patch",

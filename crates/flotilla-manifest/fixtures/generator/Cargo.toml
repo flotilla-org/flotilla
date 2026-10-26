@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-andamento-shared = { path = "../../../../../andamento/crates/andamento-shared" }
+wheelhouse-core = { path = "../../../../../wheelhouse/crates/wheelhouse-core" }
 serde_json = "1"
 
 [workspace]

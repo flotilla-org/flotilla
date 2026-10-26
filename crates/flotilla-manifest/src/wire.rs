@@ -1,13 +1,8 @@
-//! Mirror of andamento's metadata-patch wire types.
+//! Mirror of wheelhouse-core's metadata-patch wire types.
 //!
-//! Existing value kinds replicate `andamento-shared`'s serde exactly (verified
-//! by the fixture round-trip tests in this module — fixtures are generated from
-//! andamento's real serde, see `fixtures/README.md`). `entity-refs` is the
-//! coordinated next wire kind for andamento and wheelhouse. They are a deliberate
-//! v0 stopgap: at the Leg-1 manifest extraction this module is deleted and
-//! replaced by a dependency on the shared `flotilla-org/manifest` crate.
-//! Never hand-tune a serde attribute here to make a test pass — regenerate
-//! the fixtures against andamento and match what it actually speaks.
+//! Serde shapes follow wheelhouse-core, verified by round-trip tests against
+//! generated fixtures (see `fixtures/README.md`). Regenerate fixtures from
+//! Wheelhouse rather than hand-tuning serde attributes to make tests pass.
 //!
 //! # Flotilla fact dialect v1
 //!
@@ -100,6 +95,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub use crate::entity::EntityRef;
+
+mod workspace_id;
+pub use workspace_id::WorkspaceId;
 
 /// A metadata fact value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -270,7 +268,7 @@ pub enum PaneTarget {
 pub enum MetadataTarget {
     Root,
     Pane(PaneTarget),
-    Tab(u64),
+    Tab(WorkspaceId),
     Entity(EntityRef),
     Identity(MetadataIdentity),
 }

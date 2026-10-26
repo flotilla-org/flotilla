@@ -18,7 +18,7 @@ use crate::{
         KEY_ATTACH_REF, KEY_CONVOY, KEY_CREW_ROLE, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_HOST, KEY_NAMESPACE, KEY_SESSION, KEY_SOURCE,
         KEY_VESSEL, SOURCE_ACTUATOR, SOURCE_ATTACH, SOURCE_FLOTILLA,
     },
-    wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate, PaneTarget},
+    wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate, PaneTarget, WorkspaceId},
 };
 
 /// Parse a pane id as PMs expose it to child processes: a plain integer
@@ -83,7 +83,7 @@ pub struct WorkspaceStamp {
 
 /// The Tab-target patch published after workspace creation. No TTL — the
 /// stamp is a fact about the tab, not about any daemon being alive.
-pub fn tab_stamp(tab_id: u64, stamp: &WorkspaceStamp) -> MetadataPatch {
+pub fn tab_stamp(tab_id: WorkspaceId, stamp: &WorkspaceStamp) -> MetadataPatch {
     let mut set = BTreeMap::new();
     set.insert(KEY_SOURCE.to_owned(), MetadataValueUpdate::new(MetadataValue::text(SOURCE_FLOTILLA), None));
     set.insert(KEY_ENTITY_KIND.to_owned(), MetadataValueUpdate::new(MetadataValue::text(stamp.entity.kind.clone()), None));
@@ -134,9 +134,9 @@ mod tests {
     fn tab_stamp_carries_kind_and_canonical_entity_without_ttl() {
         use crate::keys::{KEY_SOURCE, SOURCE_ACTUATOR, SOURCE_FLOTILLA};
         let stamp = WorkspaceStamp { entity: entity::vessel("dev", "manifest-extraction", "implement", "feta") };
-        let patch = tab_stamp(7, &stamp);
+        let patch = tab_stamp("01920a6b-7c3d-7e4f-8a1b-2c3d4e5f6a7b".parse().unwrap(), &stamp);
 
-        assert_eq!(patch.target, MetadataTarget::Tab(7));
+        assert_eq!(patch.target, MetadataTarget::Tab("01920a6b-7c3d-7e4f-8a1b-2c3d4e5f6a7b".parse().unwrap()));
         assert_eq!(patch.source_id, SOURCE_ACTUATOR);
         assert_eq!(patch.set[KEY_ENTITY_KIND].value, MetadataValue::text("vessel"));
         assert_eq!(patch.set[KEY_ENTITY_ID].value, MetadataValue::text("dev/manifest-extraction/implement@feta"));
