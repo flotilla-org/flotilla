@@ -154,6 +154,21 @@ impl EngineConvoys for ConvoyEngine {
         if self.convoys.get(&name).is_some_and(|current| holds_generation(convoy, &current)) {
             return Ok(Admission::Held);
         }
+        if standing {
+            // Ensure only replaces terminal old generations. A controller may
+            // still hold an Active snapshot of one: consult its current source
+            // before letting it replace a newer ended engine generation.
+            let latest = self
+                .backend
+                .clone()
+                .using::<OldConvoy>(&convoy.metadata.namespace)
+                .get(&convoy.metadata.name)
+                .await
+                .map_err(|error| error.to_string())?;
+            if latest.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+                return Ok(Admission::Skipped(SkipReason::Decided("the stored standing generation has ended".into())));
+            }
+        }
         let Some(status) = convoy.status.as_ref().filter(|status| status.workflow_snapshot.is_some()) else {
             return Ok(Admission::Skipped(SkipReason::NotBootstrapped));
         };

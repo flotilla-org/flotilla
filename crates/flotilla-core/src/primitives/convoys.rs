@@ -164,7 +164,12 @@ impl Convoys {
         home.evict(name);
         // Restore only refuses an existing name. The writer lock is still held
         // and that name was just evicted, so it cannot fail after this commit.
-        home.restore(Resource::stored(name, resource.spec().clone(), resource.stored_state().clone(), Version(version)))?;
+        home.restore(Resource::stored(name, resource.spec().clone(), resource.stored_state().clone(), Version(version))).map_err(
+            |error| {
+                tracing::error!(convoy = name, ?error, "committed standing generation could not be restored to its resident home");
+                error
+            },
+        )?;
         Ok(true)
     }
 
