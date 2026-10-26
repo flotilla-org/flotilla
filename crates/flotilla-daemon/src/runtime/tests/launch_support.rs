@@ -43,6 +43,36 @@ pub(super) async fn bind_account(backend: &ResourceBackend, convoy: &str, role: 
         .expect("account binding");
 }
 
+/// As [`bind_account`], but the binding is a replica from another home, opened `ahead` later on
+/// that home's clock than this host's.
+pub(super) async fn bind_account_from_home(
+    backend: &ResourceBackend,
+    home: &str,
+    convoy: &str,
+    role: &str,
+    credential: &str,
+    ahead: chrono::Duration,
+) {
+    let source = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    bind_account(&source, convoy, role, credential, "box-a@example.com").await;
+    let bindings = source.using::<flotilla_resources::AccountBinding>(NAMESPACE);
+    let mut binding = bindings.list().await.expect("bindings").items.remove(0);
+    binding.spec.opened_at = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + ahead));
+    bindings
+        .update(
+            &InputMeta::builder().name(binding.metadata.name.clone()).labels(binding.metadata.labels.clone()).build(),
+            &binding.metadata.resource_version,
+            &binding.spec,
+        )
+        .await
+        .expect("skewed opening");
+    backend
+        .replica_writer::<flotilla_resources::AccountBinding>(flotilla_protocol::NodeId::new(home), NAMESPACE)
+        .replace(&bindings.list().await.expect("bindings"), chrono::Utc::now())
+        .await
+        .expect("replicate binding");
+}
+
 /// The token prefix a bound Claude launch starts with.
 pub(super) fn claude_token_prefix(home: &str) -> String {
     format!("CLAUDE_CODE_OAUTH_TOKEN=\"$(cat -- '{home}/.flotilla-oauth-token')\" ")

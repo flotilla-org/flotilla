@@ -777,6 +777,15 @@ async fn a_supply_setting_a_family_account_variable_is_a_host_configuration_erro
 /// A Claude crew on an agentless host bound to `claude-box-a`, whose token is the host-local
 /// file `token`: launched once, with its TerminalSession recorded.
 async fn bound_agentless_crew(token: &Path) -> (AgentlessRuntime, Arc<FakeHost>, flotilla_test_support::TestSocketDir) {
+    bound_agentless_crew_with(token, None).await
+}
+
+/// As [`bound_agentless_crew`], with the binding replicated from another home whose clock runs
+/// `skew` ahead of this host's.
+async fn bound_agentless_crew_with(
+    token: &Path,
+    skew: Option<(&str, chrono::Duration)>,
+) -> (AgentlessRuntime, Arc<FakeHost>, flotilla_test_support::TestSocketDir) {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
     let bag = EnvironmentBag::new()
@@ -812,7 +821,10 @@ async fn bound_agentless_crew(token: &Path) -> (AgentlessRuntime, Arc<FakeHost>,
         )
         .await
         .expect("box account declaration");
-    bind_account(&backend, "demo", "coder", "claude-box-a", "box-a@example.com").await;
+    match skew {
+        None => bind_account(&backend, "demo", "coder", "claude-box-a", "box-a@example.com").await,
+        Some((home, ahead)) => bind_account_from_home(&backend, home, "demo", "coder", "claude-box-a", ahead).await,
+    }
     backend.using::<TerminalSession>(NAMESPACE).create(&empty_meta("terminal-demo-work-coder"), &runtime.spec).await.expect("session");
     runtime.launch().await.expect("bound launch");
     (runtime, host, runtime_dir)
@@ -945,4 +957,24 @@ async fn a_restart_keeps_the_account_and_a_gone_place_is_swept() {
     assert_eq!(provisions.iter().map(|record| record.spec.place.as_str()).collect::<Vec<_>>(), [ENVIRONMENT]);
     let binding = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE).get(BINDING).await.expect("binding").spec;
     assert_eq!(binding.credential.0, "claude-box-a");
+}
+
+// Review #3910: a binding homed on another daemon whose clock runs ahead of this place is still
+// delivered from its replica, and the place pass never mistakes the fresh copy for one made
+// before the binding opened.
+#[tokio::test]
+async fn a_replica_binding_from_a_clock_ahead_keeps_its_fresh_copy() {
+    let tokens = TempDir::new().expect("token dir");
+    let token = tokens.path().join("box-a");
+    fs::write(&token, "box-a-token").expect("token");
+    let (runtime, host, _runtime_dir) = bound_agentless_crew_with(&token, Some(("udder-root", chrono::Duration::hours(1)))).await;
+    let backend = runtime.daemon.resource_backend();
+    let delivered = provision(&backend).await.expect("provision recorded at launch");
+    assert_eq!(delivered.binding.home, "udder-root", "the provision names the binding's home");
+
+    reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
+
+    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
+    assert_eq!(provision(&backend).await, Some(delivered));
+    assert!(backend.using::<TerminalSession>(NAMESPACE).get("terminal-demo-work-coder").await.is_ok(), "the session keeps running");
 }

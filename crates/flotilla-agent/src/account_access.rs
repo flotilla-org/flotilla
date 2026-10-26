@@ -214,9 +214,18 @@ impl AccountProvisioner for ClaudeDirect {
     }
 }
 
-/// One path component from a name: anything but ASCII alphanumerics, `-` and `_` becomes `-`.
+/// One path component from a name, injectively: a name of ASCII alphanumerics, `-` and `_`
+/// is used as it is; any other name has the rest replaced by `-` and a digest of the whole name
+/// appended, so `a.b` and `a-b` can never share a requester's home.
 fn component(name: &str) -> String {
-    name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect()
+    use sha2::{Digest, Sha256};
+    let plain = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    if !name.is_empty() && name.chars().all(plain) {
+        return name.to_string();
+    }
+    let sanitized = name.chars().map(|c| if plain(c) { c } else { '-' }).collect::<String>();
+    let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
+    format!("{sanitized}.{}", &digest[..12])
 }
 
 /// The shell prefix that hands the delivered token to the Claude process as it starts.
@@ -253,6 +262,18 @@ mod tests {
         assert_eq!(ClaudeDirect.supplies(&CredentialConsumer::Claude), None);
         assert!(AccountProvisioners::seeded().supplies_any(&oauth));
         assert!(!AccountProvisioners::seeded().supplies_any(&CredentialConsumer::Codex));
+    }
+
+    // Review #3910: requesters whose names differ only in characters a path cannot carry get
+    // different homes; plain names are kept as they are.
+    #[test]
+    fn requester_homes_never_collide() {
+        let base = Path::new("/base");
+        let home = |convoy: &str, role: &str| ClaudeDirect.home(base, convoy, role);
+        assert_eq!(home("convoy-1", "coder"), "/base/agent-homes/requesters/convoy-1/coder/claude");
+        let homes = [home("a.b", "coder"), home("a-b", "coder"), home("a/b", "coder"), home("a-b", "x.y"), home("a-b", "x-y")];
+        assert_eq!(homes.iter().collect::<std::collections::BTreeSet<_>>().len(), homes.len(), "{homes:?}");
+        assert!(homes.iter().all(|home| !home.contains("..") && home.matches('/').count() == 6), "{homes:?}");
     }
 
     #[test]

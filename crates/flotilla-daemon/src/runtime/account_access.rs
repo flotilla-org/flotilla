@@ -36,12 +36,17 @@ pub(super) async fn place_environment_kind(state: &ControllerRuntimeState, launc
         return Ok(environment_kind::HOST_DIRECT);
     }
     let environment = state.daemon.resource_backend().including_replicas::<Environment>(launch.namespace).get(launch.env_ref).await;
-    Ok(match environment {
-        Ok(environment) if environment.object.spec.cloud_sandbox.is_some() => environment_kind::CLOUD_SANDBOX,
-        Ok(environment) if environment.object.spec.host_direct.is_some() => environment_kind::HOST_DIRECT,
-        Ok(_) | Err(ResourceError::NotFound { .. }) => environment_kind::DOCKER,
-        Err(error) => return Err(error.to_string()),
-    })
+    match environment {
+        Ok(environment) if environment.object.spec.cloud_sandbox.is_some() => Ok(environment_kind::CLOUD_SANDBOX),
+        Ok(environment) if environment.object.spec.host_direct.is_some() => Ok(environment_kind::HOST_DIRECT),
+        Ok(environment) if environment.object.spec.docker.is_some() => Ok(environment_kind::DOCKER),
+        // A shape this code does not know gets no plan: it never plans as Docker by default.
+        Ok(_) => Err(format!("environment `{}` has a shape no account plan knows", launch.env_ref)),
+        // Agentless and host-direct places are recognised above; a provisioned vessel whose
+        // Environment record is not readable here is treated as a container vessel.
+        Err(ResourceError::NotFound { .. }) => Ok(environment_kind::DOCKER),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Deliver the requester's bound account into its home at this place and record the provision.
@@ -83,21 +88,36 @@ pub(super) async fn deliver_bound_account(
     let credential = &binding.object.spec.credential.0;
     let (declaration, material) = store.account_material(credential).await?;
     let home = provisioner.home(&store.writable_base(&*runner).await?, launch.convoy, launch.role);
-    let env = provisioner.deliver(&home, &material, &*runner).await?;
-    let provision = AccountProvisionSpec {
+    let record = provision_name(&name, launch.env_ref);
+    let mut provision = AccountProvisionSpec {
         binding: Ref::new(name.clone(), binding_home),
         place: launch.env_ref.to_string(),
         environment_kind: kind.to_string(),
         plan,
-        home,
-        delivered: Some(Delivered {
-            epoch: declaration.authorization_epoch.to_string(),
-            generation: material_generation(&material),
-            at: Timestamp::from_datetime(&chrono::Utc::now()),
-        }),
+        home: home.clone(),
+        delivered: None,
     };
-    record_provision(state, launch.namespace, &provision_name(&name, launch.env_ref), &provision).await?;
+    // Record the place before writing material there, so a copy is never left without a
+    // record the place pass would withdraw.
+    record_provision(state, launch.namespace, &record, &provision).await?;
+    let env = provisioner.deliver(&home, &material, &*runner).await?;
+    provision.delivered = Some(Delivered {
+        epoch: declaration.authorization_epoch.to_string(),
+        generation: material_generation(&material),
+        at: delivered_at(&binding.object.spec),
+    });
+    record_provision(state, launch.namespace, &record, &provision).await?;
     Ok(env)
+}
+
+/// When a delivery under `binding` happened, for the place pass's "delivered before the binding
+/// opened" check. Never earlier than the binding's own opening, so clock skew between the
+/// binding's home and this place can never make a fresh copy look stale. A rebind is noticed
+/// once its opening, on the home's clock, passes the last delivery's recorded time; a home
+/// clock behind this place's delays that, and a new account's material is still pushed as a
+/// new generation meanwhile.
+fn delivered_at(binding: &flotilla_resources::AccountBindingSpec) -> Timestamp {
+    Timestamp::from_datetime(&chrono::Utc::now()).max(binding.opened_at)
 }
 
 /// One provision record per (binding, place).
@@ -181,12 +201,13 @@ async fn delete_provision(provisions: &flotilla_store::TypedResolver<AccountProv
     }
 }
 
-/// The requester's crew sessions at a place.
+/// The requester's crew sessions at a place: those whose convoy, role and access name this
+/// binding. Matching by the derived name, not by parsing it, holds whatever the names contain.
 async fn requester_sessions(
     state: &ControllerRuntimeState,
     namespace: &str,
-    convoy: &str,
-    role: &str,
+    binding: &str,
+    access: &AccessName,
     place: &str,
 ) -> Result<Vec<flotilla_resources::ResourceObject<flotilla_resources::TerminalSession>>, String> {
     let sessions = state
@@ -200,9 +221,12 @@ async fn requester_sessions(
         .items
         .into_iter()
         .filter(|session| {
-            session.spec.role == role
-                && session.spec.env_ref == place
-                && matches!(&session.spec.source, flotilla_resources::TerminalSessionSource::Agent { context, .. } if context.convoy == convoy)
+            session.spec.env_ref == place
+                && matches!(
+                    &session.spec.source,
+                    flotilla_resources::TerminalSessionSource::Agent { context, .. }
+                        if binding_name(&context.convoy, &session.spec.role, access) == binding
+                )
         })
         .collect())
 }
@@ -227,14 +251,12 @@ async fn withdraw(
     spec: &AccountProvisionSpec,
     provisioners: &AccountProvisioners,
 ) -> Result<(), String> {
-    let Some((convoy, role)) = provision_requester(&spec.binding.name) else {
-        return Err(format!("provision for `{}` names no requester", spec.binding.name));
-    };
-    let sessions = requester_sessions(state, namespace, &convoy, &role, &spec.place).await?;
-    let runner = place_runner(state, &sessions, &spec.place).await?;
     let implementation = provisioners
         .for_implementation(&spec.plan.implementation)
         .ok_or_else(|| format!("no registered implementation `{}` to remove its copy", spec.plan.implementation))?;
+    let access = AccessName(implementation.access().to_string());
+    let sessions = requester_sessions(state, namespace, &spec.binding.name, &access, &spec.place).await?;
+    let runner = place_runner(state, &sessions, &spec.place).await?;
     implementation.remove(&spec.home, &*runner).await?;
     let terminal_sessions = state.daemon.resource_backend().using::<flotilla_resources::TerminalSession>(namespace);
     for session in sessions {
@@ -244,15 +266,6 @@ async fn withdraw(
         }
     }
     Ok(())
-}
-
-/// The convoy and role a binding name (`<convoy>.<role>.<access>`) belongs to.
-fn provision_requester(binding: &str) -> Option<(String, String)> {
-    let mut parts = binding.rsplitn(3, '.');
-    let _access = parts.next()?;
-    let role = parts.next()?;
-    let convoy = parts.next()?;
-    Some((convoy.to_string(), role.to_string()))
 }
 
 /// Push a new material generation or epoch into the home (#3881 update mode push).
@@ -272,15 +285,15 @@ async fn push_generation(
     if generation == delivered.generation && epoch == delivered.epoch {
         return Ok(());
     }
-    let Some((convoy, role)) = provision_requester(&spec.binding.name) else { return Ok(()) };
-    let sessions = requester_sessions(state, namespace, &convoy, &role, &spec.place).await?;
-    let runner = place_runner(state, &sessions, &spec.place).await?;
     let implementation = provisioners
         .for_implementation(&spec.plan.implementation)
         .ok_or_else(|| format!("no registered implementation `{}` to push its generation", spec.plan.implementation))?;
+    let access = AccessName(implementation.access().to_string());
+    let sessions = requester_sessions(state, namespace, &spec.binding.name, &access, &spec.place).await?;
+    let runner = place_runner(state, &sessions, &spec.place).await?;
     implementation.deliver(&spec.home, &material, &*runner).await?;
     let mut updated = spec.clone();
-    updated.delivered = Some(Delivered { epoch, generation, at: Timestamp::from_datetime(&chrono::Utc::now()) });
+    updated.delivered = Some(Delivered { epoch, generation, at: delivered_at(&binding.spec) });
     state
         .daemon
         .resource_backend()
