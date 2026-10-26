@@ -3554,5 +3554,149 @@ fn inconsistent_held_receiver_does_not_block_another_receiver(tc: hegel::TestCas
         assert!(condition.is_controller_fence_unverifiable(), "failure recording preserves known-unsent proof");
         assert_eq!(condition.observed_at, at(20));
         assert_eq!(condition.consecutive_failures, 1);
+        // Persistent errors are idempotent: no self-triggering Message or gate writes.
+        let versions = messages
+            .list()
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .filter(|message| message.metadata.name.starts_with("message-"))
+            .map(|message| (message.metadata.name, message.metadata.resource_version))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let terminal_version = terminals.get("terminal").await.unwrap().metadata.resource_version;
+        let demands = backend.using::<Demand>("flotilla");
+        let gate = demands.get("terminal-delivery-terminal").await.unwrap();
+        inbox.reconcile_delivery(&router(&accepted), at(23)).await.unwrap();
+        for (name, version) in versions {
+            assert_eq!(messages.get(&name).await.unwrap().metadata.resource_version, version);
+        }
+        assert_eq!(terminals.get("terminal").await.unwrap().metadata.resource_version, terminal_version);
+        assert_eq!(demands.get(&gate.metadata.name).await.unwrap().metadata.resource_version, gate.metadata.resource_version);
+
+        // Repair clears both the receiver failure and its attention gate without
+        // disturbing the original receipt on the healthy receiver.
+        let broken = messages.get("message-0").await.unwrap();
+        let mut repaired = broken.status.unwrap();
+        repaired.failed_batch_members.retain(|name| name != "missing-member");
+        if let Some(submission) = repaired.submission.as_mut() {
+            submission.members.retain(|name| name != "missing-member");
+        }
+        messages.update_status("message-0", &broken.metadata.resource_version, &repaired).await.unwrap();
+        for now in [100, 200] {
+            inbox.reconcile_delivery(&router(&accepted), at(now)).await.unwrap();
+        }
+        for index in 0..3 {
+            let status = messages.get(&format!("message-{index}")).await.unwrap().status.unwrap();
+            assert!(status.resolved_receiver.is_some());
+            assert!(!status.reason.unwrap_or_default().contains("Message receiver pass failed:"));
+        }
+        assert!(terminals.get("terminal").await.unwrap().status.unwrap().degraded.is_none());
+        assert!(matches!(demands.get("terminal-delivery-terminal").await, Err(ResourceError::NotFound { .. })));
     });
+}
+
+// A permissive stored-row descriptor seeds corrupt legacy data in the real
+// memory store; production reads still use TerminalSession's strict decoder.
+#[derive(Debug, Clone)]
+struct LegacyTerminalRow;
+impl Resource for LegacyTerminalRow {
+    type Spec = serde_json::Value;
+    type Status = <flotilla_resources::TerminalSession as Resource>::Status;
+    type StatusPatch = <flotilla_resources::TerminalSession as Resource>::StatusPatch;
+    const API_PATHS: flotilla_resources::ApiPaths = <flotilla_resources::TerminalSession as Resource>::API_PATHS;
+    const QUERYABLE_FIELDS: &'static [&'static str] = <flotilla_resources::TerminalSession as Resource>::QUERYABLE_FIELDS;
+}
+
+// A malformed terminal's gate records its decode failure. An unrelated closed
+// gate retires in that same pass, and the bad gate clears after the row is removed.
+#[tokio::test]
+async fn malformed_terminal_gate_does_not_retain_healthy_gates() {
+    use flotilla_resources::*;
+    let (backend, inbox) = delivery_inbox().await;
+    let terminals = backend.using::<TerminalSession>("flotilla");
+    let healthy = terminals.get("terminal").await.unwrap();
+    let mut broken = healthy.clone();
+    broken.metadata.name = "broken".into();
+    broken.metadata.labels.insert(ROLE_LABEL.into(), "broken".into());
+    let raw = backend.using::<LegacyTerminalRow>("flotilla");
+    raw.create(&InputMeta::from(&broken.metadata), &serde_json::json!({"malformed": true})).await.unwrap();
+    // This idle terminal has no Messages whose receipt could clear its stale
+    // gate: only the cleanup pass can retire it.
+    let mut retiring_meta = InputMeta::from(&healthy.metadata);
+    retiring_meta.name = "retiring".into();
+    retiring_meta.labels.insert(ROLE_LABEL.into(), "retiring".into());
+    let retiring = terminals.create(&retiring_meta, &healthy.spec).await.unwrap();
+    let demands = backend.using::<Demand>("flotilla");
+    for holder in [&healthy, &broken, &retiring] {
+        let (meta, spec) = delivery_hold::delivery_demand(holder);
+        demands.create(&meta, &spec).await.unwrap();
+    }
+    let mut intent = spec(None, MessageExpectation::None);
+    intent.receiver = "flotilla/convoy/work/broken".into();
+    inbox.accept(&InputMeta::builder().name("broken-message".into()).build(), &intent, at(21)).await.unwrap();
+    let accepted = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "received".into() });
+    inbox.reconcile_delivery(&router(&accepted), at(22)).await.unwrap();
+    assert!(matches!(demands.get("terminal-delivery-terminal").await, Err(ResourceError::NotFound { .. })));
+    assert!(
+        matches!(demands.get("terminal-delivery-retiring").await, Err(ResourceError::NotFound { .. })),
+        "unrelated idle gate must retire despite malformed receiver"
+    );
+    let gate = demands.get("terminal-delivery-broken").await.unwrap();
+    let reason = &gate.metadata.annotations[delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION];
+    assert!(reason.contains("Message receiver gate cleanup failed:"), "{reason}");
+    assert!(reason.contains("decode"), "{reason}");
+    inbox.reconcile_delivery(&router(&accepted), at(23)).await.unwrap();
+    assert_eq!(demands.get("terminal-delivery-broken").await.unwrap().metadata.resource_version, gate.metadata.resource_version);
+    raw.delete("broken").await.unwrap();
+    inbox.reconcile_delivery(&router(&accepted), at(24)).await.unwrap();
+    assert!(demands.list().await.unwrap().items.is_empty());
+    let status = backend.using::<Message>("flotilla").get("broken-message").await.unwrap().status.unwrap();
+    assert!(!status.reason.unwrap_or_default().contains("Message receiver pass failed:"));
+}
+
+// A bad receiver cannot split healthy cross-alias FIFO batches when the shared
+// snapshot fails: both aliases still resolve and submit together in accepted order.
+#[tokio::test]
+async fn degraded_snapshot_preserves_cross_alias_batching() {
+    use flotilla_resources::*;
+    let (backend, inbox) = delivery_inbox_from(&[]).await;
+    backend
+        .definitions::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("flotilla".into()).build(),
+            &ProjectSpec::builder()
+                .display_name("Flotilla".into())
+                .role_definitions(std::collections::BTreeMap::from([(
+                    "reviewer".into(),
+                    RoleDefinition { adoptable: Some(true), ..Default::default() },
+                )]))
+                .build(),
+        )
+        .await
+        .unwrap();
+    let terminals = backend.using::<TerminalSession>("flotilla");
+    let holder = terminals.get("terminal").await.unwrap();
+    let mut meta = InputMeta::from(&holder.metadata);
+    meta.annotations.insert(ROLE_ADDRESS_ANNOTATION.into(), "flotilla/reviewer".into());
+    terminals.update(&meta, &holder.metadata.resource_version, &holder.spec).await.unwrap();
+    for (index, receiver) in ["flotilla/reviewer", "flotilla/convoy/work/coder", "flotilla/reviewer"].iter().enumerate() {
+        let mut intent = spec(None, MessageExpectation::None);
+        intent.receiver = (*receiver).into();
+        intent.body = format!("alias-{index}");
+        inbox.accept(&InputMeta::builder().name(format!("alias-{index}")).build(), &intent, at(10)).await.unwrap();
+    }
+    let mut broken_meta = InputMeta::from(&holder.metadata);
+    broken_meta.name = "broken".into();
+    broken_meta.labels.insert(ROLE_LABEL.into(), "broken".into());
+    backend.using::<LegacyTerminalRow>("flotilla").create(&broken_meta, &serde_json::json!({"malformed": true})).await.unwrap();
+    let mut bad = spec(None, MessageExpectation::None);
+    bad.receiver = "flotilla/convoy/work/broken".into();
+    inbox.accept(&InputMeta::builder().name("broken-message".into()).build(), &bad, at(10)).await.unwrap();
+    let accepted = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "received".into() });
+    inbox.reconcile_delivery(&router(&accepted), at(22)).await.unwrap();
+    let batches = accepted.submissions.lock().unwrap();
+    assert_eq!(batches.len(), 1, "healthy aliases share one transport attempt");
+    assert!(batches[0].find("alias-0").unwrap() < batches[0].find("alias-1").unwrap());
+    assert!(batches[0].find("alias-1").unwrap() < batches[0].find("alias-2").unwrap());
 }

@@ -608,34 +608,33 @@ mod message_health_tests {
     // absent, healthy and unrelated controller conditions must not do so.
     #[test]
     fn message_controller_attention_tracks_durable_health() {
-        // Exhaust absent, healthy and failed states for supervision, watchdog and unrelated controllers.
-        for present in [false, true] {
-            for condition_type in ["Controller/Message", "ControllerLoop/Message", "Controller/Checkout"] {
-                let message = condition_type != "Controller/Checkout";
-                for failed in [false, true] {
-                    let mut status = ResourceHostStatus::default();
-                    if present {
-                        status.conditions.push(
-                            flotilla_resources::HostCondition::builder()
-                                .condition_type(condition_type)
-                                .value(if failed {
-                                    flotilla_resources::ConditionValue::False
-                                } else {
-                                    flotilla_resources::ConditionValue::True
-                                })
-                                .reason("RestartBudgetExhausted")
-                                .message("Message controller exhausted its restart budget")
-                                .observed_at(Utc::now())
-                                .blocks_forge_observation(false)
-                                .build(),
-                        );
-                    }
-                    assert_eq!(message_controller_failure(&status).is_some(), present && message && failed);
-                    if let Some(condition) = message_controller_failure(&status) {
-                        assert!(condition.message.contains("Message controller"));
-                        assert_eq!(condition.reason, "RestartBudgetExhausted");
-                    }
-                }
+        use flotilla_resources::ConditionValue::{False, True};
+        assert!(message_controller_failure(&ResourceHostStatus::default()).is_none());
+        // Literal expectations cover both Message health producers, healthy
+        // observations, and an unrelated unhealthy controller.
+        for (condition_type, value, expected) in [
+            ("Controller/Message", False, true),
+            ("ControllerLoop/Message", False, true),
+            ("Controller/Message", True, false),
+            ("ControllerLoop/Message", True, false),
+            ("Controller/Checkout", False, false),
+            ("Controller/Checkout", True, false),
+        ] {
+            let status = ResourceHostStatus {
+                conditions: vec![flotilla_resources::HostCondition::builder()
+                    .condition_type(condition_type)
+                    .value(value)
+                    .reason("RestartBudgetExhausted")
+                    .message("Message controller exhausted its restart budget")
+                    .observed_at(Utc::now())
+                    .blocks_forge_observation(false)
+                    .build()],
+                ..Default::default()
+            };
+            assert_eq!(message_controller_failure(&status).is_some(), expected);
+            if let Some(condition) = message_controller_failure(&status) {
+                assert_eq!(condition.message, "Message controller exhausted its restart budget");
+                assert_eq!(condition.reason, "RestartBudgetExhausted");
             }
         }
     }
