@@ -27,6 +27,10 @@ use crate::{
 // Stable control marker shared by failure persistence and attention readers.
 const RECEIVER_PASS_FAILURE: &str = "Message receiver pass failed:";
 
+fn is_receiver_failure(status: &MessageStatus) -> bool {
+    status.reason.as_deref().is_some_and(|reason| reason.starts_with(RECEIVER_PASS_FAILURE))
+}
+
 // Bound adapter calls independently of admission.
 const TRANSPORT_CALL_BOUND: Duration = Duration::from_secs(30);
 
@@ -110,6 +114,8 @@ impl MessageInbox {
     /// Holder evidence is frozen at pass start,
     /// including gate cleanup. Transport calls are bounded individually, but a
     /// pass may contain many groups: holder changes refresh on the next pass.
+    /// Admission repair runs after the snapshot; holder changes racing admission
+    /// therefore become visible on the following pass, including for new Messages.
     /// Cleanup may temporarily retain or remove a gate using that older evidence;
     /// the next pass repairs it from current holders and active Messages.
     pub async fn reconcile_delivery(&self, router: &TransportRouter, now: DateTime<Utc>) -> Result<(), ResourceError> {
@@ -118,32 +124,20 @@ impl MessageInbox {
         let messages = self.messages.query(&MessageQuery::active()).await?;
         // Keep the normal path to one frozen, addressed snapshot. If a bad
         // receiver prevents loading it, retry within each isolated boundary.
-        let snapshot = self.load_delivery_receivers(&messages).await.ok();
+        let snapshot = match self.load_delivery_receivers(&messages).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                tracing::warn!(%error, "message receiver snapshot unavailable; using scoped receiver loads");
+                None
+            }
+        };
         let mut receiver_keys: BTreeMap<(String, String), String> = BTreeMap::new();
         for message in messages {
             let address = (message.spec.receiver.clone(), message.spec.sender.clone());
             let key = match receiver_keys.get(&address) {
                 Some(key) => key.clone(),
                 None => {
-                    // Aliases and topics that resolve to the same terminal
-                    // still share one FIFO transport batch and failure boundary.
-                    let key = match snapshot.as_ref() {
-                        Some(snapshot) => match self.resolve_receiver(snapshot, &message).await {
-                            Ok(Some(holder)) => format!("terminal/{}", holder.object.metadata.name),
-                            _ => format!("address/{}", message.spec.receiver),
-                        },
-                        None => {
-                            // Recover aliases before grouping even when another
-                            // receiver prevented the shared snapshot from loading.
-                            match self.load_delivery_receivers(std::slice::from_ref(&message)).await {
-                                Ok(scoped) => match self.resolve_receiver(&scoped, &message).await {
-                                    Ok(Some(holder)) => format!("terminal/{}", holder.object.metadata.name),
-                                    _ => format!("address/{}", message.spec.receiver),
-                                },
-                                Err(_) => format!("address/{}", message.spec.receiver),
-                            }
-                        }
-                    };
+                    let key = self.receiver_key(snapshot.as_ref(), &message).await;
                     receiver_keys.insert(address, key.clone());
                     key
                 }
@@ -161,11 +155,32 @@ impl MessageInbox {
                 }
             }
         }
-        self.cleanup_delivery_gates(snapshot.as_ref(), now).await?;
+        if let Err(error) = self.cleanup_delivery_gates(snapshot.as_ref(), now).await {
+            tracing::warn!(%error, "message delivery gate cleanup pass failed");
+            // Keep the first persistence failure, while reporting cleanup's
+            // diagnosis too. Neither failure skips transport bookkeeping release.
+            persistence_error.get_or_insert(error);
+        }
         tokio::time::timeout(TRANSPORT_CALL_BOUND, router.release_closed()).await.ok();
         match persistence_error {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+
+    // Aliases and topics share one batch when they resolve to the same terminal.
+    // Scoped loads retain that rule if an unrelated receiver broke the snapshot.
+    async fn receiver_key(&self, snapshot: Option<&MessageReceiverSnapshot>, message: &ResourceObject<Message>) -> String {
+        let holder = match snapshot {
+            Some(snapshot) => self.resolve_receiver(snapshot, message).await,
+            None => match self.load_delivery_receivers(std::slice::from_ref(message)).await {
+                Ok(scoped) => self.resolve_receiver(&scoped, message).await,
+                Err(error) => Err(error),
+            },
+        };
+        match holder {
+            Ok(Some(holder)) => format!("terminal/{}", holder.object.metadata.name),
+            _ => format!("address/{}", message.spec.receiver),
         }
     }
 
@@ -1462,7 +1477,7 @@ impl MessageInbox {
                                     .retry
                                     .as_ref()
                                     .is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }))))
-                            || status.reason.as_deref().is_some_and(|reason| reason.starts_with(RECEIVER_PASS_FAILURE)))
+                            || is_receiver_failure(status))
                 })
             })
             .collect();
@@ -1590,10 +1605,7 @@ impl MessageInbox {
             condition.is_delivery()
                 && condition.message_id.as_deref() == Some(message.metadata.name.as_str())
                 && (!condition.is_controller_fence_unverifiable()
-                    || message.status.as_ref().is_none_or(|status| {
-                        status.submission.is_none()
-                            || status.reason.as_deref().is_some_and(|reason| reason.starts_with(RECEIVER_PASS_FAILURE))
-                    }))
+                    || message.status.as_ref().is_none_or(|status| status.submission.is_none() || is_receiver_failure(status)))
         }) {
             apply_status_patch(
                 &self.backend.using::<TerminalSession>(&self.namespace),
@@ -1608,9 +1620,10 @@ impl MessageInbox {
         }
         let demands = self.backend.using::<Demand>(&self.namespace);
         let (mut meta, spec) = delivery_demand(&holder.object);
-        let description = HeldMessageBatch::collect([message]).first().map(|batch| batch.describe(&self.namespace)).or_else(|| {
-            message.status.as_ref().and_then(|status| status.reason.clone()).filter(|reason| reason.starts_with(RECEIVER_PASS_FAILURE))
-        });
+        let description = HeldMessageBatch::collect([message])
+            .first()
+            .map(|batch| batch.describe(&self.namespace))
+            .or_else(|| message.status.as_ref().filter(|status| is_receiver_failure(status)).and_then(|status| status.reason.clone()));
         match demands.get(&meta.name).await {
             Ok(existing) => {
                 // Keep the gate's description current as the held reason changes,

@@ -2953,6 +2953,7 @@ async fn legacy_project_role_reply_uses_recorded_incarnation() {
 // transport (such as the Codex app-server) beside keystroke.
 struct NamedTransport {
     observations: std::sync::atomic::AtomicUsize,
+    closed_releases: std::sync::atomic::AtomicUsize,
     id: &'static str,
     outcome: TransportOutcome,
     submissions: std::sync::Mutex<Vec<String>>,
@@ -2977,6 +2978,9 @@ impl AgentTransport for NamedTransport {
             return TransportOutcome::Unconfirmed { reason: "no record of this submission".into() };
         }
         self.outcome.clone()
+    }
+    async fn release_closed(&self) {
+        self.closed_releases.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -3003,7 +3007,13 @@ fn two_route_router(first: &Arc<NamedTransport>, keystroke: &Arc<NamedTransport>
 }
 
 fn named(id: &'static str, outcome: TransportOutcome) -> Arc<NamedTransport> {
-    Arc::new(NamedTransport { id, outcome, submissions: Default::default(), observations: Default::default() })
+    Arc::new(NamedTransport {
+        id,
+        outcome,
+        submissions: Default::default(),
+        observations: Default::default(),
+        closed_releases: Default::default(),
+    })
 }
 
 // Behaviour (#3545, ADR 0059 §4): with two transports registered for the
@@ -3699,4 +3709,32 @@ async fn degraded_snapshot_preserves_cross_alias_batching() {
     assert_eq!(batches.len(), 1, "healthy aliases share one transport attempt");
     assert!(batches[0].find("alias-0").unwrap() < batches[0].find("alias-1").unwrap());
     assert!(batches[0].find("alias-1").unwrap() < batches[0].find("alias-2").unwrap());
+}
+
+// Seed an unreadable gate row through the real store, without replacing its
+// persistence implementation or the production Demand decoder.
+#[derive(Debug, Clone)]
+struct LegacyDemandRow;
+impl Resource for LegacyDemandRow {
+    type Spec = serde_json::Value;
+    type Status = <flotilla_resources::Demand as Resource>::Status;
+    type StatusPatch = <flotilla_resources::Demand as Resource>::StatusPatch;
+    const API_PATHS: flotilla_resources::ApiPaths = <flotilla_resources::Demand as Resource>::API_PATHS;
+    const QUERYABLE_FIELDS: &'static [&'static str] = <flotilla_resources::Demand as Resource>::QUERYABLE_FIELDS;
+}
+
+// Shared cleanup failure must remain visible, while closed transports still
+// release their bookkeeping in that same pass.
+#[tokio::test]
+async fn gate_cleanup_error_still_releases_closed_transports() {
+    let (backend, inbox) = delivery_inbox_from(&[]).await;
+    backend
+        .using::<LegacyDemandRow>("flotilla")
+        .create(&InputMeta::builder().name("unreadable-gate".into()).build(), &serde_json::json!({"malformed": true}))
+        .await
+        .unwrap();
+    let transport = named(KEYSTROKE, TransportOutcome::Pending);
+    let error = inbox.reconcile_delivery(&router(&transport), at(22)).await.expect_err("cleanup failure is reported");
+    assert!(error.to_string().contains("decode"), "{error}");
+    assert_eq!(transport.closed_releases.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
