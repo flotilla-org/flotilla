@@ -4,6 +4,7 @@
 #![allow(clippy::double_must_use)]
 
 pub mod account_access;
+pub use account_access::{AccountBinding, AccountBindingSpec, AccountProvision, AccountProvisionSpec};
 #[doc(hidden)]
 pub mod address;
 pub mod artifact;
@@ -256,6 +257,8 @@ pub use watch::{ResourceList, ResourcePosition, ResourceTombstone, WatchEvent, W
 #[macro_export]
 macro_rules! for_each_registered_resource {
     ($callback:ident, $($argument:expr),* $(,)?) => {{
+        $callback::<$crate::AccountBinding>($($argument),*);
+        $callback::<$crate::AccountProvision>($($argument),*);
         $callback::<$crate::Artifact>($($argument),*);
         $callback::<$crate::Checkout>($($argument),*);
         $callback::<$crate::ChangeRequest>($($argument),*);

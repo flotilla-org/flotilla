@@ -16,14 +16,15 @@
 //! Core records plans and never interprets access: the family's access description, mechanism
 //! and plan are the registered implementation's own text.
 //!
-//! These types derive both serde, for the resource store that production runs today, and
-//! `Stored`, for the generated tables the owner reviews and the engine store takes on at the
-//! cut-over. Nothing reads or writes them yet: they stop here for the owner's schema review
-//! (CLAUDE.md "Schema review before build").
+//! The records derive both serde, for the resource-store kinds [`AccountBinding`] and
+//! [`AccountProvision`] that production runs today (owner ruling 1 on #3910), and `Stored`, for the
+//! generated tables the owner reviewed, which the engine store takes on at the cut-over.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_schema::{Address, KindRegistry, Records, Ref, RegistryError, State, Stored, Timestamp};
+
+use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass};
 use serde::{Deserialize, Serialize};
 
 /// A `CredentialSpec` name: the managed credential's stable identity, which grants and bindings
@@ -126,7 +127,7 @@ pub struct EpochEntry {
     index(name = "by_requester", eq(requester)),
     index(name = "open_by_credential", eq(credential), when(state in [Open]))
 )]
-pub struct AccountBinding {
+pub struct AccountBindingSpec {
     /// The requester: a crew, by its role address (`project:<p>/convoy:<c>/role:<r>`; agent
     /// roles are unique across a convoy). The eventual home is AgentSession (#2912).
     pub requester: Address,
@@ -204,8 +205,8 @@ pub struct Delivered {
 /// replaced vessel's old place is cleaned up.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[store(kind = "AccountProvision", code = "ap", index(name = "by_binding", eq(binding)), index(name = "by_place", eq(place)))]
-pub struct AccountProvision {
-    pub binding: Ref<AccountBinding>,
+pub struct AccountProvisionSpec {
+    pub binding: Ref<AccountBindingSpec>,
     /// Where the agent loop runs: the Environment resource the harness launches in.
     #[store(intern = "pc")]
     pub place: String,
@@ -221,10 +222,30 @@ pub struct AccountProvision {
     pub delivered: Option<Delivered>,
 }
 
+define_resource!(
+    AccountBinding,
+    "accountbindings",
+    AccountBindingSpec,
+    (),
+    NoStatusPatch,
+    replication = ReplicationClass::HomeBoundRuntime,
+    queryable = &["metadata.name", "spec.requester", "spec.credential"]
+);
+
+define_resource!(
+    AccountProvision,
+    "accountprovisions",
+    AccountProvisionSpec,
+    (),
+    NoStatusPatch,
+    replication = ReplicationClass::HomeBoundRuntime,
+    queryable = &["metadata.name", "spec.binding.name", "spec.place"]
+);
+
 /// The two kinds, for their DDL snapshot and the engine store's registry at the cut-over.
 pub fn registry() -> Result<KindRegistry, RegistryError> {
     let mut registry = KindRegistry::new();
-    registry.register::<AccountBinding>()?;
-    registry.register::<AccountProvision>()?;
+    registry.register::<AccountBindingSpec>()?;
+    registry.register::<AccountProvisionSpec>()?;
     Ok(registry)
 }

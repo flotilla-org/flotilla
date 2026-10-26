@@ -9,7 +9,7 @@ mod schema_support;
 
 use flotilla_provisioning::stored;
 use flotilla_resources::account_access::{
-    self, AccessName, AccountBinding, AccountProvision, BindingState, CredentialName, Delivered, EpochEntry, GrantName, GrantScope,
+    self, AccessName, AccountBindingSpec, AccountProvisionSpec, BindingState, CredentialName, Delivered, EpochEntry, GrantName, GrantScope,
     ProvisionPlan, Selection, UpdateMode,
 };
 use flotilla_schema::{render_view, Address, Decoder, Encoder, KindCode, Records, Ref, State, Timestamp};
@@ -67,11 +67,11 @@ fn account_access_statements_search_by_key() {
     assert!(rows.iter().any(|row| row.contains("account_provision_by_binding")), "{rows:?}");
 }
 
-fn binding(state: BindingState, selection: Selection) -> AccountBinding {
+fn binding(state: BindingState, selection: Selection) -> AccountBindingSpec {
     let mut epochs = Records::new();
     epochs.append(1, EpochEntry { epoch: "1".into(), observed_at: Timestamp::from_micros(10) }).expect("append");
     epochs.append(2, EpochEntry { epoch: "2".into(), observed_at: Timestamp::from_micros(20) }).expect("append");
-    AccountBinding {
+    AccountBindingSpec {
         requester: "project:flotilla/convoy:c1/role:coder".parse::<Address>().expect("address"),
         item: "claude-code".into(),
         requirement: AccessName("claude:subscription".into()),
@@ -107,9 +107,9 @@ fn a_binding_survives_the_codec_and_json() {
     for state in states {
         for selection in selections.clone() {
             let value = binding(state.clone(), selection);
-            let decoded: AccountBinding = Decoder::decode(Encoder::encode(&value).expect("encodes")).expect("decodes");
+            let decoded: AccountBindingSpec = Decoder::decode(Encoder::encode(&value).expect("encodes")).expect("decodes");
             assert_eq!(decoded, value);
-            let json: AccountBinding = serde_json::from_value(serde_json::to_value(&value).expect("json")).expect("from json");
+            let json: AccountBindingSpec = serde_json::from_value(serde_json::to_value(&value).expect("json")).expect("from json");
             assert_eq!(json, value);
         }
     }
@@ -121,7 +121,7 @@ fn a_binding_survives_the_codec_and_json() {
 fn a_provision_record_survives_the_codec_and_json() {
     for update_mode in [UpdateMode::Push, UpdateMode::Mechanism, UpdateMode::Restart] {
         for delivered in [None, Some(Delivered { epoch: "1".into(), generation: "g7".into(), at: Timestamp::from_micros(50) })] {
-            let value = AccountProvision {
+            let value = AccountProvisionSpec {
                 binding: Ref::new("c1.coder.claude-subscription", "udder"),
                 place: "env-c1-work".into(),
                 environment_kind: "docker".into(),
@@ -134,9 +134,9 @@ fn a_provision_record_survives_the_codec_and_json() {
                 home: "/tmp/flotilla-config/agent-homes/requesters/c1/coder/claude".into(),
                 delivered,
             };
-            let decoded: AccountProvision = Decoder::decode(Encoder::encode(&value).expect("encodes")).expect("decodes");
+            let decoded: AccountProvisionSpec = Decoder::decode(Encoder::encode(&value).expect("encodes")).expect("decodes");
             assert_eq!(decoded, value);
-            let json: AccountProvision = serde_json::from_value(serde_json::to_value(&value).expect("json")).expect("from json");
+            let json: AccountProvisionSpec = serde_json::from_value(serde_json::to_value(&value).expect("json")).expect("from json");
             assert_eq!(json, value);
         }
     }

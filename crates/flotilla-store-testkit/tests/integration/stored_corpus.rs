@@ -72,7 +72,7 @@ fn deployed_stored_records_still_decode() {
         generation_count += 1;
         // ManifestRoot, CrewDefaults, ImageLayer, ImageBuild (#2728), Message (#2716) and FleetDesignation (#2718) were introduced
         // after this deployed generation, as were DispatchHold and DispatchDeployment (#2782), ForgeRead (#2868),
-        // and ForgeReadHeartbeat (#2928). Remove exemptions when the corpus is refreshed after the next fleet roll (ADR 0047).
+        // ForgeReadHeartbeat (#2928), and AccountBinding and AccountProvision (#3907). Remove exemptions when the corpus is refreshed after the next fleet roll (ADR 0047).
         let mut expected: BTreeSet<_> = REGISTERED_RESOURCE_KINDS
             .iter()
             .filter(|kind| {
@@ -84,6 +84,8 @@ fn deployed_stored_records_still_decode() {
                         | "ImageBuild"
                         | "FleetDesignation"
                         | "DispatchHold"
+                        | "AccountBinding"
+                        | "AccountProvision"
                         | "DispatchDeployment"
                         | "Message"
                         | "ForgeRead"
@@ -109,6 +111,8 @@ fn deployed_stored_records_still_decode() {
                     | "ImageBuild"
                     | "FleetDesignation"
                     | "DispatchHold"
+                    | "AccountBinding"
+                    | "AccountProvision"
                     | "DispatchDeployment"
                     | "Message"
                     | "ForgeRead"
