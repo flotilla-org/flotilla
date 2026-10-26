@@ -355,7 +355,10 @@ pub(crate) enum ImagePinDigest {
 /// Convert a previous-shape pin. A URL with an `{arch}` template keeps it
 /// verbatim in each architecture's entry: that layer's own fragment still
 /// substitutes its architecture token, and nothing else can fetch it. A
-/// checksum without a URL never named a download and is dropped.
+/// checksum without a URL never named a download and is dropped. `unpack` is
+/// a guess from the URL's suffix (anything else, including a query string,
+/// reads as `file`); previous-shape fragments unpack for themselves, so only
+/// a reader of the converted pin could see a wrong guess before the shim goes.
 fn legacy_artifacts(url: Option<String>, sha256: Option<ImagePinDigest>) -> BTreeMap<String, PinArtifact> {
     let Some(url) = url else { return BTreeMap::new() };
     let unpack = if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
