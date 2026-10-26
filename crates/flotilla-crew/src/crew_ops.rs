@@ -61,6 +61,34 @@ use flotilla_resources::crew_attention;
 
 use flotilla_config::ConfigStore;
 
+/// A held lease's ending is read from its current state, including on replicas.
+fn vessel_ending_reason(
+    reads: &dyn LifecycleReads,
+    vessel: &flotilla_resources::ReadResourceObject<Vessel>,
+    legacy_reason: &str,
+) -> Result<Option<(flotilla_protocol::LifecycleReading, String)>, String> {
+    use flotilla_protocol::LifecycleReading;
+    let origin = match &vessel.provenance {
+        ResourceProvenance::Local => None,
+        ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+    };
+    Ok(match reads.try_reading(ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref())? {
+        Some(
+            reading @ (LifecycleReading::Released
+            | LifecycleReading::Lost
+            | LifecycleReading::Failed { .. }
+            | LifecycleReading::GaveUp { .. }),
+        ) => reading.reason().map(|reason| (reading, reason)),
+        Some(_) => None,
+        None => vessel
+            .object
+            .status
+            .as_ref()
+            .filter(|status| status.phase == flotilla_resources::VesselPhase::Lost)
+            .map(|status| (LifecycleReading::Lost, status.message.clone().unwrap_or_else(|| legacy_reason.into()))),
+    })
+}
+
 /// Resolves a convoy address to its local record name.
 pub async fn resolve_local_convoy_name(backend: &ResourceBackend, namespace: &str, address: &str) -> Result<String, String> {
     let convoys = backend.clone().using::<ResourceConvoy>(namespace);
@@ -955,11 +983,12 @@ impl CrewService {
         let loss_reason =
             match self.resource_backend.including_replicas::<flotilla_resources::Vessel>(&context.namespace).get(&context.vessel_ref).await
             {
-                Ok(vessel) => {
-                    vessel.object.status.as_ref().filter(|status| status.phase == flotilla_resources::VesselPhase::Lost).map(|status| {
-                        status.message.clone().unwrap_or_else(|| "environment disappeared; rehydration is not available yet (#2872)".into())
-                    })
-                }
+                Ok(vessel) => vessel_ending_reason(
+                    self.lifecycle_reads.as_ref(),
+                    &vessel,
+                    "environment disappeared; rehydration is not available yet (#2872)",
+                )?
+                .map(|(_, reason)| reason),
                 Err(ResourceError::NotFound { .. }) => None,
                 Err(error) => return Err(error.to_string()),
             };
@@ -1788,7 +1817,7 @@ impl CrewService {
                 Some(
                     flotilla_protocol::LifecycleReading::Lost
                     | flotilla_protocol::LifecycleReading::Released
-                    | flotilla_protocol::LifecycleReading::Gone,
+                    | flotilla_protocol::LifecycleReading::Failed { .. },
                 ) => true,
                 Some(_) => false,
                 None => checkout.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::CheckoutPhase::Gone),
@@ -2906,12 +2935,13 @@ impl CrewService {
     async fn ensure_vessel_backing_available(&self, namespace: &str, convoy: &str, vessel: &str) -> Result<(), String> {
         let vessel_ref = flotilla_resources::vessel_resource_name(convoy, vessel);
         match self.resource_backend.including_replicas::<flotilla_resources::Vessel>(namespace).get(&vessel_ref).await {
-            Ok(resource) if resource.object.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::VesselPhase::Lost) => {
-                let reason =
-                    resource.object.status.as_ref().and_then(|status| status.message.as_deref()).unwrap_or("environment disappeared");
-                Err(format!("vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"))
-            }
             Ok(resource) => {
+                if let Some((ending, reason)) = vessel_ending_reason(self.lifecycle_reads.as_ref(), &resource, "environment disappeared")? {
+                    if !matches!(ending, flotilla_protocol::LifecycleReading::Lost) {
+                        return Err(format!("vessel `{vessel}` lease ended: {reason}; it cannot be resumed"));
+                    }
+                    return Err(format!("vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"));
+                }
                 if let Some(environment_ref) = resource.object.status.as_ref().and_then(|status| status.environment_ref.as_ref()) {
                     match self.resource_backend.including_replicas::<Environment>(namespace).get(environment_ref).await {
                         Ok(environment) => {
@@ -2925,13 +2955,12 @@ impl CrewService {
                                 origin.as_deref(),
                             )? {
                                 Some(
-                                    flotilla_protocol::LifecycleReading::GaveUp { cause }
+                                    flotilla_protocol::LifecycleReading::Failed { reason: cause }
+                                    | flotilla_protocol::LifecycleReading::GaveUp { cause }
                                     | flotilla_protocol::LifecycleReading::Exhausted { cause },
                                 ) => return Err(format!("vessel `{vessel}` failed provisioning and cannot be resumed: {cause}")),
                                 Some(
-                                    reading @ (flotilla_protocol::LifecycleReading::Lost
-                                    | flotilla_protocol::LifecycleReading::Released
-                                    | flotilla_protocol::LifecycleReading::Gone),
+                                    reading @ (flotilla_protocol::LifecycleReading::Lost | flotilla_protocol::LifecycleReading::Released),
                                 ) => {
                                     return Err(format!(
                                         "vessel `{vessel}` is lost, recoverable: {}; rehydration is not available yet (#2872)",
@@ -3830,3 +3859,47 @@ fn terminal_convoy_refusal(name: &str, cause: &str) -> String {
 
 #[cfg(test)]
 use flotilla_store_testkit::LegacyMessageFixture;
+
+#[cfg(test)]
+mod vessel_ending_tests {
+    use super::vessel_ending_reason;
+    use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision, PlacementTargetHost};
+    use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
+    use flotilla_resources::{ReadResourceObject, ResourceProvenance, Vessel, VesselPhase, VesselSpec, VesselStatus};
+
+    // Crew listing and resume share one checked reading; stale Lost cannot hide a live lease.
+    #[test]
+    fn crew_services_read_the_lease_ending_without_a_copy() {
+        let fixture = VesselFixture::new(false);
+        let vessel = object::<Vessel>(
+            "vessel",
+            VesselSpec {
+                convoy_ref: "convoy".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "local".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+            VesselStatus {
+                phase: VesselPhase::Lost,
+                message: Some("stale".into()),
+                placement_decision: Some(
+                    PlacementDecision::builder()
+                        .policy_name("local".into())
+                        .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("host"), display_name: "host".into() })
+                        .build(),
+                ),
+                ..Default::default()
+            },
+        );
+        fixture.request(&vessel);
+        let vessel = ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local };
+        assert!(vessel_ending_reason(fixture.reads.as_ref(), &vessel, "legacy").expect("live").is_none());
+        fixture.finish(&vessel.object, Ending::Released);
+        assert_eq!(
+            vessel_ending_reason(fixture.reads.as_ref(), &vessel, "legacy").expect("ended"),
+            Some((LifecycleReading::Released, "released".into()))
+        );
+        fixture.poison();
+        assert!(vessel_ending_reason(fixture.reads.as_ref(), &vessel, "legacy").unwrap_err().contains("poisoned"));
+    }
+}

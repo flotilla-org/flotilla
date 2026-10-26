@@ -7,7 +7,7 @@
 //! a request that never realises gives up when its attempts are spent.
 //! [`Lifecycle<K>`] is that machine, with each kind's opaque request as its
 //! spec; the state carries the attempt tally while Requested, the realised
-//! identity and the cause given up with.
+//! identity, the ending once Gone, and the cause given up with.
 //!
 //! The spec's Requested carries its attempt history, and `GiveUp` is judged
 //! by Ensure's exhaustion rule over it. Here Requested keeps only the tally
@@ -18,11 +18,9 @@
 //! columns, `#[store(state)] State<LifecycleState>` and the edge log) is
 //! declared by whoever owns its request, with a kind code of its own.
 
-pub mod schema_review;
-
 use std::marker::PhantomData;
 
-use flotilla_schema::EdgeEvent;
+use flotilla_schema::{EdgeEvent, Stored};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -50,15 +48,42 @@ pub const DEFAULT_POLICY: AttemptPolicy = AttemptPolicy { max_failures: 3, base:
 /// The shared lifecycle machine for kind `K`.
 pub struct Lifecycle<K: LifecycleKind>(PhantomData<fn() -> K>);
 
+/// How a lifecycle ended after release or disappearance.
+#[derive(Clone, Debug, PartialEq, Eq, Stored)]
+pub enum Ending {
+    #[store(code = "rl")]
+    Released,
+    #[store(code = "lo")]
+    Lost,
+    #[store(code = "fa")]
+    Failed { reason: String },
+}
+
+/// The observation that ended a realised lifecycle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VanishCause {
+    Lost,
+    Failed { reason: String },
+}
+
+impl From<&VanishCause> for Ending {
+    fn from(cause: &VanishCause) -> Self {
+        match cause {
+            VanishCause::Lost => Self::Lost,
+            VanishCause::Failed { reason } => Self::Failed { reason: reason.clone() },
+        }
+    }
+}
+
 states! {
-    /// The spec's `State`: `Requested(history) | Realised(str) | Gone | GaveUp(str)`.
+    /// The spec's `State`: `Requested(history) | Realised(str) | Gone(Ending) | GaveUp(str)`.
     /// Requested keeps the tally of the spec's attempt history:
     /// consecutive failures since the last success, and the latest.
     pub enum LifecycleState => LifecycleLabel {
         Requested { failures: u32, #[store(flatten)] last_failure: Option<Failure> } = "rq",
         /// Observed under `identity`.
         Realised { identity: String } = "rl",
-        Gone = "go",
+        Gone { ending: Ending } = "go",
         /// The attempts were spent, the last failing with `cause`.
         GaveUp { #[store(flatten)] cause: Cause } = "gu",
     }
@@ -86,7 +111,7 @@ impl LifecycleState {
 
     /// Spec `gone`.
     pub fn gone(&self) -> bool {
-        *self == LifecycleState::Gone
+        matches!(self, LifecycleState::Gone { .. })
     }
 
     /// The identity the thing is realised under, while Realised.
@@ -122,6 +147,7 @@ pub struct Release {
 /// A realised thing disappeared without a release (spec `Vanish`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Vanish {
+    pub cause: VanishCause,
     pub observed: Ref<Absence>,
 }
 
@@ -251,14 +277,16 @@ impl<K: LifecycleKind> Machine for Lifecycle<K> {
                     .from([Requested, Realised])
                     .to([Gone])
                     .gate("the teardown is complete", gate_release)
-                    .effect(|_, _, _| LifecycleState::Gone),
+                    .changes(["ending"])
+                    .effect(|_, _, _| LifecycleState::Gone { ending: Ending::Released }),
             )
             .edge(
                 EdgeDef::<Self, Vanish>::new()
                     .from([Realised])
                     .to([Gone])
                     .gate("the home observes the thing absent", gate_vanish)
-                    .effect(|_, _, _| LifecycleState::Gone),
+                    .changes(["ending"])
+                    .effect(|_, _, vanish| LifecycleState::Gone { ending: Ending::from(&vanish.cause) }),
             )
             .edge(
                 EdgeDef::<Self, Attempted>::new()

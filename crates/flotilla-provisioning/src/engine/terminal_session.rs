@@ -67,14 +67,18 @@ impl Binding for TerminalSessionBinding {
             TerminalSessionStatusPatch::MarkStopped { .. } => vec![Step::Released],
             // Relaunched after being lost: the old launch is observed absent; the next launch is
             // requested when it starts running.
-            TerminalSessionStatusPatch::MarkStarting => vec![Step::Vanished],
+            TerminalSessionStatusPatch::MarkStarting => {
+                vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }]
+            }
             // A launch that never ran failed its attempt and cannot succeed on the same inputs;
             // a running one that failed is gone.
             TerminalSessionStatusPatch::MarkFailed { message, .. } => match phase(obj) {
                 TerminalSessionPhase::Starting => {
                     vec![Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, message), retryable: false })]
                 }
-                _ => vec![Step::Vanished],
+                _ => vec![Step::Vanished {
+                    cause: flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: message.clone() },
+                }],
             },
             // Unobservable for a while, or observed again: a judgement, no edge.
             TerminalSessionStatusPatch::MarkLost { .. } | TerminalSessionStatusPatch::MarkRevived => vec![],

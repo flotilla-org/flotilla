@@ -2477,31 +2477,38 @@ impl Aggregator {
         }
     }
 
-    /// A vessel's phase as the views read it. Behind `[primitives]` the engine decides whether its
-    /// lease is live (#3629 layer 8, Vessel): a lease that broke reads Lost while the old phase still
-    /// says it is live, before the one-way copy lands. The old phase says how a live vessel is
-    /// doing (provisioning, ready, interrupted), and why an ended one ended (lost or failed), which
-    /// the engine does not distinguish. A released lease (its teardown completed) keeps the old
-    /// phase: being torn down is not being lost. When the copy is deleted (#3774), this reads the
-    /// ending from the engine alone.
+    /// A held lifecycle decides the phase; interrupted roles are an observation of a realised lease.
+    #[cfg(test)]
     pub(crate) fn vessel_phase(&self, vessel: &ReadResourceObject<Vessel>) -> VesselPhase {
-        use flotilla_protocol::LifecycleReading;
-
-        use crate::ports::ProvisioningKind;
-        let old = vessel.object.status.as_ref().map(|status| status.phase).unwrap_or_default();
-        if matches!(old, VesselPhase::Lost | VesselPhase::Failed) {
-            return old;
+        let origin = readiness::engine_origin(&vessel.provenance);
+        match self.lifecycle_reads.try_reading(crate::ports::ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref()) {
+            Ok(reading) => Self::vessel_phase_from_reading(vessel, reading.as_ref()),
+            Err(error) => {
+                tracing::warn!(%error, "vessel lifecycle read failed");
+                VesselPhase::Lost
+            }
         }
-        let origin = match &vessel.provenance {
-            ResourceProvenance::Local => None,
-            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
-        };
-        match self.lifecycle_reads.reading(ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref()) {
-            // Gone without its ending entry (a replica seeded from a snapshot) is read as broken.
-            // A vessel never gives up (#3629 Q3); GaveUp is listed only so a reading the vessel
-            // machine cannot produce is not read as live.
-            Some(LifecycleReading::Lost | LifecycleReading::Gone | LifecycleReading::GaveUp { .. }) => VesselPhase::Lost,
-            _ => old,
+    }
+
+    pub(super) fn vessel_phase_from_reading(
+        vessel: &ReadResourceObject<Vessel>,
+        reading: Option<&flotilla_protocol::LifecycleReading>,
+    ) -> VesselPhase {
+        use flotilla_protocol::LifecycleReading;
+        match reading {
+            Some(LifecycleReading::Ready { .. }) => {
+                if vessel.object.status.as_ref().is_some_and(|status| !status.interrupted_roles.is_empty()) {
+                    VesselPhase::Interrupted
+                } else {
+                    VesselPhase::Ready
+                }
+            }
+            Some(LifecycleReading::InProgress | LifecycleReading::Retrying { .. }) => VesselPhase::Provisioning,
+            Some(LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. } | LifecycleReading::Exhausted { .. }) => {
+                VesselPhase::Failed
+            }
+            Some(LifecycleReading::Lost | LifecycleReading::Released) => VesselPhase::Lost,
+            None => vessel.object.status.as_ref().map(|status| status.phase).unwrap_or_default(),
         }
     }
 
@@ -6882,48 +6889,67 @@ mod tests {
         assert!(aggregator.session_running(&session));
     }
 
-    // Behaviour (#3629 layer 8, Vessel): behind `[primitives]` the engine decides whether a vessel's
-    // lease is live. A broken lease reads Lost while the old phase still says Ready; a released one
-    // (torn down) and a live one keep the old phase, which also keeps why an ended one ended
-    // (Failed is not read as Lost).
-    #[tokio::test]
-    async fn the_engine_reading_ends_a_vessel_the_old_phase_says_is_live() {
-        use flotilla_protocol::LifecycleReading;
+    // Every stored ending decides the view despite stale lifecycle phase and message.
+    #[hegel::test]
+    fn the_engine_ending_decides_a_vessel_view(tc: hegel::TestCase) {
+        use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
+        use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
         use flotilla_resources::{VesselSpec, VesselStatus};
-
-        use crate::ports::ProvisioningKind;
-        let reads = Arc::new(ScriptedReadings::default());
+        // Every old phase and ending, with empty and Unicode causes; no old copy is published.
+        let old = [
+            VesselPhase::Pending,
+            VesselPhase::Provisioning,
+            VesselPhase::Ready,
+            VesselPhase::Interrupted,
+            VesselPhase::Failed,
+            VesselPhase::Lost,
+        ][tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(5))];
+        let reason = ["", "backing failed", "失敗"][tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2))];
+        let (ending, expected, reason) = match tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3)) {
+            0 => (Ending::Released, VesselPhase::Lost, "released"),
+            1 => (Ending::Lost("env"), VesselPhase::Lost, "observed absent"),
+            2 => (Ending::Failed(reason), VesselPhase::Failed, reason),
+            _ => (Ending::GaveUp(reason), VesselPhase::Failed, reason),
+        };
+        let convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
+        let status = convoy.status.as_ref().expect("status");
+        let definition = &status.workflow_snapshot.as_ref().expect("snapshot").vessels[0];
+        let fixture = VesselFixture::new(false);
+        let vessel = object::<Vessel>(
+            "vessel",
+            VesselSpec {
+                convoy_ref: convoy.metadata.name.clone(),
+                vessel_name: definition.name.clone(),
+                placement_policy_ref: "local".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+            VesselStatus {
+                phase: old,
+                message: Some("stale".into()),
+                checkout_refs: BTreeMap::from([(flotilla_resources::RepositoryKey("stale".into()), "missing".into())]),
+                placement_decision: Some(
+                    PlacementDecision::builder()
+                        .policy_name("local".into())
+                        .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("host"), display_name: "host".into() })
+                        .build(),
+                ),
+                ..Default::default()
+            },
+        );
+        fixture.request(&vessel);
+        fixture.finish(&vessel, ending);
         let (events, _) = broadcast::channel(8);
-        let aggregator =
-            Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads.clone());
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut vessel = backend
-            .using::<Vessel>("flotilla")
-            .create(
-                &InputMeta::builder().name("convoy-a-implement".into()).build(),
-                &VesselSpec {
-                    convoy_ref: "convoy-a".into(),
-                    vessel_name: "implement".into(),
-                    placement_policy_ref: "local".into(),
-                    adopted_checkout_refs: Default::default(),
-                },
-            )
-            .await
-            .expect("vessel");
-        vessel.status = Some(VesselStatus { phase: VesselPhase::Ready, ..Default::default() });
-        let mut read = ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local };
-        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Ready, "no reading: the old phase");
-        reads.set(ProvisioningKind::Vessel, "convoy-a-implement", Some(LifecycleReading::Ready { identity: "env-a".into() }));
-        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Ready);
-        reads.set(ProvisioningKind::Vessel, "convoy-a-implement", Some(LifecycleReading::Released));
-        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Ready, "torn down, not lost: the old phase");
-        reads.set(ProvisioningKind::Vessel, "convoy-a-implement", Some(LifecycleReading::Lost));
-        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Lost, "its lease broke");
-        // A replica seeded from a snapshot that predates the ending reads Gone: read as broken.
-        reads.set(ProvisioningKind::Vessel, "convoy-a-implement", Some(LifecycleReading::Gone));
-        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Lost, "ended, how not held here");
-        read.object.status.as_mut().expect("status").phase = VesselPhase::Failed;
-        assert_eq!(aggregator.vessel_phase(&read), VesselPhase::Failed, "the old phase says why it ended");
+        let mut aggregator =
+            Aggregator::new(AggregatorProjectionState::new(), HostName::new("host"), events).with_lifecycle_reads(fixture.reads.clone());
+        let read = ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local };
+        assert_eq!(aggregator.vessel_phase(&read), expected);
+        apply_readiness_event(&mut aggregator.readiness_vessels, ReadWatchEvent::Added(read));
+        let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("host"));
+        let (readiness, _) =
+            aggregator.vessel_readiness(&reference, definition, status.work.get(&definition.name), None, &HostName::new("host"));
+        assert_eq!(readiness.blockers.len(), 1, "stale checkout refs are not combined with engine evidence");
+        assert_eq!(readiness.blockers[0].reason, reason);
+        assert_eq!(readiness.blockers[0].phase, format!("{expected:?}"));
     }
 
     // #1961: Active plus pending agent work must remain provisioning, even

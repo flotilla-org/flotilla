@@ -160,6 +160,8 @@ CREATE TABLE "terminal_session" (
   "last_failure_cause_detail" TEXT,
   "last_failure_retryable" INTEGER CHECK ("last_failure_retryable" IN (0, 1)),
   "identity" TEXT,
+  "ending" TEXT CHECK ("ending" IN ('fa', 'lo', 'rl')),
+  "ending_reason" TEXT,
   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
   "cause_detail" TEXT,
   CHECK (CASE WHEN "source" = 'tl'
@@ -182,9 +184,20 @@ CREATE TABLE "terminal_session" (
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
       END),
+  CHECK (CASE WHEN "ending" = 'rl'
+      THEN "ending_reason" IS NULL
+      END),
+  CHECK (CASE WHEN "ending" = 'lo'
+      THEN "ending_reason" IS NULL
+      END),
+  CHECK (CASE WHEN "ending" = 'fa'
+      THEN "ending_reason" IS NOT NULL
+      END),
   CHECK (CASE WHEN "state" = 'rq'
       THEN "failures" IS NOT NULL
       AND "identity" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
@@ -195,11 +208,14 @@ CREATE TABLE "terminal_session" (
       AND "last_failure_cause_category" IS NULL
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'go'
-      THEN "failures" IS NULL
+      THEN "ending" IS NOT NULL
+      AND "failures" IS NULL
       AND "last_failure_at" IS NULL
       AND "last_failure_cause_category" IS NULL
       AND "last_failure_cause_detail" IS NULL
@@ -217,6 +233,8 @@ CREATE TABLE "terminal_session" (
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
       AND "identity" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       END)
 ) STRICT;
 CREATE TABLE "terminal_session_env" (
@@ -240,6 +258,9 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ts', 'last_failure_cause_category', 'mx', 'MissingCapability'),
   ('ts', 'last_failure_cause_category', 'rf', 'Refused'),
   ('ts', 'last_failure_cause_category', 'tr', 'Transient'),
+  ('ts', 'ending', 'fa', 'Failed'),
+  ('ts', 'ending', 'lo', 'Lost'),
+  ('ts', 'ending', 'rl', 'Released'),
   ('ts', 'cause_category', 'ex', 'External'),
   ('ts', 'cause_category', 'mc', 'Misconfigured'),
   ('ts', 'cause_category', 'mx', 'MissingCapability'),
@@ -276,6 +297,8 @@ CREATE VIEW "terminal_session_view" AS SELECT
   "terminal_session"."last_failure_cause_detail",
   "terminal_session"."last_failure_retryable",
   "terminal_session"."identity",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'ending' AND "code" = "terminal_session"."ending") AS "ending",
+  "terminal_session"."ending_reason",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'cause_category' AND "code" = "terminal_session"."cause_category") AS "cause_category",
   "terminal_session"."cause_detail"
 FROM "terminal_session";
@@ -299,6 +322,8 @@ CREATE TABLE "vessel" (
   "last_failure_cause_detail" TEXT,
   "last_failure_retryable" INTEGER CHECK ("last_failure_retryable" IN (0, 1)),
   "identity" TEXT,
+  "ending" TEXT CHECK ("ending" IN ('fa', 'lo', 'rl')),
+  "ending_reason" TEXT,
   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
   "cause_detail" TEXT,
   CHECK (CASE WHEN "last_failure_at" IS NOT NULL
@@ -309,9 +334,20 @@ CREATE TABLE "vessel" (
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
       END),
+  CHECK (CASE WHEN "ending" = 'rl'
+      THEN "ending_reason" IS NULL
+      END),
+  CHECK (CASE WHEN "ending" = 'lo'
+      THEN "ending_reason" IS NULL
+      END),
+  CHECK (CASE WHEN "ending" = 'fa'
+      THEN "ending_reason" IS NOT NULL
+      END),
   CHECK (CASE WHEN "state" = 'rq'
       THEN "failures" IS NOT NULL
       AND "identity" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
@@ -322,11 +358,14 @@ CREATE TABLE "vessel" (
       AND "last_failure_cause_category" IS NULL
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'go'
-      THEN "failures" IS NULL
+      THEN "ending" IS NOT NULL
+      AND "failures" IS NULL
       AND "last_failure_at" IS NULL
       AND "last_failure_cause_category" IS NULL
       AND "last_failure_cause_detail" IS NULL
@@ -344,6 +383,8 @@ CREATE TABLE "vessel" (
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
       AND "identity" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       END)
 ) STRICT;
 CREATE TABLE "vessel_shape" (
@@ -365,6 +406,9 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ve', 'last_failure_cause_category', 'mx', 'MissingCapability'),
   ('ve', 'last_failure_cause_category', 'rf', 'Refused'),
   ('ve', 'last_failure_cause_category', 'tr', 'Transient'),
+  ('ve', 'ending', 'fa', 'Failed'),
+  ('ve', 'ending', 'lo', 'Lost'),
+  ('ve', 'ending', 'rl', 'Released'),
   ('ve', 'cause_category', 'ex', 'External'),
   ('ve', 'cause_category', 'mc', 'Misconfigured'),
   ('ve', 'cause_category', 'mx', 'MissingCapability'),
@@ -394,6 +438,8 @@ CREATE VIEW "vessel_view" AS SELECT
   "vessel"."last_failure_cause_detail",
   "vessel"."last_failure_retryable",
   "vessel"."identity",
+  (SELECT "name" FROM "codes" WHERE "kind" = 've' AND "field" = 'ending' AND "code" = "vessel"."ending") AS "ending",
+  "vessel"."ending_reason",
   (SELECT "name" FROM "codes" WHERE "kind" = 've' AND "field" = 'cause_category' AND "code" = "vessel"."cause_category") AS "cause_category",
   "vessel"."cause_detail"
 FROM "vessel";

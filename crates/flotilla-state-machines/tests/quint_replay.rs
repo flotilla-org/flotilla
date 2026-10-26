@@ -330,7 +330,7 @@ impl LifecycleKind for VesselKind {
 fn lifecycle_outcome_value(outcome: &Outcome) -> Value {
     match outcome {
         Outcome::Succeeded => constant("Succeeded"),
-        Outcome::Failed { cause, retryable } => variant("Failed", json!({ "retryable": retryable, "cause": cause.detail })),
+        Outcome::Failed { cause, retryable } => variant("AttemptFailed", json!({ "retryable": retryable, "cause": cause.detail })),
     }
 }
 
@@ -364,7 +364,7 @@ fn lifecycle_value<K: LifecycleKind>(home: &Home<Lifecycle<K>>, resource: &Resou
             variant("Requested", Value::Array(attempts.into_iter().map(lifecycle_outcome_value).collect()))
         }
         LifecycleState::Realised { identity } => variant("Realised", json!(identity)),
-        LifecycleState::Gone => constant("Gone"),
+        LifecycleState::Gone { ending } => variant("Gone", flotilla_quint_testkit::lifecycle::ending_value(ending)),
         LifecycleState::GaveUp { cause } => variant("GaveUp", json!(cause.detail)),
     }
 }
@@ -406,7 +406,7 @@ fn lifecycle_step<K: LifecycleKind>(
             if seen {
                 world.absences.put(&observed, true);
             }
-            lifecycle::Vanish { observed }.into()
+            lifecycle::Vanish { cause: lifecycle::VanishCause::Lost, observed }.into()
         }
         other => panic!("{step}: lifecycle operation {other}"),
     };
@@ -431,7 +431,7 @@ fn lifecycle_end_refuses<K: LifecycleKind>(
     let probes = vec![
         lifecycle::Realise { identity: identity.into(), observed: witness }.into(),
         lifecycle::Release { teardown: Ref::new("witness") }.into(),
-        lifecycle::Vanish { observed: Ref::new("witness") }.into(),
+        lifecycle::Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: Ref::new("witness") }.into(),
         lifecycle::GiveUp { cause: cause("failure") }.into(),
         lifecycle::Attempted { outcome: Outcome::Succeeded }.into(),
     ];
@@ -482,7 +482,7 @@ fn machine_edges(trace: &Trace, tally: &mut Tally) {
             "attempt" => {
                 let outcome = match tag(step.pick("outcome")) {
                     "Succeeded" => Outcome::Succeeded,
-                    "Failed" => {
+                    "AttemptFailed" => {
                         let failed = payload(step.pick("outcome"));
                         Outcome::Failed { cause: cause(text(&failed["cause"])), retryable: boolean(&failed["retryable"]) }
                     }
@@ -559,7 +559,11 @@ fn refuse_without_evidence(
             (realise().into(), &none),
             (realise().into(), &stranger),
             (lifecycle::Release { teardown: Ref::new(ONE) }.into(), &none),
-            (lifecycle::Vanish { observed: Ref::new(ONE) }.into(), &none),
+            (
+                lifecycle::Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: Ref::new(ONE) }
+                    .into(),
+                &none,
+            ),
             (lifecycle::GiveUp { cause: cause("other") }.into(), &none),
         ];
         for (edge, world) in probes {
@@ -1079,7 +1083,7 @@ impl Fleet {
                 "Leased",
                 json!({ "placement": lease_value(lease), "lifecycle": lifecycle_value(&self.vessels, resource.expect("a leased vessel's lifecycle")) }),
             )),
-            (None, Some(lease), Some(LifecycleState::Gone)) => Some(variant("Gone", lease_value(lease))),
+            (None, Some(lease), Some(LifecycleState::Gone { .. })) => Some(variant("Gone", lease_value(lease))),
             (held, returned, life) => {
                 panic!("{step}: vessel {id} is inconsistent: ledger {held:?}, returned {returned:?}, lifecycle {life:?}")
             }
@@ -1231,7 +1235,7 @@ fn phase(state: &LifecycleState) -> FulfillerPhase {
     match state {
         LifecycleState::Requested { .. } => FulfillerPhase::Requested,
         LifecycleState::Realised { .. } => FulfillerPhase::Realised,
-        LifecycleState::Gone => FulfillerPhase::Gone,
+        LifecycleState::Gone { .. } => FulfillerPhase::Gone,
         LifecycleState::GaveUp { .. } => FulfillerPhase::GaveUp,
     }
 }

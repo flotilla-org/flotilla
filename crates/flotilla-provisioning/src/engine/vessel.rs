@@ -88,7 +88,12 @@ impl Binding for VesselBinding {
             }
             VesselStatusPatch::MarkReady { .. } => vec![],
             // An observed backing can vanish; a failed provisioning attempt retains its cause.
-            VesselStatusPatch::MarkLost { .. } | VesselStatusPatch::MarkFailed { .. } if realised(obj) => vec![Step::Vanished],
+            VesselStatusPatch::MarkLost { .. } if realised(obj) => {
+                vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }]
+            }
+            VesselStatusPatch::MarkFailed { message } if realised(obj) => vec![Step::Vanished {
+                cause: flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: message.clone() },
+            }],
             VesselStatusPatch::MarkLost { message } | VesselStatusPatch::MarkFailed { message } => {
                 // Both reports come from outside the machine. Before realisation the same inputs
                 // cannot recover by retrying, so the failure spends the request immediately.
@@ -109,18 +114,26 @@ impl Binding for VesselBinding {
         }
     }
 
-    fn copy(obj: &ResourceObject<OldVessel>, resource: &Resource<Vessel>) -> Option<VesselStatusPatch> {
-        // Only an ended lease has an old patch that says it; a live one the old status already shows.
-        match (resource.state(), phase(obj)) {
-            (LifecycleState::Gone, VesselPhase::Lost | VesselPhase::Failed) => None,
-            (LifecycleState::Gone, _) => Some(VesselStatusPatch::MarkLost {
-                message: obj
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.message.clone())
-                    .unwrap_or_else(|| "the vessel's lease has ended".into()),
-            }),
-            _ => None,
+    fn steps_with_state(obj: &ResourceObject<OldVessel>, patch: &VesselStatusPatch, state: Option<&LifecycleState>) -> Vec<Step> {
+        match (patch, state) {
+            (
+                VesselStatusPatch::MarkReady { environment_ref, .. },
+                Some(LifecycleState::Requested { .. } | LifecycleState::Gone { .. } | LifecycleState::GaveUp { .. }),
+            ) => {
+                vec![Step::Realised { identity: environment_ref.clone().unwrap_or_else(|| obj.metadata.name.clone()) }]
+            }
+            (VesselStatusPatch::MarkReady { .. }, Some(LifecycleState::Realised { .. })) => vec![],
+            (VesselStatusPatch::MarkLost { .. }, Some(LifecycleState::Realised { .. })) => {
+                vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }]
+            }
+            (VesselStatusPatch::MarkFailed { message }, Some(LifecycleState::Realised { .. })) => vec![Step::Vanished {
+                cause: flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: message.clone() },
+            }],
+            (
+                VesselStatusPatch::MarkLost { message } | VesselStatusPatch::MarkFailed { message },
+                Some(LifecycleState::Requested { .. }),
+            ) => vec![Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, message), retryable: false })],
+            _ => Self::steps(obj, patch),
         }
     }
 }
@@ -215,7 +228,7 @@ where
         let edge: LifecycleEdge = match step {
             Step::Realised { identity } => Realise { identity: identity.clone(), observed: Ref::new(name) }.into(),
             Step::Released => Release { teardown: Ref::new(name) }.into(),
-            Step::Vanished => Vanish { observed: Ref::new(name) }.into(),
+            Step::Vanished { cause } => Vanish { cause: cause.clone(), observed: Ref::new(name) }.into(),
             Step::Attempted(outcome) => Attempted { outcome: outcome.clone() }.into(),
         };
         let world = evidence(name, step);

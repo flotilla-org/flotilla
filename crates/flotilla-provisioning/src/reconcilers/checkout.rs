@@ -387,8 +387,10 @@ fn checkout_phase(obj: &ResourceObject<Checkout>, reading: Option<&LifecycleRead
     match reading {
         Some(LifecycleReading::InProgress | LifecycleReading::Retrying { .. }) => CheckoutPhase::Pending,
         Some(LifecycleReading::Ready { .. }) => CheckoutPhase::Ready,
-        Some(LifecycleReading::Exhausted { .. } | LifecycleReading::GaveUp { .. }) => CheckoutPhase::Failed,
-        Some(LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::Gone) => CheckoutPhase::Gone,
+        Some(LifecycleReading::Failed { .. } | LifecycleReading::Exhausted { .. } | LifecycleReading::GaveUp { .. }) => {
+            CheckoutPhase::Failed
+        }
+        Some(LifecycleReading::Lost | LifecycleReading::Released) => CheckoutPhase::Gone,
         None => obj.status.as_ref().map(|status| status.phase).unwrap_or_default(),
     }
 }

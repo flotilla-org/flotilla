@@ -3,18 +3,16 @@
 //! Every read is keyed (one resource by kind, name and home) or indexed (a declared index's page);
 //! none lists a kind and filters (#3607). The judgements a view shows (in progress, retrying,
 //! exhausted, lost) are computed per key at read time from the stored state and the policy, and
-//! never stored. Lost and released are both Gone: the last log entry of that one resource says
-//! which.
+//! never stored. A Gone state carries its ending, including on snapshot-only replicas.
 
 use std::sync::{Arc, Mutex};
 
 use flotilla_schema::{Address, IndexQuery, Kind, Ref, Timestamp};
 use flotilla_schema_sqlite::{Read, ResourceId, Store, StoreError};
 use flotilla_state_machines::{
-    edge_event,
     machines::{
         convoy::ConvoyId,
-        lifecycle::{Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState},
+        lifecycle::{Ending, Lifecycle, LifecycleKind, LifecycleState},
         vessel::{VesselKind, VesselSpec},
     },
     Cause, Resource,
@@ -42,11 +40,10 @@ pub enum Judgement {
     Ready { identity: String },
     /// Gone, observed absent without a release.
     Lost,
+    /// Gone after an observed failure.
+    Failed { reason: String },
     /// Gone, torn down on purpose.
     Released,
-    /// Gone, and the entry that ended it is not held here: a replica seeded from a snapshot keeps
-    /// no log entries from before it, so it cannot tell lost from released.
-    Gone,
     /// Its attempts were spent; the last failed with `cause`.
     GaveUp { cause: Cause },
 }
@@ -63,17 +60,8 @@ pub struct View<K: LifecycleKind> {
     pub judgement: Judgement,
 }
 
-/// How a Gone resource ended, as its last log entry says.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ending {
-    Released,
-    Vanished,
-    /// The entry is not held here (a replica seeded from a snapshot), or the resource is not Gone.
-    Unknown,
-}
-
-/// The judgement of `state` under `K`'s policy; `ending` says, for a Gone resource, how it ended.
-pub fn judge<K: LifecycleKind>(state: &LifecycleState, ending: Ending) -> Judgement {
+/// The judgement of the stored state under the kind's retry policy.
+pub fn judge<K: LifecycleKind>(state: &LifecycleState) -> Judgement {
     match state {
         LifecycleState::Requested { failures: 0, .. } => Judgement::InProgress,
         // The shared retry judgement (`attempt::retry`), over the Requested tally.
@@ -91,10 +79,10 @@ pub fn judge<K: LifecycleKind>(state: &LifecycleState, ending: Ending) -> Judgem
         }
         LifecycleState::Requested { last_failure: None, .. } => Judgement::InProgress,
         LifecycleState::Realised { identity } => Judgement::Ready { identity: identity.clone() },
-        LifecycleState::Gone => match ending {
+        LifecycleState::Gone { ending } => match ending {
             Ending::Released => Judgement::Released,
-            Ending::Vanished => Judgement::Lost,
-            Ending::Unknown => Judgement::Gone,
+            Ending::Lost => Judgement::Lost,
+            Ending::Failed { reason } => Judgement::Failed { reason: reason.clone() },
         },
         LifecycleState::GaveUp { cause } => Judgement::GaveUp { cause: cause.clone() },
     }
@@ -149,8 +137,7 @@ pub trait ProvisioningReads: Send + Sync {
 
 /// The read port over one decided store.
 ///
-/// Each read takes the store's lock for one keyed load (and, for a Gone resource, its last log
-/// entry) or one index page: 3 to 30 µs at the 10,000-convoy ceiling (`provisioning_bench`), so a
+/// Each read takes the store's lock for one keyed load or one index page: 3 to 30 µs at the 10,000-convoy ceiling (`provisioning_bench`), so a
 /// view that reads per checkout stays well inside a frame. A write holds the same lock for one
 /// short transaction (about 0.1 to 0.4 ms), which bounds how long a read can wait for it.
 pub struct StoreReads {
@@ -216,26 +203,8 @@ where
 {
     let Some(loaded) = read.load::<Resource<Lifecycle<K>>>(id)? else { return Ok(None) };
     let state = loaded.value.state().clone();
-    // Lost or released: the entry that ended it, the resource's last (its version is that entry's
-    // sequence), read by key. A replica seeded from a snapshot does not hold it.
-    let ending = if state == LifecycleState::Gone {
-        let last = read.changes(id, loaded.version.saturating_sub(1), 1)?;
-        match last.first().filter(|entry| entry.home_seq == loaded.version) {
-            Some(entry) => match edge_event::<Lifecycle<K>>(entry).map_err(|error| ReadError(format!("{error:?}")))? {
-                Some(event) if matches!(event.payload.edge, LifecycleEdge::Release(_)) => Ending::Released,
-                Some(event) if matches!(event.payload.edge, LifecycleEdge::Vanish(_)) => Ending::Vanished,
-                _ => Ending::Unknown,
-            },
-            None => {
-                tracing::debug!(resource = %loaded.name, home = %loaded.home, version = loaded.version, "the entry that ended it is not held here; read as Gone");
-                Ending::Unknown
-            }
-        }
-    } else {
-        Ending::Unknown
-    };
     Ok(Some(View {
-        judgement: judge::<K>(&state, ending),
+        judgement: judge::<K>(&state),
         name: loaded.name,
         home: loaded.home,
         request: loaded.value.spec().clone(),
@@ -361,9 +330,9 @@ impl Judgement {
             }
             Judgement::Exhausted { last } => LifecycleReading::Exhausted { cause: last.detail.clone() },
             Judgement::Ready { identity } => LifecycleReading::Ready { identity: identity.clone() },
+            Judgement::Failed { reason } => LifecycleReading::Failed { reason: reason.clone() },
             Judgement::Lost => LifecycleReading::Lost,
             Judgement::Released => LifecycleReading::Released,
-            Judgement::Gone => LifecycleReading::Gone,
             Judgement::GaveUp { cause } => LifecycleReading::GaveUp { cause: cause.detail.clone() },
         }
     }

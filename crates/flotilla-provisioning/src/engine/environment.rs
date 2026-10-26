@@ -82,7 +82,9 @@ impl Binding for EnvironmentBinding {
             EnvironmentStatusPatch::MarkFailed { message } => {
                 vec![Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, message), retryable: false })]
             }
-            EnvironmentStatusPatch::MarkLost { .. } => vec![Step::Vanished],
+            EnvironmentStatusPatch::MarkLost { .. } => {
+                vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }]
+            }
             EnvironmentStatusPatch::WaitForImageBuild { .. }
             | EnvironmentStatusPatch::ObserveRuntime { .. }
             | EnvironmentStatusPatch::CredentialDelivery { .. }
@@ -93,7 +95,9 @@ impl Binding for EnvironmentBinding {
     fn steps_with_state(obj: &ResourceObject<OldEnvironment>, patch: &EnvironmentStatusPatch, state: Option<&LifecycleState>) -> Vec<Step> {
         match (patch, state) {
             // A realised backing failed after readiness; old status may not have caught up.
-            (EnvironmentStatusPatch::MarkFailed { .. }, Some(LifecycleState::Realised { .. })) => vec![Step::Vanished],
+            (EnvironmentStatusPatch::MarkFailed { message }, Some(LifecycleState::Realised { .. })) => vec![Step::Vanished {
+                cause: flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: message.clone() },
+            }],
             _ => Self::steps(obj, patch),
         }
     }

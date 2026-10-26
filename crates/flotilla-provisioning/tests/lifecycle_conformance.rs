@@ -35,7 +35,7 @@ use flotilla_provisioning::stored::{
     Holder,
 };
 use flotilla_quint_testkit::{
-    graph::{self, bare, refusal, tick, Conformance, Report, Step},
+    graph::{self, refusal, tick, Conformance, Report, Step},
     itf::{boolean, payload, tag, text, unit, variant},
 };
 use flotilla_resources::{ImageLayerSource, ImageLayerSpec, ImageLayerTier};
@@ -203,7 +203,7 @@ fn outcome<T, M: flotilla_state_machines::Machine<Refusal = LifecycleRefusal>>(r
 fn outcome_value(outcome: &Outcome) -> Value {
     match outcome {
         Outcome::Succeeded => variant("Succeeded", unit()),
-        Outcome::Failed { cause, retryable } => variant("Failed", json!({ "retryable": retryable, "cause": cause.detail })),
+        Outcome::Failed { cause, retryable } => variant("AttemptFailed", json!({ "retryable": retryable, "cause": cause.detail })),
     }
 }
 
@@ -221,7 +221,7 @@ fn encode_state(state: &LifecycleState, attempts: &[Outcome]) -> Value {
             variant("Requested", Value::Array(attempts.iter().map(outcome_value).collect()))
         }
         LifecycleState::Realised { identity } => variant("Realised", Value::from(identity.as_str())),
-        LifecycleState::Gone => bare("Gone"),
+        LifecycleState::Gone { ending } => variant("Gone", flotilla_quint_testkit::lifecycle::ending_value(ending)),
         LifecycleState::GaveUp { cause } => variant("GaveUp", Value::from(cause.detail.as_str())),
     }
 }
@@ -268,7 +268,12 @@ where
             }
             "Vanish" => {
                 world.absences.put(&Ref::new(NAME), boolean(&o["absent"]));
-                outcome(home.apply(NAME, Vanish { observed: Ref::new(NAME) }, &world, at))
+                outcome(home.apply(
+                    NAME,
+                    Vanish { cause: flotilla_quint_testkit::lifecycle::vanish_cause(&o["cause"]), observed: Ref::new(NAME) },
+                    &world,
+                    at,
+                ))
             }
             "Attempted" => {
                 let attempted = match tag(o) {
@@ -348,7 +353,7 @@ where
     Resource<Machine<K>>: Kind,
     StoreLog: Log<Machine<K>>,
 {
-    let failed = |cause: &str| variant("Failed", json!({ "retryable": true, "cause": cause }));
+    let failed = |cause: &str| variant("AttemptFailed", json!({ "retryable": true, "cause": cause }));
     let mut subject = StoredLifecycle::<K>::create(&Value::Null);
     assert_eq!(StoredLifecycle::<K>::encode(&subject), variant("Requested", json!([])));
     for _ in 0..2 {
@@ -368,7 +373,7 @@ where
     assert_eq!(StoredLifecycle::<K>::encode(&subject), variant("Realised", json!("model")));
     let release = variant("Release", json!({ "teardownComplete": true }));
     assert!(matches!(StoredLifecycle::<K>::apply(&mut subject, &release), Step::Accepted));
-    assert_eq!(StoredLifecycle::<K>::encode(&subject), bare("Gone"));
+    assert_eq!(StoredLifecycle::<K>::encode(&subject), variant("Gone", variant("Released", flotilla_quint_testkit::itf::unit())));
     assert!(matches!(StoredLifecycle::<K>::apply(&mut subject, &realise), Step::Refused(ref r) if tag(r) == "Ended"));
 }
 

@@ -89,7 +89,7 @@ pub struct Brief {
 }
 
 /// Covering indexes: the label is digit 0 (base 4), the source digit 2 (base 2), and Requested's
-/// tally digits 3 and 4 (base 2).
+/// tally digits 3 and 4 (base 2). Gone reuses the inactive tally digit at place 16 for its three endings.
 pub const COVERING: usize = 48;
 
 pub fn state_value(tc: &TestCase, pick: Pick) -> LifecycleState {
@@ -99,7 +99,13 @@ pub fn state_value(tc: &TestCase, pick: Pick) -> LifecycleState {
             LifecycleState::Requested { failures, last_failure }
         }
         1 => LifecycleState::Realised { identity: text(tc) },
-        2 => LifecycleState::Gone,
+        2 => LifecycleState::Gone {
+            ending: match pick.digit(tc, 3, 16) {
+                0 => flotilla_state_machines::machines::lifecycle::Ending::Released,
+                1 => flotilla_state_machines::machines::lifecycle::Ending::Lost,
+                _ => flotilla_state_machines::machines::lifecycle::Ending::Failed { reason: text(tc) },
+            },
+        },
         _ => LifecycleState::GaveUp { cause: cause(tc, pick) },
     }
 }
@@ -162,7 +168,19 @@ pub fn candidates<K: LifecycleKind>(tc: &TestCase, state: &LifecycleState) -> Ve
     let absent = flotilla_state_machines::Ref::<Absence>::new(name(tc));
     let mut world = MemoryLifecycleWorld::default();
     world.absences.put(&absent, true);
-    candidates.push((Vanish { observed: absent }.into(), boxed(world), now));
+    candidates.push((
+        Vanish {
+            cause: if tc.draw(gs::booleans()) {
+                flotilla_state_machines::machines::lifecycle::VanishCause::Lost
+            } else {
+                flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: text(tc) }
+            },
+            observed: absent,
+        }
+        .into(),
+        boxed(world),
+        now,
+    ));
     candidates.push((Attempted { outcome: outcome(tc, Pick::Draw) }.into(), boxed(MemoryLifecycleWorld::default()), now));
     let last = match state {
         LifecycleState::Requested { last_failure, .. } => last_failure.as_ref().map(|failure| failure.cause.clone()),

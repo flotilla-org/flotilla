@@ -40,7 +40,7 @@ use flotilla_state_machines::{
 use serde_json::{json, Value};
 
 use crate::{
-    graph::{bare, refusal, tick, Conformance, Step},
+    graph::{refusal, tick, Conformance, Step},
     itf::{boolean, int, map_of, number, pairs, payload, set, tag, variant},
 };
 
@@ -115,7 +115,7 @@ fn lifecycle_value(state: &LifecycleState) -> Value {
             variant("Requested", Value::Array(vec![]))
         }
         LifecycleState::Realised { identity } => variant("Realised", Value::from(identity.as_str())),
-        LifecycleState::Gone => bare("Gone"),
+        LifecycleState::Gone { ending } => variant("Gone", crate::lifecycle::ending_value(ending)),
         LifecycleState::GaveUp { cause } => variant("GaveUp", Value::from(cause.detail.as_str())),
     }
 }
@@ -217,7 +217,7 @@ impl<F: VesselLogs> Conformance for VesselConformance<F> {
     fn apply(v: &mut Composed<F>, event: &Value) -> Step {
         let o = payload(event);
         match (v.vessel().map(|vessel| vessel.state().clone()), tag(event)) {
-            (Some(LifecycleState::Gone), _) => refusal("WrongState"),
+            (Some(LifecycleState::Gone { .. } | LifecycleState::GaveUp { .. }), _) => refusal("WrongState"),
             (None, "Place") => v.place(Evidence {
                 host: spec_host(count(&o["host"])),
                 available: units(&o["available"]),
@@ -244,7 +244,7 @@ impl<F: VesselLogs> Conformance for VesselConformance<F> {
             (Some(_), "Vanish") => {
                 let mut world = MemoryLifecycleWorld::default();
                 world.absences.put(&Ref::new(NAME), boolean(&o["absent"]));
-                v.lifecycle_edge(Vanish { observed: Ref::new(NAME) }.into(), &world)
+                v.lifecycle_edge(Vanish { cause: crate::lifecycle::vanish_cause(&o["cause"]), observed: Ref::new(NAME) }.into(), &world)
             }
             (_, other) => panic!("vessel event {other}"),
         }
@@ -255,7 +255,7 @@ impl<F: VesselLogs> Conformance for VesselConformance<F> {
         let vessel = placements.get(&v.id).expect("a granted lease has its vessel");
         let lease = vessel.spec().lease();
         match (vessel.state(), placements.ledger().vessel(&v.id)) {
-            (LifecycleState::Gone, None) => variant("Gone", placement_value(&lease)),
+            (LifecycleState::Gone { .. } | LifecycleState::GaveUp { .. }, None) => variant("Gone", placement_value(&lease)),
             (lifecycle, Some(Placed::Leased(held))) => {
                 assert_eq!(held, &lease, "the stored vessel holds the ledger's lease");
                 variant("Leased", json!({ "placement": placement_value(&lease), "lifecycle": lifecycle_value(lifecycle) }))

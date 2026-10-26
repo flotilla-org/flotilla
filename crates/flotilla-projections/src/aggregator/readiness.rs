@@ -54,8 +54,31 @@ impl Aggregator {
                 && self.read_host(&source.provenance).as_ref() == Some(host)
         });
         if let Some(vessel) = vessel {
-            let status = vessel.object.status.as_ref();
-            let vessel_phase = self.vessel_phase(vessel);
+            let origin = engine_origin(&vessel.provenance);
+            let engine = match self.lifecycle_reads.try_reading(ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref()) {
+                Ok(reading) => reading,
+                Err(error) => {
+                    return (
+                        Readiness {
+                            state: ReadinessState::Blocked,
+                            blockers: vec![ReadinessBlocker {
+                                resource: ResourceRef::new(
+                                    api_version(Vessel::API_PATHS),
+                                    Vessel::API_PATHS.kind,
+                                    &convoy.namespace,
+                                    &vessel.object.metadata.name,
+                                )
+                                .on_host(host.clone()),
+                                phase: "Unknown".into(),
+                                reason: error.clone(),
+                            }],
+                        },
+                        Some(error),
+                    );
+                }
+            };
+            let status = engine.is_none().then_some(vessel.object.status.as_ref()).flatten();
+            let vessel_phase = Self::vessel_phase_from_reading(vessel, engine.as_ref());
             if vessel_phase == VesselPhase::Ready {
                 result.state = ReadinessState::Ready;
             } else {
@@ -73,14 +96,18 @@ impl Aggregator {
                     )
                     .on_host(host.clone()),
                     phase: format!("{vessel_phase:?}"),
-                    reason: status.and_then(|status| status.message.clone()).unwrap_or_else(|| {
-                        if vessel_phase == VesselPhase::Lost {
-                            // TODO(#2872): remove unavailable-rehydration guidance when recovery ships.
-                            "lost, recoverable; rehydration is not available yet (#2872)".into()
-                        } else {
-                            "vessel is not ready".into()
-                        }
-                    }),
+                    reason: engine
+                        .as_ref()
+                        .and_then(LifecycleReading::reason)
+                        .or_else(|| status.and_then(|status| status.message.clone()))
+                        .unwrap_or_else(|| {
+                            if vessel_phase == VesselPhase::Lost {
+                                // TODO(#2872): remove unavailable-rehydration guidance when recovery ships.
+                                "lost, recoverable; rehydration is not available yet (#2872)".into()
+                            } else {
+                                "vessel is not ready".into()
+                            }
+                        }),
                 });
             }
             // Lost backing is frozen. Missing child evidence cannot turn it
@@ -274,7 +301,7 @@ pub(super) fn apply_readiness_event<T: Resource>(
 
 /// The engine home of a resource read from `provenance`: a replica's origin root, or `None` for
 /// this home.
-fn engine_origin(provenance: &ResourceProvenance) -> Option<String> {
+pub(super) fn engine_origin(provenance: &ResourceProvenance) -> Option<String> {
     match provenance {
         ResourceProvenance::Local => None,
         ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
@@ -291,7 +318,7 @@ fn reading_blocker(reading: &LifecycleReading, not_ready: &str) -> Option<(Readi
         // Exhausted gives up on the next reconcile; until then a retry may still be under way.
         // An ended checkout or clone never comes back: the engine has no incarnations, so a vessel
         // waiting on it waits on a replacement under a new name, and readiness says so.
-        LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::Gone | LifecycleReading::GaveUp { .. } => {
+        LifecycleReading::Failed { .. } | LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::GaveUp { .. } => {
             ReadinessState::Failed
         }
     };

@@ -9,7 +9,7 @@
 //! |---|---|---|
 //! | Environment | Pending, Provisioning | Requested |
 //! | | Ready | Realised (its container, or the host-direct root) |
-//! | | Lost | Gone |
+//! | | Lost | Gone(Lost) |
 //! | | Failed | GaveUp |
 //! | ImageBuild | Queued, Building, Failed with a retry to come | Requested (its failed attempts tallied) |
 //! | | Built | Realised (its digest) |
@@ -20,14 +20,15 @@
 //! | Checkout | Pending | Requested |
 //! | | Ready | Realised (its path) |
 //! | | Failed | GaveUp |
-//! | | Gone | Gone |
+//! | | Gone | Gone(Released) |
 //! | TerminalSession (as launch `#1`) | Starting | Requested |
 //! | | Running, Lost (unobservable is a judgement, #3629 Q2) | Realised (its session id) |
-//! | | Stopped | Gone |
+//! | | Stopped | Gone(Released) |
 //! | | Failed | GaveUp |
 //! | Vessel, placed (a lease granted on its pinned host, #3629 Q6) | Pending, Provisioning | Requested |
 //! | | Ready, Interrupted (interrupted is a judgement) | Realised (its environment; refused with none) |
-//! | | Lost, Failed (a vessel never gives up, Q3) | Gone |
+//! | | Lost | Gone(Lost) |
+//! | | Failed | Gone(Failed(message)) |
 //! | Vessel, not placed yet | Pending | not stored: Waiting, at the ledger only, until the write path places it |
 //! | | Lost, Failed | not stored: it never held a lease |
 //! | | Provisioning, Ready, Interrupted | refused: no lease to import |
@@ -120,7 +121,7 @@ pub fn label(state: &LifecycleState) -> &'static str {
     match state {
         LifecycleState::Requested { .. } => "requested",
         LifecycleState::Realised { .. } => "realised",
-        LifecycleState::Gone => "gone",
+        LifecycleState::Gone { .. } => "gone",
         LifecycleState::GaveUp { .. } => "gave-up",
     }
 }
@@ -226,7 +227,7 @@ impl Imported for EnvironmentBinding {
                 let root = obj.spec.host_direct.as_ref().map(|host| host.repo_default_dir.clone());
                 realised(container.or(root), "container or root")?
             }
-            EnvironmentPhase::Lost => LifecycleState::Gone,
+            EnvironmentPhase::Lost => LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost },
             EnvironmentPhase::Failed => LifecycleState::GaveUp { cause: failed_by(message, "the environment failed") },
         })
     }
@@ -293,7 +294,7 @@ impl Imported for CheckoutBinding {
             CheckoutPhase::Failed => {
                 LifecycleState::GaveUp { cause: failed_by(status.and_then(|status| status.message.as_deref()), "the checkout failed") }
             }
-            CheckoutPhase::Gone => LifecycleState::Gone,
+            CheckoutPhase::Gone => LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released },
         })
     }
 }
@@ -307,7 +308,9 @@ impl Imported for TerminalSessionBinding {
             TerminalSessionPhase::Running | TerminalSessionPhase::Lost => {
                 realised(status.and_then(|status| status.session_id.clone()), "session id")?
             }
-            TerminalSessionPhase::Stopped => LifecycleState::Gone,
+            TerminalSessionPhase::Stopped => {
+                LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }
+            }
             TerminalSessionPhase::Failed => {
                 LifecycleState::GaveUp { cause: failed_by(status.and_then(|status| status.message.as_deref()), "the session failed") }
             }
@@ -328,8 +331,12 @@ impl Imported for VesselBinding {
             VesselPhase::Ready | VesselPhase::Interrupted => {
                 realised(status.and_then(|status| status.environment_ref.clone()), "environment")?
             }
-            // A vessel that breaks after its lease ends Gone, and never gives up (Q3).
-            VesselPhase::Lost | VesselPhase::Failed => LifecycleState::Gone,
+            VesselPhase::Lost => LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost },
+            VesselPhase::Failed => LifecycleState::Gone {
+                ending: flotilla_state_machines::machines::lifecycle::Ending::Failed {
+                    reason: status.and_then(|status| status.message.clone()).unwrap_or_default(),
+                },
+            },
         })
     }
 }

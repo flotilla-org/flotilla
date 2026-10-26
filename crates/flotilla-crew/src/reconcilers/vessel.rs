@@ -155,10 +155,10 @@ impl VesselReconciler {
             Some(LifecycleReading::Ready { identity }) => {
                 CheckoutDependency { phase: CheckoutPhase::Ready, failure: None, path: Some(identity) }
             }
-            Some(LifecycleReading::GaveUp { cause } | LifecycleReading::Exhausted { cause }) => {
-                CheckoutDependency { phase: CheckoutPhase::Failed, failure: Some(cause), path: None }
-            }
-            Some(LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::Gone) => {
+            Some(
+                LifecycleReading::Failed { reason: cause } | LifecycleReading::GaveUp { cause } | LifecycleReading::Exhausted { cause },
+            ) => CheckoutDependency { phase: CheckoutPhase::Failed, failure: Some(cause), path: None },
+            Some(LifecycleReading::Lost | LifecycleReading::Released) => {
                 CheckoutDependency { phase: CheckoutPhase::Gone, failure: None, path: None }
             }
             Some(_) => CheckoutDependency { phase: CheckoutPhase::Pending, failure: None, path: None },
@@ -182,10 +182,11 @@ impl VesselReconciler {
         Ok(match reading {
             Some(reading) => {
                 let unavailable = match &reading {
-                    LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause } => {
-                        Some(VesselPrepared::failed(cause.clone()))
-                    }
-                    LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::Gone => Some(VesselPrepared {
+                    LifecycleReading::Failed { reason: cause }
+                    | LifecycleReading::Exhausted { cause }
+                    | LifecycleReading::GaveUp { cause } => Some(VesselPrepared::failed(cause.clone())),
+                    LifecycleReading::Lost | LifecycleReading::Released => Some(VesselPrepared {
+                        phase: None,
                         patch: PlannedPatch::Lost {
                             message: format!("environment {} {}", environment.metadata.name, reading.reason().unwrap_or_default()),
                         },
@@ -466,13 +467,14 @@ async fn environment_image(
 
 #[derive(Debug, Clone)]
 pub struct VesselPrepared {
+    phase: Option<VesselPhase>,
     patch: PlannedPatch,
     actuations: Vec<Actuation>,
 }
 
 impl VesselPrepared {
     fn none() -> Self {
-        Self { patch: PlannedPatch::None, actuations: Vec::new() }
+        Self { phase: None, patch: PlannedPatch::None, actuations: Vec::new() }
     }
 
     fn provisioning(
@@ -482,7 +484,7 @@ impl VesselPrepared {
         actuations: Vec<Actuation>,
     ) -> Self {
         let waiting_for = legible_waiting_for(waiting_for.into(), placement_decision.as_ref());
-        Self { patch: provisioning_patch(placement_policy, placement_decision, waiting_for), actuations }
+        Self { phase: None, patch: provisioning_patch(placement_policy, placement_decision, waiting_for), actuations }
     }
 
     fn checkout_churn(
@@ -492,6 +494,7 @@ impl VesselPrepared {
         actuations: Vec<Actuation>,
     ) -> Self {
         Self {
+            phase: None,
             patch: PlannedPatch::CheckoutChurn {
                 observed_policy_ref: placement_policy.metadata.name.clone(),
                 observed_policy_version: placement_policy.metadata.resource_version.clone(),
@@ -519,11 +522,11 @@ impl VesselPrepared {
             },
             _ => return None,
         };
-        Some(Self { patch, actuations: Vec::new() })
+        Some(Self { phase: None, patch, actuations: Vec::new() })
     }
 
     fn failed(message: impl Into<String>) -> Self {
-        Self { patch: PlannedPatch::Failed { message: message.into() }, actuations: Vec::new() }
+        Self { phase: None, patch: PlannedPatch::Failed { message: message.into() }, actuations: Vec::new() }
     }
 
     fn interrupted(role: String, terminal_name: &str, restart: bool, mut actuations: Vec<Actuation>) -> Self {
@@ -531,6 +534,7 @@ impl VesselPrepared {
             actuations.push(Actuation::RestartTerminalSession { name: terminal_name.to_string() });
         }
         Self {
+            phase: None,
             patch: PlannedPatch::Interrupted {
                 roles: BTreeSet::from([role]),
                 message: format!("crew terminal session {terminal_name} disappeared; relaunching from its durable brief"),
@@ -540,15 +544,8 @@ impl VesselPrepared {
     }
 }
 
-impl Reconciler for VesselReconciler {
-    type Resource = Vessel;
-    type Prepared = VesselPrepared;
-
-    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
-        if obj.status.as_ref().is_some_and(|status| matches!(status.phase, VesselPhase::Failed | VesselPhase::Lost)) {
-            return Ok(VesselPrepared::none());
-        }
-
+impl VesselReconciler {
+    async fn prepare_plan(&self, obj: &ResourceObject<Vessel>) -> Result<VesselPrepared, ResourceError> {
         let convoy = match Self::dependency(&self.convoys, self.federated_convoys.as_ref(), obj, &obj.spec.convoy_ref).await {
             Ok(convoy) => convoy,
             Err(ResourceError::NotFound { .. }) => return Ok(VesselPrepared::failed(format!("convoy {} not found", obj.spec.convoy_ref))),
@@ -1166,6 +1163,7 @@ impl Reconciler for VesselReconciler {
                         };
                         if !local_workspace_mount_matches || !git_mounts_match(&existing_git_mounts, &git_mounts) {
                             return Ok(VesselPrepared {
+                                phase: None,
                                 patch: PlannedPatch::EnvironmentRecreation {
                                     observed_policy_ref: placement_policy.metadata.name.clone(),
                                     observed_policy_version: placement_policy.metadata.resource_version.clone(),
@@ -1562,6 +1560,7 @@ impl Reconciler for VesselReconciler {
             }
         }
         Ok(VesselPrepared {
+            phase: None,
             patch: PlannedPatch::Ready {
                 configured_limits,
                 placement_decision,
@@ -1574,6 +1573,32 @@ impl Reconciler for VesselReconciler {
             },
             actuations,
         })
+    }
+}
+
+impl Reconciler for VesselReconciler {
+    type Resource = Vessel;
+    type Prepared = VesselPrepared;
+
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        let reading = self.lifecycle_reads.try_reading(ProvisioningKind::Vessel, &obj.metadata.name, None).map_err(ResourceError::other)?;
+        let phase = match reading {
+            Some(LifecycleReading::Lost | LifecycleReading::Released) => VesselPhase::Lost,
+            Some(LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. }) => VesselPhase::Failed,
+            Some(LifecycleReading::Ready { .. }) => {
+                if obj.status.as_ref().is_some_and(|status| !status.interrupted_roles.is_empty()) {
+                    VesselPhase::Interrupted
+                } else {
+                    VesselPhase::Ready
+                }
+            }
+            Some(_) => VesselPhase::Provisioning,
+            None => obj.status.as_ref().map(|status| status.phase).unwrap_or_default(),
+        };
+        let mut prepared =
+            if matches!(phase, VesselPhase::Failed | VesselPhase::Lost) { VesselPrepared::none() } else { self.prepare_plan(obj).await? };
+        prepared.phase = Some(phase);
+        Ok(prepared)
     }
 
     fn reconcile(
@@ -1590,13 +1615,11 @@ impl Reconciler for VesselReconciler {
                     observed_policy_version: observed_policy_version.clone(),
                     placement_decision: placement_decision.clone(),
                     started_at: now,
-                    message: provisioning_stuck_message(obj, waiting_for, now),
+                    message: provisioning_stuck_message(obj, prepared.phase, waiting_for, now),
                     image: image.clone(),
                 })
             }
-            PlannedPatch::EnvironmentRecreation { message, .. }
-                if obj.status.as_ref().is_some_and(|status| status.phase == VesselPhase::Ready) =>
-            {
+            PlannedPatch::EnvironmentRecreation { message, .. } if prepared.phase == Some(VesselPhase::Ready) => {
                 (obj.status.as_ref().and_then(|status| status.message.as_deref()) != Some(message))
                     .then(|| VesselStatusPatch::RequireEnvironmentRecreation { message: message.clone() })
             }
@@ -1605,7 +1628,7 @@ impl Reconciler for VesselReconciler {
                 if obj
                     .status
                     .as_ref()
-                    .is_some_and(|status| status.phase == VesselPhase::Provisioning && status.message.as_deref() == Some(message))
+                    .is_some_and(|status| prepared.phase == Some(VesselPhase::Provisioning) && status.message.as_deref() == Some(message))
                 {
                     None
                 } else {
@@ -1644,7 +1667,7 @@ impl Reconciler for VesselReconciler {
             }),
             PlannedPatch::Interrupted { roles, message }
                 if obj.status.as_ref().is_none_or(|status| {
-                    status.phase != VesselPhase::Interrupted
+                    prepared.phase != Some(VesselPhase::Interrupted)
                         || status.interrupted_roles != *roles
                         || status.message.as_deref() != Some(message.as_str())
                 }) =>
@@ -1810,8 +1833,13 @@ fn provisioning_patch(
     }
 }
 
-fn provisioning_stuck_message(obj: &ResourceObject<Vessel>, waiting_for: &str, now: DateTime<Utc>) -> Option<String> {
-    let started_at = obj.status.as_ref().filter(|status| status.phase == VesselPhase::Provisioning).and_then(|status| status.started_at)?;
+fn provisioning_stuck_message(
+    obj: &ResourceObject<Vessel>,
+    phase: Option<VesselPhase>,
+    waiting_for: &str,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let started_at = obj.status.as_ref().filter(|_| phase == Some(VesselPhase::Provisioning)).and_then(|status| status.started_at)?;
     (now.signed_duration_since(started_at) >= chrono::Duration::seconds(VESSEL_PROVISIONING_STUCK_SECONDS))
         .then(|| format!("provisioning is stalled while waiting for {waiting_for}; reconciliation will continue retrying"))
 }
@@ -2416,6 +2444,47 @@ mod tests {
         fixture.poison();
         assert!(reconciler.environment_dependency(&env).err().expect("checked read").to_string().contains("poisoned"));
     }
+    // A held lease decides terminality even while old status disagrees; read errors never fall back.
+    #[tokio::test]
+    async fn vessel_reads_its_lease_without_a_status_copy() {
+        use flotilla_protocol::CanonicalHostId;
+        use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
+        use flotilla_resources::{VesselPhase, VesselStatus};
+        use flotilla_store::controller::Reconciler;
+        let mut vessel = object::<Vessel>(
+            "vessel",
+            VesselSpec {
+                convoy_ref: "convoy".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "local".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+            VesselStatus {
+                phase: VesselPhase::Lost,
+                placement_decision: Some(
+                    PlacementDecision::builder()
+                        .policy_name("local".into())
+                        .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("host"), display_name: "host".into() })
+                        .build(),
+                ),
+                ..Default::default()
+            },
+        );
+        let fixture = VesselFixture::new(false);
+        let reconciler = VesselReconciler::new(ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()), "flotilla")
+            .with_lifecycle_reads(fixture.reads.clone());
+        fixture.request(&vessel);
+        // Live engine state proceeds to the missing-convoy failure instead of trusting old Lost.
+        let prepared = reconciler.prepare(&vessel).await.expect("prepared");
+        assert!(reconciler.reconcile(&vessel, &prepared, chrono::Utc::now()).patch.is_some());
+        fixture.finish(&vessel, Ending::Released);
+        vessel.status.as_mut().expect("status").phase = VesselPhase::Ready;
+        let prepared = reconciler.prepare(&vessel).await.expect("ended");
+        assert!(reconciler.reconcile(&vessel, &prepared, chrono::Utc::now()).patch.is_none());
+        fixture.poison();
+        assert!(reconciler.prepare(&vessel).await.expect_err("checked read").to_string().contains("poisoned"));
+    }
+
     // Vessel checkout gates take phase, failure and realised path from one engine judgement.
     // A stale path cannot override the realised identity or hide a checked read failure.
     #[tokio::test]

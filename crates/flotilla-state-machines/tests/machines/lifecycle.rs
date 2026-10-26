@@ -57,7 +57,7 @@ fn release() -> Release {
 }
 
 fn vanish() -> Vanish {
-    Vanish { observed: Ref::new("r") }
+    Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: Ref::new("r") }
 }
 
 fn observed(identity: &str) -> MemoryLifecycleWorld {
@@ -95,7 +95,7 @@ fn codes_and_names_are_pinned() {
     let expected: [(&str, Code, &[&str]); 4] = [
         ("Requested", Code::new("rq"), &["failures", "last_failure"]),
         ("Realised", Code::new("rl"), &["identity"]),
-        ("Gone", Code::new("go"), &[]),
+        ("Gone", Code::new("go"), &["ending"]),
         ("GaveUp", Code::new("gu"), &["cause"]),
     ];
     assert_eq!(labels, expected);
@@ -116,9 +116,9 @@ stateDiagram-v2
   direction LR
   [*] --> Requested
   Requested --> Realised: realise [identity]
-  Requested --> Gone: release
-  Realised --> Gone: release
-  Realised --> Gone: vanish
+  Requested --> Gone: release [ending]
+  Realised --> Gone: release [ending]
+  Realised --> Gone: vanish [ending]
   Requested --> GaveUp: give_up [cause]
   Gone --> [*]
   note right of Gone: the thing is gone
@@ -172,21 +172,25 @@ fn release_needs_a_complete_teardown() {
         assert_eq!(h.apply("r", release(), &world, at(2)).err(), refused(LifecycleRefusal::MissingEvidence));
         world.teardowns.put(&Ref::<Teardown>::new("r"), true);
         h.apply("r", release(), &world, at(3)).expect("released");
-        assert_eq!(state(&h), &LifecycleState::Gone);
+        assert_eq!(state(&h), &LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released });
         assert!(state(&h).gone() && !state(&h).live());
     }
 }
 
-// Leaving Realised for Gone changes no data: the identity goes with the
-// label, so `release` declares no changes and the engine accepts it.
+// Release leaves identity behind and records its ending as state data.
 #[test]
-fn going_leaves_the_identity_behind_without_changing_data() {
+fn going_records_the_ending_and_leaves_identity_behind() {
     let realised = LifecycleState::Realised { identity: "a".into() };
-    assert!(changed(&realised, &LifecycleState::Gone).is_empty());
+    assert_eq!(
+        changed(&realised, &LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released })
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["ending"]
+    );
     assert_eq!(changed(&LifecycleState::requested(), &realised).into_iter().collect::<Vec<_>>(), ["identity"]);
     let declared = P::definition();
     let release = declared.find(LifecycleEdgeKind::Release).expect("declared");
-    assert!(release.changes.is_empty());
+    assert_eq!(release.changes.as_slice(), ["ending"]);
 }
 
 // Vanish leaves only Realised, and needs the thing observed absent.
@@ -202,7 +206,7 @@ fn vanish_needs_an_observed_absence_from_realised() {
     assert_eq!(h.apply("r", vanish(), &present, at(2)).err(), refused(LifecycleRefusal::MissingEvidence));
     assert_eq!(h.apply("r", vanish(), &MemoryLifecycleWorld::default(), at(2)).err(), refused(LifecycleRefusal::MissingEvidence));
     h.apply("r", vanish(), &world, at(3)).expect("vanished");
-    assert_eq!(state(&h), &LifecycleState::Gone);
+    assert_eq!(state(&h), &LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost });
 }
 
 // Give up needs the retry judgement exhausted with the edge's cause as the

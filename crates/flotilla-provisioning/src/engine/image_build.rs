@@ -87,7 +87,7 @@ impl Binding for ImageBuildBinding {
                 log_ref: status.log_ref.clone().unwrap_or_default(),
             }),
             // An image build is released only as its record is deleted.
-            LifecycleState::Gone => None,
+            LifecycleState::Gone { .. } => None,
         }
     }
 }

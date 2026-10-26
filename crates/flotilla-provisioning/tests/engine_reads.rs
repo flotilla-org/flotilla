@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use flotilla_engine_store::StoreLog;
 use flotilla_provisioning::{
     engine::{
-        reads::{judge, Ending, Judgement, ProvisioningReads, StoreReads},
+        reads::{judge, Judgement, ProvisioningReads, StoreReads},
         LifecycleHome, Lifecycles, Step,
     },
     stored::{
@@ -48,7 +48,7 @@ fn failure(detail: &str) -> Step {
 // Behaviour (#3629 layer 4): each view is a keyed or indexed read judged at read time. A
 // requested checkout is in progress; after a failure it is retrying, due at the failure plus the
 // policy's backoff; realised it is ready under its identity; Gone is lost when it vanished and
-// released when torn down, told apart by its last log entry.
+// released when torn down, as recorded in its stored ending.
 #[test]
 fn views_are_read_by_key_and_index_and_judged_per_key() {
     let store = store();
@@ -71,7 +71,9 @@ fn views_are_read_by_key_and_index_and_judged_per_key() {
     }
 
     checkouts.step("b", &Step::Realised { identity: "/w".into() }, Timestamp(3)).expect("realised");
-    checkouts.step("b", &Step::Vanished, Timestamp(4)).expect("vanished");
+    checkouts
+        .step("b", &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }, Timestamp(4))
+        .expect("vanished");
     checkouts.step("c", &Step::Released, Timestamp(4)).expect("released");
     assert_eq!(reads.checkout("b", HOME).expect("read").expect("held").judgement, Judgement::Lost);
     assert_eq!(reads.checkout("c", HOME).expect("read").expect("held").judgement, Judgement::Released);
@@ -96,25 +98,31 @@ fn judgements_follow_the_stored_state_and_the_policy() {
         failures,
         last_failure: Some(Failure { at: Timestamp(0), cause: cause.clone(), retryable }),
     };
-    assert_eq!(judge::<CheckoutKind>(&LifecycleState::requested(), Ending::Unknown), Judgement::InProgress);
-    assert!(matches!(judge::<CheckoutKind>(&failed(2, true), Ending::Unknown), Judgement::Retrying { failures: 2, .. }));
-    assert_eq!(judge::<CheckoutKind>(&failed(3, true), Ending::Unknown), Judgement::Exhausted { last: cause.clone() });
-    assert_eq!(judge::<CloneKind>(&failed(1, false), Ending::Unknown), Judgement::Exhausted { last: cause.clone() });
-    assert!(matches!(judge::<CloneKind>(&failed(50, true), Ending::Unknown), Judgement::Retrying { .. }), "a clone retries while wanted");
-    assert_eq!(judge::<CheckoutKind>(&LifecycleState::GaveUp { cause: cause.clone() }, Ending::Unknown), Judgement::GaveUp { cause });
+    assert_eq!(judge::<CheckoutKind>(&LifecycleState::requested()), Judgement::InProgress);
+    assert!(matches!(judge::<CheckoutKind>(&failed(2, true)), Judgement::Retrying { failures: 2, .. }));
+    assert_eq!(judge::<CheckoutKind>(&failed(3, true)), Judgement::Exhausted { last: cause.clone() });
+    assert_eq!(judge::<CloneKind>(&failed(1, false)), Judgement::Exhausted { last: cause.clone() });
+    assert!(matches!(judge::<CloneKind>(&failed(50, true)), Judgement::Retrying { .. }), "a clone retries while wanted");
+    assert_eq!(judge::<CheckoutKind>(&LifecycleState::GaveUp { cause: cause.clone() }), Judgement::GaveUp { cause });
 }
 
-// Behaviour (#3731 review): a replica told of a release by its events reads Released, as its home
-// does; a replica seeded from a snapshot holds no entry from before it, so it reads the
-// unattributed Gone rather than guess Lost.
-#[test]
-fn a_replica_reads_how_a_resource_ended_only_from_an_entry_it_holds() {
+// The stored ending survives snapshot-only replication without any preceding log entry.
+#[hegel::test]
+fn a_replica_reads_the_ending_from_its_snapshot(tc: hegel::TestCase) {
+    use flotilla_state_machines::machines::lifecycle::VanishCause;
+    // Covers every ending, with empty, ordinary and Unicode failure reasons.
+    let reason = ["", "provider failed", "失敗"][tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2))];
+    let (ending, expected) = match tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2)) {
+        0 => (Step::Released, Judgement::Released),
+        1 => (Step::Vanished { cause: VanishCause::Lost }, Judgement::Lost),
+        _ => (Step::Vanished { cause: VanishCause::Failed { reason: reason.into() } }, Judgement::Failed { reason: reason.into() }),
+    };
     let origin = store();
     let checkouts: Arc<dyn Lifecycles<CheckoutKind>> =
         Arc::new(LifecycleHome::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&origin))).expect("home")));
     checkouts.request("a", checkout("env-1", "convoy-1"), Timestamp(1)).expect("requested");
     checkouts.step("a", &Step::Realised { identity: "/w".into() }, Timestamp(2)).expect("realised");
-    checkouts.step("a", &Step::Released, Timestamp(3)).expect("released");
+    checkouts.step("a", &ending, Timestamp(3)).expect("released");
 
     let replica_of = || {
         let mut registry = KindRegistry::new();
@@ -131,7 +139,7 @@ fn a_replica_reads_how_a_resource_ended_only_from_an_entry_it_holds() {
         }
         write.commit().expect("commit");
     }
-    assert_eq!(StoreReads::new(followed).checkout("a", HOME).expect("read").expect("held").judgement, Judgement::Released);
+    assert_eq!(StoreReads::new(followed).checkout("a", HOME).expect("read").expect("held").judgement, expected);
 
     let seeded = replica_of();
     {
@@ -153,7 +161,7 @@ fn a_replica_reads_how_a_resource_ended_only_from_an_entry_it_holds() {
         write.restore(&snapshot).expect("restored");
         write.commit().expect("commit");
     }
-    assert_eq!(StoreReads::new(seeded).checkout("a", HOME).expect("read").expect("held").judgement, Judgement::Gone);
+    assert_eq!(StoreReads::new(seeded).checkout("a", HOME).expect("read").expect("held").judgement, expected);
 }
 
 // Behaviour (#3719 look-over ruling 4): a vessel finds its environment through the holder index,
@@ -252,7 +260,9 @@ fn a_vessel_reads_as_its_lease() {
     vessels.step("convoy-a-implement", &Step::Realised { identity: "env-a".into() }, Timestamp(2)).expect("ready");
     vessels.request("convoy-a-review", lease(), Timestamp(3)).expect("granted");
     vessels.step("convoy-a-review", &Step::Realised { identity: "env-b".into() }, Timestamp(4)).expect("ready");
-    vessels.step("convoy-a-review", &Step::Vanished, Timestamp(5)).expect("lost");
+    vessels
+        .step("convoy-a-review", &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }, Timestamp(5))
+        .expect("lost");
 
     let reads = StoreReads::new(store);
     let implement = reads.vessel("convoy-a-implement", HOME).expect("read").expect("held");
