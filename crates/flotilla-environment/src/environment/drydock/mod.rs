@@ -7,7 +7,7 @@ use super::*;
 use crate::environment::runner::{contained_credential_exclusions, CONTAINED_CODEX_HOME, CONTAINED_WRITABLE_CONFIG_BASE};
 use ::drydock::api::ProviderApi;
 use drydock_protocol as wire;
-use flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX;
+
 use runner::{error, AgentRunner};
 const CHECKPOINT_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 use sha2::Digest;
@@ -181,7 +181,12 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         self.connector.preflight(&prepared.platform)?;
         Ok(PreparedEnvironment::new(&self.owner, Prepared { prepared, spec: spec.clone() }))
     }
-    async fn provision(&self, id: EnvironmentId, prepared: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String> {
+    async fn provision(
+        &self,
+        id: EnvironmentId,
+        prepared: &PreparedEnvironment,
+        opts: ProvisionOpts,
+    ) -> Result<EnvironmentHandle, EnvironmentProvisionError> {
         let prepared = prepared.get::<Prepared>(&self.owner)?;
         // Only retries for this label serialize through complete guest setup.
         // Different sandboxes must not wait for another guest's SSH readiness.
@@ -204,10 +209,10 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
             // An existing backing still trusts the original key. Regenerating
             // here cannot rotate that key through label-idempotent provision.
             let backings = self.api.list(&self.instance).await.map_err(|cause| {
-                format!("{CLOUD_ADOPTION_RETRY_PREFIX} cannot verify backing before SSH key repair: {}", api_error(cause))
+                EnvironmentProvisionError::RetryAdoption(format!("cannot verify backing before SSH key repair: {}", api_error(cause)))
             })?;
             if backings.iter().any(|backing| backing.label.as_deref() == Some(id.as_str())) {
-                return Err(format!("{CLOUD_ADOPTION_RETRY_PREFIX} SSH keypair incomplete or missing for adopted backing; restore the controller key files; public-key rotation on adoption is unsupported"));
+                return Err(EnvironmentProvisionError::RetryAdoption("SSH keypair incomplete or missing for adopted backing; restore the controller key files; public-key rotation on adoption is unsupported".into()));
             }
             remove_keys(&keydir).await?;
             ::drydock::launch::keypair(&keydir).await.map_err(api_error)?.1
@@ -232,7 +237,9 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
             .await
             .map_err(api_error)?;
         if !(200..300).contains(&response.status) {
-            return Err(api_error(::drydock::client::Error::Protocol(serde_json::from_value(response.body).map_err(|e| e.to_string())?)));
+            return Err(
+                api_error(::drydock::client::Error::Protocol(serde_json::from_value(response.body).map_err(|e| e.to_string())?)).into()
+            );
         }
         let created = response.status == 201;
         let environment: wire::Environment = serde_json::from_value(response.body).map_err(|e| e.to_string())?;
@@ -284,7 +291,7 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                     Ok::<_, String>(())
                 }
                 .await;
-                setup.map_err(|cause| format!("{CLOUD_ADOPTION_RETRY_PREFIX} {cause}"))?;
+                setup.map_err(EnvironmentProvisionError::RetryAdoption)?;
                 return Ok(handle);
             }
         }
@@ -341,11 +348,11 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         .await;
         if let Err(cause) = setup {
             if !created {
-                return Err(format!("{CLOUD_ADOPTION_RETRY_PREFIX} {cause}"));
+                return Err(EnvironmentProvisionError::RetryAdoption(cause));
             }
             return match handle.destroy().await {
-                Ok(()) => Err(cause),
-                Err(cleanup) => Err(format!("{cause}; destroy failed: {cleanup}")),
+                Ok(()) => Err(cause.into()),
+                Err(cleanup) => Err(format!("{cause}; destroy failed: {cleanup}").into()),
             };
         }
         let mut active = self.active.lock().await;

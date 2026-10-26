@@ -21,6 +21,7 @@ use flotilla_discovery_api::provider_config;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_discovery_testkit::git_process_discovery;
 use flotilla_discovery_testkit::init_git_repo_with_remote;
+use flotilla_environment::environment::EnvironmentProvisionError;
 use flotilla_protocol::{
     commands::{CrewPromiseOperation, DaemonLogQuery},
     qualified_path::QualifiedPath,
@@ -5234,7 +5235,7 @@ impl flotilla_environment::environment::EnvironmentProvider for GatedStartupEnvi
         _id: EnvironmentId,
         _image: &flotilla_environment::environment::PreparedEnvironment,
         _opts: flotilla_environment::environment::ProvisionOpts,
-    ) -> Result<flotilla_environment::environment::EnvironmentHandle, String> {
+    ) -> Result<flotilla_environment::environment::EnvironmentHandle, EnvironmentProvisionError> {
         Err("unused".into())
     }
     async fn list(&self) -> Result<Vec<flotilla_environment::environment::EnvironmentHandle>, String> {

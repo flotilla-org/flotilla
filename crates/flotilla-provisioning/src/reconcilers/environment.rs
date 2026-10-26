@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use flotilla_environment::environment::EnvironmentProvisionError;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading};
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{
@@ -19,7 +20,7 @@ pub trait EnvironmentRuntime: Send + Sync {
         &self,
         name: &str,
         spec: &flotilla_resources::EnvironmentSpec,
-    ) -> Result<EnvironmentProvisioning, String>;
+    ) -> Result<EnvironmentProvisioning, EnvironmentProvisionError>;
     async fn destroy(&self, environment_ref: &str, backing_id: &str) -> Result<(), String>;
     /// Recover a provider backing whose identity was never committed to status.
     async fn destroy_unrecorded(&self, environment_ref: &str) -> Result<(), String> {
@@ -187,18 +188,19 @@ where
                     .await
                 {
                     Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
-                    Err(message) if message.starts_with("waiting on build:") => Ok(EnvironmentPrepared::Waiting(message)),
-                    Err(message) => Ok(EnvironmentPrepared::Failed(message)),
+                    Err(EnvironmentProvisionError::RetryAdoption(message)) => {
+                        Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: adoption failed; backing retained for retry: {message}")))
+                    }
+                    Err(error) if error.to_string().starts_with("waiting on build:") => Ok(EnvironmentPrepared::Waiting(error.to_string())),
+                    Err(error) => Ok(EnvironmentPrepared::Failed(error.to_string())),
                 }
             } else {
                 match self.runtime.provision_environment(&obj.metadata.name, &obj.spec).await {
                     Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
-                    Err(message)
-                        if obj.spec.cloud_sandbox.is_some() && message.starts_with(flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX) =>
-                    {
-                        Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: {message}")))
+                    Err(EnvironmentProvisionError::RetryAdoption(message)) => {
+                        Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: adoption failed; backing retained for retry: {message}")))
                     }
-                    Err(message) => Ok(EnvironmentPrepared::Failed(message)),
+                    Err(error) => Ok(EnvironmentPrepared::Failed(error.to_string())),
                 }
             }
         } else {

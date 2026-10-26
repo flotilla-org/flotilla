@@ -155,10 +155,6 @@ impl<'de> Deserialize<'de> for EnvironmentSpec {
     }
 }
 
-/// Stable marker crossing the legacy string-error runtime boundary. Keep all
-/// producers and the retry classifier aligned until that boundary becomes typed.
-pub const CLOUD_ADOPTION_RETRY_PREFIX: &str = "adoption setup failed; backing retained for retry:";
-
 /// Additive cloud input approved on #3620 (2026-10-22). No credentials or reach recipes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CloudSandboxEnvironmentSpec {

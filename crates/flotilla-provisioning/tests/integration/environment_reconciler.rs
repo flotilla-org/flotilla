@@ -4,12 +4,14 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_environment::environment::EnvironmentProvisionError;
 use flotilla_provisioning::reconcilers::{EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime};
 use flotilla_resources::{
     DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, Host,
     HostDirectEnvironmentSpec, HostSpec, InputMeta, ResourceError, StatusPatch,
 };
 use flotilla_store::{controller::Reconciler, ResourceBackend};
+use hegel::generators as gs;
 
 struct FailingEnvironmentRuntime;
 
@@ -19,8 +21,8 @@ impl EnvironmentRuntime for FailingEnvironmentRuntime {
         &self,
         _name: &str,
         _spec: &flotilla_resources::EnvironmentSpec,
-    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
-        Err("central Codex credential is not provisioned on this host".to_string())
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
+        Err("central Codex credential is not provisioned on this host".into())
     }
 
     async fn destroy(&self, _environment_ref: &str, _container_id: &str) -> Result<(), String> {
@@ -43,7 +45,7 @@ impl EnvironmentRuntime for RecordingDockerRuntime {
         &self,
         _name: &str,
         spec: &flotilla_resources::EnvironmentSpec,
-    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
         let _spec = spec.docker.as_ref().expect("Docker scenario input");
         unreachable!("finalizer test does not provision")
     }
@@ -174,7 +176,7 @@ impl EnvironmentRuntime for ForeignEnvironmentRuntime {
         &self,
         _name: &str,
         spec: &flotilla_resources::EnvironmentSpec,
-    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
         let _spec = spec.docker.as_ref().expect("Docker scenario input");
         panic!("a non-actuator must not provision a foreign environment")
     }
@@ -369,7 +371,7 @@ impl EnvironmentRuntime for ProvisioningDockerRuntime {
         &self,
         _name: &str,
         spec: &flotilla_resources::EnvironmentSpec,
-    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
         let spec = spec.docker.as_ref().expect("Docker scenario input");
 
         self.provisioned.lock().expect("provision log").push((spec.image.clone(), spec.pull_policy));
@@ -619,7 +621,7 @@ impl EnvironmentRuntime for NeutralRuntime {
         &self,
         _: &str,
         spec: &EnvironmentSpec,
-    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
         assert!(spec.docker.is_none() && spec.host_direct.is_none());
         assert!(spec.provider_address.is_some());
         Ok(flotilla_provisioning::reconcilers::EnvironmentProvisioning {
@@ -670,7 +672,7 @@ struct CloudRuntime {
 }
 #[async_trait]
 impl EnvironmentRuntime for CloudRuntime {
-    async fn provision_environment(&self, _: &str, spec: &EnvironmentSpec) -> Result<EnvironmentProvisioning, String> {
+    async fn provision_environment(&self, _: &str, spec: &EnvironmentSpec) -> Result<EnvironmentProvisioning, EnvironmentProvisionError> {
         assert!(spec.cloud_sandbox.is_some() && spec.docker.is_none() && spec.host_direct.is_none());
         Ok(EnvironmentProvisioning {
             backing_id: Some("opaque-cloud-backing".into()),
@@ -741,49 +743,81 @@ async fn cloud_ready_and_finalization_use_generic_backing() {
 
 // #3765 B1: restart between creation and status publication may adopt an
 // unrecorded backing. Failed adoption is Unknown and requeues, never terminal.
-#[tokio::test]
-async fn unrecorded_cloud_adoption_failure_requeues() {
-    // Fake the provider runtime boundary; the resource reconciler is real.
-    struct AdoptionFailure;
-    #[async_trait]
-    impl EnvironmentRuntime for AdoptionFailure {
-        async fn provision_environment(&self, _: &str, _: &EnvironmentSpec) -> Result<EnvironmentProvisioning, String> {
-            Err(format!("{} SSH unavailable", flotilla_resources::CLOUD_ADOPTION_RETRY_PREFIX))
-        }
-        async fn destroy(&self, _: &str, _: &str) -> Result<(), String> {
-            panic!("failed adoption must preserve backing")
-        }
+#[hegel::test]
+fn unrecorded_cloud_adoption_failure_requeues(tc: hegel::TestCase) {
+    // Diagnostics span empty/printable text and misleading legacy prefixes;
+    // both classifications must depend solely on the runtime outcome variant.
+    let length = tc.draw(gs::integers::<usize>().min_value(0).max_value(64));
+    let mut diagnostic: String = (0..length).map(|_| char::from(tc.draw(gs::integers::<u8>().min_value(32).max_value(126)))).collect();
+    if tc.draw(gs::booleans()) {
+        diagnostic = format!("adoption setup failed; backing retained for retry: {diagnostic}");
     }
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
-        "provider_address":"account:cloud/provider:cloud", "cloud_sandbox": {
-            "image":"image@sha256:digest", "size":{"cpus":1,"memory_bytes":1024,"disk_bytes":2048}, "env":{}
+    let retry = tc.draw(gs::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        // Fake the provider runtime boundary; the resource reconciler is real.
+        struct AdoptionFailure {
+            diagnostic: String,
+            retry: bool,
         }
-    }))
-    .unwrap();
-    let object = backend.using::<Environment>("flotilla").create(&InputMeta::builder().name("cloud".into()).build(), &spec).await.unwrap();
-    let reconciler = EnvironmentReconciler::new(Arc::new(AdoptionFailure), backend, "flotilla");
-    let prepared = reconciler.prepare(&object).await.unwrap();
-    let outcome = reconciler.reconcile(&object, &prepared, chrono::Utc::now());
-    assert!(outcome.requeue_after.is_some(), "adoption must retry without requiring another resource event");
-    let mut status = EnvironmentStatus::default();
-    outcome.patch.unwrap().apply(&mut status);
-    assert_eq!(status.phase, EnvironmentPhase::Provisioning);
-    assert!(!status.ready);
-    assert!(status.message.unwrap().starts_with("Unknown: adoption setup failed"));
-    // Repeated failures back off and cap at five minutes; a healthy observation
-    // resets the retry budget for the next independent outage.
-    for seconds in [10, 20, 40, 80, 160, 300, 300] {
-        assert_eq!(
-            reconciler.reconcile(&object, &prepared, chrono::Utc::now()).requeue_after,
-            Some(std::time::Duration::from_secs(seconds))
-        );
-    }
-    let mut healthy = object.clone();
-    healthy.status = Some(EnvironmentStatus { phase: EnvironmentPhase::Ready, ready: true, ..Default::default() });
-    let healthy_prepared = reconciler.prepare(&healthy).await.unwrap();
-    reconciler.reconcile(&healthy, &healthy_prepared, chrono::Utc::now());
-    assert_eq!(reconciler.reconcile(&object, &prepared, chrono::Utc::now()).requeue_after, Some(std::time::Duration::from_secs(5)));
+        #[async_trait]
+        impl EnvironmentRuntime for AdoptionFailure {
+            async fn provision_environment(
+                &self,
+                _: &str,
+                _: &EnvironmentSpec,
+            ) -> Result<EnvironmentProvisioning, EnvironmentProvisionError> {
+                Err(if self.retry {
+                    EnvironmentProvisionError::RetryAdoption(self.diagnostic.clone())
+                } else {
+                    EnvironmentProvisionError::Failed(self.diagnostic.clone())
+                })
+            }
+            async fn destroy(&self, _: &str, _: &str) -> Result<(), String> {
+                panic!("failed adoption must preserve backing")
+            }
+        }
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
+            "provider_address":"account:cloud/provider:cloud", "cloud_sandbox": {
+                "image":"image@sha256:digest", "size":{"cpus":1,"memory_bytes":1024,"disk_bytes":2048}, "env":{}
+            }
+        }))
+        .unwrap();
+        let object =
+            backend.using::<Environment>("flotilla").create(&InputMeta::builder().name("cloud".into()).build(), &spec).await.unwrap();
+        let reconciler =
+            EnvironmentReconciler::new(Arc::new(AdoptionFailure { diagnostic: diagnostic.clone(), retry }), backend, "flotilla");
+        let prepared = reconciler.prepare(&object).await.unwrap();
+        let outcome = reconciler.reconcile(&object, &prepared, chrono::Utc::now());
+        if !retry {
+            assert!(outcome.requeue_after.is_none(), "ordinary failures must not become retries because of their wording");
+            let mut status = EnvironmentStatus::default();
+            outcome.patch.unwrap().apply(&mut status);
+            assert_eq!(status.phase, EnvironmentPhase::Failed);
+            assert_eq!(status.message.as_deref(), Some(diagnostic.as_str()));
+            return;
+        }
+        assert!(outcome.requeue_after.is_some(), "adoption must retry without requiring another resource event");
+        let mut status = EnvironmentStatus::default();
+        outcome.patch.unwrap().apply(&mut status);
+        assert_eq!(status.phase, EnvironmentPhase::Provisioning);
+        assert!(!status.ready);
+        assert_eq!(status.message.unwrap(), format!("Unknown: adoption failed; backing retained for retry: {diagnostic}"));
+        // Repeated failures back off and cap at five minutes; a healthy observation
+        // resets the retry budget for the next independent outage.
+        for seconds in [10, 20, 40, 80, 160, 300, 300] {
+            assert_eq!(
+                reconciler.reconcile(&object, &prepared, chrono::Utc::now()).requeue_after,
+                Some(std::time::Duration::from_secs(seconds))
+            );
+        }
+        let mut healthy = object.clone();
+        healthy.status = Some(EnvironmentStatus { phase: EnvironmentPhase::Ready, ready: true, ..Default::default() });
+        let healthy_prepared = reconciler.prepare(&healthy).await.unwrap();
+        reconciler.reconcile(&healthy, &healthy_prepared, chrono::Utc::now());
+        assert_eq!(reconciler.reconcile(&object, &prepared, chrono::Utc::now()).requeue_after, Some(std::time::Duration::from_secs(5)));
+    });
 }
 
 // Provisioning and retry decisions follow the engine while the old phase stays unchanged.

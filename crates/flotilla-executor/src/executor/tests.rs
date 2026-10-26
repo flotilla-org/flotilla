@@ -32,8 +32,7 @@ use crate::testkits::discovery::TestEnvVars;
 use crate::testkits::replay::testing::MockRunner;
 use flotilla_discovery::environment_manager::EnvironmentManager;
 use flotilla_discovery::registry::ProviderRegistry;
-use flotilla_environment::environment::ProvisionedMount;
-use flotilla_environment::environment::{PrepareOpts, PreparedEnvironment, ProvisionOpts};
+use flotilla_environment::environment::{EnvironmentProvisionError, PrepareOpts, PreparedEnvironment, ProvisionOpts, ProvisionedMount};
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_protocol::{ChangeRequest, Checkout, CloudAgentSession, Issue};
 use flotilla_protocol_testkit::event_sink::RecordingEventSink;
@@ -1592,9 +1591,14 @@ impl EnvironmentProvider for MockEnvironmentProvider {
         Ok(PreparedEnvironment::new(&Arc::new(()), ()))
     }
 
-    async fn provision(&self, _id: EnvironmentId, _image: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String> {
+    async fn provision(
+        &self,
+        _id: EnvironmentId,
+        _image: &PreparedEnvironment,
+        opts: ProvisionOpts,
+    ) -> Result<EnvironmentHandle, EnvironmentProvisionError> {
         self.seen_create_opts.lock().await.push(opts);
-        self.create_results.lock().await.remove(0)
+        self.create_results.lock().await.remove(0).map_err(Into::into)
     }
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
         Ok(vec![])

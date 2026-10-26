@@ -247,7 +247,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         id: EnvironmentId,
         prepared: &super::PreparedEnvironment,
         opts: ProvisionOpts,
-    ) -> Result<EnvironmentHandle, String> {
+    ) -> Result<EnvironmentHandle, super::EnvironmentProvisionError> {
         #[cfg(not(unix))]
         {
             let _ = (id, opts, prepared);
@@ -257,7 +257,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         {
             let prepared = prepared.get::<DockerPrepared>(&self.preparation_owner)?;
             if prepared.platform != crate::guest_tools::linux_amd64() {
-                return Err(format!("unsupported guest platform {}", prepared.platform));
+                return Err(format!("unsupported guest platform {}", prepared.platform).into());
             }
             let directory = self.inner.runtime_directory(&id)?;
             let mut tools = opts.tools.clone();
@@ -282,7 +282,9 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             let mounted_assets = tools.iter().flat_map(|tool| &tool.assets).map(|asset| asset.environment_path.as_path());
             for target in mounts.iter().map(|mount| mount.environment_path.as_path()).chain(mounted_assets) {
                 if let Some(tree) = CREW_OWNED_TREES.iter().find(|tree| target.starts_with(tree) || Path::new(tree).starts_with(target)) {
-                    return Err(format!("mount target {} overlaps {tree}, which vessel startup gives to the crew user", target.display()));
+                    return Err(
+                        format!("mount target {} overlaps {tree}, which vessel startup gives to the crew user", target.display()).into()
+                    );
                 }
             }
             mounts.push(ProvisionedMount::new(directory.join("guest"), "/run/drydock", ProvisionedMountMode::Rw));
@@ -324,7 +326,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             if result.is_err() {
                 let _ = self.inner.destroy(handle.backing_id()).await;
             }
-            result
+            result.map_err(super::EnvironmentProvisionError::Failed)
         }
     }
 
@@ -1778,7 +1780,7 @@ mod agent_contract_tests {
         .unwrap();
         let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
         let opts = ProvisionOpts { tools, provisioned_mounts: engine.requested.clone(), ..Default::default() };
-        provider.provision(EnvironmentId::new("test"), &prepared, opts).await
+        provider.provision(EnvironmentId::new("test"), &prepared, opts).await.map_err(|error| error.to_string())
     }
 
     fn overlaps(a: &Path, b: &Path) -> bool {

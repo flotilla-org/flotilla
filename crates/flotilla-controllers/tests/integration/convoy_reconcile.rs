@@ -11,6 +11,7 @@ use common::{
     task_provisioning_convoy_spec, timestamp, tool_only_workflow_template_object, valid_convoy_spec, valid_workflow_template_object,
     workflow_template_meta,
 };
+use flotilla_environment::environment::EnvironmentProvisionError;
 use flotilla_resources::{
     controller_patches, evaluate_crew_completion, evaluate_landing_settlement, external_patches, implement_review_workflow_spec,
     interactive_single_workflow_spec, reconcile, Actuation, BoundChangeRequest, ChangeRequest, ChangeRequestMergeability,
@@ -2893,7 +2894,7 @@ impl EnvironmentRuntime for FailedSkillStaging {
         &self,
         _: &str,
         _spec: &flotilla_resources::EnvironmentSpec,
-    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
         Err("skill staging: pinned source unavailable".into())
     }
     async fn destroy(&self, _: &str, _: &str) -> Result<(), String> {

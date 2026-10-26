@@ -124,7 +124,12 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
         Ok(PreparedEnvironment::new(&self.owner, docker.image.clone()))
     }
 
-    async fn provision(&self, id: EnvironmentId, prepared: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String> {
+    async fn provision(
+        &self,
+        id: EnvironmentId,
+        prepared: &PreparedEnvironment,
+        opts: ProvisionOpts,
+    ) -> Result<EnvironmentHandle, super::EnvironmentProvisionError> {
         let image = prepared.get::<String>(&self.owner)?.clone();
         self.handles().retain(|_, handle| !handle.destroyed.load(Ordering::Acquire));
         if let Some(existing) = self.handles().get(&id) {
@@ -134,7 +139,7 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
             tokio::time::sleep(self.behaviour.realise_delay).await;
         }
         if dummy_draw(self.behaviour.seed, "environment-failure", id.as_str()) < self.behaviour.failure_rate {
-            return Err(format!("dummy environment {id} failed to realise (configured failure rate)"));
+            return Err(format!("dummy environment {id} failed to realise (configured failure rate)").into());
         }
         let mut environment: HashMap<String, String> = opts.tokens.into_iter().collect();
         environment.insert(DUMMY_FLEET_ENV.into(), "1".into());
@@ -513,6 +518,7 @@ mod tests {
                 ProvisionOpts { tokens: vec![("CREW".into(), "coder".into())], ..Default::default() },
             )
             .await
+            .map_err(|error| error.to_string())
     }
 
     // Destroying a dummy container destroys its in-process child resources

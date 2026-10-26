@@ -400,7 +400,7 @@ impl EnvironmentManager {
             cpu_limit: None,
             memory_policy: Default::default(),
         };
-        let handle = env_provider.provision(env_id.clone(), &prepared, opts.into()).await?;
+        let handle = env_provider.provision(env_id.clone(), &prepared, opts.into()).await.map_err(|error| error.to_string())?;
         let (env_bag, provider_registry) = self.probe_provisioned_environment(&env_id, &handle, config_base).await?;
         self.register_provisioned_environment(env_id, handle, env_bag, Some(Arc::new(provider_registry)))
     }

@@ -151,7 +151,7 @@ pub(crate) async fn probe_kind(
 mod tests {
     use super::*;
     use flotilla_discovery_testkit::{DiscoveryMockRunner, TestEnvVars};
-    use flotilla_environment::environment::{command_provider, EnvironmentInput};
+    use flotilla_environment::environment::{command_provider, EnvironmentInput, EnvironmentProvisionError};
     use flotilla_provider_runtime::{ChannelLabel, CommandOutput};
     use std::sync::{Arc, Mutex};
 
@@ -302,7 +302,7 @@ mod tests {
             id: flotilla_protocol::EnvironmentId,
             prepared: &flotilla_environment::environment::PreparedEnvironment,
             opts: flotilla_environment::environment::ProvisionOpts,
-        ) -> Result<flotilla_environment::environment::EnvironmentHandle, String> {
+        ) -> Result<flotilla_environment::environment::EnvironmentHandle, EnvironmentProvisionError> {
             self.0.provision(id, prepared, opts).await
         }
         async fn list(&self) -> Result<Vec<flotilla_environment::environment::EnvironmentHandle>, String> {

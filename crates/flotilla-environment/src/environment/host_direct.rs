@@ -57,7 +57,12 @@ impl EnvironmentProvider for HostDirectEnvironmentProvider {
         Ok(PreparedEnvironment::new(&self.owner, ()))
     }
 
-    async fn provision(&self, id: EnvironmentId, prepared: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String> {
+    async fn provision(
+        &self,
+        id: EnvironmentId,
+        prepared: &PreparedEnvironment,
+        opts: ProvisionOpts,
+    ) -> Result<EnvironmentHandle, super::EnvironmentProvisionError> {
         prepared.get::<()>(&self.owner)?;
         if !opts.tokens.is_empty()
             || !opts.provisioned_mounts.is_empty()

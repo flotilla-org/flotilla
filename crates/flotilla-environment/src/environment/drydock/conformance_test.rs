@@ -41,7 +41,11 @@ impl HttpClient for AdapterHttp {
                             if matches!(body.egress, wire::EgressRequest::Open)
                                 && prepared.get::<Prepared>(&self.provider.owner)?.prepared == body.prepared
                             {
-                                let handle = self.provider.provision(EnvironmentId::new(&body.label), prepared, Default::default()).await?;
+                                let handle = self
+                                    .provider
+                                    .provision(EnvironmentId::new(&body.label), prepared, Default::default())
+                                    .await
+                                    .map_err(|error| error.to_string())?;
                                 let status = if handle.created_for_setup() { 201 } else { 200 };
                                 let environment = api.inspect(&self.provider.instance, handle.backing_id()).await.map_err(api_error)?;
                                 self.handles.lock().await.insert(environment.id.clone(), handle);

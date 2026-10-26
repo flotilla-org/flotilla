@@ -15,6 +15,7 @@ use common::{
 };
 use flotilla_crew::reconcilers::terminal_session::{TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
+use flotilla_environment::environment::EnvironmentProvisionError;
 use flotilla_protocol::ConfiguredResourceLimits;
 use flotilla_provisioning::reconcilers::{
     checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler,
@@ -47,7 +48,7 @@ impl EnvironmentRuntime for FakeDockerRuntime {
         &self,
         name: &str,
         spec: &flotilla_resources::EnvironmentSpec,
-    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, String> {
+    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
         let spec = spec.docker.as_ref().expect("Docker scenario input");
 
         Ok(EnvironmentProvisioning {

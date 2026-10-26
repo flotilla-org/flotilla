@@ -323,6 +323,33 @@ impl PreparedEnvironment {
     }
 }
 
+/// Provisioning classification is independent of its human-readable diagnostic.
+/// This runtime-only outcome is never serialized into a resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentProvisionError {
+    Failed(String),
+    /// A retained backing needs another setup attempt, regardless of spec kind.
+    RetryAdoption(String),
+}
+impl std::fmt::Display for EnvironmentProvisionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(message) | Self::RetryAdoption(message) => f.write_str(message),
+        }
+    }
+}
+impl std::error::Error for EnvironmentProvisionError {}
+impl From<String> for EnvironmentProvisionError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+impl From<&str> for EnvironmentProvisionError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.into())
+    }
+}
+
 /// Makes an environment spec real, without exposing runtime-specific inputs.
 #[async_trait]
 pub trait EnvironmentProvider: Send + Sync {
@@ -361,7 +388,12 @@ pub trait EnvironmentProvider: Send + Sync {
         None
     }
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String>;
-    async fn provision(&self, id: EnvironmentId, prepared: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String>;
+    async fn provision(
+        &self,
+        id: EnvironmentId,
+        prepared: &PreparedEnvironment,
+        opts: ProvisionOpts,
+    ) -> Result<EnvironmentHandle, EnvironmentProvisionError>;
     async fn inspect(&self, id: &EnvironmentId) -> Result<Option<EnvironmentHandle>, String> {
         Ok(self.list().await?.into_iter().find(|handle| handle.id() == id))
     }

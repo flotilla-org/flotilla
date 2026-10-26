@@ -1,6 +1,6 @@
 use super::*;
 use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
-use flotilla_environment::environment::EnvironmentToolAssetKind;
+use flotilla_environment::environment::{EnvironmentProvisionError, EnvironmentToolAssetKind};
 
 #[tokio::test]
 async fn local_profile_does_not_advertise_docker_without_interior_cleat() {
@@ -303,14 +303,14 @@ async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_r
         assert!(!delivered_auth.exists(), "refused creation must discard delivered agent credentials");
         let opts = provider.create_opts.lock().await.take();
         if outcome == RegistryPreflightOutcome::Success {
-            assert_eq!(error, "stop after capturing create options");
+            assert_eq!(error, EnvironmentProvisionError::Failed("stop after capturing create options".into()));
             let auth = opts.expect("provider invoked").prepared_auth.expect("opaque auth admitted");
             auth.validate("registry.example/crew:latest", flotilla_resources::HostImageAction::ImagePull).expect("pull admitted");
             assert_eq!(registry_runner.calls.load(Ordering::SeqCst), 0, "credential minting never invokes Docker");
         } else {
             assert!(opts.is_none(), "provider must not run without successful preflight");
             assert!(
-                error.contains(if outcome == RegistryPreflightOutcome::MissingStore {
+                error.to_string().contains(if outcome == RegistryPreflightOutcome::MissingStore {
                     "credential store unavailable"
                 } else {
                     "preflight failed"
@@ -463,17 +463,17 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
         let opts = provider.create_opts.lock().await.take();
         match case {
             "granted" => {
-                assert_eq!(error, "stop after capturing create options");
+                assert_eq!(error, EnvironmentProvisionError::Failed("stop after capturing create options".into()));
                 let auth = opts.expect("provider invoked").prepared_auth.expect("fleet pull credential admitted");
                 auth.validate(&image, flotilla_resources::HostImageAction::ImagePull).expect("pull of the composed digest");
                 assert_eq!(registry_runner.calls.load(Ordering::SeqCst), 0, "credential minting never invokes Docker");
             }
             "ungranted" => {
                 assert!(opts.is_none(), "the provider never runs without the pull credential");
-                assert!(error.contains("crew-image-registry-pull"), "{error}");
+                assert!(error.to_string().contains("crew-image-registry-pull"), "{error}");
             }
             _ => {
-                assert_eq!(error, "stop after capturing create options");
+                assert_eq!(error, EnvironmentProvisionError::Failed("stop after capturing create options".into()));
                 assert!(opts.expect("provider invoked").prepared_auth.is_none(), "a local image ID needs no registry credential");
             }
         }
@@ -1376,9 +1376,10 @@ async fn cloud_image_probe_refuses_missing_harness() {
 }
 
 // #3765 B1: post-provider credential/probe failures must preserve an adopted
-// backing too. The fake represents the remote environment destruction boundary.
+// backing too, while a fresh backing is destroyed and fails terminally.
+// The fake represents the remote environment destruction boundary.
 #[tokio::test]
-async fn controller_setup_rollback_preserves_adopted_backing() {
+async fn controller_setup_rollback_preserves_adopted_and_destroys_fresh_backing() {
     struct Adopted(TestInteriorEnvironment);
     #[async_trait]
     impl ProvisionedEnvironment for Adopted {
@@ -1414,6 +1415,17 @@ async fn controller_setup_rollback_preserves_adopted_backing() {
         destroyed: destroyed.clone(),
     }));
     let message = super::super::docker::discard_failed_environment(&handle, None, None, "adopted", "injected setup failure".into()).await;
-    assert!(message.contains("retained for retry"));
+    assert!(matches!(message, EnvironmentProvisionError::RetryAdoption(ref diagnostic) if diagnostic == "injected setup failure"));
     assert!(!destroyed.load(Ordering::SeqCst));
+    let fresh_destroyed = Arc::new(AtomicBool::new(false));
+    let fresh: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+        id: EnvironmentId::new("fresh"),
+        image: ImageId::new("cloud"),
+        runner: Arc::new(DiscoveryMockRunner::builder().build()),
+        env_vars: Default::default(),
+        destroyed: fresh_destroyed.clone(),
+    });
+    let error = super::super::docker::discard_failed_environment(&fresh, None, None, "fresh", "injected setup failure".into()).await;
+    assert!(matches!(error, EnvironmentProvisionError::Failed(ref diagnostic) if diagnostic == "injected setup failure"));
+    assert!(fresh_destroyed.load(Ordering::SeqCst));
 }

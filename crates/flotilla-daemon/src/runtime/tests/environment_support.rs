@@ -1,5 +1,6 @@
 use super::*;
 use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
+use flotilla_environment::environment::EnvironmentProvisionError;
 
 pub(super) fn fixed_environment_tools(state_dir: impl Into<PathBuf>) -> EnvironmentToolProvisioner {
     EnvironmentToolProvisioner::fixed(
@@ -274,8 +275,8 @@ impl EnvironmentProvider for TestInteriorEnvironmentProvider {
         _id: EnvironmentId,
         _image: &flotilla_environment::environment::PreparedEnvironment,
         _opts: flotilla_environment::environment::ProvisionOpts,
-    ) -> Result<EnvironmentHandle, String> {
-        self.handle.lock().await.take().ok_or_else(|| "test environment already created".to_string())
+    ) -> Result<EnvironmentHandle, EnvironmentProvisionError> {
+        self.handle.lock().await.take().ok_or_else(|| "test environment already created".into())
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
@@ -307,8 +308,8 @@ impl EnvironmentProvider for AdoptionEnvironmentProvider {
         _id: EnvironmentId,
         _image: &flotilla_environment::environment::PreparedEnvironment,
         _opts: flotilla_environment::environment::ProvisionOpts,
-    ) -> Result<EnvironmentHandle, String> {
-        Err("not used".to_string())
+    ) -> Result<EnvironmentHandle, EnvironmentProvisionError> {
+        Err("not used".into())
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
@@ -347,7 +348,7 @@ impl EnvironmentProvider for CapturingFailingEnvironmentProvider {
         _id: EnvironmentId,
         _image: &flotilla_environment::environment::PreparedEnvironment,
         opts: flotilla_environment::environment::ProvisionOpts,
-    ) -> Result<EnvironmentHandle, String> {
+    ) -> Result<EnvironmentHandle, EnvironmentProvisionError> {
         *self.create_opts.lock().await = Some(CreateOpts {
             tokens: opts.tokens,
             working_directory: opts.working_directory,
@@ -358,7 +359,7 @@ impl EnvironmentProvider for CapturingFailingEnvironmentProvider {
             image_pull_policy: Default::default(),
             prepared_auth: self.prepared_auth.lock().await.take().expect("prepared auth captured"),
         });
-        Err("stop after capturing create options".to_string())
+        Err("stop after capturing create options".into())
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
@@ -470,8 +471,8 @@ impl EnvironmentProvider for ListingEnvironmentProvider {
         _id: EnvironmentId,
         _image: &flotilla_environment::environment::PreparedEnvironment,
         _opts: flotilla_environment::environment::ProvisionOpts,
-    ) -> Result<EnvironmentHandle, String> {
-        Err("not used".to_string())
+    ) -> Result<EnvironmentHandle, EnvironmentProvisionError> {
+        Err("not used".into())
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
