@@ -137,8 +137,9 @@ pub trait ProvisioningReads: Send + Sync {
 
 /// The read port over one decided store.
 ///
-/// Each read takes the store's lock for one keyed load or one index page: 3 to 30 µs at the 10,000-convoy ceiling (`provisioning_bench`), so a
-/// view that reads per checkout stays well inside a frame. A write holds the same lock for one
+/// Each read takes the store's lock for one keyed load or one index page: 3 to 30 µs at the
+/// 10,000-convoy ceiling (`provisioning_bench`), so a view that reads per checkout stays well
+/// inside a frame. A write holds the same lock for one
 /// short transaction (about 0.1 to 0.4 ms), which bounds how long a read can wait for it.
 pub struct StoreReads {
     store: Arc<Mutex<Store>>,
@@ -326,7 +327,9 @@ impl Judgement {
             // A next try is a stored failure's time plus a capped backoff, always within chrono's
             // range, so the epoch never stands in for a real one.
             Judgement::Retrying { failures, next, last } => {
-                LifecycleReading::Retrying { failures: *failures, next: next.to_datetime().unwrap_or_default(), cause: last.detail.clone() }
+                let next = next.to_datetime();
+                debug_assert!(next.is_some(), "stored retry time is within chrono range");
+                LifecycleReading::Retrying { failures: *failures, next: next.unwrap_or_default(), cause: last.detail.clone() }
             }
             Judgement::Exhausted { last } => LifecycleReading::Exhausted { cause: last.detail.clone() },
             Judgement::Ready { identity } => LifecycleReading::Ready { identity: identity.clone() },

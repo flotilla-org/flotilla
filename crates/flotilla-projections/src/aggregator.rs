@@ -6889,7 +6889,7 @@ mod tests {
     // Engine readings decide readiness despite stale lifecycle phase/message; interrupted roles remain observations.
     #[hegel::test]
     fn the_engine_reading_decides_a_vessel_view(tc: hegel::TestCase) {
-        use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
+        use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision, PlacementTargetHost};
         use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
         use flotilla_resources::{VesselSpec, VesselStatus};
         // Every old phase, live readings and endings, with empty and Unicode causes; no old copy is published.
@@ -6950,6 +6950,20 @@ mod tests {
             Aggregator::new(AggregatorProjectionState::new(), HostName::new("host"), events).with_lifecycle_reads(fixture.reads.clone());
         let read = ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local };
         assert_eq!(aggregator.vessel_phase(&read).expect("reading"), expected);
+        // Empty interrupted-role evidence uses a complete generic reason, never a dangling label or stale message.
+        if mode == 5 {
+            let mut empty = read.clone();
+            empty.object.status.as_mut().expect("status").interrupted_roles.clear();
+            assert_eq!(
+                readiness::vessel_blocker_reason(
+                    Some(&LifecycleReading::Ready { identity: "env".into() }),
+                    &empty,
+                    VesselPhase::Interrupted
+                ),
+                "vessel is not ready"
+            );
+        }
+
         apply_readiness_event(&mut aggregator.readiness_vessels, ReadWatchEvent::Added(read.clone()));
         let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("host"));
         let (readiness, _) =

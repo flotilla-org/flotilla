@@ -227,6 +227,9 @@ fn a_session_reads_as_its_current_launch() {
         sessions.request(&launch(name, n), request(), Timestamp(10 + i64::from(n))).expect("launch");
         assert_eq!(reads.terminal_session(name, HOME).expect("read").expect("held").name, launch(name, n));
     }
+    // A missing launch bounds the contiguous-prefix search; a later orphan is not the current launch.
+    sessions.request(&launch(name, 13), request(), Timestamp(23)).expect("orphan launch");
+    assert_eq!(reads.terminal_session(name, HOME).expect("read").expect("held").name, launch(name, 11));
 }
 
 // Behaviour (#3629 layer 8, Vessel): a vessel's lease reads by its name, Ready once realised and

@@ -105,6 +105,7 @@ impl Binding for TerminalSessionBinding {
         }
     }
 
+    // Remove this copy once launch readers take their phase from the engine.
     fn copy(obj: &ResourceObject<OldTerminalSession>, resource: &Resource<TerminalSession>) -> Option<TerminalSessionStatusPatch> {
         // Only an ended launch has an old patch that says it; everything else the old status
         // already shows, or the old shape cannot say (a running session's id, pid, endpoint).
