@@ -1,3 +1,4 @@
+use flotilla_resources::account_access::AccountRecords;
 use flotilla_resources::checkout_path::checkout_path_component;
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::Actuation;
@@ -103,11 +104,11 @@ pub trait WorktreeMetadataResolver: Send + Sync {
     async fn worktree_metadata(&self, env_ref: &str, target: &str) -> Result<flotilla_vcs::vcs::WorktreeMetadata, String>;
 }
 
-#[derive(bon::Builder)]
 pub struct VesselReconciler {
     backend: ResourceBackend,
-    #[builder(default = Arc::new(NoLifecycleReads))]
     lifecycle_reads: Arc<dyn LifecycleReads>,
+    /// The account kinds' records: a crew whose binding ended waits.
+    accounts: Arc<dyn AccountRecords>,
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
     placement_policies: TypedResolver<PlacementPolicy>,
@@ -124,7 +125,6 @@ pub struct VesselReconciler {
     namespace: String,
     worktree_metadata: Option<Arc<dyn WorktreeMetadataResolver>>,
     brief_templates: CrewBriefTemplateResolver,
-    #[builder(default)]
     // A local backstop for rapid create/delete fights; it resets on restart.
     recent_checkout_create_attempts: Mutex<BTreeMap<String, Instant>>,
 }
@@ -147,6 +147,7 @@ impl VesselReconciler {
         Self {
             backend: backend.clone(),
             lifecycle_reads: Arc::new(NoLifecycleReads),
+            accounts: Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())),
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
             placement_policies: backend.clone().using::<PlacementPolicy>(namespace),
@@ -177,18 +178,22 @@ impl VesselReconciler {
         else {
             return Ok(None);
         };
-        let name = flotilla_resources::account_access::binding_name(convoy, &process.role, &access);
-        match self.backend.including_replicas::<flotilla_resources::AccountBinding>(&self.namespace).get(&name).await {
-            Ok(binding) => Ok(binding
-                .object
+        let binding =
+            self.accounts.requester_binding(&self.namespace, convoy, &process.role, &access).await.map_err(ResourceError::other)?;
+        Ok(binding.and_then(|binding| {
+            binding
                 .spec
                 .state
                 .value
                 .reason()
-                .map(|reason| format!("crew `{}` waits: {reason}; `flotilla convoy rebind` opens a new binding", process.role))),
-            Err(ResourceError::NotFound { .. }) => Ok(None),
-            Err(error) => Err(error),
-        }
+                .map(|reason| format!("crew `{}` waits: {reason}; `flotilla convoy rebind` opens a new binding", process.role))
+        }))
+    }
+
+    /// The account records the daemon composed: the engine's behind `[primitives]`.
+    pub fn with_accounts(mut self, accounts: Arc<dyn AccountRecords>) -> Self {
+        self.accounts = accounts;
+        self
     }
 
     pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {

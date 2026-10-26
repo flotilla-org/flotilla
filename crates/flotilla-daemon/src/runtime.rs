@@ -1008,6 +1008,7 @@ fn spawn_controller_loops(
                     Engine::<_, VesselBinding>::new(
                         VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
                             .with_lifecycle_reads(state.daemon.lifecycle_reads())
+                            .with_accounts(state.daemon.account_records())
                             .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None }))
                             .with_federated_dependencies(&backend, CanonicalHostId::resolved(local_host_ref))
                             .with_additional_host_refs(additional_host_refs),
@@ -1164,16 +1165,24 @@ fn spawn_controller_loops(
         let daemon = Arc::clone(&state.daemon);
         move |_backend: ResourceBackend, namespace: String| account_access::binding_controller(Arc::clone(&daemon), namespace)
     }));
-    controllers.push(controller!(flotilla_resources::AccountProvision, {
+    controllers.push({
         let state = Arc::clone(&state);
-        move |_backend: ResourceBackend, namespace: String| account_access::provision_controller(Arc::clone(&state), namespace)
-    }));
+        spawn_named_controller(
+            "AccountProvision",
+            backend.clone(),
+            namespace_string.clone(),
+            supervision.clone(),
+            runtime_health.clone(),
+            move |_backend, namespace| account_access::run_provision_controller(Arc::clone(&state), namespace, controller_resync_interval),
+        )
+    });
     controllers
 }
 
 /// The decided store's kinds behind `[primitives]`: Message and AgentSession
-/// (#3317), the provisioning lifecycle kinds and TerminalSession, and the
-/// engine's Vessel and Ensure (#3629), each under its production code.
+/// (#3317), the provisioning lifecycle kinds and TerminalSession, the account
+/// kinds (#3824 layer 1), and the engine's Vessel and Ensure (#3629), each
+/// under its production code.
 pub(crate) fn decided_registry() -> Result<flotilla_schema::KindRegistry, flotilla_schema::RegistryError> {
     let mut registry = flotilla_engine_store::registry()?;
     flotilla_provisioning::stored::register(&mut registry)?;
@@ -1191,9 +1200,9 @@ pub(crate) fn decided_diagrams() -> Result<std::collections::BTreeMap<String, St
 
 #[cfg(test)]
 mod decided_kinds_tests {
-    // Behaviour (#3629 layers 2 and 6): behind `[primitives]` the decided store holds the
-    // provisioning lifecycle kinds and the crew kinds beside Message and AgentSession, and every
-    // kind it holds has its machine's diagram for the table views.
+    // Behaviour (#3629 layers 2 and 6, #3824 layer 1): behind `[primitives]` the decided store
+    // holds the provisioning lifecycle kinds, the crew kinds and the account kinds beside Message
+    // and AgentSession, and every kind with a machine has its diagram for the table views.
     #[test]
     fn the_decided_store_holds_the_provisioning_kinds_with_their_diagrams() {
         let registry = super::decided_registry().expect("no code is held twice");
@@ -1201,11 +1210,13 @@ mod decided_kinds_tests {
         for kind in ["Message", "AgentSession", "Environment", "ImageBuild", "Clone", "Checkout", "TerminalSession", "Vessel", "Ensure"] {
             assert!(kinds.contains(&kind), "{kind} in {kinds:?}");
         }
+        assert!(kinds.contains(&"AccountBinding") && kinds.contains(&"AccountProvision"), "{kinds:?}");
+        // A plain kind (#3824 layer 0) declares no edges and has no machine to draw.
         let diagrams = super::decided_diagrams().expect("diagrams");
-        assert_eq!(diagrams.len(), kinds.len());
-        for kind in kinds {
-            assert!(diagrams[kind].contains("stateDiagram"), "{kind}");
+        for set in registry.iter() {
+            assert_eq!(diagrams.contains_key(&set.kind), !set.edges.is_empty(), "{}", set.kind);
         }
+        assert!(diagrams.values().all(|diagram| diagram.contains("stateDiagram")));
     }
 }
 
@@ -1275,6 +1286,13 @@ async fn open_provisioning_lifecycles(
         reads: StoreReads::new(Arc::clone(&store)),
         backend: daemon.resource_backend(),
     }))?;
+    // #3824 layer 1: the account kinds on the engine, installed before their controllers start.
+    let service = daemon.decided_store()?;
+    let clock = daemon.clock_for_scenarios();
+    let accounts = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::account::EngineAccounts::open(service, clock))
+        .await
+        .map_err(|error| error.to_string())??;
+    daemon.install_account_records(Arc::new(accounts))?;
     tokio::task::spawn_blocking(move || {
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
         let log = || StoreLog::new(Arc::clone(&store));

@@ -6,6 +6,7 @@
 //! transaction. Receipts are served as a [`ReceiptLog`] from `Read::about`.
 
 pub mod archive;
+pub mod follow;
 pub mod plain;
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -214,39 +215,59 @@ pub fn rehearse_plain<K: Kind + PartialEq>(kinds: KindRegistry, imported: &[(Str
 }
 
 fn rehearse_records<K: Kind + PartialEq>(kinds: KindRegistry, imported: &[(String, String, u64, &K)]) -> Vec<(usize, String)> {
-    use flotilla_schema::Encoder;
-    let store = rusqlite::Connection::open_in_memory()
-        .map_err(|error| error.to_string())
-        .and_then(|connection| Store::open(connection, REHEARSAL_HOME, kinds).map_err(|error| error.to_string()));
-    let mut store = match store {
-        Ok(store) => store,
+    let mut rehearsal = match Rehearsal::open(kinds) {
+        Ok(rehearsal) => rehearsal,
         Err(error) => return (0..imported.len()).map(|index| (index, error.clone())).collect(),
     };
-    let mut refused = Vec::new();
-    for (index, (home, name, version, value)) in imported.iter().enumerate() {
-        if home == REHEARSAL_HOME {
-            refused.push((index, format!("homed at `{REHEARSAL_HOME}`, the rehearsal's own home")));
-            continue;
-        }
-        let result = Encoder::encode(*value).map_err(|error| error.to_string()).and_then(|rows| {
-            let snapshot =
-                flotilla_schema_sqlite::Snapshot { kind: K::CODE, name: name.clone(), home: home.clone(), version: *version, rows };
-            let mut write = store.write().map_err(|error| error.to_string())?;
-            write.restore(&snapshot).map_err(|error| error.to_string())?;
-            write.commit().map_err(|error| error.to_string())?;
-            let mut read = store.read().map_err(|error| error.to_string())?;
-            let id = read.resolve(K::CODE, name, home).map_err(|error| error.to_string())?.ok_or("not restored")?;
-            let loaded = read.load::<K>(id).map_err(|error| error.to_string())?.ok_or("not loaded")?;
-            if &loaded.value.with_identity(&loaded.name, loaded.version) != *value {
-                return Err("reads back differently".to_owned());
-            }
-            Ok(())
-        });
-        if let Err(reason) = result {
-            refused.push((index, reason));
-        }
+    imported
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (home, name, version, value))| {
+            rehearsal.restore(home, name, *version, *value).err().map(|reason| (index, reason))
+        })
+        .collect()
+}
+
+/// A temporary store the import rehearsal restores into, homed at [`REHEARSAL_HOME`], so every
+/// record restores as another home's. Several kinds share it, so a reference restores after
+/// the record it names.
+pub struct Rehearsal {
+    store: Store,
+}
+
+impl Rehearsal {
+    pub fn open(kinds: KindRegistry) -> Result<Self, String> {
+        let connection = rusqlite::Connection::open_in_memory().map_err(|error| error.to_string())?;
+        Ok(Self { store: Store::open(connection, REHEARSAL_HOME, kinds).map_err(|error| error.to_string())? })
     }
-    refused
+
+    /// Restores `value` as `name` at `home` and `version`, reads it back and compares; the reason
+    /// it was refused, or read back differently, otherwise.
+    pub fn restore<K: Kind + PartialEq>(&mut self, home: &str, name: &str, version: u64, value: &K) -> Result<(), String> {
+        use flotilla_schema::Encoder;
+        if home == REHEARSAL_HOME {
+            return Err(format!("homed at `{REHEARSAL_HOME}`, the rehearsal's own home"));
+        }
+        let rows = Encoder::encode(value).map_err(|error| error.to_string())?;
+        let snapshot = flotilla_schema_sqlite::Snapshot { kind: K::CODE, name: name.to_owned(), home: home.to_owned(), version, rows };
+        let mut write = self.store.write().map_err(|error| error.to_string())?;
+        write.restore(&snapshot).map_err(|error| error.to_string())?;
+        write.commit().map_err(|error| error.to_string())?;
+        let mut read = self.store.read().map_err(|error| error.to_string())?;
+        let id = read.resolve(K::CODE, name, home).map_err(|error| error.to_string())?.ok_or("not restored")?;
+        let loaded = read.load::<K>(id).map_err(|error| error.to_string())?.ok_or("not loaded")?;
+        if &loaded.value.with_identity(&loaded.name, loaded.version) != value {
+            return Err("reads back differently".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Whether a live `K` named `name` at `home` was restored: a reference's target, say.
+    pub fn holds<K: Kind>(&mut self, name: &str, home: &str) -> Result<bool, String> {
+        let mut read = self.store.read().map_err(|error| error.to_string())?;
+        let Some(id) = read.resolve(K::CODE, name, home).map_err(|error| error.to_string())? else { return Ok(false) };
+        Ok(read.load::<K>(id).map_err(|error| error.to_string())?.is_some())
+    }
 }
 
 /// Every entry about resource `id`, paged through `Read::about`.

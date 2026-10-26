@@ -52,7 +52,9 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("Clone"), Some(KindCode::new("cl")));
     assert_eq!(held("Checkout"), Some(KindCode::new("ck")));
     assert_eq!(held("TerminalSession"), Some(KindCode::new("ts")));
-    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 5);
+    assert_eq!(held("AccountBinding"), Some(KindCode::new("ab")));
+    assert_eq!(held("AccountProvision"), Some(KindCode::new("ap")));
+    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 7);
 }
 
 // Behaviour (#3392 A1, lane 3 ruling 1): removing an identity checks every reference to it by a

@@ -115,6 +115,8 @@ pub struct ReadProjections<'a> {
     pub lifecycles: &'a dyn crate::ports::LifecycleReads,
     /// The `[primitives]` Convoy path: explanations show the engine's promises (#3587 layer 8).
     pub convoy_engine: &'a flotilla_resources::convoy::engine::EngineConvoyPath,
+    /// The account kinds' records: the old store's, or the engine's behind `[primitives]`.
+    pub accounts: &'a dyn flotilla_resources::account_access::AccountRecords,
 }
 
 impl ReadProjections<'_> {
@@ -969,6 +971,7 @@ impl ReadProjections<'_> {
             fleet: self.fleet,
             lifecycles: self.lifecycles,
             convoy_engine: self.convoy_engine,
+            accounts: self.accounts,
         }
     }
 
@@ -1881,7 +1884,7 @@ impl ReadProjections<'_> {
             settlement,
             recent_events,
             lifecycle_mutations,
-            account_bindings: account_binding_evidence(self.backend, namespace, &convoy.metadata.name).await?,
+            account_bindings: account_binding_evidence(self.accounts, namespace, &convoy.metadata.name).await?,
         };
         Ok((explanation, convoy))
     }
@@ -2200,47 +2203,31 @@ pub async fn message_views(
 /// Every account binding of a convoy's requesters, open and retired, with its provisions
 /// (#3907): `convoy explain` shows the selected account, how it was chosen and where it is.
 pub async fn account_binding_evidence(
-    backend: &ResourceBackend,
+    accounts: &dyn flotilla_resources::account_access::AccountRecords,
     namespace: &str,
     convoy: &str,
 ) -> Result<Vec<flotilla_protocol::ExplainedAccountBinding>, String> {
     use flotilla_resources::account_access::{requester_parts, BindingState, UpdateMode};
-    use flotilla_resources::AccountProvision;
-    let bindings = flotilla_store::convoy_account_bindings(backend, namespace, convoy, true)
-        .await
-        .map_err(|error| format!("read account bindings: {error}"))?;
+    let bindings = accounts.convoy_bindings(namespace, convoy, false).await?;
     if bindings.is_empty() {
         return Ok(Vec::new());
     }
-    let provisions = backend
-        .query_declared::<AccountProvision>(
-            namespace,
-            &StoreQuery {
-                field_values: BTreeMap::from([(
-                    "spec.binding.name".to_string(),
-                    bindings.iter().map(|binding| binding.metadata.name.clone()).collect(),
-                )]),
-                include_replicas: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|error| format!("read account provisions: {error}"))?;
+    let names = bindings.iter().map(|binding| binding.name.clone()).collect::<Vec<_>>();
+    let provisions = accounts.binding_provisions(namespace, &names, false).await?;
     let mut explained = Vec::new();
     for binding in bindings {
         let spec = &binding.spec;
         let role = requester_parts(&spec.requester).map(|(_, role)| role).unwrap_or_default();
         let (state, delivered_until) = match &spec.state.value {
             BindingState::Open => ("open", None),
-            BindingState::Closed { delivered_until, .. } => ("closed", *delivered_until),
-            BindingState::Revoked { delivered_until, .. } => ("revoked", *delivered_until),
+            BindingState::Closed { delivered_until, .. } => ("closed", delivered_until.as_ref()),
+            BindingState::Revoked { delivered_until, .. } => ("revoked", delivered_until.as_ref()),
         };
         let mut binding_provisions = provisions
-            .items
             .iter()
-            .filter(|provision| provision.object.spec.binding.name == binding.metadata.name)
+            .filter(|provision| provision.spec.binding.name == binding.name)
             .map(|provision| {
-                let provision = &provision.object.spec;
+                let provision = &provision.spec;
                 flotilla_protocol::ExplainedAccountProvision {
                     place: provision.place.clone(),
                     environment_kind: provision.environment_kind.clone(),
@@ -2261,7 +2248,7 @@ pub async fn account_binding_evidence(
             .collect::<Vec<_>>();
         binding_provisions.sort_by(|left, right| left.place.cmp(&right.place));
         explained.push(flotilla_protocol::ExplainedAccountBinding {
-            binding: binding.metadata.name.clone(),
+            binding: binding.name.clone(),
             role,
             requirement: spec.requirement.0.clone(),
             credential: spec.credential.0.clone(),

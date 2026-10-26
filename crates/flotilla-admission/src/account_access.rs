@@ -14,11 +14,11 @@ use flotilla_agent::{
 use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     account_access::{
-        binding_name, requester_address, requester_parts, AccessName, AccountBinding, AccountBindingSpec, AccountProvision, BindingState,
-        CredentialName, EpochEntry, GrantName, GrantScope, Selection, ACCOUNT_BINDING_LABEL, ACCOUNT_CREDENTIAL_LABEL,
+        binding_name, requester_address, requester_parts, AccessName, AccountBindingSpec, AccountRecords, BindingRecord, BindingState,
+        CredentialName, EpochEntry, GrantName, GrantScope, PendingBinding, Selection,
     },
-    Convoy, ConvoyRepositorySpec, CredentialGrant, CredentialSpec, CrewSource, Host as ResourceHost, InputMeta, PlacementPolicy,
-    PlacementPolicySpec, Repository, RepositoryKey, RepositoryTrust, ResourceError, ResourceObject, WorkflowTemplateSpec,
+    Convoy, ConvoyRepositorySpec, CredentialGrant, CredentialSpec, CrewSource, Host as ResourceHost, PlacementPolicy, PlacementPolicySpec,
+    Repository, RepositoryKey, RepositoryTrust, ResourceError, ResourceObject, WorkflowTemplateSpec,
 };
 use flotilla_schema::{Records, State, Timestamp};
 use flotilla_store::{ResourceBackend, StoreQuery};
@@ -329,13 +329,6 @@ pub fn select(alternatives: &RequesterAlternatives, pin: Option<(&str, &str)>, r
     Ok(Selected { credential: usable[index as usize].clone(), selection: Selection::Draw { index } })
 }
 
-/// A binding chosen at admission, written once its convoy exists.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PendingBinding {
-    pub name: String,
-    pub spec: AccountBindingSpec,
-}
-
 /// Build the record for a selection.
 pub fn binding_record(
     project: Option<&str>,
@@ -404,36 +397,6 @@ pub async fn choose_bindings(
     Ok(pending)
 }
 
-/// A binding's metadata: labelled with its requester's convoy (explain, the capability card and
-/// the home pass read a convoy's bindings by index), its credential (grant and declaration
-/// changes reach the convoys using it) and its own name (its provisions are found by it).
-pub fn binding_meta(name: &str, spec: &AccountBindingSpec) -> InputMeta {
-    let mut labels = BTreeMap::from([
-        (ACCOUNT_BINDING_LABEL.to_string(), name.to_string()),
-        (ACCOUNT_CREDENTIAL_LABEL.to_string(), spec.credential.0.clone()),
-    ]);
-    if let Some((convoy, _)) = requester_parts(&spec.requester) {
-        labels.insert(flotilla_resources::CONVOY_LABEL.to_string(), convoy);
-    }
-    if let Some(provisioner) = flotilla_agent::account_access::AccountProvisioners::seeded().for_access(&spec.requirement) {
-        match provisioner.home_key(spec) {
-            Ok(key) => {
-                labels.insert(flotilla_resources::account_access::CREW_HOME_KEY_LABEL.into(), key);
-            }
-            Err(error) => tracing::warn!(binding = name, %error, "account authority could not assign requester home"),
-        }
-    }
-    InputMeta::builder().name(name.to_string()).labels(labels).build()
-}
-
-fn binding_update_meta(binding: &ResourceObject<AccountBinding>, spec: &AccountBindingSpec) -> InputMeta {
-    let mut meta = binding_meta(&binding.metadata.name, spec);
-    if let Some(key) = binding.metadata.labels.get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL) {
-        meta.labels.insert(flotilla_resources::account_access::CREW_HOME_KEY_LABEL.into(), key.clone());
-    }
-    meta
-}
-
 /// Copy the account authority's recorded keys into the frozen per-crew entries.
 pub fn apply_crew_home_keys(
     convoy: &str,
@@ -497,31 +460,6 @@ pub async fn recover_home_keys(backend: &ResourceBackend, namespace: &str, convo
     Ok(keys)
 }
 
-/// Write chosen bindings. A requester that already holds an open binding keeps it: bindings are
-/// sticky and only rebind or an authorization change moves them (#3882).
-pub async fn write_bindings(backend: &ResourceBackend, namespace: &str, pending: Vec<PendingBinding>) -> Result<(), String> {
-    let bindings = backend.clone().using::<AccountBinding>(namespace);
-    for binding in pending {
-        match bindings.get(&binding.name).await {
-            Ok(existing) if existing.spec.state.value.is_open() => continue,
-            Ok(existing) => {
-                bindings
-                    .update(&binding_update_meta(&existing, &binding.spec), &existing.metadata.resource_version, &binding.spec)
-                    .await
-                    .map_err(|error| format!("reopen account binding `{}`: {error}", binding.name))?;
-            }
-            Err(ResourceError::NotFound { .. }) => {
-                bindings
-                    .create(&binding_meta(&binding.name, &binding.spec), &binding.spec)
-                    .await
-                    .map_err(|error| format!("write account binding `{}`: {error}", binding.name))?;
-            }
-            Err(error) => return Err(format!("read account binding `{}`: {error}", binding.name)),
-        }
-    }
-    Ok(())
-}
-
 /// The reason a withdrawn authorization records (#3882).
 pub const NO_AUTHORIZING_GRANT: &str = "binding revoked: no authorizing grant";
 
@@ -561,19 +499,9 @@ async fn admitted_workflow(
 }
 
 /// Whether any place still holds a delivered copy of a binding's credential.
-async fn delivered_anywhere(backend: &ResourceBackend, namespace: &str, binding: &str) -> Result<bool, String> {
-    let provisions = backend
-        .query_declared::<AccountProvision>(
-            namespace,
-            &StoreQuery {
-                fields: BTreeMap::from([("spec.binding.name".to_string(), binding.to_string())]),
-                include_replicas: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|error| format!("list provisions of `{binding}`: {error}"))?;
-    Ok(provisions.items.iter().any(|provision| provision.object.spec.delivered.is_some()))
+async fn delivered_anywhere(accounts: &dyn AccountRecords, namespace: &str, binding: &str) -> Result<bool, String> {
+    let provisions = accounts.binding_provisions(namespace, &[binding.to_string()], false).await?;
+    Ok(provisions.iter().any(|provision| provision.spec.delivered.is_some()))
 }
 
 /// A requester the home pass found without a binding; it is bound under the admission lock.
@@ -589,22 +517,19 @@ pub struct Unbound {
 /// bindings existed) are returned for [`bind_unbound`].
 pub async fn reconcile_convoy_bindings(
     backend: &ResourceBackend,
+    accounts: &dyn AccountRecords,
     namespace: &str,
     convoy: &ResourceObject<Convoy>,
     now: Timestamp,
 ) -> Result<(Vec<(String, BindingChange)>, Vec<Unbound>), String> {
-    let resolver = backend.clone().using::<AccountBinding>(namespace);
-    let bindings = flotilla_store::convoy_account_bindings(backend, namespace, &convoy.metadata.name, false)
-        .await
-        .map_err(|error| format!("read account bindings: {error}"))?;
+    let bindings = accounts.convoy_bindings(namespace, &convoy.metadata.name, true).await?;
     let mut changes = Vec::new();
     if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
         for binding in bindings.iter().filter(|binding| binding.spec.state.value.is_open()) {
-            let name = binding.metadata.name.clone();
             let reason = "requester teardown".to_string();
-            let delivered_until = delivered_anywhere(backend, namespace, &name).await?.then_some(now);
-            close(&resolver, binding, BindingState::Closed { reason: reason.clone(), delivered_until }, now).await?;
-            changes.push((name, BindingChange::Closed(reason)));
+            let delivered_until = delivered_anywhere(accounts, namespace, &binding.name).await?.then_some(now);
+            accounts.end(namespace, binding, BindingState::Closed { reason: reason.clone(), delivered_until }, now).await?;
+            changes.push((binding.name.clone(), BindingChange::Closed(reason)));
         }
         return Ok((changes, Vec::new()));
     }
@@ -612,61 +537,18 @@ pub async fn reconcile_convoy_bindings(
     let alternatives =
         current_alternatives(backend, namespace, convoy.spec.project_ref.as_deref(), &convoy.spec.repositories, &workflow).await?;
     for binding in bindings.iter().filter(|binding| binding.spec.state.value.is_open()) {
-        let name = binding.metadata.name.clone();
-        let Some((_, role)) = requester_parts(&binding.spec.requester) else { continue };
-        let candidate = alternatives
-            .iter()
-            .find(|alternative| alternative.requester.role == role && alternative.requester.access == binding.spec.requirement)
-            .and_then(|alternative| alternative.candidates.get(&binding.spec.credential));
-        let Some(candidate) = candidate else {
-            let delivered_until = delivered_anywhere(backend, namespace, &name).await?.then_some(now);
-            let state = BindingState::Revoked { reason: NO_AUTHORIZING_GRANT.to_string(), delivered_until };
-            close(&resolver, binding, state, now).await?;
-            changes.push((name, BindingChange::Revoked(NO_AUTHORIZING_GRANT.to_string())));
-            continue;
-        };
-        let mut spec = binding.spec.clone();
-        let mut change = None;
-        if spec.grants != candidate.grants {
-            spec.grants = candidate.grants.clone();
-            change = Some(BindingChange::GrantsUpdated);
-        }
-        let current_epoch = spec.epochs.last().and_then(|row| row.record.epoch.parse::<u32>().ok()).unwrap_or(0);
-        if candidate.epoch > current_epoch {
-            if candidate.account != spec.account {
-                let reason = format!(
-                    "replacement refused: credential `{}` now declares account `{}`, not the bound `{}`",
-                    spec.credential,
-                    candidate.account.as_deref().unwrap_or("none"),
-                    spec.account.as_deref().unwrap_or("none")
-                );
-                let delivered_until = delivered_anywhere(backend, namespace, &name).await?.then_some(now);
-                close(&resolver, binding, BindingState::Revoked { reason: reason.clone(), delivered_until }, now).await?;
-                changes.push((name, BindingChange::Revoked(reason)));
-                continue;
-            }
-            let next = spec.epochs.last().map_or(1, |row| row.version + 1);
-            spec.epochs
-                .append(next, EpochEntry { epoch: candidate.epoch.to_string(), observed_at: now })
-                .map_err(|error| format!("epoch lineage: {error:?}"))?;
-            change = Some(BindingChange::EpochAppended(candidate.epoch.to_string()));
-        }
-        if let Some(change) = change {
-            resolver
-                .update(&binding_update_meta(binding, &spec), &binding.metadata.resource_version, &spec)
-                .await
-                .map_err(|error| format!("update account binding `{name}`: {error}"))?;
-            changes.push((name, change));
+        if let Some(change) = reconcile_open_binding(accounts, namespace, binding, &alternatives, now).await? {
+            changes.push((binding.name.clone(), change));
         }
     }
-    let bound = bindings.iter().map(|binding| binding.metadata.name.as_str()).collect::<BTreeSet<_>>();
+    let bound = bindings
+        .iter()
+        .filter_map(|binding| requester_parts(&binding.spec.requester).map(|(_, role)| (role, binding.spec.requirement.clone())))
+        .collect::<BTreeSet<_>>();
     let unbound = alternatives
         .into_iter()
         .filter(|alternative| !alternative.candidates.is_empty())
-        .filter(|alternative| {
-            let requester = &alternative.requester;
-            !bound.contains(binding_name(&convoy.metadata.name, &requester.role, &requester.access).as_str())
-        })
+        .filter(|alternative| !bound.contains(&(alternative.requester.role.clone(), alternative.requester.access.clone())))
         .map(|alternative| {
             let carried = workflow
                 .vessels
@@ -688,9 +570,71 @@ pub async fn reconcile_convoy_bindings(
     Ok((changes, unbound))
 }
 
+/// One open binding against its requester's current alternatives: revoked when no grant
+/// authorises its credential or a replacement login names another account; its grants updated;
+/// a replacement login for the same account appended as the next epoch.
+async fn reconcile_open_binding(
+    accounts: &dyn AccountRecords,
+    namespace: &str,
+    binding: &BindingRecord,
+    alternatives: &[RequesterAlternatives],
+    now: Timestamp,
+) -> Result<Option<BindingChange>, String> {
+    let Some((_, role)) = requester_parts(&binding.spec.requester) else { return Ok(None) };
+    let spec = &binding.spec;
+    let candidate = alternatives
+        .iter()
+        .find(|alternative| alternative.requester.role == role && alternative.requester.access == spec.requirement)
+        .and_then(|alternative| alternative.candidates.get(&spec.credential));
+    let Some(candidate) = candidate else {
+        let delivered_until = delivered_anywhere(accounts, namespace, &binding.name).await?.then_some(now);
+        let state = BindingState::Revoked { reason: NO_AUTHORIZING_GRANT.to_string(), delivered_until };
+        accounts.end(namespace, binding, state, now).await?;
+        return Ok(Some(BindingChange::Revoked(NO_AUTHORIZING_GRANT.to_string())));
+    };
+    let current_epoch = spec.epochs.last().and_then(|row| row.record.epoch.parse::<u32>().ok()).unwrap_or(0);
+    if candidate.epoch > current_epoch && candidate.account != spec.account {
+        let reason = format!(
+            "replacement refused: credential `{}` now declares account `{}`, not the bound `{}`",
+            spec.credential,
+            candidate.account.as_deref().unwrap_or("none"),
+            spec.account.as_deref().unwrap_or("none")
+        );
+        let delivered_until = delivered_anywhere(accounts, namespace, &binding.name).await?.then_some(now);
+        accounts.end(namespace, binding, BindingState::Revoked { reason: reason.clone(), delivered_until }, now).await?;
+        return Ok(Some(BindingChange::Revoked(reason)));
+    }
+    let mut change = None;
+    let mut current = binding.clone();
+    if spec.grants != candidate.grants {
+        accounts.regrant(namespace, &current, candidate.grants.clone()).await?;
+        change = Some(BindingChange::GrantsUpdated);
+        // The epoch below is a second write: read the binding at the version the regrant left.
+        if candidate.epoch > current_epoch {
+            current = reread(accounts, namespace, binding).await?;
+        }
+    }
+    if candidate.epoch > current_epoch {
+        accounts.observe_epoch(namespace, &current, EpochEntry { epoch: candidate.epoch.to_string(), observed_at: now }).await?;
+        change = Some(BindingChange::EpochAppended(candidate.epoch.to_string()));
+    }
+    Ok(change)
+}
+
+/// `binding` as its convoy's bindings read now.
+async fn reread(accounts: &dyn AccountRecords, namespace: &str, binding: &BindingRecord) -> Result<BindingRecord, String> {
+    let convoy = requester_parts(&binding.spec.requester).map(|(convoy, _)| convoy).unwrap_or_default();
+    accounts
+        .convoy_bindings(namespace, &convoy, true)
+        .await?
+        .into_iter()
+        .find(|current| current.name == binding.name)
+        .ok_or_else(|| format!("account binding `{}` is gone", binding.name))
+}
+
 /// Bind requesters the home pass found without a binding; the caller holds the admission lock.
 pub async fn bind_unbound(
-    backend: &ResourceBackend,
+    accounts: &dyn AccountRecords,
     namespace: &str,
     convoy: &ResourceObject<Convoy>,
     unbound: Vec<Unbound>,
@@ -703,30 +647,17 @@ pub async fn bind_unbound(
         pending.push(binding_record(convoy.spec.project_ref.as_deref(), &convoy.metadata.name, &alternatives, selected, now)?);
     }
     let changes = pending.iter().map(|binding| (binding.name.clone(), BindingChange::Opened)).collect();
-    write_bindings(backend, namespace, pending).await?;
+    accounts.open(namespace, pending).await?;
     Ok(changes)
 }
 
-async fn close(
-    bindings: &flotilla_store::TypedResolver<AccountBinding>,
-    binding: &ResourceObject<AccountBinding>,
-    state: BindingState,
-    now: Timestamp,
-) -> Result<(), String> {
-    let mut spec = binding.spec.clone();
-    spec.state = State::new(state, now);
-    bindings
-        .update(&binding_update_meta(binding, &spec), &binding.metadata.resource_version, &spec)
-        .await
-        .map(|_| ())
-        .map_err(|error| format!("update account binding `{}`: {error}", binding.metadata.name))
-}
-
-/// An explicit rebind (#3882 lifecycle): the old binding is closed and kept under a retired
-/// name for attribution, and a new one opens by pin or draw under the requester's name. Its
-/// places see the new opening, remove the old copies and start a fresh harness session.
+/// An explicit rebind (#3882 lifecycle): the old binding is closed and kept for attribution, and
+/// a new one opens by pin or draw for the requester. Its places see the new opening, remove the
+/// old copies and start a fresh harness session.
+#[allow(clippy::too_many_arguments)]
 pub async fn rebind(
     backend: &ResourceBackend,
+    accounts: &dyn AccountRecords,
     namespace: &str,
     convoy_name: &str,
     role: &str,
@@ -747,36 +678,13 @@ pub async fn rebind(
         .ok_or_else(|| format!("role `{role}` of convoy `{convoy_name}` declares no account requirement"))?;
     let selected = select(alternative, pin.map(|pin| (pin, REBIND_PIN)), random)?;
     let opened = binding_record(project, convoy_name, alternative, selected, now)?;
-    let bindings = backend.clone().using::<AccountBinding>(namespace);
-    match bindings.get(&opened.name).await {
-        Ok(existing) => {
-            let delivered_until = delivered_anywhere(backend, namespace, &opened.name).await?.then_some(now);
-            let mut retired = existing.spec.clone();
-            if retired.state.value.is_open() {
-                retired.state = State::new(BindingState::Closed { reason: "rebind".to_string(), delivered_until }, now);
-            }
-            let retired_name = format!("{}.closed-{}", opened.name, existing.spec.opened_at.micros());
-            let mut retired_meta = binding_update_meta(&existing, &retired);
-            retired_meta.name = retired_name.clone();
-            retired_meta.labels.insert(ACCOUNT_BINDING_LABEL.into(), retired_name.clone());
-            bindings
-                .create(&retired_meta, &retired)
-                .await
-                .map_err(|error| format!("retire account binding as `{retired_name}`: {error}"))?;
-            bindings
-                .update(&binding_update_meta(&existing, &opened.spec), &existing.metadata.resource_version, &opened.spec)
-                .await
-                .map_err(|error| format!("open account binding `{}`: {error}", opened.name))?;
-        }
-        Err(ResourceError::NotFound { .. }) => {
-            bindings
-                .create(&binding_meta(&opened.name, &opened.spec), &opened.spec)
-                .await
-                .map_err(|error| format!("open account binding `{}`: {error}", opened.name))?;
-        }
-        Err(error) => return Err(format!("read account binding `{}`: {error}", opened.name)),
-    }
-    Ok(opened.spec)
+    let delivered_until = match accounts.requester_binding(namespace, convoy_name, role, &alternative.requester.access).await? {
+        Some(current) if current.spec.state.value.is_open() => delivered_anywhere(accounts, namespace, &current.name).await?.then_some(now),
+        _ => None,
+    };
+    let spec = opened.spec.clone();
+    accounts.rebind(namespace, opened, delivered_until, now).await?;
+    Ok(spec)
 }
 
 #[cfg(test)]

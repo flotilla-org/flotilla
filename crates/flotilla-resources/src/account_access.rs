@@ -16,14 +16,17 @@
 //! Core records plans and never interprets access: the family's access description, mechanism
 //! and plan are the registered implementation's own text.
 //!
-//! The records derive both serde, for the resource-store kinds [`AccountBinding`] and
-//! [`AccountProvision`] that production runs today (owner ruling 1 on #3910), and `Stored`, for the
-//! generated tables the owner reviewed, which the engine store takes on at the cut-over.
+//! These are the serde shapes of the old-store kinds [`AccountBinding`] and [`AccountProvision`]
+//! that production runs with `[primitives]` off (owner ruling 1 on #3910); they go with the
+//! switch. The engine stores the reviewed tables through `flotilla_provisioning::stored::account`
+//! (#3824 layer 1); the parts both shapes share derive `Stored` here.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_address::Kind as AddressKind;
-use flotilla_schema::{Address, KindRegistry, Records, Ref, RegistryError, State, Stored, Timestamp};
+use flotilla_schema::{Address, Records, Ref, Stored};
+/// The schema's values the account records carry, for the crates that read them without it.
+pub use flotilla_schema::{State, Timestamp};
 
 use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass};
 use serde::{Deserialize, Serialize};
@@ -74,28 +77,14 @@ pub enum Selection {
     Draw { index: u32 },
 }
 
-/// Labels of a binding's state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
-pub enum BindingLabel {
-    #[store(code = "op")]
-    Open,
-    #[store(code = "cl")]
-    Closed,
-    #[store(code = "rv")]
-    Revoked,
-}
-
 /// A binding's state. The time it entered the state is the `State`'s `since`: when Closed or
 /// Revoked, that is the closing or revocation time.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
-#[store(labels = BindingLabel)]
 pub enum BindingState {
     /// In use. Opened at the binding's `opened_at`.
-    #[store(code = "op")]
     Open,
     /// Ended by an explicit act: a rebind, or the requester's teardown. Kept for attribution.
-    #[store(code = "cl")]
     Closed {
         reason: String,
         /// Directly delivered material was present in a vessel until this time. Flotilla cannot
@@ -104,7 +93,6 @@ pub enum BindingState {
     },
     /// Ended because no grant authorizes the credential any more: "binding revoked: no
     /// authorizing grant". The requester waits.
-    #[store(code = "rv")]
     Revoked { reason: String, delivered_until: Option<Timestamp> },
 }
 
@@ -135,19 +123,12 @@ pub struct EpochEntry {
 ///
 /// The resource name is derived from the requester and the requirement, so there is at most one
 /// open binding per pair: a rebind closes the old one under a retired name and opens the new one.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
-#[store(
-    kind = "AccountBinding",
-    code = "ab",
-    index(name = "by_requester", eq(requester)),
-    index(name = "open_by_credential", eq(credential), when(state in [Open]))
-)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountBindingSpec {
     /// The requester: a crew, by its role address (`project:<p>/convoy:<c>/role:<r>`; agent
     /// roles are unique across a convoy). The eventual home is AgentSession (#2912).
     pub requester: Address,
     /// The item that declared the requirement: the harness adapter, `claude-code`.
-    #[store(intern = "it")]
     pub item: String,
     /// The access the requirement names.
     pub requirement: AccessName,
@@ -157,21 +138,16 @@ pub struct AccountBindingSpec {
     pub account: Option<String>,
     /// Every grant authorizing this credential for this requester, with its scope. Updated when a
     /// grant is withdrawn while another still authorizes the credential.
-    #[store(child)]
     pub grants: BTreeMap<GrantName, GrantScope>,
     /// The selection record: every authorized candidate, the exclusions with their reasons, and
     /// how the result was chosen. Exclusions are a subset of the candidates (an authorized
     /// candidate known to be unusable); a draw is over the candidates less the exclusions.
-    #[store(child)]
     pub candidates: BTreeSet<CredentialName>,
-    #[store(child)]
     pub exclusions: BTreeMap<CredentialName, String>,
     pub selection: Selection,
     /// The epoch lineage, oldest first.
-    #[store(records)]
     pub epochs: Records<EpochEntry>,
     pub opened_at: Timestamp,
-    #[store(state)]
     pub state: State<BindingState>,
 }
 
@@ -218,22 +194,17 @@ pub struct Delivered {
 ///
 /// Removed when its copies are deleted: on revocation, rebind, requester teardown, or when a
 /// replaced vessel's old place is cleaned up.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
-#[store(kind = "AccountProvision", code = "ap", index(name = "by_binding", eq(binding)), index(name = "by_place", eq(place)))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountProvisionSpec {
     pub binding: Ref<AccountBindingSpec>,
     /// Where the agent loop runs: the Environment resource the harness launches in.
-    #[store(intern = "pc")]
     pub place: String,
     /// The environment kind the plan was resolved for (`docker`, `agentless-ssh`, …), as named
     /// by the environment provider.
-    #[store(intern = "ek")]
     pub environment_kind: String,
-    #[store(flatten)]
     pub plan: ProvisionPlan,
     /// The requester's home at the place, which the plan delivers into (`CLAUDE_CONFIG_DIR`).
     pub home: String,
-    #[store(flatten)]
     pub delivered: Option<Delivered>,
 }
 
@@ -262,14 +233,6 @@ pub const ACCOUNT_BINDING_LABEL: &str = "flotilla.work/account-binding";
 
 /// Labels a binding by its credential, so grant and declaration changes reach its convoy.
 pub const ACCOUNT_CREDENTIAL_LABEL: &str = "flotilla.work/account-credential";
-
-/// The two kinds, for their DDL snapshot and the engine store's registry at the cut-over.
-pub fn registry() -> Result<KindRegistry, RegistryError> {
-    let mut registry = KindRegistry::new();
-    registry.register::<AccountBindingSpec>()?;
-    registry.register::<AccountProvisionSpec>()?;
-    Ok(registry)
-}
 
 /// The binding's resource name: one per (requester, requirement), so a lookup needs no query.
 pub fn binding_name(convoy: &str, role: &str, access: &AccessName) -> String {
@@ -370,4 +333,116 @@ impl std::fmt::Display for AccessName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// A binding as its readers see it, from whichever store holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingRecord {
+    pub name: String,
+    /// The home that wrote it, which alone writes it again.
+    pub home: String,
+    /// The store's version, compared only for equality.
+    pub version: String,
+    pub spec: AccountBindingSpec,
+}
+
+/// A provision as its readers see it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvisionRecord {
+    pub name: String,
+    pub home: String,
+    pub version: String,
+    pub spec: AccountProvisionSpec,
+}
+
+/// A binding chosen for its requester, before it is written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingBinding {
+    /// The requester's binding name ([`binding_name`]).
+    pub name: String,
+    pub spec: AccountBindingSpec,
+}
+
+/// What changed, for the account controllers' wake-ups.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccountChange {
+    /// A binding of `convoy`'s requesters, by its record name.
+    Binding { name: String, convoy: Option<String> },
+    /// A provision of binding `binding`, by its record name.
+    Provision { name: String, binding: String, convoy: Option<String> },
+}
+
+/// How a version-checked provision write ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProvisionWrite {
+    Written,
+    /// Another write moved the record first, or removed it.
+    Superseded,
+}
+
+/// The account kinds' read and write port (#3824 layer 1). With `[primitives]` off it is the old
+/// store's records; with it on, the engine's: the binding home's AccountBinding machine and the
+/// place's AccountProvision plain records, read from the decided store. Callers never see how
+/// either names its records beyond the names it returns.
+#[async_trait::async_trait]
+pub trait AccountRecords: Send + Sync {
+    /// The requester's current binding for `access`: its open one, or else its latest ended one.
+    async fn requester_binding(
+        &self,
+        namespace: &str,
+        convoy: &str,
+        role: &str,
+        access: &AccessName,
+    ) -> Result<Option<BindingRecord>, String>;
+    /// Binding `name`, from whichever home holds it.
+    async fn binding(&self, namespace: &str, name: &str) -> Result<Option<BindingRecord>, String>;
+    /// Every binding of a convoy's requesters, open and ended: this home's alone with `local`.
+    async fn convoy_bindings(&self, namespace: &str, convoy: &str, local: bool) -> Result<Vec<BindingRecord>, String>;
+    /// The convoys whose bindings here use one of `credentials`, and every convoy with a binding
+    /// here.
+    async fn bound_convoys(&self, namespace: &str, credentials: &[String]) -> Result<(BTreeSet<String>, BTreeSet<String>), String>;
+    /// Opens each binding; a requester that already holds an open one keeps it (#3882).
+    async fn open(&self, namespace: &str, bindings: Vec<PendingBinding>) -> Result<(), String>;
+    /// Ends an open binding as `state` (Closed or Revoked).
+    async fn end(&self, namespace: &str, binding: &BindingRecord, state: BindingState, now: Timestamp) -> Result<(), String>;
+    /// Records the grants that now authorise an open binding's credential.
+    async fn regrant(&self, namespace: &str, binding: &BindingRecord, grants: BTreeMap<GrantName, GrantScope>) -> Result<(), String>;
+    /// Appends the credential's next authorisation epoch to an open binding.
+    async fn observe_epoch(&self, namespace: &str, binding: &BindingRecord, epoch: EpochEntry) -> Result<(), String>;
+    /// An explicit rebind (#3882): the requester's open binding, if any, closes for `rebind` with
+    /// `delivered_until`, kept for attribution, and `opened` opens in its place.
+    async fn rebind(
+        &self,
+        namespace: &str,
+        opened: PendingBinding,
+        delivered_until: Option<Timestamp>,
+        now: Timestamp,
+    ) -> Result<(), String>;
+    /// This home's provision `name`.
+    async fn provision(&self, namespace: &str, name: &str) -> Result<Option<ProvisionRecord>, String>;
+    /// The provisions of `bindings`: this home's alone with `local`.
+    async fn binding_provisions(&self, namespace: &str, bindings: &[String], local: bool) -> Result<Vec<ProvisionRecord>, String>;
+    /// Every provision homed here.
+    async fn local_provisions(&self, namespace: &str) -> Result<Vec<ProvisionRecord>, String>;
+    /// Records provision `name` of `convoy`'s binding at this place, or with `replace` brings an
+    /// existing one to `spec`; without it an existing record is kept.
+    async fn record_provision(
+        &self,
+        namespace: &str,
+        name: &str,
+        convoy: &str,
+        spec: &AccountProvisionSpec,
+        replace: bool,
+    ) -> Result<(), String>;
+    /// Writes `spec` over `provision` as it was read.
+    async fn update_provision(
+        &self,
+        namespace: &str,
+        provision: &ProvisionRecord,
+        spec: &AccountProvisionSpec,
+    ) -> Result<ProvisionWrite, String>;
+    /// Removes provision `name`; absent is done.
+    async fn delete_provision(&self, namespace: &str, name: &str) -> Result<(), String>;
+    /// Every later change of a binding or provision, from now on, for the controllers' wake-ups.
+    async fn changes(&self, namespace: &str) -> Result<futures::stream::BoxStream<'static, Result<AccountChange, String>>, String>;
 }

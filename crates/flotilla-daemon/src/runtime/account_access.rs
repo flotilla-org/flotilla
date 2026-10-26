@@ -12,12 +12,14 @@
 //!   declaration event the convoys whose bindings use that credential and those still waiting
 //!   for a binding. Only binding a requester is serialised against admission.
 //! - The provision controller reconciles one provision at its place, on its binding's events.
-//!   A withdrawal that fails is an ordinary reconcile failure, retried with backoff.
+//!   A withdrawal that fails is retried with backoff.
+//!
+//! Both read and write the account kinds through [`AccountRecords`]: the old store's with
+//! `[primitives]` off, the engine's with it on (#3824 layer 1), and are woken by its changes.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
-    marker::PhantomData,
     pin::Pin,
     sync::Arc,
     time::Duration,
@@ -29,19 +31,16 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     account_access::{
-        binding_name, material_generation, AccessName, AccountBinding, AccountBindingSpec, AccountProvision, AccountProvisionSpec,
-        Delivered, ACCOUNT_BINDING_LABEL, ACCOUNT_CREDENTIAL_LABEL,
+        binding_name, material_generation, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords,
+        BindingRecord, Delivered, ProvisionRecord,
     },
-    Convoy, CredentialGrant, CredentialSpec, Environment, InputMeta, ReadWatchEvent, ResourceError, ResourceObject, ResourceProvenance,
-    TerminalSession, TerminalSessionSource, CONVOY_LABEL,
+    Convoy, CredentialGrant, CredentialSpec, Environment, ReadWatchEvent, ResourceError, ResourceObject, ResourceProvenance,
+    TerminalSession, TerminalSessionSource,
 };
 use flotilla_schema::{Ref, Timestamp};
 use flotilla_store::{
-    controller::{
-        LabelMappedWatch, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileOutcome, Reconciler, ReplicaLabelMappedWatch,
-        SecondaryWatch, WorkQueueSender,
-    },
-    ResourceBackend, TypedResolver,
+    controller::{ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
+    ResourceBackend,
 };
 use futures::StreamExt;
 
@@ -80,28 +79,20 @@ pub(super) async fn deliver_bound_account(
     access: &AccessName,
     runner: Arc<dyn CommandRunner>,
 ) -> Result<Vec<(String, String)>, String> {
-    let backend = state.daemon.resource_backend();
-    let name = binding_name(launch.convoy, launch.role, access);
-    let binding = match backend.including_replicas::<AccountBinding>(launch.namespace).get(&name).await {
-        Ok(binding) => binding,
-        Err(ResourceError::NotFound { .. }) => {
-            return Err(format!(
-                "crew `{}` has no account binding for `{access}`: its harness home is never left to an ambient login",
-                launch.role
-            ))
-        }
-        Err(error) => return Err(format!("read account binding `{name}`: {error}")),
+    let accounts = state.daemon.account_records();
+    let Some(binding) = accounts.requester_binding(launch.namespace, launch.convoy, launch.role, access).await? else {
+        return Err(format!(
+            "crew `{}` has no account binding for `{access}`: its harness home is never left to an ambient login",
+            launch.role
+        ));
     };
+    let name = binding.name.clone();
     // The provision controller cannot withdraw this binding's copy here while it is delivered.
     let lock = state.account_delivery_lock(&name);
     let _delivering = lock.lock().await;
-    if let Some(reason) = binding.object.spec.state.value.reason() {
+    if let Some(reason) = binding.spec.state.value.reason() {
         return Err(format!("crew `{}` waits: {reason}; `flotilla convoy rebind` opens a new binding", launch.role));
     }
-    let binding_home = match &binding.provenance {
-        ResourceProvenance::Local => backend.local_root().map_err(|error| error.to_string())?.to_string(),
-        ResourceProvenance::Replica { origin_root, .. } => origin_root.to_string(),
-    };
     let provisioners = AccountProvisioners::seeded();
     let provisioner = provisioners.for_access(access).ok_or_else(|| format!("no registered implementation supplies `{access}`"))?;
     let kind = place_environment_kind(state, launch).await?;
@@ -111,51 +102,29 @@ pub(super) async fn deliver_bound_account(
         .plan(kind)
         .map_err(|reason| format!("account binding `{name}` cannot be provisioned at `{}`: {reason}", launch.env_ref))?;
     let store = state.credential_store.as_ref().ok_or("host-local credential store unavailable for account delivery")?;
-    let (declaration, material) = store.account_material(&binding.object.spec.credential.0).await?;
-    let key = binding.object.metadata.labels.get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL).ok_or_else(|| {
-        format!("{} crew `{}` has no recorded home key", flotilla_resources::account_access::REQUESTER_HOME_UNAVAILABLE, launch.role)
-    })?;
-    let home = provisioner.home(&store.writable_base(&*runner).await?, key)?;
+    let (declaration, material) = store.account_material(&binding.spec.credential.0).await?;
+    let home = provisioner.home(&store.writable_base(&*runner).await?, launch.convoy, launch.role);
     let record = provision_name(&name, launch.env_ref);
     let mut provision = AccountProvisionSpec {
-        binding: Ref::new(name.clone(), binding_home),
+        binding: Ref::new(name.clone(), binding.home.clone()),
         place: launch.env_ref.to_string(),
         environment_kind: kind.as_str().to_string(),
         plan,
         home: home.clone(),
         delivered: None,
     };
-    let provisions = backend.using::<AccountProvision>(launch.namespace);
-    let meta = provision_meta(&record, &name, launch.convoy);
     // Record the place before writing material there, so a copy is never left without a
     // record the provision controller would withdraw. A relaunch keeps its existing record,
     // and with it the previous delivery, until this one succeeds.
-    write_provision(&provisions, &meta, &provision, false).await?;
+    accounts.record_provision(launch.namespace, &record, launch.convoy, &provision, false).await?;
     let env = provisioner.deliver(&home, &material, &*runner).await?;
     provision.delivered = Some(Delivered {
         epoch: declaration.authorization_epoch.to_string(),
         generation: material_generation(&material),
-        at: delivered_at(state, &binding.object.spec),
+        at: delivered_at(state, &binding.spec),
     });
-    write_provision(&provisions, &meta, &provision, true).await?;
+    accounts.record_provision(launch.namespace, &record, launch.convoy, &provision, true).await?;
     Ok(env)
-}
-
-/// Create the provision record, or with `replace`, bring an existing one to `spec`.
-async fn write_provision(
-    provisions: &TypedResolver<AccountProvision>,
-    meta: &InputMeta,
-    spec: &AccountProvisionSpec,
-    replace: bool,
-) -> Result<(), String> {
-    let name = &meta.name;
-    let written = match provisions.get(name).await {
-        Ok(existing) if !replace || existing.spec == *spec => return Ok(()),
-        Ok(existing) => provisions.update(meta, &existing.metadata.resource_version, spec).await.map(|_| ()),
-        Err(ResourceError::NotFound { .. }) => provisions.create(meta, spec).await.map(|_| ()),
-        Err(error) => return Err(format!("read account provision `{name}`: {error}")),
-    };
-    written.map_err(|error| format!("record account provision `{name}`: {error}"))
 }
 
 /// When a delivery under `binding` happened, on the runtime's clock, for the provision
@@ -171,14 +140,6 @@ fn delivered_at(state: &ControllerRuntimeState, binding: &AccountBindingSpec) ->
 /// One provision record per (binding, place).
 fn provision_name(binding: &str, place: &str) -> String {
     format!("{binding}.{place}")
-}
-
-/// A provision's metadata: labelled with its binding (binding events reach it) and convoy.
-fn provision_meta(name: &str, binding: &str, convoy: &str) -> InputMeta {
-    InputMeta::builder()
-        .name(name.to_string())
-        .labels(BTreeMap::from([(ACCOUNT_BINDING_LABEL.to_string(), binding.to_string()), (CONVOY_LABEL.to_string(), convoy.to_string())]))
-        .build()
 }
 
 /// Reconciles one convoy's account bindings on the convoy's home.
@@ -221,100 +182,39 @@ impl Reconciler for AccountBindingReconciler {
 ///   withdrawn; a relaunch that recorded a new delivery first wins.
 /// - A place whose environment is gone: the record is removed; its copies went with it.
 /// - Otherwise a new material generation or epoch is pushed into the home (update mode push).
-pub(super) struct AccountProvisionReconciler {
-    state: Arc<ControllerRuntimeState>,
-    namespace: String,
-}
-
-impl Reconciler for AccountProvisionReconciler {
-    type Resource = AccountProvision;
-    type Prepared = ();
-
-    async fn prepare(&self, provision: &ResourceObject<AccountProvision>) -> Result<(), ResourceError> {
-        reconcile_provision(&self.state, &self.namespace, provision).await.map_err(ResourceError::other)
-    }
-
-    fn reconcile(
-        &self,
-        _obj: &ResourceObject<AccountProvision>,
-        _prepared: &(),
-        _now: DateTime<Utc>,
-    ) -> ReconcileOutcome<AccountProvision> {
-        ReconcileOutcome::new(None)
-    }
-
-    async fn run_finalizer(&self, _obj: &ResourceObject<AccountProvision>) -> Result<(), ResourceError> {
-        Ok(())
-    }
-
-    fn finalizer_name(&self) -> Option<&'static str> {
-        None
-    }
-
-    fn reconcile_error_policy(&self) -> Option<ReconcileErrorPolicy> {
-        Some(ReconcileErrorPolicy {
-            max_consecutive_failures: 8,
-            initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(60),
-            exhaustion: ReconcileErrorExhaustion::Retry,
-        })
-    }
-}
-
-async fn reconcile_provision(
-    state: &Arc<ControllerRuntimeState>,
-    namespace: &str,
-    provision: &ResourceObject<AccountProvision>,
-) -> Result<(), String> {
-    let backend = state.daemon.resource_backend();
-    let provisions = backend.clone().using::<AccountProvision>(namespace);
-    let lock = state.account_delivery_lock(&provision.spec.binding.name);
+async fn reconcile_provision(state: &Arc<ControllerRuntimeState>, namespace: &str, name: &str) -> Result<(), String> {
+    let accounts = state.daemon.account_records();
+    // Read under the binding's lock: a launch may record a new delivery meanwhile.
+    let Some(unlocked) = accounts.provision(namespace, name).await? else { return Ok(()) };
+    let lock = state.account_delivery_lock(&unlocked.spec.binding.name);
     let _withdrawing = lock.lock().await;
-    // Read again under the lock: a launch may have recorded a new delivery meanwhile.
-    let provision = &match provisions.get(&provision.metadata.name).await {
-        Ok(provision) => provision,
-        Err(ResourceError::NotFound { .. }) => return Ok(()),
-        Err(error) => return Err(format!("read account provision `{}`: {error}", provision.metadata.name)),
-    };
-    let name = &provision.metadata.name;
+    let Some(provision) = accounts.provision(namespace, name).await? else { return Ok(()) };
     let spec = &provision.spec;
     if spec.place != state.host_direct_environment_name
-        && matches!(backend.including_replicas::<Environment>(namespace).get(&spec.place).await, Err(ResourceError::NotFound { .. }))
+        && matches!(
+            state.daemon.resource_backend().including_replicas::<Environment>(namespace).get(&spec.place).await,
+            Err(ResourceError::NotFound { .. })
+        )
     {
-        return delete_provision(&provisions, name).await;
+        return accounts.delete_provision(namespace, name).await;
     }
-    let binding = match backend.including_replicas::<AccountBinding>(namespace).get(&spec.binding.name).await {
-        Ok(binding) => Some(binding.object),
-        Err(ResourceError::NotFound { .. }) => None,
-        Err(error) => return Err(format!("read account binding `{}`: {error}", spec.binding.name)),
-    };
+    let binding = accounts.binding(namespace, &spec.binding.name).await?;
     let provisioners = AccountProvisioners::seeded();
     match binding {
         Some(binding) if binding.spec.state.value.is_open() => {
             let superseded = spec.delivered.as_ref().is_some_and(|delivered| delivered.at < binding.spec.opened_at);
             if !superseded {
-                return push_generation(state, namespace, provision, &binding, &provisioners).await;
+                return push_generation(state, namespace, &provision, &binding, &provisioners).await;
             }
             withdraw(state, namespace, spec, &provisioners).await?;
             let mut cleared = spec.clone();
             cleared.delivered = None;
-            let meta = InputMeta::builder().name(name.clone()).labels(provision.metadata.labels.clone()).build();
-            match provisions.update(&meta, &provision.metadata.resource_version, &cleared).await {
-                Ok(_) | Err(ResourceError::Conflict { .. }) | Err(ResourceError::NotFound { .. }) => Ok(()),
-                Err(error) => Err(format!("clear withdrawn provision `{name}`: {error}")),
-            }
+            accounts.update_provision(namespace, &provision, &cleared).await.map(drop)
         }
         _ => {
             withdraw(state, namespace, spec, &provisioners).await?;
-            delete_provision(&provisions, name).await
+            accounts.delete_provision(namespace, name).await
         }
-    }
-}
-
-async fn delete_provision(provisions: &TypedResolver<AccountProvision>, name: &str) -> Result<(), String> {
-    match provisions.delete(name).await {
-        Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(()),
-        Err(error) => Err(format!("remove account provision `{name}`: {error}")),
     }
 }
 
@@ -323,10 +223,11 @@ async fn delete_provision(provisions: &TypedResolver<AccountProvision>, name: &s
 async fn requester_sessions(
     state: &ControllerRuntimeState,
     namespace: &str,
-    binding: &str,
+    binding: &BindingRecord,
     access: &AccessName,
     place: &str,
 ) -> Result<Vec<ResourceObject<TerminalSession>>, String> {
+    let Some((convoy, role)) = flotilla_resources::account_access::requester_parts(&binding.spec.requester) else { return Ok(Vec::new()) };
     let sessions = state
         .daemon
         .resource_backend()
@@ -334,6 +235,7 @@ async fn requester_sessions(
         .list()
         .await
         .map_err(|error| format!("list terminal sessions: {error}"))?;
+    let requester = binding_name(&convoy, &role, access);
     Ok(sessions
         .items
         .into_iter()
@@ -342,7 +244,7 @@ async fn requester_sessions(
                 && matches!(
                     &session.spec.source,
                     TerminalSessionSource::Agent { context, .. }
-                        if binding_name(&context.convoy, &session.spec.role, access) == binding
+                        if binding_name(&context.convoy, &session.spec.role, access) == requester
                 )
         })
         .collect())
@@ -372,7 +274,10 @@ async fn withdraw(
         .for_implementation(&spec.plan.implementation)
         .ok_or_else(|| format!("no registered implementation `{}` to remove its copy", spec.plan.implementation))?;
     let access = AccessName(implementation.access().to_string());
-    let sessions = requester_sessions(state, namespace, &spec.binding.name, &access, &spec.place).await?;
+    let sessions = match state.daemon.account_records().binding(namespace, &spec.binding.name).await? {
+        Some(binding) => requester_sessions(state, namespace, &binding, &access, &spec.place).await?,
+        None => Vec::new(),
+    };
     let runner = place_runner(state, &sessions, &spec.place).await?;
     implementation.remove(&spec.home, &*runner).await?;
     let terminal_sessions = state.daemon.resource_backend().using::<TerminalSession>(namespace);
@@ -389,8 +294,8 @@ async fn withdraw(
 async fn push_generation(
     state: &Arc<ControllerRuntimeState>,
     namespace: &str,
-    provision: &ResourceObject<AccountProvision>,
-    binding: &ResourceObject<AccountBinding>,
+    provision: &ProvisionRecord,
+    binding: &BindingRecord,
     provisioners: &AccountProvisioners,
 ) -> Result<(), String> {
     let spec = &provision.spec;
@@ -406,25 +311,24 @@ async fn push_generation(
         .for_implementation(&spec.plan.implementation)
         .ok_or_else(|| format!("no registered implementation `{}` to push its generation", spec.plan.implementation))?;
     let access = AccessName(implementation.access().to_string());
-    let sessions = requester_sessions(state, namespace, &spec.binding.name, &access, &spec.place).await?;
+    let sessions = requester_sessions(state, namespace, binding, &access, &spec.place).await?;
     let runner = place_runner(state, &sessions, &spec.place).await?;
     implementation.deliver(&spec.home, &material, &*runner).await?;
     let mut updated = spec.clone();
     updated.delivered = Some(Delivered { epoch, generation, at: delivered_at(state, &binding.spec) });
-    let meta = InputMeta::builder().name(provision.metadata.name.clone()).labels(provision.metadata.labels.clone()).build();
     state
         .daemon
-        .resource_backend()
-        .using::<AccountProvision>(namespace)
-        .update(&meta, &provision.metadata.resource_version, &updated)
+        .account_records()
+        .update_provision(namespace, provision, &updated)
         .await
-        .map(|_| ())
-        .map_err(|error| format!("record pushed generation for `{}`: {error}", provision.metadata.name))
+        .map(drop)
+        .map_err(|error| format!("record pushed generation for `{}`: {error}", provision.name))
 }
 
 /// Grant and declaration events reach the convoys whose bindings use the credentials they name,
 /// and the live convoys here still waiting for a binding.
 struct CredentialConvoysWatch<K: flotilla_resources::Resource> {
+    accounts: Arc<dyn AccountRecords>,
     credentials: fn(&ResourceObject<K>) -> Vec<String>,
     /// The credentials a deletion known only by name names, when the name alone says.
     deleted: fn(&str) -> Option<Vec<String>>,
@@ -432,33 +336,21 @@ struct CredentialConvoysWatch<K: flotilla_resources::Resource> {
 
 impl<K: flotilla_resources::Resource> Clone for CredentialConvoysWatch<K> {
     fn clone(&self) -> Self {
-        Self { credentials: self.credentials, deleted: self.deleted }
+        Self { accounts: Arc::clone(&self.accounts), credentials: self.credentials, deleted: self.deleted }
     }
 }
 
 impl<K: flotilla_resources::Resource> CredentialConvoysWatch<K> {
     /// `credentials: None` (a grant deleted by name) reaches every convoy with a binding here.
     async fn enqueue(
+        &self,
         backend: &ResourceBackend,
         namespace: &str,
         sender: &WorkQueueSender,
         credentials: Option<Vec<String>>,
     ) -> Result<(), ResourceError> {
-        let bindings = backend.clone().using::<AccountBinding>(namespace);
-        let mut convoys = BTreeSet::new();
-        for credential in credentials.iter().flatten() {
-            let selector = BTreeMap::from([(ACCOUNT_CREDENTIAL_LABEL.to_string(), credential.clone())]);
-            for binding in bindings.list_matching_labels(&selector).await?.items {
-                convoys.extend(flotilla_resources::label_value(&binding.metadata.labels, CONVOY_LABEL).cloned());
-            }
-        }
-        let bound = bindings
-            .list()
-            .await?
-            .items
-            .into_iter()
-            .filter_map(|binding| flotilla_resources::label_value(&binding.metadata.labels, CONVOY_LABEL).cloned())
-            .collect::<BTreeSet<_>>();
+        let (mut convoys, bound) =
+            self.accounts.bound_convoys(namespace, credentials.as_deref().unwrap_or_default()).await.map_err(ResourceError::other)?;
         if credentials.is_none() {
             convoys.extend(bound.iter().cloned());
         }
@@ -496,46 +388,43 @@ impl<K: flotilla_resources::Resource> SecondaryWatch for CredentialConvoysWatch<
                     }
                     ReadWatchEvent::DeletedByName { tombstone, .. } => (self.deleted)(&tombstone.name),
                 };
-                Self::enqueue(&backend, &namespace, &sender, credentials).await?;
+                self.enqueue(&backend, &namespace, &sender, credentials).await?;
             }
             Ok(())
         })
     }
 }
 
-/// A binding's events, its home's or a replica's, reach this daemon's provisions of it.
+/// A binding's or provision's change, from its home or a replica, reaches its convoy.
 #[derive(Clone)]
-struct BindingProvisionsWatch;
+struct AccountConvoysWatch {
+    accounts: Arc<dyn AccountRecords>,
+}
 
-impl SecondaryWatch for BindingProvisionsWatch {
-    type Primary = AccountProvision;
+impl SecondaryWatch for AccountConvoysWatch {
+    type Primary = Convoy;
 
-    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = AccountProvision>> {
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Convoy>> {
         Box::new(self.clone())
     }
 
     fn spawn(
         self: Box<Self>,
-        backend: ResourceBackend,
+        _backend: ResourceBackend,
         namespace: String,
         sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            let provisions = backend.clone().using::<AccountProvision>(&namespace);
-            let mut watch = backend.including_replicas::<AccountBinding>(&namespace).watch().await?;
-            while let Some(event) = watch.next().await {
-                let binding = match event? {
-                    ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => {
-                        source.object.metadata.name
-                    }
-                    ReadWatchEvent::DeletedByName { tombstone, .. } => tombstone.name,
+            let mut changes = self.accounts.changes(&namespace).await.map_err(ResourceError::other)?;
+            while let Some(change) = changes.next().await {
+                let convoy = match change.map_err(ResourceError::other)? {
+                    AccountChange::Binding { convoy, .. } | AccountChange::Provision { convoy, .. } => convoy,
                 };
-                let selector = BTreeMap::from([(ACCOUNT_BINDING_LABEL.to_string(), binding)]);
-                for provision in provisions.list_matching_labels(&selector).await?.items {
+                if let Some(convoy) = convoy {
                     sender
-                        .send(provision.metadata.name)
+                        .send(convoy)
                         .await
-                        .map_err(|_| ResourceError::other("controller queue closed while forwarding a binding event"))?;
+                        .map_err(|_| ResourceError::other("controller queue closed while forwarding an account event"))?;
                 }
             }
             Ok(())
@@ -548,19 +437,17 @@ pub(super) fn binding_controller(
     daemon: Arc<InProcessDaemon>,
     namespace: String,
 ) -> (Vec<Box<dyn SecondaryWatch<Primary = Convoy>>>, AccountBindingReconciler) {
+    let accounts = daemon.account_records();
     (
         vec![
-            Box::new(LabelMappedWatch::<AccountBinding, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
-            Box::new(ReplicaLabelMappedWatch::<AccountProvision, Convoy> {
-                label_key: CONVOY_LABEL,
-                resolver: daemon.resource_backend().including_replicas(&namespace),
-                _marker: PhantomData,
-            }),
+            Box::new(AccountConvoysWatch { accounts: Arc::clone(&accounts) }),
             Box::new(CredentialConvoysWatch::<CredentialGrant> {
+                accounts: Arc::clone(&accounts),
                 credentials: |grant| grant.spec.credentials.iter().cloned().collect(),
                 deleted: |_| None,
             }),
             Box::new(CredentialConvoysWatch::<CredentialSpec> {
+                accounts,
                 credentials: |spec| vec![spec.metadata.name.clone()],
                 deleted: |name| Some(vec![name.to_string()]),
             }),
@@ -569,20 +456,69 @@ pub(super) fn binding_controller(
     )
 }
 
-/// The provision controller's parts: keyed by provision, at its place.
-pub(super) fn provision_controller(
+/// The first retry delay of a provision whose reconcile failed, doubling to [`RETRY_CAP`].
+const RETRY_BASE: Duration = Duration::from_secs(1);
+const RETRY_CAP: Duration = Duration::from_secs(60);
+
+/// The provision controller: reconciles each provision at this place when it or its binding
+/// changes, every provision once a `resync` and at start, and a failed one again with backoff.
+/// A failure to read the changes ends the run, for the supervisor to restart it.
+pub(super) async fn run_provision_controller(
     state: Arc<ControllerRuntimeState>,
     namespace: String,
-) -> (Vec<Box<dyn SecondaryWatch<Primary = AccountProvision>>>, AccountProvisionReconciler) {
-    (vec![Box::new(BindingProvisionsWatch)], AccountProvisionReconciler { state, namespace })
+    resync: Duration,
+) -> Result<(), ResourceError> {
+    let accounts = state.daemon.account_records();
+    let mut changes = accounts.changes(&namespace).await.map_err(ResourceError::other)?;
+    let mut retries: BTreeMap<String, (u32, tokio::time::Instant)> = BTreeMap::new();
+    let mut due: BTreeSet<String> = BTreeSet::new();
+    let mut resync_at = tokio::time::Instant::now();
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= resync_at {
+            due.extend(
+                accounts.local_provisions(&namespace).await.map_err(ResourceError::other)?.into_iter().map(|provision| provision.name),
+            );
+            resync_at = now + resync;
+        }
+        due.extend(retries.iter().filter(|(_, (_, at))| *at <= now).map(|(name, _)| name.clone()));
+        for name in std::mem::take(&mut due) {
+            match reconcile_provision(&state, &namespace, &name).await {
+                Ok(()) => {
+                    retries.remove(&name);
+                }
+                Err(error) => {
+                    let failures = retries.get(&name).map_or(0, |(failures, _)| *failures) + 1;
+                    let delay = RETRY_BASE.saturating_mul(1 << failures.min(6)).min(RETRY_CAP);
+                    tracing::warn!(provision = %name, %error, failures, "account provision reconcile failed; retrying");
+                    retries.insert(name, (failures, tokio::time::Instant::now() + delay));
+                }
+            }
+        }
+        let wake = retries.values().map(|(_, at)| *at).chain([resync_at]).min().unwrap_or(resync_at);
+        tokio::select! {
+            change = changes.next() => match change {
+                Some(Ok(AccountChange::Provision { name, .. })) => {
+                    due.insert(name);
+                }
+                Some(Ok(AccountChange::Binding { name, .. })) => {
+                    due.extend(
+                        accounts.binding_provisions(&namespace, &[name], true).await.map_err(ResourceError::other)?.into_iter().map(|provision| provision.name),
+                    );
+                }
+                Some(Err(error)) => return Err(ResourceError::other(error)),
+                None => return Err(ResourceError::other("account changes closed")),
+            },
+            () = tokio::time::sleep_until(wake) => {}
+        }
+    }
 }
 
 /// Reconcile every provision here, as the provision controller would; tests drive it directly.
 #[cfg(test)]
 pub(super) async fn reconcile_place_provisions(state: &Arc<ControllerRuntimeState>, namespace: &str) -> Result<(), String> {
-    let provisions = state.daemon.resource_backend().using::<AccountProvision>(namespace);
-    for provision in provisions.list().await.map_err(|error| error.to_string())?.items {
-        reconcile_provision(state, namespace, &provision).await?;
+    for provision in state.daemon.account_records().local_provisions(namespace).await? {
+        reconcile_provision(state, namespace, &provision.name).await?;
     }
     Ok(())
 }

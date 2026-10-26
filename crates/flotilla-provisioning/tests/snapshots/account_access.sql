@@ -108,7 +108,14 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ab', 'selection', 'pn', 'Pin'),
   ('ab', 'state', 'cl', 'Closed'),
   ('ab', 'state', 'op', 'Open'),
-  ('ab', 'state', 'rv', 'Revoked');
+  ('ab', 'state', 'rv', 'Revoked'),
+  ('ab', 'log:edge', 'cl', 'Close'),
+  ('ab', 'log:edge', 'ep', 'ObserveEpoch'),
+  ('ab', 'log:edge', 'rg', 'Regrant'),
+  ('ab', 'log:edge', 'rv', 'Revoke'),
+  ('ab', 'log:label', 'cl', 'Closed'),
+  ('ab', 'log:label', 'op', 'Open'),
+  ('ab', 'log:label', 'rv', 'Revoked');
 CREATE VIEW "account_binding_view" AS SELECT
   "account_binding"."id",
   "account_binding"."version",

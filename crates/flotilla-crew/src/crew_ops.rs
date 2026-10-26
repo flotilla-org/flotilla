@@ -123,6 +123,8 @@ pub struct CrewService {
     pub(crate) resource_backend: ResourceBackend,
     #[builder(default = Arc::new(NoLifecycleReads))]
     lifecycle_reads: Arc<dyn LifecycleReads>,
+    /// The account kinds' records: the capability card reads the requester's bindings.
+    accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
     #[builder(default)]
     capability_source: RwLock<Option<Arc<dyn flotilla_capability_contract::SessionCapabilitySource>>>,
     #[builder(default)]
@@ -840,6 +842,7 @@ impl CrewService {
             &credentials,
             &source.endpoints(&session.spec.env_ref, &session.metadata.name).await?,
             Arc::clone(&self.lifecycle_reads),
+            &*self.accounts,
         )
         .await
     }
