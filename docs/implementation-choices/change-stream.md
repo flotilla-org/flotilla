@@ -1,7 +1,10 @@
 # Change stream schema checkpoint (#3463)
 
 Status: implemented after the [owner's schema approval](https://github.com/flotilla-org/flotilla/pull/3465#issuecomment-6252741558).
-Every host follows every other home's whole log. Each home's log is the partition.
+Whole-home replication currently requires a full mesh: every host dials every other
+host. Each follower covers its directly connected peer's own home log only; a home that
+is not a direct neighbour is not replicated. There is no relaying of non-neighbour homes.
+Each home's log is the partition.
 Fine-grained filtered views belong to read-only observation consumers and are out of scope.
 
 The approved DDL is in `shared.rs`, installed by store startup, with readable views synchronized
@@ -43,7 +46,11 @@ production `read_record` routes one local miss there and marks it remote with it
 age. Gates receive no remote transport capability.
 
 Peer connection generations own their follower tasks. Homes with forwarded resource sockets
-use HTTP; homes reached through command routing use `QueryChangeStream`. To authenticate
+prefer HTTP; homes reached through command routing use `QueryChangeStream`. A socket
+connection failure or HTTP 404 falls back to a fresh routed round from the committed
+watermark, replacing the abandoned cursor. Every later round tries the socket again;
+there is no sticky transport state within a connection generation. Mid-body, framing,
+decode, spool-write and other HTTP status failures remain errors without fallback. To authenticate
 HTTP without treating the forwarded Unix socket as an interactive user, every peer first
 opens a round through peer-only routed dispatch. The returned opaque session token is a
 capability carried in the `x-flotilla-change-stream-session` header over the forwarded
@@ -79,7 +86,11 @@ The receiver uses the same disk spool and production Follower as HTTP. Lost resp
 the session and the next round resumes from committed progress. Displacement/disconnect
 cancels the matching follower task. Failed links resume from committed
 progress. The persisted watermark row, including zero, identifies a completed baseline after
-restart. Home point reads reuse the HTTP client for each currently connected socket. The old replicator is unchanged. No decided store is opened lazily: before a kind
+restart. Home point reads retain every connected home, including routed-only homes, and reuse
+HTTP clients for those with sockets. A missing socket or failed read yields an explicit
+`home unreachable` if the search finds no value; only an entirely successful search
+returns absent. The engine propagates that error instead of treating it as an absent
+message. Routed point-read queries are not introduced. The old replicator is unchanged. No decided store is opened lazily: before a kind
 migration installs its registered Service with `install_decided_store`, point reads and
 peer cursor creation refuse service and no followers start. #3317 installs the first kind before peer tasks start and verifies
 the complete production path. Tests exercise the generic mechanism before that integration.
@@ -176,7 +187,9 @@ snapshot in RAM. A stalled receive leaves the old watermark available and unchan
 Frame/page buffers remain bounded, but memory and disk scale with simultaneously active peers.
 Measure actual event widths, snapshot objects, recovery time and disk growth (#3425).
 
-**Expiry condition.** Replace replicate-everything when the topology needs hubs and spokes:
+**Expiry condition.** The full-mesh requirement (every host dials every other) remains
+in force until this redesign; do not deploy a hub-and-spoke topology with the current
+whole-home follower. Replace replicate-everything when the topology needs hubs and spokes:
 hubs such as a desktop and a cloud host replicate everything, while spokes such as laptops
 hold enough state to work offline. At larger scales, partition writes and replicate read
 layers. Those shapes, placement policy, selective replication, topic filtering, archives,
