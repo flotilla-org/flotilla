@@ -11,6 +11,7 @@ pub mod ports;
 pub mod project_image_layers;
 pub mod project_ops;
 pub mod provider_placement;
+pub mod random;
 pub mod reconcilers;
 pub mod regard_lifecycle;
 pub mod repository_addressing;

@@ -25,6 +25,7 @@ flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-schema = { path = "../flotilla-schema" }
+rand = "0.9"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

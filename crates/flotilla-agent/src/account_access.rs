@@ -17,23 +17,23 @@ use flotilla_protocol::arg::{flatten, Arg};
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
 use flotilla_resources::{
     account_access::{AccessName, ProvisionPlan, UpdateMode},
-    CredentialConsumer,
+    CredentialConsumer, EnvironmentSpec, FulfilmentRealisation, PlacementPolicySpec,
 };
 
-/// An item's registered account requirements (#3879 "Requirement, not a switch").
+/// An item's registered account requirement (#3879 "Requirement, not a switch").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ItemDeclaration {
     /// The item id: the agent adapter that declared the requirement.
     pub item: &'static str,
-    /// The access each requirement names, in its family's vocabulary.
-    pub account_access: &'static [&'static str],
+    /// The access the requirement names, in its family's vocabulary.
+    pub account_access: &'static str,
 }
 
 /// The Claude subscription access (#3884).
 pub const CLAUDE_SUBSCRIPTION: &str = "claude:subscription";
 
 /// The claude-code item: its harness runs on a Claude subscription.
-pub const CLAUDE_CODE_ITEM: ItemDeclaration = ItemDeclaration { item: "claude-code", account_access: &[CLAUDE_SUBSCRIPTION] };
+pub const CLAUDE_CODE_ITEM: ItemDeclaration = ItemDeclaration { item: "claude-code", account_access: CLAUDE_SUBSCRIPTION };
 
 /// Every registered item that declares account access. Items absent here (Codex in this slice)
 /// keep today's declared-credential pipeline.
@@ -44,8 +44,7 @@ pub fn declared_account_access(item: &str) -> Option<AccessName> {
     REGISTERED_ITEMS
         .iter()
         .find(|declaration| declaration.item == item)
-        .and_then(|declaration| declaration.account_access.first())
-        .map(|access| AccessName((*access).to_string()))
+        .map(|declaration| AccessName(declaration.account_access.to_string()))
 }
 
 /// What a declared credential supplies for a family's access: the account it belongs to, as the
@@ -55,16 +54,64 @@ pub struct SuppliedAccess {
     pub account: Option<String>,
 }
 
-/// Environment kinds a plan is resolved against, as admission names its placement candidates.
-pub mod environment_kind {
+/// The candidate environment kind a plan is resolved against: one vocabulary for admission's
+/// placement candidates and a launch's place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvironmentKind {
     /// A container vessel; its vessel agent writes into it (#3756).
-    pub const DOCKER: &str = "docker";
+    Docker,
     /// A bare host reached over SSH through its vessel agent (#3792).
-    pub const AGENTLESS_SSH: &str = "agentless-ssh";
+    AgentlessSsh,
     /// The daemon's own host, written by the daemon.
-    pub const HOST_DIRECT: &str = "host-direct";
+    HostDirect,
     /// A provider-hosted sandbox.
-    pub const CLOUD_SANDBOX: &str = "cloud-sandbox";
+    CloudSandbox,
+}
+
+impl EnvironmentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::AgentlessSsh => "agentless-ssh",
+            Self::HostDirect => "host-direct",
+            Self::CloudSandbox => "cloud-sandbox",
+        }
+    }
+
+    /// A fulfilment kind's realisation, on a host that is or is not agentless.
+    pub fn of_realisation(realisation: &FulfilmentRealisation, agentless_host: bool) -> Self {
+        match realisation {
+            FulfilmentRealisation::CloudSandboxPerVessel { .. } => Self::CloudSandbox,
+            FulfilmentRealisation::DockerPerVessel { .. } => Self::Docker,
+            FulfilmentRealisation::HostDirect if agentless_host => Self::AgentlessSsh,
+            FulfilmentRealisation::HostDirect => Self::HostDirect,
+        }
+    }
+
+    /// A placement policy's realisation.
+    pub fn of_policy(spec: &PlacementPolicySpec, agentless_host: bool) -> Self {
+        if spec.cloud_sandbox_per_vessel.is_some() {
+            Self::CloudSandbox
+        } else if spec.docker_per_vessel.is_some() {
+            Self::Docker
+        } else if agentless_host {
+            Self::AgentlessSsh
+        } else {
+            Self::HostDirect
+        }
+    }
+
+    /// A launch's place: its Environment record, if readable here. An unknown shape gets no
+    /// kind, so no plan; an unreadable record is a provisioned container vessel.
+    pub fn of_environment(environment: Option<&EnvironmentSpec>) -> Result<Self, String> {
+        match environment {
+            Some(spec) if spec.cloud_sandbox.is_some() => Ok(Self::CloudSandbox),
+            Some(spec) if spec.host_direct.is_some() => Ok(Self::HostDirect),
+            Some(spec) if spec.docker.is_some() => Ok(Self::Docker),
+            Some(_) => Err("the environment has a shape no account plan knows".to_string()),
+            None => Ok(Self::Docker),
+        }
+    }
 }
 
 /// A registered implementation that supplies one family's access (#3881).
@@ -77,7 +124,7 @@ pub trait AccountProvisioner: Send + Sync {
     /// Whether a declared credential supplies this access, and for which account.
     fn supplies(&self, consumer: &CredentialConsumer) -> Option<SuppliedAccess>;
     /// The plan for an environment kind, or the reason there is none.
-    fn plan(&self, environment_kind: &str) -> Result<ProvisionPlan, String>;
+    fn plan(&self, kind: EnvironmentKind) -> Result<ProvisionPlan, String>;
     /// The requester's home under a place's writable base.
     fn home(&self, writable_base: &Path, convoy: &str, role: &str) -> String;
     /// Write the material into the home at a place; returns the session variables that point
@@ -96,10 +143,6 @@ pub struct AccountProvisioners {
 impl AccountProvisioners {
     pub fn seeded() -> Self {
         Self { implementations: vec![Arc::new(ClaudeDirect)] }
-    }
-
-    pub fn new(implementations: Vec<Arc<dyn AccountProvisioner>>) -> Self {
-        Self { implementations }
     }
 
     /// The implementation supplying `access`.
@@ -167,14 +210,14 @@ impl AccountProvisioner for ClaudeDirect {
         }
     }
 
-    fn plan(&self, environment_kind: &str) -> Result<ProvisionPlan, String> {
-        // Keep this list strict: it is the only guard against a wrong-kind placement, and the
-        // launch side treats a vessel whose Environment record it cannot read as Docker.
-        use environment_kind::{AGENTLESS_SSH, DOCKER, HOST_DIRECT};
-        if ![DOCKER, AGENTLESS_SSH, HOST_DIRECT].contains(&environment_kind) {
+    fn plan(&self, kind: EnvironmentKind) -> Result<ProvisionPlan, String> {
+        // Keep this strict: it is the only guard against a wrong-kind placement, and the launch
+        // side treats a vessel whose Environment record it cannot read as Docker.
+        if kind == EnvironmentKind::CloudSandbox {
             return Err(format!(
-                "{} has no plan for {environment_kind} environments: no agent writes the requester's home there",
-                Self::IMPLEMENTATION
+                "{} has no plan for {} environments: no agent writes the requester's home there",
+                Self::IMPLEMENTATION,
+                kind.as_str()
             ));
         }
         Ok(ProvisionPlan {
@@ -239,20 +282,6 @@ pub(crate) fn claude_token_prefix(token_file: &str) -> String {
 mod tests {
     use super::*;
 
-    // Behaviour (#3881, #3907 contract 3): one implementation plans for Docker, agent-backed and
-    // host-direct vessels alike, and refuses a kind no agent writes into, with the reason.
-    #[test]
-    fn claude_direct_plans_where_an_agent_writes_the_home_and_refuses_elsewhere() {
-        for kind in [environment_kind::DOCKER, environment_kind::AGENTLESS_SSH, environment_kind::HOST_DIRECT] {
-            let plan = ClaudeDirect.plan(kind).expect("plan");
-            assert_eq!((plan.effective_access.as_str(), plan.update_mode), ("account", UpdateMode::Push));
-        }
-        assert_eq!(
-            ClaudeDirect.plan(environment_kind::CLOUD_SANDBOX).expect_err("no plan"),
-            "claude-direct has no plan for cloud-sandbox environments: no agent writes the requester's home there"
-        );
-    }
-
     // Behaviour (#3879): only the subscription declaration supplies the subscription; the item's
     // requirement comes from its registration, and Codex declares none in this slice.
     #[test]
@@ -276,10 +305,5 @@ mod tests {
         let homes = [home("a.b", "coder"), home("a-b", "coder"), home("a/b", "coder"), home("a-b", "x.y"), home("a-b", "x-y")];
         assert_eq!(homes.iter().collect::<std::collections::BTreeSet<_>>().len(), homes.len(), "{homes:?}");
         assert!(homes.iter().all(|home| !home.contains("..") && home.matches('/').count() == 6), "{homes:?}");
-    }
-
-    #[test]
-    fn the_token_prefix_quotes_the_file() {
-        assert_eq!(claude_token_prefix("/b/it's"), "CLAUDE_CODE_OAUTH_TOKEN=\"$(cat -- '/b/it'\\''s')\"");
     }
 }

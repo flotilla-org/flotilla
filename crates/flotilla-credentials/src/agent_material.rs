@@ -294,6 +294,11 @@ impl AgentMaterialRegistry {
             for adapter in required_adapters.iter().filter_map(|id| self.adapters.get(id.as_str())) {
                 let Some(destination) = adapter.skill_destination(environment, &config_base)? else { continue };
                 let base = destination.parent().expect("skill directory has a parent");
+                // A requester's bound home (#3907) is already this crew's own: it is used as
+                // recorded, never nested a level below.
+                if base.starts_with(config_base.join("agent-homes").join("requesters")) {
+                    continue;
+                }
                 let home = base.join("crews").join(role);
                 // Static config seeds scratch once: later base edits intentionally do
                 // not overwrite crew-owned config or state. Auth follows atomic

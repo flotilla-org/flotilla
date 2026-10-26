@@ -139,17 +139,14 @@ pub async fn session_card(
 /// harness runs on, and how it was chosen. Never material.
 async fn account_card(backend: &ResourceBackend, namespace: &str, convoy: &str, role: &str) -> Result<String, String> {
     use flotilla_resources::account_access::requester_parts;
-    let by_convoy = BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), convoy.to_string())]);
-    let bindings = backend
-        .query_declared::<flotilla_resources::AccountBinding>(namespace, &flotilla_store::StoreQuery::labels(&by_convoy, true, false))
+    let bindings = flotilla_store::convoy_account_bindings(backend, namespace, convoy, true)
         .await
         .map_err(|error| format!("read account bindings: {error}"))?;
     let mut lines = bindings
-        .items
         .iter()
-        .map(|binding| &binding.object.spec)
+        .map(|binding| &binding.spec)
         .filter(|spec| spec.state.value.is_open())
-        .filter(|spec| requester_parts(&spec.requester).is_some_and(|(owner, bound_role)| owner == convoy && bound_role == role))
+        .filter(|spec| requester_parts(&spec.requester).is_some_and(|(_, bound_role)| bound_role == role))
         .map(|spec| {
             let account = spec.account.as_deref().map(|account| format!(" (account {account})")).unwrap_or_default();
             format!("- Account for `{}`: credential `{}`{account}, {}.\n", spec.requirement, spec.credential, spec.describe_selection())

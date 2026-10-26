@@ -2205,17 +2205,10 @@ pub async fn account_binding_evidence(
     convoy: &str,
 ) -> Result<Vec<flotilla_protocol::ExplainedAccountBinding>, String> {
     use flotilla_resources::account_access::{requester_parts, BindingState, UpdateMode};
-    use flotilla_resources::{AccountBinding, AccountProvision};
-    let by_convoy = BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), convoy.to_string())]);
-    let bindings = backend
-        .query_declared::<AccountBinding>(namespace, &StoreQuery::labels(&by_convoy, true, false))
+    use flotilla_resources::AccountProvision;
+    let bindings = flotilla_store::convoy_account_bindings(backend, namespace, convoy, true)
         .await
-        .map_err(|error| format!("read account bindings: {error}"))?
-        .items
-        .into_iter()
-        .map(|binding| binding.object)
-        .filter(|binding| requester_parts(&binding.spec.requester).is_some_and(|(owner, _)| owner == convoy))
-        .collect::<Vec<_>>();
+        .map_err(|error| format!("read account bindings: {error}"))?;
     if bindings.is_empty() {
         return Ok(Vec::new());
     }

@@ -3463,16 +3463,17 @@ impl InProcessDaemon {
     }
 
     /// Replace the account draw's random source (#3884); tests fix its seed.
-    pub fn set_account_random(&self, random: Arc<dyn flotilla_resources::RandomSource>) {
+    pub fn set_account_random(&self, random: Arc<dyn flotilla_admission::random::RandomSource>) {
         self.admission.set_account_random(random);
     }
 
-    /// The home pass over this daemon's account bindings (#3907).
-    pub async fn reconcile_account_bindings(
+    /// The home pass over one convoy's account bindings (#3907).
+    pub async fn reconcile_convoy_accounts(
         &self,
         namespace: &str,
+        convoy: &str,
     ) -> Result<Vec<(String, flotilla_admission::account_access::BindingChange)>, String> {
-        self.admission.reconcile_account_bindings(namespace).await
+        self.admission.reconcile_convoy_accounts(namespace, convoy).await
     }
 
     /// Rebind one requester's account (#3907).

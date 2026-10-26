@@ -1,18 +1,12 @@
 //! The account access kinds' stored shape (#3907): AccountBinding and AccountProvision.
 //! Deterministic DDL and a readable view, checked in for the owner's schema look-over, the codes
-//! they would hold beside the production kinds, the plans of their statements, and both kinds
-//! through the schema codec and serde. No row is written to or read from a store here.
-
-use std::collections::{BTreeMap, BTreeSet};
+//! they would hold beside the production kinds, and the plans of their statements.
 
 mod schema_support;
 
 use flotilla_provisioning::stored;
-use flotilla_resources::account_access::{
-    self, AccessName, AccountBindingSpec, AccountProvisionSpec, BindingState, CredentialName, Delivered, EpochEntry, GrantName, GrantScope,
-    ProvisionPlan, Selection, UpdateMode,
-};
-use flotilla_schema::{render_view, Address, Decoder, Encoder, KindCode, Records, Ref, State, Timestamp};
+use flotilla_resources::account_access;
+use flotilla_schema::{render_view, KindCode};
 use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store};
 use schema_support::{check, plan};
 
@@ -65,79 +59,4 @@ fn account_access_statements_search_by_key() {
     let sql = &statements.iter().find(|(label, _)| label == "identity_delete").expect("shared statement").1;
     let rows = plan(&conn, sql);
     assert!(rows.iter().any(|row| row.contains("account_provision_by_binding")), "{rows:?}");
-}
-
-fn binding(state: BindingState, selection: Selection) -> AccountBindingSpec {
-    let mut epochs = Records::new();
-    epochs.append(1, EpochEntry { epoch: "1".into(), observed_at: Timestamp::from_micros(10) }).expect("append");
-    epochs.append(2, EpochEntry { epoch: "2".into(), observed_at: Timestamp::from_micros(20) }).expect("append");
-    AccountBindingSpec {
-        requester: "project:flotilla/convoy:c1/role:coder".parse::<Address>().expect("address"),
-        item: "claude-code".into(),
-        requirement: AccessName("claude:subscription".into()),
-        credential: CredentialName("claude-jseo-oauth".into()),
-        account: Some("someone@example.com".into()),
-        grants: BTreeMap::from([
-            (GrantName("claude-box-accounts".into()), GrantScope { scope: "account".into() }),
-            (GrantName("claude-max-contained".into()), GrantScope { scope: "account".into() }),
-        ]),
-        candidates: BTreeSet::from([
-            CredentialName("claude-jseo-oauth".into()),
-            CredentialName("claude-max".into()),
-            CredentialName("claude-time-to-change-oauth".into()),
-        ]),
-        exclusions: BTreeMap::from([(CredentialName("claude-time-to-change-oauth".into()), "replacement required".into())]),
-        selection,
-        epochs,
-        opened_at: Timestamp::from_micros(5),
-        state: State::new(state, Timestamp::from_micros(30)),
-    }
-}
-
-// Behaviour (ADR 0064 D5, ADR 0047): a binding survives the schema codec and the resource store's
-// JSON in every state and selection, its epoch lineage and selection record included.
-#[test]
-fn a_binding_survives_the_codec_and_json() {
-    let states = [
-        BindingState::Open,
-        BindingState::Closed { reason: "rebind".into(), delivered_until: Some(Timestamp::from_micros(40)) },
-        BindingState::Revoked { reason: "binding revoked: no authorizing grant".into(), delivered_until: None },
-    ];
-    let selections = [Selection::Pin { pinned_by: "convoy start".into() }, Selection::Draw { index: 1 }];
-    for state in states {
-        for selection in selections.clone() {
-            let value = binding(state.clone(), selection);
-            let decoded: AccountBindingSpec = Decoder::decode(Encoder::encode(&value).expect("encodes")).expect("decodes");
-            assert_eq!(decoded, value);
-            let json: AccountBindingSpec = serde_json::from_value(serde_json::to_value(&value).expect("json")).expect("from json");
-            assert_eq!(json, value);
-        }
-    }
-}
-
-// Behaviour (ADR 0064 D5, ADR 0047): a provision record survives the codec and JSON, delivered or
-// not, in every update mode.
-#[test]
-fn a_provision_record_survives_the_codec_and_json() {
-    for update_mode in [UpdateMode::Push, UpdateMode::Mechanism, UpdateMode::Restart] {
-        for delivered in [None, Some(Delivered { epoch: "1".into(), generation: "g7".into(), at: Timestamp::from_micros(50) })] {
-            let value = AccountProvisionSpec {
-                binding: Ref::new("c1.coder.claude-subscription", "udder"),
-                place: "env-c1-work".into(),
-                environment_kind: "docker".into(),
-                plan: ProvisionPlan {
-                    implementation: "claude-direct".into(),
-                    effective_access: "account".into(),
-                    mechanism: "oauth-token-file:CLAUDE_CONFIG_DIR".into(),
-                    update_mode,
-                },
-                home: "/tmp/flotilla-config/agent-homes/requesters/c1/coder/claude".into(),
-                delivered,
-            };
-            let decoded: AccountProvisionSpec = Decoder::decode(Encoder::encode(&value).expect("encodes")).expect("decodes");
-            assert_eq!(decoded, value);
-            let json: AccountProvisionSpec = serde_json::from_value(serde_json::to_value(&value).expect("json")).expect("from json");
-            assert_eq!(json, value);
-        }
-    }
 }

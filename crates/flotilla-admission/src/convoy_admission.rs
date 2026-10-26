@@ -141,8 +141,8 @@ pub struct ConvoyAdmission {
     host_name: HostName,
     clock: Arc<dyn Clock>,
     /// The draw that selects a requester's account (#3884); tests fix the seed.
-    #[builder(default = std::sync::RwLock::new(Arc::new(flotilla_resources::SeededRandom::from_entropy())))]
-    random: std::sync::RwLock<Arc<dyn flotilla_resources::RandomSource>>,
+    #[builder(default = std::sync::RwLock::new(Arc::new(crate::random::SeededRandom::from_entropy())))]
+    random: std::sync::RwLock<Arc<dyn crate::random::RandomSource>>,
     fulfilment_decider: Arc<dyn FulfilmentDecider>,
     /// Serializes the identity selector check with Convoy creation on the owner host.
     #[builder(default)]
@@ -1662,20 +1662,36 @@ impl ConvoyAdmission {
         .await
     }
 
-    fn account_random(&self) -> Arc<dyn flotilla_resources::RandomSource> {
+    fn account_random(&self) -> Arc<dyn crate::random::RandomSource> {
         Arc::clone(&self.random.read().unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
 
     /// Replace the account draw's random source; tests fix its seed (#3884).
-    pub fn set_account_random(&self, random: Arc<dyn flotilla_resources::RandomSource>) {
+    pub fn set_account_random(&self, random: Arc<dyn crate::random::RandomSource>) {
         *self.random.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = random;
     }
 
-    /// The home pass over this daemon's account bindings (#3882 lifecycle).
-    pub async fn reconcile_account_bindings(&self, namespace: &str) -> Result<Vec<(String, crate::account_access::BindingChange)>, String> {
-        let _admission_guard = self.lock().await;
+    /// The home pass over one convoy's account bindings (#3882 lifecycle). Only binding a
+    /// requester that has none is serialised against admission; the rest is per convoy.
+    pub async fn reconcile_convoy_accounts(
+        &self,
+        namespace: &str,
+        convoy: &str,
+    ) -> Result<Vec<(String, crate::account_access::BindingChange)>, String> {
+        let convoy = match self.backend.clone().using::<ResourceConvoy>(namespace).get(convoy).await {
+            Ok(convoy) => convoy,
+            Err(ResourceError::NotFound { .. }) => return Ok(Vec::new()),
+            Err(error) => return Err(format!("read convoy `{convoy}`: {error}")),
+        };
         let now = flotilla_schema::Timestamp::from_datetime(&self.clock.now());
-        crate::account_access::reconcile_home_bindings(&self.backend, namespace, &*self.account_random(), now).await
+        let (mut changes, unbound) = crate::account_access::reconcile_convoy_bindings(&self.backend, namespace, &convoy, now).await?;
+        if !unbound.is_empty() {
+            let _admission_guard = self.lock().await;
+            changes.extend(
+                crate::account_access::bind_unbound(&self.backend, namespace, &convoy, unbound, &*self.account_random(), now).await?,
+            );
+        }
+        Ok(changes)
     }
 
     /// An explicit rebind of one requester's account (#3882).
@@ -2729,18 +2745,10 @@ impl AdmissionReadContext<'_> {
             let policy_name = kind.metadata.name.clone();
             let refusal = |reason: String| PlacementRefusal { policy_name: policy_name.clone(), target_host: target_host.clone(), reason };
             // #3907: a kind where some requester's access has no plan drops out.
-            let environment_kind = match &kind.spec.realisation {
-                flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { .. } => {
-                    flotilla_agent::account_access::environment_kind::CLOUD_SANDBOX
-                }
-                flotilla_resources::FulfilmentRealisation::DockerPerVessel { .. } => {
-                    flotilla_agent::account_access::environment_kind::DOCKER
-                }
-                flotilla_resources::FulfilmentRealisation::HostDirect if host.is_some_and(is_agentless_ssh_host) => {
-                    flotilla_agent::account_access::environment_kind::AGENTLESS_SSH
-                }
-                flotilla_resources::FulfilmentRealisation::HostDirect => flotilla_agent::account_access::environment_kind::HOST_DIRECT,
-            };
+            let environment_kind = flotilla_agent::account_access::EnvironmentKind::of_realisation(
+                &kind.spec.realisation,
+                host.is_some_and(is_agentless_ssh_host),
+            );
             if let Some(reason) = crate::account_access::plan_refusal(workflow, environment_kind)? {
                 rejected.push(refusal(reason));
                 continue;

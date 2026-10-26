@@ -257,6 +257,12 @@ define_resource!(
     queryable = &["metadata.name", "spec.binding.name", "spec.place"]
 );
 
+/// Labels a binding by its own name; its provisions carry it too, so they are found by it.
+pub const ACCOUNT_BINDING_LABEL: &str = "flotilla.work/account-binding";
+
+/// Labels a binding by its credential, so grant and declaration changes reach its convoy.
+pub const ACCOUNT_CREDENTIAL_LABEL: &str = "flotilla.work/account-credential";
+
 /// The two kinds, for their DDL snapshot and the engine store's registry at the cut-over.
 pub fn registry() -> Result<KindRegistry, RegistryError> {
     let mut registry = KindRegistry::new();
