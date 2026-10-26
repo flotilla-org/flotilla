@@ -153,7 +153,7 @@ The skill-specific part lives in `flotilla-credentials` and `flotilla-vcs`: auth
 
 The build's test budget is in the PR description. The coverage that the review asked for:
 
-- **Publication** runs against a real filesystem through the local `CommandRunner`, so `rename(2)` semantics are real; a fake `mv` would hide `ENOTEMPTY` and the reap race. The cases:
+- **Publication** has one behavioural contract and two implementations. Logical scenarios run against an in-memory guest model, which enforces `rename(2)`'s `ENOTEMPTY` and `EEXIST` semantics, and replacement of a link but never of a directory. The same contract also runs against a real filesystem through the local `CommandRunner`, because a fake `mv` would hide `ENOTEMPTY` and the reap race. The cases:
   - a losing directory rename;
   - a reaper removing a tree between step 1 and step 3;
   - read-only reaping;
