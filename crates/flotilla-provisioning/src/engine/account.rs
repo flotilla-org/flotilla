@@ -52,11 +52,15 @@ pub fn engine_binding_name(requester: &str, opened_at: Timestamp) -> String {
 /// Every home's bindings and provisions, as this store holds them.
 struct Resident {
     follower: Follower,
-    bindings: BTreeMap<(String, String), Resource<AccountBinding>>,
-    provisions: BTreeMap<(String, String), Plain<ProvisionSpec>>,
+    bindings: Bindings,
+    provisions: Provisions,
 }
 
 /// The account records of the decided store at one home.
+///
+/// Reads catch the resident maps up with the log first, synchronously under the store's lock,
+/// on the caller's thread: a short read of the entries since the last pass, as the Convoy and
+/// Message paths read the store. The change stream does the same every [`POLL`].
 pub struct EngineAccounts {
     service: Arc<Service>,
     home: String,
@@ -184,16 +188,28 @@ fn reload(read: &mut Read<'_>, resident: &mut Resident, identity: &Identity) -> 
     Ok(())
 }
 
-/// Reads every account record homed at `home` into the resident maps.
+type Bindings = BTreeMap<(String, String), Resource<AccountBinding>>;
+type Provisions = BTreeMap<(String, String), Plain<ProvisionSpec>>;
+
+/// Reads every account record homed at `home` into the resident maps, in place of what they held.
 fn rescan(read: &mut Read<'_>, resident: &mut Resident, home: &str) -> Result<(), StoreError> {
+    let (bindings, provisions) = scan_home(read, home)?;
     resident.bindings.retain(|(owner, _), _| owner != home);
     resident.provisions.retain(|(owner, _), _| owner != home);
+    resident.bindings.extend(bindings);
+    resident.provisions.extend(provisions);
+    Ok(())
+}
+
+/// Every account record homed at `home`.
+fn scan_home(read: &mut Read<'_>, home: &str) -> Result<(Bindings, Provisions), StoreError> {
+    let mut bindings = Bindings::new();
     let mut after = None;
     loop {
         let page = read.scan::<Resource<AccountBinding>>(home, after, 64)?;
         for id in page.ids {
             if let Some(loaded) = read.load::<Resource<AccountBinding>>(id)? {
-                resident.bindings.insert((home.to_owned(), loaded.name.clone()), loaded.value.with_identity(&loaded.name, loaded.version));
+                bindings.insert((home.to_owned(), loaded.name.clone()), loaded.value.with_identity(&loaded.name, loaded.version));
             }
         }
         after = page.next;
@@ -201,12 +217,13 @@ fn rescan(read: &mut Read<'_>, resident: &mut Resident, home: &str) -> Result<()
             break;
         }
     }
+    let mut provisions = Provisions::new();
     let mut after = None;
     loop {
         let page = read.scan::<ProvisionSpec>(home, after, 64)?;
         for id in page.ids {
             if let Some(loaded) = read.load::<ProvisionSpec>(id)? {
-                resident.provisions.insert(
+                provisions.insert(
                     (home.to_owned(), loaded.name.clone()),
                     Plain { name: loaded.name, home: loaded.home, version: loaded.version, spec: loaded.value },
                 );
@@ -214,7 +231,7 @@ fn rescan(read: &mut Read<'_>, resident: &mut Resident, home: &str) -> Result<()
         }
         after = page.next;
         if after.is_none() {
-            return Ok(());
+            return Ok((bindings, provisions));
         }
     }
 }
@@ -398,6 +415,12 @@ impl AccountRecords for EngineAccounts {
         delivered_until: Option<Timestamp>,
         now: Timestamp,
     ) -> Result<(), String> {
+        // The next binding's name is checked before the open one closes, so a refused rebind
+        // leaves the requester bound: the close and the create are two writes.
+        let next = engine_binding_name(&opened.name, opened.spec.opened_at);
+        if locked(&self.bindings).get(&next).is_some() {
+            return Err(format!("account binding `{next}` already exists: a rebind must open after the binding it replaces"));
+        }
         if let Some(name) = self.open_binding(&opened.spec.requester, &opened.spec.requirement) {
             locked(&self.bindings)
                 .apply(&name, Close { reason: "rebind".to_string(), delivered_until }, &(), now)
@@ -509,7 +532,8 @@ impl AccountRecords for EngineAccounts {
     }
 }
 
-/// The change `identity`'s entry makes, as the controllers are woken by it.
+/// The change `identity`'s entry makes, as the controllers are woken by it. A provision's convoy
+/// is its binding's, while this store holds the binding.
 fn change(read: &mut Read<'_>, identity: &Identity) -> Result<Option<AccountChange>, StoreError> {
     let id = read.resolve(identity.kind, &identity.name, &identity.home)?;
     if identity.kind == BINDING {
@@ -517,25 +541,31 @@ fn change(read: &mut Read<'_>, identity: &Identity) -> Result<Option<AccountChan
             id.map(|id| read.load::<Resource<AccountBinding>>(id)).transpose()?.flatten().and_then(|loaded| convoy_of(&loaded.value));
         return Ok(Some(AccountChange::Binding { name: identity.name.clone(), convoy }));
     }
-    let loaded = id.map(|id| read.load::<ProvisionSpec>(id)).transpose()?.flatten();
-    let binding = loaded.as_ref().map(|loaded| loaded.value.binding.name.clone()).unwrap_or_default();
-    Ok(Some(AccountChange::Provision { name: identity.name.clone(), binding, convoy: None }))
+    match id.map(|id| read.load::<ProvisionSpec>(id)).transpose()?.flatten() {
+        Some(loaded) => {
+            let convoy = provision_convoy(read, &loaded.value)?;
+            Ok(Some(AccountChange::Provision { name: identity.name.clone(), binding: loaded.value.binding.name, convoy }))
+        }
+        // A removed provision wakes only its place's controller, which finds it gone.
+        None => Ok(Some(AccountChange::Provision { name: identity.name.clone(), binding: String::new(), convoy: None })),
+    }
+}
+
+/// The convoy of a provision's binding, if this store holds the binding.
+fn provision_convoy(read: &mut Read<'_>, provision: &ProvisionSpec) -> Result<Option<String>, StoreError> {
+    let Some(id) = read.resolve(BINDING, &provision.binding.name, &provision.binding.home)? else { return Ok(None) };
+    Ok(read.load::<Resource<AccountBinding>>(id)?.and_then(|loaded| convoy_of(&loaded.value)))
 }
 
 /// A change for every account record homed at `home`.
 fn rescanned(read: &mut Read<'_>, home: &str) -> Result<Vec<AccountChange>, StoreError> {
-    let mut resident = Resident { follower: Follower::new([]), bindings: BTreeMap::new(), provisions: BTreeMap::new() };
-    rescan(read, &mut resident, home)?;
-    let mut changes: Vec<_> = resident
-        .bindings
-        .iter()
-        .map(|((_, name), binding)| AccountChange::Binding { name: name.clone(), convoy: convoy_of(binding) })
-        .collect();
-    changes.extend(resident.provisions.iter().map(|((_, name), provision)| AccountChange::Provision {
-        name: name.clone(),
-        binding: provision.spec.binding.name.clone(),
-        convoy: None,
-    }));
+    let (bindings, provisions) = scan_home(read, home)?;
+    let mut changes: Vec<_> =
+        bindings.iter().map(|((_, name), binding)| AccountChange::Binding { name: name.clone(), convoy: convoy_of(binding) }).collect();
+    for ((_, name), provision) in &provisions {
+        let convoy = provision_convoy(read, &provision.spec)?;
+        changes.push(AccountChange::Provision { name: name.clone(), binding: provision.spec.binding.name.clone(), convoy });
+    }
     Ok(changes)
 }
 
@@ -570,6 +600,7 @@ pub fn rehearse_accounts(
         }
     };
     let mut renamed = BTreeMap::new();
+    let mut taken = BTreeSet::new();
     for (old, home) in bindings {
         let refuse = |reason: String| ImportRefusal { kind: "AccountBinding", record: old.metadata.name.clone(), reason };
         let spec = binding_spec(&old.spec);
@@ -578,7 +609,7 @@ pub fn rehearse_accounts(
             continue;
         };
         let name = engine_binding_name(&requester, spec.opened_at);
-        if renamed.values().any(|(held_home, held): &(String, String)| *held_home == *home && *held == name) {
+        if !taken.insert((home.clone(), name.clone())) {
             report.refused.push(refuse(format!("another binding of its requester opened at the same time already imports as `{name}`")));
             continue;
         }

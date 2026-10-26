@@ -202,3 +202,43 @@ fn a_deleted_name_is_created_again_at_a_new_version() {
     let again = PlainLog::new(replica).get::<Sample>("one", HOME).expect("replica get");
     assert_eq!(again, Some(Plain { name: "one".into(), home: HOME.into(), version: second, spec }));
 }
+
+// Behaviour (#3824 layer 1, the log follower): a follower names each followed resource an applied
+// entry wrote; a home first seen, or one whose sequence moved by a snapshot restore (which logs
+// nothing), is named for a rescan instead.
+#[test]
+fn a_follower_names_written_resources_and_rescans_after_a_snapshot() {
+    use flotilla_engine_store::follow::{Followed, Follower};
+    use flotilla_schema::Identity;
+    let mut kinds = KindRegistry::new();
+    register_plain::<Sample>(&mut kinds).expect("register");
+    let (home, replica) = (open(HOME, &kinds), open(REPLICA, &kinds));
+    let log = PlainLog::new(Arc::clone(&home));
+    let spec = Sample { title: "a".into(), owner: "b".into(), limit: None, tags: Vec::new() };
+    let homes = [HOME.to_owned()];
+    let mut follower = Follower::new([<Sample as Kind>::CODE]);
+    let pass = |follower: &mut Follower| follower.pass(&mut replica.lock().expect("replica").read().expect("read"), &homes).expect("pass");
+    assert_eq!(pass(&mut follower), vec![Followed::Rescan(HOME.into())], "a home first seen is rescanned");
+    log.create("one", &spec, "writer", Timestamp::from_micros(1)).expect("create");
+    let applied = follow(&home, &replica, 0);
+    let one = Identity { kind: <Sample as Kind>::CODE, name: "one".into(), home: HOME.into() };
+    assert_eq!(pass(&mut follower), vec![Followed::Changed(one)]);
+    assert_eq!(pass(&mut follower), Vec::new(), "nothing new, nothing named");
+    // A second resource reaches the replica as a snapshot, as a follower's catch-up delivers it.
+    let version = log.create("two", &spec, "writer", Timestamp::from_micros(2)).expect("create");
+    let snapshot = {
+        let mut store = home.lock().expect("home");
+        let mut read = store.read().expect("read");
+        let id = read.resolve(<Sample as Kind>::CODE, "two", HOME).expect("resolve").expect("stored");
+        read.load_snapshot(id).expect("snapshot").expect("present")
+    };
+    {
+        let mut store = replica.lock().expect("replica");
+        let mut write = store.write().expect("write");
+        write.restore(&snapshot).expect("restore");
+        write.finish_snapshot(HOME, version).expect("cut");
+        write.commit().expect("commit");
+    }
+    assert!(applied < version);
+    assert_eq!(pass(&mut follower), vec![Followed::Rescan(HOME.into())], "a snapshot leaves no entries to read");
+}

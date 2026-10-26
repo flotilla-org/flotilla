@@ -223,3 +223,21 @@ fn old_account_records_rehearse_onto_the_engine() {
     assert_eq!(report.refused.len(), 1, "{:?}", report.refused);
     assert_eq!((report.refused[0].kind, report.refused[0].record.as_str()), ("AccountProvision", "prov-2"));
 }
+
+// Review of #3951: a rebind whose next binding would take a name already held (opened in the same
+// microsecond as the open one) is refused before anything is written, so the requester stays
+// bound to its open binding.
+#[tokio::test]
+async fn an_engine_rebind_that_cannot_open_leaves_the_binding_open() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    flotilla_provisioning::stored::account::register(&mut kinds).expect("register");
+    let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
+    let accounts = EngineAccounts::open(service, Arc::new(SystemClock)).expect("open");
+    accounts.open(NS, vec![pending("convoy-a", "coder", "cred-1", 10)]).await.expect("open");
+    let refused = accounts.rebind(NS, pending("convoy-a", "coder", "cred-2", 10), None, at(10)).await;
+    assert!(refused.is_err(), "a rebind onto a held name is refused");
+    let bound = accounts.requester_binding(NS, "convoy-a", "coder", &access()).await.expect("read").expect("bound");
+    assert!(bound.spec.state.value.is_open());
+    assert_eq!(bound.spec.credential.0, "cred-1");
+}
