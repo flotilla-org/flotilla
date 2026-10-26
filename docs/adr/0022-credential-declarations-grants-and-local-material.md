@@ -177,3 +177,7 @@ Ambient identity inheritance remains only for consumers with no deliverable
 material form. A missing grant or unavailable material for a consumer with a
 deliverable form is therefore a named preflight refusal, not permission to
 start a crew and discover stale ambient authentication interactively.
+
+## Amendment (2026-10-26): per-requester account bindings (#3907)
+
+Model subscriptions are no longer delivered as vessel-wide credential references. A requester's account is a stored binding, chosen at its admission and sticky until an explicit rebind or an authorization change; managed credential, authorization epoch and material generation are distinct. See the ADR 0044 amendment of the same date.

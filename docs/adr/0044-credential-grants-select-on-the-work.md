@@ -220,3 +220,11 @@ The principle: strict egress must be **possible**, and a normal workflow must ne
 
 - §2's "staged into its credential directory" applies only to the in-vessel subscription exception, and to credentials the proxy can't yet attach while the proxy is being built.
 - The recording of approved and delegated actions, and where that record lives, belong to the approval-policy ADR and to "the audit trail and its tamper evidence" (#3265), not to this one.
+
+## Amendment: account access binds per requester (#3907, from #3879–#3884)
+
+- **Bindings are per requester.** An item declares the account access it needs (the claude-code item declares `claude:subscription`); applicable grants contribute authorized alternatives, with each grant and its scope kept. One binding per (requester, requirement) records the managed credential, the grants, the selection (candidates, exclusions with reasons, and the authorized pin or seeded uniform draw), the epoch lineage and its open, closed or revoked state.
+- **Chosen at the requester's admission, sticky.** Refresh, harness restart, controller restart and vessel replacement do not move a binding. Only an explicit rebind (`flotilla convoy rebind`) or an authorization change does: withdrawing the last authorizing grant revokes it ("binding revoked: no authorizing grant"), stops the harness session and deletes delivered copies; the requester waits.
+- **Managed credential, authorization epoch and material generation are distinct.** A refresh is a new generation, pushed into the place. A replacement login for the same account is a new epoch, declared by the operator as `authorization_epoch` on the CredentialSpec; the binding records it and does not move. A login to a different account is refused as a replacement.
+- **Provision is recorded per place.** A registered implementation returns a plan or a refusal per candidate environment kind; a kind without a plan drops out of placement. Each (binding, place) records the plan and the last delivered epoch and generation, never material.
+- **The harness home is always explicit.** A subscription credential never rides vessel-wide credential references; a Claude harness without its bound home is refused at launch, including on the daemon host.

@@ -157,12 +157,15 @@ A crew on an agentless host takes the same harness path as a Docker crew
 harness runs from a flotilla-owned home under the SSH runner's writable base,
 not from the login user's own configuration:
 
-- Claude Code uses the delivered credential's config directory
-  (`<base>/credentials/<credential>/claude`), with a per-crew
-  `crews/<role>` home inside it. Onboarding, workspace trust for the checkout
-  and attribution suppression are seeded there. A Claude crew needs a granted
-  `claude-oauth` credential: the login user's own Claude login is not used, and
-  a launch without one is refused with that reason.
+- Claude Code runs in its requester's bound home
+  (`<base>/agent-homes/requesters/<convoy>/<role>/claude`, #3907), with a
+  per-crew `crews/<role>` home inside it. The vessel agent writes the bound
+  account's OAuth token into that home, and the launch reads it from there as
+  the harness starts. Onboarding, workspace trust for the checkout and
+  attribution suppression are seeded there. A Claude crew needs an account
+  binding, chosen at admission from the `claude-oauth` credentials its grants
+  authorize: the login user's own Claude login is not used, and a launch
+  without a binding is refused with that reason.
 - Codex uses `<base>/agent-homes/<environment>/codex`, or a delivered Codex key's
   home. Workspace trust is seeded in that home's `config.toml`, and the host's
   existing Codex login (`auth.json`) is linked into it.
