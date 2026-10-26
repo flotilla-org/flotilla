@@ -15,6 +15,14 @@ Each file line counts once, in exactly one column:
   `corpus` directory, and non-Rust files under `tests/`.
 
 `benches/` and `examples/` are left out. Lines are physical lines (`wc -l`).
+
+Classification is by directory name anywhere below `src/`, so a production
+module named `tests`, `test_support`, `fixtures`, `snapshots`, `testdata` or
+`corpus` would be counted as test code; none exists today. `Test/prod` is
+printed as `-` when production is under 100 lines, where the ratio says
+nothing (testkit and test-only crates).
+
+`--self-test` checks the masking and module scan on small snippets.
 `ci/<area>` rows count `test_*.py` and `test-*.sh` as tests and other Python,
 shell and shebang scripts as production; Markdown and data files outside
 fixture directories are left out.
@@ -26,12 +34,18 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+MIN_RATIO_PROD = 100
 FIXTURE_DIRS = {"fixtures", "snapshots", "testdata", "corpus"}
 CFG_TEST = re.compile(r"#\[cfg\((test|all\([^\]]*\btest\b[^\]]*\))\)\]")
 MOD_DECL = re.compile(
     r"((?:#\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*([;{])"
 )
 PATH_ATTR = re.compile(r'#\[path\s*=\s*"([^"]+)"\]')
+
+
+def is_test_cfg(attrs):
+    """`cfg(test)` or `cfg(all(.., test, ..))`, but not `cfg(all(not(test), ..))`."""
+    return any(not re.search(r"not\(\s*test\s*\)", m.group(0)) for m in CFG_TEST.finditer(attrs))
 
 
 def lines(path):
@@ -115,7 +129,7 @@ def scan(path, test_files):
             break
         pos = m.end()
         attrs_masked = m.group(1)
-        if not CFG_TEST.search(attrs_masked):
+        if not is_test_cfg(attrs_masked):
             continue
         attrs_real = src[m.start(1):m.end(1)]
         if m.group(3) == ";":
@@ -163,7 +177,6 @@ def measure_rust(name, base):
     inline = {}
     for f in rs:
         inline[f.resolve()] = scan(f, test_files)
-    # Iterate: out-of-line test modules may declare further modules.
     test_files = expand_test_dirs(test_files)
     for f in rs:
         rel = f.relative_to(src).parts
@@ -231,14 +244,36 @@ def measure_ci(area):
     return row
 
 
+def self_test():
+    import tempfile
+
+    masked = mask('let s = "}{"; let r = r#"}"#; /* } /* { */ */ let c = \'}\'; fn f<\'a>() {}')
+    assert masked.count("{") == 1 and masked.count("}") == 1, masked
+    assert is_test_cfg("#[cfg(test)]") and is_test_cfg("#[cfg(all(test, unix))]")
+    assert not is_test_cfg("#[cfg(all(not(test), unix))]") and not is_test_cfg("#[cfg(not(test))]")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        lib = root / "lib.rs"
+        lib.write_text('fn a() {}\n#[cfg(test)]\nmod tests {\n    const S: &str = "}";\n}\n'
+                       '#[cfg(test)]\nmod more;\n#[cfg(all(not(test), unix))]\nmod prod {}\n')
+        (root / "more.rs").write_text("\n")
+        found = set()
+        assert scan(lib, found) == 4
+        assert found == {(root / "more.rs").resolve()}
+    print("self-test ok")
+
+
 def main():
+    if "--self-test" in sys.argv:
+        self_test()
+        return
     rows = [measure_rust(d.name, d) for d in sorted((ROOT / "crates").iterdir())
             if (d / "Cargo.toml").exists()]
     rows.append(measure_rust("flotilla (root)", ROOT))
     rows += [measure_ci(d) for d in sorted((ROOT / "ci").iterdir()) if d.is_dir()]
     for r in rows:
         r["test_total"] = r["unit"] + r["tests"] + r["fixtures"]
-        r["ratio"] = round(r["test_total"] / r["prod"], 2) if r["prod"] else None
+        r["ratio"] = round(r["test_total"] / r["prod"], 2) if r["prod"] >= MIN_RATIO_PROD else None
     rows.sort(key=lambda r: -r["test_total"])
     if "--json" in sys.argv:
         print(json.dumps(rows, indent=1))
@@ -247,10 +282,11 @@ def main():
     print("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
     tot = {k: 0 for k in ("prod", "unit", "tests", "fixtures", "test_total")}
     for r in rows:
-        if not r["prod"] and not r["test_total"]:
-            continue
         for k in tot:
             tot[k] += r[k]
+    for r in rows:
+        if not r["test_total"]:
+            continue  # build-feature shims and testkits without tests of their own; counted in the total
         ratio = "-" if r["ratio"] is None else f'{r["ratio"]:.2f}'
         print(f'| `{r["area"]}` | {r["prod"]:,} | {r["unit"]:,} | {r["unit_modules"]} | {r["tests"]:,} | '
               f'{r["test_targets"]} | {r["fixtures"]:,} | {r["fixture_files"]} | {r["test_total"]:,} | {ratio} |')

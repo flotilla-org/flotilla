@@ -31,7 +31,7 @@ Measured at `origin/main` on 2026-10-26, sorted by test lines:
 | `flotilla-store-testkit` | 922 | 384 | 3 | 17,249 | 4 | 26,179 | 36 | 43,812 | 47.52 |
 | `flotilla-crew` | 14,539 | 13,741 | 25 | 9,015 | 1 | 69 | 9 | 22,825 | 1.57 |
 | `flotilla-core` | 16,963 | 18,087 | 47 | 2,792 | 11 | 217 | 7 | 21,096 | 1.24 |
-| `flotilla-controllers` | 15 | 0 | 0 | 16,889 | 1 | 0 | 0 | 16,889 | 1125.93 |
+| `flotilla-controllers` | 15 | 0 | 0 | 16,889 | 1 | 0 | 0 | 16,889 | - |
 | `flotilla-provisioning` | 5,638 | 3,535 | 7 | 7,976 | 9 | 1,387 | 7 | 12,898 | 2.29 |
 | `flotilla-schema-sqlite` | 4,749 | 731 | 5 | 6,696 | 3 | 4,025 | 14 | 11,452 | 2.41 |
 | `flotilla-environment` | 8,086 | 8,308 | 23 | 0 | 0 | 109 | 6 | 8,417 | 1.04 |
@@ -91,27 +91,27 @@ Measured at `origin/main` on 2026-10-26, sorted by test lines:
 | `flotilla-relay-protocol` | 277 | 120 | 2 | 0 | 0 | 0 | 0 | 120 | 0.43 |
 | `flotilla-issue-tracker` | 217 | 119 | 2 | 0 | 0 | 0 | 0 | 119 | 0.55 |
 | `flotilla-tracing` | 180 | 119 | 1 | 0 | 0 | 0 | 0 | 119 | 0.66 |
-| `ci/crew-image` | 34 | 0 | 0 | 105 | 3 | 0 | 0 | 105 | 3.09 |
-| `ci/toolchain` | 29 | 0 | 0 | 105 | 3 | 0 | 0 | 105 | 3.62 |
-| `ci/platform-tests` | 35 | 0 | 0 | 104 | 2 | 0 | 0 | 104 | 2.97 |
-| `ci/platform-changes` | 72 | 0 | 0 | 103 | 1 | 0 | 0 | 103 | 1.43 |
+| `ci/crew-image` | 34 | 0 | 0 | 105 | 3 | 0 | 0 | 105 | - |
+| `ci/toolchain` | 29 | 0 | 0 | 105 | 3 | 0 | 0 | 105 | - |
+| `ci/platform-tests` | 35 | 0 | 0 | 104 | 2 | 0 | 0 | 104 | - |
+| `ci/platform-changes` | 72 | 0 | 0 | 103 | 1 | 0 | 0 | 103 | - |
 | `flotilla-discovery-testkit` | 1,803 | 93 | 2 | 0 | 0 | 0 | 0 | 93 | 0.05 |
 | `flotilla-paths` | 126 | 88 | 1 | 0 | 0 | 0 | 0 | 88 | 0.70 |
 | `flotilla-protocol-testkit` | 208 | 88 | 1 | 0 | 0 | 0 | 0 | 88 | 0.42 |
-| `flotilla-review-bundle-object-store` | 38 | 0 | 0 | 81 | 1 | 0 | 0 | 81 | 2.13 |
+| `flotilla-review-bundle-object-store` | 38 | 0 | 0 | 81 | 1 | 0 | 0 | 81 | - |
 | `flotilla-store-http` | 1,127 | 74 | 2 | 0 | 0 | 0 | 0 | 74 | 0.07 |
-| `flotilla-capability-contract` | 96 | 68 | 1 | 0 | 0 | 0 | 0 | 68 | 0.71 |
-| `flotilla-build-features` | 5 | 0 | 0 | 36 | 1 | 0 | 0 | 36 | 7.20 |
-| `flotilla-test-support` | 55 | 22 | 1 | 0 | 0 | 0 | 0 | 22 | 0.40 |
+| `flotilla-capability-contract` | 96 | 68 | 1 | 0 | 0 | 0 | 0 | 68 | - |
+| `flotilla-build-features` | 5 | 0 | 0 | 36 | 1 | 0 | 0 | 36 | - |
+| `flotilla-test-support` | 55 | 22 | 1 | 0 | 0 | 0 | 0 | 22 | - |
 | **Total** | 266,277 | 174,167 | | 104,430 | | 38,310 | | 316,907 | 1.19 |
 
-Rows with no test lines at all (the `flotilla-build-features-*` shims and testkit crates with no tests of their own) are left out of the table; `--json` lists them.
+Rows with no test lines (the `flotilla-build-features-*` shims and testkit crates without tests of their own) are left out of the table but counted in the total; `--json` lists them. `Test/prod` reads `-` where production is under 100 lines.
 
 Readings:
 
 - Tests outweigh production code 1.19 : 1 across the workspace: about 317k test lines (unit 174k, `tests/` 104k, fixtures 38k) against 266k production lines.
 - `flotilla-store-testkit` is mostly the stored-record corpus (26k fixture lines) and backend contracts. The corpus is out of scope, so the store-testkit was not surveyed for clusters.
-- `flotilla-controllers` is 16.9k lines of tests over 15 production lines. It is the cross-capability suite marked "pending retirement" in `CLAUDE.md`, and it holds the most cross-crate duplication.
+- `flotilla-controllers` is 16.9k lines of tests over 15 production lines (its ratio prints as `-`). It is the cross-capability suite marked "pending retirement" in `CLAUDE.md`, and it holds the most cross-crate duplication.
 - `flotilla-schema-sqlite` and `flotilla-engine-store` fixture lines are DDL snapshots (out of scope).
 
 ## 2. Areas surveyed
