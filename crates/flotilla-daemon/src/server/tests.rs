@@ -5330,6 +5330,7 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
                 source: CredentialSource::Env { name: "TEST_WORK_TOKEN".into() },
                 lifecycle: CredentialLifecycle::Issued,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await

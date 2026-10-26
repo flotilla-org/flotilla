@@ -24,6 +24,7 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
                 source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await

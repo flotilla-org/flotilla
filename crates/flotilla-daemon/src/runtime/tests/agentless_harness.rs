@@ -291,6 +291,7 @@ async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool
                 source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await

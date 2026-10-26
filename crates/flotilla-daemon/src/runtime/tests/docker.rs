@@ -242,6 +242,7 @@ async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_r
                     source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -389,6 +390,7 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
                     source: CredentialSource::Env { name: "TEST_PULL_TOKEN".to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await

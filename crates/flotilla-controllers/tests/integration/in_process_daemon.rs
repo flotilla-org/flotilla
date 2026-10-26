@@ -2211,6 +2211,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
                 source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -3203,6 +3204,7 @@ async fn implement_review_admission_shares_a_vessel_with_different_resolved_skil
                 source: CredentialSource::Env { name: "TEST_CODER_TOKEN".into() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -3458,6 +3460,7 @@ async fn requested_model_ignores_legacy_account_evidence_and_uses_only_selected_
                 source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await

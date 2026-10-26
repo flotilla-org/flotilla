@@ -69,6 +69,24 @@ pub struct CredentialSpecSpec {
     #[builder(default)]
     #[serde(default)]
     pub placement: CredentialPlacementRequirements,
+    /// The upstream login or key currently behind this managed credential (#3880, #3882). The
+    /// operator bumps it in the manifest when a replacement login for the same account replaces
+    /// the old one; a refresh never changes it. Declarations written before it decode as the
+    /// initial epoch. Authored by project-map credential manifests.
+    #[builder(default = INITIAL_AUTHORIZATION_EPOCH)]
+    #[serde(default = "initial_authorization_epoch", skip_serializing_if = "is_initial_authorization_epoch")]
+    pub authorization_epoch: u32,
+}
+
+/// The epoch a managed credential starts in.
+pub const INITIAL_AUTHORIZATION_EPOCH: u32 = 1;
+
+fn initial_authorization_epoch() -> u32 {
+    INITIAL_AUTHORIZATION_EPOCH
+}
+
+fn is_initial_authorization_epoch(epoch: &u32) -> bool {
+    *epoch == INITIAL_AUTHORIZATION_EPOCH
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -683,6 +701,19 @@ mod tests {
         assert_eq!(consumer.delivery_slot(), CredentialConsumer::Claude.delivery_slot());
     }
 
+    // Behaviour (#3910 owner ruling 2, ADR 0047): a declaration written before the authorization
+    // epoch existed decodes as the initial epoch and re-encodes unchanged; a bumped epoch survives.
+    #[test]
+    fn credential_spec_decodes_old_declarations_at_the_initial_authorization_epoch() {
+        let old = r#"{"consumer":{"adapter":"claude-oauth","account_email":"box@example.com"},"source":{"kind":"file","path":"/tokens/box"},"lifecycle":"static"}"#;
+        let spec: CredentialSpecSpec = serde_json::from_str(old).expect("old declaration decodes");
+        assert_eq!(spec.authorization_epoch, INITIAL_AUTHORIZATION_EPOCH);
+        assert!(!serde_json::to_string(&spec).expect("encodes").contains("authorization_epoch"));
+        let replaced = CredentialSpecSpec { authorization_epoch: 2, ..spec };
+        let decoded: CredentialSpecSpec = serde_json::from_value(serde_json::to_value(&replaced).expect("json")).expect("decodes");
+        assert_eq!(decoded.authorization_epoch, 2);
+    }
+
     #[test]
     fn github_app_actor_login_decodes_old_declarations_and_configured_identity() {
         let old: CredentialConsumer =
@@ -717,6 +748,7 @@ mod tests {
             source: CredentialSource::Env { name: "HOST_ONLY_KEY".to_string() },
             lifecycle: CredentialLifecycle::Static,
             placement: CredentialPlacementRequirements::default(),
+            authorization_epoch: crate::INITIAL_AUTHORIZATION_EPOCH,
         })
         .expect("serialize declaration");
         assert!(!encoded.contains("secret-material"));

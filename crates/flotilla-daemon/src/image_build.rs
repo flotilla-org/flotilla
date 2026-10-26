@@ -438,6 +438,7 @@ mod tests {
                         source: CredentialSource::Env { name: env.into() },
                         lifecycle: CredentialLifecycle::Static,
                         placement: Default::default(),
+                        authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                     },
                 )
                 .await

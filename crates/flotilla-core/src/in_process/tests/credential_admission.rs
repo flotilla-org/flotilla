@@ -97,6 +97,7 @@ async fn grant_resolution_scopes_roles_trust_and_permissions_independently_of_is
                 source: CredentialSource::GithubApp { app_id_path: "app-id".to_string(), private_key_path: "key".to_string() },
                 lifecycle: CredentialLifecycle::Refreshable,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -205,6 +206,7 @@ async fn admission_refuses_mixed_grant_permissions_and_preserves_homogeneous_mod
                     source: CredentialSource::GithubApp { app_id_path: "app-id".into(), private_key_path: "key".into() },
                     lifecycle: CredentialLifecycle::Refreshable,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -274,6 +276,7 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
                 source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -339,6 +342,7 @@ async fn harness_bound_credential_reaches_only_vessels_running_that_harness() {
                 source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -402,6 +406,7 @@ async fn docker_placement_selects_credentials_for_the_effective_contained_stance
                 source: CredentialSource::Env { name: "GITHUB_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -447,6 +452,7 @@ async fn project_grant_entitlement_is_independent_of_vessel_stance() {
                 source: CredentialSource::Env { name: "GITHUB_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -573,6 +579,7 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
                 source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -681,6 +688,7 @@ async fn dispatch_against_an_expired_credential_is_refused_with_the_credential_a
                 source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await

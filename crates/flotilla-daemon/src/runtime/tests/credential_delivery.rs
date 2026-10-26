@@ -449,6 +449,7 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
                     source: CredentialSource::Env { name: source.to_string() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
                 },
             )
             .await
@@ -472,6 +473,7 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
                 },
                 lifecycle: CredentialLifecycle::Refreshable,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -741,6 +743,7 @@ async fn codex_credential_and_agent_material_conflict_before_container_creation(
                 source: CredentialSource::Env { name: "TEST_CODEX_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -830,6 +833,7 @@ async fn an_unprovisioned_central_codex_credential_fails_before_registry_preflig
                 source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
@@ -926,6 +930,7 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
                 source: CredentialSource::Env { name: "TEST_WORK_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Issued,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await

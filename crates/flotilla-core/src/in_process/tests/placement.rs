@@ -59,6 +59,7 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
                 source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
