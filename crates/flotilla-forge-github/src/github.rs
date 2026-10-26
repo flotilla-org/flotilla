@@ -6,12 +6,22 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
+use flotilla_provider_runtime::execution_context::AccountState;
 use flotilla_provider_runtime::run_output;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ObservationError;
 
 use crate::github_poll;
+
+/// `gh`'s login and configuration home, and the variables that authenticate
+/// it directly.
+pub const GH_ACCOUNT_STATE: AccountState = AccountState::new("gh").homes(&["GH_CONFIG_DIR"]).secrets(&[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+]);
 
 const MAX_PER_PAGE: usize = 100;
 const MIN_REMAINING_BUDGET: u32 = 100;

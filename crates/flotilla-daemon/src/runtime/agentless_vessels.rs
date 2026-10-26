@@ -33,7 +33,11 @@ use flotilla_environment::environment::agent::{
 use flotilla_environment::environment::{VesselAgent, CONTAINED_DAEMON_REQUIRED_ENV, DAEMON_SOCKET_ENV};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::EnvironmentId;
-use flotilla_provider_runtime::{host_environment::export_lines, ChannelLabel, CommandOutput, CommandProcess, CommandRunner};
+use flotilla_provider_runtime::{
+    execution_context::{BaseLayer, BoundLayer},
+    host_environment::export_lines,
+    ChannelLabel, CommandOutput, CommandProcess, CommandRunner,
+};
 use flotilla_resources::{TerminalSession, TerminalSessionTarget, Vessel};
 use flotilla_store::ResourceBackend;
 use serde::{Deserialize, Serialize};
@@ -58,22 +62,10 @@ const CLEAT_SOCKET_SUFFIX: usize = "/default-daemon-name/socket".len();
 /// restarts can retire the agents of vessels removed while it was down.
 const MARKER: &str = "vessel.json";
 
-/// Variables a login gives every process, kept in the vessel's environment
-/// when the host's discovery observed them.
-const LOGIN_VARIABLES: &[&str] = &[
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "LANG",
-    "LC_ALL",
-    "TZ",
-    "XDG_RUNTIME_DIR",
-    "XDG_STATE_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-];
+/// The login identity a vessel's processes run as, kept in its environment
+/// when the host's discovery observed it. Locale comes with the base layer.
+const IDENTITY_VARIABLES: &[&str] =
+    &["HOME", "USER", "LOGNAME", "SHELL", "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"];
 
 /// One vessel on one agentless host's Environment.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -490,6 +482,7 @@ impl VesselAgents for SshVesselAgents {
             platform.drydock(),
             build,
             Duration::from_secs(60),
+            &vessel_base(profile, paths)?,
         )
         .with_executable_cache(cache);
         let runner = AgentRunner::new(Arc::new(connector), local.into()).with_writable_bases(WritableBases::Host);
@@ -874,19 +867,16 @@ impl EnvironmentToolContext for LayerContext {
     }
 }
 
-/// #3722: the vessel's composed environment, pushed to its agent. `PATH` is
-/// the generation layer's `bin`, the host's declared supplies and the system
-/// tail; each supply's variables are set; no login profile is read. Crews
-/// reach the daemon through the vessel's forward.
+/// The vessel's environment, pushed to its agent: the login identity, the
+/// prepared base layer and flotilla's own variables. Crews reach the daemon
+/// through the vessel's forward.
 pub(super) fn vessel_environment(profile: &AgentlessSshProfile, paths: &VesselPaths) -> Result<BTreeMap<String, String>, String> {
     let bag = &profile.env_bag;
-    let home = bag.find_env_var("HOME").ok_or_else(|| format!("agentless host {} has no HOME", profile.destination))?;
-    let mut environment = LOGIN_VARIABLES
+    let base = vessel_base(profile, paths)?;
+    let mut environment = IDENTITY_VARIABLES
         .iter()
         .filter_map(|name| bag.find_env_var(name).map(|value| (name.to_string(), value.to_string())))
         .collect::<BTreeMap<_, _>>();
-    let host = &profile.host_environment;
-    environment.insert("PATH".into(), host.compose_path(home, &[paths.cli_directory().to_string_lossy().into_owned()], None));
     let flotilla = [
         (DAEMON_SOCKET_ENV.to_string(), paths.daemon_socket().to_string_lossy().into_owned()),
         ("FLOTILLA_ENVIRONMENT_ID".to_string(), profile.environment_id.to_string()),
@@ -894,19 +884,24 @@ pub(super) fn vessel_environment(profile: &AgentlessSshProfile, paths: &VesselPa
         ("CLEAT_RUNTIME_DIR".to_string(), paths.cleat_runtime().to_string_lossy().into_owned()),
         ("TERMINFO_DIRS".to_string(), format!("{}:/usr/share/terminfo", paths.terminfo().display())),
     ];
-    for (name, value) in host.variables(home) {
-        if flotilla.iter().any(|(key, _)| *key == name) {
-            let supply = host.supplies().iter().find(|supply| supply.env.iter().any(|(variable, _)| *variable == name));
-            return Err(format!(
-                "host configuration error for {}: supply `{}` sets {name}, which flotilla sets",
-                profile.environment_id,
-                supply.map(|supply| supply.name.as_str()).unwrap_or_default()
-            ));
-        }
-        environment.insert(name, value);
+    if let Some((name, _)) = flotilla.iter().find(|(name, _)| base.sets(name)) {
+        return Err(format!(
+            "host configuration error for {}: supply `{}` sets {name}, which flotilla sets",
+            profile.environment_id,
+            base.supply_of(name).unwrap_or_default()
+        ));
     }
+    environment.extend(base.environment());
     environment.extend(flotilla);
     Ok(environment)
+}
+
+/// The vessel's base layer: its generation layer, then the host's.
+pub(super) fn vessel_base(profile: &AgentlessSshProfile, paths: &VesselPaths) -> Result<BaseLayer, String> {
+    profile
+        .preparer(vec![paths.cli_directory().to_string_lossy().into_owned()])
+        .base()
+        .map_err(|error| error.for_environment(profile.environment_id.as_str()))
 }
 
 /// Point a session at its vessel's daemon forward. The CLI never spawns a
@@ -920,33 +915,28 @@ pub(super) fn apply_reach_environment(env: &mut Vec<(String, String)>, environme
     ]);
 }
 
-/// #3722: the last step before an agentless session starts. `PATH` is the
-/// vessel's generation layer, the credential wrappers flotilla put on the
-/// session's `PATH`, the host's declared supplies and the system tail, in
-/// that order, and each supply's variables are set. A supply variable that
-/// flotilla already set for the session is a configuration error for that
-/// host.
+/// The last step before an agentless session starts: the vessel's prepared
+/// context rendered onto the launch, with `bound` the crew's account
+/// material. Nothing after it adds to `PATH` or sets a base variable.
 ///
 /// cleat runs a session command through `$SHELL -lc`, so the host's login
 /// profile still runs before the command; the returned command sets the
-/// composed `PATH` and supply variables again before anything else, until
-/// cleat can launch without a login shell (#3761).
+/// base layer and `PATH` again before anything else, until cleat can launch
+/// without a login shell.
 pub(super) fn compose_session_environment(
     env: &mut Vec<(String, String)>,
     command: &str,
-    environment: &str,
     paths: &VesselPaths,
     profile: &AgentlessSshProfile,
+    bound: BoundLayer,
 ) -> Result<String, String> {
-    let home = profile.env_bag.find_env_var("HOME").ok_or_else(|| format!("agentless host {environment} has no HOME"))?;
-    let host = &profile.host_environment;
-    let own = [paths.cli_directory().to_string_lossy().into_owned()];
-    host.compose_session(home, &own, env).map_err(|error| format!("host configuration error for {environment}: {error}"))?;
-    let composed = env
-        .iter()
-        .filter(|(name, _)| name == "PATH" || host.supplies().iter().any(|supply| supply.env.iter().any(|(variable, _)| variable == name)))
-        .cloned()
-        .collect::<Vec<_>>();
+    let environment = &profile.environment_id;
+    let prepared = profile
+        .preparer(vec![paths.cli_directory().to_string_lossy().into_owned()])
+        .prepare(Some(bound))
+        .map_err(|error| error.for_environment(environment.as_str()))?;
+    prepared.render_crew(env, &profile.accounts).map_err(|error| error.for_environment(environment.as_str()))?;
+    let composed = env.iter().filter(|(name, _)| prepared.base().sets(name)).cloned().collect::<Vec<_>>();
     Ok(format!("{}{command}", export_lines(&composed)))
 }
 

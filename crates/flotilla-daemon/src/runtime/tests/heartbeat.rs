@@ -190,6 +190,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
                 runner: probe_runner.as_ref(),
                 env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
                 scratch: Path::new("/tmp/flotilla-probe-test"),
+                observation: &Default::default(),
             },
             &mut ModelProbeState::default(),
         )
@@ -274,6 +275,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
             runner: cache_runner.as_ref(),
             env: &TestEnvVars::default(),
             scratch: Path::new("/tmp/flotilla-probe-test"),
+            observation: &Default::default(),
         },
         &mut model_probes,
     )
@@ -300,6 +302,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
             runner: failing_runner.as_ref(),
             env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
             scratch: Path::new("/tmp/flotilla-probe-test"),
+            observation: &Default::default(),
         },
         &mut model_probes,
     )
@@ -590,6 +593,7 @@ fn unresolved_fulfilment_provider_publishes_unknown(tc: hegel::TestCase) {
                 runner: runner.as_ref(),
                 env: &TestEnvVars::default(),
                 scratch: Path::new("/tmp/probe"),
+                observation: &Default::default(),
             },
             &mut model_probes,
         )

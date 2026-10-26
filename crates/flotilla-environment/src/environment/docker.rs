@@ -1202,11 +1202,15 @@ impl super::EnvironmentDetection for DockerEnvironmentProvider {
     async fn detect(
         &self,
         image: Option<&str>,
+        context: &flotilla_provider_runtime::execution_context::ObservationContext,
         binary: &str,
         args: &[&str],
         scratch: &Path,
     ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
         let image = image.ok_or("detection requires an image reference")?;
+        // An image declares its own base layer; the probe renders it under the
+        // same isolation as any other target.
+        let context = context.with_base(self.image_base(image, context.accounts()).await?);
         let name = format!("flotilla-observation-{}", uuid::Uuid::new_v4());
         let mut command = [
             "run",
@@ -1226,7 +1230,7 @@ impl super::EnvironmentDetection for DockerEnvironmentProvider {
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
-        command.extend(super::detection::observation_args("/tmp/flotilla-observation", binary, args));
+        command.extend(super::detection::observation_args("/tmp/flotilla-observation", &context, binary, args));
         super::detection::run_with_cleanup(
             self.inner.runner.clone(),
             "docker",
@@ -1241,6 +1245,32 @@ impl super::EnvironmentDetection for DockerEnvironmentProvider {
 }
 
 impl DockerEnvironmentProvider {
+    /// The environment the local image's configuration declares. Detection
+    /// never pulls.
+    async fn image_base(
+        &self,
+        image: &str,
+        accounts: &flotilla_provider_runtime::execution_context::AccountVariables,
+    ) -> Result<flotilla_provider_runtime::execution_context::BaseLayer, String> {
+        let output = self
+            .inner
+            .runner
+            .run_output("docker", &["image", "inspect", "--format", "{{json .Config.Env}}", image], Path::new("/"), &ChannelLabel::Default)
+            .await
+            .map_err(|error| format!("inspect image {image} environment: {error}"))?;
+        if !output.success() {
+            return Err(format!("inspect image {image} environment exited {:?}", output.exit_code));
+        }
+        let entries: Option<Vec<String>> = serde_json::from_str(output.stdout.trim())
+            .map_err(|error| format!("docker returned invalid environment for image {image}: {error}"))?;
+        let environment = entries
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| entry.split_once('=').map(|(name, value)| (name.to_string(), value.to_string())));
+        flotilla_provider_runtime::execution_context::BaseLayer::declared(environment, accounts)
+            .map_err(|error| format!("image {image}: {error}"))
+    }
+
     fn capability_declaration() -> super::ProviderCapabilities {
         super::ProviderCapabilities {
             material_modes: vec![super::MaterialMode::Frozen, super::MaterialMode::Pushed, super::MaterialMode::Shared],

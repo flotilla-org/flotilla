@@ -20,7 +20,7 @@ use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::VcsKind;
 use flotilla_discovery_api::{Factory, HostDetector, ProviderCategory, ProviderDescriptor, RepoDetector, UnmetRequirement};
-use flotilla_provider_runtime::{EnvVars, ProcessEnvVars};
+use flotilla_provider_runtime::{execution_context::AccountVariables, EnvVars, ProcessEnvVars};
 use futures::StreamExt;
 
 use flotilla_environment::environment::EnvironmentProvider;
@@ -79,6 +79,25 @@ pub struct FactoryRegistry {
 }
 
 impl FactoryRegistry {
+    /// The account-state declarations of every registered family: provider
+    /// factories, the built-in harnesses and installed harness factories.
+    pub fn account_variables(&self) -> AccountVariables {
+        let declared = self
+            .vcs
+            .iter()
+            .filter_map(|factory| factory.account_state())
+            .chain(self.change_requests.iter().filter_map(|factory| factory.account_state()))
+            .chain(self.issue_trackers.iter().filter_map(|factory| factory.account_state()))
+            .chain(self.cloud_agents.iter().filter_map(|factory| factory.account_state()))
+            .chain(self.ai_utilities.iter().filter_map(|factory| factory.account_state()))
+            .chain(self.terminal_pools.iter().filter_map(|factory| factory.account_state()))
+            .chain(self.environment_providers.iter().filter_map(|factory| factory.account_state()))
+            .chain(AgentAdapterRegistry::built_in_account_state().iter().copied())
+            .chain(self.agent_adapters.iter().filter_map(|factory| factory.account_state()))
+            .collect::<Vec<_>>();
+        AccountVariables::from_families(&declared)
+    }
+
     /// Probe all factory categories against an environment bag and return a
     /// populated `ProviderRegistry`. Used for environment-internal discovery
     /// where detectors have already run and the bag is pre-built.

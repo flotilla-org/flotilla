@@ -22,6 +22,7 @@ use flotilla_crew::reconcilers::terminal_session::{
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId, TerminalStatus};
+use flotilla_provider_runtime::execution_context::BoundLayer;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     Checkout, Convoy, Environment, FulfilmentKind, ResourceError, ResourceObject, TerminalAttentionSource, TerminalAttentionState,
@@ -33,12 +34,11 @@ use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, T
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::agentless_vessels::{apply_reach_environment, compose_session_environment, VesselAccess};
+use super::agentless_vessels::{apply_reach_environment, compose_session_environment, vessel_base, VesselAccess};
 use super::credentials::{agent_material_environment, RuntimeSessionCapabilities};
 use super::state::ControllerRuntimeState;
 use crate::blob_store::BlobDigest;
 use crate::blob_store::BlobStore;
-use crate::stdlib_image_layers::harness_session_environment;
 use flotilla_agent::adapter::FLOTILLA_ENVIRONMENT_ID_ENV;
 
 pub(super) struct PendingTerminalDelivery {
@@ -422,6 +422,11 @@ impl TerminalRuntime for TerminalControllerRuntime {
             None if credential_refs.is_empty() => Vec::new(),
             None => return Err("host-local credential store unavailable".to_string()),
         };
+        // An agentless crew's bound layer: what credential delivery and its
+        // harness homes produced, with the wrapper directories a declared
+        // `PATH` names. No other declared variable joins it.
+        let mut bound_material = credential_env.clone();
+        bound_material.extend(spec.env.get("PATH").map(|path| ("PATH".to_string(), path.clone())));
         let mut declared_env = spec.env.clone();
         declared_env.extend(credential_env);
         if spec.env_ref == self.state.host_direct_environment_name {
@@ -437,14 +442,6 @@ impl TerminalRuntime for TerminalControllerRuntime {
             // #3618, #3792: an agentless host's crews reach the daemon through
             // their vessel agent's forward, with the generation's CLI on PATH.
             apply_reach_environment(&mut credential_env, &spec.env_ref, &access.paths);
-            // What the crew image sets for its harnesses, a bare host's
-            // session gets too; the session's own declarations win, as they do
-            // over a vessel's image environment.
-            for (name, value) in harness_session_environment() {
-                if !credential_env.iter().any(|(key, _)| key == name) {
-                    credential_env.push((name.clone(), value.clone()));
-                }
-            }
         } else if spec.env_ref != self.state.host_direct_environment_name {
             // A provisioned vessel's container already names its environment;
             // the session states it too, so the harness sees what it runs in.
@@ -511,6 +508,11 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     credential_env = material
                         .host_harness_environment(&spec.env_ref, &spec.role, &required, &credential_env, launch_runner()?.as_ref())
                         .await?;
+                    if let Some(profile) = agentless {
+                        let homes = profile.accounts.homes().collect::<BTreeSet<_>>();
+                        bound_material.retain(|(name, _)| !homes.contains(name.as_str()));
+                        bound_material.extend(credential_env.iter().filter(|(name, _)| homes.contains(name.as_str())).cloned());
+                    }
                 }
                 if let Some(store) = &self.state.credential_store {
                     store.record_capability_endpoints(&spec.env_ref, name, &credential_env).await;
@@ -629,10 +631,11 @@ impl TerminalRuntime for TerminalControllerRuntime {
             ]);
         }
         if let (Some(profile), Some(access)) = (agentless, &vessel) {
-            // #3722: composed last, so nothing after it adds to PATH or sets a
-            // variable a supply also declares. Every agentless launch reaches
-            // here with its vessel: without one it returned above.
-            command = compose_session_environment(&mut env, &command, &spec.env_ref, &access.paths, profile)?;
+            // Rendered last, so nothing after it adds to PATH or sets a base
+            // variable. Every agentless launch reaches here with its vessel:
+            // without one it returned above.
+            let bound = BoundLayer::delivered(&bound_material, &vessel_base(profile, &access.paths)?)?;
+            command = compose_session_environment(&mut env, &command, &access.paths, profile, bound)?;
         }
         // A dead generation may retain a recording with the old ID. Launch
         // under a fresh ID so cleat cannot resolve the name ambiguously, then

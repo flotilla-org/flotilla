@@ -14,10 +14,12 @@ use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::CredentialStore;
 use flotilla_discovery::registry::ProviderRegistry;
+use flotilla_discovery::DiscoveryRuntime;
 use flotilla_environment::environment::EnvironmentInput;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::EnvironmentId;
+use flotilla_provider_runtime::execution_context::{AccountVariables, BaseLayer, ExecutionPreparer, ObservationContext, LOCALE_VARIABLES};
 use flotilla_provider_runtime::host_environment::HostEnvironment;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
@@ -34,6 +36,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use crate::fulfilment_probe::{probe_kind, DetectionTarget};
+use crate::stdlib_image_layers::harness_session_environment;
 
 use super::agentless_vessels::AgentlessVessels;
 use super::seed::{
@@ -65,11 +68,26 @@ pub(super) struct AgentlessSshProfile {
     pub(super) runner: Arc<dyn CommandRunner>,
     /// The host's declared supplies (#3722).
     pub(super) host_environment: HostEnvironment,
+    /// Where the registered families keep account state.
+    pub(super) accounts: AccountVariables,
     /// The vessels this host declares it can hold (#3793).
     pub(super) max_vessels: Option<u32>,
     pub(super) fulfilment_facts: Arc<RwLock<BTreeMap<String, FulfilmentFacts>>>,
     /// How its vessel agents are reached (#3792), or why they cannot be.
     pub(super) vessel_agent: Result<SshAgentReach, String>,
+}
+
+impl AgentlessSshProfile {
+    /// The host's one preparer: its probes, its vessel agents and its crews
+    /// all take their base layer from here. `generation` names the
+    /// directories flotilla installed for a vessel; a host probe has none.
+    pub(super) fn preparer(&self, generation: Vec<String>) -> ExecutionPreparer {
+        let bag = &self.env_bag;
+        ExecutionPreparer::new(self.host_environment.clone(), self.accounts.clone(), bag.find_env_var("HOME"))
+            .with_generation(generation)
+            .with_locale(|name| bag.find_env_var(name))
+            .with_settings(harness_session_environment())
+    }
 }
 
 pub(super) struct BagEnvVars<'a>(pub(super) &'a EnvironmentBag);
@@ -140,6 +158,7 @@ pub(super) async fn discover_agentless_ssh_profile(
         env_bag: direct.env_bag,
         runner: direct.runner,
         host_environment: direct.host_environment,
+        accounts: daemon.discovery_runtime().factories.account_variables(),
         max_vessels: direct.max_vessels,
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
         vessel_agent,
@@ -514,6 +533,19 @@ pub(super) struct FulfilmentProbeContext<'a> {
     pub(super) runner: &'a dyn CommandRunner,
     pub(super) env: &'a dyn EnvVars,
     pub(super) scratch: &'a Path,
+    /// The host's prepared base layer and isolation.
+    pub(super) observation: &'a ObservationContext,
+}
+
+/// The daemon's own host declares its environment through the daemon
+/// process: its probes take that `PATH` and locale as their base layer.
+pub(super) fn local_observation(discovery: &DiscoveryRuntime) -> Result<ObservationContext, String> {
+    let declared = std::iter::once("PATH").chain(LOCALE_VARIABLES.iter().copied());
+    let base = BaseLayer::declared(
+        declared.filter_map(|name| discovery.env.get(name).map(|value| (name.to_string(), value))),
+        &discovery.factories.account_variables(),
+    )?;
+    Ok(ObservationContext::new(base, &discovery.factories.account_variables()))
 }
 
 pub(super) async fn observe_fulfilment_facts(
@@ -608,7 +640,7 @@ pub(super) async fn observe_fulfilment_facts(
                 deadline.min(tokio::time::Instant::now() + Duration::from_secs(45)),
                 probe_kind(
                     &kind.spec,
-                    DetectionTarget { image: image.as_deref(), provider: provider.as_ref() },
+                    DetectionTarget { image: image.as_deref(), provider: provider.as_ref(), context: probe.observation },
                     pool_available,
                     probe.runner,
                     probe.env,

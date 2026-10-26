@@ -16,7 +16,7 @@ use drydock_transport::{
     ssh::{GuestStreams, SshConfig},
     Limits, Transport,
 };
-use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
+use flotilla_provider_runtime::{execution_context::BaseLayer, ChannelLabel, CommandRunner};
 use tokio::sync::OnceCell;
 
 use super::{connect_current, AgentConnector};
@@ -30,15 +30,16 @@ pub const AGENT_EXECUTABLE: &str = "drydock-agent";
 const MISSING_EXECUTABLE: i32 = 64;
 
 /// Start the vessel's supervisor unless it already runs. The supervisor's lock
-/// makes this idempotent, so every reconnect may run it. Only the variables a
-/// login provides are kept: the agent's own environment is what flotilla
-/// configures, never the SSH session's.
+/// makes this idempotent, so every reconnect may run it. The agent runs with
+/// the login's identity and the prepared base layer, passed as `NAME=value`
+/// words after the directory: never the SSH session's own environment.
 const BOOTSTRAP: &str = r#"dir=$1
+shift
 umask 077
 mkdir -p -- "$dir" && chmod 700 -- "$dir" || exit 1
 [ -x "$dir/drydock-agent" ] || exit 64
 exec env -i HOME="${HOME:-/}" USER="${USER:-}" LOGNAME="${LOGNAME:-}" SHELL="${SHELL:-/bin/sh}" \
-  XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" LANG="${LANG:-C.UTF-8}" PATH=/usr/local/bin:/usr/bin:/bin \
+  XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" "$@" \
   "$dir/drydock-agent" --supervise --socket "$dir/agent.sock""#;
 
 /// Publish the copied executable only once it is complete and executable.
@@ -120,11 +121,13 @@ pub struct HostAgentConnector {
     executable: PathBuf,
     executable_bytes: Arc<OnceCell<Vec<u8>>>,
     timeout: Duration,
+    base: Vec<String>,
 }
 
 impl HostAgentConnector {
     /// `directory` is the vessel's private directory on the host; `executable`
-    /// is the controller's agent build for the host's `platform`.
+    /// is the controller's agent build for the host's `platform`; `base` is
+    /// the vessel's prepared base layer, which the agent process starts with.
     pub fn new(
         host: Arc<dyn CommandRunner>,
         transport: Arc<dyn AgentTransport>,
@@ -132,8 +135,10 @@ impl HostAgentConnector {
         platform: Platform,
         executable: PathBuf,
         timeout: Duration,
+        base: &BaseLayer,
     ) -> Self {
-        Self { host, transport, directory, platform, executable, executable_bytes: Arc::new(OnceCell::new()), timeout }
+        let base = base.environment().into_iter().map(|(name, value)| format!("{name}={value}")).collect();
+        Self { host, transport, directory, platform, executable, executable_bytes: Arc::new(OnceCell::new()), timeout, base }
     }
 
     /// Share one read of the agent build between a host's vessels.
@@ -175,9 +180,11 @@ impl HostAgentConnector {
 
     async fn start(&self) -> Result<bool, String> {
         let directory = self.directory.to_string_lossy();
+        let mut args = vec!["-c", BOOTSTRAP, "flotilla-vessel-agent", &directory];
+        args.extend(self.base.iter().map(String::as_str));
         let output = self
             .host
-            .run_output("sh", &["-c", BOOTSTRAP, "flotilla-vessel-agent", &directory], Path::new("/"), &ChannelLabel::Default)
+            .run_output("sh", &args, Path::new("/"), &ChannelLabel::Default)
             .await
             .map_err(|error| format!("start vessel agent in {directory}: {error}"))?;
         match output.exit_code {

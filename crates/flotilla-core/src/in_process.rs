@@ -422,6 +422,9 @@ async fn register_static_ssh_direct_environment(
     let destination = flotilla_config::ssh_destination(&environment.hostname, environment.user.as_deref());
     let host_environment =
         host_environment(&environment.supplies).map_err(|error| format!("host configuration error for {config_key}: {error}"))?;
+    host_environment
+        .check_account_state(&discovery.factories.account_variables())
+        .map_err(|error| format!("host configuration error for {config_key}: {error}"))?;
     let runner = Arc::new(
         SshCommandRunner::new(destination.clone(), multiplex, Arc::clone(&discovery.runner)).with_environment(host_environment.clone()),
     );

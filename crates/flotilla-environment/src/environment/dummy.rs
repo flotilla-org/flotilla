@@ -459,7 +459,14 @@ impl CommandRunner for DummyCommandRunner {
 
 #[async_trait]
 impl super::EnvironmentDetection for DummyEnvironmentProvider {
-    async fn detect(&self, _image: Option<&str>, binary: &str, _args: &[&str], _scratch: &Path) -> Result<CommandOutput, String> {
+    async fn detect(
+        &self,
+        _image: Option<&str>,
+        _context: &flotilla_provider_runtime::execution_context::ObservationContext,
+        binary: &str,
+        _args: &[&str],
+        _scratch: &Path,
+    ) -> Result<CommandOutput, String> {
         Ok(absent(binary))
     }
 }

@@ -323,6 +323,7 @@ async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool
         env_bag: bag.clone(),
         runner: Arc::clone(&runner),
         host_environment,
+        accounts: flotilla_discovery::FactoryRegistry::default_all().account_variables(),
         max_vessels: None,
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
         vessel_agent: Err("the test's vessel agents run on the host runner".into()),
@@ -701,4 +702,37 @@ async fn a_supply_overriding_a_flotilla_variable_is_a_host_configuration_error()
         panic!("a colliding supply must not launch");
     };
     assert_eq!(error, "host configuration error for host-direct-b3: supply `locale` sets LANG, which flotilla sets");
+}
+
+// Supplies describe installations only: one that sets a variable a
+// registered family keeps its account state in is a host configuration
+// error, so the host's ambient Claude home can never reach a crew through it.
+#[tokio::test]
+async fn a_supply_setting_a_family_account_variable_is_a_host_configuration_error() {
+    let runtime_dir = flotilla_test_support::TestSocketDir::new();
+    let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
+    let bag = EnvironmentBag::new()
+        .with(EnvironmentAssertion::env_var("HOME", HOST_HOME))
+        .with(EnvironmentAssertion::env_var("XDG_RUNTIME_DIR", runtime_dir.path().display().to_string()))
+        .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
+        .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"));
+    let host_environment = HostEnvironment::new(vec![HostSupply {
+        name: "claude".into(),
+        path: vec!["~/.local/opt/claude/bin".into()],
+        env: vec![("CLAUDE_CONFIG_DIR".into(), "~/.claude".into())],
+    }])
+    .expect("well-formed supply");
+    let Err(error) = launch_agentless(
+        AgentlessHost { runner: host.clone(), bag, host_environment, checkout: CHECKOUT.to_string(), session_env: BTreeMap::new() },
+        "claude-code",
+        true,
+    )
+    .await
+    else {
+        panic!("a supply carrying account state must not launch");
+    };
+    assert_eq!(
+        error,
+        "host configuration error for host-direct-b3: supply `claude` sets CLAUDE_CONFIG_DIR, which carries `claude-code` account state"
+    );
 }

@@ -364,3 +364,7 @@ The low-level provider protocol retains deny-all as its default. The standalone
 Open default is the owner's explicit convenience choice for today's interactive
 launches; callers wanting restricted egress choose `--egress deny-all`, while
 low-level clients must opt in to Open.
+
+## Amendment (2026-10-26, prepared execution context; #3883)
+
+The vessel agent is the only command executor for observations and crews, remote or embedded. Preparation is layered: one preparer builds an environment's credential-free base layer (generation layers, declared supplies, the system tail, supply variables, locale and non-secret harness settings, every path absolute against the target's discovered home) and, for a crew, a bound layer of the account material its plans supply. Crews run with both; observations run with the base layer under an isolation overlay. Until each path has moved onto the agent, the transitional observation executor receives the prepared base layer as arguments.

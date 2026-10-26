@@ -164,6 +164,7 @@ impl super::EnvironmentDetection for HostDirectEnvironmentProvider {
     async fn detect(
         &self,
         image: Option<&str>,
+        context: &flotilla_provider_runtime::execution_context::ObservationContext,
         binary: &str,
         args: &[&str],
         scratch: &std::path::Path,
@@ -171,7 +172,7 @@ impl super::EnvironmentDetection for HostDirectEnvironmentProvider {
         if image.is_some() {
             return Err("host-direct detection does not accept an image".into());
         }
-        super::detection::host_detection(self.runner.clone(), binary, args, scratch).await
+        super::detection::host_detection(self.runner.clone(), context, binary, args, scratch).await
     }
 }
 

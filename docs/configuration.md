@@ -200,30 +200,40 @@ be absolute or under `~/`. A `hosts.toml` without `supplies` declares none.
 Static SSH environments in `daemon.toml` take the same `supplies` list. The
 format is shared with drydock's vessel agent (flotilla-org/drydock#55).
 
-`PATH` is composed in this order:
+Flotilla prepares one execution context per environment, in two layers. The
+**base layer** is credential-free: the composed `PATH`, the supply variables,
+the locale and the harness settings flotilla gives every session. Every `~` is
+resolved when it is prepared, against the home discovery found for the host;
+a host whose home is unknown is not ready. The **bound layer** is a crew's
+account material: credential wrapper directories, token-file variables and
+harness account homes. Crew sessions run with both layers; fulfilment probes
+run with the base layer only, under throwaway homes, so a probe sees the same
+tools a crew does and none of its accounts.
 
-1. flotilla's own directories: the vessel's generation layer (`flotilla` and
-   `cleat`) and the credential wrappers (the `gh` wrapper, for example);
-2. tools flotilla installs from its generation (harnesses and skills, #3655,
-   not yet shipped);
+A crew's `PATH` is composed in this order:
+
+1. the vessel's generation layer (`flotilla` and `cleat`);
+2. the credential wrappers of the bound layer (the `gh` wrapper, for example);
 3. declared supplies, in declaration order;
 4. the fixed system tail, `/usr/local/bin:/usr/bin:/bin`.
 
-The vessel's agent runs every command with this composition (without the
-session's credential wrappers).
+The vessel's agent and probes run with the same composition without the
+wrappers.
 
 Directories a login profile would have added are not on `PATH` unless
 declared, so everything a crew needs from the host (Git, the agent harness,
 `gh`, toolchains) must be in a supply or the system tail. Supply
 variables are set as declared. A supply cannot set `PATH`, `HOME`, a `FLOTILLA_`
 variable, or any variable flotilla sets for a session (such as `LANG`) or a
-vessel (such as `CLEAT_RUNTIME_DIR`); that is
-a configuration error reported for the host, and the host is not registered or
-the crew is not launched.
+vessel (such as `CLEAT_RUNTIME_DIR`). Supplies describe installations only, so
+a supply also cannot set a variable a harness or provider keeps its account
+state in (such as `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GH_CONFIG_DIR` or
+`GH_TOKEN`). Each of these is a configuration error reported for the host, and
+the host is not registered or the crew is not launched.
 
 cleat still starts each session command through `$SHELL -lc`, so the profile
 runs once inside a crew session before its command. The command sets the
-composed `PATH` and supply variables again as its first step, so the harness
+base layer and `PATH` again as its first step, so the harness
 sees the composed environment. Removing that profile run needs a cleat launch
 without a login shell (#3761).
 

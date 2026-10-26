@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
+use flotilla_provider_runtime::{execution_context::ObservationContext, ChannelLabel, CommandOutput, CommandRunner};
 
 pub(super) const OBSERVATION_SCRIPT: &str = r#"
 set -eu
@@ -15,7 +15,16 @@ set -eu
 # until every descendant is stopped and reaped by cleanup.
 set -m
 root=$1
+count=$2
+shift 2
+# The prepared base layer, as NAME=value words with every path absolute: no
+# word may depend on the HOME this script replaces.
+base=("${@:1:$count}")
+shift "$count"
+count=$1
 shift
+homes=("${@:1:$count}")
+shift "$count"
 umask 077
 mkdir -m 700 "$root"
 child=
@@ -27,12 +36,17 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 143' HUP INT TERM
-mkdir -p "$root/home" "$root/config" "$root/cache" "$root/state" "$root/runtime" "$root/claude" "$root/codex" "$root/tmp" "$root/cwd"
+mkdir -p "$root/home" "$root/config" "$root/cache" "$root/state" "$root/runtime" "$root/accounts" "$root/tmp" "$root/cwd"
+overlay=(HOME="$root/home" XDG_CONFIG_HOME="$root/config" XDG_CACHE_HOME="$root/cache" XDG_STATE_HOME="$root/state" XDG_RUNTIME_DIR="$root/runtime" TMPDIR="$root/tmp")
+for name in ${homes[@]+"${homes[@]}"}; do
+    mkdir "$root/accounts/$name"
+    overlay+=("$name=$root/accounts/$name")
+done
 cd "$root/cwd"
 (
     set +m
     status=0
-    env -i PATH="$PATH" HOME="$root/home" XDG_CONFIG_HOME="$root/config" XDG_CACHE_HOME="$root/cache" XDG_STATE_HOME="$root/state" XDG_RUNTIME_DIR="$root/runtime" CLAUDE_CONFIG_DIR="$root/claude" CODEX_HOME="$root/codex" TMPDIR="$root/tmp" CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 "$@" || status=$?
+    env -i ${base[@]+"${base[@]}"} "${overlay[@]}" "$@" || status=$?
     printf '%s' "$status" > "$root/status.tmp"
     mv "$root/status.tmp" "$root/status"
     while :; do sleep 1; done
@@ -51,22 +65,32 @@ status=$(cat "$root/status")
 exit "$status"
 "#;
 
-pub(super) fn observation_args(root: &str, binary: &str, args: &[&str]) -> Vec<String> {
-    ["-u", "BASH_ENV", "-u", "ENV", "bash", "--noprofile", "--norc", "-p", "-c", OBSERVATION_SCRIPT, "flotilla-observation", root, binary]
+/// The isolation shell's argv: the base layer and the families' account
+/// homes go in as words, never through the target's own environment.
+pub(super) fn observation_args(root: &str, context: &ObservationContext, binary: &str, args: &[&str]) -> Vec<String> {
+    let base = context.assignments();
+    let homes = context.account_homes();
+    ["-u", "BASH_ENV", "-u", "ENV", "bash", "--noprofile", "--norc", "-p", "-c", OBSERVATION_SCRIPT, "flotilla-observation", root]
         .into_iter()
-        .chain(args.iter().copied())
         .map(str::to_string)
+        .chain(std::iter::once(base.len().to_string()))
+        .chain(base)
+        .chain(std::iter::once(homes.len().to_string()))
+        .chain(homes)
+        .chain(std::iter::once(binary.to_string()))
+        .chain(args.iter().map(|arg| (*arg).to_string()))
         .collect()
 }
 
 pub(super) async fn host_detection(
     runner: Arc<dyn CommandRunner>,
+    context: &ObservationContext,
     binary: &str,
     args: &[&str],
     _scratch: &Path,
 ) -> Result<CommandOutput, String> {
     let root = format!("/tmp/flotilla-observation-{}", uuid::Uuid::new_v4());
-    let command = observation_args(&root, binary, args);
+    let command = observation_args(&root, context, binary, args);
     run_with_cleanup(runner, "env", command, PathBuf::from("/"), "rm", vec!["-rf".into(), "--".into(), root], true).await
 }
 
@@ -108,8 +132,14 @@ pub(super) async fn run_with_cleanup(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::environment::{command_provider, EnvironmentInput};
-    use flotilla_provider_runtime::{ssh_runner::SshCommandRunner, ProcessCommandRunner};
+    use crate::environment::{command_provider, drydock::GuestAgentRunner, EnvironmentInput};
+    use flotilla_provider_runtime::{
+        execution_context::{AccountState, AccountVariables, BaseLayer, BoundLayer, ExecutionPreparer},
+        host_environment::{HostEnvironment, HostSupply},
+        ssh_runner::SshCommandRunner,
+        ProcessCommandRunner,
+    };
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     // Process/SSH/container transport stand-in. It executes the real isolation
@@ -136,6 +166,11 @@ mod tests {
                 command = "sh".into();
                 argv = vec!["-c".into(), args.last().expect("remote command").to_string()];
             } else if cmd == "docker" {
+                if args[..2] == ["image", "inspect"] {
+                    // The image declares the search path its tools are on.
+                    let path = std::env::var("PATH").expect("test PATH");
+                    return Ok(CommandOutput { stdout: format!("[\"PATH={path}\"]"), stderr: String::new(), exit_code: Some(0) });
+                }
                 if args[0] == "rm" {
                     let _ = std::fs::remove_dir_all(&self.image_root);
                     return Ok(CommandOutput { stdout: String::new(), stderr: String::new(), exit_code: Some(0) });
@@ -169,6 +204,17 @@ mod tests {
         async fn exists(&self, _: &str, _: &[&str]) -> bool {
             false
         }
+    }
+
+    const CLAUDE: AccountState =
+        AccountState::new("claude").homes(&["CLAUDE_CONFIG_DIR"]).secrets(&["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]);
+    const CODEX: AccountState = AccountState::new("codex").homes(&["CODEX_HOME"]);
+
+    // The base layer of a target whose tools are on the test's own PATH.
+    fn test_observation() -> ObservationContext {
+        let accounts = AccountVariables::from_families(&[CLAUDE, CODEX]);
+        let base = BaseLayer::declared([("PATH".to_string(), std::env::var("PATH").expect("test PATH"))], &accounts).expect("base");
+        ObservationContext::new(base, &accounts)
     }
 
     async fn sentinel_case(target: usize, mode: &str) {
@@ -224,11 +270,18 @@ case "$1" in success|failure)
         ];
         let binary = harness.to_string_lossy().into_owned();
         let workdir = project.clone();
+        let context = test_observation();
         let task = tokio::spawn(async move {
             provider
                 .detection()
                 .expect("detection")
-                .detect((target == 2).then_some("crew:test"), &binary, &args.iter().map(String::as_str).collect::<Vec<_>>(), &workdir)
+                .detect(
+                    (target == 2).then_some("crew:test"),
+                    &context,
+                    &binary,
+                    &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                    &workdir,
+                )
                 .await
         });
         if mode == "cancel" {
@@ -276,5 +329,174 @@ case "$1" in success|failure)
         for mode in ["success", "failure", "cancel"] {
             let ((), (), ()) = tokio::join!(sentinel_case(0, mode), sentinel_case(1, mode), sentinel_case(2, mode));
         }
+    }
+
+    /// A host with a declared rust supply whose toolchain, like rustup's
+    /// proxies, is found only through `RUSTUP_HOME`.
+    struct RustHost {
+        dir: tempfile::TempDir,
+        home: PathBuf,
+    }
+
+    impl RustHost {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let home = dir.path().join("home");
+            std::fs::create_dir_all(home.join(".rustup/toolchains/stable")).expect("toolchain");
+            std::fs::write(home.join(".rustup/toolchains/stable/marker"), "").expect("marker");
+            std::fs::create_dir_all(home.join(".cargo/bin")).expect("cargo bin");
+            let rustc = home.join(".cargo/bin/rustc");
+            std::fs::write(
+                &rustc,
+                "#!/bin/sh\n[ -f \"${RUSTUP_HOME:-$HOME/.rustup}/toolchains/stable/marker\" ] || { echo 'error: no default toolchain' >&2; exit 1; }\nenv > \"$2\"\necho 'rustc 1.99.0'\n",
+            )
+            .expect("rustc");
+            std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).expect("executable");
+            Self { dir, home }
+        }
+
+        fn preparer(&self) -> ExecutionPreparer {
+            let host = HostEnvironment::new(vec![HostSupply {
+                name: "rust".into(),
+                path: vec!["~/.cargo/bin".into()],
+                env: vec![("CARGO_HOME".into(), "~/.cargo".into()), ("RUSTUP_HOME".into(), "~/.rustup".into())],
+            }])
+            .expect("supplies");
+            ExecutionPreparer::new(host, AccountVariables::from_families(&[CLAUDE, GH]), Some(&self.home.to_string_lossy()))
+                .with_generation(vec![self.dir.path().join("generation/bin").to_string_lossy().into_owned()])
+        }
+
+        fn bound(&self) -> BoundLayer {
+            let state = self.dir.path().join("state");
+            BoundLayer::new(
+                vec![state.join("credentials").to_string_lossy().into_owned()],
+                [
+                    ("GITHUB_TOKEN_FILE".to_string(), state.join("credentials/token").to_string_lossy().into_owned()),
+                    ("CLAUDE_CONFIG_DIR".to_string(), state.join("agent-homes/claude").to_string_lossy().into_owned()),
+                    ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "fake-delivered".to_string()),
+                ],
+            )
+            .expect("bound layer")
+        }
+
+        fn dump(&self, name: &str) -> (PathBuf, impl Fn() -> BTreeMap<String, String>) {
+            let path = self.dir.path().join(name);
+            let read = path.clone();
+            (path, move || {
+                std::fs::read_to_string(&read)
+                    .expect("environment dump")
+                    .lines()
+                    .filter_map(|line| line.split_once('='))
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect()
+            })
+        }
+    }
+
+    const GH: AccountState = AccountState::new("gh").homes(&["GH_CONFIG_DIR"]).secrets(&["GH_TOKEN"]);
+
+    /// How a runner launches a crew with its rendered environment.
+    enum CrewLaunch {
+        /// The command starts from nothing but the rendered environment.
+        Clean,
+        /// The vessel agent is configured with it, as a vessel's push is.
+        Agent(Arc<drydock_agent::Client>),
+    }
+
+    // The shared scenario every runner passes: a probe and a crew launch on
+    // one prepared environment. Both get the same base layer; the probe finds
+    // the supplied toolchain, sees no bound-layer variable and only throwaway
+    // family homes, and leaves no scratch root; the crew sees both layers.
+    async fn prepared_context_case(runner: Arc<dyn CommandRunner>, launch: CrewLaunch) {
+        let host = RustHost::new();
+        let preparer = host.preparer();
+        let observation = preparer.observation().expect("observation");
+        let crew = preparer.prepare(Some(host.bound())).expect("crew");
+        assert_eq!(observation.base().environment(), crew.base().environment(), "one base layer for probe and crew");
+
+        let provider = command_provider(EnvironmentInput::HostDirect, runner.clone());
+        let (probe_dump, probe_env) = host.dump("probe-environment");
+        let output = provider
+            .detection()
+            .expect("detection")
+            .detect(None, &observation, "rustc", &["--version", &probe_dump.to_string_lossy()], host.dir.path())
+            .await
+            .expect("probe");
+        assert!(output.success(), "probe misses the toolchain: {}", output.stderr);
+        assert_eq!(output.stdout.trim(), "rustc 1.99.0");
+        let probe = probe_env();
+        for (name, value) in observation.base().environment() {
+            assert_eq!(probe.get(&name), Some(&value), "probe {name}");
+        }
+        let root = Path::new(&probe["HOME"]).parent().expect("scratch root").to_path_buf();
+        for (name, _) in host.bound().variables() {
+            if name != "CLAUDE_CONFIG_DIR" {
+                assert!(!probe.contains_key(name), "probe inherits bound {name}");
+            }
+        }
+        for name in ["CLAUDE_CONFIG_DIR", "GH_CONFIG_DIR"] {
+            assert!(Path::new(&probe[name]).starts_with(&root), "probe {name} is not throwaway: {}", probe[name]);
+        }
+        for name in ["CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN", "ANTHROPIC_API_KEY"] {
+            assert!(!probe.contains_key(name), "probe has account variable {name}");
+        }
+        assert!(!root.exists(), "scratch root {} survives the probe", root.display());
+
+        let (crew_dump, crew_env) = host.dump("crew-environment");
+        let mut env = vec![("FLOTILLA_CREW_ROLE".to_string(), "coder".to_string())];
+        crew.render_crew(&mut env, observation.accounts()).expect("render");
+        let script = "rustc --version \"$0\"";
+        let dump = crew_dump.to_string_lossy().into_owned();
+        let result = match launch {
+            CrewLaunch::Clean => {
+                let mut argv = vec!["-i".to_string()];
+                argv.extend(env.iter().map(|(name, value)| format!("{name}={value}")));
+                argv.extend(["sh".into(), "-c".into(), script.into(), dump]);
+                runner.run("env", &argv.iter().map(String::as_str).collect::<Vec<_>>(), Path::new("/"), &ChannelLabel::Default).await
+            }
+            CrewLaunch::Agent(client) => {
+                let environment = env.iter().cloned().collect();
+                client.configure(drydock_agent::Configuration { environment, ..Default::default() }).await.expect("configure");
+                runner.run("sh", &["-c", script, &dump], Path::new("/"), &ChannelLabel::Default).await
+            }
+        };
+        assert_eq!(result.expect("crew launch").trim(), "rustc 1.99.0");
+        let launched = crew_env();
+        assert_eq!(launched.get("PATH"), Some(&crew.crew_path()));
+        for (name, value) in crew.base().variables().chain(host.bound().variables()) {
+            assert_eq!(launched.get(name).map(String::as_str), Some(value), "crew {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_runner_renders_the_prepared_context() {
+        prepared_context_case(Arc::new(ProcessCommandRunner), CrewLaunch::Clean).await;
+    }
+
+    #[tokio::test]
+    async fn loopback_ssh_runner_renders_the_prepared_context() {
+        // The SSH connection is the stand-in: its remote end is a local shell
+        // with a hostile login environment.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint =
+            Arc::new(Endpoint { operator: dir.path().into(), image_root: dir.path().join("unused"), roots: Mutex::new(Vec::new()) });
+        prepared_context_case(Arc::new(SshCommandRunner::new("fake-remote", false, endpoint)), CrewLaunch::Clean).await;
+    }
+
+    #[tokio::test]
+    async fn vessel_agent_renders_the_prepared_context() {
+        use drydock_transport::{Limits, Transport};
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (host, guest) = tokio::io::duplex(4096);
+        let (host, guest) = tokio::join!(
+            Transport::yamux(Box::new(host), true, Limits::default()),
+            Transport::yamux(Box::new(guest), false, Limits::default())
+        );
+        let agent = tokio::spawn(drydock_agent::Agent::new(guest.expect("guest"), "scenario".into(), directory.path().join("agent")).run());
+        let client = Arc::new(drydock_agent::Client::connect(host.expect("host"), "scenario").await.expect("client"));
+        let runner = Arc::new(GuestAgentRunner(client.clone()));
+        prepared_context_case(runner, CrewLaunch::Agent(client)).await;
+        agent.abort();
     }
 }
