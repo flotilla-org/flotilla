@@ -776,6 +776,9 @@ impl CredentialStore {
             if never_session_delivered(&spec.consumer) {
                 // Recorded as an intentional absence so it cannot be confused with a
                 // reconstruction gap.
+                if matches!(spec.consumer, CredentialConsumer::ClaudeOauth { .. }) {
+                    tracing::debug!(environment = environment_ref, credential = %name, "subscription credential reaches requesters only through bindings");
+                }
                 self.record_host_only_reference(environment_ref, name).await;
                 continue;
             }

@@ -1687,6 +1687,14 @@ impl ConvoyAdmission {
         let (mut changes, unbound) = crate::account_access::reconcile_convoy_bindings(&self.backend, namespace, &convoy, now).await?;
         if !unbound.is_empty() {
             let _admission_guard = self.lock().await;
+            // Re-read under the lock: the convoy may have ended since. A requester another path
+            // (admission, a rebind) bound meanwhile keeps that binding: `write_bindings` keeps an
+            // open one.
+            let convoy = match self.backend.clone().using::<ResourceConvoy>(namespace).get(&convoy.metadata.name).await {
+                Ok(convoy) if !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) => convoy,
+                Ok(_) | Err(ResourceError::NotFound { .. }) => return Ok(changes),
+                Err(error) => return Err(format!("read convoy `{}`: {error}", convoy.metadata.name)),
+            };
             changes.extend(
                 crate::account_access::bind_unbound(&self.backend, namespace, &convoy, unbound, &*self.account_random(), now).await?,
             );

@@ -981,3 +981,31 @@ async fn a_replica_binding_from_a_clock_ahead_keeps_its_fresh_copy() {
     assert_eq!(provision(&backend).await, Some(delivered));
     assert!(backend.using::<TerminalSession>(NAMESPACE).get("terminal-demo-work-coder").await.is_ok(), "the session keeps running");
 }
+
+// Review #3933: a withdrawal waits for a delivery of the same binding at the place to finish,
+// so it can never remove a copy a launch is still delivering.
+#[tokio::test]
+async fn a_withdrawal_waits_for_a_delivery_in_progress() {
+    let tokens = TempDir::new().expect("token dir");
+    let token = tokens.path().join("box-a");
+    fs::write(&token, "box-a-token").expect("token");
+    let (runtime, host, _runtime_dir) = bound_agentless_crew(&token).await;
+    let backend = runtime.daemon.resource_backend();
+    let bindings = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE);
+    let binding = bindings.get(BINDING).await.expect("binding");
+    let mut reopened = binding.spec.clone();
+    reopened.opened_at = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + chrono::Duration::seconds(1)));
+    bindings.update(&empty_meta(BINDING), &binding.metadata.resource_version, &reopened).await.expect("rebind");
+
+    let lock = runtime.state.account_delivery_lock(BINDING);
+    let delivering = lock.lock().await;
+    let state = Arc::clone(&runtime.state);
+    let withdrawal = tokio::spawn(async move { reconcile_place_provisions(&state, NAMESPACE).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!withdrawal.is_finished(), "the withdrawal waits for the delivery");
+    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
+
+    drop(delivering);
+    withdrawal.await.expect("join").expect("place pass");
+    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), None);
+}

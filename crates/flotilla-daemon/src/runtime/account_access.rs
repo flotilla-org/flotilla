@@ -423,25 +423,28 @@ async fn push_generation(
 /// and the live convoys here still waiting for a binding.
 struct CredentialConvoysWatch<K: flotilla_resources::Resource> {
     credentials: fn(&ResourceObject<K>) -> Vec<String>,
+    /// The credentials a deletion known only by name names, when the name alone says.
+    deleted: fn(&str) -> Option<Vec<String>>,
 }
 
 impl<K: flotilla_resources::Resource> Clone for CredentialConvoysWatch<K> {
     fn clone(&self) -> Self {
-        Self { credentials: self.credentials }
+        Self { credentials: self.credentials, deleted: self.deleted }
     }
 }
 
 impl<K: flotilla_resources::Resource> CredentialConvoysWatch<K> {
+    /// `credentials: None` (a grant deleted by name) reaches every convoy with a binding here.
     async fn enqueue(
         backend: &ResourceBackend,
         namespace: &str,
         sender: &WorkQueueSender,
-        credentials: Vec<String>,
+        credentials: Option<Vec<String>>,
     ) -> Result<(), ResourceError> {
         let bindings = backend.clone().using::<AccountBinding>(namespace);
         let mut convoys = BTreeSet::new();
-        for credential in credentials {
-            let selector = BTreeMap::from([(ACCOUNT_CREDENTIAL_LABEL.to_string(), credential)]);
+        for credential in credentials.iter().flatten() {
+            let selector = BTreeMap::from([(ACCOUNT_CREDENTIAL_LABEL.to_string(), credential.clone())]);
             for binding in bindings.list_matching_labels(&selector).await?.items {
                 convoys.extend(flotilla_resources::label_value(&binding.metadata.labels, CONVOY_LABEL).cloned());
             }
@@ -453,6 +456,9 @@ impl<K: flotilla_resources::Resource> CredentialConvoysWatch<K> {
             .into_iter()
             .filter_map(|binding| flotilla_resources::label_value(&binding.metadata.labels, CONVOY_LABEL).cloned())
             .collect::<BTreeSet<_>>();
+        if credentials.is_none() {
+            convoys.extend(bound.iter().cloned());
+        }
         for convoy in backend.query_declared::<Convoy>(namespace, &flotilla_store::live_convoys_query()).await?.items {
             if matches!(convoy.provenance, ResourceProvenance::Local) && !bound.contains(&convoy.object.metadata.name) {
                 convoys.insert(convoy.object.metadata.name);
@@ -481,11 +487,13 @@ impl<K: flotilla_resources::Resource> SecondaryWatch for CredentialConvoysWatch<
         Box::pin(async move {
             let mut watch = backend.including_replicas::<K>(&namespace).watch().await?;
             while let Some(event) = watch.next().await {
-                let source = match event? {
-                    ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => source,
-                    ReadWatchEvent::DeletedByName { .. } => continue,
+                let credentials = match event? {
+                    ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => {
+                        Some((self.credentials)(&source.object))
+                    }
+                    ReadWatchEvent::DeletedByName { tombstone, .. } => (self.deleted)(&tombstone.name),
                 };
-                Self::enqueue(&backend, &namespace, &sender, (self.credentials)(&source.object)).await?;
+                Self::enqueue(&backend, &namespace, &sender, credentials).await?;
             }
             Ok(())
         })
@@ -513,11 +521,13 @@ impl SecondaryWatch for BindingProvisionsWatch {
             let provisions = backend.clone().using::<AccountProvision>(&namespace);
             let mut watch = backend.including_replicas::<AccountBinding>(&namespace).watch().await?;
             while let Some(event) = watch.next().await {
-                let source = match event? {
-                    ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => source,
-                    ReadWatchEvent::DeletedByName { .. } => continue,
+                let binding = match event? {
+                    ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => {
+                        source.object.metadata.name
+                    }
+                    ReadWatchEvent::DeletedByName { tombstone, .. } => tombstone.name,
                 };
-                let selector = BTreeMap::from([(ACCOUNT_BINDING_LABEL.to_string(), source.object.metadata.name.clone())]);
+                let selector = BTreeMap::from([(ACCOUNT_BINDING_LABEL.to_string(), binding)]);
                 for provision in provisions.list_matching_labels(&selector).await?.items {
                     sender
                         .send(provision.metadata.name)
@@ -543,8 +553,14 @@ pub(super) fn binding_controller(
                 resolver: daemon.resource_backend().including_replicas(&namespace),
                 _marker: PhantomData,
             }),
-            Box::new(CredentialConvoysWatch::<CredentialGrant> { credentials: |grant| grant.spec.credentials.iter().cloned().collect() }),
-            Box::new(CredentialConvoysWatch::<CredentialSpec> { credentials: |spec| vec![spec.metadata.name.clone()] }),
+            Box::new(CredentialConvoysWatch::<CredentialGrant> {
+                credentials: |grant| grant.spec.credentials.iter().cloned().collect(),
+                deleted: |_| None,
+            }),
+            Box::new(CredentialConvoysWatch::<CredentialSpec> {
+                credentials: |spec| vec![spec.metadata.name.clone()],
+                deleted: |name| Some(vec![name.to_string()]),
+            }),
         ],
         AccountBindingReconciler { daemon, namespace },
     )

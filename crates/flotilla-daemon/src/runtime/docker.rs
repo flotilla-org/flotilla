@@ -532,7 +532,11 @@ impl DockerControllerRuntime {
                     environment.push((key.into(), selection.clone()));
                 }
             }
-            // #3907: requester-bound crews' skills are staged in their requesters' homes.
+            // #3907: requester-bound crews' skills are staged in their requesters' homes, named by
+            // the vessel's convoy. Without its Environment record that convoy is unknown.
+            if convoy.is_none() {
+                tracing::warn!(environment = name, "no convoy for this vessel; requester-bound skills cannot be staged in requester homes");
+            }
             environment
                 .extend(convoy.iter().map(|convoy| (flotilla_resources::account_access::REQUESTER_CONVOY_ENV.to_string(), convoy.clone())));
             let mut source_token_files = BTreeMap::new();

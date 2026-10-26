@@ -11,7 +11,6 @@ use flotilla_agent::{
     account_access::{AccountProvisioners, EnvironmentKind},
     adapter::CapabilityTable,
 };
-
 use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     account_access::{
