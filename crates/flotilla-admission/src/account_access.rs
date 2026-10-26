@@ -164,7 +164,11 @@ pub async fn current_alternatives(
         )
         .await
         .map_err(|error| format!("list credential grants: {error}"))?
-        .items;
+        .items
+        .into_iter()
+        // A withdrawn grant (a definition's deletion tombstone) authorizes nothing.
+        .filter(|grant| grant.object.metadata.deletion_timestamp.is_none())
+        .collect::<Vec<_>>();
     let specs = backend
         .query_declared::<CredentialSpec>(
             namespace,
@@ -174,6 +178,7 @@ pub async fn current_alternatives(
         .map_err(|error| format!("list credential specs: {error}"))?
         .items
         .into_iter()
+        .filter(|source| source.object.metadata.deletion_timestamp.is_none())
         .map(|source| (source.object.metadata.name, source.object.spec))
         .collect::<BTreeMap<_, _>>();
     let all_repositories = repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<BTreeSet<_>>();
@@ -452,10 +457,22 @@ pub enum BindingChange {
     Closed(String),
 }
 
-/// A convoy's admitted workflow, as alternatives are resolved against it.
-fn admitted_workflow(convoy: &ResourceObject<Convoy>) -> Option<WorkflowTemplateSpec> {
-    let snapshot = convoy.status.as_ref()?.workflow_snapshot.as_ref()?;
-    Some(WorkflowTemplateSpec::builder().vessels(snapshot.vessels.clone()).build())
+/// A convoy's admitted workflow, as alternatives are resolved against it: the snapshot in its
+/// status, or before the convoy reconciler copies it there, the one admission pinned.
+async fn admitted_workflow(
+    backend: &ResourceBackend,
+    namespace: &str,
+    convoy: &ResourceObject<Convoy>,
+) -> Result<Option<WorkflowTemplateSpec>, String> {
+    if let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) {
+        return Ok(Some(WorkflowTemplateSpec::builder().vessels(snapshot.vessels.clone()).build()));
+    }
+    let Some(pinned) = convoy.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION) else { return Ok(None) };
+    match backend.definitions::<flotilla_resources::WorkflowTemplate>(namespace).get(pinned).await {
+        Ok(snapshot) => Ok(Some(snapshot.spec)),
+        Err(ResourceError::NotFound { .. }) => Ok(None),
+        Err(error) => Err(format!("read admitted workflow `{pinned}`: {error}")),
+    }
 }
 
 /// Whether any place still holds a delivered copy of a binding's credential.
@@ -503,7 +520,7 @@ pub async fn reconcile_home_bindings(
             changes.push((name, BindingChange::Closed(reason)));
             continue;
         };
-        let Some(workflow) = admitted_workflow(convoy) else { continue };
+        let Some(workflow) = admitted_workflow(backend, namespace, convoy).await? else { continue };
         let alternatives =
             current_alternatives(backend, namespace, convoy.spec.project_ref.as_deref(), &convoy.spec.repositories, &workflow).await?;
         let candidate = alternatives
@@ -553,7 +570,7 @@ pub async fn reconcile_home_bindings(
     }
     // Convoys admitted before bindings existed.
     for convoy in convoys.iter().filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())) {
-        let Some(workflow) = admitted_workflow(convoy) else { continue };
+        let Some(workflow) = admitted_workflow(backend, namespace, convoy).await? else { continue };
         let project = convoy.spec.project_ref.as_deref();
         let alternatives = current_alternatives(backend, namespace, project, &convoy.spec.repositories, &workflow).await?;
         let mut pending = Vec::new();
@@ -613,7 +630,9 @@ pub async fn rebind(
 ) -> Result<AccountBindingSpec, String> {
     let convoy =
         backend.clone().using::<Convoy>(namespace).get(convoy_name).await.map_err(|error| format!("convoy `{convoy_name}`: {error}"))?;
-    let workflow = admitted_workflow(&convoy).ok_or_else(|| format!("convoy `{convoy_name}` has no admitted workflow yet"))?;
+    let workflow = admitted_workflow(backend, namespace, &convoy)
+        .await?
+        .ok_or_else(|| format!("convoy `{convoy_name}` has no admitted workflow yet"))?;
     let project = convoy.spec.project_ref.as_deref();
     let alternatives = current_alternatives(backend, namespace, project, &convoy.spec.repositories, &workflow).await?;
     let alternative = alternatives

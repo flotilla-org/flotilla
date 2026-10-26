@@ -10582,3 +10582,366 @@ async fn convoy_resume_milliseconds_after_complete_still_lands() {
     let settled = convoys.get("claimed-resume").await.unwrap().status.unwrap();
     assert_eq!(settled.phase, ConvoyPhase::Landed, "{settled:?}");
 }
+
+// #3907: the Claude subscription requirement resolves through grants into stored,
+// per-requester bindings. These scenarios run through the real admission path.
+mod account_bindings {
+    use super::*;
+    use flotilla_admission::account_access::BindingChange;
+    use flotilla_resources::account_access::{requester_parts, BindingState, Selection};
+    use flotilla_resources::{AccountBinding, RandomSource, SeededRandom};
+
+    const BOX_GRANT: &str = "claude-box-accounts";
+
+    /// A project with a host-direct Claude placement holding every named credential, the
+    /// credentials declared as subscription logins, and the named grants on project `flotilla`.
+    async fn claude_world(daemon: &InProcessDaemon, credentials: &[(&str, &str)], grants: &[(&str, &[&str])]) {
+        let backend = daemon.resource_backend();
+        create_test_convoy_project(&backend, None).await;
+        create_test_host_direct_policy(&backend, "host-direct-accounts", "accounts-host", 0, BTreeSet::from(["claude-code".to_string()]))
+            .await;
+        for (name, account) in credentials {
+            declare(&backend, name, account, 1).await;
+        }
+        for (grant, names) in grants {
+            authorize(&backend, grant, names).await;
+        }
+        let hosts = backend.clone().using::<ResourceHost>("flotilla");
+        let host = hosts.get("accounts-host").await.expect("host");
+        let mut status = host.status.expect("host status");
+        status
+            .fulfilment_facts
+            .get_mut("host-direct-accounts")
+            .expect("kind facts")
+            .harnesses
+            .insert("claude-code".to_string(), HarnessFacts { version: "2.1.300".to_string(), models: BTreeMap::new() });
+        status.capabilities.insert(
+            HELD_CREDENTIALS_CAPABILITY.to_string(),
+            serde_json::json!(credentials.iter().map(|(name, _)| *name).collect::<Vec<_>>()),
+        );
+        hosts.update_status("accounts-host", &host.metadata.resource_version, &status).await.expect("held credentials");
+    }
+
+    async fn declare(backend: &ResourceBackend, name: &str, account: &str, epoch: u32) {
+        let specs = backend.clone().using::<CredentialSpec>("flotilla");
+        let spec = CredentialSpecSpec {
+            consumer: CredentialConsumer::ClaudeOauth { account_email: account.to_string() },
+            source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+            lifecycle: CredentialLifecycle::Static,
+            placement: CredentialPlacementRequirements::default(),
+            authorization_epoch: epoch,
+        };
+        match specs.get(name).await {
+            Ok(existing) => specs
+                .update(&InputMeta::builder().name(name.to_string()).build(), &existing.metadata.resource_version, &spec)
+                .await
+                .map(|_| ()),
+            Err(_) => specs.create(&InputMeta::builder().name(name.to_string()).build(), &spec).await.map(|_| ()),
+        }
+        .expect("declare credential");
+    }
+
+    async fn authorize(backend: &ResourceBackend, grant: &str, names: &[&str]) {
+        backend
+            .clone()
+            .definitions::<CredentialGrant>("flotilla")
+            .create(
+                &InputMeta::builder().name(grant.to_string()).build(),
+                &CredentialGrantSpec::builder()
+                    .selector(CredentialGrantSelector::builder().projects(BTreeSet::from(["flotilla".to_string()])).build())
+                    .credentials(names.iter().map(|name| name.to_string()).collect())
+                    .build(),
+            )
+            .await
+            .expect("grant");
+    }
+
+    async fn start_claude(daemon: &InProcessDaemon, name: &str, pins: &[(&str, &str)]) -> CommandValue {
+        start_capability_convoy(daemon, name, |intent| {
+            intent.agent_overrides.push(flotilla_protocol::AgentOverride {
+                capability: "code".to_string(),
+                adapter: "claude-code".to_string(),
+                model: None,
+            });
+            intent.account_pins = pins.iter().map(|(role, credential)| (role.to_string(), credential.to_string())).collect();
+        })
+        .await
+    }
+
+    /// The bindings of a convoy's requesters, open first.
+    async fn bindings_of(backend: &ResourceBackend, convoy: &str) -> Vec<flotilla_resources::ResourceObject<AccountBinding>> {
+        let mut bindings = backend
+            .clone()
+            .using::<AccountBinding>("flotilla")
+            .list()
+            .await
+            .expect("bindings")
+            .items
+            .into_iter()
+            .filter(|binding| requester_parts(&binding.spec.requester).is_some_and(|(owner, _)| owner == convoy))
+            .collect::<Vec<_>>();
+        bindings.sort_by_key(|binding| !binding.spec.state.value.is_open());
+        bindings
+    }
+
+    async fn open_binding(backend: &ResourceBackend, role: &str) -> flotilla_resources::ResourceObject<AccountBinding> {
+        let convoy = admitted_convoy(backend, role).await;
+        let bindings = bindings_of(backend, &convoy.metadata.name).await;
+        let [binding, ..] = bindings.as_slice() else { panic!("no binding for {role}") };
+        assert!(binding.spec.state.value.is_open());
+        binding.clone()
+    }
+
+    async fn explain(daemon: &InProcessDaemon, name: &str) -> flotilla_protocol::ConvoyExplanation {
+        let result = daemon
+            .execute_query(
+                Command::builder()
+                    .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: name.to_string() })
+                    .build(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("explain query");
+        let CommandValue::ConvoyExplanation(explanation) = result else { panic!("explanation: {result:?}") };
+        *explanation
+    }
+
+    /// A seed whose first draw over two candidates is `index`.
+    fn seed_drawing(index: u32) -> u64 {
+        (0..).find(|seed| SeededRandom::new(*seed).below(2) == index).expect("a seed")
+    }
+
+    // Acceptance: two box accounts in one grant. A seeded draw picks one, records the
+    // candidates and the draw, and the selected account shows in explain. Mutation check:
+    // seeds drawing each index bind each account, so a fixed "first candidate" choice fails.
+    #[tokio::test]
+    async fn a_seeded_draw_over_two_box_accounts_binds_one_and_records_the_draw() {
+        let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+        let backend = daemon.resource_backend();
+        claude_world(
+            &daemon,
+            &[("claude-box-a", "a@example.com"), ("claude-box-b", "b@example.com")],
+            &[(BOX_GRANT, &["claude-box-a", "claude-box-b"])],
+        )
+        .await;
+        for (name, index, credential, account) in
+            [("draw-first", 0, "claude-box-a", "a@example.com"), ("draw-second", 1, "claude-box-b", "b@example.com")]
+        {
+            daemon.set_account_random(Arc::new(SeededRandom::new(seed_drawing(index))));
+            let result = start_claude(&daemon, name, &[]).await;
+            assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+            let binding = open_binding(&backend, name).await;
+            assert_eq!(binding.spec.credential.0, credential);
+            assert_eq!(binding.spec.account.as_deref(), Some(account));
+            assert_eq!(binding.spec.selection, Selection::Draw { index });
+            assert_eq!(binding.spec.candidates.iter().map(|name| name.0.as_str()).collect::<Vec<_>>(), ["claude-box-a", "claude-box-b"]);
+            assert!(binding.spec.exclusions.is_empty());
+            assert_eq!(binding.spec.grants.keys().map(|grant| grant.0.as_str()).collect::<Vec<_>>(), [BOX_GRANT]);
+            assert_eq!(binding.spec.item, "claude-code");
+            assert_eq!(binding.spec.requirement.0, "claude:subscription");
+            let explained = explain(&daemon, name).await;
+            let [shown] = explained.account_bindings.as_slice() else { panic!("{:?}", explained.account_bindings) };
+            assert_eq!((shown.role.as_str(), shown.credential.as_str(), shown.account.as_deref()), ("coder", credential, Some(account)));
+            assert_eq!(shown.selection, format!("drawn: {} of 2 usable", index + 1));
+        }
+    }
+
+    // Acceptance: an unauthorized pin refuses admission with the reason and writes nothing;
+    // an authorized pin wins over the draw.
+    #[tokio::test]
+    async fn an_unauthorized_pin_refuses_and_an_authorized_pin_wins() {
+        let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+        let backend = daemon.resource_backend();
+        claude_world(
+            &daemon,
+            &[("claude-box-a", "a@example.com"), ("claude-box-b", "b@example.com"), ("claude-ungranted", "u@example.com")],
+            &[(BOX_GRANT, &["claude-box-a", "claude-box-b"])],
+        )
+        .await;
+        let refused = start_claude(&daemon, "pin-refused", &[("coder", "claude-ungranted")]).await;
+        assert_eq!(
+            refused,
+            CommandValue::Error {
+                message:
+                    "account pin `claude-ungranted` for role `coder` is refused: no CredentialGrant authorizes it for `claude:subscription`"
+                        .to_string()
+            }
+        );
+        assert!(backend.clone().using::<AccountBinding>("flotilla").list().await.expect("bindings").items.is_empty());
+
+        daemon.set_account_random(Arc::new(SeededRandom::new(seed_drawing(0))));
+        let pinned = start_claude(&daemon, "pin-wins", &[("coder", "claude-box-b")]).await;
+        assert!(matches!(pinned, CommandValue::ConvoyStarted { .. }), "{pinned:?}");
+        let binding = open_binding(&backend, "pin-wins").await;
+        assert_eq!(binding.spec.credential.0, "claude-box-b", "the pin wins over a draw that would pick box-a");
+        assert_eq!(binding.spec.selection, Selection::Pin { pinned_by: "convoy start --account".to_string() });
+    }
+
+    // Acceptance: withdrawing the only authorizing grant revokes the binding with the reason;
+    // with a second authorizing grant, only the recorded grants change.
+    #[tokio::test]
+    async fn grant_withdrawal_revokes_unless_another_grant_authorizes() {
+        let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+        let backend = daemon.resource_backend();
+        claude_world(
+            &daemon,
+            &[("claude-max", "max@example.com")],
+            &[("claude-max-contained", &["claude-max"]), (BOX_GRANT, &["claude-max"])],
+        )
+        .await;
+        assert!(matches!(start_claude(&daemon, "withdrawn", &[]).await, CommandValue::ConvoyStarted { .. }));
+        let binding = open_binding(&backend, "withdrawn").await;
+        assert_eq!(binding.spec.grants.len(), 2);
+
+        backend.clone().using::<CredentialGrant>("flotilla").delete(BOX_GRANT).await.expect("withdraw one grant");
+        let changes = daemon.reconcile_account_bindings("flotilla").await.expect("home pass");
+        assert_eq!(changes, vec![(binding.metadata.name.clone(), BindingChange::GrantsUpdated)]);
+        let kept = open_binding(&backend, "withdrawn").await;
+        assert_eq!(kept.spec.credential, binding.spec.credential);
+        assert_eq!(kept.spec.grants.keys().map(|grant| grant.0.as_str()).collect::<Vec<_>>(), ["claude-max-contained"]);
+
+        backend.clone().using::<CredentialGrant>("flotilla").delete("claude-max-contained").await.expect("withdraw the last grant");
+        let changes = daemon.reconcile_account_bindings("flotilla").await.expect("home pass");
+        assert_eq!(changes, vec![(binding.metadata.name.clone(), BindingChange::Revoked("binding revoked: no authorizing grant".into()))]);
+        let revoked = backend.clone().using::<AccountBinding>("flotilla").get(&binding.metadata.name).await.expect("binding kept");
+        assert!(matches!(
+            &revoked.spec.state.value,
+            BindingState::Revoked { reason, delivered_until: None } if reason == "binding revoked: no authorizing grant"
+        ));
+        let explained = explain(&daemon, "withdrawn").await;
+        assert_eq!(explained.account_bindings[0].state, "revoked");
+        assert_eq!(explained.account_bindings[0].reason.as_deref(), Some("binding revoked: no authorizing grant"));
+    }
+
+    // Acceptance (sticky): repeated home passes and controller restarts move nothing; a
+    // replacement login for the same account (a new epoch) keeps the binding and records the
+    // epoch; a login to a different account is refused as a replacement.
+    #[tokio::test]
+    async fn a_new_epoch_keeps_the_binding_and_a_different_account_is_refused() {
+        let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+        let backend = daemon.resource_backend();
+        claude_world(&daemon, &[("claude-max", "max@example.com")], &[("claude-max-contained", &["claude-max"])]).await;
+        assert!(matches!(start_claude(&daemon, "sticky", &[]).await, CommandValue::ConvoyStarted { .. }));
+        let binding = open_binding(&backend, "sticky").await;
+        for _ in 0..3 {
+            assert_eq!(daemon.reconcile_account_bindings("flotilla").await.expect("home pass"), Vec::new());
+        }
+        assert_eq!(open_binding(&backend, "sticky").await.spec, binding.spec);
+
+        declare(&backend, "claude-max", "max@example.com", 2).await;
+        let changes = daemon.reconcile_account_bindings("flotilla").await.expect("home pass");
+        assert_eq!(changes, vec![(binding.metadata.name.clone(), BindingChange::EpochAppended("2".into()))]);
+        let renewed = open_binding(&backend, "sticky").await;
+        assert_eq!(renewed.spec.credential, binding.spec.credential);
+        assert_eq!(renewed.spec.epochs.iter().map(|row| row.record.epoch.as_str()).collect::<Vec<_>>(), ["1", "2"]);
+
+        declare(&backend, "claude-max", "someone-else@example.com", 3).await;
+        let changes = daemon.reconcile_account_bindings("flotilla").await.expect("home pass");
+        let [(_, BindingChange::Revoked(reason))] = changes.as_slice() else { panic!("{changes:?}") };
+        assert_eq!(
+            reason,
+            "replacement refused: credential `claude-max` now declares account `someone-else@example.com`, not the bound `max@example.com`"
+        );
+    }
+
+    // Acceptance: rebind closes the old binding (kept for attribution) and opens a new one by
+    // pin; an unauthorized rebind pin is refused and moves nothing.
+    #[tokio::test]
+    async fn rebind_closes_the_old_binding_and_opens_a_new_one() {
+        let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+        let backend = daemon.resource_backend();
+        claude_world(
+            &daemon,
+            &[("claude-box-a", "a@example.com"), ("claude-box-b", "b@example.com")],
+            &[(BOX_GRANT, &["claude-box-a", "claude-box-b"])],
+        )
+        .await;
+        let result = start_claude(&daemon, "rebound", &[("coder", "claude-box-a")]).await;
+        assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+        let convoy = admitted_convoy(&backend, "rebound").await.metadata.name;
+
+        let refused = daemon.rebind_account("flotilla", &convoy, "coder", Some("claude-elsewhere")).await.expect_err("unauthorized");
+        assert_eq!(
+            refused,
+            "account pin `claude-elsewhere` for role `coder` is refused: no CredentialGrant authorizes it for `claude:subscription`"
+        );
+        assert_eq!(bindings_of(&backend, &convoy).await.len(), 1);
+
+        let opened = daemon.rebind_account("flotilla", &convoy, "coder", Some("claude-box-b")).await.expect("rebind");
+        assert_eq!(opened.credential.0, "claude-box-b");
+        assert_eq!(opened.selection, Selection::Pin { pinned_by: "convoy rebind --account".to_string() });
+        let bindings = bindings_of(&backend, &convoy).await;
+        let [open, retired] = bindings.as_slice() else { panic!("{bindings:?}") };
+        assert_eq!(open.spec.credential.0, "claude-box-b");
+        assert_eq!(retired.spec.credential.0, "claude-box-a");
+        assert!(matches!(&retired.spec.state.value, BindingState::Closed { reason, .. } if reason == "rebind"));
+        assert!(retired.metadata.name.starts_with(&format!("{}.closed-", open.metadata.name)));
+        let explained = explain(&daemon, "rebound").await;
+        assert_eq!(explained.account_bindings.iter().map(|binding| binding.state.as_str()).collect::<Vec<_>>(), ["open", "closed"]);
+    }
+
+    // Acceptance: a candidate kind with no plan for the Claude subscription drops out of
+    // placement, and explain shows the reason.
+    #[tokio::test]
+    async fn a_kind_without_a_plan_is_refused_with_the_reason_in_explain() {
+        let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+        let backend = daemon.resource_backend();
+        claude_world(&daemon, &[("claude-max", "max@example.com")], &[("claude-max-contained", &["claude-max"])]).await;
+        backend
+            .clone()
+            .using::<FulfilmentKind>("flotilla")
+            .create(
+                &InputMeta::builder().name("cloud-sandbox".to_string()).build(),
+                &FulfilmentKindSpec {
+                    host_ref: "accounts-host".to_string(),
+                    pool: "passthrough".to_string(),
+                    cost_class: Default::default(),
+                    grants: BTreeSet::new(),
+                    realisation: flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { image: "crew".to_string() },
+                },
+            )
+            .await
+            .expect("cloud kind");
+        let result = start_claude(&daemon, "planned", &[]).await;
+        assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+        let explained = explain(&daemon, "planned").await;
+        let placement = &explained.vessel_placements["work"];
+        assert_eq!(placement.policy_name, "host-direct-accounts");
+        let refusal = placement.refused_candidates.iter().find(|refusal| refusal.policy_name == "cloud-sandbox").expect("cloud refused");
+        assert_eq!(
+            refusal.reason,
+            "role `coder` needs `claude:subscription`: claude-direct has no plan for cloud-sandbox environments: no agent writes the requester's home there"
+        );
+    }
+
+    // Migration (#3907): a convoy admitted before bindings existed is bound by the home pass,
+    // so its next launch has an explicit home rather than a refusal.
+    #[tokio::test]
+    async fn a_convoy_without_a_binding_is_bound_by_the_home_pass() {
+        let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+        let backend = daemon.resource_backend();
+        claude_world(&daemon, &[("claude-max", "max@example.com")], &[("claude-max-contained", &["claude-max"])]).await;
+        assert!(matches!(start_claude(&daemon, "legacy", &[]).await, CommandValue::ConvoyStarted { .. }));
+        let binding = open_binding(&backend, "legacy").await;
+        backend.clone().using::<AccountBinding>("flotilla").delete(&binding.metadata.name).await.expect("as before bindings");
+
+        let changes = daemon.reconcile_account_bindings("flotilla").await.expect("home pass");
+        assert_eq!(changes, vec![(binding.metadata.name.clone(), BindingChange::Opened)]);
+        assert_eq!(open_binding(&backend, "legacy").await.spec.credential.0, "claude-max");
+        assert_eq!(daemon.reconcile_account_bindings("flotilla").await.expect("home pass"), Vec::new());
+    }
+
+    // Acceptance: the existing claude-max-contained grant keeps working: its single
+    // credential is the only candidate, and the crew binds to it.
+    #[tokio::test]
+    async fn the_claude_max_contained_grant_keeps_working() {
+        let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+        let backend = daemon.resource_backend();
+        claude_world(&daemon, &[("claude-max", "max@example.com")], &[("claude-max-contained", &["claude-max"])]).await;
+        let result = start_claude(&daemon, "contained", &[]).await;
+        assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+        let binding = open_binding(&backend, "contained").await;
+        assert_eq!(binding.spec.credential.0, "claude-max");
+        assert_eq!(binding.spec.selection, Selection::Draw { index: 0 });
+    }
+}
