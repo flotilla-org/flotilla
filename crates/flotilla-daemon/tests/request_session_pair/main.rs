@@ -4999,9 +4999,15 @@ fn messages_are_homed_at_the_receiver_and_replies_route_by_subject(tc: hegel::Te
     // Generate short cancellation sequences: supersede, withdraw, expire;
     // records may arrive after the drop, and the observer may restart between steps.
     let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
-    let operations = (0..steps)
-        .map(|_| (tc.draw(gs::integers::<usize>().min_value(0).max_value(2)), tc.draw(gs::booleans()), tc.draw(gs::booleans())))
-        .collect::<Vec<_>>();
+    use message_homes::{DropAction, DropStep};
+    // Pin drop-before-record with a cold observer in this same shared scenario.
+    let mut operations = vec![DropStep { action: DropAction::Withdraw, late_record: true, restart: true }];
+    operations.extend((0..steps).map(|_| DropStep {
+        action: [DropAction::Supersede, DropAction::Withdraw, DropAction::Expire]
+            [tc.draw(gs::integers::<usize>().min_value(0).max_value(2))],
+        late_record: tc.draw(gs::booleans()),
+        restart: tc.draw(gs::booleans()),
+    }));
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

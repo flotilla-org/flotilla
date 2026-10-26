@@ -162,7 +162,7 @@ impl AwaitingReplies {
     }
 
     /// Whether the sender still awaits this message, without loading ended history.
-    pub(super) fn is_open(&self, message: &MessageRef) -> bool {
+    pub(super) fn has_open_record(&self, message: &MessageRef) -> bool {
         locked(&self.home).get(&record_name(message)).is_some()
     }
 

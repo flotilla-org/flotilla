@@ -129,10 +129,25 @@ fn convoy_ref(name: &str) -> MessageReference {
     }
 }
 
+// The tracing proof includes this fixture with no cancellation steps.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(super) enum DropAction {
+    Supersede,
+    Withdraw,
+    Expire,
+}
+
+pub(super) struct DropStep {
+    pub action: DropAction,
+    pub late_record: bool,
+    pub restart: bool,
+}
+
 // Behaviour (#3317): the receiver's home holds the message; the other home
 // reads it from its replica, or at its home on a miss, marked remote with its
 // age; a reply to a fleet role is routed by subject.
-pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject(operations: &[(usize, bool, bool)]) {
+pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject(operations: &[DropStep]) {
     let topology = flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful(
         super::empty_daemon_named("home-a").await,
         super::empty_daemon_named("home-b").await,
@@ -267,10 +282,10 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     use flotilla_core::primitives::sweep::OpenMessages;
     use flotilla_state_machines::machines::{awaiting_reply::AwaitingReplyLabel, message::MessageRef};
     let mut observer = OpenMessages::default();
-    for (step, &(action, late_record, restart)) in operations.iter().enumerate() {
+    for (step, DropStep { action, late_record, restart }) in operations.iter().enumerate() {
         let name = flotilla_resources::message_record_name(&intent.receiver, &intent.sender, &format!("cancel-{step}"));
         let mut cancel = intent.clone();
-        cancel.deadline = (action == 2).then(|| Utc::now() - chrono::Duration::seconds(1));
+        cancel.deadline = matches!(action, DropAction::Expire).then(|| Utc::now() - chrono::Duration::seconds(1));
         // Exercise receiver admission through the router, then resume the sender's
         // record write separately to model a delayed or retried send continuation.
         let mut events = a.subscribe();
@@ -300,26 +315,26 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         let (_, message) = homed(&engine_b, &name).expect("receiver admitted");
         let reference = MessageRef::new(message.name(), &home_b);
         assert!(engine_a.awaiting().get(&reference).is_none(), "sender continuation has not written its record yet");
-        if !late_record {
+        if !*late_record {
             engine_a.await_reply(NS, &name, &cancel, &home_b, "reply", None).await.expect("sender record");
         }
         pump(&store_b, &home_b, &store_a, &mut b_to_a);
         engine_a.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut observer).await.expect("live observation");
         match action {
-            0 => {
+            DropAction::Supersede => {
                 let next = format!("{name}-successor");
                 let mut successor = cancel.clone();
                 successor.expectation = MessageExpectation::None;
                 successor.supersedes = Some(name.clone());
                 a.publish_message(NS, &next, &successor).await.expect("routed supersession");
             }
-            1 => engine_b.withdraw(NS, &name, "crew-b").await.expect("receiver withdrawal"),
-            _ => {
+            DropAction::Withdraw => engine_b.withdraw(NS, &name, "crew-b").await.expect("receiver withdrawal"),
+            DropAction::Expire => {
                 engine_b.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut OpenMessages::default()).await.expect("receiver expiry");
             }
         }
         assert!(matches!(homed(&engine_b, &name).expect("receiver message").1.state(), MessageState::Dropped { .. }));
-        if !late_record {
+        if !*late_record {
             assert_eq!(
                 engine_a.awaiting().get(&reference).expect("sender record").label(),
                 AwaitingReplyLabel::Open,
@@ -327,12 +342,16 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
             );
         }
         pump(&store_b, &home_b, &store_a, &mut b_to_a);
-        if late_record {
+        // A cold observer must also consume a drop before the sender record exists.
+        if *restart {
+            observer = OpenMessages::default();
+        }
+        if *late_record {
             engine_a.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut observer).await.expect("drop arrives before the record");
             engine_a.await_reply(NS, &name, &cancel, &home_b, "reply", None).await.expect("late sender record");
             assert_eq!(engine_a.awaiting().get(&reference).expect("late record").label(), AwaitingReplyLabel::Withdrawn);
         }
-        if restart {
+        if *restart {
             observer = OpenMessages::default();
         }
         for _ in 0..2 {

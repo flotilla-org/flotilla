@@ -538,7 +538,7 @@ impl MessagePrimitives {
             replace(&spec)?;
             // A prior attempt may have persisted the record but failed before
             // reconciling its evidence. Retry while open; never reopen an ended record.
-            if !awaiting.is_open(&message) {
+            if !awaiting.has_open_record(&message) {
                 return Ok(recorded);
             }
             // A reply may have landed before the record: replies are indexed by what they answer.
