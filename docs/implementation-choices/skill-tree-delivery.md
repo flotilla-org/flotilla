@@ -1,6 +1,6 @@
 # Skill tree delivery (#3663)
 
-Status: four decisions proposed for owner review. Nothing is built yet.
+Status: decisions 1 to 4 approved by the owner on 2026-10-26, and built. "Build notes" at the end records where the build departs from the approved text, and why.
 
 ## Ruled
 
@@ -214,3 +214,26 @@ The build's test budget is in the PR description. The coverage that the review a
   - a disconnected attempt racing its retry.
 - **Tar canonicality** has a golden test (fixed bytes and digest for a fixed tree), plus a Hegel property: permuting input order or file timestamps never changes the digest.
 - **`fetch_commit`** runs against real local Git remotes, one that allows reachable-SHA wants and one that refuses them (protocol v0 without `allowReachableSHA1InWant`). This exercises both steps and the "pin absent after both" refusal. The stderr classification is covered by table tests, which include the unclassified default.
+
+## Build notes
+
+Where the build departs from the approved text above:
+
+1. **Publication runs at each crew launch, for every vessel kind.** Docker provisioning no longer stages skills, so cloud adoption no longer restages them either.
+   - The launch path was already the one place that knows each crew's harness home, for Docker, cloud and agentless vessels alike.
+   - The "launch-time check" in decision 3 therefore becomes the publication itself. A hit costs one `readlink` and one `test -e` in the guest.
+2. **The selection comes from the convoy's frozen workflow snapshot**, through the session's Vessel. No new `FLOTILLA_CREW_SKILLS` key was added to agentless specs.
+   - Every vessel kind already carries this record (ADR 0052), so neither an agentless nor a Docker spec changes shape.
+   - A launch without a Vessel, Convoy or snapshot publishes nothing and logs a warning; any tree already published stays.
+   - A snapshot that lacks the crew is an error.
+3. **The reap runs before the flip, not after the completion check.** The interleaving property showed the problem with the old order. A late flip by a cancelled attempt, followed by a stall, could reach a reap that read its protected set before the flip, and the reap then removed the newly linked tree after this attempt had already reported success. With the reap first, nothing an attempt does follows its completion check.
+4. **No separate handling for a losing rename or for step 4's return to step 2.** A rename that loses to a same-digest writer, and a dangling link found at the completion check, are both transient failures. The retry restarts at step 1 with a new attempt id, finds or rebuilds the complete tree, and touches it.
+5. **Cache last use is `FETCH_HEAD`'s mtime**, the record the existing revision-cache retirement already reads. A cache hit touches it. Retirement of caches unused for 7 days runs at each staging, with no new timer.
+6. **The fallback fetch logs a `warn!`.** The workspace has no metrics facility to count it in.
+7. **A failed credential mint is transient.** Its error does not separate a network failure from a revoked installation, and an unclassified failure is transient by rule. Either way the staging fails and no cached tree is served.
+8. **Host-side fetches accept only HTTPS and local repositories.** SSH would use the daemon user's ambient keys, which ADR 0038 forbids.
+9. **The supply mount and its preflight are retired.** The supply mount is `/run/flotilla/skills` inside containers. A contained agent is still refused before its container exists when no supply is declared.
+10. **A missing guest tool is detected by exit status 127** on first use, rather than by a separate probe. The refusal is permanent and names the tool.
+11. **The tree manifest is `{"schema_version":1,"sources":[…],"skills":[…]}`**, built from the fields listed in decision 3.
+12. **Requester-bound homes (#3907) get their skills at launch, like every other home.** The launch's crew environment already names the bound home, which is where the binding delivers, so publication writes its `skills` there. The provisioning-time requester staging that #3933 added is retired together with the rest of provisioning-time staging.
+13. **The runner store was checked against BusyBox 1.35.0** (static musl build). With its `readlink`, `test`, `mkdir`, `sha256sum`, `tar`, `mv`, `ln`, `touch`, `find` and `rm` first on `PATH`, the real-filesystem publication contract tests pass. Only the tests' own GNU-only `touch -d` aging helper needed GNU coreutils.
