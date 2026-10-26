@@ -614,6 +614,10 @@ impl CommandRunner for AgentRunner {
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
         self.run(cmd, args, Path::new("/"), &ChannelLabel::Default).await.is_ok()
     }
+    // A write without a mode takes the agent's private 0600 default. Readers
+    // must run as the agent's uid (true of every vessel layout today: Docker
+    // runs the container as one user, and crews start through the agent);
+    // a reader under another uid needs `write_file_with_mode`.
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
         self.publish(path, content.as_bytes().to_vec(), None).await
     }
