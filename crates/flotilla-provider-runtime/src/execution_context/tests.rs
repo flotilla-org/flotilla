@@ -187,3 +187,35 @@ fn delivered_material_becomes_the_bound_layer() {
     assert!(BoundLayer::new(vec!["relative".into()], []).is_err());
     assert!(BoundLayer::new(Vec::new(), [("HOME".to_string(), "/x".to_string())]).is_err());
 }
+
+// Harness settings are non-secret settings only: one naming a variable
+// flotilla composes (`PATH`, `HOME`, `FLOTILLA_*`) is refused, as a supply
+// naming one is, so no rendering can carry two `PATH`s.
+#[test]
+fn a_harness_setting_cannot_name_a_composed_variable() {
+    for name in ["PATH", "HOME", "FLOTILLA_ENVIRONMENT_ID"] {
+        let preparer = preparer(rust(), Some("/home/u")).with_settings(&[(name.to_string(), "/x".to_string())]);
+        assert_eq!(
+            preparer.base().expect_err("refused"),
+            PreparationError::HostConfiguration(format!("harness setting {name} is a variable flotilla composes"))
+        );
+    }
+}
+
+// A bound variable the launch also sets must agree with the bound layer,
+// whether or not a family declares it; a launch PATH is replaced.
+#[test]
+fn a_launch_cannot_override_a_bound_variable() {
+    let crew = preparer(rust(), Some("/home/u")).prepare(Some(bound())).expect("crew");
+    let mut env = vec![("GITHUB_TOKEN_FILE".to_string(), "/elsewhere/token".to_string())];
+    assert_eq!(
+        crew.render_crew(&mut env, &accounts()).expect_err("refused"),
+        PreparationError::Refused("the launch sets GITHUB_TOKEN_FILE, which its bound plan sets differently".into())
+    );
+    let mut env = vec![
+        ("GITHUB_TOKEN_FILE".to_string(), "/state/credentials/github/token".to_string()),
+        ("PATH".to_string(), "/launch/bin".to_string()),
+    ];
+    crew.render_crew(&mut env, &accounts()).expect("agreeing launch");
+    assert_eq!(env.iter().filter(|(name, _)| name == "PATH").map(|(_, value)| value.as_str()).collect::<Vec<_>>(), [crew.crew_path()]);
+}

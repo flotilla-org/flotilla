@@ -230,7 +230,10 @@ impl BoundLayer {
     }
 
     /// The material a launch's credential delivery produced: the directories
-    /// it put on `PATH` ahead of `base`, and its other variables.
+    /// it put on `PATH` ahead of `base`, and its other variables. An entry
+    /// already in the base layer or the system tail is not a wrapper
+    /// directory: delivery prepends its wrappers to the runner's own `PATH`,
+    /// and every wrapper directory is a private absolute path of its own.
     pub fn delivered(delivered: &[(String, String)], base: &BaseLayer) -> Result<Self, String> {
         let known = base.path_entries();
         let path = delivered
@@ -286,8 +289,11 @@ impl PreparedContext {
     }
 
     /// Render both layers onto a crew launch's own variables. The launch may
-    /// not set a base variable, and a family's account variable only as the
-    /// bound layer sets it. Refused renderings leave `launch` unchanged.
+    /// not set a base variable, and may set a bound variable, including a
+    /// family's account variable, only as the bound layer sets it. A launch
+    /// `PATH` is replaced by the crew `PATH`: the wrapper directories it may
+    /// name reach the crew only through the bound layer. Refused renderings
+    /// leave `launch` unchanged.
     pub fn render_crew(&self, launch: &mut Vec<(String, String)>, accounts: &AccountVariables) -> Result<(), PreparationError> {
         for (name, value) in launch.iter().filter(|(name, _)| name != "PATH") {
             if self.base.sets(name) {
@@ -296,12 +302,15 @@ impl PreparedContext {
                     None => PreparationError::Refused(format!("the launch sets {name}, which the environment's base layer sets")),
                 });
             }
+            let bound = self.bound.as_ref().and_then(|bound| bound.get(name));
             if let Some(family) = accounts.owner(name) {
-                if self.bound.as_ref().and_then(|bound| bound.get(name)) != Some(value.as_str()) {
+                if bound != Some(value.as_str()) {
                     return Err(PreparationError::Refused(format!(
                         "the launch sets {name}, `{family}` account state that no bound plan supplies"
                     )));
                 }
+            } else if bound.is_some_and(|bound| bound != value) {
+                return Err(PreparationError::Refused(format!("the launch sets {name}, which its bound plan sets differently")));
             }
         }
         launch.retain(|(name, _)| name != "PATH");
@@ -419,6 +428,9 @@ impl ExecutionPreparer {
         let mut variables = BTreeMap::from([("LANG".to_string(), DEFAULT_LANG.to_string())]);
         let mut supplies = BTreeMap::new();
         for (name, value) in self.locale.iter().chain(&self.settings) {
+            if matches!(name.as_str(), "PATH" | "HOME") || name.starts_with("FLOTILLA_") {
+                return Err(PreparationError::HostConfiguration(format!("harness setting {name} is a variable flotilla composes")));
+            }
             if let Some(family) = self.accounts.owner(name) {
                 return Err(PreparationError::HostConfiguration(format!("harness setting {name} carries `{family}` account state")));
             }
