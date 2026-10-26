@@ -331,7 +331,6 @@ impl Judgement {
                 if converted.is_none() {
                     tracing::warn!(retry_at = ?next, "stored lifecycle retry time is outside chrono range; using epoch fallback");
                 }
-                debug_assert!(converted.is_some(), "stored retry time is within chrono range");
                 LifecycleReading::Retrying { failures: *failures, next: converted.unwrap_or_default(), cause: last.detail.clone() }
             }
             Judgement::Exhausted { last } => LifecycleReading::Exhausted { cause: last.detail.clone() },

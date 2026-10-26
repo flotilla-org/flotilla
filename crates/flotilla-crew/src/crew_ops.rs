@@ -3868,7 +3868,9 @@ mod vessel_ending_tests {
     use super::vessel_ending_reason;
     use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision, PlacementTargetHost};
     use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
-    use flotilla_resources::{ReadResourceObject, ResourceProvenance, Vessel, VesselPhase, VesselSpec, VesselStatus};
+    use flotilla_resources::{
+        lifecycle_reads::ProvisioningKind, ReadResourceObject, ResourceProvenance, Vessel, VesselPhase, VesselSpec, VesselStatus,
+    };
 
     // Crew listing and resume share one checked reading; stale Lost cannot hide a live lease.
     #[test]
@@ -3897,6 +3899,15 @@ mod vessel_ending_tests {
         fixture.request(&vessel);
         let vessel = ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local };
         assert!(vessel_ending_reason(fixture.reads.as_ref(), &vessel, "legacy").expect("live").is_none());
+        // Exhaustion is a failed judgement, not a committed ending: listing has no loss until GiveUp.
+        let pending = VesselFixture::new(false);
+        pending.request(&vessel.object);
+        pending.exhaust_before_give_up(&vessel.object, "provider refused");
+        assert_eq!(
+            pending.reads.try_reading(ProvisioningKind::Vessel, "vessel", None).expect("exhausted"),
+            Some(LifecycleReading::Exhausted { cause: "provider refused".into() })
+        );
+        assert!(vessel_ending_reason(pending.reads.as_ref(), &vessel, "legacy").expect("no ending yet").is_none());
         fixture.finish(&vessel.object, Ending::Released);
         assert_eq!(
             vessel_ending_reason(fixture.reads.as_ref(), &vessel, "legacy").expect("ended"),

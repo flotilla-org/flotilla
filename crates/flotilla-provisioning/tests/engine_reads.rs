@@ -349,3 +349,14 @@ fn a_vessel_written_through_the_binding_reads_by_its_old_name() {
     assert_eq!(obj.status.as_ref().expect("provisioning").phase, flotilla_resources::VesselPhase::Provisioning);
     assert_eq!(obj.status.as_ref().expect("provisioning").message, None);
 }
+
+// Corrupt persisted retry times remain readable in debug and release builds; diagnostics preserve a usable fallback.
+#[test]
+fn out_of_range_retry_times_do_not_panic() {
+    use flotilla_protocol::LifecycleReading;
+    for micros in [i64::MIN, i64::MAX] {
+        let reading =
+            Judgement::Retrying { failures: 1, next: Timestamp(micros), last: Cause::new(CauseCategory::Transient, "retry") }.reading();
+        assert!(matches!(reading, LifecycleReading::Retrying { next, .. } if next == chrono::DateTime::UNIX_EPOCH));
+    }
+}

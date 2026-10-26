@@ -77,7 +77,7 @@ impl LifecycleReading {
             Self::Exhausted { cause } => Some(format!("{cause} (attempts spent)")),
             Self::Ready { .. } => None,
             Self::Lost => Some("observed absent".into()),
-            Self::Failed { reason } => Some(reason.clone()),
+            Self::Failed { reason } => Some(if reason.is_empty() { "failed (no reason recorded)".into() } else { reason.clone() }),
             Self::Released => Some("released".into()),
             Self::GaveUp { cause } => Some(cause.clone()),
         }

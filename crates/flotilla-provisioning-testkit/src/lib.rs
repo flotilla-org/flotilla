@@ -10,7 +10,7 @@ use flotilla_resources::{lifecycle_reads::LifecycleReads, ResourceObject};
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
-    machines::lifecycle::{Lifecycle, LifecycleKind},
+    machines::lifecycle::{Attempted, Lifecycle, LifecycleKind, MemoryLifecycleWorld},
     Cause, CauseCategory, Home, Log, Outcome,
 };
 
@@ -60,6 +60,19 @@ where
                 Timestamp(2_000_000),
             )
             .expect("retry");
+    }
+
+    /// Persist only Attempted, modelling a restart before GiveUp; later assertions use the store read port.
+    pub fn exhaust_before_give_up(&self, obj: &ResourceObject<B::Old>, cause: &str) {
+        let mut home = Home::<Lifecycle<B::Kind>, _>::with_log("home", StoreLog::new(Arc::clone(&self.store))).expect("home");
+        home.restore(self.home.get(&obj.metadata.name).expect("requested resource")).expect("restore");
+        home.apply(
+            &obj.metadata.name,
+            Attempted { outcome: Outcome::Failed { cause: Cause::new(CauseCategory::Refused, cause), retryable: false } },
+            &MemoryLifecycleWorld::default(),
+            Timestamp(2_000_000),
+        )
+        .expect("durable failed attempt");
     }
 
     pub fn finish(&self, obj: &ResourceObject<B::Old>, ending: Ending<'_>) {

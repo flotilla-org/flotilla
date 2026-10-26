@@ -2477,15 +2477,6 @@ impl Aggregator {
         }
     }
 
-    /// A held lifecycle decides the phase; interrupted roles are an observation of a realised lease.
-    #[cfg(test)]
-    pub(crate) fn vessel_phase(&self, vessel: &ReadResourceObject<Vessel>) -> Result<VesselPhase, String> {
-        let origin = readiness::engine_origin(&vessel.provenance);
-        self.lifecycle_reads
-            .try_reading(crate::ports::ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref())
-            .map(|reading| Self::vessel_phase_from_reading(vessel, reading.as_ref()))
-    }
-
     pub(super) fn vessel_phase_from_reading(
         vessel: &ReadResourceObject<Vessel>,
         reading: Option<&flotilla_protocol::LifecycleReading>,
@@ -6889,9 +6880,6 @@ mod tests {
     // Engine readings decide readiness despite stale lifecycle phase/message; interrupted roles remain observations.
     #[hegel::test]
     fn the_engine_reading_decides_a_vessel_view(tc: hegel::TestCase) {
-        use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision, PlacementTargetHost};
-        use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
-        use flotilla_resources::{VesselSpec, VesselStatus};
         // Every old phase, live readings and endings, with empty and Unicode causes; no old copy is published.
         let old = [
             VesselPhase::Pending,
@@ -6902,15 +6890,34 @@ mod tests {
             VesselPhase::Lost,
         ][tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(5))];
         let reason = ["", "backing failed", "失敗"][tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2))];
-        let mode = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(6));
+        let mode = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(7));
+        assert_vessel_readiness_contract(old, reason, mode);
+    }
+
+    // Fixed boundaries complement generated phase/ending coverage under the bounded default profile.
+    #[test]
+    fn vessel_readiness_exposes_exhaustion_and_missing_failure_text() {
+        assert_vessel_readiness_contract(VesselPhase::Ready, "", 2);
+        assert_vessel_readiness_contract(VesselPhase::Ready, "provider refused", 7);
+    }
+
+    fn assert_vessel_readiness_contract(old: VesselPhase, reason: &str, mode: usize) {
+        use crate::ports::ProvisioningKind;
+        use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision, PlacementTargetHost};
+        use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
+        use flotilla_resources::{VesselSpec, VesselStatus};
+        let recorded_reason = reason;
         let (ending, expected, reason) = match mode {
             0 => (Some(Ending::Released), VesselPhase::Lost, "released"),
             1 => (Some(Ending::Lost("env")), VesselPhase::Lost, "observed absent"),
-            2 => (Some(Ending::Failed(reason)), VesselPhase::Failed, reason),
+            2 => {
+                (Some(Ending::Failed(reason)), VesselPhase::Failed, if reason.is_empty() { "failed (no reason recorded)" } else { reason })
+            }
             3 => (Some(Ending::GaveUp(reason)), VesselPhase::Failed, reason),
             4 => (None, VesselPhase::Provisioning, "being realised"),
             5 => (Some(Ending::Ready("env")), VesselPhase::Interrupted, "crew roles are interrupted: coder"),
-            _ => (None, VesselPhase::Provisioning, "provider is busy (1 failed; next try at 1970-01-01T00:00:03+00:00)"),
+            6 => (None, VesselPhase::Provisioning, "provider is busy (1 failed; next try at 1970-01-01T00:00:03+00:00)"),
+            _ => (None, VesselPhase::Failed, "provider refused (attempts spent)"),
         };
         let convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
         let status = convoy.status.as_ref().expect("status");
@@ -6941,6 +6948,8 @@ mod tests {
         fixture.request(&vessel);
         if mode == 6 {
             fixture.retry(&vessel, "provider is busy");
+        } else if mode == 7 {
+            fixture.exhaust_before_give_up(&vessel, "provider refused");
         }
         if let Some(ending) = ending {
             fixture.finish(&vessel, ending);
@@ -6949,7 +6958,6 @@ mod tests {
         let mut aggregator =
             Aggregator::new(AggregatorProjectionState::new(), HostName::new("host"), events).with_lifecycle_reads(fixture.reads.clone());
         let read = ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local };
-        assert_eq!(aggregator.vessel_phase(&read).expect("reading"), expected);
         // Empty interrupted-role evidence uses a complete generic reason, never a dangling label or stale message.
         if mode == 5 {
             let mut empty = read.clone();
@@ -6971,8 +6979,13 @@ mod tests {
         assert_eq!(readiness.blockers.len(), 1, "stale checkout refs are not combined with engine evidence");
         assert_eq!(readiness.blockers[0].reason, reason);
         assert_eq!(readiness.blockers[0].phase, format!("{expected:?}"));
+        if mode == 2 {
+            assert_eq!(
+                fixture.reads.try_reading(ProvisioningKind::Vessel, "vessel", None),
+                Ok(Some(LifecycleReading::Failed { reason: recorded_reason.into() }))
+            );
+        }
         fixture.poison();
-        assert!(aggregator.vessel_phase(&read).unwrap_err().contains("poisoned"));
         let (readiness, _) =
             aggregator.vessel_readiness(&reference, definition, status.work.get(&definition.name), None, &HostName::new("host"));
         assert_eq!(readiness.blockers[0].phase, "Unknown");
