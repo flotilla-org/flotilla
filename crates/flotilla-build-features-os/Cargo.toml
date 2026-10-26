@@ -10,10 +10,10 @@ publish = false
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 once_cell = { version = "1", features = ["std", "critical-section", "portable-atomic", "race"] }
-rustix = { version = "1", features = ["fs", "stdio", "system", "termios"] }
+rustix = { version = "1", features = ["fs", "process", "stdio", "system", "termios"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "system"] }
+linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl", "system"] }
 
 # rustix uses libc/errno on macOS rather than Linux's raw syscall backend.
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -1591,6 +1591,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-core",
  "zeroize",
