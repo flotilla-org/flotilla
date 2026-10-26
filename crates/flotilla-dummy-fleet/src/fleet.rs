@@ -12,6 +12,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_config::dummy_fleet::DummyFleetConfig;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_environment::factories::dummy::DummyEnvironmentFactory;
 use flotilla_protocol::{commands::CommandValue, Command, CommandAction, DaemonEvent};
 use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
 use tokio::sync::{broadcast::error::RecvError, oneshot};
@@ -40,6 +41,7 @@ pub struct DummyFleet {
     /// Where coders open change requests instead of `forge`, when configured.
     pub(crate) shared_forge: Option<Arc<SharedForge>>,
     pub(crate) sessions: DummySessions,
+    pub(crate) environment_factory: OnceLock<DummyEnvironmentFactory>,
     pub(crate) checkouts: DummyCheckouts,
     port: OnceLock<Arc<dyn CrewCommandPort>>,
     counters: Counters,
@@ -71,6 +73,7 @@ impl DummyFleet {
             forge: DummyForge::new(&config),
             shared_forge,
             sessions: DummySessions::default(),
+            environment_factory: OnceLock::new(),
             checkouts: DummyCheckouts::default(),
             config,
             port: OnceLock::new(),

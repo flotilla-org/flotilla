@@ -480,7 +480,7 @@ fn tokio_block<F: std::future::Future>(future: F) -> F::Output {
 
 #[tokio::test]
 async fn standing_admission_and_rollover_use_the_ensure_role_identity() {
-    use flotilla_resources::{Selector, ENSURED_FROM_ANNOTATION};
+    use flotilla_resources::{convoy::engine::SkipReason, Selector, ENSURED_FROM_ANNOTATION};
     use flotilla_schema::Timestamp;
     use flotilla_state_machines::{machines::convoy::Rollover, Ref};
     let fixture = fixture();
@@ -521,6 +521,37 @@ async fn standing_admission_and_rollover_use_the_ensure_role_identity() {
     assert!(fixture.engine.holds(&old));
     assert_eq!(fixture.convoys.get(name).unwrap().name(), name);
     assert!(fixture.engine.promises(&old, None).unwrap().is_some());
+    // A nonterminal old-store generation must not mask an ended engine record:
+    // the next Ensure generation reaches admission under the same stable name.
+    fixture.engine.abandon(&old, "operator", "replace generation").await.expect("end engine generation");
+    assert_eq!(old.status.as_ref().expect("old status").phase, ConvoyPhase::Active);
+    assert!(!fixture.engine.holds(&old));
+    let mut next = old_convoy(&fixture.backend, "next-generation-id", old.status.clone().expect("bootstrap")).await;
+    next.spec.role = old.spec.role.clone();
+    next.metadata.annotations = old.metadata.annotations.clone();
+    assert!(!fixture.engine.holds(&next));
+    assert_eq!(fixture.engine.admit(&next).await.expect("next generation"), Admission::Held);
+    let version = fixture.convoys.get(name).expect("fresh engine generation").version();
+    assert!(fixture.engine.holds(&next));
+    assert_eq!(fixture.engine.admit(&next).await.expect("duplicate generation"), Admission::Held);
+    assert_eq!(fixture.convoys.get(name).expect("same generation").version(), version);
+    // Ensure has marked the earlier generation terminal, but a controller may
+    // still hold its Active snapshot. Replaying it must not replace the newer
+    // ended engine generation.
+    let stored_old = fixture.backend.clone().using::<Convoy>(NAMESPACE).get(&old.metadata.name).await.expect("stored old generation");
+    let mut terminal = stored_old.status.expect("old status");
+    terminal.phase = ConvoyPhase::Abandoned;
+    fixture
+        .backend
+        .clone()
+        .using::<Convoy>(NAMESPACE)
+        .update_status(&old.metadata.name, &stored_old.metadata.resource_version, &terminal)
+        .await
+        .expect("retire old generation");
+    fixture.engine.abandon(&next, "operator", "end newer generation").await.expect("end newer engine generation");
+    let ended = fixture.convoys.get(name).expect("newer ended generation");
+    assert!(matches!(fixture.engine.admit(&old).await.expect("stale admission"), Admission::Skipped(SkipReason::Decided(_))));
+    assert_eq!(fixture.convoys.get(name).expect("retained newer generation").version(), ended.version());
 }
 
 #[tokio::test]

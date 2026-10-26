@@ -50,6 +50,10 @@ Convoys assumed that their vessels were co-located and fixed. Many writers could
 
   ADR 0064 retired seats: a retired seat's name is reserved for the rest of its generation; Rollover clears retired seats, so a later generation may reuse the name, and the live record never accumulates seat history.
 
+  [Owner ruling, 2026-10-26 (#3825)](https://github.com/flotilla-org/flotilla/issues/3825#issuecomment-6416928549):
+
+  ADR carry: ADR 0064 (or the convoy ADR #3794 updated) records that an ended standing generation is retired and its stable name reused by the next generation, with history in the per-home log; superseded if #3911 lands.
+
   ADR 0064 Convoy records: a change-request observation finds its submission through a full index on the submission address (one lookup per event); there is no partial index on open convoys.
 
   ADR 0064 promise labels: a promise's label is stored per convoy and is the name crews and views use; kinds stay declarations.

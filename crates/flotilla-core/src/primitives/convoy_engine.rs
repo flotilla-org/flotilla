@@ -131,18 +131,43 @@ fn open(promise: &Promise) -> bool {
     matches!(promise.progress.value, Progress::Pending | Progress::Submitted)
 }
 
+// A new standing generation must reach admission when its stable record has
+// ended; terminal old records still read the engine view. Admission and routing
+// use the same predicate so they cannot disagree about a held generation.
+fn holds_generation(convoy: &ResourceObject<OldConvoy>, current: &Resource<Convoy>) -> bool {
+    !flotilla_resources::convoy::reconcile::is_ensured(convoy)
+        || current.label() == ConvoyLabel::Open
+        || convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())
+}
+
 #[async_trait]
 impl EngineConvoys for ConvoyEngine {
     fn holds(&self, convoy: &ResourceObject<OldConvoy>) -> bool {
         // Fail closed: route an invalid identity to this writer, whose edits return
         // the naming error, rather than falling back to the legacy writer.
-        map::engine_name(convoy).map_or(true, |name| self.convoys.get(&name).is_some())
+        map::engine_name(convoy).map_or(true, |name| self.convoys.get(&name).is_some_and(|current| holds_generation(convoy, &current)))
     }
 
     async fn admit(&self, convoy: &ResourceObject<OldConvoy>) -> Result<Admission, String> {
         let name = map::engine_name(convoy)?;
-        if self.convoys.get(&name).is_some() {
+        let standing = flotilla_resources::convoy::reconcile::is_ensured(convoy);
+        if self.convoys.get(&name).is_some_and(|current| holds_generation(convoy, &current)) {
             return Ok(Admission::Held);
+        }
+        if standing {
+            // Ensure only replaces terminal old generations. A controller may
+            // still hold an Active snapshot of one: consult its current source
+            // before letting it replace a newer ended engine generation.
+            let latest = self
+                .backend
+                .clone()
+                .using::<OldConvoy>(&convoy.metadata.namespace)
+                .get(&convoy.metadata.name)
+                .await
+                .map_err(|error| error.to_string())?;
+            if latest.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+                return Ok(Admission::Skipped(SkipReason::Decided("the stored standing generation has ended".into())));
+            }
         }
         let Some(status) = convoy.status.as_ref().filter(|status| status.workflow_snapshot.is_some()) else {
             return Ok(Admission::Skipped(SkipReason::NotBootstrapped));
@@ -160,7 +185,11 @@ impl EngineConvoys for ConvoyEngine {
         let admitted = tokio::task::spawn_blocking(move || {
             // Old admission read the project; the engine's gate reads that record.
             convoys.world(|world| world.projects.put(&Ref::new(project.as_str()), ()));
-            convoys.admit(&name, request, now)
+            if standing {
+                convoys.admit_standing(&name, request, now)
+            } else {
+                convoys.admit(&name, request, now)
+            }
         })
         .await
         .map_err(|error| error.to_string())?;

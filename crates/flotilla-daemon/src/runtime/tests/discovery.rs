@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::discovery::crew_pool_available;
 
 #[cfg(unix)]
 #[tokio::test]
@@ -468,4 +469,27 @@ async fn agentless_host_without_vessel_agents_is_refused_at_placement() {
         super::discovery::agentless_vessel_conditions(Some(&no_build), &profile("b5", Some(controller_uname), true, Ok(reach))).await;
     assert!(!ready);
     assert!(matches!(conditions.as_slice(), [condition] if condition.reason == "NoAgentBuild"), "{conditions:?}");
+}
+
+// Exhaust all capability combinations: only self-contained per-vessel runtimes
+// may supply a missing host pool. A present host pool always remains usable.
+#[test]
+fn crew_pool_availability_follows_runtime_ownership() {
+    let cases = [
+        (false, false, false, false),
+        (false, false, true, false),
+        (false, true, false, true),
+        (false, true, true, false),
+        (true, false, false, true),
+        (true, false, true, true),
+        (true, true, false, true),
+        (true, true, true, true),
+    ];
+    for (host_has_pool, per_vessel, receives_host_tools, expected) in cases {
+        assert_eq!(
+            crew_pool_available(host_has_pool, per_vessel, receives_host_tools),
+            expected,
+            "host pool={host_has_pool}, per-vessel={per_vessel}, receives host tools={receives_host_tools}",
+        );
+    }
 }
