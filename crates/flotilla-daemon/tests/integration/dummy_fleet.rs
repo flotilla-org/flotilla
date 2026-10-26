@@ -656,7 +656,7 @@ async fn on_the_engine_a_lone_coder_realises_its_resources_and_delivers() {
                     for id in page.ids {
                         let record = read.load::<Resource<$kind>>(id)?.expect("engine record").value;
                         assert!(
-                            matches!(record.state(), LifecycleState::Realised { .. } | LifecycleState::Gone),
+                            matches!(record.state(), LifecycleState::Realised { .. } | LifecycleState::Gone { .. }),
                             "unrealised engine record: {record:?}"
                         );
                     }

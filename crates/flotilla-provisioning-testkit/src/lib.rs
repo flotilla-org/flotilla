@@ -10,7 +10,7 @@ use flotilla_resources::{lifecycle_reads::LifecycleReads, ResourceObject};
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
-    machines::lifecycle::{Lifecycle, LifecycleKind},
+    machines::lifecycle::{Attempted, Lifecycle, LifecycleKind, MemoryLifecycleWorld},
     Cause, CauseCategory, Home, Log, Outcome,
 };
 
@@ -20,6 +20,7 @@ pub enum Ending<'a> {
     Ready(&'a str),
     Lost(&'a str),
     Released,
+    Failed(&'a str),
     GaveUp(&'a str),
 }
 
@@ -39,8 +40,7 @@ where
     StoreLog: Log<Lifecycle<B::Kind>>,
 {
     pub fn new(replica: bool) -> Self {
-        let mut registry = flotilla_schema::KindRegistry::new();
-        flotilla_provisioning::stored::register(&mut registry).expect("registry");
+        let registry = flotilla_provisioning::stored::production_kinds().expect("registry");
         let store =
             Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry).expect("store")));
         let home = Arc::new(LifecycleHome::new("home", Home::with_log("home", StoreLog::new(Arc::clone(&store))).expect("home")));
@@ -62,6 +62,19 @@ where
             .expect("retry");
     }
 
+    /// Persist only Attempted, modelling a restart before GiveUp; later assertions use the store read port.
+    pub fn exhaust_before_give_up(&self, obj: &ResourceObject<B::Old>, cause: &str) {
+        let mut home = Home::<Lifecycle<B::Kind>, _>::with_log("home", StoreLog::new(Arc::clone(&self.store))).expect("home");
+        home.restore(self.home.get(&obj.metadata.name).expect("requested resource")).expect("restore");
+        home.apply(
+            &obj.metadata.name,
+            Attempted { outcome: Outcome::Failed { cause: Cause::new(CauseCategory::Refused, cause), retryable: false } },
+            &MemoryLifecycleWorld::default(),
+            Timestamp(2_000_000),
+        )
+        .expect("durable failed attempt");
+    }
+
     pub fn finish(&self, obj: &ResourceObject<B::Old>, ending: Ending<'_>) {
         let name = &obj.metadata.name;
         let step = match ending {
@@ -72,9 +85,13 @@ where
                 }) {
                     self.home.step(name, &Step::Realised { identity: identity.into() }, Timestamp(3_000_000)).expect("ready");
                 }
-                Step::Vanished
+                Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }
             }
             Ending::Released => Step::Released,
+            Ending::Failed(reason) => {
+                self.home.step(name, &Step::Realised { identity: "backing".into() }, Timestamp(3_000_000)).expect("ready");
+                Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: reason.into() } }
+            }
             Ending::GaveUp(cause) => {
                 Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Refused, cause), retryable: false })
             }
@@ -122,3 +139,6 @@ pub async fn store_object<T: flotilla_resources::Resource>(
         None => created,
     }
 }
+
+/// The Vessel lease using the same real store and reader contract.
+pub type VesselFixture = LifecycleFixture<flotilla_provisioning::engine::vessel::VesselBinding>;

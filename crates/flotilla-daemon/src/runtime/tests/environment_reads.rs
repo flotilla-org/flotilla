@@ -68,7 +68,17 @@ async fn daemon_reads_environment_readiness_and_identity_without_a_copy() {
             if matches!(ending, "ready" | "released" | "lost") {
                 engine.step(&name, &Step::Realised { identity: identity.clone() }, Timestamp(3)).expect("ready");
                 if ending != "ready" {
-                    engine.step(&name, &if ending == "lost" { Step::Vanished } else { Step::Released }, Timestamp(4)).expect("ended");
+                    engine
+                        .step(
+                            &name,
+                            &if ending == "lost" {
+                                Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }
+                            } else {
+                                Step::Released
+                            },
+                            Timestamp(4),
+                        )
+                        .expect("ended");
                 }
             } else {
                 engine

@@ -435,7 +435,7 @@ impl<L: Log<VesselMachine>> Placements<L> {
 mod placements_tests {
     use super::*;
     use crate::{
-        machines::lifecycle::{Attempted, GiveUp, LifecycleState, Observed, Realise, Release, Vanish},
+        machines::lifecycle::{Attempted, Ending, GiveUp, LifecycleState, Observed, Realise, Release, Vanish, VanishCause},
         Cause, CauseCategory, MemoryLog, Outcome, Ref,
     };
 
@@ -494,7 +494,7 @@ mod placements_tests {
         placements.place(&a, host(), Timestamp(1)).expect("granted");
         let world = MemoryLifecycleWorld::default();
         let unrealised = placements
-            .apply(&a, Vanish { observed: Ref::new("a") }.into(), &world, Timestamp(2))
+            .apply(&a, Vanish { cause: VanishCause::Lost, observed: Ref::new("a") }.into(), &world, Timestamp(2))
             .expect_err("a Requested vessel cannot vanish");
         assert_eq!(unrealised.refusal(), Some(PlacementRefusal::MissingEvidence));
         let cause = Cause::new(CauseCategory::External, "provider refused provisioning");
@@ -523,7 +523,7 @@ mod placements_tests {
         let mut world = MemoryLifecycleWorld::default();
         world.teardowns.put(&Ref::new("a"), true);
         let vessel = restarted.apply(&a, Release { teardown: Ref::new("a") }.into(), &world, Timestamp(2)).expect("released");
-        assert_eq!(*vessel.state(), LifecycleState::Gone);
+        assert_eq!(*vessel.state(), LifecycleState::Gone { ending: Ending::Released });
     }
 
     // Behaviour (#3733 review): a create the log refuses puts the request back where it waited,

@@ -140,7 +140,9 @@ fn each_kind_survives_the_codec() {
             LifecycleState::requested(),
             failed(),
             LifecycleState::Realised { identity: "sha256:feed".into() },
-            LifecycleState::Gone,
+            LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released },
+            LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost },
+            LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Failed { reason: "failed".into() } },
             LifecycleState::GaveUp { cause: Cause::new(CauseCategory::Refused, "recipe failed") },
         ]
     };

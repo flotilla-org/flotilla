@@ -57,6 +57,8 @@ CREATE TABLE "checkout" (
   "last_failure_cause_detail" TEXT,
   "last_failure_retryable" INTEGER CHECK ("last_failure_retryable" IN (0, 1)),
   "identity" TEXT,
+  "ending" TEXT CHECK ("ending" IN ('fa', 'lo', 'rl')),
+  "ending_reason" TEXT,
   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
   "cause_detail" TEXT,
   CHECK (CASE WHEN "source" = 'wt'
@@ -73,9 +75,20 @@ CREATE TABLE "checkout" (
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
       END),
+  CHECK (CASE WHEN "ending" = 'rl'
+      THEN "ending_reason" IS NULL
+      END),
+  CHECK (CASE WHEN "ending" = 'lo'
+      THEN "ending_reason" IS NULL
+      END),
+  CHECK (CASE WHEN "ending" = 'fa'
+      THEN "ending_reason" IS NOT NULL
+      END),
   CHECK (CASE WHEN "state" = 'rq'
       THEN "failures" IS NOT NULL
       AND "identity" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
@@ -86,11 +99,14 @@ CREATE TABLE "checkout" (
       AND "last_failure_cause_category" IS NULL
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'go'
-      THEN "failures" IS NULL
+      THEN "ending" IS NOT NULL
+      AND "failures" IS NULL
       AND "last_failure_at" IS NULL
       AND "last_failure_cause_category" IS NULL
       AND "last_failure_cause_detail" IS NULL
@@ -108,6 +124,8 @@ CREATE TABLE "checkout" (
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
       AND "identity" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       END)
 ) STRICT;
 CREATE INDEX "checkout_by_clone" ON "checkout" ("clone") WHERE "clone" IS NOT NULL;
@@ -125,6 +143,9 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ck', 'last_failure_cause_category', 'mx', 'MissingCapability'),
   ('ck', 'last_failure_cause_category', 'rf', 'Refused'),
   ('ck', 'last_failure_cause_category', 'tr', 'Transient'),
+  ('ck', 'ending', 'fa', 'Failed'),
+  ('ck', 'ending', 'lo', 'Lost'),
+  ('ck', 'ending', 'rl', 'Released'),
   ('ck', 'cause_category', 'ex', 'External'),
   ('ck', 'cause_category', 'mc', 'Misconfigured'),
   ('ck', 'cause_category', 'mx', 'MissingCapability'),
@@ -159,6 +180,8 @@ CREATE VIEW "checkout_view" AS SELECT
   "checkout"."last_failure_cause_detail",
   "checkout"."last_failure_retryable",
   "checkout"."identity",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ck' AND "field" = 'ending' AND "code" = "checkout"."ending") AS "ending",
+  "checkout"."ending_reason",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ck' AND "field" = 'cause_category' AND "code" = "checkout"."cause_category") AS "cause_category",
   "checkout"."cause_detail"
 FROM "checkout";
@@ -177,6 +200,8 @@ CREATE TABLE "clone" (
   "last_failure_cause_detail" TEXT,
   "last_failure_retryable" INTEGER CHECK ("last_failure_retryable" IN (0, 1)),
   "identity" TEXT,
+  "ending" TEXT CHECK ("ending" IN ('fa', 'lo', 'rl')),
+  "ending_reason" TEXT,
   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
   "cause_detail" TEXT,
   CHECK (CASE WHEN "last_failure_at" IS NOT NULL
@@ -187,9 +212,20 @@ CREATE TABLE "clone" (
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
       END),
+  CHECK (CASE WHEN "ending" = 'rl'
+      THEN "ending_reason" IS NULL
+      END),
+  CHECK (CASE WHEN "ending" = 'lo'
+      THEN "ending_reason" IS NULL
+      END),
+  CHECK (CASE WHEN "ending" = 'fa'
+      THEN "ending_reason" IS NOT NULL
+      END),
   CHECK (CASE WHEN "state" = 'rq'
       THEN "failures" IS NOT NULL
       AND "identity" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
@@ -200,11 +236,14 @@ CREATE TABLE "clone" (
       AND "last_failure_cause_category" IS NULL
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'go'
-      THEN "failures" IS NULL
+      THEN "ending" IS NOT NULL
+      AND "failures" IS NULL
       AND "last_failure_at" IS NULL
       AND "last_failure_cause_category" IS NULL
       AND "last_failure_cause_detail" IS NULL
@@ -222,6 +261,8 @@ CREATE TABLE "clone" (
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
       AND "identity" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       END)
 ) STRICT;
 CREATE INDEX "clone_by_environment" ON "clone" ("environment", "repository");
@@ -235,6 +276,9 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cl', 'last_failure_cause_category', 'mx', 'MissingCapability'),
   ('cl', 'last_failure_cause_category', 'rf', 'Refused'),
   ('cl', 'last_failure_cause_category', 'tr', 'Transient'),
+  ('cl', 'ending', 'fa', 'Failed'),
+  ('cl', 'ending', 'lo', 'Lost'),
+  ('cl', 'ending', 'rl', 'Released'),
   ('cl', 'cause_category', 'ex', 'External'),
   ('cl', 'cause_category', 'mc', 'Misconfigured'),
   ('cl', 'cause_category', 'mx', 'MissingCapability'),
@@ -264,6 +308,8 @@ CREATE VIEW "clone_view" AS SELECT
   "clone"."last_failure_cause_detail",
   "clone"."last_failure_retryable",
   "clone"."identity",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'cl' AND "field" = 'ending' AND "code" = "clone"."ending") AS "ending",
+  "clone"."ending_reason",
   (SELECT "name" FROM "codes" WHERE "kind" = 'cl' AND "field" = 'cause_category' AND "code" = "clone"."cause_category") AS "cause_category",
   "clone"."cause_detail"
 FROM "clone";
@@ -282,6 +328,8 @@ CREATE TABLE "environment" (
   "last_failure_cause_detail" TEXT,
   "last_failure_retryable" INTEGER CHECK ("last_failure_retryable" IN (0, 1)),
   "identity" TEXT,
+  "ending" TEXT CHECK ("ending" IN ('fa', 'lo', 'rl')),
+  "ending_reason" TEXT,
   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
   "cause_detail" TEXT,
   CHECK (CASE WHEN "last_failure_at" IS NOT NULL
@@ -292,9 +340,20 @@ CREATE TABLE "environment" (
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
       END),
+  CHECK (CASE WHEN "ending" = 'rl'
+      THEN "ending_reason" IS NULL
+      END),
+  CHECK (CASE WHEN "ending" = 'lo'
+      THEN "ending_reason" IS NULL
+      END),
+  CHECK (CASE WHEN "ending" = 'fa'
+      THEN "ending_reason" IS NOT NULL
+      END),
   CHECK (CASE WHEN "state" = 'rq'
       THEN "failures" IS NOT NULL
       AND "identity" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
@@ -305,11 +364,14 @@ CREATE TABLE "environment" (
       AND "last_failure_cause_category" IS NULL
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'go'
-      THEN "failures" IS NULL
+      THEN "ending" IS NOT NULL
+      AND "failures" IS NULL
       AND "last_failure_at" IS NULL
       AND "last_failure_cause_category" IS NULL
       AND "last_failure_cause_detail" IS NULL
@@ -327,6 +389,8 @@ CREATE TABLE "environment" (
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
       AND "identity" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       END)
 ) STRICT;
 CREATE INDEX "environment_by_holder" ON "environment" ("holder") WHERE "holder" IS NOT NULL;
@@ -342,6 +406,9 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ev', 'last_failure_cause_category', 'mx', 'MissingCapability'),
   ('ev', 'last_failure_cause_category', 'rf', 'Refused'),
   ('ev', 'last_failure_cause_category', 'tr', 'Transient'),
+  ('ev', 'ending', 'fa', 'Failed'),
+  ('ev', 'ending', 'lo', 'Lost'),
+  ('ev', 'ending', 'rl', 'Released'),
   ('ev', 'cause_category', 'ex', 'External'),
   ('ev', 'cause_category', 'mc', 'Misconfigured'),
   ('ev', 'cause_category', 'mx', 'MissingCapability'),
@@ -371,6 +438,8 @@ CREATE VIEW "environment_view" AS SELECT
   "environment"."last_failure_cause_detail",
   "environment"."last_failure_retryable",
   "environment"."identity",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ev' AND "field" = 'ending' AND "code" = "environment"."ending") AS "ending",
+  "environment"."ending_reason",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ev' AND "field" = 'cause_category' AND "code" = "environment"."cause_category") AS "cause_category",
   "environment"."cause_detail"
 FROM "environment";
@@ -392,6 +461,8 @@ CREATE TABLE "image_build" (
   "last_failure_cause_detail" TEXT,
   "last_failure_retryable" INTEGER CHECK ("last_failure_retryable" IN (0, 1)),
   "identity" TEXT,
+  "ending" TEXT CHECK ("ending" IN ('fa', 'lo', 'rl')),
+  "ending_reason" TEXT,
   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
   "cause_detail" TEXT,
   CHECK (CASE WHEN "delivery" = 'rg'
@@ -408,9 +479,20 @@ CREATE TABLE "image_build" (
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
       END),
+  CHECK (CASE WHEN "ending" = 'rl'
+      THEN "ending_reason" IS NULL
+      END),
+  CHECK (CASE WHEN "ending" = 'lo'
+      THEN "ending_reason" IS NULL
+      END),
+  CHECK (CASE WHEN "ending" = 'fa'
+      THEN "ending_reason" IS NOT NULL
+      END),
   CHECK (CASE WHEN "state" = 'rq'
       THEN "failures" IS NOT NULL
       AND "identity" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
@@ -421,11 +503,14 @@ CREATE TABLE "image_build" (
       AND "last_failure_cause_category" IS NULL
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'go'
-      THEN "failures" IS NULL
+      THEN "ending" IS NOT NULL
+      AND "failures" IS NULL
       AND "last_failure_at" IS NULL
       AND "last_failure_cause_category" IS NULL
       AND "last_failure_cause_detail" IS NULL
@@ -443,6 +528,8 @@ CREATE TABLE "image_build" (
       AND "last_failure_cause_detail" IS NULL
       AND "last_failure_retryable" IS NULL
       AND "identity" IS NULL
+      AND "ending" IS NULL
+      AND "ending_reason" IS NULL
       END)
 ) STRICT;
 CREATE INDEX "image_build_by_composition" ON "image_build" ("composition");
@@ -460,6 +547,9 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ib', 'last_failure_cause_category', 'mx', 'MissingCapability'),
   ('ib', 'last_failure_cause_category', 'rf', 'Refused'),
   ('ib', 'last_failure_cause_category', 'tr', 'Transient'),
+  ('ib', 'ending', 'fa', 'Failed'),
+  ('ib', 'ending', 'lo', 'Lost'),
+  ('ib', 'ending', 'rl', 'Released'),
   ('ib', 'cause_category', 'ex', 'External'),
   ('ib', 'cause_category', 'mc', 'Misconfigured'),
   ('ib', 'cause_category', 'mx', 'MissingCapability'),
@@ -492,6 +582,8 @@ CREATE VIEW "image_build_view" AS SELECT
   "image_build"."last_failure_cause_detail",
   "image_build"."last_failure_retryable",
   "image_build"."identity",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ib' AND "field" = 'ending' AND "code" = "image_build"."ending") AS "ending",
+  "image_build"."ending_reason",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ib' AND "field" = 'cause_category' AND "code" = "image_build"."cause_category") AS "cause_category",
   "image_build"."cause_detail"
 FROM "image_build";

@@ -66,7 +66,9 @@ impl Binding for CheckoutBinding {
             }
             // A Ready checkout observed absent on its host. A Gone one observed again is a
             // replacement for its owner to request: the engine has no incarnations.
-            CheckoutStatusPatch::MarkGone => vec![Step::Vanished],
+            CheckoutStatusPatch::MarkGone => {
+                vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }]
+            }
             CheckoutStatusPatch::ObserveDegradation { .. }
             | CheckoutStatusPatch::ObserveCloneRetry { .. }
             | CheckoutStatusPatch::ObserveValidation { .. }

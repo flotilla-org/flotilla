@@ -430,7 +430,9 @@ where
             .try_reading(ProvisioningKind::Environment, &environment.metadata.name, None)
             .map_err(ResourceError::other)?;
         let owner_failed = match &environment_reading {
-            Some(reading) => matches!(reading, LifecycleReading::Exhausted { .. } | LifecycleReading::GaveUp { .. }),
+            Some(reading) => {
+                matches!(reading, LifecycleReading::Failed { .. } | LifecycleReading::Exhausted { .. } | LifecycleReading::GaveUp { .. })
+            }
             None => environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Failed),
         };
         if owner_failed {
@@ -446,7 +448,7 @@ where
         // Keep it distinct from process loss: never probe or relaunch in a dead environment.
         let lost_reason =
             match &environment_reading {
-                Some(reading @ (LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::Gone)) => {
+                Some(reading @ (LifecycleReading::Lost | LifecycleReading::Released)) => {
                     Some(format!("environment {} {}", environment.metadata.name, reading.reason().unwrap_or_default()))
                 }
                 Some(_) => None,

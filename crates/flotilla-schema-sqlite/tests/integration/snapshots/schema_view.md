@@ -30,10 +30,10 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 | `ticket` | root | 14 | – | `ticket_assignees` (state data), `ticket_notes` (state data) | `open_by_queue` (queue) |
 | `ticket_assignees` | state data | 2 | – | – | – |
 | `ticket_notes` | state data | 3 | – | – | – |
-| `terminal_session` | root | 21 | 4: `source` 4 | `terminal_session_env` (child), `terminal_session_labels` (child) | `by_vessel` (vessel, ordinal), `live_by_pool` (pool) |
+| `terminal_session` | root | 23 | 6: `source` 4, `ending` 2 | `terminal_session_env` (child), `terminal_session_labels` (child) | `by_vessel` (vessel, ordinal), `live_by_pool` (pool) |
 | `terminal_session_env` | child | 3 | – | – | – |
 | `terminal_session_labels` | child | 2 | – | – | – |
-| `vessel` | root | 16 | – | `vessel_shape` (child) | `live_by_host` (host), `by_convoy` (convoy) |
+| `vessel` | root | 18 | 2: `ending` 2 | `vessel_shape` (child) | `live_by_host` (host), `by_convoy` (convoy) |
 | `vessel_shape` | child | 3 | – | – | – |
 
 Tables wider than 30 columns:
@@ -46,8 +46,8 @@ States with data (one label column, then data shared by name across the labels):
 - `ensure`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `bound`; data tables `ensure_recorded`, `ensure_created`
 - `message`.`state`: label `state` and `state_since`; data columns `receiver_kind`, `receiver_id`, `receiver_host`, `reason`, `reason_by`, `reason_authority`, `watermark`; data tables –
 - `ticket`.`state`: label `state` and `state_since`; data columns `priority`, `owner`, `hold_by`, `hold_until`, `reason`, `closed_by`, `signature_who`, `signature_at`; data tables `ticket_assignees`, `ticket_notes`
-- `terminal_session`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `cause_category`, `cause_detail`; data tables –
-- `vessel`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `cause_category`, `cause_detail`; data tables –
+- `terminal_session`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `ending`, `ending_reason`, `cause_category`, `cause_detail`; data tables –
+- `vessel`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `ending`, `ending_reason`, `cause_category`, `cause_detail`; data tables –
 
 Interned column domains:
 

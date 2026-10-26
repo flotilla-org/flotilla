@@ -84,7 +84,7 @@ pub enum Step {
     /// Its teardown completed.
     Released,
     /// It is observed absent.
-    Vanished,
+    Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause },
 }
 
 /// Why the engine did not take a write.
@@ -163,7 +163,7 @@ fn evidence(name: &str, step: &Step) -> MemoryLifecycleWorld {
         Step::Released => {
             world.teardowns.put(&Ref::new(name), true);
         }
-        Step::Vanished => {
+        Step::Vanished { .. } => {
             world.absences.put(&Ref::new(name), true);
         }
         Step::Attempted(_) => {}
@@ -209,8 +209,8 @@ where
             Step::Released => {
                 home.apply(name, Release { teardown: Ref::new(name) }, &world, at)?;
             }
-            Step::Vanished => {
-                home.apply(name, Vanish { observed: Ref::new(name) }, &world, at)?;
+            Step::Vanished { cause } => {
+                home.apply(name, Vanish { cause: cause.clone(), observed: Ref::new(name) }, &world, at)?;
             }
         }
         Ok(home.get(name).cloned().expect("stepped"))
@@ -230,7 +230,7 @@ fn apply_attempt<K: LifecycleKind, H, E>(
         _ => None,
     };
     let exhausted = |home: &H| {
-        state(home).and_then(|state| match reads::judge::<K>(&state, reads::Ending::Unknown) {
+        state(home).and_then(|state| match reads::judge::<K>(&state) {
             reads::Judgement::Exhausted { last } => Some(last),
             _ => None,
         })
@@ -287,7 +287,7 @@ pub type Patch<T> = <T as flotilla_resources::Resource>::StatusPatch;
 
 /// Whether the engine has ended `resource`: Gone or GaveUp.
 fn ended<K: LifecycleKind>(resource: &Resource<Lifecycle<K>>) -> bool {
-    matches!(resource.state(), LifecycleState::Gone | LifecycleState::GaveUp { .. })
+    matches!(resource.state(), LifecycleState::Gone { .. } | LifecycleState::GaveUp { .. })
 }
 
 /// The time the engine records for a write made now.
@@ -475,9 +475,7 @@ where
             let (name, mut held) = current::<B>(home.as_ref(), &owned);
             let mut completed_attempt = false;
             // A committed failed attempt must finish before any provider work resumes.
-            if let Some(reads::Judgement::Exhausted { last }) =
-                held.as_ref().map(|resource| reads::judge::<B::Kind>(resource.state(), reads::Ending::Unknown))
-            {
+            if let Some(reads::Judgement::Exhausted { last }) = held.as_ref().map(|resource| reads::judge::<B::Kind>(resource.state())) {
                 completed_attempt = true;
                 held = Some(
                     home.step(&name, &Step::Attempted(Outcome::Failed { cause: last, retryable: false }), at(Utc::now()))

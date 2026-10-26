@@ -7,5 +7,5 @@
 -    failed(h[i]) and not(h.indices().exists(j => j > i and not(failed(h[j]))))).size()
 +    failed(h[i])).size()
    pure def exhausted(h: List[AttemptOutcome]): bool = failureCount(h) >= MAX_FAILURES or
-     (h.length() > 0 and (match h[h.length() - 1] { | Failed(f) => not(f.retryable) | _ => false }))
+     (h.length() > 0 and (match h[h.length() - 1] { | AttemptFailed(f) => not(f.retryable) | _ => false }))
    // The cause of the last attempt, when it failed.

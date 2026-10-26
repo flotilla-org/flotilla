@@ -55,6 +55,7 @@ impl Binding for ImageBuildBinding {
         }
     }
 
+    // Remove this copy once the legacy validator no longer requires copied lifecycle status.
     fn copy(obj: &ResourceObject<OldImageBuild>, resource: &Resource<ImageBuild>) -> Option<ImageBuildStatusPatch> {
         let status = obj.status.clone().unwrap_or_default();
         // A stored time outside chrono's range cannot occur for a write made now; the epoch stands in.
@@ -87,7 +88,7 @@ impl Binding for ImageBuildBinding {
                 log_ref: status.log_ref.clone().unwrap_or_default(),
             }),
             // An image build is released only as its record is deleted.
-            LifecycleState::Gone => None,
+            LifecycleState::Gone { .. } => None,
         }
     }
 }

@@ -223,7 +223,10 @@ async fn a_finished_teardown_releases_the_resource() {
     reconcile(&engine, &mut obj).await;
     engine.run_finalizer(&obj).await.expect("teardown");
     assert_eq!(engine.inner().finalized.load(Ordering::SeqCst), 1);
-    assert_eq!(home.get("clone-a").expect("held").state(), &LifecycleState::Gone);
+    assert_eq!(
+        home.get("clone-a").expect("held").state(),
+        &LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }
+    );
 }
 
 // Behaviour: a checkout observed absent vanishes; observed again, it is not revived (no
@@ -240,7 +243,10 @@ async fn a_vanished_checkout_is_not_revived() {
     let mut obj = worktree(Some("convoy-a"));
     reconcile(&engine, &mut obj).await;
     assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(CheckoutStatusPatch::MarkGone));
-    assert_eq!(home.get("checkout-a").expect("held").state(), &LifecycleState::Gone);
+    assert_eq!(
+        home.get("checkout-a").expect("held").state(),
+        &LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost }
+    );
     assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
     assert_eq!(engine.inner().prepared.load(Ordering::SeqCst), 2);
     assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(CheckoutPhase::Gone));
@@ -320,7 +326,10 @@ fn patches_read_as_lifecycle_steps() {
         vec![Step::Realised { identity: "/clones/repo".into() }]
     );
     let checkout = worktree(Some("c"));
-    assert_eq!(CheckoutBinding::steps(&checkout, &CheckoutStatusPatch::MarkGone), vec![Step::Vanished]);
+    assert_eq!(
+        CheckoutBinding::steps(&checkout, &CheckoutStatusPatch::MarkGone),
+        vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }]
+    );
 }
 
 // Behaviour: with the switch off the wrapper is the old reconciler: its patch and requeue pass
@@ -470,7 +479,12 @@ async fn environment_failure_uses_engine_readiness_without_a_copy() {
                 assert_eq!(decision.patch, Some(failed));
                 let held = home.get("env-a").expect("held");
                 if realised {
-                    assert_eq!(held.state(), &LifecycleState::Gone);
+                    assert_eq!(
+                        held.state(),
+                        &LifecycleState::Gone {
+                            ending: flotilla_state_machines::machines::lifecycle::Ending::Failed { reason: cause.into() }
+                        }
+                    );
                 } else {
                     assert!(matches!(held.state(), LifecycleState::GaveUp { cause: actual } if actual.detail == cause));
                 }
@@ -638,23 +652,35 @@ async fn each_launch_of_a_session_is_its_own_resource() {
     reconcile(&engine, &mut obj).await;
     assert_eq!(state(1), Some(LifecycleState::Realised { identity: "s1".into() }));
     reconcile(&engine, &mut obj).await;
-    assert_eq!(state(1), Some(LifecycleState::Gone), "stopped: released");
+    assert_eq!(
+        state(1),
+        Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }),
+        "stopped: released"
+    );
     assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(TerminalSessionPhase::Stopped));
     // Ended, and not starting again: the old reconciler is not asked, and nothing is written.
     assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
-    assert_eq!(state(1), Some(LifecycleState::Gone));
+    assert_eq!(state(1), Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }));
 
     // The old path resumes it in place (crew_ops' MarkStarting): the next run is a new launch.
     TerminalSessionStatusPatch::MarkStarting.apply(obj.status.as_mut().expect("status"));
     reconcile(&engine, &mut obj).await;
-    assert_eq!(state(1), Some(LifecycleState::Gone), "never revived");
+    assert_eq!(
+        state(1),
+        Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }),
+        "never revived"
+    );
     assert_eq!(state(2), Some(LifecycleState::Realised { identity: "s2".into() }));
 
     reconcile(&engine, &mut obj).await;
     assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(TerminalSessionPhase::Lost));
     assert_eq!(state(2), Some(LifecycleState::Realised { identity: "s2".into() }), "unobservable stays Realised");
     reconcile(&engine, &mut obj).await;
-    assert_eq!(state(2), Some(LifecycleState::Gone), "relaunched: the lost launch observed absent");
+    assert_eq!(
+        state(2),
+        Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost }),
+        "relaunched: the lost launch observed absent"
+    );
     reconcile(&engine, &mut obj).await;
     assert_eq!(state(3), Some(LifecycleState::Realised { identity: "s3".into() }));
 }
@@ -742,6 +768,12 @@ fn every_old_phase_imports_and_rehearses() {
         let mut obj = environment_object(true);
         obj.status = Some(EnvironmentStatus { phase, docker_container_id: Some("c0ffee".into()), ..Default::default() });
         let imported = import::<EnvironmentBinding>(&obj, HOME).expect("imports");
+        if phase == EnvironmentPhase::Lost {
+            assert_eq!(
+                imported.resource.state(),
+                &LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost }
+            );
+        }
         assert_eq!(label(imported.resource.state()), expected, "{phase:?}");
         environments.push(imported);
     }
@@ -807,6 +839,12 @@ fn every_old_phase_imports_and_rehearses() {
         let mut obj = worktree(Some("convoy-a"));
         obj.status = Some(CheckoutStatus { phase, path: Some("/work/feature".into()), ..CheckoutStatus::default() });
         let imported = import::<CheckoutBinding>(&obj, HOME).expect("imports");
+        if phase == CheckoutPhase::Gone {
+            assert_eq!(
+                imported.resource.state(),
+                &LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }
+            );
+        }
         assert_eq!(label(imported.resource.state()), expected, "{phase:?}");
         assert_eq!(rehearse(&[imported]), BTreeMap::new());
     }
@@ -960,7 +998,7 @@ async fn a_vessel_lease_is_granted_on_its_pinned_host_and_ends_gone() {
     assert_eq!(state(), Some(LifecycleState::Realised { identity: "env-a".into() }));
 
     assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(lost));
-    assert_eq!(state(), Some(LifecycleState::Gone));
+    assert_eq!(state(), Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost }));
     home.with_placements(|placements| assert!(placements.ledger().vessel(&VesselId::new(name)).is_none(), "the lease is freed"));
 }
 
@@ -1053,7 +1091,7 @@ fn a_restart_puts_each_live_lease_back_on_its_pinned_host() {
 
 // Behaviour (#3629 layer 9, Q6): each old vessel phase imports as its lease on its pinned host, and
 // the rehearsal restores each: provisioning is Requested, ready and interrupted are Realised under
-// the environment, and lost and failed are Gone (a vessel never gives up). A vessel never placed
+// the environment, and lost and failed retain distinct Gone endings. A vessel never placed
 // is noted, not stored and not refused.
 #[test]
 fn every_vessel_phase_imports_as_its_lease() {
@@ -1070,6 +1108,7 @@ fn every_vessel_phase_imports_as_its_lease() {
         let status = vessel.status.as_mut().expect("status");
         status.phase = phase;
         status.environment_ref = Some("env-a".into());
+        status.message = Some("backing failed".into());
         vessel
     };
     for (phase, expected) in [
@@ -1081,6 +1120,19 @@ fn every_vessel_phase_imports_as_its_lease() {
         (VesselPhase::Failed, "gone"),
     ] {
         let imported = import::<VesselBinding>(&placed(phase), HOME).expect("imported");
+        match phase {
+            VesselPhase::Lost => assert_eq!(
+                imported.resource.state(),
+                &LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost }
+            ),
+            VesselPhase::Failed => assert_eq!(
+                imported.resource.state(),
+                &LifecycleState::Gone {
+                    ending: flotilla_state_machines::machines::lifecycle::Ending::Failed { reason: "backing failed".into() }
+                }
+            ),
+            _ => {}
+        }
         assert_eq!(label(imported.resource.state()), expected, "{phase:?}");
         assert_eq!(imported.resource.spec().host, Host::new("feta"));
     }
@@ -1144,13 +1196,16 @@ async fn a_readiness_the_engine_does_not_take_is_not_written() {
     home.step("convoy-a-implement", &Step::Released, super::at(Utc::now())).expect("released");
 
     let decided = decide::<VesselBinding>(home.as_ref(), &obj, Some(vessel_ready("env-a")), Utc::now());
-    assert!(matches!(decided.patch, Some(VesselStatusPatch::MarkLost { .. })), "the copy, not the readiness: {:?}", decided.patch);
-    decided.patch.expect("copy").apply(obj.status.get_or_insert_with(Default::default));
+    assert!(decided.patch.is_none(), "refused readiness emits no status copy");
     let status = obj.status.as_ref().expect("status");
     assert!(status.ready_at.is_none(), "never written ready");
-    assert_eq!(status.phase, VesselPhase::Lost);
+    assert_eq!(status.phase, VesselPhase::Provisioning, "old status is not a lifecycle source");
+    assert!(matches!(
+        super::reads::judge::<flotilla_state_machines::machines::vessel::VesselKind>(home.get("convoy-a-implement").expect("held").state()),
+        super::reads::Judgement::Released
+    ));
     let lost = VesselStatusPatch::MarkLost { message: "gone".into() };
-    assert_eq!(decide::<VesselBinding>(home.as_ref(), &obj, Some(lost), Utc::now()).patch, None, "already Lost: nothing to write");
+    assert_eq!(decide::<VesselBinding>(home.as_ref(), &obj, Some(lost), Utc::now()).patch, None, "ended: nothing to write");
 }
 
 // Storage errors between Attempted and GiveUp cannot retally one failure, including after restart.
@@ -1233,12 +1288,10 @@ fn a_lifecycle_finishes_a_durable_failed_attempt_after_log_errors(tc: hegel::Tes
         struct Reads(Arc<dyn Lifecycles<CloneKind>>);
         impl LifecycleReads for Reads {
             fn try_reading(&self, _: ProvisioningKind, name: &str, _: Option<&str>) -> Result<Option<LifecycleReading>, String> {
-                Ok(self.0.get(name).map(|resource| {
-                    match super::reads::judge::<CloneKind>(resource.state(), super::reads::Ending::Unknown) {
-                        super::reads::Judgement::Exhausted { last } => LifecycleReading::Exhausted { cause: last.detail },
-                        super::reads::Judgement::GaveUp { cause } => LifecycleReading::GaveUp { cause: cause.detail },
-                        _ => panic!("only recovery states belong in this scenario"),
-                    }
+                Ok(self.0.get(name).map(|resource| match super::reads::judge::<CloneKind>(resource.state()) {
+                    super::reads::Judgement::Exhausted { last } => LifecycleReading::Exhausted { cause: last.detail },
+                    super::reads::Judgement::GaveUp { cause } => LifecycleReading::GaveUp { cause: cause.detail },
+                    _ => panic!("only recovery states belong in this scenario"),
                 }))
             }
         }

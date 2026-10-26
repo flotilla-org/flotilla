@@ -46,10 +46,10 @@ pub enum LifecycleReading {
     Ready { identity: String },
     /// Gone, observed absent without a release.
     Lost,
+    /// Ended after an observed failure.
+    Failed { reason: String },
     /// Gone, torn down on purpose.
     Released,
-    /// Gone, without the entry that says how (a replica seeded from a snapshot).
-    Gone,
     /// Its attempts were spent; the last failed with `cause`.
     GaveUp { cause: String },
 }
@@ -63,8 +63,8 @@ impl LifecycleReading {
             Self::Exhausted { .. } => "Exhausted",
             Self::Ready { .. } => "Ready",
             Self::Lost => "Lost",
+            Self::Failed { .. } => "Failed",
             Self::Released => "Released",
-            Self::Gone => "Gone",
             Self::GaveUp { .. } => "GaveUp",
         }
     }
@@ -77,8 +77,8 @@ impl LifecycleReading {
             Self::Exhausted { cause } => Some(format!("{cause} (attempts spent)")),
             Self::Ready { .. } => None,
             Self::Lost => Some("observed absent".into()),
+            Self::Failed { reason } => Some(if reason.is_empty() { "failed (no reason recorded)".into() } else { reason.clone() }),
             Self::Released => Some("released".into()),
-            Self::Gone => Some("gone".into()),
             Self::GaveUp { cause } => Some(cause.clone()),
         }
     }
@@ -99,7 +99,7 @@ mod reading_tests {
             (LifecycleReading::Ready { identity: "i".into() }, "Ready"),
             (LifecycleReading::Lost, "Lost"),
             (LifecycleReading::Released, "Released"),
-            (LifecycleReading::Gone, "Gone"),
+            (LifecycleReading::Failed { reason: "c".into() }, "Failed"),
             (LifecycleReading::GaveUp { cause: "c".into() }, "GaveUp"),
         ];
         for (reading, label) in readings {

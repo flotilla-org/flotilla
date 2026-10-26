@@ -232,7 +232,14 @@ fn the_host_ledger_is_rebuilt_from_live_vessels() {
     world.realisations.put(&observed, Observed { identity: "vm-1".into() });
     world.absences.put(&absent, true);
     vessels.apply("gone", Realise { identity: "vm-1".into(), observed }, &world, Timestamp(1)).expect("realised");
-    vessels.apply("gone", Vanish { observed: absent }, &world, Timestamp(2)).expect("gone");
+    vessels
+        .apply(
+            "gone",
+            Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: absent },
+            &world,
+            Timestamp(2),
+        )
+        .expect("gone");
     before.release(&VesselId::new("gone")).expect("released when Gone");
 
     let stored: Vec<Resource<Vessel>> = vessels
@@ -332,7 +339,7 @@ fn live_leases_and_the_live_by_host_index_agree() {
     let states = [
         LifecycleState::requested(),
         LifecycleState::Realised { identity: "vm".into() },
-        LifecycleState::Gone,
+        LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released },
         LifecycleState::GaveUp { cause },
     ];
     for state in states {

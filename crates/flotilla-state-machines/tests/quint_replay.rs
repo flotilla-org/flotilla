@@ -330,7 +330,7 @@ impl LifecycleKind for VesselKind {
 fn lifecycle_outcome_value(outcome: &Outcome) -> Value {
     match outcome {
         Outcome::Succeeded => constant("Succeeded"),
-        Outcome::Failed { cause, retryable } => variant("Failed", json!({ "retryable": retryable, "cause": cause.detail })),
+        Outcome::Failed { cause, retryable } => variant("AttemptFailed", json!({ "retryable": retryable, "cause": cause.detail })),
     }
 }
 
@@ -364,7 +364,7 @@ fn lifecycle_value<K: LifecycleKind>(home: &Home<Lifecycle<K>>, resource: &Resou
             variant("Requested", Value::Array(attempts.into_iter().map(lifecycle_outcome_value).collect()))
         }
         LifecycleState::Realised { identity } => variant("Realised", json!(identity)),
-        LifecycleState::Gone => constant("Gone"),
+        LifecycleState::Gone { ending } => variant("Gone", flotilla_quint_testkit::lifecycle::ending_value(ending)),
         LifecycleState::GaveUp { cause } => variant("GaveUp", json!(cause.detail)),
     }
 }
@@ -406,7 +406,7 @@ fn lifecycle_step<K: LifecycleKind>(
             if seen {
                 world.absences.put(&observed, true);
             }
-            lifecycle::Vanish { observed }.into()
+            lifecycle::Vanish { cause: lifecycle::VanishCause::Lost, observed }.into()
         }
         other => panic!("{step}: lifecycle operation {other}"),
     };
@@ -431,7 +431,7 @@ fn lifecycle_end_refuses<K: LifecycleKind>(
     let probes = vec![
         lifecycle::Realise { identity: identity.into(), observed: witness }.into(),
         lifecycle::Release { teardown: Ref::new("witness") }.into(),
-        lifecycle::Vanish { observed: Ref::new("witness") }.into(),
+        lifecycle::Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: Ref::new("witness") }.into(),
         lifecycle::GiveUp { cause: cause("failure") }.into(),
         lifecycle::Attempted { outcome: Outcome::Succeeded }.into(),
     ];
@@ -482,7 +482,7 @@ fn machine_edges(trace: &Trace, tally: &mut Tally) {
             "attempt" => {
                 let outcome = match tag(step.pick("outcome")) {
                     "Succeeded" => Outcome::Succeeded,
-                    "Failed" => {
+                    "AttemptFailed" => {
                         let failed = payload(step.pick("outcome"));
                         Outcome::Failed { cause: cause(text(&failed["cause"])), retryable: boolean(&failed["retryable"]) }
                     }
@@ -559,7 +559,11 @@ fn refuse_without_evidence(
             (realise().into(), &none),
             (realise().into(), &stranger),
             (lifecycle::Release { teardown: Ref::new(ONE) }.into(), &none),
-            (lifecycle::Vanish { observed: Ref::new(ONE) }.into(), &none),
+            (
+                lifecycle::Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: Ref::new(ONE) }
+                    .into(),
+                &none,
+            ),
             (lifecycle::GiveUp { cause: cause("other") }.into(), &none),
         ];
         for (edge, world) in probes {
@@ -1028,11 +1032,11 @@ struct Placed {
     evidence: Evidence,
 }
 
-/// The scenario's world: convoys, the ledger, vessel lifecycles, and what
+/// The scenario's world: admission quotas, the ledger, vessel lifecycles, and what
 /// the harness keeps beyond them (each placement's evidence, and the leases
 /// the ledger returned and forgot).
 struct Fleet {
-    convoys: Home<Convoy>,
+    quotas: BTreeMap<i64, Quota>,
     ledger: Ledger,
     vessels: Home<Lifecycle<VesselKind>>,
     placed: BTreeMap<i64, Placed>,
@@ -1051,7 +1055,7 @@ impl Fleet {
         ledger.add_host(Host::new("1"), BTreeMap::from([(Dimension(0), 2), (Dimension(1), 1)])).expect("host 1");
         ledger.add_host(Host::new("2"), BTreeMap::from([(Dimension(0), 1), (Dimension(1), 2)])).expect("host 2");
         Fleet {
-            convoys: Home::new("home").expect("declaration"),
+            quotas: BTreeMap::new(),
             ledger,
             vessels: Home::new("home").expect("declaration"),
             placed: BTreeMap::new(),
@@ -1062,7 +1066,7 @@ impl Fleet {
     /// The ledger's caps follow the convoy's quota in force.
     fn sync_caps(&mut self, convoy: i64) {
         let name = convoy.to_string();
-        let quota = self.convoys.get(&name).expect("admitted convoy").state().quota().clone();
+        let quota = self.quotas.get(&convoy).expect("admitted quota").clone();
         self.ledger.set_caps(ConvoyId::new(name, "home"), quota);
     }
 
@@ -1079,7 +1083,7 @@ impl Fleet {
                 "Leased",
                 json!({ "placement": lease_value(lease), "lifecycle": lifecycle_value(&self.vessels, resource.expect("a leased vessel's lifecycle")) }),
             )),
-            (None, Some(lease), Some(LifecycleState::Gone)) => Some(variant("Gone", lease_value(lease))),
+            (None, Some(lease), Some(LifecycleState::Gone { .. })) => Some(variant("Gone", lease_value(lease))),
             (held, returned, life) => {
                 panic!("{step}: vessel {id} is inconsistent: ledger {held:?}, returned {returned:?}, lifecycle {life:?}")
             }
@@ -1100,10 +1104,11 @@ impl Fleet {
         }))
     }
 
-    /// Convoys, vessels and the recorded placement evidence equal the model's,
+    /// Quotas, vessels and the recorded placement evidence equal the model's,
     /// and every live lease keeps `queuePriority` over the evidence it read.
     fn check(&self, state: &Value, step: &Step) {
-        check_convoys(&self.convoys, state, step);
+        let observed = map_of(self.quotas.iter().map(|(id, quota)| (int(*id), quota_value(quota))));
+        same(&observed, &state["quotas"], step, "admission quotas");
         let model = store(state, "::vessels");
         same(&slots(model, |id| self.vessel_value(id, step)), model, step, "vessel");
         same(&self.placed_value(), &state["placedOn"], step, "placedOn");
@@ -1178,14 +1183,19 @@ fn admission_placement(trace: &Trace, tally: &mut Tally) {
         };
         match step.action() {
             "admitRequest" => {
-                admit(&mut fleet.convoys, &step, convoy, tally);
+                assert!(!fleet.quotas.contains_key(&convoy), "{step}: admission sets a previously absent quota");
+                fleet.quotas.insert(convoy, BTreeMap::from([(class(0), 1), (class(1), 1)]));
+                tally.writes += 1;
                 fleet.sync_caps(convoy);
             }
             // The scenario readmits authorised, with `Map(0 -> count, 1 -> 1)`.
             "readmit" => {
                 let quota = BTreeMap::from([(class(0), small(step.pick("count"))), (class(1), 1)]);
-                let edge = convoy::Readmit { quota, by: by(), authority: owner() };
-                accept(&mut fleet.convoys, &convoy.to_string(), edge, &convoy_world(true, true), now, &step, tally);
+                let before = fleet.quotas.get(&convoy).expect("admitted quota");
+                assert_eq!(before.keys().collect::<Vec<_>>(), quota.keys().collect::<Vec<_>>(), "{step}: same quota keys");
+                assert!(before.iter().all(|(key, count)| quota[key] >= *count), "{step}: quota only rises");
+                fleet.quotas.insert(convoy, quota);
+                tally.writes += 1;
                 fleet.sync_caps(convoy);
             }
             "request" => {
@@ -1216,7 +1226,6 @@ fn admission_placement(trace: &Trace, tally: &mut Tally) {
             other => panic!("{step}: admission_placement operation {other}"),
         }
         fleet.check(step.after, &step);
-        probe_convoys(&mut fleet.convoys, step.after, now, &step, tally);
         fleet.probe(step.after, &step, tally);
         fleet.gone_refuses(step.after, now, &step, tally);
     }
@@ -1231,7 +1240,7 @@ fn phase(state: &LifecycleState) -> FulfillerPhase {
     match state {
         LifecycleState::Requested { .. } => FulfillerPhase::Requested,
         LifecycleState::Realised { .. } => FulfillerPhase::Realised,
-        LifecycleState::Gone => FulfillerPhase::Gone,
+        LifecycleState::Gone { .. } => FulfillerPhase::Gone,
         LifecycleState::GaveUp { .. } => FulfillerPhase::GaveUp,
     }
 }

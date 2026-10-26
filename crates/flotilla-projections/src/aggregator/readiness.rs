@@ -54,8 +54,31 @@ impl Aggregator {
                 && self.read_host(&source.provenance).as_ref() == Some(host)
         });
         if let Some(vessel) = vessel {
-            let status = vessel.object.status.as_ref();
-            let vessel_phase = self.vessel_phase(vessel);
+            let origin = engine_origin(&vessel.provenance);
+            let engine = match self.lifecycle_reads.try_reading(ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref()) {
+                Ok(reading) => reading,
+                Err(error) => {
+                    return (
+                        Readiness {
+                            state: ReadinessState::Blocked,
+                            blockers: vec![ReadinessBlocker {
+                                resource: ResourceRef::new(
+                                    api_version(Vessel::API_PATHS),
+                                    Vessel::API_PATHS.kind,
+                                    &convoy.namespace,
+                                    &vessel.object.metadata.name,
+                                )
+                                .on_host(host.clone()),
+                                phase: "Unknown".into(),
+                                reason: error.clone(),
+                            }],
+                        },
+                        Some(error),
+                    );
+                }
+            };
+            let status = engine.is_none().then_some(vessel.object.status.as_ref()).flatten();
+            let vessel_phase = Self::vessel_phase_from_reading(vessel, engine.as_ref());
             if vessel_phase == VesselPhase::Ready {
                 result.state = ReadinessState::Ready;
             } else {
@@ -73,14 +96,7 @@ impl Aggregator {
                     )
                     .on_host(host.clone()),
                     phase: format!("{vessel_phase:?}"),
-                    reason: status.and_then(|status| status.message.clone()).unwrap_or_else(|| {
-                        if vessel_phase == VesselPhase::Lost {
-                            // TODO(#2872): remove unavailable-rehydration guidance when recovery ships.
-                            "lost, recoverable; rehydration is not available yet (#2872)".into()
-                        } else {
-                            "vessel is not ready".into()
-                        }
-                    }),
+                    reason: vessel_blocker_reason(engine.as_ref(), vessel, vessel_phase),
                 });
             }
             // Lost backing is frozen. Missing child evidence cannot turn it
@@ -90,6 +106,7 @@ impl Aggregator {
                 let loss_reason = result.blockers.last().expect("lost vessel blocker").reason.clone();
                 return (result, Some(loss_reason));
             }
+            // Engine-backed vessels use adopted refs and convoy membership; stale status-only refs are not dependencies.
             let mut checkout_refs =
                 status.map(|status| status.checkout_refs.values().cloned().collect::<BTreeSet<_>>()).unwrap_or_default();
             checkout_refs.extend(vessel.object.spec.adopted_checkout_refs.values().cloned());
@@ -274,7 +291,7 @@ pub(super) fn apply_readiness_event<T: Resource>(
 
 /// The engine home of a resource read from `provenance`: a replica's origin root, or `None` for
 /// this home.
-fn engine_origin(provenance: &ResourceProvenance) -> Option<String> {
+pub(super) fn engine_origin(provenance: &ResourceProvenance) -> Option<String> {
     match provenance {
         ResourceProvenance::Local => None,
         ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
@@ -291,9 +308,29 @@ fn reading_blocker(reading: &LifecycleReading, not_ready: &str) -> Option<(Readi
         // Exhausted gives up on the next reconcile; until then a retry may still be under way.
         // An ended checkout or clone never comes back: the engine has no incarnations, so a vessel
         // waiting on it waits on a replacement under a new name, and readiness says so.
-        LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::Gone | LifecycleReading::GaveUp { .. } => {
+        LifecycleReading::Failed { .. } | LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::GaveUp { .. } => {
             ReadinessState::Failed
         }
     };
     Some((state, reading.label().to_owned(), reading.reason().unwrap_or_else(|| not_ready.to_owned())))
+}
+
+pub(super) fn vessel_blocker_reason(engine: Option<&LifecycleReading>, vessel: &ReadResourceObject<Vessel>, phase: VesselPhase) -> String {
+    engine
+        .and_then(LifecycleReading::reason)
+        .or_else(|| {
+            if engine.is_none() || phase != VesselPhase::Interrupted {
+                return None;
+            }
+            let roles = vessel.object.status.iter().flat_map(|status| status.interrupted_roles.iter()).cloned().collect::<Vec<_>>();
+            (!roles.is_empty()).then(|| format!("crew roles are interrupted: {}", roles.join(", ")))
+        })
+        .or_else(|| engine.is_none().then(|| vessel.object.status.as_ref().and_then(|status| status.message.clone())).flatten())
+        .unwrap_or_else(|| {
+            if phase == VesselPhase::Lost {
+                "lost, recoverable; rehydration is not available yet (#2872)".into()
+            } else {
+                "vessel is not ready".into()
+            }
+        })
 }

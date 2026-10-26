@@ -8,14 +8,14 @@ module lifecycle_conformance {
   var probe: Probe
   pure val maxHistory = 2
   pure val causes = Set("failure", "other")
-  pure val outcomes = Set(L::Succeeded).union(Set(true, false).map(r => causes.map(c => L::Failed({ retryable: r, cause: c }))).flatten())
+  pure val outcomes = Set(L::Succeeded).union(Set(true, false).map(r => causes.map(c => L::AttemptFailed({ retryable: r, cause: c }))).flatten())
   pure def attempts(s: L::State): Set[L::Event] = match s {
     | Requested(h) => if (h.length() < maxHistory) outcomes.map(o => L::Attempted(o)) else Set()
     | _ => outcomes.map(o => L::Attempted(o))
   }
   pure def events(s: L::State): Set[L::Event] = Set(true, false).map(p => Set(true, false).map(m => L::Realise({ present: p, matches: m, identity: "model" }))).flatten()
     .union(Set(true, false).map(c => L::Release({ teardownComplete: c })))
-    .union(Set(true, false).map(a => L::Vanish({ absent: a })))
+    .union(Set(true, false).map(a => Set(L::Lost).union(causes.map(c => L::Failed(c))).map(c => L::Vanish({ absent: a, cause: c }))).flatten())
     .union(causes.map(c => L::GiveUp({ cause: c })))
     .union(attempts(s))
   action init = all { state' = L::Requested([]), probe' = Started }

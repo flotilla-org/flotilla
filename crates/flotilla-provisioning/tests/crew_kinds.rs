@@ -76,7 +76,13 @@ fn a_terminal_session_survives_the_codec() {
         brief: Frozen::new(brief).expect("freeze"),
     };
     for (source, holder) in [(Launch::Tool { command: "bash".into() }, None), (agent, Some(Holder::vessel("convoy-work")))] {
-        for state in [LifecycleState::requested(), LifecycleState::Realised { identity: "cleat-1".into() }, LifecycleState::Gone] {
+        for state in [
+            LifecycleState::requested(),
+            LifecycleState::Realised { identity: "cleat-1".into() },
+            LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released },
+            LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost },
+            LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Failed { reason: "failed".into() } },
+        ] {
             let spec = TerminalSessionRequest {
                 environment: Ref::<Resource<Environment>>::new("env", "feta"),
                 holder: holder.clone(),
