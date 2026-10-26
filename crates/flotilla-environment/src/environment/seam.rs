@@ -63,14 +63,17 @@ impl ProviderObservation {
 }
 
 /// Read-only tool detection, separate from required lifecycle operations.
-/// Providers isolate HOME, harness and XDG configuration/cache/state, clear
-/// ambient authentication, and clean observation state after cancellation.
-/// `scratch` identifies the caller workspace, never the harness home or CWD.
+/// The observed command inherits only the prepared base layer in `context`.
+/// Providers isolate HOME, XDG configuration/cache/state and each family's
+/// account home, clear ambient authentication, and clean observation state
+/// after cancellation. `scratch` identifies the caller workspace, never the
+/// harness home or CWD.
 #[async_trait]
 pub trait EnvironmentDetection: Send + Sync {
     async fn detect(
         &self,
         image: Option<&str>,
+        context: &flotilla_provider_runtime::execution_context::ObservationContext,
         binary: &str,
         args: &[&str],
         scratch: &std::path::Path,

@@ -213,6 +213,7 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
             runner: runner.as_ref(),
             env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
             scratch: Path::new("/tmp/flotilla-probe-test"),
+            observation: &Default::default(),
         },
         &mut ModelProbeState::default(),
     )

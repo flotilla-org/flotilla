@@ -7,7 +7,8 @@ use super::*;
 use crate::environment::runner::{contained_credential_exclusions, CONTAINED_CODEX_HOME, CONTAINED_WRITABLE_CONFIG_BASE};
 use ::drydock::api::ProviderApi;
 use drydock_protocol as wire;
-
+#[cfg(test)]
+pub(crate) use runner::AgentRunner as GuestAgentRunner;
 use runner::{error, AgentRunner};
 const CHECKPOINT_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 use sha2::Digest;

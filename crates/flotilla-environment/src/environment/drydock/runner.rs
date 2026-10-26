@@ -3,7 +3,7 @@ use super::*;
 use drydock_agent::{Client, Exec, ExecEvent};
 use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 
-pub(super) struct AgentRunner(pub Arc<Client>);
+pub(crate) struct AgentRunner(pub Arc<Client>);
 impl AgentRunner {
     pub(super) async fn write_bytes(&self, path: &Path, bytes: Vec<u8>, mode: u32) -> Result<(), String> {
         if !matches!(mode, 0o600 | 0o700 | 0o755 | 0o644) {

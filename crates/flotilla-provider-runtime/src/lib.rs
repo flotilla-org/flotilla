@@ -3,6 +3,7 @@ pub mod blocking_probe;
 pub mod observation_error;
 pub mod weak_registry;
 pub use observation_error::ObservationError;
+pub mod execution_context;
 mod git_config_guard;
 pub mod host_environment;
 pub mod ssh_runner;

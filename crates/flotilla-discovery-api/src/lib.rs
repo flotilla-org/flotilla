@@ -11,7 +11,7 @@ pub mod provider_config;
 use async_trait::async_trait;
 pub use environment::{host_environment_keys, EnvironmentAssertion, EnvironmentBag, VcsKind};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_provider_runtime::{CommandRunner, EnvVars};
+use flotilla_provider_runtime::{execution_context::AccountState, CommandRunner, EnvVars};
 use provider_config::ProviderConfigView;
 use std::sync::Arc;
 
@@ -198,6 +198,11 @@ pub trait Factory: Send + Sync {
     type Output: ?Sized + Send + Sync;
 
     fn descriptor(&self) -> Self::Descriptor;
+
+    /// The variables this provider family keeps its account state in.
+    fn account_state(&self) -> Option<AccountState> {
+        None
+    }
 
     async fn probe(
         &self,

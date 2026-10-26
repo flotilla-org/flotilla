@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use chrono::Utc;
 use flotilla_environment::environment::EnvironmentProvider;
-use flotilla_provider_runtime::{CommandRunner, EnvVars};
+use flotilla_provider_runtime::{execution_context::ObservationContext, CommandRunner, EnvVars};
 use flotilla_resources::{
     FulfilmentFacts, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, ModelProbeState, Platform,
 };
@@ -15,6 +15,9 @@ const HARNESSES: &[(&str, &str)] = &[("claude-code", "claude"), ("codex", "codex
 pub(crate) struct DetectionTarget<'a> {
     pub(crate) image: Option<&'a str>,
     pub(crate) provider: &'a dyn EnvironmentProvider,
+    /// The target's prepared base layer: what its crews run with, minus
+    /// their account material.
+    pub(crate) context: &'a ObservationContext,
 }
 
 async fn run_in_realisation(
@@ -27,6 +30,7 @@ async fn run_in_realisation(
         Duration::from_secs(15),
         target.provider.detection().ok_or("environment provider has no tool detection capability")?.detect(
             target.image,
+            target.context,
             binary,
             args,
             scratch,
@@ -155,6 +159,16 @@ mod tests {
     use flotilla_provider_runtime::{ChannelLabel, CommandOutput};
     use std::sync::{Arc, Mutex};
 
+    /// The command the isolation shell runs: after its root, the counted
+    /// base-layer words and the counted account homes.
+    fn observed_command<'a>(args: &'a [&'a str]) -> Option<&'a [&'a str]> {
+        let mut index = args.iter().position(|arg| *arg == "flotilla-observation")? + 2;
+        for _ in 0..2 {
+            index += args[index].parse::<usize>().expect("word count") + 1;
+        }
+        Some(&args[index..])
+    }
+
     // Subprocess seam: unwrap only the provider's isolated observation shell.
     // Any model-turn command or ambient token/profile read fails immediately.
     #[derive(Default)]
@@ -170,13 +184,16 @@ mod tests {
             panic!("unexpected request or credential read")
         }
         async fn run_output(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
-            let harness_args = args.iter().position(|arg| *arg == "flotilla-observation").map(|index| &args[index + 3..]).unwrap_or(args);
+            let harness_args = observed_command(args).unwrap_or(args);
             if harness_args.iter().any(|arg| ["--model", "--print", "-p", "/messages", "/completions"].contains(arg)) {
                 self.inference_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return Err("automatic inference forbidden".into());
             }
             if cmd == "rm" {
                 return Ok(CommandOutput { stdout: String::new(), stderr: String::new(), exit_code: Some(0) });
+            }
+            if cmd == "docker" && args.contains(&"{{json .Config.Env}}") {
+                return Ok(CommandOutput { stdout: r#"["PATH=/usr/bin:/bin"]"#.into(), stderr: String::new(), exit_code: Some(0) });
             }
             if cmd == "docker" && args.first() == Some(&"image") {
                 return if self.missing_image {
@@ -189,11 +206,9 @@ mod tests {
                 return Ok(CommandOutput { stdout: String::new(), stderr: String::new(), exit_code: Some(0) });
             }
             assert!(cmd == "env" || cmd == "docker");
-            let args = &args[args.iter().position(|arg| *arg == "-c").expect("isolated shell")..];
-            assert_eq!(args[0], "-c");
-            assert_eq!(args[2], "flotilla-observation");
-            let binary = args[4];
-            assert_eq!(&args[5..], &["--version"], "no model request may be used for availability");
+            let observed = observed_command(args).expect("isolated shell");
+            let binary = observed[0];
+            assert_eq!(&observed[1..], &["--version"], "no model request may be used for availability");
             self.calls.lock().expect("calls").push(binary.into());
             if binary == "rustc" && self.slow_tool {
                 tokio::time::sleep(Duration::from_secs(60)).await;
@@ -225,7 +240,7 @@ mod tests {
         let mut state = ModelProbeState { total_requests: 8, ..Default::default() };
         let facts = probe_kind(
             &spec,
-            DetectionTarget { image: None, provider: provider.as_ref() },
+            DetectionTarget { image: None, provider: provider.as_ref(), context: &Default::default() },
             false,
             runner.as_ref(),
             &TestEnvVars::new([("HOME", "/fake-operator"), ("ANTHROPIC_API_KEY", "fake-unrelated-account")]),
@@ -258,7 +273,7 @@ mod tests {
                 .build();
             let facts = probe_kind(
                 &spec,
-                DetectionTarget { image: Some("crew:test"), provider: provider.as_ref() },
+                DetectionTarget { image: Some("crew:test"), provider: provider.as_ref(), context: &Default::default() },
                 true,
                 runner.as_ref(),
                 &TestEnvVars::default(),
@@ -332,7 +347,7 @@ mod tests {
         let mut models = ModelProbeState::default();
         let facts = super::probe_kind(
             &spec,
-            DetectionTarget { image: None, provider: &provider },
+            DetectionTarget { image: None, provider: &provider, context: &Default::default() },
             true,
             runner.as_ref(),
             &TestEnvVars::default(),

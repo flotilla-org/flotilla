@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use toml_edit::{value, DocumentMut, Item, Table};
 
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::execution_context::AccountState;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_terminal::TerminalEnvVars;
@@ -1255,7 +1256,24 @@ async fn remove_agent_files(runner: &dyn CommandRunner, cwd: &Path, brief: &Term
 /// probes them in every environment beside the built-in detection.
 pub trait AgentAdapterFactory: Send + Sync {
     fn probe(&self, env: &EnvironmentBag, runner: Arc<dyn CommandRunner>) -> Option<Arc<dyn AgentAdapter>>;
+
+    /// The variables the contributed harness keeps its account state in.
+    fn account_state(&self) -> Option<AccountState> {
+        None
+    }
 }
+
+/// Claude Code's login and configuration home, and the variables that
+/// authenticate it directly.
+pub const CLAUDE_CODE_ACCOUNT_STATE: AccountState = AccountState::new("claude-code")
+    .homes(&["CLAUDE_CONFIG_DIR"])
+    .secrets(&["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"])
+    .observation_defaults(&[("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")]);
+
+/// Codex's login and configuration home, and the variables that authenticate
+/// it directly.
+pub const CODEX_ACCOUNT_STATE: AccountState =
+    AccountState::new("codex").homes(&["CODEX_HOME"]).secrets(&["OPENAI_API_KEY", "CODEX_API_KEY"]);
 
 #[derive(Clone, Default)]
 pub struct AgentAdapterRegistry {
@@ -1263,6 +1281,11 @@ pub struct AgentAdapterRegistry {
 }
 
 impl AgentAdapterRegistry {
+    /// The account state of the harnesses built-in detection can register.
+    pub fn built_in_account_state() -> &'static [AccountState] {
+        &[CLAUDE_CODE_ACCOUNT_STATE, CODEX_ACCOUNT_STATE]
+    }
+
     /// Built-in detection plus every installed factory that accepts the bag.
     /// An installed adapter never replaces a built-in with the same id.
     pub fn discover_with(env: &EnvironmentBag, runner: Arc<dyn CommandRunner>, factories: &[Arc<dyn AgentAdapterFactory>]) -> Self {

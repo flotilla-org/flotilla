@@ -173,3 +173,7 @@ The owner's environment and placement grill separated three things that "host" u
   - **Removal:** the fields go one roll after nothing writes them, or at the generated-table move (#3108), whichever is first, with the schema review.
 - **A drydock provider's name is the instance segment.** Its place is the account that its `credential_reference` identifies ([ADR 0070](0070-drydock-out-of-process-environment-adaptors.md), 2026-10-20 amendment).
 - Placement policies say how a crew runs, not where (#3394). The address is a placement *result*, recorded on the Environment, not a policy input.
+
+### Supplies are installations (2026-10-26, #3883)
+
+A host's declared supplies describe installed tools only. Each registered harness or provider family declares the variables it keeps account state in (Claude Code's `CLAUDE_CONFIG_DIR`, Codex's `CODEX_HOME`, gh's `GH_CONFIG_DIR` and `GH_TOKEN`); a supply that sets one is a host configuration error. Account state comes only from a crew's bound plans, or from an observation's throwaway isolation.

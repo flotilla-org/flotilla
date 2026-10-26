@@ -11,7 +11,9 @@ use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 use flotilla_forge_github::discovery::github_repo_slug;
 use flotilla_forge_github::github::GhApiClient;
+use flotilla_forge_github::github::GH_ACCOUNT_STATE;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::execution_context::AccountState;
 use flotilla_provider_runtime::CommandRunner;
 
 use crate::change_request::GitHubChangeRequest;
@@ -37,6 +39,10 @@ impl Factory for GitHubChangeRequestFactory {
             "Pull Requests",
             "pull request",
         )
+    }
+
+    fn account_state(&self) -> Option<AccountState> {
+        Some(GH_ACCOUNT_STATE)
     }
 
     async fn probe(

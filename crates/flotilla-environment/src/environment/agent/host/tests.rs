@@ -30,8 +30,10 @@ struct FakeHost {
     starts: AtomicUsize,
 }
 
-/// The stub copied as the agent executable: it only records the request.
-const STUB_AGENT: &[u8] = b"#!/bin/sh\n[ \"$1\" = --supervise ] && : > \"$(dirname \"$0\")/supervise-requested\"\n";
+/// The stub copied as the agent executable: it records the request and the
+/// environment it was started with.
+const STUB_AGENT: &[u8] =
+    b"#!/bin/sh\nenv > \"$(dirname \"$0\")/started-environment\"\n[ \"$1\" = --supervise ] && : > \"$(dirname \"$0\")/supervise-requested\"\n";
 
 impl FakeHost {
     fn new() -> Arc<Self> {
@@ -72,7 +74,7 @@ impl CommandRunner for FakeHost {
     }
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         let output = self.local.run_output(cmd, args, cwd, label).await;
-        if let ["-c", script, "flotilla-vessel-agent", directory] = args {
+        if let ["-c", script, "flotilla-vessel-agent", directory, ..] = args {
             if *script == BOOTSTRAP {
                 self.supervise(Path::new(directory));
             }
@@ -110,8 +112,20 @@ fn fixture(transport: Arc<dyn AgentTransport>) -> Fixture {
     let executable = root.path().join("drydock-agent-build");
     std::fs::write(&executable, STUB_AGENT).unwrap();
     let host = FakeHost::new();
-    let connector =
-        HostAgentConnector::new(host.clone(), transport, directory.clone(), Platform::current(), executable, Duration::from_secs(10));
+    let base = BaseLayer::declared(
+        [("PATH".to_string(), "/opt/supplied/bin:/usr/bin:/bin".to_string()), ("TOOL_HOME".to_string(), "/opt/supplied".to_string())],
+        &Default::default(),
+    )
+    .unwrap();
+    let connector = HostAgentConnector::new(
+        host.clone(),
+        transport,
+        directory.clone(),
+        Platform::current(),
+        executable,
+        Duration::from_secs(10),
+        &base,
+    );
     let runner = Arc::new(AgentRunner::new(Arc::new(connector), root.path().join("controller")));
     std::fs::create_dir(root.path().join("controller")).unwrap();
     Fixture { host, directory, runner, _root: root }
@@ -132,6 +146,13 @@ async fn first_connect_installs_and_a_killed_agent_is_bootstrapped_again() {
     assert_eq!(std::fs::metadata(&installed).unwrap().permissions().mode() & 0o777, 0o700);
     assert_eq!(std::fs::metadata(&fixture.directory).unwrap().permissions().mode() & 0o777, 0o700);
     assert_eq!(fixture.host.starts.load(Ordering::SeqCst), 1);
+    // The agent starts with the prepared base layer and the login identity,
+    // nothing of the session that started it.
+    let started = std::fs::read_to_string(fixture.directory.join("started-environment")).unwrap();
+    let started = started.lines().filter_map(|line| line.split_once('=')).collect::<BTreeMap<_, _>>();
+    assert_eq!(started.get("PATH"), Some(&"/opt/supplied/bin:/usr/bin:/bin"), "{started:?}");
+    assert_eq!(started.get("TOOL_HOME"), Some(&"/opt/supplied"));
+    assert!(!started.contains_key("CARGO_MANIFEST_DIR"), "{started:?}");
     let echo = || runner.run("sh", &["-c", "printf %s \"$VESSEL\""], Path::new("/"), &ChannelLabel::Default);
     assert_eq!(echo().await.unwrap(), "a");
 

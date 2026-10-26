@@ -17,6 +17,7 @@ use flotilla_environment::environment::{
 };
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId};
+use flotilla_provider_runtime::execution_context::{AccountVariables, BaseLayer, ObservationContext, LOCALE_VARIABLES};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provisioning::reconcilers::{EnvironmentProvisioning, EnvironmentRuntime};
 use flotilla_resources::{
@@ -648,7 +649,15 @@ impl DockerControllerRuntime {
             }
         };
         if let Some(cloud) = &environment_spec.cloud_sandbox {
-            if let Err(error) = verify_cloud_image_needs(&cloud.probe_needs, &cloud.image, &handle, &bag).await {
+            if let Err(error) = verify_cloud_image_needs(
+                &cloud.probe_needs,
+                &cloud.image,
+                &handle,
+                &bag,
+                &self.state.daemon.discovery_runtime().factories.account_variables(),
+            )
+            .await
+            {
                 return Err(discard_failed_environment(
                     &handle,
                     self.state.credential_store.as_deref(),
@@ -902,10 +911,19 @@ pub(super) async fn verify_cloud_image_needs(
     image: &str,
     handle: &EnvironmentHandle,
     bag: &EnvironmentBag,
+    accounts: &AccountVariables,
 ) -> Result<(), String> {
     if needs.is_empty() {
         return Ok(());
     }
+    // The sandbox's agent states its own environment; its probes take that
+    // `PATH` and locale as their base layer.
+    let declared = std::iter::once("PATH").chain(LOCALE_VARIABLES.iter().copied());
+    let base = BaseLayer::declared(
+        declared.filter_map(|name| bag.find_env_var(name).map(|value| (name.to_string(), value.to_string()))),
+        accounts,
+    )?;
+    let observation = ObservationContext::new(base, accounts);
     // This helper adopts an already-running command endpoint only for detection;
     // it never provisions or selects a runtime for the sandbox.
     let detector = flotilla_environment::environment::command_provider(
@@ -921,7 +939,7 @@ pub(super) async fn verify_cloud_image_needs(
     };
     let facts = crate::fulfilment_probe::probe_kind(
         &kind,
-        crate::fulfilment_probe::DetectionTarget { image: None, provider: detector.as_ref() },
+        crate::fulfilment_probe::DetectionTarget { image: None, provider: detector.as_ref(), context: &observation },
         true,
         &*handle.runner(),
         &GuestProbeEnvironment(bag),

@@ -326,6 +326,13 @@ pub(super) fn spawn_local_fulfilment_probe_task(
             // `observed_at` may lag until the heartbeat folds a refresh in.
             let previous = observations.fulfilment_facts().await.unwrap_or_else(|| status.fulfilment_facts.clone());
             let mut model_probes = status.model_probes.clone();
+            let observation = match super::discovery::local_observation(discovery) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    warn!(%error, "local host is not ready for fulfilment probes");
+                    return;
+                }
+            };
             match observe_fulfilment_facts(
                 &daemon.resource_backend(),
                 &namespace,
@@ -337,6 +344,7 @@ pub(super) fn spawn_local_fulfilment_probe_task(
                     runner: discovery.runner.as_ref(),
                     env: discovery.env.as_ref(),
                     scratch: &scratch,
+                    observation: &observation,
                 },
                 &mut model_probes,
             )
@@ -398,6 +406,14 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
                     return;
                 }
             };
+            let observation = match ssh.preparer(Vec::new()).observation() {
+                Ok(observation) => observation,
+                Err(error) => {
+                    let error = error.for_environment(ssh.environment_id.as_str());
+                    warn!(%error, "agentless host cannot be probed");
+                    return;
+                }
+            };
             match observe_fulfilment_facts(
                 &daemon.resource_backend(),
                 &namespace,
@@ -409,6 +425,7 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
                     runner: ssh.runner.as_ref(),
                     env: &BagEnvVars(&ssh.env_bag),
                     scratch: &scratch,
+                    observation: &observation,
                 },
                 &mut model_probes,
             )

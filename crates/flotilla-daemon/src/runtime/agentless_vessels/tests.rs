@@ -184,6 +184,7 @@ fn host(runner: Arc<dyn CommandRunner>) -> Host {
             .with(EnvironmentAssertion::env_var("XDG_RUNTIME_DIR", runtime.path().display().to_string())),
         runner,
         host_environment: Default::default(),
+        accounts: flotilla_discovery::FactoryRegistry::default_all().account_variables(),
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::<String, FulfilmentFacts>::new())),
         vessel_agent: Err("vessel agents are reached directly in this test".into()),
         max_vessels: None,
