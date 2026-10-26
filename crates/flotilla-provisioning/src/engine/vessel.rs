@@ -31,7 +31,7 @@ use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyId, Priority, VesselClass},
-        lifecycle::{Attempted, Lifecycle, LifecycleEdge, LifecycleState, Realise, Release, Vanish},
+        lifecycle::{Attempted, Lifecycle, LifecycleEdge, LifecycleState, Realise, Release, Vanish, VanishCause},
         vessel::{live_leases, Vessel, VesselKind, VesselSpec},
     },
     placement::{Host, LedgerError, PlacementError, Placements, Units, VesselId},
@@ -88,12 +88,7 @@ impl Binding for VesselBinding {
             }
             VesselStatusPatch::MarkReady { .. } => vec![],
             // An observed backing can vanish; a failed provisioning attempt retains its cause.
-            VesselStatusPatch::MarkLost { .. } if realised(obj) => {
-                vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }]
-            }
-            VesselStatusPatch::MarkFailed { message } if realised(obj) => vec![Step::Vanished {
-                cause: flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: message.clone() },
-            }],
+            VesselStatusPatch::MarkLost { .. } | VesselStatusPatch::MarkFailed { .. } if realised(obj) => vanished(patch),
             VesselStatusPatch::MarkLost { message } | VesselStatusPatch::MarkFailed { message } => {
                 // Both reports come from outside the machine. Before realisation the same inputs
                 // cannot recover by retrying, so the failure spends the request immediately.
@@ -123,18 +118,24 @@ impl Binding for VesselBinding {
                 vec![Step::Realised { identity: environment_ref.clone().unwrap_or_else(|| obj.metadata.name.clone()) }]
             }
             (VesselStatusPatch::MarkReady { .. }, Some(LifecycleState::Realised { .. })) => vec![],
-            (VesselStatusPatch::MarkLost { .. }, Some(LifecycleState::Realised { .. })) => {
-                vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }]
+            (VesselStatusPatch::MarkLost { .. } | VesselStatusPatch::MarkFailed { .. }, Some(LifecycleState::Realised { .. })) => {
+                vanished(patch)
             }
-            (VesselStatusPatch::MarkFailed { message }, Some(LifecycleState::Realised { .. })) => vec![Step::Vanished {
-                cause: flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: message.clone() },
-            }],
             (
                 VesselStatusPatch::MarkLost { message } | VesselStatusPatch::MarkFailed { message },
                 Some(LifecycleState::Requested { .. }),
             ) => vec![Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, message), retryable: false })],
             _ => Self::steps(obj, patch),
         }
+    }
+}
+
+/// A realised backing's observed ending has the same cause on both binding paths.
+fn vanished(patch: &VesselStatusPatch) -> Vec<Step> {
+    match patch {
+        VesselStatusPatch::MarkLost { .. } => vec![Step::Vanished { cause: VanishCause::Lost }],
+        VesselStatusPatch::MarkFailed { message } => vec![Step::Vanished { cause: VanishCause::Failed { reason: message.clone() } }],
+        _ => vec![],
     }
 }
 

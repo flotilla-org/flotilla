@@ -46,7 +46,7 @@ use flotilla_resources::{
 };
 use flotilla_schema::{Kind, State, Timestamp};
 use flotilla_state_machines::{
-    machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
+    machines::lifecycle::{Ending, Lifecycle, LifecycleKind, LifecycleState},
     Cause, CauseCategory, Failure, Resource, Version,
 };
 
@@ -227,7 +227,7 @@ impl Imported for EnvironmentBinding {
                 let root = obj.spec.host_direct.as_ref().map(|host| host.repo_default_dir.clone());
                 realised(container.or(root), "container or root")?
             }
-            EnvironmentPhase::Lost => LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost },
+            EnvironmentPhase::Lost => LifecycleState::Gone { ending: Ending::Lost },
             EnvironmentPhase::Failed => LifecycleState::GaveUp { cause: failed_by(message, "the environment failed") },
         })
     }
@@ -294,7 +294,8 @@ impl Imported for CheckoutBinding {
             CheckoutPhase::Failed => {
                 LifecycleState::GaveUp { cause: failed_by(status.and_then(|status| status.message.as_deref()), "the checkout failed") }
             }
-            CheckoutPhase::Gone => LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released },
+            // Legacy Gone retained no ending cause; import normalizes it to a release.
+            CheckoutPhase::Gone => LifecycleState::Gone { ending: Ending::Released },
         })
     }
 }
@@ -308,9 +309,8 @@ impl Imported for TerminalSessionBinding {
             TerminalSessionPhase::Running | TerminalSessionPhase::Lost => {
                 realised(status.and_then(|status| status.session_id.clone()), "session id")?
             }
-            TerminalSessionPhase::Stopped => {
-                LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }
-            }
+            // A legacy stopped launch imports as released; it carries no more detailed ending.
+            TerminalSessionPhase::Stopped => LifecycleState::Gone { ending: Ending::Released },
             TerminalSessionPhase::Failed => {
                 LifecycleState::GaveUp { cause: failed_by(status.and_then(|status| status.message.as_deref()), "the session failed") }
             }
@@ -331,11 +331,9 @@ impl Imported for VesselBinding {
             VesselPhase::Ready | VesselPhase::Interrupted => {
                 realised(status.and_then(|status| status.environment_ref.clone()), "environment")?
             }
-            VesselPhase::Lost => LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost },
+            VesselPhase::Lost => LifecycleState::Gone { ending: Ending::Lost },
             VesselPhase::Failed => LifecycleState::Gone {
-                ending: flotilla_state_machines::machines::lifecycle::Ending::Failed {
-                    reason: status.and_then(|status| status.message.clone()).unwrap_or_default(),
-                },
+                ending: Ending::Failed { reason: status.and_then(|status| status.message.clone()).unwrap_or_default() },
             },
         })
     }
