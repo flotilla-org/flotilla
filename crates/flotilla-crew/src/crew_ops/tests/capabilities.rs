@@ -461,3 +461,63 @@ async fn failing_source_never_publishes_an_empty_card() {
     let messages = backend.using::<Message>("flotilla").list().await.expect("messages").items;
     assert!(messages.is_empty());
 }
+
+// Capability cards verify tools only after the engine realises the referenced image.
+#[tokio::test]
+async fn image_capabilities_follow_engine_without_a_copy() {
+    use flotilla_provisioning::engine::image_build::ImageBuildBinding;
+    use flotilla_provisioning_testkit::{image_build, store_object, Ending, LifecycleFixture};
+    use flotilla_resources::{DockerEnvironmentSpec, Environment, EnvironmentSpec, ImageBuildPhase};
+    let (_, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    let build = image_build(ImageBuildPhase::Built);
+    store_object(&backend, build.clone()).await;
+    backend
+        .using::<Environment>("flotilla")
+        .create(
+            &InputMeta::builder().name("resume-env".into()).build(),
+            &EnvironmentSpec {
+                provider_address: None,
+                host_direct: None,
+                cloud_sandbox: None,
+                docker: Some(DockerEnvironmentSpec {
+                    host_ref: "builder".into(),
+                    image: "composed".into(),
+                    image_build_ref: Some(build.metadata.name.clone()),
+                    declared_agent_adapters: Default::default(),
+                    required_agent_adapters: Default::default(),
+                    pull_policy: Default::default(),
+                    memory_policy: Default::default(),
+                    mounts: vec![],
+                    env: Default::default(),
+                }),
+            },
+        )
+        .await
+        .expect("environment");
+    let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
+    let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
+    // A command-source card exercises the same image reader without unrelated vessel-placement setup.
+    let mut spec = session.spec;
+    spec.source = flotilla_resources::TerminalSessionSource::Tool { command: "true".into() };
+    let endpoints = BTreeMap::new();
+    let card = || {
+        crate::crew_capabilities::session_card_with_lifecycle_reads(
+            &backend,
+            "flotilla",
+            "crew",
+            &spec,
+            &[],
+            &endpoints,
+            fixture.reads.clone(),
+        )
+    };
+    assert!(card().await.expect("unheld").contains("tool:verified"));
+    fixture.request(&build);
+    assert!(!card().await.expect("requested").contains("tool:verified"));
+    fixture.finish(&build, Ending::Ready("engine digest"));
+    assert!(card().await.expect("ready").contains("tool:verified"));
+    fixture.finish(&build, Ending::Lost("engine digest"));
+    assert!(!card().await.expect("lost").contains("tool:verified"));
+    fixture.poison();
+    assert!(card().await.expect_err("checked read").contains("poisoned"));
+}

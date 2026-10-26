@@ -8,10 +8,12 @@ use std::{
 use flotilla_agent::adapter::CAPABILITIES_HEADING;
 use flotilla_capability_contract::{credential_card, CredentialCapability, SessionCapabilitySource};
 use flotilla_messaging::MessageInbox;
+use flotilla_protocol::LifecycleReading;
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{
     message_record_name, vessel_placement_pin, Convoy, Environment, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, ImageBuild,
-    ImageBuildPhase, InputMeta, Message, MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, CREDENTIAL_REFS_ANNOTATION,
+    ImageBuildPhase, InputMeta, Message, MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceProvenance,
+    ResourceRef, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, CREDENTIAL_REFS_ANNOTATION,
 };
 use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
@@ -35,6 +37,19 @@ pub async fn session_card(
     spec: &TerminalSessionSpec,
     credentials: &[CredentialCapability],
     endpoints: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    session_card_with_lifecycle_reads(backend, namespace, convoy_name, spec, credentials, endpoints, Arc::new(NoLifecycleReads)).await
+}
+
+/// Verify image capabilities from the selected origin's checked lifecycle reading.
+pub async fn session_card_with_lifecycle_reads(
+    backend: &ResourceBackend,
+    namespace: &str,
+    convoy_name: &str,
+    spec: &TerminalSessionSpec,
+    credentials: &[CredentialCapability],
+    endpoints: &BTreeMap<String, String>,
+    reads: Arc<dyn LifecycleReads>,
 ) -> Result<String, String> {
     let convoy = backend.including_replicas::<Convoy>(namespace).get(convoy_name).await.map_err(|error| error.to_string())?.object;
     let mut text = format!(
@@ -97,9 +112,23 @@ pub async fn session_card(
     if let Some(docker) = &environment.spec.docker {
         text.push_str(&reachable_paths(&docker.mounts));
         if let Some(build) = &docker.image_build_ref {
-            let build = backend.including_replicas::<ImageBuild>(namespace).get(build).await.map_err(|error| error.to_string())?.object;
-            // A Built image passed every layer's probe, so its layers' provides are verified.
-            if let (Some(spec), Some(ImageBuildPhase::Built)) = (build.spec.current(), build.status.as_ref().map(|status| status.phase)) {
+            let selected = backend.including_replicas::<ImageBuild>(namespace).get(build).await.map_err(|error| error.to_string())?;
+            let origin = match selected.provenance {
+                ResourceProvenance::Local => None,
+                ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+            };
+            let build = selected.object;
+            let name = build.metadata.name.clone();
+            let lifecycle = tokio::task::spawn_blocking(move || reads.try_reading(ProvisioningKind::ImageBuild, &name, origin.as_deref()))
+                .await
+                .map_err(|error| format!("image capability lifecycle read: {error}"))??;
+            let verified = match lifecycle {
+                Some(LifecycleReading::Ready { .. }) => true,
+                Some(_) => false,
+                None => build.status.as_ref().is_some_and(|status| status.phase == ImageBuildPhase::Built),
+            };
+            // Only a realised image has passed every layer's probe.
+            if let Some(spec) = build.spec.current().filter(|_| verified) {
                 let provides = spec.layers.iter().flat_map(|layer| layer.provides.iter().cloned()).collect::<BTreeSet<_>>();
                 text.push_str(&format!("Verified tools and runtimes: {}.\n", provides.into_iter().collect::<Vec<_>>().join(", ")));
             }
@@ -495,16 +524,18 @@ async fn refresh_session_card(
     source: &dyn SessionCapabilitySource,
     session: &ResourceObject<TerminalSession>,
     tracker: &CapabilityCardTracker,
+    reads: Arc<dyn LifecycleReads>,
 ) -> Result<(), String> {
     let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { return Ok(()) };
     let credentials = source.credentials(&session.spec.env_ref, &credential_references(session)?).await?;
-    let card = session_card(
+    let card = session_card_with_lifecycle_reads(
         backend,
         namespace,
         &context.convoy,
         &session.spec,
         &credentials,
         &source.endpoints(&session.spec.env_ref, &session.metadata.name).await?,
+        reads,
     )
     .await?;
     observe_card(backend, namespace, session, &card, tracker).await
@@ -515,6 +546,16 @@ pub async fn refresh_cards(
     namespace: &str,
     source: &dyn SessionCapabilitySource,
     tracker: &CapabilityCardTracker,
+) -> Result<(), String> {
+    refresh_cards_with_lifecycle_reads(backend, namespace, source, tracker, Arc::new(NoLifecycleReads)).await
+}
+
+pub async fn refresh_cards_with_lifecycle_reads(
+    backend: &ResourceBackend,
+    namespace: &str,
+    source: &dyn SessionCapabilitySource,
+    tracker: &CapabilityCardTracker,
+    reads: Arc<dyn LifecycleReads>,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
     let sessions = backend.clone().using::<TerminalSession>(namespace).list().await.map_err(|error| error.to_string())?;
@@ -534,7 +575,7 @@ pub async fn refresh_cards(
         if !session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running) {
             continue;
         }
-        if let Err(error) = refresh_session_card(backend, namespace, source, &session, tracker).await {
+        if let Err(error) = refresh_session_card(backend, namespace, source, &session, tracker, Arc::clone(&reads)).await {
             warn!(session = %session.metadata.name, %error, "failed to refresh session capability card");
             errors.push(format!("{}: {error}", session.metadata.name));
         }

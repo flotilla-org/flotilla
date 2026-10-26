@@ -164,6 +164,7 @@ struct AdmissionReadContext<'a> {
 /// External observations and actions available during planning. No admission
 /// owner, mutation store, identity guard or pending-start registry is exposed.
 struct AdmissionRuntime<'a> {
+    lifecycle_reads: &'a Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     config: &'a ConfigStore,
     discovery: &'a DiscoveryRuntime,
     environment_manager: &'a dyn Environments,
@@ -209,6 +210,7 @@ impl ConvoyAdmission {
             occupancy: BTreeMap::new(),
             placed_here: Default::default(),
             runtime: AdmissionRuntime {
+                lifecycle_reads: &self.lifecycle_reads,
                 config: &self.config,
                 discovery: &self.discovery,
                 environment_manager: self.environment_manager.as_ref(),
@@ -2806,6 +2808,7 @@ impl AdmissionReadContext<'_> {
                         policy.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
                         &kind.spec.realisation,
                         composed.map(|images| images.values().map(|image| image.identity.as_str()).collect::<BTreeSet<_>>()),
+                        Arc::clone(self.runtime.lifecycle_reads),
                     )
                     .await?;
                     candidates.push(KindCandidate { kind, placement, free_slots, vessel_cap, host_ready, sleeping_until, image_cost });
@@ -5067,6 +5070,7 @@ async fn image_placement_cost(
     provider_instance: Option<&str>,
     realisation: &flotilla_resources::FulfilmentRealisation,
     composed: Option<BTreeSet<&str>>,
+    lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
 ) -> Result<flotilla_resources::ImageAcquisitionCost, String> {
     use flotilla_resources::{
         DockerImageSource, FleetDesignation, FulfilmentRealisation, ImageAcquisitionCost, ImageBuildPhase, FLEET_DESIGNATION_NAME,
@@ -5093,8 +5097,17 @@ async fn image_placement_cost(
             let digest = match (&architecture, host) {
                 (Some(architecture), Some(host)) => {
                     let name = crate::image_build::expected_build_name(identity, architecture, image_cache.as_ref(), &host.metadata.name);
-                    match flotilla_store::read_image_build(backend, namespace, &name).await {
-                        Ok(build) => build.status.filter(|status| status.phase == ImageBuildPhase::Built).and_then(|status| status.digest),
+                    match flotilla_store::read_image_build_with_lifecycle(backend, namespace, &name, Arc::clone(&lifecycle_reads)).await {
+                        Ok(reading) => match reading.lifecycle {
+                            Some(flotilla_protocol::LifecycleReading::Ready { identity }) => Some(identity),
+                            Some(_) => None,
+                            None => reading
+                                .build
+                                .object
+                                .status
+                                .filter(|status| status.phase == ImageBuildPhase::Built)
+                                .and_then(|status| status.digest),
+                        },
                         Err(ResourceError::NotFound { .. }) => None,
                         Err(error) => return Err(error.to_string()),
                     }
@@ -5915,6 +5928,7 @@ mod tests {
                 labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
                 &realisation,
                 None,
+                Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
             )
             .await
             .expect("cost");
@@ -5967,8 +5981,17 @@ mod tests {
         let identity = flotilla_resources::image_identity(&layers);
         let name = flotilla_resources::image_build_name(&identity, "amd64", &ImageDelivery::Local, "host");
         let realisation = flotilla_resources::FulfilmentRealisation::DockerPerVessel { image: None };
-        let cost =
-            || image_placement_cost(&backend, "test", Some(&host), Some("cache"), &realisation, Some(BTreeSet::from([identity.as_str()])));
+        let cost = || {
+            image_placement_cost(
+                &backend,
+                "test",
+                Some(&host),
+                Some("cache"),
+                &realisation,
+                Some(BTreeSet::from([identity.as_str()])),
+                Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+            )
+        };
         assert_eq!(cost().await.expect("cost"), ImageAcquisitionCost::Build, "no build yet");
         let builds = backend.using::<ImageBuild>("test");
         let spec = flotilla_resources::ImageBuildSpec::builder()
@@ -5995,9 +6018,41 @@ mod tests {
         status.capabilities.insert(flotilla_resources::IMAGE_DIGESTS_CAPABILITY.into(), serde_json::json!({"cache": [local_id, manifest]}));
         hosts.update_status("host", &host.metadata.resource_version, &status).await.expect("pulled inventory");
         let host = hosts.get("host").await.expect("host");
-        let held =
-            image_placement_cost(&backend, "test", Some(&host), Some("cache"), &realisation, Some(BTreeSet::from([identity.as_str()])));
+        let held = image_placement_cost(
+            &backend,
+            "test",
+            Some(&host),
+            Some("cache"),
+            &realisation,
+            Some(BTreeSet::from([identity.as_str()])),
+            Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        );
         assert_eq!(held.await.expect("cost"), ImageAcquisitionCost::Held);
+
+        // A held engine judgement replaces the contradictory Built digest in placement costs.
+        use flotilla_provisioning::engine::image_build::ImageBuildBinding;
+        use flotilla_provisioning_testkit::{Ending, LifecycleFixture};
+        let build = builds.get(&name).await.expect("build");
+        let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
+        fixture.request(&build);
+        let cost = || {
+            image_placement_cost(
+                &backend,
+                "test",
+                Some(&host),
+                Some("cache"),
+                &realisation,
+                Some(BTreeSet::from([identity.as_str()])),
+                fixture.reads.clone(),
+            )
+        };
+        assert_eq!(cost().await.expect("requested"), ImageAcquisitionCost::Build);
+        fixture.finish(&build, Ending::Ready(&manifest));
+        assert_eq!(cost().await.expect("ready"), ImageAcquisitionCost::Held);
+        fixture.finish(&build, Ending::Lost(&manifest));
+        assert_eq!(cost().await.expect("lost"), ImageAcquisitionCost::Build);
+        fixture.poison();
+        assert!(cost().await.expect_err("checked read").contains("poisoned"));
     }
 
     #[test]

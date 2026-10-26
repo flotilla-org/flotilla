@@ -799,3 +799,167 @@ async fn environment_becomes_ready_with_the_built_digest(#[case] delivery: Image
     assert_eq!(built, expected.0);
     assert_eq!(*docker.provisioned.lock().expect("provisioned"), vec![expected]);
 }
+
+// Shared property helper: engine phase, tally and deadlines win over stale build evidence without a copy.
+pub(super) async fn assert_image_lifecycle(old_phase: ImageBuildPhase, ending: flotilla_provisioning_testkit::Ending<'_>) {
+    use flotilla_provisioning::{engine::image_build::ImageBuildBinding, reconcilers::image_build::ImageBuildPrepared};
+    use flotilla_provisioning_testkit::{image_build, store_object, LifecycleFixture};
+    use flotilla_resources::ImageBuildStatusPatch;
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    host(&backend, "amd64", None).await;
+    let mut obj = image_build(old_phase);
+    obj.metadata.namespace = NS.into();
+    let name = obj.metadata.name.as_str();
+    store_object(&backend, obj.clone()).await;
+    let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
+    fixture.request(&obj);
+    let writes = backend.using::<ImageBuild>(NS).with_lifecycle_status_reads(fixture.reads.clone());
+    let service = BuildService::new(Behaviour::Succeed);
+    let materials = Arc::new(Materials::default());
+    let clock = Arc::new(VirtualClock::new(chrono::DateTime::from_timestamp(3, 0).expect("time")));
+    let reconciler = reconciler(&backend, &service, &materials, &clock).with_lifecycle_reads(fixture.reads.clone());
+    let prepared = reconciler.prepare(&obj).await.expect("engine permits start despite old terminal phase");
+    assert!(matches!(prepared, ImageBuildPrepared::Waiting(_)));
+    let observed = status(&backend, name).await;
+    assert_eq!((observed.phase, observed.attempt), (ImageBuildPhase::Building, 1));
+    fixture.retry(&obj, "network");
+    assert!(
+        matches!(reconciler.retry_disposition(&obj), Some(flotilla_resources::ControllerRetryDisposition::Retryable { next_attempt_at })
+        if next_attempt_at == chrono::DateTime::from_timestamp(32, 0).expect("deadline"))
+    );
+    let prepared = reconciler.prepare(&obj).await.expect("retry");
+    assert!(matches!(prepared, ImageBuildPrepared::Waiting(Some(delay)) if delay == Duration::from_secs(29)));
+    // An accepted infrastructure failure leaves an actuator observation; engine backoff permits the next attempt.
+    apply_status_patch(
+        &writes,
+        name,
+        &ImageBuildStatusPatch::Failed {
+            at: chrono::DateTime::from_timestamp(3, 0).expect("time"),
+            failure: ImageBuildFailure { class: ImageBuildFailureClass::Infrastructure, reason: "network".into() },
+            probes: vec![],
+            log_ref: String::new(),
+        },
+    )
+    .await
+    .expect("failure observation");
+    clock.advance(chrono::Duration::seconds(30));
+    assert!(matches!(reconciler.prepare(&obj).await.expect("engine permits retry"), ImageBuildPrepared::Waiting(_)));
+    assert_eq!(status(&backend, name).await.attempt, 2);
+    fixture.finish(&obj, ending);
+    let selected = flotilla_store::read_image_build_with_lifecycle(&backend, NS, name, fixture.reads.clone()).await.expect("selected");
+    assert_eq!(
+        selected.lifecycle,
+        fixture.reads.try_reading(flotilla_resources::lifecycle_reads::ProvisioningKind::ImageBuild, name, None).expect("read")
+    );
+    let prepared = reconciler.prepare(&obj).await.expect("ending");
+    assert!(matches!(prepared, ImageBuildPrepared::None));
+    assert!(reconciler.reconcile(&obj, &prepared, Utc::now()).patch.is_none());
+    assert_eq!(obj.status.as_ref().expect("snapshot").phase, old_phase);
+    fixture.poison();
+    assert!(reconciler.prepare(&obj).await.err().expect("read failure").to_string().contains("poisoned"));
+    assert!(flotilla_store::read_image_build_with_lifecycle(&backend, NS, name, fixture.reads.clone()).await.is_err());
+    let actual = backend.using::<ImageBuild>(NS).get(name).await.expect("resource remains readable");
+    let error = writes
+        .update_status(name, &actual.metadata.resource_version, actual.status.as_ref().expect("status"))
+        .await
+        .expect_err("authority read errors cannot select legacy validation, even for an unchanged status");
+    assert!(error.to_string().contains("poisoned"));
+}
+
+// Environment provisioning uses the selected engine digest and refuses stale Built evidence after loss.
+#[tokio::test]
+async fn environment_image_dependency_follows_engine_without_a_copy() {
+    use flotilla_provisioning::engine::image_build::ImageBuildBinding;
+    use flotilla_provisioning::reconcilers::environment::EnvironmentPrepared;
+    use flotilla_provisioning_testkit::{image_build, store_object, Ending, LifecycleFixture};
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    host(&backend, "amd64", None).await;
+    let mut build = image_build(ImageBuildPhase::Built);
+    build.metadata.namespace = NS.into();
+    store_object(&backend, build.clone()).await;
+    let env = backend
+        .using::<Environment>(NS)
+        .create(
+            &InputMeta::builder().name("env".into()).build(),
+            &EnvironmentSpec {
+                provider_address: None,
+                host_direct: None,
+                cloud_sandbox: None,
+                docker: Some(DockerEnvironmentSpec {
+                    host_ref: HOST.into(),
+                    image: String::new(),
+                    image_build_ref: Some(build.metadata.name.clone()),
+                    declared_agent_adapters: Default::default(),
+                    required_agent_adapters: Default::default(),
+                    pull_policy: Default::default(),
+                    memory_policy: Default::default(),
+                    mounts: vec![],
+                    env: Default::default(),
+                }),
+            },
+        )
+        .await
+        .expect("environment");
+    let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
+    fixture.request(&build);
+    let docker = Arc::new(Docker::default());
+    let reconciler = EnvironmentReconciler::new(docker.clone(), backend, NS).with_lifecycle_reads(fixture.reads.clone());
+    assert!(matches!(reconciler.prepare(&env).await.expect("requested"), EnvironmentPrepared::Waiting(_)));
+    fixture.finish(&build, Ending::Ready("engine digest"));
+    reconciler.prepare(&env).await.expect("ready");
+    assert_eq!(*docker.provisioned.lock().expect("calls"), vec![("engine digest".into(), DockerImagePullPolicy::Never)]);
+    fixture.finish(&build, Ending::Lost("engine digest"));
+    assert!(matches!(reconciler.prepare(&env).await.expect("lost"), EnvironmentPrepared::Waiting(_)));
+    assert_eq!(docker.provisioned.lock().expect("calls").len(), 1);
+    fixture.poison();
+    assert!(reconciler.prepare(&env).await.is_err());
+}
+
+// Pin the reachable Queued → infrastructure failure → engine-permitted retry path independently of stale terminal examples.
+#[tokio::test]
+async fn image_retry_observations_follow_engine_without_a_copy() {
+    assert_image_lifecycle(ImageBuildPhase::Queued, flotilla_provisioning_testkit::Ending::Ready("engine digest")).await;
+}
+
+// Both transactional backends keep legacy policy for unheld builds, CAS checks, and checked-read failures.
+#[tokio::test]
+async fn image_status_authority_requires_a_held_engine_resource() {
+    use flotilla_provisioning::engine::image_build::ImageBuildBinding;
+    use flotilla_provisioning_testkit::{image_build, store_object, LifecycleFixture};
+    use flotilla_store_sqlite::SqliteBackend;
+    for backend in [
+        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+        ResourceBackend::new(SqliteBackend::open_in_memory().expect("resource store")),
+    ] {
+        let obj = image_build(ImageBuildPhase::Built);
+        let current = store_object(&backend, obj.clone()).await;
+        let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
+        let builds = backend.using::<ImageBuild>("flotilla").with_lifecycle_status_reads(fixture.reads.clone());
+        let mut observed = current.status.clone().expect("status");
+        observed.log_ref = Some("new observation".into());
+        assert!(builds
+            .update_status(&obj.metadata.name, &current.metadata.resource_version, &observed)
+            .await
+            .expect_err("unheld Built remains immutable")
+            .to_string()
+            .contains("immutable"));
+        fixture.request(&obj);
+        let updated = builds
+            .update_status(&obj.metadata.name, &current.metadata.resource_version, &observed)
+            .await
+            .expect("engine owns phase, observation remains mutable");
+        assert!(builds
+            .update_status(&obj.metadata.name, &current.metadata.resource_version, &observed)
+            .await
+            .expect_err("engine authority cannot bypass CAS")
+            .to_string()
+            .contains("resourceVersion"));
+        fixture.poison();
+        assert!(builds
+            .update_status(&obj.metadata.name, &updated.metadata.resource_version, &observed)
+            .await
+            .expect_err("read error cannot fall back, even for identical status")
+            .to_string()
+            .contains("poisoned"));
+    }
+}

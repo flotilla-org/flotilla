@@ -6,7 +6,7 @@ use flotilla_resources::{CheckoutPhase, ClonePhase, EnvironmentPhase};
 #[hegel::test]
 fn lifecycle_phases_and_endings_override_old_status(tc: hegel::TestCase) {
     use hegel::generators as gs;
-    let kind = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let kind = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
     let phase = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
     let ending = match tc.draw(gs::integers::<usize>().min_value(0).max_value(4)) {
         0 => Ending::Ready("/work"),
@@ -31,7 +31,7 @@ fn lifecycle_phases_and_endings_override_old_status(tc: hegel::TestCase) {
                 )
                 .await
             }
-            _ => {
+            2 => {
                 super::environment_reconciler::assert_environment_lifecycle(
                     [
                         EnvironmentPhase::Pending,
@@ -40,6 +40,18 @@ fn lifecycle_phases_and_endings_override_old_status(tc: hegel::TestCase) {
                         EnvironmentPhase::Failed,
                         EnvironmentPhase::Lost,
                     ][phase],
+                    ending,
+                )
+                .await
+            }
+            _ => {
+                super::image_build::assert_image_lifecycle(
+                    [
+                        flotilla_resources::ImageBuildPhase::Queued,
+                        flotilla_resources::ImageBuildPhase::Building,
+                        flotilla_resources::ImageBuildPhase::Built,
+                        flotilla_resources::ImageBuildPhase::Failed,
+                    ][phase % 4],
                     ending,
                 )
                 .await

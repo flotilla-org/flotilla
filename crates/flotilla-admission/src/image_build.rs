@@ -225,10 +225,17 @@ pub async fn plan_image_build_for(
         None => placement_architecture,
     };
     let name = expected_build_name(&resolved.identity, &architecture, image_cache.as_ref(), &placement.metadata.name);
-    match flotilla_store::read_image_build(backend, namespace, &name).await {
-        Ok(_) => return Ok(PlannedImageBuild { name, create: None }),
-        Err(ResourceError::NotFound { .. }) => {}
-        Err(error) => return Err(error.to_string()),
+    // Planning only needs existence; source phase ranking cannot affect whether demand already exists.
+    if backend
+        .including_replicas::<ImageBuild>(namespace)
+        .get_all(&name)
+        .await
+        .map_err(|error| error.to_string())?
+        .items
+        .iter()
+        .any(|source| !source.object.spec.is_retired())
+    {
+        return Ok(PlannedImageBuild { name, create: None });
     }
     let (host_ref, delivery, reservation) = choose_builder(&hosts, placement, &architecture, image_cache.as_ref())?;
     let spec = ImageBuildSpec::builder()

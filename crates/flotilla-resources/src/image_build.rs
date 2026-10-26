@@ -43,6 +43,14 @@ impl Resource for ImageBuild {
         Ok(())
     }
 
+    const STATUS_LIFECYCLE_KIND: Option<crate::lifecycle_reads::ProvisioningKind> =
+        Some(crate::lifecycle_reads::ProvisioningKind::ImageBuild);
+
+    fn validate_engine_status_update(_current: Option<&Self::Status>, _requested: &Self::Status) -> Result<(), ResourceError> {
+        // The checked engine gates phase changes; this snapshot retains actuator observations.
+        Ok(())
+    }
+
     fn validate_status_update(current: Option<&Self::Status>, requested: &Self::Status) -> Result<(), ResourceError> {
         let Some(current) = current else { return Ok(()) };
         if current == requested {

@@ -5,8 +5,8 @@
 //! architecture this host builds. It publishes `Start` (taking one of the
 //! host's build slots) before any build process runs, runs the build as a
 //! background job, and records `Built` or `Failed` with every layer's probe
-//! outcome and the build log artifact. Infrastructure failures return to
-//! `Queued` after exponential backoff while attempts remain; recipe failures
+//! outcome and the build log artifact. Infrastructure failures wait out
+//! exponential backoff while attempts remain; recipe failures
 //! and exhausted attempts stay `Failed` and name the owner of the failing
 //! layer. Retired ADR 0053 records are deleted.
 use std::{
@@ -21,9 +21,12 @@ use flotilla_environment::environment::{
     image::{BuiltImage, FailedImageBuild, ImageBuildRequest, ImageDeliveryTarget, SecretFile},
     ImageBuildService, RegistryAuth,
 };
+use flotilla_protocol::LifecycleReading;
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{
     Clock, Host, ImageBuild, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass, ImageBuildPhase, ImageBuildSpec,
-    ImageBuildStatusPatch, ImageDelivery, ImageLayerSource, ImageProbeOutcome, ResourceError, ResourceObject, StatusPatch, SystemClock,
+    ImageBuildStatus, ImageBuildStatusPatch, ImageDelivery, ImageLayerSource, ImageProbeOutcome, ResourceError, ResourceObject,
+    StatusPatch, SystemClock,
 };
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler},
@@ -85,6 +88,7 @@ pub struct ImageBuildReconciler {
     local_host_ref: String,
     probe_wrapper: Arc<str>,
     clock: Arc<dyn Clock>,
+    lifecycle_reads: Arc<dyn LifecycleReads>,
     liveness_interval: Duration,
     execution: Mutex<()>,
     jobs: Mutex<BTreeMap<String, Job>>,
@@ -109,6 +113,7 @@ impl ImageBuildReconciler {
             local_host_ref: local_host_ref.into(),
             probe_wrapper: probe_wrapper.into(),
             clock: Arc::new(SystemClock),
+            lifecycle_reads: Arc::new(NoLifecycleReads),
             liveness_interval: DEFAULT_JOB_LIVENESS_INTERVAL,
             execution: Mutex::new(()),
             jobs: Mutex::new(BTreeMap::new()),
@@ -118,6 +123,16 @@ impl ImageBuildReconciler {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
+        self.builds = self.builds.clone().with_lifecycle_status_reads(Arc::clone(&reads));
+        self.lifecycle_reads = reads;
+        self
+    }
+
+    fn reading(&self, obj: &ResourceObject<ImageBuild>) -> Result<Option<LifecycleReading>, String> {
+        self.lifecycle_reads.try_reading(ProvisioningKind::ImageBuild, &obj.metadata.name, None)
     }
 
     pub fn with_liveness_interval(mut self, interval: Duration) -> Self {
@@ -148,18 +163,16 @@ impl ImageBuildReconciler {
     }
 
     async fn building_here(&self, except: &str) -> Result<usize, ResourceError> {
-        Ok(self
-            .builds
-            .list()
-            .await?
-            .items
-            .iter()
-            .filter(|build| {
-                build.metadata.name != except
-                    && build.spec.current().is_some_and(|spec| spec.host_ref == self.local_host_ref)
-                    && build.status.as_ref().is_some_and(|status| status.phase == ImageBuildPhase::Building)
-            })
-            .count())
+        let mut building = 0;
+        for build in self.builds.list().await?.items {
+            if build.metadata.name != except && build.spec.current().is_some_and(|spec| spec.host_ref == self.local_host_ref) {
+                let reading = self.reading(&build).map_err(ResourceError::other)?;
+                if progress(&build.status.unwrap_or_default(), reading.as_ref()).phase == ImageBuildPhase::Building {
+                    building += 1;
+                }
+            }
+        }
+        Ok(building)
     }
 
     fn spawn_job(&self, service: Arc<dyn ImageBuildService>, obj: &ResourceObject<ImageBuild>, spec: ImageBuildSpec, attempt: u32) -> Job {
@@ -279,6 +292,33 @@ pub fn attribute_recipe_failure(spec: &ImageBuildSpec, failed: &FailedImageBuild
     failure
 }
 
+/// The engine decides eligibility/tally/backoff; timestamps describe an attempt already started.
+struct BuildProgress {
+    phase: ImageBuildPhase,
+    attempt: u32,
+    not_before: Option<DateTime<Utc>>,
+}
+
+fn progress(status: &ImageBuildStatus, reading: Option<&LifecycleReading>) -> BuildProgress {
+    let Some(reading) = reading else {
+        return BuildProgress { phase: status.phase, attempt: status.attempt, not_before: status.not_before };
+    };
+    let (failures, not_before) = match reading {
+        LifecycleReading::InProgress => (0, None),
+        LifecycleReading::Retrying { failures, next, .. } => (*failures, Some(*next)),
+        LifecycleReading::Ready { .. } => {
+            return BuildProgress { phase: ImageBuildPhase::Built, attempt: status.attempt, not_before: None }
+        }
+        _ => return BuildProgress { phase: ImageBuildPhase::Failed, attempt: status.attempt, not_before: None },
+    };
+    let started = status.started_at.is_some_and(|at| not_before.is_none_or(|next| at >= next)) && status.finished_at.is_none();
+    BuildProgress {
+        phase: if started { ImageBuildPhase::Building } else { ImageBuildPhase::Queued },
+        attempt: failures.saturating_add(u32::from(started)),
+        not_before,
+    }
+}
+
 pub enum ImageBuildPrepared {
     None,
     /// Retired record deleted, or nothing for this host to do.
@@ -326,11 +366,13 @@ impl Reconciler for ImageBuildReconciler {
             return Ok(ImageBuildPrepared::None);
         };
         let status = current.status.clone().unwrap_or_default();
-        match status.phase {
+        let reading = self.reading(&current).map_err(ResourceError::other)?;
+        let progress = progress(&status, reading.as_ref());
+        match progress.phase {
             ImageBuildPhase::Built | ImageBuildPhase::Failed => Ok(ImageBuildPrepared::None),
             ImageBuildPhase::Queued => {
                 let now = self.clock.now();
-                if let Some(not_before) = status.not_before.filter(|at| *at > now) {
+                if let Some(not_before) = progress.not_before.filter(|at| *at > now) {
                     return Ok(ImageBuildPrepared::Waiting((not_before - now).to_std().ok()));
                 }
                 if self.building_here(&current.metadata.name).await? >= slots as usize {
@@ -338,13 +380,13 @@ impl Reconciler for ImageBuildReconciler {
                 }
                 // Publish the reservation before running any build process.
                 let mut next = status.clone();
-                ImageBuildStatusPatch::Start { at: now, attempt: status.attempt.saturating_add(1) }.apply(&mut next);
+                ImageBuildStatusPatch::Start { at: now, attempt: progress.attempt.saturating_add(1) }.apply(&mut next);
                 self.builds.update_status(&current.metadata.name, &current.metadata.resource_version, &next).await?;
                 Ok(ImageBuildPrepared::Waiting(Some(Duration::ZERO)))
             }
             ImageBuildPhase::Building => {
                 let mut jobs = self.jobs.lock().await;
-                let stale = jobs.get(&current.metadata.name).is_some_and(|job| job.attempt != status.attempt);
+                let stale = jobs.get(&current.metadata.name).is_some_and(|job| job.attempt != progress.attempt);
                 if stale {
                     if let Some(job) = jobs.remove(&current.metadata.name) {
                         job.handle.abort();
@@ -353,7 +395,7 @@ impl Reconciler for ImageBuildReconciler {
                 if !jobs.contains_key(&current.metadata.name) {
                     // Also resumes an attempt this process did not start
                     // (a restart while Building): its slot is already held.
-                    let job = self.spawn_job(Arc::clone(service), &current, spec.clone(), status.attempt);
+                    let job = self.spawn_job(Arc::clone(service), &current, spec.clone(), progress.attempt);
                     jobs.insert(current.metadata.name.clone(), job);
                     drop(jobs);
                     tokio::task::yield_now().await;
@@ -392,6 +434,19 @@ impl Reconciler for ImageBuildReconciler {
     fn reconcile(&self, obj: &ResourceObject<ImageBuild>, prepared: &Self::Prepared, now: DateTime<Utc>) -> ReconcileOutcome<ImageBuild> {
         let Some(spec) = obj.spec.current() else { return ReconcileOutcome::new(None) };
         let status = obj.status.clone().unwrap_or_default();
+        let reading = match self.reading(obj) {
+            Ok(reading) => reading,
+            Err(error) => {
+                let mut outcome = ReconcileOutcome::new(None);
+                outcome.events.push(flotilla_resources::ObjectEvent::for_object(obj, "LifecycleReadFailed", error));
+                outcome.requeue_after = Some(BUSY_REQUEUE);
+                return outcome;
+            }
+        };
+        if reading.as_ref().is_some_and(|reading| !matches!(reading, LifecycleReading::InProgress | LifecycleReading::Retrying { .. })) {
+            return ReconcileOutcome::new(None);
+        }
+        let progress = progress(&status, reading.as_ref());
         let mut outcome = match prepared {
             ImageBuildPrepared::Finished(finished) => {
                 let patch = match (&finished.outcome, &finished.log_ref) {
@@ -443,7 +498,7 @@ impl Reconciler for ImageBuildReconciler {
             ImageBuildPrepared::None => {
                 // A bounded infrastructure failure goes back to Queued after
                 // its backoff; recipe failures never retry identical inputs.
-                let retry = spec.host_ref == self.local_host_ref && self.service.is_some() && status.will_retry();
+                let retry = spec.host_ref == self.local_host_ref && self.service.is_some() && reading.is_none() && status.will_retry();
                 if retry {
                     let not_before = status.finished_at.unwrap_or(now) + image_build_retry_backoff(status.attempt);
                     let mut outcome = ReconcileOutcome::new(Some(ImageBuildStatusPatch::Retry { not_before }));
@@ -457,12 +512,23 @@ impl Reconciler for ImageBuildReconciler {
         if outcome.requeue_after.is_none()
             && spec.host_ref == self.local_host_ref
             && self.service.is_some()
-            && matches!(status.phase, ImageBuildPhase::Queued | ImageBuildPhase::Building)
+            && matches!(progress.phase, ImageBuildPhase::Queued | ImageBuildPhase::Building)
             && !matches!(prepared, ImageBuildPrepared::None)
         {
             outcome.requeue_after = Some(BUSY_REQUEUE);
         }
         outcome
+    }
+
+    fn retry_disposition(&self, obj: &ResourceObject<Self::Resource>) -> Option<flotilla_resources::ControllerRetryDisposition> {
+        match self.reading(obj) {
+            Ok(Some(LifecycleReading::Retrying { next, .. })) => {
+                Some(flotilla_resources::ControllerRetryDisposition::Retryable { next_attempt_at: next })
+            }
+            Ok(Some(LifecycleReading::GaveUp { cause })) => Some(flotilla_resources::ControllerRetryDisposition::Terminal { needs: cause }),
+            // Exhausted must reach shared engine preparation to complete GiveUp.
+            _ => None,
+        }
     }
 
     async fn run_finalizer(&self, _obj: &ResourceObject<ImageBuild>) -> Result<(), ResourceError> {

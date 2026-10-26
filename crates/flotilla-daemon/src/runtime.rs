@@ -810,6 +810,7 @@ fn spawn_controller_loops(
     runtime_health: RuntimeHealth,
 ) -> Vec<JoinHandle<()>> {
     let backend = state.daemon.resource_backend();
+    let status_lifecycle_reads = state.daemon.lifecycle_reads();
     let observed_backend = state.daemon.observed_resource_backend();
     let gh_default_branches = state
         .daemon
@@ -826,6 +827,7 @@ fn spawn_controller_loops(
     macro_rules! controller {
         ($primary:ty, $make_parts:expr) => {{
             let make_parts = $make_parts;
+            let write_lifecycle_reads = Arc::clone(&status_lifecycle_reads);
             let loop_health = runtime_health.clone();
             let loop_metrics = Arc::clone(&state.controller_metrics);
             spawn_resource_controller::<$primary, _, _>(
@@ -836,7 +838,10 @@ fn spawn_controller_loops(
                 move |backend, namespace| {
                     let (secondaries, reconciler) = make_parts(backend.clone(), namespace.clone());
                     let controller = ControllerLoop {
-                        primary: backend.clone().using::<$primary>(&namespace),
+                        primary: backend
+                            .clone()
+                            .using::<$primary>(&namespace)
+                            .with_lifecycle_status_reads(Arc::clone(&write_lifecycle_reads)),
                         secondaries,
                         reconciler,
                         resync_interval: controller_resync_interval,
@@ -1071,6 +1076,7 @@ fn spawn_controller_loops(
         let service = state.image_build_service.clone();
         let host = state.local_host_ref.clone();
         let probe_wrapper: Arc<str> = flotilla_agent::process::with_preludes("exec \"$@\"").into();
+        let image_build_reads = state.daemon.lifecycle_reads();
         let image_build_lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.image_builds));
         controllers.push(controller!(flotilla_resources::ImageBuild, {
             move |backend: ResourceBackend, namespace_string: String| {
@@ -1084,7 +1090,8 @@ fn spawn_controller_loops(
                             &namespace_string,
                             &host,
                             &probe_wrapper,
-                        ),
+                        )
+                        .with_lifecycle_reads(Arc::clone(&image_build_reads)),
                         image_build_lifecycles.clone(),
                     ),
                 )

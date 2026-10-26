@@ -156,7 +156,7 @@ pub enum ImageProbeReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageBuildFailureReport {
-    /// `infrastructure` or `recipe`.
+    /// `infrastructure` or `recipe` for an actuator failure; `lifecycle` for an engine cause or ending.
     pub class: String,
     pub reason: String,
 }

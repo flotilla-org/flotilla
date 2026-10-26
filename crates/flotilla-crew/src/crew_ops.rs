@@ -52,7 +52,7 @@ use crate::ports::WorkCredentialReconciler;
 use flotilla_agent::adapter::{CrewAssignment, CrewBriefTemplateResolver};
 use flotilla_vcs::vcs::CheckoutVcsResolver;
 
-use crate::crew_capabilities::{credential_references, session_card, CapabilityCardTracker};
+use crate::crew_capabilities::{credential_references, session_card_with_lifecycle_reads, CapabilityCardTracker};
 use crate::leaf_engine::{
     crew_role_address, supervision_message_source, turn_message_producer_key, CrewTurnAdmission, CrewTurnIntent, EscalationAdmission,
     LeafSubscriptionTable, ResourceIntentPublisher, TurnDeliveryActuator,
@@ -852,13 +852,14 @@ impl CrewService {
         let session = context.caller_session.as_ref().ok_or("capabilities requires a live crew session")?;
         let source = self.capability_source.read().await.clone().ok_or("session capability source unavailable")?;
         let credentials = source.credentials(&session.spec.env_ref, &credential_references(session)?).await?;
-        session_card(
+        session_card_with_lifecycle_reads(
             &self.resource_backend,
             &context.namespace,
             &context.convoy,
             &session.spec,
             &credentials,
             &source.endpoints(&session.spec.env_ref, &session.metadata.name).await?,
+            Arc::clone(&self.lifecycle_reads),
         )
         .await
     }

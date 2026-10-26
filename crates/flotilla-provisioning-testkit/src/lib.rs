@@ -142,3 +142,42 @@ pub async fn store_object<T: flotilla_resources::Resource>(
 
 /// The Vessel lease using the same real store and reader contract.
 pub type VesselFixture = LifecycleFixture<flotilla_provisioning::engine::vessel::VesselBinding>;
+/// Contradictory actuator evidence for image reader contracts; the engine supplies phase/digest/cause.
+pub fn image_build(phase: flotilla_resources::ImageBuildPhase) -> ResourceObject<flotilla_resources::ImageBuild> {
+    use flotilla_resources::{
+        ImageBuildFailure, ImageBuildFailureClass, ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec, ImageBuildStatus,
+        ImageDelivery, ImageLayerSource, ImageLayerSpec, ImageLayerTier,
+    };
+    let layers = vec![ImageLayerSpec::builder()
+        .name("base".into())
+        .version("1".into())
+        .tier(ImageLayerTier::Base)
+        .source(ImageLayerSource::Stdlib)
+        .from(format!("ubuntu@sha256:{}", "a".repeat(64)))
+        .fragment("FROM ${BASE}\n".into())
+        .probe("true".into())
+        .provides(std::collections::BTreeSet::from(["tool:verified".into()]))
+        .build()];
+    let identity = flotilla_resources::image_identity(&layers);
+    let name = flotilla_resources::image_build_name(&identity, "amd64", &ImageDelivery::Local, "builder");
+    object(
+        &name,
+        ImageBuildResourceSpec::Current(Box::new(
+            ImageBuildSpec::builder()
+                .identity(identity)
+                .architecture("amd64".into())
+                .layers(layers)
+                .host_ref("builder".into())
+                .delivery(ImageDelivery::Local)
+                .reservation(ImageBuildReservation { cpu: 1, disk_bytes: 1 })
+                .build(),
+        )),
+        ImageBuildStatus {
+            phase,
+            attempt: 99,
+            digest: Some("stale digest".into()),
+            failure: Some(ImageBuildFailure { class: ImageBuildFailureClass::Recipe, reason: "stale reason".into() }),
+            ..Default::default()
+        },
+    )
+}

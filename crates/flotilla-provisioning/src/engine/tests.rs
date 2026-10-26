@@ -532,14 +532,8 @@ async fn image_build_failures_follow_the_build_policy() {
         let infrastructure = failed(flotilla_resources::ImageBuildFailureClass::Infrastructure);
         let decision = decide::<ImageBuildBinding>(home.as_ref(), &obj, Some(infrastructure.clone()), Utc::now());
         assert_eq!(decision.ended, attempt == 5, "attempt {attempt}");
-        if attempt < 5 {
-            assert_eq!(decision.patch, Some(infrastructure), "retried");
-        } else {
-            // The old status would still retry it: the engine's copy settles it as failed instead.
-            assert!(
-                matches!(decision.patch, Some(ImageBuildStatusPatch::Failed { ref failure, .. }) if failure.class == flotilla_resources::ImageBuildFailureClass::Recipe)
-            );
-        }
+        assert_eq!(decision.patch, Some(infrastructure), "the accepted observation retains its real failure class");
+        assert!(ImageBuildBinding::copy(&obj, &home.get("image-a").expect("held")).is_none());
     }
     assert!(matches!(home.get("image-a").expect("held").state(), LifecycleState::GaveUp { .. }));
 

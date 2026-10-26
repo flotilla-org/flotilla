@@ -1,4 +1,6 @@
+use crate::store::transcode_request;
 use crate::StoreExt;
+use flotilla_resources::lifecycle_reads::LifecycleReads;
 use std::{
     collections::{BTreeMap, HashSet},
     marker::PhantomData,
@@ -61,7 +63,7 @@ impl ResourceBackend {
         self.0.serves_read_views()
     }
     pub fn using<T: Resource>(&self, namespace: &str) -> TypedResolver<T> {
-        TypedResolver { backend: self.clone(), namespace: namespace.to_string(), _marker: PhantomData }
+        TypedResolver { backend: self.clone(), namespace: namespace.to_string(), lifecycle_status_reads: None, _marker: PhantomData }
     }
 
     /// Namespaces containing locally-authored objects of this kind.
@@ -543,20 +545,37 @@ fn ensure_replication_enabled<T: Resource>() -> Result<(), ResourceError> {
     }
 }
 
-#[derive(Debug)]
 pub struct TypedResolver<T: Resource> {
+    lifecycle_status_reads: Option<std::sync::Arc<dyn LifecycleReads>>,
     pub(crate) backend: ResourceBackend,
     pub(crate) namespace: String,
     pub(crate) _marker: PhantomData<T>,
 }
 
+impl<T: Resource> std::fmt::Debug for TypedResolver<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedResolver").field("backend", &self.backend).field("namespace", &self.namespace).finish()
+    }
+}
+
 impl<T: Resource> std::clone::Clone for TypedResolver<T> {
     fn clone(&self) -> Self {
-        Self { backend: self.backend.clone(), namespace: self.namespace.clone(), _marker: PhantomData }
+        Self {
+            backend: self.backend.clone(),
+            namespace: self.namespace.clone(),
+            lifecycle_status_reads: self.lifecycle_status_reads.clone(),
+            _marker: PhantomData,
+        }
     }
 }
 
 impl<T: Resource> TypedResolver<T> {
+    /// Local controller writes select engine validation only after a checked ownership read.
+    pub fn with_lifecycle_status_reads(mut self, reads: std::sync::Arc<dyn LifecycleReads>) -> Self {
+        self.lifecycle_status_reads = Some(reads);
+        self
+    }
+
     pub async fn get(&self, name: &str) -> Result<ResourceObject<T>, ResourceError> {
         dispatch_backend!(self, get_typed, name)
     }
@@ -601,7 +620,14 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn update_status(&self, name: &str, resource_version: &str, status: &T::Status) -> Result<ResourceObject<T>, ResourceError> {
-        dispatch_backend!(self, update_status_typed, name, resource_version, status)
+        let mut kind = crate::ResourceKind::of::<T>();
+        if let (Some(lifecycle), Some(reads)) = (T::STATUS_LIFECYCLE_KIND, self.lifecycle_status_reads.as_ref()) {
+            if reads.try_reading(lifecycle, name, None).map_err(ResourceError::other)?.is_some() {
+                kind = kind.with_engine_status_validator::<T>();
+            }
+        }
+        let status = transcode_request(self.backend.blocking_request_encoding(), status.clone()).await?;
+        crate::typed_object(self.backend.update_status_raw(kind, &self.namespace, name, resource_version, &status).await?)
     }
 
     pub async fn delete(&self, name: &str) -> Result<(), ResourceError> {

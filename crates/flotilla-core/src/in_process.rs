@@ -4552,7 +4552,14 @@ impl InProcessDaemon {
 
     pub async fn refresh_capability_cards(&self, namespace: &str) -> Result<(), String> {
         let source = self.crew.capability_source().read().await.clone().ok_or("session capability source unavailable")?;
-        flotilla_crew::crew_capabilities::refresh_cards(&self.resource_backend, namespace, &*source, self.crew.capability_cards()).await
+        flotilla_crew::crew_capabilities::refresh_cards_with_lifecycle_reads(
+            &self.resource_backend,
+            namespace,
+            &*source,
+            self.crew.capability_cards(),
+            self.lifecycle_reads(),
+        )
+        .await
     }
 
     pub async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {
@@ -5861,7 +5868,7 @@ impl crew_actions::CrewActionPort for InProcessDaemon {
 #[async_trait]
 impl projections_actions::ProjectionsActionPort for InProcessDaemon {
     async fn image_build_report(&self, namespace: &str, name: &str) -> Result<flotilla_protocol::image_check::ImageBuildReport, String> {
-        image_check::image_build_report(&self.resource_backend, namespace, name).await
+        image_check::image_build_report_with_lifecycle_reads(&self.resource_backend, namespace, name, self.lifecycle_reads()).await
     }
     async fn crew_capability_card(&self, context: &flotilla_protocol::CrewCommandContext) -> Result<String, String> {
         self.crew.query_capabilities(context).await
@@ -6118,7 +6125,8 @@ impl ProjectOperations for InProcessDaemon {
     ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String> {
         let namespace = self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone();
         let host = self.environment_manager.local_host_id().as_str().to_string();
-        image_check::check_image(&self.resource_backend, &namespace, &host, self, request).await
+        image_check::check_image_with_lifecycle_reads(&self.resource_backend, &namespace, &host, self, request, self.lifecycle_reads())
+            .await
     }
     async fn project_register(&self, target: &str) -> Result<(String, usize), String> {
         InProcessDaemon::project_register(self, target).await

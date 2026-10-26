@@ -516,13 +516,14 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     store.record_capability_endpoints(&spec.env_ref, name, &credential_env).await;
                     let card = async {
                         let credentials = store.credentials(&spec.env_ref, &credential_refs).await?;
-                        flotilla_crew::crew_capabilities::session_card(
+                        flotilla_crew::crew_capabilities::session_card_with_lifecycle_reads(
                             &self.state.daemon.resource_backend(),
                             &context.namespace,
                             &context.convoy,
                             spec.spec,
                             &credentials,
                             &RuntimeSessionCapabilities { state: Arc::downgrade(&self.state) }.endpoints(&spec.env_ref, name).await?,
+                            self.state.daemon.lifecycle_reads(),
                         )
                         .await
                     }

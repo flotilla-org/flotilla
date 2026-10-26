@@ -142,7 +142,14 @@ where
                 if let Some(name) = &original.image_build_ref {
                     // The composed image is the per-identity build's digest.
                     // Never fall back to another image: wait with the reason.
-                    let build = match flotilla_store::read_image_build(&self.backend, &self.namespace, name).await {
+                    let reading = match flotilla_store::read_image_build_with_lifecycle(
+                        &self.backend,
+                        &self.namespace,
+                        name,
+                        Arc::clone(&self.lifecycle_reads),
+                    )
+                    .await
+                    {
                         Ok(build) => build,
                         Err(ResourceError::NotFound { .. }) => {
                             // A previous-generation per-stage build can never
@@ -162,13 +169,25 @@ where
                         }
                         Err(error) => return Err(error),
                     };
+                    let build = reading.build.object;
                     let status = build.status.clone().unwrap_or_default();
-                    let digest = match (status.phase, &status.digest) {
-                        (ImageBuildPhase::Built, Some(digest)) => digest.clone(),
-                        (phase, _) => {
-                            let reason = status.failure.as_ref().map(|failure| format!(": {}", failure.reason)).unwrap_or_default();
-                            return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} {phase:?}{reason}")));
+                    let digest = match reading.lifecycle {
+                        Some(LifecycleReading::Ready { identity }) => identity,
+                        Some(reading) => {
+                            let reason = reading
+                                .reason()
+                                .filter(|reason| !reason.is_empty())
+                                .map(|reason| format!(": {reason}"))
+                                .unwrap_or_default();
+                            return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} {}{reason}", reading.label())));
                         }
+                        None => match (status.phase, &status.digest) {
+                            (ImageBuildPhase::Built, Some(digest)) => digest.clone(),
+                            (phase, _) => {
+                                let reason = status.failure.as_ref().map(|failure| format!(": {}", failure.reason)).unwrap_or_default();
+                                return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} {phase:?}{reason}")));
+                            }
+                        },
                     };
                     spec.image = digest;
                     // A local build exists only on its builder. A registry

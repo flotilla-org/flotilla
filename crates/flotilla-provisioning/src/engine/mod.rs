@@ -10,7 +10,7 @@
 //! - a step refused: no lifecycle patch may overrule the engine;
 //! - a resource the engine has ended (Gone or GaveUp): the old reconciler is not run.
 //!
-//! Clone, Checkout and Environment consumers read the engine directly and their bindings emit
+//! Clone, Checkout, Environment and ImageBuild consumers read the engine directly and their bindings emit
 //! no status copy. Bindings whose readers have not moved retain a one-way, rebuildable copy;
 //! that copy is removed with the kind's last legacy phase reader.
 //!
