@@ -7,7 +7,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_agent::{
     account_access::{environment_kind, AccountProvisioners},
     adapter::CapabilityTable,
@@ -15,9 +14,10 @@ use flotilla_agent::{
 use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     account_access::{
-        AccessName, AccountBinding, AccountBindingSpec, BindingState, CredentialName, EpochEntry, GrantName, GrantScope, Selection,
+        binding_name, requester_address, AccessName, AccountBinding, AccountBindingSpec, AccountProvision, BindingState, CredentialName,
+        EpochEntry, GrantName, GrantScope, Selection,
     },
-    ConvoyRepositorySpec, CredentialGrant, CredentialSpec, CrewSource, Host as ResourceHost, InputMeta, PlacementPolicy,
+    Convoy, ConvoyRepositorySpec, CredentialGrant, CredentialSpec, CrewSource, Host as ResourceHost, InputMeta, PlacementPolicy,
     PlacementPolicySpec, RandomSource, Repository, RepositoryKey, RepositoryTrust, ResourceError, ResourceObject, WorkflowTemplateSpec,
 };
 use flotilla_schema::{Records, State, Timestamp};
@@ -114,6 +114,26 @@ pub async fn authorized_alternatives(
     repositories: &[ConvoyRepositorySpec],
     workflow: &WorkflowTemplateSpec,
 ) -> Result<Vec<RequesterAlternatives>, String> {
+    let alternatives = current_alternatives(backend, namespace, project_ref, repositories, workflow).await?;
+    if let Some(unauthorized) = alternatives.iter().find(|alternative| alternative.candidates.is_empty()) {
+        let requester = &unauthorized.requester;
+        return Err(format!(
+            "agent adapter `{}` for role `{}` requires `{}`, but no CredentialGrant authorizes a credential that supplies it",
+            requester.item, requester.role, requester.access
+        ));
+    }
+    Ok(alternatives)
+}
+
+/// Every requester's alternatives as the grants stand now, including requesters no grant
+/// authorizes any longer (an empty candidate set).
+pub async fn current_alternatives(
+    backend: &ResourceBackend,
+    namespace: &str,
+    project_ref: Option<&str>,
+    repositories: &[ConvoyRepositorySpec],
+    workflow: &WorkflowTemplateSpec,
+) -> Result<Vec<RequesterAlternatives>, String> {
     let requesters = requesters(workflow)?;
     if requesters.is_empty() {
         return Ok(Vec::new());
@@ -194,12 +214,6 @@ pub async fn authorized_alternatives(
                     .insert(GrantName(grant.object.metadata.name.clone()), GrantScope { scope: ACCOUNT_SCOPE.to_string() });
             }
         }
-        if candidates.is_empty() {
-            return Err(format!(
-                "agent adapter `{}` for role `{}` requires `{}`, but no CredentialGrant authorizes a credential that supplies it",
-                requester.item, requester.role, requester.access
-            ));
-        }
         resolved.push(RequesterAlternatives { requester, candidates, exclusions: BTreeMap::new() });
     }
     Ok(resolved)
@@ -279,9 +293,9 @@ pub struct Selected {
 
 /// Select one credential (#3882 as amended by #3884): an authorized, usable pin wins; an
 /// unauthorized or unusable pin refuses; otherwise a uniform draw over the usable candidates.
-pub fn select(alternatives: &RequesterAlternatives, pin: Option<&str>, random: &dyn RandomSource) -> Result<Selected, String> {
+pub fn select(alternatives: &RequesterAlternatives, pin: Option<(&str, &str)>, random: &dyn RandomSource) -> Result<Selected, String> {
     let requester = &alternatives.requester;
-    if let Some(pin) = pin {
+    if let Some((pin, pinned_by)) = pin {
         let credential = CredentialName(pin.to_string());
         if !alternatives.candidates.contains_key(&credential) {
             return Err(format!(
@@ -292,7 +306,7 @@ pub fn select(alternatives: &RequesterAlternatives, pin: Option<&str>, random: &
         if let Some(reason) = alternatives.exclusions.get(&credential) {
             return Err(format!("account pin `{pin}` for role `{}` is refused: {reason}", requester.role));
         }
-        return Ok(Selected { credential, selection: Selection::Pin { pinned_by: CONVOY_START_PIN.to_string() } });
+        return Ok(Selected { credential, selection: Selection::Pin { pinned_by: pinned_by.to_string() } });
     }
     let usable = alternatives.usable();
     if usable.is_empty() {
@@ -301,20 +315,6 @@ pub fn select(alternatives: &RequesterAlternatives, pin: Option<&str>, random: &
     let bound = u32::try_from(usable.len()).map_err(|_| "too many candidates for a draw".to_string())?;
     let index = random.below(bound);
     Ok(Selected { credential: usable[index as usize].clone(), selection: Selection::Draw { index } })
-}
-
-/// The binding's resource name: one per (requester, requirement), so a lookup needs no query.
-pub fn binding_name(convoy: &str, role: &str, access: &AccessName) -> String {
-    format!("{convoy}.{role}.{}", access.0.replace(':', "-"))
-}
-
-/// The requester's role address (`project:<p>/convoy:<c>/role:<r>`).
-pub fn requester_address(project: Option<&str>, convoy: &str, role: &str) -> Result<Address, String> {
-    let convoy = match project {
-        Some(project) => Address::project(project).and_then(|address| address.child(AddressKind::Convoy, convoy)),
-        None => Address::convoy(convoy),
-    };
-    convoy.and_then(|address| address.child(AddressKind::Role, role)).map_err(|error| format!("requester address: {error:?}"))
 }
 
 /// A binding chosen at admission, written once its convoy exists.
@@ -385,7 +385,8 @@ pub async fn choose_bindings(
             check_at_host(backend, namespace, std::slice::from_mut(alternative), spec, &decision.target_host, &decision.policy_name)
                 .await?;
         }
-        let selected = select(alternative, pins.get(&alternative.requester.role).map(String::as_str), random)?;
+        let pin = pins.get(&alternative.requester.role).map(|pin| (pin.as_str(), CONVOY_START_PIN));
+        let selected = select(alternative, pin, random)?;
         pending.push(binding_record(project_ref, convoy, alternative, selected, now)?);
     }
     Ok(pending)
@@ -414,6 +415,239 @@ pub async fn write_bindings(backend: &ResourceBackend, namespace: &str, pending:
         }
     }
     Ok(())
+}
+
+/// The reason a withdrawn authorization records (#3882).
+pub const NO_AUTHORIZING_GRANT: &str = "binding revoked: no authorizing grant";
+
+/// Who pinned a binding chosen by `convoy rebind --account`.
+pub const REBIND_PIN: &str = "convoy rebind --account";
+
+/// Who pinned a binding adopted from a convoy admitted before bindings existed: its snapshot
+/// already carried exactly one subscription credential, and the account stays (#3882).
+pub const SNAPSHOT_PIN: &str = "admitted workflow snapshot";
+
+/// What the home pass did to one binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingChange {
+    Opened,
+    GrantsUpdated,
+    EpochAppended(String),
+    Revoked(String),
+    Closed(String),
+}
+
+/// A convoy's admitted workflow, as alternatives are resolved against it.
+fn admitted_workflow(convoy: &ResourceObject<Convoy>) -> Option<WorkflowTemplateSpec> {
+    let snapshot = convoy.status.as_ref()?.workflow_snapshot.as_ref()?;
+    Some(WorkflowTemplateSpec::builder().vessels(snapshot.vessels.clone()).build())
+}
+
+/// Whether any place still holds a delivered copy of a binding's credential.
+async fn delivered_anywhere(backend: &ResourceBackend, namespace: &str, binding: &str) -> Result<bool, String> {
+    let provisions = backend
+        .query_declared::<AccountProvision>(
+            namespace,
+            &StoreQuery {
+                fields: BTreeMap::from([("spec.binding.name".to_string(), binding.to_string())]),
+                include_replicas: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| format!("list provisions of `{binding}`: {error}"))?;
+    Ok(provisions.items.iter().any(|provision| provision.object.spec.delivered.is_some()))
+}
+
+/// The home pass over this daemon's own bindings (#3882 lifecycle): a requester's teardown
+/// closes its binding; an authorization change revokes it or updates its recorded grants; a
+/// replacement login for the same account appends an epoch. A convoy admitted before bindings
+/// existed gets one, pinned to the credential its snapshot carried when exactly one did.
+pub async fn reconcile_home_bindings(
+    backend: &ResourceBackend,
+    namespace: &str,
+    random: &dyn RandomSource,
+    now: Timestamp,
+) -> Result<Vec<(String, BindingChange)>, String> {
+    let bindings = backend.clone().using::<AccountBinding>(namespace);
+    let convoys = backend.clone().using::<Convoy>(namespace).list().await.map_err(|error| format!("list convoys: {error}"))?.items;
+    let mut changes = Vec::new();
+    let mut bound = BTreeSet::new();
+    for binding in bindings.list().await.map_err(|error| format!("list account bindings: {error}"))?.items {
+        let name = binding.metadata.name.clone();
+        bound.insert(name.clone());
+        if !binding.spec.state.value.is_open() {
+            continue;
+        }
+        let Some((convoy_name, role)) = requester_parts(&binding.spec.requester) else { continue };
+        let convoy = convoys.iter().find(|convoy| convoy.metadata.name == convoy_name);
+        let live = convoy.filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()));
+        let Some(convoy) = live else {
+            let reason = "requester teardown".to_string();
+            close(&bindings, &binding, BindingState::Closed { reason: reason.clone(), delivered_until: None }, now).await?;
+            changes.push((name, BindingChange::Closed(reason)));
+            continue;
+        };
+        let Some(workflow) = admitted_workflow(convoy) else { continue };
+        let alternatives =
+            current_alternatives(backend, namespace, convoy.spec.project_ref.as_deref(), &convoy.spec.repositories, &workflow).await?;
+        let candidate = alternatives
+            .iter()
+            .find(|alternative| alternative.requester.role == role && alternative.requester.access == binding.spec.requirement)
+            .and_then(|alternative| alternative.candidates.get(&binding.spec.credential));
+        let Some(candidate) = candidate else {
+            let delivered_until = delivered_anywhere(backend, namespace, &name).await?.then_some(now);
+            let state = BindingState::Revoked { reason: NO_AUTHORIZING_GRANT.to_string(), delivered_until };
+            close(&bindings, &binding, state, now).await?;
+            changes.push((name, BindingChange::Revoked(NO_AUTHORIZING_GRANT.to_string())));
+            continue;
+        };
+        let mut spec = binding.spec.clone();
+        let mut change = None;
+        if spec.grants != candidate.grants {
+            spec.grants = candidate.grants.clone();
+            change = Some(BindingChange::GrantsUpdated);
+        }
+        let current_epoch = spec.epochs.last().and_then(|row| row.record.epoch.parse::<u32>().ok()).unwrap_or(0);
+        if candidate.epoch > current_epoch {
+            if candidate.account != spec.account {
+                let reason = format!(
+                    "replacement refused: credential `{}` now declares account `{}`, not the bound `{}`",
+                    spec.credential,
+                    candidate.account.as_deref().unwrap_or("none"),
+                    spec.account.as_deref().unwrap_or("none")
+                );
+                let delivered_until = delivered_anywhere(backend, namespace, &name).await?.then_some(now);
+                close(&bindings, &binding, BindingState::Revoked { reason: reason.clone(), delivered_until }, now).await?;
+                changes.push((name, BindingChange::Revoked(reason)));
+                continue;
+            }
+            let next = spec.epochs.last().map_or(1, |row| row.version + 1);
+            spec.epochs
+                .append(next, EpochEntry { epoch: candidate.epoch.to_string(), observed_at: now })
+                .map_err(|error| format!("epoch lineage: {error:?}"))?;
+            change = Some(BindingChange::EpochAppended(candidate.epoch.to_string()));
+        }
+        if let Some(change) = change {
+            bindings
+                .update(&InputMeta::builder().name(name.clone()).build(), &binding.metadata.resource_version, &spec)
+                .await
+                .map_err(|error| format!("update account binding `{name}`: {error}"))?;
+            changes.push((name, change));
+        }
+    }
+    // Convoys admitted before bindings existed.
+    for convoy in convoys.iter().filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())) {
+        let Some(workflow) = admitted_workflow(convoy) else { continue };
+        let project = convoy.spec.project_ref.as_deref();
+        let alternatives = current_alternatives(backend, namespace, project, &convoy.spec.repositories, &workflow).await?;
+        let mut pending = Vec::new();
+        for alternative in alternatives.iter().filter(|alternative| !alternative.candidates.is_empty()) {
+            let requester = &alternative.requester;
+            let name = binding_name(&convoy.metadata.name, &requester.role, &requester.access);
+            if bound.contains(&name) {
+                continue;
+            }
+            let vessel = workflow.vessels.iter().find(|vessel| vessel.name == requester.vessel);
+            let carried = vessel
+                .map(|vessel| {
+                    vessel.credential_refs.iter().filter(|name| alternative.candidates.contains_key(&CredentialName((*name).clone())))
+                })
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let pin = match carried.as_slice() {
+                [single] => Some((single.as_str(), SNAPSHOT_PIN)),
+                _ => None,
+            };
+            let selected = select(alternative, pin, random)?;
+            pending.push(binding_record(project, &convoy.metadata.name, alternative, selected, now)?);
+            changes.push((name, BindingChange::Opened));
+        }
+        write_bindings(backend, namespace, pending).await?;
+    }
+    Ok(changes)
+}
+
+async fn close(
+    bindings: &flotilla_store::TypedResolver<AccountBinding>,
+    binding: &ResourceObject<AccountBinding>,
+    state: BindingState,
+    now: Timestamp,
+) -> Result<(), String> {
+    let mut spec = binding.spec.clone();
+    spec.state = State::new(state, now);
+    bindings
+        .update(&InputMeta::builder().name(binding.metadata.name.clone()).build(), &binding.metadata.resource_version, &spec)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("update account binding `{}`: {error}", binding.metadata.name))
+}
+
+/// The convoy and role a requester address names.
+pub fn requester_parts(requester: &flotilla_schema::Address) -> Option<(String, String)> {
+    let mut convoy = None;
+    let mut role = None;
+    for segment in requester.segments() {
+        match segment.kind() {
+            flotilla_address::Kind::Convoy => convoy = Some(segment.value().to_string()),
+            flotilla_address::Kind::Role => role = Some(segment.value().to_string()),
+            _ => {}
+        }
+    }
+    convoy.zip(role)
+}
+
+/// An explicit rebind (#3882 lifecycle): the old binding is closed and kept under a retired
+/// name for attribution, and a new one opens by pin or draw under the requester's name. Its
+/// places see the new opening, remove the old copies and start a fresh harness session.
+pub async fn rebind(
+    backend: &ResourceBackend,
+    namespace: &str,
+    convoy_name: &str,
+    role: &str,
+    pin: Option<&str>,
+    random: &dyn RandomSource,
+    now: Timestamp,
+) -> Result<AccountBindingSpec, String> {
+    let convoy =
+        backend.clone().using::<Convoy>(namespace).get(convoy_name).await.map_err(|error| format!("convoy `{convoy_name}`: {error}"))?;
+    let workflow = admitted_workflow(&convoy).ok_or_else(|| format!("convoy `{convoy_name}` has no admitted workflow yet"))?;
+    let project = convoy.spec.project_ref.as_deref();
+    let alternatives = current_alternatives(backend, namespace, project, &convoy.spec.repositories, &workflow).await?;
+    let alternative = alternatives
+        .iter()
+        .find(|alternative| alternative.requester.role == role)
+        .ok_or_else(|| format!("role `{role}` of convoy `{convoy_name}` declares no account requirement"))?;
+    let selected = select(alternative, pin.map(|pin| (pin, REBIND_PIN)), random)?;
+    let opened = binding_record(project, convoy_name, alternative, selected, now)?;
+    let bindings = backend.clone().using::<AccountBinding>(namespace);
+    match bindings.get(&opened.name).await {
+        Ok(existing) => {
+            let delivered_until = delivered_anywhere(backend, namespace, &opened.name).await?.then_some(now);
+            let mut retired = existing.spec.clone();
+            if retired.state.value.is_open() {
+                retired.state = State::new(BindingState::Closed { reason: "rebind".to_string(), delivered_until }, now);
+            }
+            let retired_name = format!("{}.closed-{}", opened.name, existing.spec.opened_at.micros());
+            bindings
+                .create(&InputMeta::builder().name(retired_name.clone()).build(), &retired)
+                .await
+                .map_err(|error| format!("retire account binding as `{retired_name}`: {error}"))?;
+            bindings
+                .update(&InputMeta::builder().name(opened.name.clone()).build(), &existing.metadata.resource_version, &opened.spec)
+                .await
+                .map_err(|error| format!("open account binding `{}`: {error}", opened.name))?;
+        }
+        Err(ResourceError::NotFound { .. }) => {
+            bindings
+                .create(&InputMeta::builder().name(opened.name.clone()).build(), &opened.spec)
+                .await
+                .map_err(|error| format!("open account binding `{}`: {error}", opened.name))?;
+        }
+        Err(error) => return Err(format!("read account binding `{}`: {error}", opened.name)),
+    }
+    Ok(opened.spec)
 }
 
 #[cfg(test)]
@@ -467,15 +701,15 @@ mod tests {
         let set = alternatives(&["box-a", "box-b"], &["box-b"]);
         let random = SeededRandom::new(1);
         assert_eq!(
-            select(&set, Some("box-a"), &random).expect("pin"),
+            select(&set, Some(("box-a", CONVOY_START_PIN)), &random).expect("pin"),
             Selected { credential: CredentialName("box-a".into()), selection: Selection::Pin { pinned_by: CONVOY_START_PIN.into() } }
         );
         assert_eq!(
-            select(&set, Some("claude-max"), &random).expect_err("unauthorized"),
+            select(&set, Some(("claude-max", CONVOY_START_PIN)), &random).expect_err("unauthorized"),
             "account pin `claude-max` for role `coder` is refused: no CredentialGrant authorizes it for `claude:subscription`"
         );
         assert_eq!(
-            select(&set, Some("box-b"), &random).expect_err("excluded"),
+            select(&set, Some(("box-b", CONVOY_START_PIN)), &random).expect_err("excluded"),
             "account pin `box-b` for role `coder` is refused: not held by host `b1`"
         );
     }

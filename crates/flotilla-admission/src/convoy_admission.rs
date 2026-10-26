@@ -141,8 +141,8 @@ pub struct ConvoyAdmission {
     host_name: HostName,
     clock: Arc<dyn Clock>,
     /// The draw that selects a requester's account (#3884); tests fix the seed.
-    #[builder(default = Arc::new(flotilla_resources::SeededRandom::from_entropy()))]
-    random: Arc<dyn flotilla_resources::RandomSource>,
+    #[builder(default = std::sync::RwLock::new(Arc::new(flotilla_resources::SeededRandom::from_entropy())))]
+    random: std::sync::RwLock<Arc<dyn flotilla_resources::RandomSource>>,
     fulfilment_decider: Arc<dyn FulfilmentDecider>,
     /// Serializes the identity selector check with Convoy creation on the owner host.
     #[builder(default)]
@@ -1654,10 +1654,39 @@ impl ConvoyAdmission {
             placements.vessels,
             placements.convoy,
             &by_role,
-            &*self.random,
+            &*self.account_random(),
             flotilla_schema::Timestamp::from_datetime(&self.clock.now()),
         )
         .await
+    }
+
+    fn account_random(&self) -> Arc<dyn flotilla_resources::RandomSource> {
+        Arc::clone(&self.random.read().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+
+    /// Replace the account draw's random source; tests fix its seed (#3884).
+    pub fn set_account_random(&self, random: Arc<dyn flotilla_resources::RandomSource>) {
+        *self.random.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = random;
+    }
+
+    /// The home pass over this daemon's account bindings (#3882 lifecycle).
+    pub async fn reconcile_account_bindings(&self, namespace: &str) -> Result<Vec<(String, crate::account_access::BindingChange)>, String> {
+        let _admission_guard = self.lock().await;
+        let now = flotilla_schema::Timestamp::from_datetime(&self.clock.now());
+        crate::account_access::reconcile_home_bindings(&self.backend, namespace, &*self.account_random(), now).await
+    }
+
+    /// An explicit rebind of one requester's account (#3882).
+    pub async fn rebind_account(
+        &self,
+        namespace: &str,
+        convoy: &str,
+        role: &str,
+        pin: Option<&str>,
+    ) -> Result<flotilla_resources::AccountBindingSpec, String> {
+        let _admission_guard = self.lock().await;
+        let now = flotilla_schema::Timestamp::from_datetime(&self.clock.now());
+        crate::account_access::rebind(&self.backend, namespace, convoy, role, pin, &*self.account_random(), now).await
     }
 }
 

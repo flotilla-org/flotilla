@@ -107,6 +107,11 @@ impl AccountProvisioners {
         self.implementations.iter().find(|implementation| implementation.access() == access.0)
     }
 
+    /// The implementation that made a recorded plan.
+    pub fn for_implementation(&self, implementation: &str) -> Option<&Arc<dyn AccountProvisioner>> {
+        self.implementations.iter().find(|candidate| candidate.implementation() == implementation)
+    }
+
     /// Whether any registered family's access is supplied by this credential. Such credentials
     /// reach a requester only through its binding, never as vessel-wide credential references.
     pub fn supplies_any(&self, consumer: &CredentialConsumer) -> bool {
@@ -179,7 +184,14 @@ impl AccountProvisioner for ClaudeDirect {
     }
 
     fn home(&self, writable_base: &Path, convoy: &str, role: &str) -> String {
-        writable_base.join("agent-homes").join("requesters").join(convoy).join(role).join("claude").display().to_string()
+        writable_base
+            .join("agent-homes")
+            .join("requesters")
+            .join(component(convoy))
+            .join(component(role))
+            .join("claude")
+            .display()
+            .to_string()
     }
 
     async fn deliver(&self, home: &str, material: &str, runner: &dyn CommandRunner) -> Result<Vec<(String, String)>, String> {
@@ -200,6 +212,11 @@ impl AccountProvisioner for ClaudeDirect {
         let token_file = Path::new(home).join(CLAUDE_OAUTH_TOKEN_FILE).display().to_string();
         runner.run("rm", &["-f", "--", &token_file], Path::new("/"), &ChannelLabel::Default).await.map(|_| ())
     }
+}
+
+/// One path component from a name: anything but ASCII alphanumerics, `-` and `_` becomes `-`.
+fn component(name: &str) -> String {
+    name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect()
 }
 
 /// The shell prefix that hands the delivered token to the Claude process as it starts.

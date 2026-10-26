@@ -22,6 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use flotilla_address::Kind as AddressKind;
 use flotilla_schema::{Address, KindRegistry, Records, Ref, RegistryError, State, Stored, Timestamp};
 
 use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass};
@@ -262,6 +263,20 @@ pub fn registry() -> Result<KindRegistry, RegistryError> {
     registry.register::<AccountBindingSpec>()?;
     registry.register::<AccountProvisionSpec>()?;
     Ok(registry)
+}
+
+/// The binding's resource name: one per (requester, requirement), so a lookup needs no query.
+pub fn binding_name(convoy: &str, role: &str, access: &AccessName) -> String {
+    format!("{convoy}.{role}.{}", access.0.replace(':', "-"))
+}
+
+/// The requester's role address (`project:<p>/convoy:<c>/role:<r>`).
+pub fn requester_address(project: Option<&str>, convoy: &str, role: &str) -> Result<Address, String> {
+    let convoy = match project {
+        Some(project) => Address::project(project).and_then(|address| address.child(AddressKind::Convoy, convoy)),
+        None => Address::convoy(convoy),
+    };
+    convoy.and_then(|address| address.child(AddressKind::Role, role)).map_err(|error| format!("requester address: {error:?}"))
 }
 
 /// The material generation a delivery records (#3910 owner ruling 3): a short digest of the

@@ -1624,6 +1624,19 @@ impl CredentialStore {
         current.record_refresh_failure(self.clock.now())
     }
 
+    /// A bound credential's current declaration and material, for its account binding's delivery
+    /// (#3907). The material goes only to the plan's delivery; it is never logged or stored.
+    pub async fn account_material(&self, name: &str) -> Result<(CredentialSpecSpec, String), String> {
+        let spec = self.spec(name).await?;
+        let material = self.resolve(name, &spec).await?;
+        Ok((spec, material.trim().to_string()))
+    }
+
+    /// The writable base a runner's deliveries live under.
+    pub async fn writable_base(&self, runner: &dyn CommandRunner) -> Result<PathBuf, String> {
+        Ok(self.delivery_paths(runner).await?.base)
+    }
+
     async fn spec(&self, name: &str) -> Result<CredentialSpecSpec, String> {
         self.backend.clone().definitions::<CredentialSpec>(&self.namespace).get(name).await.map(|object| object.spec).map_err(|error| {
             match error {

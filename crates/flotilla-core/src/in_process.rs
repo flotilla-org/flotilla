@@ -3461,6 +3461,30 @@ impl InProcessDaemon {
         self.admission.admission_free_space_floor_bytes()
     }
 
+    /// Replace the account draw's random source (#3884); tests fix its seed.
+    pub fn set_account_random(&self, random: Arc<dyn flotilla_resources::RandomSource>) {
+        self.admission.set_account_random(random);
+    }
+
+    /// The home pass over this daemon's account bindings (#3907).
+    pub async fn reconcile_account_bindings(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<(String, flotilla_admission::account_access::BindingChange)>, String> {
+        self.admission.reconcile_account_bindings(namespace).await
+    }
+
+    /// Rebind one requester's account (#3907).
+    pub async fn rebind_account(
+        &self,
+        namespace: &str,
+        convoy: &str,
+        role: &str,
+        pin: Option<&str>,
+    ) -> Result<flotilla_resources::AccountBindingSpec, String> {
+        self.admission.rebind_account(namespace, convoy, role, pin).await
+    }
+
     #[cfg(test)]
     async fn check_remote_placement_free_space_floor(&self, namespace: &str, placement: Option<&PlacementDecision>) -> Result<(), String> {
         self.admission.check_remote_placement_free_space_floor(namespace, placement).await
