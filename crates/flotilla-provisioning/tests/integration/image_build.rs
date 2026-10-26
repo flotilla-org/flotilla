@@ -850,7 +850,9 @@ pub(super) async fn assert_image_lifecycle(old_phase: ImageBuildPhase, ending: f
     .expect("failure observation");
     clock.advance(chrono::Duration::seconds(30));
     assert!(matches!(reconciler.prepare(&obj).await.expect("engine permits retry").action, ImageBuildAction::Waiting(_)));
-    assert_eq!(status(&backend, name).await.attempt, 2);
+    let restarted = status(&backend, name).await;
+    assert_eq!(restarted.attempt, 2);
+    assert!(restarted.started_at.is_some_and(|started| started >= chrono::DateTime::from_timestamp(32, 0).expect("deadline")));
     fixture.finish(&obj, ending);
     let selected = flotilla_store::read_image_build(&backend, NS, name, fixture.reads.clone()).await.expect("selected");
     assert_eq!(
@@ -925,7 +927,9 @@ async fn environment_image_dependency_follows_engine_without_a_copy() {
 // Pin the reachable Queued → infrastructure failure → engine-permitted retry path independently of stale terminal examples.
 #[tokio::test]
 async fn image_retry_observations_follow_engine_without_a_copy() {
-    assert_image_lifecycle(ImageBuildPhase::Queued, flotilla_provisioning_testkit::Ending::Ready("engine digest")).await;
+    for old_phase in [ImageBuildPhase::Queued, ImageBuildPhase::Built] {
+        assert_image_lifecycle(old_phase, flotilla_provisioning_testkit::Ending::Ready("engine digest")).await;
+    }
 }
 
 // Both transactional backends keep legacy policy for unheld builds, CAS checks, and checked-read failures.

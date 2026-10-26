@@ -332,6 +332,8 @@ fn progress(status: &ImageBuildStatus, reading: Option<&LifecycleReading>) -> Bu
     }
 }
 
+/// Owns the execution slot through reconciliation and publication.
+/// Callers finish and drop this frame before preparing another object.
 pub struct ImageBuildPrepared {
     pub action: ImageBuildAction,
     reading: Result<Option<LifecycleReading>, String>,
@@ -455,6 +457,7 @@ impl Reconciler for ImageBuildReconciler {
     async fn prepare(&self, obj: &ResourceObject<ImageBuild>) -> Result<Self::Prepared, ResourceError> {
         let execution = Arc::clone(&self.execution).lock_owned().await;
         let action = self.prepare_build(obj).await?;
+        // Refresh after job collection: the engine may have ended it while the job ran.
         let reading = self.reading(obj).await;
         Ok(ImageBuildPrepared { action, reading, _execution: execution })
     }
