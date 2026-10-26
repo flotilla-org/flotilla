@@ -11,19 +11,22 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
-use crate::environment::dummy::{DummyEnvironmentProvider, DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV};
+use crate::environment::dummy::{
+    DummyEnvironmentBehaviour, DummyEnvironmentCleanup, DummyEnvironmentProvider, DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV,
+};
 use crate::environment::EnvironmentProvider;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 
+#[derive(Clone)]
 pub struct DummyEnvironmentFactory {
     provider: Arc<DummyEnvironmentProvider>,
 }
 
 impl DummyEnvironmentFactory {
-    /// The fleet owns the external environment world across daemon restarts.
-    pub fn new(provider: Arc<DummyEnvironmentProvider>) -> Self {
-        Self { provider }
+    /// Clones share the external backing inventory across daemon restarts.
+    pub fn new(behaviour: DummyEnvironmentBehaviour, cleanup: DummyEnvironmentCleanup) -> Self {
+        Self { provider: Arc::new(DummyEnvironmentProvider::new(behaviour).with_cleanup(cleanup)) }
     }
 }
 
