@@ -33,14 +33,15 @@ use flotilla_resources::{
         Delivered, ACCOUNT_BINDING_LABEL, ACCOUNT_CREDENTIAL_LABEL,
     },
     Convoy, CredentialGrant, CredentialSpec, Environment, InputMeta, ReadWatchEvent, ResourceError, ResourceObject, ResourceProvenance,
-    CONVOY_LABEL,
+    TerminalSession, TerminalSessionSource, CONVOY_LABEL,
 };
 use flotilla_schema::{Ref, Timestamp};
 use flotilla_store::{
     controller::{
-        LabelMappedWatch, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender,
+        LabelMappedWatch, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileOutcome, Reconciler, ReplicaLabelMappedWatch,
+        SecondaryWatch, WorkQueueSender,
     },
-    ResourceBackend,
+    ResourceBackend, TypedResolver,
 };
 use futures::StreamExt;
 
@@ -91,6 +92,9 @@ pub(super) async fn deliver_bound_account(
         }
         Err(error) => return Err(format!("read account binding `{name}`: {error}")),
     };
+    // The provision controller cannot withdraw this binding's copy here while it is delivered.
+    let lock = state.account_delivery_lock(&name);
+    let _delivering = lock.lock().await;
     if let Some(reason) = binding.object.spec.state.value.reason() {
         return Err(format!("crew `{}` waits: {reason}; `flotilla convoy rebind` opens a new binding", launch.role));
     }
@@ -136,7 +140,7 @@ pub(super) async fn deliver_bound_account(
 
 /// Create the provision record, or with `replace`, bring an existing one to `spec`.
 async fn write_provision(
-    provisions: &flotilla_store::TypedResolver<AccountProvision>,
+    provisions: &TypedResolver<AccountProvision>,
     meta: &InputMeta,
     spec: &AccountProvisionSpec,
     replace: bool,
@@ -261,6 +265,14 @@ async fn reconcile_provision(
 ) -> Result<(), String> {
     let backend = state.daemon.resource_backend();
     let provisions = backend.clone().using::<AccountProvision>(namespace);
+    let lock = state.account_delivery_lock(&provision.spec.binding.name);
+    let _withdrawing = lock.lock().await;
+    // Read again under the lock: a launch may have recorded a new delivery meanwhile.
+    let provision = &match provisions.get(&provision.metadata.name).await {
+        Ok(provision) => provision,
+        Err(ResourceError::NotFound { .. }) => return Ok(()),
+        Err(error) => return Err(format!("read account provision `{}`: {error}", provision.metadata.name)),
+    };
     let name = &provision.metadata.name;
     let spec = &provision.spec;
     if spec.place != state.host_direct_environment_name
@@ -296,7 +308,7 @@ async fn reconcile_provision(
     }
 }
 
-async fn delete_provision(provisions: &flotilla_store::TypedResolver<AccountProvision>, name: &str) -> Result<(), String> {
+async fn delete_provision(provisions: &TypedResolver<AccountProvision>, name: &str) -> Result<(), String> {
     match provisions.delete(name).await {
         Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(()),
         Err(error) => Err(format!("remove account provision `{name}`: {error}")),
@@ -311,11 +323,11 @@ async fn requester_sessions(
     binding: &str,
     access: &AccessName,
     place: &str,
-) -> Result<Vec<ResourceObject<flotilla_resources::TerminalSession>>, String> {
+) -> Result<Vec<ResourceObject<TerminalSession>>, String> {
     let sessions = state
         .daemon
         .resource_backend()
-        .using::<flotilla_resources::TerminalSession>(namespace)
+        .using::<TerminalSession>(namespace)
         .list()
         .await
         .map_err(|error| format!("list terminal sessions: {error}"))?;
@@ -326,7 +338,7 @@ async fn requester_sessions(
             session.spec.env_ref == place
                 && matches!(
                     &session.spec.source,
-                    flotilla_resources::TerminalSessionSource::Agent { context, .. }
+                    TerminalSessionSource::Agent { context, .. }
                         if binding_name(&context.convoy, &session.spec.role, access) == binding
                 )
         })
@@ -336,7 +348,7 @@ async fn requester_sessions(
 /// A runner that reaches the requester's home at a place.
 async fn place_runner(
     state: &Arc<ControllerRuntimeState>,
-    sessions: &[ResourceObject<flotilla_resources::TerminalSession>],
+    sessions: &[ResourceObject<TerminalSession>],
     place: &str,
 ) -> Result<Arc<dyn CommandRunner>, String> {
     let runtime = super::terminal::TerminalControllerRuntime { state: Arc::clone(state) };
@@ -360,7 +372,7 @@ async fn withdraw(
     let sessions = requester_sessions(state, namespace, &spec.binding.name, &access, &spec.place).await?;
     let runner = place_runner(state, &sessions, &spec.place).await?;
     implementation.remove(&spec.home, &*runner).await?;
-    let terminal_sessions = state.daemon.resource_backend().using::<flotilla_resources::TerminalSession>(namespace);
+    let terminal_sessions = state.daemon.resource_backend().using::<TerminalSession>(namespace);
     for session in sessions {
         match terminal_sessions.delete(&session.metadata.name).await {
             Ok(_) | Err(ResourceError::NotFound { .. }) => {}
@@ -526,6 +538,11 @@ pub(super) fn binding_controller(
     (
         vec![
             Box::new(LabelMappedWatch::<AccountBinding, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
+            Box::new(ReplicaLabelMappedWatch::<AccountProvision, Convoy> {
+                label_key: CONVOY_LABEL,
+                resolver: daemon.resource_backend().including_replicas(&namespace),
+                _marker: PhantomData,
+            }),
             Box::new(CredentialConvoysWatch::<CredentialGrant> { credentials: |grant| grant.spec.credentials.iter().cloned().collect() }),
             Box::new(CredentialConvoysWatch::<CredentialSpec> { credentials: |spec| vec![spec.metadata.name.clone()] }),
         ],

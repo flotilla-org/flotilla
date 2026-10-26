@@ -68,6 +68,9 @@ pub(super) struct ControllerRuntimeState {
     pub(super) local_backing_observed: AtomicBool,
     pub(super) clone_flights: Arc<CloneFlights>,
     pub(super) terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
+    /// Serialises a launch's delivery of a binding with the provision controller's withdrawal of
+    /// it at this place (#3910 review), keyed by binding.
+    pub(super) account_deliveries: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
     pub(super) exit_receipts: ExitReceiptObserver,
     pub(super) archive_catalog_lock: Mutex<()>,
     pub(super) checkout_removal_concurrency: NonZeroUsize,
@@ -82,6 +85,12 @@ pub(super) struct ControllerRuntimeState {
 }
 
 impl ControllerRuntimeState {
+    /// The lock a binding's delivery and withdrawal at this place share.
+    pub(super) fn account_delivery_lock(&self, binding: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.account_deliveries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(locks.entry(binding.to_string()).or_default())
+    }
+
     pub(super) async fn provider_address(
         &self,
         name: &str,
@@ -231,6 +240,7 @@ impl ControllerRuntimeState {
             local_backing_observed: AtomicBool::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
+            account_deliveries: StdMutex::new(HashMap::new()),
             exit_receipts: ExitReceiptObserver::default(),
             archive_catalog_lock: Mutex::new(()),
             checkout_removal_concurrency: DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
