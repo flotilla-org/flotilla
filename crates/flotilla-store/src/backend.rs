@@ -619,6 +619,9 @@ impl<T: Resource> TypedResolver<T> {
         dispatch_backend!(self, update_typed, meta, resource_version, spec)
     }
 
+    /// Ownership can be acquired after the read below. A legacy validation refusal is
+    /// retried by reconciliation with the newly held lifecycle; it cannot change engine state.
+    /// HTTP validates on its server and does not transmit this local validator selection.
     pub async fn update_status(&self, name: &str, resource_version: &str, status: &T::Status) -> Result<ResourceObject<T>, ResourceError> {
         let engine_owned = match (T::STATUS_LIFECYCLE_KIND, self.lifecycle_status_reads.as_ref()) {
             (Some(lifecycle), Some(reads)) => {

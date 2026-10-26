@@ -508,6 +508,8 @@ async fn image_build_failures_follow_the_build_policy() {
         ImageBuild as OldImageBuild, ImageBuildFailure, ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec,
         ImageBuildStatusPatch, ImageDelivery,
     };
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::{Cause, CauseCategory, Outcome};
     let object = || ResourceObject::<OldImageBuild> {
         metadata: meta("image-a"),
         spec: ImageBuildResourceSpec::Current(Box::new(ImageBuildSpec {
@@ -547,6 +549,14 @@ async fn image_build_failures_follow_the_build_policy() {
         ImageBuildStatusPatch::Built { at: DateTime::UNIX_EPOCH, digest: "sha256:beef".into(), probes: vec![], log_ref: "log".into() };
     assert_eq!(decide::<ImageBuildBinding>(home.as_ref(), &obj, Some(built.clone()), Utc::now()).patch, Some(built));
     assert_eq!(home.get("image-a").expect("held").state(), &LifecycleState::Realised { identity: "sha256:beef".into() });
+    // Mutable actuator observations cannot start another attempt or replace a realised digest.
+    for step in [
+        Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, "late failure"), retryable: true }),
+        Step::Realised { identity: "sha256:other".into() },
+    ] {
+        assert!(home.step("image-a", &step, Timestamp(3)).is_err());
+        assert_eq!(home.get("image-a").expect("held").state(), &LifecycleState::Realised { identity: "sha256:beef".into() });
+    }
 }
 
 // When a status write fails after an engine step, the next report is a new attempt.
