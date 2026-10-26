@@ -32,6 +32,8 @@ use super::environments::ActiveProvisionedEnvironment;
 use super::state::ControllerRuntimeState;
 use crate::environment_tools::{EnvironmentToolContext, DOCKER_PROVIDER_KIND};
 
+pub(super) const REQUESTER_CONVOY_UNAVAILABLE: &str = "RequesterConvoyUnavailable:";
+
 pub(super) struct DockerControllerRuntime {
     pub(super) state: Arc<ControllerRuntimeState>,
 }
@@ -173,38 +175,50 @@ impl DockerControllerRuntime {
         spec: &flotilla_resources::DockerEnvironmentSpec,
     ) -> Result<EnvironmentProvisioning, EnvironmentProvisionError> {
         let legacy_baseline = self.legacy_baseline_for_environment(name).await?;
-        let (mut environment_spec, instance, convoy) =
-            match self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(name).await {
-                Ok(environment) => {
-                    // Contained Environments reference their owning Vessel on the placement host.
-                    // Its spec carries convoy identity even when the Environment has no convoy label.
-                    let convoy = if let Some(convoy) = environment.metadata.labels.get(flotilla_resources::CONVOY_LABEL) {
-                        Some(convoy.clone())
-                    } else if let Some(vessel_ref) = environment.metadata.labels.get(flotilla_resources::VESSEL_REF_LABEL) {
-                        match self.state.daemon.resource_backend().using::<Vessel>(&self.state.namespace).get(vessel_ref).await {
-                            Ok(vessel) => Some(vessel.spec.convoy_ref),
-                            Err(ResourceError::NotFound { .. }) => None,
-                            Err(error) => return Err(error.to_string().into()),
+        let requires_requester =
+            spec.required_agent_adapters.iter().any(|adapter| flotilla_agent::account_access::declared_account_access(adapter).is_some());
+        let (mut environment_spec, instance, convoy) = match self
+            .state
+            .daemon
+            .resource_backend()
+            .using::<Environment>(&self.state.namespace)
+            .get(name)
+            .await
+        {
+            Ok(environment) => {
+                // Contained Environments reference their owning Vessel on the placement host.
+                // Its spec carries convoy identity even when the Environment has no convoy label.
+                let convoy = if let Some(convoy) = environment.metadata.labels.get(flotilla_resources::CONVOY_LABEL) {
+                    Some(convoy.clone())
+                } else if let Some(vessel_ref) = environment.metadata.labels.get(flotilla_resources::VESSEL_REF_LABEL) {
+                    match self.state.daemon.resource_backend().using::<Vessel>(&self.state.namespace).get(vessel_ref).await {
+                        Ok(vessel) => Some(vessel.spec.convoy_ref),
+                        Err(ResourceError::NotFound { .. }) if requires_requester => {
+                            return Err(format!(
+                                    "{REQUESTER_CONVOY_UNAVAILABLE} contained environment `{name}` has no resolvable convoy: referenced Vessel `{vessel_ref}` is missing"
+                                ).into());
                         }
-                    } else {
-                        None
-                    };
-                    (
-                        environment.spec,
-                        environment.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned(),
-                        convoy,
-                    )
-                }
-                Err(ResourceError::NotFound { .. }) => (
-                    EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) },
-                    None,
-                    None,
-                ),
-                Err(error) => return Err(error.to_string().into()),
-            };
-        if convoy.as_deref().is_none_or(str::is_empty) && spec.required_agent_adapters.contains("claude-code") {
+                        Err(ResourceError::NotFound { .. }) => None,
+                        Err(error) => return Err(error.to_string().into()),
+                    }
+                } else {
+                    None
+                };
+                (
+                    environment.spec,
+                    environment.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned(),
+                    convoy,
+                )
+            }
+            Err(ResourceError::NotFound { .. }) => {
+                (EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) }, None, None)
+            }
+            Err(error) => return Err(error.to_string().into()),
+        };
+        let convoy = convoy.filter(|convoy| !convoy.is_empty());
+        if convoy.is_none() && requires_requester {
             return Err(format!(
-                "RequesterConvoyUnavailable: contained Claude environment `{name}` has no resolvable convoy; expected an Environment convoy label or its referenced Vessel's convoy_ref"
+                "{REQUESTER_CONVOY_UNAVAILABLE} contained requester-bound environment `{name}` has no resolvable convoy; expected an Environment convoy label or its referenced Vessel's convoy_ref"
             ).into());
         }
         if environment_spec.cloud_sandbox.is_none() {

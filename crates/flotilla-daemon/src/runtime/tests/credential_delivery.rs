@@ -1,3 +1,4 @@
+use super::super::docker::REQUESTER_CONVOY_UNAVAILABLE;
 use super::*;
 use flotilla_store_memory::InMemoryBackend;
 
@@ -771,7 +772,7 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
         .expect("orphan environment");
     let error =
         DockerControllerRuntime { state }.provision_docker(&environment.metadata.name, spec).await.expect_err("missing requester convoy");
-    assert!(error.to_string().starts_with("RequesterConvoyUnavailable:"), "{error}");
+    assert!(error.to_string().starts_with(REQUESTER_CONVOY_UNAVAILABLE), "{error}");
     mint_session.assert_complete();
 }
 
