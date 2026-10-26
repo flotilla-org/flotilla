@@ -85,8 +85,8 @@ pub use descriptor::{
     TableSet, When, RECORD_VERSION, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS, SHARED_NAMES, VIEW_SUFFIX,
 };
 pub use edge::{
-    AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeHeader, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf, LabelCheck, RecordsOf,
-    RowPath, StateOf,
+    AppendTo, ColumnOf, Edge, EdgeAppend, EdgeCollection, EdgeError, EdgeHeader, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf,
+    LabelCheck, RecordsOf, RowPath, StateOf,
 };
 pub use event::{whole_log_topic, Cause, Change, Effect, Event, EventError, Named, Origin, Step, LOG_LIMITS};
 pub use flotilla_address::Address;

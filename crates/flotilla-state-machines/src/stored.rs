@@ -124,7 +124,13 @@ where
     const CODE: KindCode = <M::Spec as KindSpec>::CODE;
 
     fn table_set() -> TableSet {
-        holder_tables::<M::Spec, EdgeKind<M>>()
+        let mut tables = holder_tables::<M::Spec, EdgeKind<M>>();
+        for (field, name, default) in M::STORED_DEFAULTS {
+            let table = tables.tables.iter_mut().find(|table| table.field == *field).expect("compatibility default names a table");
+            let column = table.columns.iter_mut().find(|column| column.name == *name).expect("compatibility default names a column");
+            column.properties.insert("previous_generation_default".into(), (*default).into());
+        }
+        tables
     }
 
     fn with_identity(self, name: &str, version: u64) -> Self {

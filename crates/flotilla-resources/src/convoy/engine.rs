@@ -64,8 +64,6 @@ pub enum Admission {
 pub enum SkipReason {
     /// Bootstrap has not frozen its workflow yet.
     NotBootstrapped,
-    /// A standing convoy: the seat-growth item on #3587 gates those, with the import.
-    Standing,
     /// Something is decided already; the import maps a convoy with history.
     Decided(String),
 }
@@ -73,7 +71,8 @@ pub enum SkipReason {
 /// The engine-first Convoy writer, in the old shape.
 #[async_trait]
 pub trait EngineConvoys: Send + Sync {
-    /// Whether the engine holds (and so decides) this convoy.
+    /// Whether the engine decides this convoy. An invalid engine identity also
+    /// selects this path so an operation reports its error instead of using the old writer.
     fn holds(&self, convoy: &ResourceObject<Convoy>) -> bool;
 
     /// Admits a freshly bootstrapped convoy, unless the engine holds it. Only
@@ -178,6 +177,31 @@ fn with_promises(convoy: &ResourceObject<Convoy>, promises: OldPromises) -> Reso
     let mut viewed = convoy.clone();
     viewed.status.get_or_insert_with(Default::default).promises = promises;
     viewed
+}
+
+/// Stable engine identity of a standing role; independent of its old generation record.
+pub fn standing_name(project: &str, role: &str) -> Result<String, String> {
+    flotilla_address::Address::project(project)
+        .and_then(|project| project.child(flotilla_address::Kind::Convoy, role))
+        .map(|address| address.to_string())
+        .map_err(|error| error.to_string())
+}
+
+/// Finite convoys keep their old name. Standing convoys use their ensure's
+/// frozen role and project, including old generations admitted before spec.role.
+pub fn engine_name(convoy: &ResourceObject<Convoy>) -> Result<String, String> {
+    if !super::reconcile::is_ensured(convoy) {
+        return Ok(convoy.metadata.name.clone());
+    }
+    let role = convoy
+        .status
+        .as_ref()
+        .and_then(|status| status.ensure_admission.as_ref())
+        .map(|ensure| ensure.role.as_str())
+        .filter(|role| !role.is_empty())
+        .or_else(|| (!convoy.spec.role.is_empty()).then_some(convoy.spec.role.as_str()))
+        .ok_or_else(|| format!("standing convoy `{}` has no recorded ensure role", convoy.metadata.name))?;
+    standing_name(convoy.spec.project_ref.as_deref().unwrap_or(&convoy.metadata.namespace), role)
 }
 
 #[cfg(test)]

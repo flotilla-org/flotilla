@@ -1166,7 +1166,7 @@ impl Ctx<'_> {
     fn apply_edge<K: Kind>(&mut self, current: Stamp, parts: EdgeParts) -> Result<Stamp, StoreError> {
         self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
-        let EdgeParts { sets, rows, appends, objects, from, event } = parts;
+        let EdgeParts { sets, rows, appends, collections, objects, from, event } = parts;
         self.check_edge(K::CODE, event.edge, event.from, event.to)?;
         let state = self.sql(K::CODE)?.edge_state.as_ref().map(|(field, _)| field.as_str());
         if state != Some(from.field) {
@@ -1241,6 +1241,26 @@ impl Ctx<'_> {
                 RowEdit::Insert { key, values } | RowEdit::Update { key, values } => sql.added(index, &Row { key: full(key), values })?,
                 RowEdit::Delete { key } => sql.removed(index, &full(key)),
             });
+        }
+        // A rollover drops ended-generation rows before inserting the compacted
+        // live generation. Version/from checks above cover the entire replacement.
+        for collection in collections {
+            let table = self.child_table(K::CODE, 0, collection.table, collection.role)?;
+            let sql = self.sql(K::CODE)?;
+            let count = 1 + descendants(&sql.tables, table);
+            if collection.before.tables.len() != count || collection.after.tables.len() != count {
+                return Err(StoreError::EdgeTarget { table: sql.tables[table].name.clone(), field: collection.table.to_owned() });
+            }
+            for (offset, rows) in collection.before.tables.into_iter().enumerate().rev() {
+                for row in rows {
+                    changes.push(sql.removed(table + offset, &row.key));
+                }
+            }
+            for (offset, rows) in collection.after.tables.into_iter().enumerate() {
+                for row in rows {
+                    changes.push(sql.added(table + offset, &row)?);
+                }
+            }
         }
         // Positions taken by this edge, per table and parent row, after the first read.
         let mut taken: BTreeMap<(usize, Vec<Value>), i64> = BTreeMap::new();

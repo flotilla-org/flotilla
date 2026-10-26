@@ -17,10 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use flotilla_resources::{
-    convoy::{
-        engine::{Actor, Admission, EngineConvoys, OldPromises, SkipReason, VerdictScope},
-        reconcile::is_ensured,
-    },
+    convoy::engine::{Actor, Admission, EngineConvoys, OldPromises, SkipReason, VerdictScope},
     promises::{PromiseKind as OldKind, PromiseOperation, PromiseSource as OldSource},
     Convoy as OldConvoy, ConvoyStatusPatch, Forge, ForgeSpec, ResourceObject,
 };
@@ -84,7 +81,7 @@ impl ConvoyEngine {
             + 'static,
     ) -> Result<T, String> {
         let convoys = Arc::clone(&self.convoys);
-        let name = convoy.metadata.name.clone();
+        let name = map::engine_name(convoy)?;
         let now = self.now();
         let edited = tokio::task::spawn_blocking(move || convoys.edit(&name, now, plan)).await.map_err(|error| error.to_string())?;
         let applied = match &edited {
@@ -119,8 +116,10 @@ fn operator(principal: &str) -> SeatName {
 }
 
 /// The next unused promise id: ids are never reused, retracted ones included.
-fn next_id(convoy: &Resource<Convoy>) -> PromiseId {
-    PromiseId(convoy.spec().promises.iter().map(|row| row.record.id.0 + 1).max().unwrap_or(0))
+fn next_id(convoy: &Resource<Convoy>) -> Result<PromiseId, String> {
+    let spec = convoy.spec();
+    let next = spec.promises.iter().map(|row| u64::from(row.record.id.0) + 1).max().unwrap_or(0).max(spec.promise_floor);
+    u32::try_from(next).map(PromiseId).map_err(|_| "convoy promise ids exhausted".into())
 }
 
 /// The world key an edge's recorded input is read under.
@@ -135,19 +134,19 @@ fn open(promise: &Promise) -> bool {
 #[async_trait]
 impl EngineConvoys for ConvoyEngine {
     fn holds(&self, convoy: &ResourceObject<OldConvoy>) -> bool {
-        self.convoys.get(&convoy.metadata.name).is_some()
+        // Fail closed: route an invalid identity to this writer, whose edits return
+        // the naming error, rather than falling back to the legacy writer.
+        map::engine_name(convoy).map_or(true, |name| self.convoys.get(&name).is_some())
     }
 
     async fn admit(&self, convoy: &ResourceObject<OldConvoy>) -> Result<Admission, String> {
-        if self.holds(convoy) {
+        let name = map::engine_name(convoy)?;
+        if self.convoys.get(&name).is_some() {
             return Ok(Admission::Held);
         }
         let Some(status) = convoy.status.as_ref().filter(|status| status.workflow_snapshot.is_some()) else {
             return Ok(Admission::Skipped(SkipReason::NotBootstrapped));
         };
-        if is_ensured(convoy) {
-            return Ok(Admission::Skipped(SkipReason::Standing));
-        }
         if let Err(history) = map::undecided(status) {
             return Ok(Admission::Skipped(SkipReason::Decided(history)));
         }
@@ -157,7 +156,6 @@ impl EngineConvoys for ConvoyEngine {
         }
         let project = request.project.clone();
         let convoys = Arc::clone(&self.convoys);
-        let name = convoy.metadata.name.clone();
         let now = self.now();
         let admitted = tokio::task::spawn_blocking(move || {
             // Old admission read the project; the engine's gate reads that record.
@@ -212,7 +210,7 @@ impl EngineConvoys for ConvoyEngine {
                 match map::taken(current, &label) {
                     Some(refusal) => Err(refusal),
                     None => Ok(Declare {
-                        promise: next_id(current),
+                        promise: next_id(current)?,
                         label,
                         kind: kind.as_str().to_owned(),
                         target: target.clone(),
@@ -288,7 +286,7 @@ impl EngineConvoys for ConvoyEngine {
     async fn reassign(&self, convoy: &ResourceObject<OldConvoy>, vessel: &str, from: &str, to: &str) -> Result<(), String> {
         let crews = crews(convoy);
         let (from, to) = (crews.seat(vessel, from), crews.seat(vessel, to));
-        let name = convoy.metadata.name.clone();
+        let name = map::engine_name(convoy)?;
         self.edit(convoy, move |current, world| {
             let mut edges: Vec<ConvoyEdge> = Vec::new();
             if from == to {
@@ -394,7 +392,7 @@ impl EngineConvoys for ConvoyEngine {
     }
 
     async fn abandon(&self, convoy: &ResourceObject<OldConvoy>, principal: &str, reason: &str) -> Result<(), String> {
-        let (name, by, reason) = (convoy.metadata.name.clone(), operator(principal), reason.to_owned());
+        let (name, by, reason) = (map::engine_name(convoy)?, operator(principal), reason.to_owned());
         self.edit(convoy, move |current, world| {
             // An ended engine convoy has nothing left to abandon.
             if current.label() != ConvoyLabel::Open {
@@ -415,10 +413,10 @@ impl EngineConvoys for ConvoyEngine {
         // This home named as the convoy's home is deliberately the local read: the in-memory
         // engine is current, and its own records are never replicas here.
         let engine = match home.filter(|home| *home != self.convoys.home()) {
-            None => self.convoys.get(&convoy.metadata.name),
+            None => self.convoys.get(&map::engine_name(convoy)?),
             Some(home) => self
                 .convoys
-                .replica(&convoy.metadata.name, home)
+                .replica(&map::engine_name(convoy)?, home)
                 .map_err(|error| format!("convoy `{}` at {home}: the engine replica did not read: {error}", convoy.metadata.name))?,
         };
         Ok(engine.map(|engine| map::old_promises(&engine, &crews(convoy))))

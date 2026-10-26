@@ -229,7 +229,7 @@ fn render_table(out: &mut String, set: &TableSet, table: &Table, exists: &str) {
     let _ = writeln!(out, "CREATE TABLE {exists}{} (\n  {}\n) {options};", quote_ident(&table.name), lines.join(",\n  "));
 }
 
-fn column(column: &ColumnDef) -> String {
+pub(crate) fn column(column: &ColumnDef) -> String {
     let name = quote_ident(&column.name);
     let sql_type = match column.ty {
         ColumnType::Text | ColumnType::Code(_) => "TEXT",
@@ -253,6 +253,9 @@ fn column(column: &ColumnDef) -> String {
             let _ = write!(out, " CHECK ({name} IN ({}))", codes.join(", "));
         }
         ColumnType::Integer | ColumnType::Number | ColumnType::Text | ColumnType::Blob | ColumnType::Cbor | ColumnType::Timestamp => {}
+    }
+    if let Some(default) = column.previous_generation_default() {
+        let _ = write!(out, " DEFAULT {default}");
     }
     out
 }

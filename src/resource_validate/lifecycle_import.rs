@@ -16,6 +16,7 @@ use flotilla_provisioning::engine::{
     import::{rehearse_records, rehearse_vessels, ImportRefusal, ImportReport},
     terminal_session::TerminalSessionBinding,
 };
+use flotilla_resources::convoy::engine::engine_name;
 use flotilla_resources::{Convoy, ConvoyEnsure, K8sResourceObject, Resource, ResourceObject};
 use serde_json::Value;
 
@@ -70,8 +71,35 @@ impl Documents {
         rehearse_records::<CheckoutBinding>(&records, &mut report);
         let records = self.decoded("terminalsessions", "TerminalSession", &mut report);
         rehearse_records::<TerminalSessionBinding>(&records, &mut report);
-        let records = self.decoded("vessels", "Vessel", &mut report);
+        let convoys = self.decoded::<Convoy>("convoys", "Convoy", &mut report);
+        let aliases: BTreeMap<_, _> = convoys
+            .iter()
+            .filter_map(|(convoy, home)| engine_name(convoy).ok().map(|name| ((home.clone(), convoy.metadata.name.clone()), name)))
+            .collect();
+        let mut records = self.decoded::<flotilla_resources::Vessel>("vessels", "Vessel", &mut report);
+        for (vessel, home) in &mut records {
+            let convoy_home = vessel.metadata.annotations.get(flotilla_resources::ACTUATOR_SOURCE_ROOT_ANNOTATION).unwrap_or(home);
+            if let Some(stable) = aliases.get(&(convoy_home.clone(), vessel.spec.convoy_ref.clone())) {
+                vessel.spec.convoy_ref.clone_from(stable);
+            } else {
+                report.notes.push(format!(
+                    "Vessel `{}` records convoy `{}` from home `{convoy_home}`, which is not listed or has no mappable identity: left unchanged",
+                    vessel.metadata.name, vessel.spec.convoy_ref
+                ));
+            }
+        }
         rehearse_vessels(&records, &mut report);
+        let standing: Vec<_> = aliases.iter().filter(|((_, old), stable)| old != *stable).collect();
+        let identities: std::collections::BTreeSet<_> =
+            standing.iter().map(|((home, _), stable)| (home.as_str(), stable.as_str())).collect();
+        if !standing.is_empty() {
+            report.notes.push(format!(
+                "{} standing convoy generations map to {} stable identities ({} folded)",
+                standing.len(),
+                identities.len(),
+                standing.len() - identities.len()
+            ));
+        }
         // Ensures: each derived from its live convoy.
         // Each convoy's liveness, and whether it has a status yet: one with none is a fresh convoy,
         // read as live, and an Ensure bound to it is noted.
@@ -245,5 +273,51 @@ mod tests {
         assert!(unmapped.contains(&("Clone", "broken-a")), "an undecodable record is named: {unmapped:?}");
         assert!(report.notes.iter().any(|note| note.contains("`governor-9`, which is not listed")), "{:?}", report.notes);
         assert!(report.notes.iter().any(|note| note.contains("`governor-1`, which has no status yet")), "{:?}", report.notes);
+    }
+
+    #[test]
+    fn rehearsal_counts_old_generations_under_one_standing_identity() {
+        let mut documents = Documents::default();
+        let generations = (1..=2).map(|generation| {
+            let mut convoy = document("Convoy", &format!("governor-{generation}"),
+                serde_json::json!({"workflow_ref": "w", "inputs": {}, "project_ref": "flotilla", "role": "governor", "generation": generation}),
+                serde_json::json!({"phase": "Active"}));
+            convoy["metadata"]["annotations"] = serde_json::json!({"flotilla.work/ensured-from": "standing-governor"});
+            convoy
+        }).collect();
+        documents.0.insert("convoys".into(), generations);
+        documents.0.insert(
+            "convoyensures".into(),
+            vec![document(
+                "ConvoyEnsure",
+                "standing-governor",
+                serde_json::json!({"project_ref": "flotilla", "role": "governor", "repositories": []}),
+                serde_json::json!({"convoy_ref": "governor-2"}),
+            )],
+        );
+        // An archived earlier generation still maps to the stable identity.
+        documents.0.get_mut("convoys").unwrap()[0]["status"]["phase"] = serde_json::json!("Landed");
+        documents.0.insert(
+            "vessels".into(),
+            vec![document(
+                "Vessel",
+                "unlisted-vessel",
+                serde_json::json!({"convoy_ref": "missing-convoy", "vessel_name": "work", "placement_policy_ref": "p"}),
+                Value::Null,
+            )],
+        );
+        let report = documents.rehearse();
+        assert!(
+            report.notes.iter().any(|note| note.contains("Vessel `unlisted-vessel`")
+                && note.contains("missing-convoy")
+                && note.contains("left unchanged")),
+            "{report:?}"
+        );
+        assert!(report.refused.is_empty(), "{report:?}");
+        assert_eq!(report.imported.get(&("Ensure", "fulfilled")), Some(&1));
+        assert!(
+            report.notes.iter().any(|note| note.contains("2 standing convoy generations map to 1 stable identities (1 folded)")),
+            "{report:?}"
+        );
     }
 }

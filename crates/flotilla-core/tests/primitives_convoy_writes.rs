@@ -477,3 +477,64 @@ fn a_partial_edit_reports_what_applied() {
 fn tokio_block<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(future)
 }
+
+#[tokio::test]
+async fn standing_admission_and_rollover_use_the_ensure_role_identity() {
+    use flotilla_resources::{Selector, ENSURED_FROM_ANNOTATION};
+    use flotilla_schema::Timestamp;
+    use flotilla_state_machines::{machines::convoy::Rollover, Ref};
+    let fixture = fixture();
+    let governor = CrewSpec::builder()
+        .role("governor".to_string())
+        .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
+        .build();
+    let mut old = old_convoy(&fixture.backend, "old-generation-id", bootstrapped(vec![("work", vec![governor])])).await;
+    old.spec.role = "governor".into();
+    old.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "ensure-governor".into());
+    let name = "project:fleet/convoy:governor";
+    assert_eq!(convoy_map::engine_name(&old).unwrap(), name);
+    assert_eq!(convoy_map::address(&old).unwrap().as_str(), name);
+    assert_eq!(fixture.engine.admit(&old).await.unwrap(), Admission::Held);
+    assert!(fixture.convoys.get("old-generation-id").is_none());
+    assert_eq!(fixture.convoys.get(name).unwrap().spec().duties.len(), 1);
+    let authority = Ref::new("ensure-governor");
+    fixture.convoys.world(|world| world.authority.put(&authority, true));
+    let duties = fixture.convoys.get(name).unwrap().spec().duties.clone();
+    // Sorts before governor: rebuilding positional duty IDs would renumber them.
+    fixture
+        .convoys
+        .apply(
+            name,
+            flotilla_state_machines::machines::convoy::AddSeat {
+                seat: SeatName::new("aaa", ""),
+                parent: SeatName::new("governor", ""),
+                supervised_by: convoy_map::address(&old).unwrap(),
+                by: SeatName::new("governor", ""),
+                authority: authority.clone(),
+            },
+            Timestamp(8),
+        )
+        .unwrap();
+    assert_eq!(fixture.convoys.get(name).unwrap().spec().duties, duties);
+    fixture.convoys.apply(name, Rollover { by: SeatName::new("governor", ""), authority }, Timestamp(9)).unwrap();
+    assert_eq!(fixture.convoys.get(name).unwrap().spec().duties, duties);
+    assert!(fixture.engine.holds(&old));
+    assert_eq!(fixture.convoys.get(name).unwrap().name(), name);
+    assert!(fixture.engine.promises(&old, None).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn invalid_standing_identity_refuses_admission_and_reads_without_legacy_fallback() {
+    let fixture = fixture();
+    let mut old = old_convoy(&fixture.backend, "invalid-standing", bootstrapped(vec![])).await;
+    old.metadata.annotations.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.into(), "ensure".into());
+    old.spec.role.clear();
+    assert!(fixture.engine.holds(&old), "invalid identity must stay on the error-returning engine path");
+    assert!(fixture.engine.admit(&old).await.is_err());
+    assert!(fixture.engine.promises(&old, None).is_err());
+    assert!(fixture.convoys.get("invalid-standing").is_none());
+    let path: flotilla_resources::convoy::engine::EngineConvoyPath = Default::default();
+    assert!(path.set(Arc::new(fixture.engine)).is_ok());
+    let Err(error) = flotilla_resources::convoy::engine::viewed(&path, &old) else { panic!("public read must return the error") };
+    assert!(error.contains("no recorded ensure role"), "{error}");
+}

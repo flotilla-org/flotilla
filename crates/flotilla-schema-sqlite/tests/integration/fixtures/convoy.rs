@@ -8,7 +8,7 @@ use flotilla_state_machines::{
     machines::convoy::{
         Abandon, AddSeat, Authority, Convoy, ConvoySpec, ConvoyState, ConvoyWorld, Declare, Deliver, Duty, DutyId, DutyScope, Keep,
         MemoryConvoyWorld, Priority, Progress, Promise, PromiseId, PromiseKind, PromiseKinds, PromiseSource, Readmit, Reassign, Reject,
-        Resupervise, RetireDuty, Retract, Seat, SeatName, Submission, Submit, Terms, VesselClass,
+        ReplaceSeat, Resupervise, RetireDuty, RetireSeat, Retract, Rollover, Seat, SeatName, Submission, Submit, Terms, VesselClass,
     },
     Ref, Resource,
 };
@@ -42,7 +42,7 @@ fn seat_name(tc: &TestCase) -> SeatName {
 
 fn seat(tc: &TestCase, pick: Pick) -> Seat {
     let parent = pick.some(tc, SHAPES / 2).then(|| seat_name(tc));
-    Seat { role: name(tc), seat: name(tc), parent, supervised_by: address(tc) }
+    Seat { retired: false, replacements: 0, role: name(tc), seat: name(tc), parent, supervised_by: address(tc) }
 }
 
 fn submission(tc: &TestCase) -> Submission {
@@ -96,6 +96,7 @@ pub fn spec(tc: &TestCase, pick: Pick) -> ConvoySpec {
         }
     }
     ConvoySpec {
+        promise_floor: 0,
         project: address(tc),
         priority: Priority(tc.draw(gs::integers::<u32>())),
         kinds: Frozen::new(kinds).expect("freeze"),
@@ -133,7 +134,17 @@ pub fn sample() -> Resource<Convoy> {
     let owner = SeatName::new("coder", "");
     let mut seats = Records::new();
     seats
-        .append(0, Seat { role: "coder".into(), seat: String::new(), parent: None, supervised_by: "project:p".parse().expect("address") })
+        .append(
+            0,
+            Seat {
+                retired: false,
+                replacements: 0,
+                role: "coder".into(),
+                seat: String::new(),
+                parent: None,
+                supervised_by: "project:p".parse().expect("address"),
+            },
+        )
         .expect("room");
     let mut promises = Records::new();
     let promise = Promise {
@@ -148,6 +159,7 @@ pub fn sample() -> Resource<Convoy> {
     };
     promises.append(0, promise).expect("room");
     let spec = ConvoySpec {
+        promise_floor: 0,
         project: "project:p".parse().expect("address"),
         priority: Priority(1),
         kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
@@ -180,7 +192,10 @@ pub fn candidates(tc: &TestCase, pick: Pick, convoy: &Resource<Convoy>) -> Vec<C
     let mut candidates: Vec<Candidate<Convoy>> = Vec::new();
     let seats: Vec<SeatName> = spec.seats.iter().map(|row| row.record.name()).collect();
     if let Some(owner) = seats.first() {
-        let unused = (0..).map(PromiseId).find(|id| spec.promise(*id).is_none()).expect("an unused id");
+        let unused = (u32::try_from(spec.promise_floor).expect("small floor")..)
+            .map(PromiseId)
+            .find(|id| spec.promise(*id).is_none())
+            .expect("an unused id");
         let label = (0..)
             .map(|n| format!("p{n}"))
             .find(|label| spec.promises.iter().all(|row| row.record.label != *label))
@@ -222,10 +237,17 @@ pub fn candidates(tc: &TestCase, pick: Pick, convoy: &Resource<Convoy>) -> Vec<C
         let change =
             Resupervise { seat: parent.clone(), supervised_by: place.clone(), by: by.clone(), authority: Ref::new(authority.as_str()) };
         candidates.push((change.into(), yes(&authority), now));
+        candidates.push((
+            RetireSeat { seat: parent.clone(), by: by.clone(), authority: Ref::new(authority.as_str()) }.into(),
+            yes(&authority),
+            now,
+        ));
+        candidates.push((ReplaceSeat(parent.clone()).into(), yes(&authority), now));
     }
     if let Some(duty) = spec.holding(convoy.state().retired()).into_iter().next() {
         candidates.push((RetireDuty { duty, by: by.clone(), authority: Ref::new(authority.as_str()) }.into(), yes(&authority), now));
     }
+    candidates.push((Rollover { by: by.clone(), authority: Ref::new(authority.as_str()) }.into(), yes(&authority), now));
     candidates.push((Deliver.into(), yes(&authority), now));
     let reason = prose;
     candidates.push((Abandon { by: by.clone(), reason, authority: Ref::new(authority.as_str()) }.into(), yes(&authority), now));
@@ -253,7 +275,12 @@ impl Fixture for Resource<Convoy> {
     /// The project, priority, kinds and duties drawn afresh; the records, state and edge log kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> Resource<Convoy> {
         let drawn = spec(tc, pick);
-        let spec = ConvoySpec { seats: self.spec().seats.clone(), promises: self.spec().promises.clone(), ..drawn };
+        let spec = ConvoySpec {
+            promise_floor: self.spec().promise_floor,
+            seats: self.spec().seats.clone(),
+            promises: self.spec().promises.clone(),
+            ..drawn
+        };
         self.clone().with_spec(spec)
     }
 
@@ -265,7 +292,9 @@ impl Fixture for Resource<Convoy> {
     fn stamped(&self, before: Option<&Resource<Convoy>>, version: u64) -> Resource<Convoy> {
         let spec = self.spec();
         let before_spec = before.map(Resource::spec);
-        let seats = stamp_flat(&spec.seats, before_spec.map(|before| &before.seats), version);
+        let compacted =
+            before_spec.is_some_and(|before| spec.seats.len() < before.seats.len() || spec.promise_floor > before.promise_floor);
+        let seats = stamp_flat(&spec.seats, before_spec.filter(|_| !compacted).map(|before| &before.seats), version);
         let promises = stamp(&spec.promises, before_spec.map(|before| &before.promises), version, |promise, before| Promise {
             submissions: stamp_flat(&promise.submissions, before.map(|before| &before.submissions), version),
             ..promise.clone()

@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_schema::{Address, Code, CodeEnum, Frozen, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
-        Abandon, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoyState,
-        Declare, Deliver, Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority, Progress, PromiseId, PromiseKinds, PromiseSource,
-        Quota, Readmit, Reassign, Reject, Resupervise, RetireDuty, Retract, Seat, SeatName, Submit, Terms, VesselClass,
+        Abandon, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoySpec,
+        ConvoyState, Declare, Deliver, Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority, Progress, PromiseId, PromiseKinds,
+        PromiseSource, Quota, Readmit, Reassign, Reject, Resupervise, RetireDuty, Retract, Seat, SeatName, Submit, Terms, VesselClass,
     },
     Coded, Diagram, Home, InputRead, Machine, Ref, StateValue, Version, WriteError,
 };
@@ -32,7 +32,14 @@ fn seat(role: &str) -> SeatName {
 }
 
 fn seat_row(role: &str, parent: Option<&str>) -> Seat {
-    Seat { role: role.into(), seat: String::new(), parent: parent.map(seat), supervised_by: address("supervisor") }
+    Seat {
+        retired: false,
+        replacements: 0,
+        role: role.into(),
+        seat: String::new(),
+        parent: parent.map(seat),
+        supervised_by: address("supervisor"),
+    }
 }
 
 fn admitted(id: u32, source: PromiseSource, owner: &str) -> AdmittedPromise {
@@ -135,6 +142,9 @@ fn codes_are_pinned() {
         ("retire_duty", "rd"),
         ("add_seat", "as"),
         ("resupervise", "sv"),
+        ("retire_seat", "sr"),
+        ("rollover", "ro"),
+        ("replace_seat", "rp"),
         ("deliver", "de"),
         ("abandon", "ab"),
         ("readmit", "ra"),
@@ -190,7 +200,13 @@ fn admission_reads_the_project_by_address() {
     let mut known = MemoryConvoyWorld::default();
     let version = known.projects.put(&Ref::new(project().as_str()), ());
     let created = home.create("c", request(&[(0, PromiseSource::Template)]), &known, Timestamp(0)).expect("admitted");
-    assert_eq!(created.reads, [InputRead { kind: "project".into(), name: "project:p".into(), version: Some(version) }]);
+    assert_eq!(
+        created.reads,
+        [
+            InputRead { kind: "project".into(), name: "project:p".into(), version: Some(version) },
+            InputRead { kind: "convoy-limits".into(), name: "configured".into(), version: None }
+        ]
+    );
 }
 
 // Every owner and every parent is an admitted seat, and seat names are unique.
@@ -399,4 +415,41 @@ fn readmission_only_raises_the_quota() {
     assert_eq!(apply(&mut home, readmit(&[("standard", 2), ("large", 1)], YES)), refused(ConvoyRefusal::QuotaNotIncrease));
     apply(&mut home, readmit(&[("standard", 2)], YES)).expect("readmitted");
     assert_eq!(home.get("c").expect("exists").state().quota(), &quota(&[("standard", 2)]));
+}
+
+// ADR 0047: the previous generation's stored record representation has no
+// retired/replacement/floor fields; new writes include their current values.
+#[test]
+fn previous_seat_and_convoy_records_decode_with_growth_defaults() {
+    let row = seat_row("a", None);
+    let mut previous = serde_json::to_value(&row).expect("encode seat");
+    previous.as_object_mut().unwrap().remove("retired");
+    previous.as_object_mut().unwrap().remove("replacements");
+    let decoded: Seat = serde_json::from_value(previous).expect("N→N+1 seat");
+    assert!(!decoded.retired);
+    assert_eq!(decoded.replacements, 0);
+    let spec = ConvoySpec {
+        project: project(),
+        promise_floor: 0,
+        priority: Priority(0),
+        kinds: Frozen::new(PromiseKinds::default()).unwrap(),
+        duties: BTreeMap::new(),
+        seats: flotilla_schema::Records::new(),
+        promises: flotilla_schema::Records::new(),
+    };
+    let mut previous = serde_json::to_value(&spec).expect("encode convoy spec");
+    previous.as_object_mut().unwrap().remove("promise_floor");
+    let decoded: ConvoySpec = serde_json::from_value(previous).expect("N→N+1 convoy spec");
+    assert_eq!(decoded.promise_floor, 0);
+}
+
+#[test]
+fn admission_starts_fresh_seat_lifetimes() {
+    let mut req = request(&[(0, PromiseSource::Template)]);
+    for seat in &mut req.seats {
+        seat.retired = true;
+        seat.replacements = u32::MAX;
+    }
+    let home = convoy(req);
+    assert!(home.get("c").unwrap().spec().seats.iter().all(|r| !r.record.retired && r.record.replacements == 0));
 }

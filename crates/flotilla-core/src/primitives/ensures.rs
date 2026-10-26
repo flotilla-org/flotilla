@@ -39,6 +39,7 @@ use async_trait::async_trait;
 use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_admission::convoy_ensure::EngineEnsures;
 use flotilla_engine_store::{open_home, StoreLog};
+use flotilla_resources::convoy::engine::standing_name;
 use flotilla_resources::{Clock, ConvoyEnsure, ConvoyEnsureStatusPatch, ResourceObject};
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::Store;
@@ -105,7 +106,7 @@ fn decide(
     }
     let state = home.get(name).expect("held").state().clone();
     let inbox = home.get(name).expect("held").spec().inbox.clone();
-    for (edge, world) in edges(name, &inbox, &state, &patch) {
+    for (edge, world) in edges(name, &inbox, &state, &patch)? {
         match home.apply(name, edge.clone(), &world, now) {
             Ok(_) => {}
             Err(WriteError::Refused(refusal)) => {
@@ -155,7 +156,12 @@ fn failed(detail: &str) -> Outcome {
 }
 
 /// The edges `patch` means for an Ensure in `state`, each with the evidence its gate reads.
-fn edges(name: &str, inbox: &Address, state: &EnsureState, patch: &ConvoyEnsureStatusPatch) -> Vec<(EnsureEdge, MemoryEnsureWorld)> {
+fn edges(
+    name: &str,
+    inbox: &Address,
+    state: &EnsureState,
+    patch: &ConvoyEnsureStatusPatch,
+) -> Result<Vec<(EnsureEdge, MemoryEnsureWorld)>, String> {
     let gone = |convoy: &Ref<Fulfiller>| {
         let mut world = MemoryEnsureWorld::default();
         world.fulfillers.put(convoy, FulfillerStatus { phase: FulfillerPhase::Gone, can_receive: false });
@@ -170,10 +176,10 @@ fn edges(name: &str, inbox: &Address, state: &EnsureState, patch: &ConvoyEnsureS
     let tried = state.bound().cloned().unwrap_or_else(|| fulfiller(&format!("{name}/admission")));
     let mut edges = Vec::new();
     match patch {
-        ConvoyEnsureStatusPatch::Running { convoy_ref, .. } => {
-            let convoy = fulfiller(convoy_ref);
+        ConvoyEnsureStatusPatch::Running { .. } => {
+            let convoy = fulfiller(&standing_name(inbox.get(AddressKind::Project).ok_or("standing inbox has no project")?, inbox.name())?);
             if state.bound() == Some(&convoy) {
-                return edges;
+                return Ok(edges);
             }
             unbind(&mut edges);
             if !state.recorded().contains(&convoy) {
@@ -213,7 +219,7 @@ fn edges(name: &str, inbox: &Address, state: &EnsureState, patch: &ConvoyEnsureS
         }
         _ => {}
     }
-    edges
+    Ok(edges)
 }
 
 /// The Ensure an old ConvoyEnsure imports as (#3629 layer 9), its state derived from its live
@@ -224,7 +230,8 @@ fn edges(name: &str, inbox: &Address, state: &EnsureState, patch: &ConvoyEnsureS
 pub fn import_ensure(ensure: &ResourceObject<ConvoyEnsure>, convoy_live: bool) -> Result<Resource<Ensure>, String> {
     use flotilla_resources::ConvoyEnsureHoldReason;
     let status = ensure.status.clone().unwrap_or_default();
-    let recorded: BTreeSet<Ref<Fulfiller>> = status.convoy_ref.iter().map(|convoy| fulfiller(convoy)).collect();
+    let stable = standing_name(&ensure.spec.project_ref, &ensure.spec.role)?;
+    let recorded: BTreeSet<Ref<Fulfiller>> = status.convoy_ref.iter().map(|_| fulfiller(&stable)).collect();
     let failures = status.restart_count;
     let last_failure = (failures > 0).then(|| Failure {
         // Failures with no recorded window read as long past (the epoch): the engine's backoff has
@@ -237,8 +244,8 @@ pub fn import_ensure(ensure: &ResourceObject<ConvoyEnsure>, convoy_live: bool) -
         (Some(ConvoyEnsureHoldReason::RestartLimit), _) => {
             EnsureState::Held { recorded: recorded.clone(), created: recorded, failures, last_failure }
         }
-        (_, Some(convoy)) if convoy_live => {
-            EnsureState::Fulfilled { recorded: recorded.clone(), created: recorded, failures, last_failure, bound: fulfiller(convoy) }
+        (_, Some(_)) if convoy_live => {
+            EnsureState::Fulfilled { recorded: recorded.clone(), created: recorded, failures, last_failure, bound: fulfiller(&stable) }
         }
         _ => EnsureState::Unfulfilled { recorded: recorded.clone(), created: recorded, failures, last_failure },
     };
@@ -335,6 +342,14 @@ pub(super) mod tests {
     // counts an attempt; its replacement is bound in turn; three failures in a row hold the Ensure,
     // and the operator clearing the hold resumes it. Each patch is written as the engine took it.
     #[test]
+    fn a_running_patch_without_a_project_returns_an_error() {
+        let state = import_ensure(&ensure(None), false).unwrap().state().clone();
+        let inbox: Address = "convoy:orphan/role:governor".parse().unwrap();
+        let patch = ConvoyEnsureStatusPatch::Running { convoy_ref: "old-generation".into(), observed_at: Utc::now() };
+        assert!(matches!(edges("ensure", &inbox, &state, &patch), Err(error) if error.contains("no project")));
+    }
+
+    #[test]
     fn the_engine_ensure_keeps_a_standing_convoy_bound() {
         let path = path();
         let mut obj = ensure(None);
@@ -350,13 +365,14 @@ pub(super) mod tests {
 
         assert!(write(running("governor-1"), &mut obj));
         assert_eq!(label(&path), "Fulfilled");
-        assert_eq!(path.get("flotilla-governor").expect("held").state().bound(), Some(&Ref::new("governor-1")));
+        assert_eq!(path.get("flotilla-governor").expect("held").state().bound(), Some(&Ref::new("project:flotilla/convoy:governor")));
         assert!(write(running("governor-1"), &mut obj), "observing the bound convoy again changes nothing");
         assert!(write(failed(), &mut obj));
         assert_eq!(label(&path), "Unfulfilled");
         assert_eq!(path.get("flotilla-governor").expect("held").state().failures(), 1);
+        // A new legacy generation keeps the same engine fulfiller binding.
         assert!(write(running("governor-2"), &mut obj));
-        assert_eq!(path.get("flotilla-governor").expect("held").state().bound(), Some(&Ref::new("governor-2")));
+        assert_eq!(path.get("flotilla-governor").expect("held").state().bound(), Some(&Ref::new("project:flotilla/convoy:governor")));
         assert_eq!(path.get("flotilla-governor").expect("held").state().failures(), 0, "a bound replacement is a success");
 
         for _ in 0..2 {
@@ -423,7 +439,7 @@ mod import_tests {
             }))
         };
         let bound = import_ensure(&with(Some("governor-3"), 0, None), true).expect("imports");
-        assert_eq!(bound.state().bound(), Some(&Ref::new("governor-3")));
+        assert_eq!(bound.state().bound(), Some(&Ref::new("project:flotilla/convoy:governor")));
         assert_eq!(bound.spec().inbox.as_str(), "project:flotilla/role:governor");
         let unbound = import_ensure(&with(Some("governor-3"), 2, None), false).expect("imports");
         assert!(matches!(unbound.state(), EnsureState::Unfulfilled { failures: 2, .. }));

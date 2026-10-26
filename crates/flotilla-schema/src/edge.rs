@@ -15,7 +15,8 @@
 //! `Message::SUBJECT: ColumnOf<Message, Option<MessageReference>>` for another column-shaped field,
 //! `Session::RECEIPTS: HistoryOf<Session, Receipt>` for a `history` field and
 //! `Convoy::DELIVERABLES: RecordsOf<Convoy, Deliverable>` for a `records` field. Spec collections
-//! (`child`) have no handle: they change only by a spec edit.
+//! (`child`) have no handle; a generation edge can replace a bounded collection
+//! explicitly through [`Edge::replace_children`].
 //!
 //! Nesting is one `records` level deep: [`Edge::set_in`] and [`Edge::append_in`] address a row of
 //! a `records` table of the kind itself (a deliverable) and a field or table of that row (its
@@ -37,7 +38,7 @@ use crate::{
     descriptor::TableRole,
     history::{EdgeEvent, Labelled},
     inline::{Cbor, INLINE_LIMITS},
-    records::Position,
+    records::{Position, Records},
     state::{RowEdit, State, StateDelta},
     time::Timestamp,
     traits::{CodeEnum, Element, StateData},
@@ -263,6 +264,16 @@ impl EdgeHeader {
     }
 }
 
+/// A generation boundary replaces a bounded collection and its descendants atomically.
+/// Its prior rows are part of the version-checked edge; history remains in the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeCollection {
+    pub table: &'static str,
+    pub role: TableRole,
+    pub before: Rows,
+    pub after: Rows,
+}
+
 /// An edge's writes, as a backend executes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeParts {
@@ -272,6 +283,7 @@ pub struct EdgeParts {
     pub rows: Vec<EdgeRow>,
     /// The declared appends, in order.
     pub appends: Vec<EdgeAppend>,
+    pub collections: Vec<EdgeCollection>,
     /// Every object the edge's values name: an edge carries the objects it sets.
     pub objects: BTreeMap<Hash, Vec<u8>>,
     pub from: LabelCheck,
@@ -396,6 +408,7 @@ impl<K> Edge<K> {
             about: None,
         };
         let parts = EdgeParts {
+            collections: Vec::new(),
             sets: Vec::new(),
             rows: Vec::new(),
             appends: Vec::new(),
@@ -447,6 +460,42 @@ impl<K> Edge<K> {
         row: &R,
     ) -> Result<Edge<K>, EdgeError> {
         self.appended(RowPath::Record { table: records.name, position }, table, row)
+    }
+
+    /// Replaces a bounded generation's records. Positions start again at zero;
+    /// callers must ensure no reference to a position survives the generation.
+    pub fn replace_records<R: Element>(self, table: RecordsOf<K, R>, before: &Records<R>, after: &Records<R>) -> Result<Self, EdgeError> {
+        self.collection::<crate::adapt::AsRecords, _>(table.name, TableRole::Records, before, after)
+    }
+
+    /// Replaces a generation's child collection (for example its standing duties).
+    pub fn replace_children<T>(self, field: &'static str, before: &T, after: &T) -> Result<Self, EdgeError>
+    where
+        crate::adapt::AsChild: crate::adapt::Adapter<T>,
+    {
+        self.collection::<crate::adapt::AsChild, T>(field, TableRole::Child, before, after)
+    }
+
+    fn collection<A: crate::adapt::Adapter<T>, T>(
+        mut self,
+        table: &'static str,
+        role: TableRole,
+        before: &T,
+        after: &T,
+    ) -> Result<Self, EdgeError> {
+        if self.parts.collections.iter().any(|old| old.table == table) {
+            return Err(EdgeError::Repeated { field: table.to_owned() });
+        }
+        let encode = |value: &T| -> Result<Rows, EdgeError> {
+            let mut rows = Encoder::fragment(A::TABLES, |e| A::encode(value, e))?;
+            rows.tables.remove(0);
+            Ok(rows)
+        };
+        let before = encode(before)?;
+        let mut after = encode(after)?;
+        self.parts.objects.append(&mut after.objects);
+        self.parts.collections.push(EdgeCollection { table, role, before, after });
+        Ok(self)
     }
 
     /// The writes, for a backend.

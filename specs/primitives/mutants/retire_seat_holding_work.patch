@@ -1,0 +1,11 @@
+--- a/machines/convoy.qnt
++++ b/machines/convoy.qnt
+@@ -201,8 +201,6 @@
+       | RetireSeat(a) => if (not(a.authorised)) Refused(Unauthorised)
+           else if (not(w.seats.keys().contains(a.seat))) Refused(UnknownSeat)
+           else if (w.retiredSeats.contains(a.seat)) Refused(SeatRetired)
+-          else if (seatPromises(w, a.seat).size() > 0) Refused(PromisesOutstanding(seatPromises(w, a.seat)))
+-          else if (seatDuties(w, a.seat).size() > 0) Refused(DutyHolds(seatDuties(w, a.seat)))
+           else Moved(Open({ ...w, retiredSeats: w.retiredSeats.union(Set(a.seat)) }))
+       // Only a standing convoy rolls over: the next generation needs an
+       // obligation, as admission does, and carries no promise over.

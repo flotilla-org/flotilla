@@ -1,0 +1,11 @@
+--- a/machines/convoy.qnt
++++ b/machines/convoy.qnt
+@@ -159,7 +159,7 @@
+     else rule(w.promises.get(id))
+   pure def step(s: State, e: Event): Next = match s {
+     | Open(w) => match e {
+-      | Declare(d) => if (w.promises.keys().contains(d.promise) or d.promise < w.promiseFloor) Refused(PromiseExists)
++      | Declare(d) => if (w.promises.keys().contains(d.promise)) Refused(PromiseExists)
+           else if (not(w.seats.keys().contains(d.owner))) Refused(UnknownSeat)
+           else if (w.retiredSeats.contains(d.owner)) Refused(SeatRetired)
+           else withPromise(w, d.promise, { promise: d.definition, source: Crew, owner: d.owner, state: Pending, submissions: [] })

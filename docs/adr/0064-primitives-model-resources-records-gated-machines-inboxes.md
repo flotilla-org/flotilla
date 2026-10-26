@@ -46,7 +46,9 @@ Convoys assumed that their vessels were co-located and fixed. Many writers could
 
   A convoy's seats, promises, submissions and duties are records of the Convoy, not their own kinds. A generated parent key is named after its root table (#3627 look-over ruling).
 
-  ADR 0064 seats: fan-out adds a seat under an existing one (`AddSeat`, names never reused) and `Resupervise` is the only edge that changes `supervised_by`; admission refuses unknown owners, unknown parents and cycles. Seat retirement is not yet modelled.
+  ADR 0064 seats: fan-out adds a seat under an existing one (`AddSeat`, names never reused within a generation) and `Resupervise` is the only edge that changes `supervised_by`; admission refuses unknown owners, unknown parents and cycles.
+
+  ADR 0064 retired seats: a retired seat's name is reserved for the rest of its generation; Rollover clears retired seats, so a later generation may reuse the name, and the live record never accumulates seat history.
 
   ADR 0064 Convoy records: a change-request observation finds its submission through a full index on the submission address (one lookup per event); there is no partial index on open convoys.
 

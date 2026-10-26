@@ -33,7 +33,7 @@ use flotilla_state_machines::{
     machines::convoy::{
         Abandon, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyRefusal, ConvoyRequest, ConvoySpec, ConvoyState, Declare, Deliver,
         Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority, Progress, PromiseId, PromiseKinds, PromiseSource, Quota, Readmit,
-        Reassign, Reject, Resupervise, RetireDuty, Retract, Seat, SeatName, Submit, Terms, VesselClass,
+        Reassign, Reject, ReplaceSeat, Resupervise, RetireDuty, RetireSeat, Retract, Rollover, Seat, SeatName, Submit, Terms, VesselClass,
     },
     Home, Ref, WriteError,
 };
@@ -133,7 +133,14 @@ fn seat_of(name: &str, v: &Value) -> Seat {
         "Root" => None,
         _ => Some(seat(payload(&v["parent"]))),
     };
-    Seat { role: name.into(), seat: String::new(), parent, supervised_by: address(&v["supervisedBy"]) }
+    Seat {
+        retired: false,
+        replacements: id(&v["replacements"]),
+        role: name.into(),
+        seat: String::new(),
+        parent,
+        supervised_by: address(&v["supervisedBy"]),
+    }
 }
 
 fn seat_value(seat: &Seat) -> Value {
@@ -141,7 +148,7 @@ fn seat_value(seat: &Seat) -> Value {
         None => bare("Root"),
         Some(parent) => variant("Under", seat_text(parent)),
     };
-    json!({ "parent": parent, "supervisedBy": seat.supervised_by.name() })
+    json!({ "parent": parent, "supervisedBy": seat.supervised_by.name(), "replacements": int(seat.replacements.into()) })
 }
 
 fn kinds() -> Frozen<PromiseKinds> {
@@ -201,6 +208,9 @@ fn refusal_of(refusal: ConvoyRefusal) -> Value {
         ConvoyRefusal::UnknownDuty => "UnknownDuty",
         ConvoyRefusal::UnknownSeat => "UnknownSeat",
         ConvoyRefusal::SeatExists => "SeatExists",
+        ConvoyRefusal::SeatRetired => "SeatRetired",
+        ConvoyRefusal::SeatsFull => "SeatsFull",
+        ConvoyRefusal::ReplacementsExhausted => "ReplacementsExhausted",
         ConvoyRefusal::SeatCycle => "SeatCycle",
     };
     bare(name)
@@ -244,6 +254,8 @@ fn work(spec: &ConvoySpec, state: &ConvoyState) -> Value {
         "spec": { "project": spec.project.name(), "duties": map_of(duties), "priority": int(spec.priority.0.into()) },
         "promises": map_of(promises),
         "seats": Value::Object(seats),
+        "retiredSeats": set_of(spec.seats.iter().filter(|r| r.record.retired).map(|r| seat_text(&r.record.name()))),
+        "promiseFloor": int(spec.promise_floor.try_into().expect("model floor")),
         "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
         "quota": quota_value(state.quota()),
     })
@@ -275,7 +287,7 @@ fn admitted_request(work: &Value) -> ConvoyRequest {
 /// The world admission reads: the request's project exists when the spec's
 /// `projectKnown` says so.
 fn projects(request: &ConvoyRequest, known: bool) -> MemoryConvoyWorld {
-    let world = MemoryConvoyWorld::default();
+    let world = MemoryConvoyWorld::default().with_limits(4, 1);
     if known {
         world.with_project(&request.project)
     } else {
@@ -301,7 +313,7 @@ impl Conformance for ConvoyConformance {
 
     fn apply(home: &mut Home<Convoy>, event: &Value) -> Step {
         let o = payload(event);
-        let mut world = MemoryConvoyWorld::default();
+        let mut world = MemoryConvoyWorld::default().with_limits(4, 1);
         let authority = Ref::new(DECIDER);
         let by = SeatName::new(DECIDER, "");
         let at = tick(1);
@@ -372,6 +384,9 @@ impl Conformance for ConvoyConformance {
                 let change = Resupervise { seat: seat(&o["seat"]), supervised_by: address(&o["supervisedBy"]), by, authority };
                 outcome(home.apply(NAME, change, &world, at))
             }
+            "RetireSeat" => outcome(home.apply(NAME, RetireSeat { seat: seat(&o["seat"]), by, authority }, &world, at)),
+            "Rollover" => outcome(home.apply(NAME, Rollover { by, authority }, &world, at)),
+            "ReplaceSeat" => outcome(home.apply(NAME, ReplaceSeat(seat(o)), &world, at)),
             "Deliver" => outcome(home.apply(NAME, Deliver, &world, at)),
             "Abandon" => outcome(home.apply(NAME, Abandon { by, reason: text(&o["reason"]).into(), authority }, &world, at)),
             "Readmit" => outcome(home.apply(NAME, Readmit { quota: quota_of(&o["quota"]), by, authority }, &world, at)),

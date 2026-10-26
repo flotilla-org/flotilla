@@ -25,6 +25,9 @@ use crate::{code::changed, Admission, Coded, Edge, EdgeArg, Handle, StateValue};
 pub trait Machine: Sized + 'static {
     /// The machine's name in diagrams and errors.
     const NAME: &'static str;
+    /// ADR 0047 additive integer/bool columns absent from the previous generation.
+    /// (table field, column, default); an empty table field names the root.
+    const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = &[];
     /// What a caller asks for when it creates a resource.
     type Request;
     /// What admission fixes. Its columns and collections never change after
@@ -59,7 +62,7 @@ pub trait Machine: Sized + 'static {
 /// the home applies it to its value once the log has taken the edge, and a
 /// store log writes it as the edge's rows.
 pub trait RecordWrite<S>: Clone + Debug {
-    /// The records field the write appends to or changes a row of.
+    /// The spec field the write changes, including generation-scoped collections.
     fn field(&self) -> &'static str;
     /// Applies the write to `spec`, stamping an appended row with `version`,
     /// the write's version.

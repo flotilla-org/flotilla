@@ -261,7 +261,17 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
                 Some(_) => vec![set.parent_key_column().to_owned()],
             };
             expected.extend(table.key.iter().chain(&table.columns).map(|column| column.name.clone()));
-            let found = statement.query_map([&table.name], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+            let mut found = statement.query_map([&table.name], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+            // Explicit ADR 0047 N→N+1 defaults only: no broad migration policy.
+            // Remove each column's default/upgrade eligibility one roll after its
+            // field lands; once no eligible columns remain this check only reads.
+            // The open transaction rolls this back if any other drift remains.
+            for column in &table.columns {
+                if !found.contains(&column.name) && column.previous_generation_default().is_some() {
+                    conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {};", quote_ident(&table.name), crate::ddl::column(column)))?;
+                    found.push(column.name.clone());
+                }
+            }
             if found.iter().collect::<BTreeSet<_>>() != expected.iter().collect::<BTreeSet<_>>() {
                 return Err(StoreError::KindTableDrift { table: table.name.clone(), expected, found });
             }
