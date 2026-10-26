@@ -321,8 +321,8 @@ async fn missing_host_binary_is_not_ready() {
     .unwrap();
 }
 
-// #3745: transport EOF without Exit must fail asset delivery or
-// replace a recovery archive; cancellation must remove streamed partial bytes.
+// #3745: transport EOF without Exit must fail asset delivery without
+// replacing a recovery archive; cancellation must remove the temporary archive.
 #[tokio::test]
 async fn truncated_agent_streams_preserve_recovery_and_reject_assets() {
     use axum::{
@@ -338,6 +338,7 @@ async fn truncated_agent_streams_preserve_recovery_and_reject_assets() {
     const COMPLETE: u8 = 0;
     const TRUNCATED: u8 = 1;
     const STALLED: u8 = 2;
+    // Requests are sequential across phases, so each handler reads its phase mode.
     let mode = Arc::new(AtomicU8::new(COMPLETE));
     let (host, guest) = tokio::io::duplex(64 * 1024);
     let (host, guest) = tokio::join!(
