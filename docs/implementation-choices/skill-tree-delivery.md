@@ -89,7 +89,8 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
   ```
   <home>/.flotilla-skills/<digest>/            # complete, immutable trees
   <home>/.flotilla-skills/<digest>.partial-<attempt>/
-  <home>/skills -> .flotilla-skills/<digest>   # the only mutable name
+  <home>/skills -> .flotilla-skills/<digest>   # what readers resolve
+  <home>/skills.prev -> .flotilla-skills/<old> # retention record only
   ```
 
   Nothing else in the home is touched: no crew config, authentication, history or sessions. The rules for externally managed Codex homes and Claude's managed-home refusal keep running through `skill_destination` unchanged.
@@ -107,19 +108,30 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
   2. Unpack into `<digest>.partial-<attempt>` and check the archive digest, then `chmod` the trees to their final modes and `rename` the partial to `<digest>`, then `touch` the directory. A rename onto an existing `<digest>/` can fail with `ENOTEMPTY` or `EEXIST`. Because only complete trees ever carry that name, the attempt then counts as success, removes its partial and continues to step 3.
      - With drydock#84, this step is the agent's digest-checked streamed unpack.
      - Before drydock#84, the runner pipes the tar to `tar -xof - -C <partial>` on stdin. That works for Docker exec, the SSH runner and the agent exec alike. The guest then hashes the received bytes with `sha256sum` against the expected digest.
-  3. `ln -s .flotilla-skills/<digest> skills.<attempt> && mv -Tf skills.<attempt> skills`. A single `rename(2)` means a reader resolving `skills` sees the complete old tree or the complete new one.
+  3. Flip `skills` to the new tree.
+     - If `skills` already names a different digest, first record that digest: `ln -s <old target> skills.prev.<attempt> && mv -Tf skills.prev.<attempt> skills.prev`.
+     - Then run `ln -s .flotilla-skills/<digest> skills.<attempt> && mv -Tf skills.<attempt> skills`.
+
+     A single `rename(2)` means a reader resolving `skills` sees the complete old tree or the complete new one. `skills.prev` is never read by a harness; it records only what step 5 must keep.
   4. Verify that `readlink skills` equals the target, **and** that `skills/.flotilla-sources.json` resolves through the link. This is the completion record.
-     - A link text that matches but points at a missing tree means a concurrent reaper won. The attempt returns to step 2 once, then fails as transient.
-  5. Reap. A complete tree is removed only when all three hold:
-     - it is not the current target;
-     - it is not the previous target;
-     - its directory mtime is older than 60 minutes (`find -mmin +60`).
+     - A link text that matches but points at a missing tree means a concurrent reaper won. The attempt returns to step 2 once, which runs a fresh unpack and `touch`, then fails as transient.
+     - Each of the three outer retries (see "Retry and cancellation") restarts at step 1 with a new `<attempt>` id and a fresh `touch`. A reaper-induced failure therefore always gets a newly protected tree, and it cannot exhaust the retries on one stale tree.
+  5. Reap. A complete tree under `.flotilla-skills` is **kept** if any of these holds:
+     - it is the target of `skills`;
+     - it is the target of `skills.prev`;
+     - its directory mtime is within the last 60 minutes.
+
+     Everything else is removed. The rule is a union, so the two records never disagree. A previous tree is kept for as long as it is previous, and a recent tree is kept even when it is in neither link.
 
      Every attempt touches its target in step 1 or step 2, so an in-flight attempt's tree is never reaped unless that attempt has stalled for an hour, and step 4 catches that case.
 
-     `*.partial-*` entries older than 60 minutes are removed the same way. Removal is `chmod -R u+w -- <dir> && rm -rf -- <dir>`, because the trees are read-only. Legacy directories are removed the same way.
+     Leftovers older than 60 minutes are removed too, using `find -mmin +60`, which tests the link itself and not its target:
+     - `*.partial-*` directories;
+     - `skills.<attempt>` and `skills.prev.<attempt>` temporary links, left behind when `mv -T` failed or an exec was cut off.
+
+     Removal is `chmod -R u+w -- <dir> && rm -rf -- <dir>`, because the trees are read-only. Legacy directories are removed the same way.
 - **Ambiguous activation.** When an exec disconnects or times out, the next attempt starts by reading the link. If it already names the target digest, the attempt reports success without writing anything. Activation is therefore reconcilable by identity alone.
-- **Retained previous tree.** Step 5 keeps the previous tree, so a reader that resolved `skills` just before a flip keeps finding sibling files through one flip. This is a per-resolution guarantee. No multi-open snapshot across repeated flips is claimed.
+- **Retained previous tree.** Step 5 keeps the `skills.prev` target, so a reader that resolved `skills` just before a flip keeps finding sibling files through one flip. This is a per-resolution guarantee. No multi-open snapshot across repeated flips is claimed.
 - **Pre-existing real directory.** This is a vessel staged by today's stager and restaged on cloud adoption. `rename(2)` cannot replace a non-empty directory with a link.
   - The real directory is first renamed to `.flotilla-skills/legacy-<attempt>`, and then the link is created.
   - Between those two renames, `skills` is briefly absent. This is the one stated exception to old-or-new, and it occurs only on the first restage of a pre-upgrade vessel.
@@ -138,7 +150,11 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
 
 ## Decision 4: crews on one vessel at different revisions of one source
 
-**Recommendation: permit it.** Each crew's selection resolves and publishes independently. The operator check changes to match provisioning: `validate_frozen_vessel_skills` resolves per crew instead of across the union. Mixed revisions on one vessel are reported as a notice naming the crews and SHAs, so the operator keeps the signal without a refusal.
+**Recommendation: permit it.** Each crew's selection resolves and publishes independently. The operator check changes to match provisioning: `validate_frozen_vessel_skills` resolves per crew instead of across the union. Mixed revisions on one vessel are reported as a notice, so the operator keeps the signal without a refusal. The notice has one contract:
+- It is a new `notices` list on `resource validate`'s report, beside `failures` and `waivers`.
+- In JSON output it is the `notices` array. In human output it is a `notice:` line naming the vessel, the source and each crew's SHA.
+- It does not count as unsatisfied, and it does not change the exit code.
+- The report is command output, not stored data, so this is a wire change.
 
 - **How it arises.** A crew joins a standing convoy after a generation roll moved the source, so it freezes the new SHA while earlier crews keep theirs (ADR 0052). Refusing this would make the later crew unadmittable for no safety gain.
 - **Cost.** Both revisions share one repository, one credential narrowing and one host object cache. Each crew's tree is already private to its own home.
@@ -153,9 +169,16 @@ The skill-specific part lives in `flotilla-credentials` and `flotilla-vcs`: auth
 
 The build's test budget is in the PR description. The coverage that the review asked for:
 
-- **Publication** has one behavioural contract and two implementations. Logical scenarios run against an in-memory guest model, which enforces `rename(2)`'s `ENOTEMPTY` and `EEXIST` semantics, and replacement of a link but never of a directory. The same contract also runs against a real filesystem through the local `CommandRunner`, because a fake `mv` would hide `ENOTEMPTY` and the reap race. The cases:
+- **Publication** has one behavioural contract and two implementations. Logical scenarios run against an in-memory guest model, which enforces `rename(2)`'s `ENOTEMPTY` and `EEXIST` semantics, and replacement of a link but never of a directory. The same contract also runs against a real filesystem through the local `CommandRunner`, because a fake `mv` would hide `ENOTEMPTY` and the reap race. The model enforces these too:
+  - a link replaced by another link through `mv -T`;
+  - `mv -T` failing to replace a real directory.
+
+  The cases:
   - a losing directory rename;
   - a reaper removing a tree between step 1 and step 3;
+  - a reaper racing a `touch`;
+  - retention of the `skills.prev` target past 60 minutes;
+  - a leaked `skills.<attempt>` link being reaped;
   - read-only reaping;
   - legacy-directory migration;
   - a failed unpack;
