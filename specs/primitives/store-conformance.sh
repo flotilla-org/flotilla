@@ -8,9 +8,10 @@ run=$(cd "${1:?usage: store-conformance.sh RUN_DIRECTORY}" && pwd)
 [ -d "$run/graphs" ] || { echo "no graphs in $run; run specs/primitives/check.sh first" >&2; exit 2; }
 cd "$(dirname "$0")"
 # Every probe replays its path into a fresh SQLite store, so these suites spend most of their
-# time inside SQLite; an unoptimised bundled SQLite makes them about a third slower. Only
-# libsqlite3-sys and its dependents build differently, and every suite here shares the setting.
-cargo_test=(cargo test --config 'profile.dev.package.libsqlite3-sys.opt-level=3' --locked)
+# time inside SQLite; an unoptimised bundled SQLite makes them about a third slower.
+# The scoped quick-tier config preserves SQLite's optimisation and also optimises
+# these harness packages and their shared graph walker.
+cargo_test=(cargo test --config "$PWD/../../ci/quint/cargo-config.toml" --locked)
 # The provisioning lifecycle kinds (#3629) run the lifecycle graph through the decided store.
 QUINT_GRAPH_DIR="$run/graphs" "${cargo_test[@]}" -p flotilla-provisioning \
   --test lifecycle_conformance -- --ignored --nocapture 2>&1 | tee "$run/provisioning.log"

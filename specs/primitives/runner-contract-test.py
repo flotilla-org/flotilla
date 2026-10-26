@@ -80,6 +80,25 @@ echo 'Model checking completed. No error has been found'
                 self.assertIn(f'diagnostic-{step}-stdout', result.stderr)
                 self.assertIn(f'diagnostic-{step}-stderr', result.stderr)
 
+    def test_each_quick_part_propagates_a_failing_check(self):
+        # The split must fail the PR when any selected check fails (#3925).
+        # These stubs stand in for the formal-tool and Cargo process boundaries.
+        jar = self.root / 'apalache.jar'
+        jar.touch()
+        self.env['APALACHE_JAR'] = str(jar)
+        for tool in ('quint', 'java', 'cargo', 'python3'):
+            self.stub(tool, 'echo injected-check-failure >&2; exit 17')
+        for part in ('scenarios', 'graphs', 'engine', 'mutants', 'contracts', 'store'):
+            with self.subTest(part=part):
+                run = self.root / part
+                self.env['QUINT_RUN_DIR'] = str(run)
+                if part == 'store':
+                    (run / 'graphs').mkdir(parents=True)
+                    result = self.run_script(HERE / 'store-conformance.sh', str(run))
+                else:
+                    result = self.run_script(HERE / 'check.sh', '--part', part)
+                self.assertEqual(result.returncode, 17, result.stderr)
+
     def test_deep_bound_change_is_verified_before_quint(self):
         copy = self.root / 'specs'
         shutil.copytree(HERE / 'scenarios', copy / 'scenarios')

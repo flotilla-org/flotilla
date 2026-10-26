@@ -50,7 +50,7 @@ macos_content='^[+-].*(target_os *= *"macos"|target_vendor *= *"apple")'
 # The provisioning lifecycle kinds run the lifecycle graph through their stored
 # kinds (#3629), so their declarations and that harness are Quint inputs too, as is
 # the crew kinds' run through the decided store.
-quint_paths='^(specs/primitives/|crates/flotilla-state-machines/|crates/flotilla-provisioning/(src/stored/|tests/lifecycle_conformance\.rs)|crates/flotilla-engine-store/tests/crew_conformance\.rs|crates/flotilla-inbox(-testkit)?/|crates/flotilla-quint-testkit/|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/platform-changes/)'
+quint_paths='^(ci/quint/|specs/primitives/|crates/flotilla-state-machines/|crates/flotilla-provisioning/(src/stored/|tests/lifecycle_conformance\.rs)|crates/flotilla-engine-store/tests/crew_conformance\.rs|crates/flotilla-inbox(-testkit)?/|crates/flotilla-quint-testkit/|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/platform-changes/)'
 
 # An empty content pattern decides on paths alone.
 decide() {
