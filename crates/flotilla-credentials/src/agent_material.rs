@@ -202,7 +202,7 @@ impl AgentMaterialRegistry {
             })
             .collect::<Vec<_>>();
         let mut environment = environment.to_vec();
-        environment.push(("FLOTILLA_RESOLVED_SKILLS".to_string(), serde_json::to_string(&selected).expect("test selection")));
+        environment.push((flotilla_resources::RESOLVED_SKILLS_ENV.to_string(), serde_json::to_string(&selected).expect("test selection")));
         self.stage_skills(environment_ref, required_adapters, &environment, source_token_files, runner).await
     }
 
@@ -224,9 +224,11 @@ impl AgentMaterialRegistry {
                     }
                     for (index, (role, selected)) in crews.into_iter().enumerate() {
                         let mut crew_environment = self.crew_environment(&role, required_adapters, environment, runner).await?;
-                        crew_environment.retain(|(key, _)| key != "FLOTILLA_CREW_SKILLS" && key != "FLOTILLA_RESOLVED_SKILLS");
+                        crew_environment.retain(|(key, _)| {
+                            key != flotilla_resources::CREW_SKILLS_ENV && key != flotilla_resources::RESOLVED_SKILLS_ENV
+                        });
                         crew_environment.push((
-                            "FLOTILLA_RESOLVED_SKILLS".into(),
+                            flotilla_resources::RESOLVED_SKILLS_ENV.into(),
                             serde_json::to_string(&selected).expect("resolved skills serialize"),
                         ));
                         self.skills
@@ -759,7 +761,7 @@ type CrewSkills = BTreeMap<String, Vec<flotilla_resources::SkillCatalogEntry>>;
 fn decode_crew_skills(environment: &[(String, String)]) -> Result<Option<CrewSkills>, String> {
     environment
         .iter()
-        .find(|(key, _)| key == "FLOTILLA_CREW_SKILLS")
+        .find(|(key, _)| key == flotilla_resources::CREW_SKILLS_ENV)
         .map(|(_, value)| serde_json::from_str(value).map_err(|error| format!("decode frozen crew skills: {error}")))
         .transpose()
 }
@@ -770,7 +772,7 @@ fn decode_selected_skills(environment: &[(String, String)]) -> Result<Vec<flotil
     }
     // ADR 0047: remove the old selection decoder one fleet roll after #2673,
     // once stored environments have been rewritten or reaped.
-    match environment.iter().find(|(key, _)| key == "FLOTILLA_RESOLVED_SKILLS") {
+    match environment.iter().find(|(key, _)| key == flotilla_resources::RESOLVED_SKILLS_ENV) {
         Some((_, value)) => serde_json::from_str(value).map_err(|error| format!("decode frozen skill selection: {error}")),
         None => {
             tracing::debug!("no frozen skill selection forwarded; using an empty selection for legacy provisioning");
@@ -3010,7 +3012,7 @@ esac
             let variable = if adapter == CODEX_ADAPTER_ID { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" };
             let environment = vec![
                 (variable.to_string(), config_home.clone()),
-                ("FLOTILLA_RESOLVED_SKILLS".to_string(), serde_json::to_string(&selection).expect("selection")),
+                (flotilla_resources::RESOLVED_SKILLS_ENV.to_string(), serde_json::to_string(&selection).expect("selection")),
             ];
             registry
                 .stage_skills(
@@ -3138,7 +3140,7 @@ esac
         let environment = vec![
             ("CLAUDE_CONFIG_DIR".into(), runner.config_base.join("claude").display().to_string()),
             (
-                "FLOTILLA_RESOLVED_SKILLS".into(),
+                flotilla_resources::RESOLVED_SKILLS_ENV.into(),
                 serde_json::to_string(&vec![crew_skill("private-source", "skills-other/private-folder")]).expect("selection"),
             ),
         ];
@@ -3179,7 +3181,7 @@ esac
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
         let environment = vec![(
-            "FLOTILLA_RESOLVED_SKILLS".into(),
+            flotilla_resources::RESOLVED_SKILLS_ENV.into(),
             serde_json::to_string(&vec![crew_skill("private-source", "skills/private-folder")]).expect("selection"),
         )];
         registry
@@ -3239,7 +3241,7 @@ esac
         let environment = vec![
             ("CLAUDE_CONFIG_DIR".into(), base.display().to_string()),
             (
-                "FLOTILLA_CREW_SKILLS".into(),
+                flotilla_resources::CREW_SKILLS_ENV.into(),
                 serde_json::to_string(&BTreeMap::from([("governor", vec![crew_skill("private-source", "skills/private-folder")])]))
                     .expect("frozen skills"),
             ),
@@ -3297,7 +3299,7 @@ esac
             ]);
             let environment = vec![
                 (variable.into(), virtual_base.clone()),
-                ("FLOTILLA_CREW_SKILLS".into(), serde_json::to_string(&crews).expect("crew selections")),
+                (flotilla_resources::CREW_SKILLS_ENV.into(), serde_json::to_string(&crews).expect("crew selections")),
             ];
             registry
                 .stage_skills(
@@ -3364,7 +3366,7 @@ esac
         std::fs::write(&token, "test-token").expect("token");
         let environment = vec![
             ("CLAUDE_CONFIG_DIR".into(), runner.config_base.join("claude").display().to_string()),
-            ("FLOTILLA_CREW_SKILLS".into(), serde_json::json!({"coder": [], "reviewer/invalid": []}).to_string()),
+            (flotilla_resources::CREW_SKILLS_ENV.into(), serde_json::json!({"coder": [], "reviewer/invalid": []}).to_string()),
         ];
         let error = registry
             .stage_skills(

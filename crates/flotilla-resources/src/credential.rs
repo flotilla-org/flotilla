@@ -13,6 +13,10 @@ pub const CREDENTIAL_SCOPES_SESSION_TAG: &str = "flotilla-credential-scopes";
 pub const CREDENTIAL_PERMISSIONS_ANNOTATION: &str = "flotilla.work/credential-permissions";
 pub const CREDENTIAL_PERMISSIONS_ENV: &str = "FLOTILLA_CREDENTIAL_PERMISSIONS";
 pub const CREDENTIAL_PERMISSIONS_SESSION_TAG: &str = "flotilla-credential-permissions";
+/// Per-role skill selections composed at crew launch, never stored in an Environment recipe.
+pub const CREW_SKILLS_ENV: &str = "FLOTILLA_CREW_SKILLS";
+/// Selected skills delivered to one crew at launch.
+pub const RESOLVED_SKILLS_ENV: &str = "FLOTILLA_RESOLVED_SKILLS";
 
 define_resource!(
     CredentialSpec,

@@ -779,7 +779,7 @@ impl Reconciler for VesselReconciler {
                                             {
                                                 let mut env = env.clone();
                                                 env.insert(
-                                                    "FLOTILLA_CREW_SKILLS".to_string(),
+                                                    flotilla_resources::CREW_SKILLS_ENV.to_string(),
                                                     serde_json::to_string(
                                                         &requirement
                                                             .crew
@@ -1272,7 +1272,7 @@ impl Reconciler for VesselReconciler {
                                             {
                                                 let mut env = env.clone();
                                                 env.insert(
-                                                    "FLOTILLA_CREW_SKILLS".to_string(),
+                                                    flotilla_resources::CREW_SKILLS_ENV.to_string(),
                                                     serde_json::to_string(
                                                         &requirement
                                                             .crew

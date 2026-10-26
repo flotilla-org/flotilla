@@ -51,7 +51,7 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
                         pull_policy: Default::default(),
                         mounts: Vec::new(),
                         env: if private_home {
-                            BTreeMap::from([("FLOTILLA_CREW_SKILLS".into(), "{\"coder\":[],\"reviewer\":[]}".into())])
+                            BTreeMap::from([(flotilla_resources::CREW_SKILLS_ENV.into(), "{\"coder\":[],\"reviewer\":[]}".into())])
                         } else {
                             BTreeMap::new()
                         },

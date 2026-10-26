@@ -550,7 +550,7 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
         env: BTreeMap::from([
             (CREDENTIAL_REFS_ENV.to_string(), serde_json::to_string(&credential_refs).expect("encode credential refs")),
             (
-                "FLOTILLA_RESOLVED_SKILLS".to_string(),
+                flotilla_resources::RESOLVED_SKILLS_ENV.to_string(),
                 serde_json::to_string(&vec![flotilla_resources::SkillCatalogEntry {
                     source: "mattpocock-skills".to_string(),
                     repository: "flotilla-org/mattpocock-skills".to_string(),

@@ -232,7 +232,14 @@ fn a_docker_recipe_holds_one_image_choice_and_nothing_derived_at_launch() {
     assert!(recipe(DockerImage::Built, &[]).validate(None).expect_err("built without its build").contains("names its ImageBuild"));
     assert!(recipe(pinned(), &[]).validate(Some(&build)).expect_err("pinned and built").contains("names no ImageBuild"));
     assert!(recipe(DockerImage::Pinned { reference: " ".into() }, &[]).validate(None).expect_err("empty").contains("reference"));
-    for key in flotilla_provisioning::stored::environment::LAUNCH_DERIVED_ENV {
+    // Exercise the public launch keys independently of the recipe's exclusion list.
+    for key in [
+        flotilla_resources::CREDENTIAL_REFS_ENV,
+        flotilla_resources::CREDENTIAL_SCOPES_ENV,
+        flotilla_resources::CREDENTIAL_PERMISSIONS_ENV,
+        flotilla_resources::CREW_SKILLS_ENV,
+        flotilla_resources::RESOLVED_SKILLS_ENV,
+    ] {
         assert!(recipe(pinned(), &[(key, "[]")]).validate(None).expect_err(key).contains("composed at launch"), "{key}");
     }
 }

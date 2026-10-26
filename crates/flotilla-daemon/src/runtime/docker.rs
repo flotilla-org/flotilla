@@ -523,7 +523,7 @@ impl DockerControllerRuntime {
             };
             // ADR 0047: remove forwarding of the legacy selection key one roll
             // after #2673, once stored environments are rewritten or reaped.
-            for key in ["FLOTILLA_CREW_SKILLS", "FLOTILLA_RESOLVED_SKILLS"] {
+            for key in [flotilla_resources::CREW_SKILLS_ENV, flotilla_resources::RESOLVED_SKILLS_ENV] {
                 if let Some(selection) = spec.env.get(key) {
                     environment.push((key.into(), selection.clone()));
                 }
