@@ -637,6 +637,12 @@ async fn http_change_stream_requires_peer_session() {
     let router =
         HttpRouter::for_daemon(Arc::clone(&daemon), Arc::new(LoginStore::new(daemon.clock_for_scenarios())), ListenerOrigin::default())
             .into_router();
+    // Non-GET requests do not consult the session map, including unissued tokens.
+    let mut request = get(flotilla_schema_sqlite::stream::PATH);
+    *request.method_mut() = axum::http::Method::POST;
+    request.extensions_mut().insert(CallerAuth::Socket(None));
+    request.headers_mut().insert(super::super::change_stream::SESSION_HEADER, "unissued-session".parse().expect("token"));
+    assert_eq!(router.clone().oneshot(request).await.expect("method refusal").status(), StatusCode::METHOD_NOT_ALLOWED);
     let login = Incarnation::new();
     let session = login.session_of(&login.login_cookie().await).expect("session");
     for caller in [CallerAuth::Socket(None), CallerAuth::Bearer, CallerAuth::Session(session), environment()] {
