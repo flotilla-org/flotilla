@@ -241,12 +241,8 @@ fn http_client(socket: &std::path::Path) -> Result<reqwest::Client, String> {
 }
 
 async fn follow_connection(service: Arc<Service>, home: &str, client: &reqwest::Client, session: &str, first: &[u8]) -> Result<(), String> {
-    let after = service.watermark(home).map_err(|e| e.to_string())?;
-    let target = if !service.has_watermark(home) {
-        format!("http://flotilla.local{}", stream::PATH)
-    } else {
-        format!("http://flotilla.local{}?after={}", stream::PATH, after.home_seq)
-    };
+    // The peer-issued session fixes the cursor; HTTP only continues that round.
+    let target = format!("http://flotilla.local{}", stream::PATH);
     let mut spool = tokio::fs::File::from_std(tempfile::tempfile().map_err(|e| e.to_string())?);
     spool.write_all(first).await.map_err(|e| e.to_string())?;
     if matches!(Frame::decode(first).map_err(|e| e.to_string())?, Frame::Keepalive { .. }) {
@@ -367,13 +363,7 @@ mod tests {
                     request.push(byte[0]);
                 }
                 let request = String::from_utf8(request).expect("UTF-8");
-                assert_eq!(
-                    request.lines().next(),
-                    Some(match known {
-                        false => "GET /apis/flotilla.work/v1/change-stream HTTP/1.1",
-                        true => "GET /apis/flotilla.work/v1/change-stream?after=0 HTTP/1.1",
-                    })
-                );
+                assert_eq!(request.lines().next(), Some("GET /apis/flotilla.work/v1/change-stream HTTP/1.1"));
                 assert!(request.contains("x-flotilla-change-stream-session: peer-session"));
                 let frames = [
                     Frame::End { home: "home".into(), home_seq: 0 },
