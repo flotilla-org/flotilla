@@ -132,8 +132,8 @@ pub const LAUNCH_DERIVED_ENV: [&str; 5] = [
     flotilla_resources::CREDENTIAL_REFS_ENV,
     flotilla_resources::CREDENTIAL_SCOPES_ENV,
     flotilla_resources::CREDENTIAL_PERMISSIONS_ENV,
-    "FLOTILLA_CREW_SKILLS",
-    "FLOTILLA_RESOLVED_SKILLS",
+    flotilla_resources::CREW_SKILLS_ENV,
+    flotilla_resources::RESOLVED_SKILLS_ENV,
 ];
 
 impl DockerRecipe {

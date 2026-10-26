@@ -485,7 +485,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         Err(ResourceError::NotFound { .. }) => None,
                         Err(error) => return Err(error.to_string()),
                     };
-                    if let Some(docker) = docker.filter(|docker| docker.env.contains_key("FLOTILLA_CREW_SKILLS")) {
+                    if let Some(docker) = docker.filter(|docker| docker.env.contains_key(flotilla_resources::CREW_SKILLS_ENV)) {
                         let required = BTreeSet::from([requirement.adapter.clone()]);
                         let environment = agent_material_environment(material, &required, &docker.env, credential_env.iter().cloned())?;
                         let runner = launch_runner()?;

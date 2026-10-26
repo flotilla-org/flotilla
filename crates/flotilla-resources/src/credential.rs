@@ -6,6 +6,10 @@ use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationC
 
 pub const CREDENTIAL_REFS_ANNOTATION: &str = "flotilla.work/credential-refs";
 pub const CREDENTIAL_REFS_ENV: &str = "FLOTILLA_CREDENTIAL_REFS";
+/// Per-role skill selections composed at crew launch, never stored in an Environment recipe.
+pub const CREW_SKILLS_ENV: &str = "FLOTILLA_CREW_SKILLS";
+/// Selected skills delivered to one crew at launch.
+pub const RESOLVED_SKILLS_ENV: &str = "FLOTILLA_RESOLVED_SKILLS";
 pub const CREDENTIAL_REF_SESSION_TAG: &str = "flotilla-credential";
 pub const CREDENTIAL_SCOPES_ANNOTATION: &str = "flotilla.work/credential-scopes";
 pub const CREDENTIAL_SCOPES_ENV: &str = "FLOTILLA_CREDENTIAL_SCOPES";

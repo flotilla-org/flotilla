@@ -366,7 +366,7 @@ fn environment_object(docker: bool) -> ResourceObject<flotilla_resources::Enviro
                 env: [
                     ("A".to_owned(), "1".to_owned()),
                     (flotilla_resources::CREDENTIAL_REFS_ENV.to_owned(), "[\"github\"]".to_owned()),
-                    ("FLOTILLA_CREW_SKILLS".to_owned(), "[]".to_owned()),
+                    (flotilla_resources::CREW_SKILLS_ENV.to_owned(), "[]".to_owned()),
                 ]
                 .into(),
             }),
