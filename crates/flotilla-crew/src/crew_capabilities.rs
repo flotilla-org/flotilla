@@ -9,7 +9,7 @@ use flotilla_agent::adapter::CAPABILITIES_HEADING;
 use flotilla_capability_contract::{credential_card, CredentialCapability, SessionCapabilitySource};
 use flotilla_messaging::MessageInbox;
 use flotilla_protocol::LifecycleReading;
-use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
+use flotilla_resources::lifecycle_reads::{LifecycleReads, ProvisioningKind};
 use flotilla_resources::{
     message_record_name, vessel_placement_pin, Convoy, Environment, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, ImageBuild,
     ImageBuildPhase, InputMeta, Message, MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceProvenance,
@@ -30,19 +30,8 @@ pub fn credential_references(session: &ResourceObject<TerminalSession>) -> Resul
         .map(|references| references.unwrap_or_default())
 }
 
-pub async fn session_card(
-    backend: &ResourceBackend,
-    namespace: &str,
-    convoy_name: &str,
-    spec: &TerminalSessionSpec,
-    credentials: &[CredentialCapability],
-    endpoints: &BTreeMap<String, String>,
-) -> Result<String, String> {
-    session_card_with_lifecycle_reads(backend, namespace, convoy_name, spec, credentials, endpoints, Arc::new(NoLifecycleReads)).await
-}
-
 /// Verify image capabilities from the selected origin's checked lifecycle reading.
-pub async fn session_card_with_lifecycle_reads(
+pub async fn session_card(
     backend: &ResourceBackend,
     namespace: &str,
     convoy_name: &str,
@@ -528,7 +517,7 @@ async fn refresh_session_card(
 ) -> Result<(), String> {
     let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { return Ok(()) };
     let credentials = source.credentials(&session.spec.env_ref, &credential_references(session)?).await?;
-    let card = session_card_with_lifecycle_reads(
+    let card = session_card(
         backend,
         namespace,
         &context.convoy,
@@ -542,15 +531,6 @@ async fn refresh_session_card(
 }
 
 pub async fn refresh_cards(
-    backend: &ResourceBackend,
-    namespace: &str,
-    source: &dyn SessionCapabilitySource,
-    tracker: &CapabilityCardTracker,
-) -> Result<(), String> {
-    refresh_cards_with_lifecycle_reads(backend, namespace, source, tracker, Arc::new(NoLifecycleReads)).await
-}
-
-pub async fn refresh_cards_with_lifecycle_reads(
     backend: &ResourceBackend,
     namespace: &str,
     source: &dyn SessionCapabilitySource,

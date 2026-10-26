@@ -49,6 +49,8 @@ pub(super) fn image_build_failure_condition(
         Ok(Some(
             LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause } | LifecycleReading::Failed { reason: cause },
         )) => ("ImageBuildFailed", cause),
+        // Absence or release makes the image unusable, but does not establish a failed build execution.
+        Ok(Some(LifecycleReading::Lost | LifecycleReading::Released)) => return None,
         Ok(Some(_)) => return None,
         Ok(None) => {
             let status = build.status.as_ref().filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Failed)?;
@@ -67,6 +69,27 @@ pub(super) fn image_build_failure_condition(
             .blocks_forge_observation(false)
             .build(),
     )
+}
+
+/// A shared reader failure is one heartbeat fault, regardless of the number of image records.
+fn image_build_failure_conditions<'a>(
+    builds: impl Iterator<Item = &'a flotilla_resources::ResourceObject<flotilla_resources::ImageBuild>>,
+    lifecycles: &dyn flotilla_resources::lifecycle_reads::LifecycleReads,
+) -> Vec<HostCondition> {
+    let mut read_failed = false;
+    builds
+        .filter_map(|build| {
+            let mut condition = image_build_failure_condition(build, lifecycles)?;
+            if condition.reason == "LifecycleReadFailed" {
+                if read_failed {
+                    return None;
+                }
+                read_failed = true;
+                condition.condition_type = "ImageBuild/LifecycleReads".into();
+            }
+            Some(condition)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -478,13 +501,10 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
     let local_host = profile.host_id.clone();
     conditions.extend(
         tokio::task::spawn_blocking(move || {
-            let mut conditions = Vec::new();
-            for build in &build_records.items {
-                if build.spec.current().is_some_and(|spec| spec.host_ref == local_host) {
-                    conditions.extend(image_build_failure_condition(build, lifecycles.as_ref()));
-                }
-            }
-            conditions
+            image_build_failure_conditions(
+                build_records.items.iter().filter(|build| build.spec.current().is_some_and(|spec| spec.host_ref == local_host)),
+                lifecycles.as_ref(),
+            )
         })
         .await
         .map_err(|error| error.to_string())?,
@@ -961,24 +981,42 @@ mod read_retry_health_tests {
     }
 }
 
-// Heartbeats expose engine failure causes, suppress stale failures, and retain checked-read errors.
 #[cfg(test)]
-#[test]
-fn image_health_follows_engine_without_a_copy() {
-    use flotilla_provisioning::engine::image_build::ImageBuildBinding;
-    use flotilla_provisioning_testkit::{image_build, Ending, LifecycleFixture};
-    let build = image_build(flotilla_resources::ImageBuildPhase::Failed);
-    let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
-    fixture.request(&build);
-    assert!(image_build_failure_condition(&build, fixture.reads.as_ref()).is_none());
-    fixture.finish(&build, Ending::GaveUp("engine cause"));
-    let condition = image_build_failure_condition(&build, fixture.reads.as_ref()).expect("engine failure");
-    assert_eq!(condition.reason, "ImageBuildFailed");
-    assert_eq!(condition.message, "engine cause");
-    assert!(!condition.blocks_readiness);
-    assert!(!condition.blocks_forge_observation);
-    fixture.poison();
-    let condition = image_build_failure_condition(&build, fixture.reads.as_ref()).expect("checked read failure");
-    assert_eq!(condition.reason, "LifecycleReadFailed");
-    assert!(condition.message.contains("poisoned"));
+mod image_health_tests {
+    use super::*;
+
+    // Build execution failures raise health conditions; release and absence only invalidate the artifact.
+    #[test]
+    fn image_health_follows_engine_without_a_copy() {
+        use flotilla_provisioning::engine::image_build::ImageBuildBinding;
+        use flotilla_provisioning_testkit::{image_build, Ending, LifecycleFixture};
+        let build = image_build(flotilla_resources::ImageBuildPhase::Failed);
+        for (ending, failed) in [
+            (Ending::GaveUp("engine cause"), true),
+            (Ending::Failed("engine cause"), true),
+            (Ending::Lost("digest"), false),
+            (Ending::Released, false),
+        ] {
+            let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
+            fixture.request(&build);
+            assert!(image_build_failure_condition(&build, fixture.reads.as_ref()).is_none());
+            fixture.finish(&build, ending);
+            let condition = image_build_failure_condition(&build, fixture.reads.as_ref());
+            assert_eq!(condition.is_some(), failed);
+            if let Some(condition) = condition {
+                assert_eq!(condition.reason, "ImageBuildFailed");
+                assert_eq!(condition.message, "engine cause");
+                assert!(!condition.blocks_readiness);
+                assert!(!condition.blocks_forge_observation);
+            }
+            fixture.poison();
+            let mut other = build.clone();
+            other.metadata.name = "other-image".into();
+            let conditions = image_build_failure_conditions([&build, &other].into_iter(), fixture.reads.as_ref());
+            assert_eq!(conditions.len(), 1, "one unavailable reader, not one fault per image");
+            assert_eq!(conditions[0].condition_type, "ImageBuild/LifecycleReads");
+            assert_eq!(conditions[0].reason, "LifecycleReadFailed");
+            assert!(conditions[0].message.contains("poisoned"));
+        }
+    }
 }

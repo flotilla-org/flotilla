@@ -142,6 +142,7 @@ pub async fn store_object<T: flotilla_resources::Resource>(
 
 /// The Vessel lease using the same real store and reader contract.
 pub type VesselFixture = LifecycleFixture<flotilla_provisioning::engine::vessel::VesselBinding>;
+
 /// Contradictory actuator evidence for image reader contracts; the engine supplies phase/digest/cause.
 pub fn image_build(phase: flotilla_resources::ImageBuildPhase) -> ResourceObject<flotilla_resources::ImageBuild> {
     use flotilla_resources::{

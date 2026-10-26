@@ -118,9 +118,15 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
             assert!(crate::crew_capabilities::observe_card(&backend, "flotilla", &session, &card, &crew.capability_cards).await.is_err());
             continue;
         }
-        let error = crate::crew_capabilities::refresh_cards(&backend, "flotilla", source.as_ref(), &crew.capability_cards)
-            .await
-            .expect_err("aggregate error");
+        let error = crate::crew_capabilities::refresh_cards(
+            &backend,
+            "flotilla",
+            source.as_ref(),
+            &crew.capability_cards,
+            Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        )
+        .await
+        .expect_err("aggregate error");
         assert!(error.contains("000-malformed"));
         assert!(error.contains("invalid session credential references"));
         assert_eq!(
@@ -370,17 +376,25 @@ async fn refresh_after_reaped_message_recovers_with_full_card() {
         .expect("running");
     let source = Delivery(RwLock::new(BTreeMap::new()));
     let tracker = CapabilityCardTracker::default();
-    refresh_cards(&backend, "flotilla", &source, &tracker).await.expect("initial baseline");
+    refresh_cards(&backend, "flotilla", &source, &tracker, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
+        .await
+        .expect("initial baseline");
     source.0.write().await.insert("API".into(), "127.0.0.1:1".into());
-    refresh_cards(&backend, "flotilla", &source, &tracker).await.expect("pending delta");
+    refresh_cards(&backend, "flotilla", &source, &tracker, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
+        .await
+        .expect("pending delta");
     let session = sessions.get("session").await.expect("session");
     let messages = backend.using::<Message>("flotilla");
     let reaped = &session.metadata.annotations["flotilla.work/capabilities-message"];
     assert!(messages.get(reaped).await.expect("delta").spec.body.starts_with("## Capability changes"));
     messages.delete(reaped).await.expect("reap Message");
     source.0.write().await.insert("API".into(), "127.0.0.1:2".into());
-    refresh_cards(&backend, "flotilla", &source, &tracker).await.expect("recover reaped Message");
-    refresh_cards(&backend, "flotilla", &source, &tracker).await.expect("unchanged refresh");
+    refresh_cards(&backend, "flotilla", &source, &tracker, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
+        .await
+        .expect("recover reaped Message");
+    refresh_cards(&backend, "flotilla", &source, &tracker, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
+        .await
+        .expect("unchanged refresh");
     let session = sessions.get("session").await.expect("session");
     assert_eq!(session.metadata.annotations["flotilla.work/capabilities-revision"], "3");
     let all = messages.list().await.expect("messages").items;
@@ -450,13 +464,17 @@ async fn failing_source_never_publishes_an_empty_card() {
         .expect("running");
     let source = Delivery(RwLock::new(BTreeMap::new()), std::sync::atomic::AtomicBool::new(false));
     let tracker = CapabilityCardTracker::default();
-    refresh_cards(&backend, "flotilla", &source, &tracker).await.expect("initial baseline");
+    refresh_cards(&backend, "flotilla", &source, &tracker, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
+        .await
+        .expect("initial baseline");
     let revision = |session: &flotilla_resources::ResourceObject<ResourceTerminalSession>| {
         session.metadata.annotations["flotilla.work/capabilities-revision"].clone()
     };
     let before = revision(&sessions.get("session").await.expect("session"));
     source.1.store(true, std::sync::atomic::Ordering::SeqCst);
-    refresh_cards(&backend, "flotilla", &source, &tracker).await.expect_err("reconstruction gap");
+    refresh_cards(&backend, "flotilla", &source, &tracker, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
+        .await
+        .expect_err("reconstruction gap");
     assert_eq!(revision(&sessions.get("session").await.expect("session")), before);
     let messages = backend.using::<Message>("flotilla").list().await.expect("messages").items;
     assert!(messages.is_empty());
@@ -500,17 +518,7 @@ async fn image_capabilities_follow_engine_without_a_copy() {
     let mut spec = session.spec;
     spec.source = flotilla_resources::TerminalSessionSource::Tool { command: "true".into() };
     let endpoints = BTreeMap::new();
-    let card = || {
-        crate::crew_capabilities::session_card_with_lifecycle_reads(
-            &backend,
-            "flotilla",
-            "crew",
-            &spec,
-            &[],
-            &endpoints,
-            fixture.reads.clone(),
-        )
-    };
+    let card = || crate::crew_capabilities::session_card(&backend, "flotilla", "crew", &spec, &[], &endpoints, fixture.reads.clone());
     assert!(card().await.expect("unheld").contains("tool:verified"));
     fixture.request(&build);
     assert!(!card().await.expect("requested").contains("tool:verified"));

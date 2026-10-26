@@ -26,7 +26,7 @@ use flotilla_protocol::image_check::{
     ImageCheckRequest, ImageCheckShadow, ImageLayerReport, ImageProbeReport,
 };
 use flotilla_protocol::LifecycleReading;
-use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
+use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::{
     parse_layer_directory, CapabilityNeed, CharterSource, ImageBuildFailureClass, ImageBuildPhase, ImageBuildSpec, ImageBuildStatus,
     ImageCatalogue, ImageDelivery, ImageLayerResourceSpec, ImageLayerSource, ImageLayerSpec, ImageProbeOutcome, ImageRequest,
@@ -57,16 +57,6 @@ pub trait ImageCheckSources: Send + Sync {
 /// returned in the report, which then names no build; `Err` is an
 /// infrastructure failure (an unknown project, a failed fetch, a store error).
 pub async fn check_image(
-    backend: &ResourceBackend,
-    namespace: &str,
-    placement_host: &str,
-    sources: &dyn ImageCheckSources,
-    request: &ImageCheckRequest,
-) -> Result<ImageCheckReport, String> {
-    check_image_with_lifecycle_reads(backend, namespace, placement_host, sources, request, Arc::new(NoLifecycleReads)).await
-}
-
-pub async fn check_image_with_lifecycle_reads(
     backend: &ResourceBackend,
     namespace: &str,
     placement_host: &str,
@@ -208,7 +198,7 @@ pub async fn check_image_with_lifecycle_reads(
     .await?;
     let created = flotilla_admission::image_build::create_planned_builds(backend, namespace, std::slice::from_ref(&planned)).await?;
     report.reused = created.is_empty();
-    report.build = Some(image_build_report_with_lifecycle_reads(backend, namespace, &planned.name, reads).await?);
+    report.build = Some(image_build_report(backend, namespace, &planned.name, reads).await?);
     Ok(report)
 }
 
@@ -260,11 +250,7 @@ fn resolution_layers(error: &ImageResolutionError) -> Vec<String> {
 }
 
 /// One ImageBuild as a check reports it, from the most advanced copy.
-pub async fn image_build_report(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<ImageBuildReport, String> {
-    image_build_report_with_lifecycle_reads(backend, namespace, name, Arc::new(NoLifecycleReads)).await
-}
-
-pub async fn image_build_report_with_lifecycle_reads(
+pub async fn image_build_report(
     backend: &ResourceBackend,
     namespace: &str,
     name: &str,
@@ -384,6 +370,26 @@ mod lifecycle_contract {
     use flotilla_resources::ImageBuild;
     use flotilla_store_testkit::{measure_reads, ReadCountsBackendExt};
 
+    // A retry's in-flight observation counts only at or after the engine's deadline.
+    #[test]
+    fn retry_report_observation_crosses_deadline() {
+        let obj = image_build(ImageBuildPhase::Built);
+        let spec = obj.spec.current().expect("live image");
+        let next = chrono::DateTime::from_timestamp(100, 0).expect("fixed deadline");
+        let lifecycle = LifecycleReading::Retrying { failures: 1, next, cause: "network".into() };
+        for (offset, expected) in
+            [(-1, ImageBuildReportPhase::Queued), (0, ImageBuildReportPhase::Building), (1, ImageBuildReportPhase::Building)]
+        {
+            let mut status = obj.status.clone().expect("observations");
+            status.started_at = Some(next + chrono::Duration::seconds(offset));
+            status.finished_at = None;
+            let report = build_report("image", spec, Some(&status), Some(&lifecycle));
+            assert_eq!(report.phase, expected);
+            assert!(!report.settled);
+            assert_eq!(report.failure.expect("engine cause").reason, "network");
+        }
+    }
+
     // Reports select engine digest/cause at the chosen origin while old Built evidence stays unchanged.
     #[tokio::test]
     async fn image_reports_follow_engine_without_a_copy() {
@@ -406,7 +412,7 @@ mod lifecycle_contract {
             }
             let fixture = LifecycleFixture::<ImageBuildBinding>::new(replica);
             fixture.request(&obj);
-            let report = || image_build_report_with_lifecycle_reads(&backend, "flotilla", name, fixture.reads.clone());
+            let report = || image_build_report(&backend, "flotilla", name, fixture.reads.clone());
             let (requested, counts) = measure_reads(report()).await;
             counts.of(&backend).assert_no_lists("one named image report");
             let requested = requested.expect("requested");
