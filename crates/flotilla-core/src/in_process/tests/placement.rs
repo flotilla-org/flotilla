@@ -171,7 +171,19 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
     resolve_workflow_credentials(&backend, "flotilla", Some("andamento"), &[], &mut resolved_workflow)
         .await
         .expect("resolve replicated credential grant");
-    assert_eq!(resolved_workflow.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
+    // #3907: a subscription credential reaches its requester only through a binding.
+    assert!(resolved_workflow.vessels[0].credential_refs.is_empty());
+    let alternatives = flotilla_admission::account_access::validate_account_access(
+        &backend,
+        "flotilla",
+        Some("andamento"),
+        &[],
+        &resolved_workflow,
+        Some(&placement),
+    )
+    .await
+    .expect("the replicated grant authorizes a held Claude account");
+    assert_eq!(alternatives[0].usable().into_iter().map(|name| name.0.as_str()).collect::<Vec<_>>(), ["claude-max"]);
     validate_workflow_agent_adapters(&backend, "flotilla", &resolved_workflow, Some(&placement), false)
         .await
         .expect("placement should provide agent adapter");

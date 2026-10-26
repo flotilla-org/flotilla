@@ -238,6 +238,7 @@ impl App {
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
+                        account_pins: Vec::new(),
                     }),
                 }));
             }
@@ -266,6 +267,7 @@ impl App {
                             promises: Vec::new(),
                             skills: Vec::new(),
                             auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                            account_pins: Vec::new(),
                         }),
                     });
                     let pending_ctx = PendingActionContext::project_issue_start(
@@ -304,6 +306,7 @@ impl App {
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
+                        account_pins: Vec::new(),
                     }),
                 }));
                 if let Some(index) = self.views.find(&address) {

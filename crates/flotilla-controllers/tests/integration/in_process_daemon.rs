@@ -2294,6 +2294,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
                     promises: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    account_pins: Vec::new(),
                 }),
             })
             .build()
@@ -2506,6 +2507,7 @@ async fn exercise_existing_pr_admission(continuing: bool) {
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -3763,6 +3765,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -3806,6 +3809,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -3931,6 +3935,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -4096,6 +4101,7 @@ async fn convoy_start_accepts_project_list_identifier() {
                             promises: Vec::new(),
                             skills: Vec::new(),
                             auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                            account_pins: Vec::new(),
                         }),
                     })
                     .build(),
@@ -4287,6 +4293,7 @@ async fn convoy_start_unknown_project_reports_resolved_reference_tried() {
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -4414,6 +4421,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -4512,6 +4520,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                             promises: Vec::new(),
                             skills: Vec::new(),
                             auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                            account_pins: Vec::new(),
                         }),
                     })
                     .build(),
@@ -4562,6 +4571,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -4597,6 +4607,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -4652,6 +4663,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -4713,6 +4725,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -4824,6 +4837,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -4876,6 +4890,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -4923,6 +4938,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -5027,6 +5043,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),
@@ -5465,6 +5482,7 @@ async fn convoy_start_acknowledges_while_admission_is_in_flight() {
                                 promises: Vec::new(),
                                 skills: Vec::new(),
                                 auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                                account_pins: Vec::new(),
                             }),
                         })
                         .build(),
@@ -5536,6 +5554,7 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
                 promises: Vec::new(),
                 skills: Vec::new(),
                 auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                account_pins: Vec::new(),
             }),
         })
         .build();
@@ -5643,6 +5662,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
                         promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Always,
+                        account_pins: Vec::new(),
                     }),
                 })
                 .build(),

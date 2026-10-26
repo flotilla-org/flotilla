@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::arg::{flatten, Arg};
-use flotilla_resources::{Convoy, FulfilmentGrant, ResourceObject, TerminalAttentionState, TerminalBrief};
+use flotilla_resources::{account_access::AccessName, Convoy, FulfilmentGrant, ResourceObject, TerminalAttentionState, TerminalBrief};
 use serde::Serialize;
 use tokio::sync::Mutex;
 use toml_edit::{value, DocumentMut, Item, Table};
@@ -445,23 +445,31 @@ pub struct AgentLaunchPlan {
 pub struct AgentRequirement {
     pub adapter: String,
     pub model: Option<String>,
-    credential_policy: AgentCredentialPolicy,
+    /// The account access the item declares in its registration (#3907),
+    /// resolved through grants into a per-requester binding.
+    account_access: Option<AccessName>,
+    /// Authenticates only through an ambient host login. No seeded adapter
+    /// uses this yet; admission is forward-provisioned for one.
+    ambient_scope: Option<&'static str>,
 }
 
 const CLAUDE_CODE_ADAPTER_ID: &str = "claude-code";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentCredentialPolicy {
-    None,
-    DeliveredWithAmbientFallback {
-        slot: &'static str,
-        scope: &'static str,
-    },
-    /// Authenticates only through an ambient host login. No seeded adapter
-    /// uses this yet; admission is forward-provisioned for one.
-    AmbientOnly {
-        scope: &'static str,
-    },
+/// Token sources that would compete with a Claude plan's own. Claude's precedence among them is
+/// unverified (#3882 "Unknown precedence stays unknown"), so a bound launch clears them.
+const CLAUDE_COMPETING_TOKEN_SOURCES: &[&str] = &["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+
+/// The requester's bound Claude home and its token file. A Claude harness without both is
+/// refused: nothing falls through to `~/.claude` or an ambient token (#3907 contract 8).
+fn bound_claude_home(environment: &TerminalEnvVars) -> Result<(&str, &str), String> {
+    let lookup = |key: &str| environment.iter().find(|(name, _)| name == key).map(|(_, value)| value.as_str());
+    match (lookup("CLAUDE_CONFIG_DIR"), lookup(crate::account_access::CLAUDE_OAUTH_TOKEN_FILE_ENV)) {
+        (Some(home), Some(token_file)) if Path::new(home).is_absolute() && Path::new(token_file).is_absolute() => Ok((home, token_file)),
+        _ => Err(
+            "Claude Code requires the requester's bound account home: no account binding delivered `CLAUDE_CONFIG_DIR` and its token file"
+                .to_string(),
+        ),
+    }
 }
 
 pub struct CapabilityTable {
@@ -510,7 +518,8 @@ impl CapabilityTable {
         Ok(AgentRequirement {
             adapter: seeded.adapter.clone(),
             model: selector.model.clone().or_else(|| seeded.model.clone()),
-            credential_policy: seeded.credential_policy,
+            account_access: seeded.account_access.clone(),
+            ambient_scope: seeded.ambient_scope,
         })
     }
 }
@@ -533,42 +542,28 @@ pub fn required_agent_adapters<'a>(crew: impl IntoIterator<Item = &'a flotilla_r
 impl AgentRequirement {
     fn new(adapter: impl Into<String>, model: Option<String>) -> Self {
         let adapter = adapter.into();
-        let credential_policy = match adapter.as_str() {
-            CLAUDE_CODE_ADAPTER_ID => AgentCredentialPolicy::DeliveredWithAmbientFallback {
-                slot: "claude",
-                scope: flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
-            },
-            _ => AgentCredentialPolicy::None,
-        };
-        Self { adapter, model, credential_policy }
+        let account_access = crate::account_access::declared_account_access(&adapter);
+        Self { adapter, model, account_access, ambient_scope: None }
     }
 
     /// A requirement for an adapter that has no deliverable credential form and
     /// authenticates only through the named ambient host login scope.
     pub fn ambient_only(adapter: impl Into<String>, model: Option<String>, scope: &'static str) -> Self {
-        Self { adapter: adapter.into(), model, credential_policy: AgentCredentialPolicy::AmbientOnly { scope } }
+        Self { adapter: adapter.into(), model, account_access: None, ambient_scope: Some(scope) }
     }
 
-    /// Credential delivery slot supported by this adapter. A session must
-    /// never fall through to ambient or interactive login when its adapter has
-    /// a deliverable material form.
-    pub fn credential_delivery_slot(&self) -> Option<&'static str> {
-        match self.credential_policy {
-            AgentCredentialPolicy::DeliveredWithAmbientFallback { slot, .. } => Some(slot),
-            AgentCredentialPolicy::None => None,
-            AgentCredentialPolicy::AmbientOnly { .. } => None,
-        }
+    /// The account access this item declares. A session for it starts only
+    /// in the explicit home its binding delivers; it never falls through to
+    /// ambient or interactive login.
+    pub fn account_access(&self) -> Option<&AccessName> {
+        self.account_access.as_ref()
     }
 
-    /// Ambient-login scope this adapter falls back to when no credential is
-    /// delivered, named as it appears under the Host `credential_expiry`
-    /// capability. `None` for adapters with no ambient authentication path.
+    /// Ambient-login scope this adapter authenticates through, named as it
+    /// appears under the Host `credential_expiry` capability. `None` for
+    /// adapters with no ambient authentication path.
     pub fn ambient_credential_scope(&self) -> Option<&'static str> {
-        match self.credential_policy {
-            AgentCredentialPolicy::DeliveredWithAmbientFallback { scope, .. } => Some(scope),
-            AgentCredentialPolicy::None => None,
-            AgentCredentialPolicy::AmbientOnly { scope } => Some(scope),
-        }
+        self.ambient_scope
     }
 }
 
@@ -763,13 +758,6 @@ impl CliAgentAdapter {
         args.push(Arg::Quoted(self.deliver_brief(&request.brief)));
         flatten(&args, 0)
     }
-
-    fn claude_invocation_config_dir(&self, environment: &TerminalEnvVars) -> Option<PathBuf> {
-        if !matches!(&self.flavor, AdapterFlavor::ClaudeCode { .. }) || !session_is_contained(environment) {
-            return None;
-        }
-        environment.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, value)| PathBuf::from(value))
-    }
 }
 
 #[async_trait]
@@ -885,28 +873,15 @@ impl AgentAdapter for CliAgentAdapter {
             env.retain(|(name, _)| name != "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION");
             env.push(("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".to_string(), "false".to_string()));
         }
-        let contained = session_is_contained(&env);
-        if claude && contained && !env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
-            return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
+        let mut command = self.command(request);
+        if claude {
+            // #3907: the harness home is always the requester's bound home, and
+            // the plan's token file is its only token source.
+            let token_file = bound_claude_home(&env)?.1.to_string();
+            env.retain(|(name, _)| !CLAUDE_COMPETING_TOKEN_SOURCES.contains(&name.as_str()));
+            command = format!("{} {command}", crate::account_access::claude_token_prefix(&token_file));
         }
-        if claude
-            && contained
-            && env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
-            && !env.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
-        {
-            return Err("Claude Code OAuth requires seam-resolved environment `CLAUDE_CONFIG_DIR`".to_string());
-        }
-        if let Some(config_dir) = self.claude_invocation_config_dir(&env) {
-            env.retain(|(name, _)| name != "CLAUDE_CONFIG_DIR");
-            env.push(("CLAUDE_CONFIG_DIR".to_string(), config_dir.display().to_string()));
-        } else if claude && !contained && env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
-            // Credential delivery supplies a private config directory for
-            // contained crews. Trusted crews deliberately retain the host's
-            // ambient settings, skills, and MCP configuration while the token
-            // alone replaces ambient authentication.
-            env.retain(|(name, _)| name != "CLAUDE_CONFIG_DIR");
-        }
-        Ok(AgentLaunchPlan { command: self.command(request), env, stance: TRUSTED_IMPLICIT_STANCE.into() })
+        Ok(AgentLaunchPlan { command, env, stance: TRUSTED_IMPLICIT_STANCE.into() })
     }
 }
 
@@ -926,22 +901,10 @@ impl CliAgentAdapter {
         match &self.flavor {
             AdapterFlavor::ClaudeCode { state_config, state_lock } => {
                 let contained = session_is_contained(environment);
-                if contained && !environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
-                    return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
-                }
-                if contained
-                    && environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
-                    && !environment.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
-                {
-                    return Err("Claude Code OAuth requires seam-resolved environment `CLAUDE_CONFIG_DIR`".to_string());
-                }
-                let invocation_state = if let Some(config_dir) = self.claude_invocation_config_dir(environment) {
-                    let config_dir_string = config_dir.display().to_string();
-                    self.runner.run("mkdir", &["-p", &config_dir_string], Path::new("/"), &ChannelLabel::Default).await?;
-                    Some(ClaudeStateConfig { path: config_dir.join(".claude.json"), lock: Arc::clone(state_lock) })
-                } else {
-                    None
-                };
+                let config_dir = PathBuf::from(bound_claude_home(environment)?.0);
+                let config_dir_string = config_dir.display().to_string();
+                self.runner.run("mkdir", &["-p", &config_dir_string], Path::new("/"), &ChannelLabel::Default).await?;
+                let invocation_state = Some(ClaudeStateConfig { path: config_dir.join(".claude.json"), lock: Arc::clone(state_lock) });
                 // A contained session never falls back to the discovered
                 // (host user's) state file: it is seeded only in its own home.
                 let host_state = state_config.as_ref().filter(|_| !contained);
@@ -1399,6 +1362,14 @@ mod tests {
             &env,
             Arc::new(MockRunner::new(vec![Ok("/workspace\n".into()), Ok(".git/info/exclude\n".into()), Ok(String::new())])),
         )
+    }
+
+    /// The session variables a Claude binding's delivery sets for a requester home.
+    fn bound_claude(home: &str) -> Vec<(String, String)> {
+        vec![
+            ("CLAUDE_CONFIG_DIR".to_string(), home.to_string()),
+            (crate::account_access::CLAUDE_OAUTH_TOKEN_FILE_ENV.to_string(), format!("{home}/.flotilla-oauth-token")),
+        ]
     }
 
     #[test]
@@ -2131,7 +2102,7 @@ mod tests {
 
         let ambient = table.resolve("ambient").expect("added capability");
         assert_eq!((ambient.adapter.as_str(), ambient.model.as_deref()), ("ambient-harness", Some("m1")));
-        assert_eq!(ambient.credential_delivery_slot(), None);
+        assert_eq!(ambient.account_access(), None);
         assert_eq!(ambient.ambient_credential_scope(), Some(scope));
         assert_eq!(table.resolve("coding").expect("replaced capability").adapter, "replacement");
 
@@ -2139,7 +2110,7 @@ mod tests {
         let mut reskinned = flotilla_resources::Selector::for_capability("ambient");
         reskinned.model = Some("m2".to_string());
         let requirement = table.resolve_selector(&reskinned).expect("model override");
-        assert_eq!((requirement.model.as_deref(), requirement.credential_delivery_slot()), (Some("m2"), None));
+        assert_eq!((requirement.model.as_deref(), requirement.account_access()), (Some("m2"), None));
         assert_eq!(requirement.ambient_credential_scope(), Some(scope));
     }
 
@@ -2277,12 +2248,12 @@ mod tests {
                 role: "reviewer".into(),
                 model: Some("opus".into()),
                 brief: brief.clone(),
-                environment: Vec::new(),
+                environment: bound_claude("/homes/reviewer/claude"),
             })
             .expect("claude launch plan");
         assert_eq!(
             plan.command,
-            "/tools/claude --dangerously-skip-permissions --settings .flotilla/claude-settings.json --model 'opus' 'protocol preamble\n\nImplement the issue.\n\nThis is also at `.flotilla/briefs/coder.md`; re-read that file after a context compaction.'"
+            "CLAUDE_CODE_OAUTH_TOKEN=\"$(cat -- '/homes/reviewer/claude/.flotilla-oauth-token')\" /tools/claude --dangerously-skip-permissions --settings .flotilla/claude-settings.json --model 'opus' 'protocol preamble\n\nImplement the issue.\n\nThis is also at `.flotilla/briefs/coder.md`; re-read that file after a context compaction.'"
         );
         assert!(plan.command.contains("Implement the issue"));
 
@@ -2295,7 +2266,7 @@ mod tests {
                 role: "reviewer".into(),
                 model: Some("opus; touch /tmp/pwned".into()),
                 brief,
-                environment: Vec::new(),
+                environment: bound_claude("/homes/reviewer/claude"),
             })
             .expect("claude launch plan");
         assert!(plan.command.contains("--model 'opus; touch /tmp/pwned'"));
@@ -2315,11 +2286,17 @@ mod tests {
         let plan = registry
             .get("claude-code")
             .expect("claude adapter")
-            .launch(&AgentLaunchRequest { fulfilment_grants: None, role: "coder".into(), model: None, brief, environment: Vec::new() })
+            .launch(&AgentLaunchRequest {
+                fulfilment_grants: None,
+                role: "coder".into(),
+                model: None,
+                brief,
+                environment: bound_claude("/homes/coder/claude"),
+            })
             .expect("launch plan");
 
-        assert!(plan.command.starts_with("/x/y/claude "));
-        assert!(!plan.command.starts_with("claude "));
+        assert!(plan.command.contains("\" /x/y/claude "), "{}", plan.command);
+        assert!(!plan.command.contains(" claude "));
     }
 
     #[tokio::test]
@@ -2344,9 +2321,10 @@ mod tests {
         let invocation_environment = vec![
             ("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".to_string(), "true".to_string()),
             ("FLOTILLA_ENVIRONMENT_ID".to_string(), "contained-claude".to_string()),
-            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string()),
-            ("CLAUDE_CONFIG_DIR".to_string(), claude_config.display().to_string()),
-        ];
+        ]
+        .into_iter()
+        .chain(bound_claude(&claude_config.display().to_string()))
+        .collect::<Vec<_>>();
         claude
             .prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &invocation_environment)
             .await
@@ -2417,6 +2395,8 @@ mod tests {
             (crate::CLAUDE_CODE_HOOK_TOKEN_ENV.to_string(), "hook-token".to_string()),
         ];
         for (name, environment, http) in [("host-direct", hook_environment.clone(), true), ("vessel", Vec::new(), false)] {
+            let home = temp.path().join(format!("{name}-home"));
+            let environment = environment.into_iter().chain(bound_claude(&home.display().to_string())).collect::<Vec<_>>();
             let workspace = temp.path().join(name);
             std::fs::create_dir_all(&workspace).expect("workspace");
             claude.prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &environment).await.expect("prepare");
@@ -2449,8 +2429,10 @@ mod tests {
         }
     }
 
+    // #3907 contract 8: a Claude session starts only in the requester's bound
+    // home, contained or not; the plan's token file is its only token source.
     #[tokio::test]
-    async fn contained_claude_uses_the_seam_resolved_invocation_config() {
+    async fn claude_uses_only_the_bound_requester_home() {
         let workspace = ExecutionEnvironmentPath::new("/workspace");
         let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok("/workspace\n".to_string()), Err("not a checkout".to_string())]));
         let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
@@ -2462,40 +2444,38 @@ mod tests {
             content: "brief".into(),
             copies: Vec::new(),
         };
+        let home = "/home/crew/flotilla/agent-homes/requesters/c1/coder/claude";
         let contained = ("FLOTILLA_ENVIRONMENT_ID".to_string(), "contained-claude".to_string());
-        let invocation_environment = vec![
-            contained.clone(),
-            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string()),
-            ("CLAUDE_CONFIG_DIR".to_string(), "/home/crew/flotilla/credentials/claude-max/claude".to_string()),
+        let ambient = [
+            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "ambient-profile-token".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "ambient-key".to_string()),
         ];
-
-        let missing = claude
-            .prepare_with_environment(&workspace, &brief, &vec![contained])
-            .await
-            .expect_err("contained Claude must refuse a session without delivered authentication");
-        assert_eq!(missing, "contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`");
-
-        claude.prepare_with_environment(&workspace, &brief, &invocation_environment).await.expect("prepare contained Claude");
-        let plan = claude
-            .launch(&AgentLaunchRequest {
+        let unbound = std::iter::once(contained.clone()).chain(ambient.clone()).collect::<Vec<_>>();
+        let refusal =
+            "Claude Code requires the requester's bound account home: no account binding delivered `CLAUDE_CONFIG_DIR` and its token file";
+        let missing = claude.prepare_with_environment(&workspace, &brief, &unbound).await.expect_err("an unbound session is refused");
+        assert_eq!(missing, refusal);
+        let launch = |environment: Vec<(String, String)>| {
+            claude.launch(&AgentLaunchRequest {
                 fulfilment_grants: None,
                 role: "coder".into(),
                 model: None,
-                brief,
-                environment: invocation_environment,
+                brief: brief.clone(),
+                environment,
             })
-            .expect("contained launch plan");
+        };
+        // Mutation check: without the explicit home the session would fall through to `~/.claude`
+        // and the ambient token; the launch refuses instead.
+        assert_eq!(launch(unbound.clone()).expect_err("unbound launch"), refusal);
 
-        assert!(plan.env.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == "redacted-test-token"));
-        assert!(plan
-            .env
-            .iter()
-            .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == "/home/crew/flotilla/credentials/claude-max/claude"));
-        assert!(runner
-            .calls()
-            .iter()
-            .any(|(command, args)| { command == "mkdir" && args == &["-p", "/home/crew/flotilla/credentials/claude-max/claude"] }));
-        assert!(runner.calls().iter().flat_map(|(_, args)| args).all(|arg| !arg.starts_with("/run/flotilla")));
+        let bound = unbound.into_iter().chain(bound_claude(home)).collect::<Vec<_>>();
+        claude.prepare_with_environment(&workspace, &brief, &bound).await.expect("prepare bound Claude");
+        let plan = launch(bound).expect("bound launch plan");
+        let value = |key: &str| plan.env.iter().find(|(name, _)| name == key).map(|(_, value)| value.as_str());
+        assert_eq!(value("CLAUDE_CONFIG_DIR"), Some(home));
+        assert_eq!((value("CLAUDE_CODE_OAUTH_TOKEN"), value("ANTHROPIC_API_KEY")), (None, None));
+        assert!(plan.command.starts_with(&format!("CLAUDE_CODE_OAUTH_TOKEN=\"$(cat -- '{home}/.flotilla-oauth-token')\" /tools/claude ")));
+        assert!(runner.calls().iter().any(|(command, args)| command == "mkdir" && args == &["-p", home]));
     }
 
     #[tokio::test]
@@ -2520,7 +2500,11 @@ mod tests {
         registry
             .get("claude-code")
             .expect("claude adapter")
-            .prepare(&ExecutionEnvironmentPath::new(&workspace_root), &brief)
+            .prepare_with_environment(
+                &ExecutionEnvironmentPath::new(&workspace_root),
+                &brief,
+                &bound_claude(&claude_config.display().to_string()),
+            )
             .await
             .expect("prepare multi-repo workspace root");
 
@@ -2554,10 +2538,11 @@ mod tests {
             copies: Vec::new(),
         };
 
+        let bound_home = temp.path().join("requester-home");
         registry
             .get("claude-code")
             .expect("Claude adapter")
-            .prepare(&ExecutionEnvironmentPath::new(&workspace), &brief)
+            .prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &bound_claude(&bound_home.display().to_string()))
             .await
             .expect("prepare host-direct Claude");
 
@@ -2612,8 +2597,7 @@ mod tests {
         if codex {
             session.push(("CODEX_HOME".to_string(), home.display().to_string()));
         } else {
-            session.push(("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string()));
-            session.push(("CLAUDE_CONFIG_DIR".to_string(), home.display().to_string()));
+            session.extend(bound_claude(&home.display().to_string()));
         }
         let brief = flotilla_resources::TerminalBrief {
             artifact_digest: None,
@@ -2656,8 +2640,10 @@ mod tests {
         }
     }
 
+    // #3907 contract 8: a host-direct session no longer keeps the host user's
+    // ambient Claude config; it starts in its bound home like any other.
     #[test]
-    fn host_direct_claude_oauth_uses_delivered_auth_without_replacing_ambient_config() {
+    fn host_direct_claude_launches_in_its_bound_home() {
         let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(MockRunner::new(Vec::new())));
         let claude = registry.get("claude-code").expect("Claude adapter");
@@ -2667,21 +2653,19 @@ mod tests {
             content: "brief".into(),
             copies: Vec::new(),
         };
+        let home = "/state/flotilla/agent-homes/requesters/c1/coder/claude";
         let plan = claude
             .launch(&AgentLaunchRequest {
                 fulfilment_grants: None,
                 role: "coder".into(),
                 model: None,
                 brief,
-                environment: vec![
-                    ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "token-alice".to_string()),
-                    ("CLAUDE_CONFIG_DIR".to_string(), "/state/flotilla/credentials/alice/claude".to_string()),
-                ],
+                environment: bound_claude(home),
             })
-            .expect("host-direct OAuth launch");
+            .expect("host-direct launch");
 
-        assert!(plan.env.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == "token-alice"));
-        assert!(plan.env.iter().all(|(name, _)| name != "CLAUDE_CONFIG_DIR"), "ambient Claude config must remain selected");
+        assert!(plan.env.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == home));
+        assert!(plan.env.iter().all(|(name, _)| name != "CLAUDE_CODE_OAUTH_TOKEN"));
     }
 
     #[test]

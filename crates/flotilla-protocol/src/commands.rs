@@ -693,6 +693,11 @@ pub struct ConvoyStartIntent {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub promise_exclusions: Vec<(String, String)>,
+    /// Account pins at admission (`--account role=credential`, #3907): an
+    /// authorized pin wins over the draw; an unauthorized one refuses.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_pins: Vec<(String, String)>,
     /// Dispatch-supplied promises (`--promise kind:label[@vessel/role]`).
     /// Admission resolves kind and owner against the final workflow.
     #[builder(default)]

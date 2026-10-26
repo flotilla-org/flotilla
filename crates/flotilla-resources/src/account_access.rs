@@ -107,6 +107,20 @@ pub enum BindingState {
     Revoked { reason: String, delivered_until: Option<Timestamp> },
 }
 
+impl BindingState {
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+
+    /// The reason a closed or revoked binding ended.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Open => None,
+            Self::Closed { reason, .. } | Self::Revoked { reason, .. } => Some(reason),
+        }
+    }
+}
+
 /// One authorization epoch of the bound credential, as the binding learned it: the first is the
 /// epoch current at selection; a replacement login for the same account appends the next. The
 /// binding does not move.
@@ -248,4 +262,32 @@ pub fn registry() -> Result<KindRegistry, RegistryError> {
     registry.register::<AccountBindingSpec>()?;
     registry.register::<AccountProvisionSpec>()?;
     Ok(registry)
+}
+
+/// The material generation a delivery records (#3910 owner ruling 3): a short digest of the
+/// published material, so a refreshed file is told apart without storing or logging it.
+pub fn material_generation(material: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"flotilla-account-material-generation-v1");
+    hash.update(material.as_bytes());
+    format!("{:x}", hash.finalize())[..16].to_string()
+}
+
+impl std::fmt::Display for CredentialName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Display for GrantName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Display for AccessName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }

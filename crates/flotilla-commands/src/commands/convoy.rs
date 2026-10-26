@@ -168,6 +168,10 @@ pub struct ConvoyStartArgs {
     /// Exclude a template promise at admission (repeatable): --exclude-promise role=kind
     #[arg(long = "exclude-promise", value_parser = parse_promise_exclusion)]
     pub promise_exclusions: Vec<(String, String)>,
+    /// Pin a role's account (repeatable): --account role=credential. An
+    /// authorized pin wins over the random draw; an unauthorized one refuses.
+    #[arg(long = "account", value_parser = parse_account_pin)]
+    pub account_pins: Vec<(String, String)>,
     /// Dispatch a promise (repeatable): --promise kind:label[@vessel/role].
     /// The owner defaults to the workflow's deliverer, e.g. --promise pr:api-split
     #[arg(long = "promise", value_parser = parse_dispatch_promise)]
@@ -214,6 +218,14 @@ fn parse_promise_exclusion(raw: &str) -> Result<(String, String), String> {
         .filter(|(role, kind)| !role.is_empty() && !kind.is_empty())
         .ok_or_else(|| format!("promise exclusion must be role=kind: {raw}"))?;
     Ok((role.to_string(), kind.to_string()))
+}
+
+fn parse_account_pin(raw: &str) -> Result<(String, String), String> {
+    let (role, credential) = raw
+        .split_once('=')
+        .filter(|(role, credential)| !role.is_empty() && !credential.is_empty())
+        .ok_or_else(|| format!("account pin must be role=credential: {raw}"))?;
+    Ok((role.to_string(), credential.to_string()))
 }
 
 fn parse_dispatch_promise(raw: &str) -> Result<DispatchPromiseRequest, String> {
@@ -457,6 +469,7 @@ impl ConvoyNoun {
                     escalation_reason,
                     agent_overrides,
                     promise_exclusions,
+                    account_pins,
                     promises,
                     skills,
                     no_attach,
@@ -520,6 +533,7 @@ impl ConvoyNoun {
                                     (false, false) => ConvoyAutoAttach::Default,
                                     (true, true) => unreachable!("clap rejects conflicting attach flags"),
                                 },
+                                account_pins,
                             }),
                         },
                     },
@@ -564,6 +578,7 @@ impl ConvoyNoun {
                                     promises: Vec::new(),
                                     skills: Vec::new(),
                                     auto_attach: ConvoyAutoAttach::Never,
+                                    account_pins: Vec::new(),
                                 }),
                             },
                         },
@@ -682,6 +697,7 @@ impl std::fmt::Display for ConvoyNoun {
                     escalation_reason,
                     agent_overrides,
                     promise_exclusions,
+                    account_pins,
                     promises,
                     skills,
                     no_attach,
@@ -732,6 +748,9 @@ impl std::fmt::Display for ConvoyNoun {
                 }
                 for (role, kind) in promise_exclusions {
                     write!(f, " --exclude-promise {}", quote_value(&format!("{role}={kind}")))?;
+                }
+                for (role, credential) in account_pins {
+                    write!(f, " --account {}", quote_value(&format!("{role}={credential}")))?;
                 }
                 for promise in promises {
                     write!(f, " --promise {}", quote_value(&promise.to_string()))?;
@@ -1049,6 +1068,20 @@ mod tests {
         );
     }
 
+    // Glue (#3907): account pins reach admission per role and render back to
+    // the same command for other surfaces.
+    #[test]
+    fn start_account_pins_reach_admission() {
+        let args = ["convoy", "start", "--project", "flotilla", "--account", "coder=claude-jseo-oauth"];
+        assert_round_trip::<ConvoyNoun>(&args);
+        let Resolved::NeedsContext { command, .. } = parse(&args).resolve().expect("resolve pins") else { panic!("command expected") };
+        let CommandAction::ConvoyStart { intent } = command.action else { panic!("start expected") };
+        assert_eq!(intent.account_pins, vec![("coder".into(), "claude-jseo-oauth".into())]);
+        let error =
+            ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--account", "coder"]).expect_err("malformed pin");
+        assert!(error.to_string().contains("role=credential"));
+    }
+
     // Glue: malformed exclusions explain the required authoring syntax. Kind
     // and owner validity depend on the admitted template, covered at that seam.
     #[test]
@@ -1221,6 +1254,7 @@ mod tests {
                     promises: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Never,
+                    account_pins: Vec::new(),
                 }),
             },
             RepoContext::None,
@@ -1257,6 +1291,7 @@ mod tests {
                     promises: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Default,
+                    account_pins: Vec::new(),
                 }),
             },
             RepoContext::None,
@@ -1291,6 +1326,7 @@ mod tests {
                     promises: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Default,
+                    account_pins: Vec::new(),
                 }),
             },
             RepoContext::None,
@@ -1334,6 +1370,7 @@ mod tests {
                     promises: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Never,
+                    account_pins: Vec::new(),
                 }),
             },
             RepoContext::None,
@@ -1454,6 +1491,7 @@ mod tests {
                     promises: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Never,
+                    account_pins: Vec::new(),
                 }),
             }
         );
