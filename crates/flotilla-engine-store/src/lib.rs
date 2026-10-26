@@ -20,13 +20,14 @@ use flotilla_state_machines::{
         consumer::Consumer,
         convoy, ensure,
         message::{Message, ReceiptLog},
+        person::Person,
         vessel,
     },
     EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, StoredWrite, Version,
 };
 
 /// The kinds the `[primitives]` switch moves: Message, and the minimal
-/// AgentSession its receipts are written on. Codes are the production
+/// AgentSession and the Person its receipts are written on. Codes are the production
 /// registry's (`flotilla_state_machines::kinds`), never reassigned here.
 pub struct MachineRegistry {
     pub kinds: KindRegistry,
@@ -45,6 +46,7 @@ pub fn machine_registry() -> Result<MachineRegistry, RegistryError> {
     }
     register!(Message);
     register!(AgentSession);
+    register!(Person);
     register!(convoy::Convoy);
     register!(AwaitingReply);
     Ok(MachineRegistry { kinds, diagrams })
@@ -111,7 +113,7 @@ pub struct StoreLog {
 }
 
 impl StoreLog {
-    /// A log homed at the store's own home, accepting AgentSession receipts.
+    /// A log homed at the store's own home, accepting AgentSession and Person receipts.
     pub fn new(store: Arc<Mutex<Store>>) -> Self {
         let home = lock_store(&store).home().to_owned();
         Self { store, home, receipts: ReceiptLog::new() }

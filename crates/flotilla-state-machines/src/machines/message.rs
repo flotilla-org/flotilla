@@ -56,6 +56,7 @@ use crate::{
         agent_session::AgentSession,
         consumer::{Consumer, ConsumerKind},
         convoy::ConvoyRequest,
+        person::Person,
     },
     states, Admission, EdgeDef, EdgePayload, Ended, Handle, Kind, Machine, MachineDef, NoRecords, Ref, Resource, Source, Table, Transport,
     Version, WrongState,
@@ -332,8 +333,8 @@ type DecodeReceipt = fn(&Event) -> Result<Option<(String, Transport)>, EventErro
 /// [`Receipts`] served from the store's log (#3392 G11, D1): the entries
 /// about each message, as a store's `about` read pages them, give the
 /// receipts a message's gates read. Any consumer kind's `Receive` is a
-/// receipt (#3424 ruling 2): an agent session's is accepted from the start,
-/// and [`ReceiptLog::consumer`] adds a controller's kind. An entry of another
+/// receipt (#3424 ruling 2): an agent session's and a person's are accepted
+/// from the start, and [`ReceiptLog::consumer`] adds a controller's kind. An entry of another
 /// kind, or of another edge, is no receipt and is skipped without decoding
 /// its payload; a `Receive` entry whose payload does not decode is refused. A
 /// message's version is the number of receipts about it: entries are only
@@ -347,7 +348,7 @@ pub struct ReceiptLog {
 
 impl Default for ReceiptLog {
     fn default() -> Self {
-        ReceiptLog { consumers: BTreeMap::new(), messages: BTreeMap::new() }.consumer::<AgentSession>()
+        ReceiptLog { consumers: BTreeMap::new(), messages: BTreeMap::new() }.consumer::<AgentSession>().consumer::<Person>()
     }
 }
 

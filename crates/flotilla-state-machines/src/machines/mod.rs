@@ -8,4 +8,5 @@ pub mod convoy;
 pub mod ensure;
 pub mod lifecycle;
 pub mod message;
+pub mod person;
 pub mod vessel;

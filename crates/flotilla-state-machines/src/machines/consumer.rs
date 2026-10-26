@@ -1,8 +1,7 @@
 //! Consumers of an inbox (ADR 0064 "Roles, inboxes and delivery", #3424
-//! rulings 1 to 3): an agent session or a deterministic controller. A
-//! person's kind comes with the principals model (owner's schema look-over,
-//! 2026-10-18): their receipt is an acknowledgement or a response, never a
-//! surface loading the message.
+//! rulings 1 to 3): an agent session, a deterministic controller or a person
+//! (#3938). A person's receipt is an acknowledgement or a response, never a
+//! surface loading the message (owner's schema look-over, 2026-10-18).
 //!
 //! A consumer is named by a typed [`Receiver`]: its kind, its resource's
 //! name and the host the resource is homed at. A receiver is compared only
@@ -28,6 +27,9 @@ pub enum ConsumerKind {
     /// A deterministic controller, through its own resource.
     #[store(code = "co")]
     Controller,
+    /// A person, through their own resource (`Person`).
+    #[store(code = "pe")]
+    Person,
 }
 
 /// The consumer a receipt came from: its kind, its resource's name (`id`)
