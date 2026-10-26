@@ -40,7 +40,7 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
   - Public sources run with ambient credentials disabled: `GIT_CONFIG_GLOBAL=/dev/null`, an empty `credential.helper`, `GIT_TERMINAL_PROMPT=0`, and no askpass.
   - A private source gets a per-command credential helper that reads the minted token file:
     - The token file is `0600`, inside a `0700` per-attempt directory under the daemon's private state.
-    - It is removed when `fetch_commit` returns, on success or failure.
+    - It is removed when `fetch_commit` returns, on success or failure, and also when the future is dropped or cancelled. A guard type removes the directory in its `Drop`. A spawned fetch task owns the guard, so the token outlives the caller only for as long as Git still runs.
     - The token value never appears in argv or in the environment. Only the file's path is passed, and the helper prints the value to Git on stdin and stdout.
     - Tests assert this against the recorded runner calls.
 - **Cache key and private content.** The key is the repository URL, not the source name. Bytes are served only for an entry that the current supply has just authorized for that repository. The cache stores Git objects and nothing derived from a selection.
@@ -161,7 +161,7 @@ The owner ruled on these before this note (flotilla#3909, 2026-10-26):
   - `renameat2(RENAME_EXCHANGE)` would close the gap, but it needs coreutils 9.5's `mv --exchange` or a guest helper. Agentless SSH hosts cannot be assumed to have either.
 - **Which selection is authoritative.** The authoritative selection is the crew's admission-frozen selection in the environment spec's `FLOTILLA_CREW_SKILLS`.
   - Live attempts for one destination are serialized by the daemon's keyed mutex, held across retries.
-  - A cancelled attempt's flip exec can still land after a newer attempt has run. So before launching a harness, `crew_environment` checks that `readlink skills` names the digest of the current selection. If it does not, it republishes that selection, and the launch is the final check.
+  - A cancelled attempt's flip exec can still land after a newer attempt has run. So before launching a harness, `crew_environment` checks that `readlink skills` names the digest of the current selection. A missing `skills` entry counts as a mismatch; that case covers a harness launched inside the legacy-migration window. On a mismatch it republishes the selection, and the launch is the final check.
   - Same-digest writers need none of this. It covers only the rare case where the desired digest changed, for example after a roll that changes canonicalization.
 - **Retry and cancellation.**
   - Transient failures are retried three times with backoff 1 s, 2 s and 3 s: Git transport errors, runner or exec transport errors, and unpack I/O errors.
@@ -206,6 +206,8 @@ The build's test budget is in the PR description. The coverage that the review a
   - a reaper racing a `touch`;
   - retention of the `skills.prev` target past 60 minutes;
   - a leaked `skills.<attempt>` link being reaped;
+  - removal of the token directory when the fetch future is dropped;
+  - a launch-time republish when `skills` is missing or names a stale digest;
   - ordinary `rm -rf` removal of a crew home holding published trees;
   - legacy-directory migration;
   - a failed unpack;
