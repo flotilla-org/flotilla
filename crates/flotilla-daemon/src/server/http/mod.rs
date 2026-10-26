@@ -270,6 +270,9 @@ async fn resource_api(
     request: Request,
 ) -> Response {
     if request.uri().path() == flotilla_schema_sqlite::stream::PATH {
+        if request.method() != axum::http::Method::GET {
+            return auth::refusal(StatusCode::METHOD_NOT_ALLOWED, "resource API is read-only");
+        }
         if !matches!(caller, CallerAuth::Socket(_)) {
             return auth::refusal(StatusCode::FORBIDDEN, "change-stream requires peer replication transport");
         }
@@ -283,9 +286,6 @@ async fn resource_api(
             Ok(peer) => peer,
             Err(error) => return auth::refusal(StatusCode::FORBIDDEN, &error),
         };
-        if request.method() != axum::http::Method::GET {
-            return auth::refusal(StatusCode::METHOD_NOT_ALLOWED, "resource API is read-only");
-        }
         return streaming(
             super::change_stream::CONTENT_TYPE,
             Body::from_stream(super::change_stream::body(Arc::clone(daemon), peer, session.to_owned())),

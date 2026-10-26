@@ -33,6 +33,8 @@ const DEADLINE: Duration = Duration::from_secs(15);
 const MAX_ROUNDS: usize = 16;
 
 impl Rounds {
+    // Tokens are random UUIDv4 capabilities minted by next(), never sequential.
+    // Authentication alone does not refresh idle expiry; only pulling a frame does.
     pub(super) async fn peer(&self, session: &str) -> Result<String, String> {
         self.sessions.lock().await.get(session).map(|session| session.peer.clone()).ok_or_else(|| "change-stream session expired".into())
     }

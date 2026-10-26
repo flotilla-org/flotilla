@@ -6979,7 +6979,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
                 request.push(byte[0]);
             }
             let request = String::from_utf8(request).unwrap();
-            assert!(request.starts_with("GET /apis/flotilla.work/v1/change-stream?after="));
+            assert_eq!(request.lines().next(), Some("GET /apis/flotilla.work/v1/change-stream HTTP/1.1"));
             assert!(request.contains(super::change_stream::SESSION_HEADER));
             socket.write_all(response).await.unwrap();
         }
