@@ -606,7 +606,10 @@ async fn cloud_scheduler_bounds_refills_and_cancels_without_starving_siblings() 
     let count = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let cancelled = Arc::new(AtomicUsize::new(0));
-    let started = Arc::new(Mutex::new(Vec::new()));
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    async fn next_start(starts: &mut tokio::sync::mpsc::UnboundedReceiver<usize>) -> usize {
+        tokio::time::timeout(Duration::from_secs(1), starts.recv()).await.unwrap().unwrap()
+    }
     let healthy_and_gone = Arc::new(Mutex::new(Vec::new()));
     let release_unknown = Arc::new(tokio::sync::Notify::new());
     let jobs = (0..CLOUD_RECONCILIATION_LIMIT + 3)
@@ -616,7 +619,7 @@ async fn cloud_scheduler_bounds_refills_and_cancels_without_starving_siblings() 
             (id.to_string(), async move {
                 let mut guard = Active { count: count.clone(), cancelled, completed: false };
                 peak.fetch_max(count.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
-                started.lock().unwrap().push(id);
+                started.send(id).unwrap();
                 if id == CLOUD_RECONCILIATION_LIMIT - 1 {
                     release_unknown.notified().await;
                     guard.completed = true;
@@ -631,29 +634,22 @@ async fn cloud_scheduler_bounds_refills_and_cancels_without_starving_siblings() 
             })
         })
         .collect();
-    let began = tokio::time::Instant::now();
+    drop(started);
     let mut batch = start_cloud_reconciliations(jobs);
-    for _ in 0..1000 {
-        if started.lock().unwrap().len() >= CLOUD_RECONCILIATION_LIMIT {
-            break;
-        }
-        tokio::task::yield_now().await;
+    for id in 0..CLOUD_RECONCILIATION_LIMIT {
+        assert_eq!(next_start(&mut starts).await, id);
     }
-    assert_eq!(started.lock().unwrap().len(), CLOUD_RECONCILIATION_LIMIT);
+    // Let runnable jobs settle before asserting that queued work stays queued.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(starts.try_recv().is_err());
     assert_eq!(count.load(Ordering::SeqCst), CLOUD_RECONCILIATION_LIMIT);
     // One Unknown completion must refill repeatedly: healthy and Gone jobs
     // queued behind blocked peers finish before any timeout or peer release.
     release_unknown.notify_one();
-    for _ in 0..1000 {
-        if started.lock().unwrap().len() == CLOUD_RECONCILIATION_LIMIT + 3 {
-            break;
-        }
-        tokio::task::yield_now().await;
+    for id in CLOUD_RECONCILIATION_LIMIT..CLOUD_RECONCILIATION_LIMIT + 3 {
+        assert_eq!(next_start(&mut starts).await, id);
     }
-    assert_eq!(
-        &started.lock().unwrap()[CLOUD_RECONCILIATION_LIMIT..],
-        &[CLOUD_RECONCILIATION_LIMIT, CLOUD_RECONCILIATION_LIMIT + 1, CLOUD_RECONCILIATION_LIMIT + 2]
-    );
+    let last_admitted = tokio::time::Instant::now();
     assert_eq!(*healthy_and_gone.lock().unwrap(), vec![CLOUD_RECONCILIATION_LIMIT, CLOUD_RECONCILIATION_LIMIT + 1]);
     assert_eq!(peak.load(Ordering::SeqCst), CLOUD_RECONCILIATION_LIMIT);
     assert_eq!(cancelled.load(Ordering::SeqCst), 0);
@@ -663,6 +659,6 @@ async fn cloud_scheduler_bounds_refills_and_cancels_without_starving_siblings() 
     assert_eq!(errors.matches("timed out").count(), CLOUD_RECONCILIATION_LIMIT);
     assert_eq!(cancelled.load(Ordering::SeqCst), CLOUD_RECONCILIATION_LIMIT);
     assert_eq!(count.load(Ordering::SeqCst), 0);
-    assert_eq!(began.elapsed(), ENVIRONMENT_ADOPTION_TIMEOUT);
+    assert_eq!(last_admitted.elapsed(), ENVIRONMENT_ADOPTION_TIMEOUT);
     assert!(batch.join_next().await.is_none());
 }

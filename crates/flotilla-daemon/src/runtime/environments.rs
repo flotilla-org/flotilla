@@ -217,12 +217,15 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     }
 }
 
-// Each cloud job can hold provider HTTP and SSH preparation work. Sixteen
-// permits ordinary siblings to progress while bounding both kinds of load.
-// FIFO admission in listing order, with immediate refill on any completion,
-// lets fast jobs refill slots without waiting for an entire slow wave.
+/// Each cloud job can hold provider HTTP and SSH preparation work. Sixteen
+/// permits ordinary siblings to progress while bounding both kinds of load.
+/// FIFO admission in listing order, with immediate refill on any completion,
+/// lets fast jobs refill slots without waiting for an entire slow wave.
 pub(super) const CLOUD_RECONCILIATION_LIMIT: usize = 16;
 
+/// Admit jobs in FIFO listing order and refill each completed slot.
+/// Each deadline starts at admission; the returned set owns the coordinator
+/// and its children, so dropping it cancels all outstanding work.
 pub(super) fn start_cloud_reconciliations<F>(jobs: Vec<(String, F)>) -> tokio::task::JoinSet<Result<(), String>>
 where
     F: std::future::Future<Output = Result<(), String>> + Send + 'static,
