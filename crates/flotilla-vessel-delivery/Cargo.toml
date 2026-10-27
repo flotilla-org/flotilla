@@ -1,0 +1,26 @@
+[package]
+name = "flotilla-vessel-delivery"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Vessel delivery (#3956): the needs and mechanisms vocabulary and the pure lowering planner"
+
+[dependencies]
+
+[dev-dependencies]
+hegeltest = { workspace = true }
+
+[lints]
+workspace = true
+
+# Feature anchors for ci/build-graph/check.py (see
+# docs/measurements/2747-build-graph.md). They select features of dependencies
+# already in the test graph and add none.
+[target.'cfg(not(target_arch = "wasm32"))'.build-dependencies]
+proc-macro2 = { version = "1", features = ["default", "proc-macro"] }
+quote = { version = "1", features = ["default", "proc-macro"] }
+syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+libc = { workspace = true }
+smallvec = { version = "1", default-features = false, features = ["const_generics", "const_new"] }
