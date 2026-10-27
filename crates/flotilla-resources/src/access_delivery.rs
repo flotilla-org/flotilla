@@ -6,9 +6,9 @@
 //! shows the mechanism per need from it. A delivery that fails records its retry
 //! state here, never on the Environment's status.
 //!
-//! The access is an opaque address: the crew role address
-//! (`project:<p>/convoy:<c>/vessel:<v>/role:<r>`) until the #3108 cut-over.
-//! Delivery never parses it.
+//! The access is an opaque key: the crew's Role Address (`project/convoy/vessel/role`)
+//! until the #3108 cut-over. Delivery never parses it. It is not an ADR 0066 address,
+//! whose grammar puts a role under its convoy and has no vessel segment there.
 //!
 //! Like the account access kinds, the record derives serde, for the resource-store kind
 //! production runs today, and `Stored`, for the generated tables the engine store takes
@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{Address, KindRegistry, RegistryError, Stored, Timestamp};
+use flotilla_schema::{KindRegistry, RegistryError, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass};
@@ -72,8 +72,9 @@ pub struct DeliveryRetry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[store(kind = "AccessDelivery", code = "ad", index(name = "by_access", eq(access)), index(name = "by_place", eq(place)))]
 pub struct AccessDeliverySpec {
-    /// The access relation's identity, opaque to delivery.
-    pub access: Address,
+    /// The access relation's identity, opaque to delivery. Interned in its own domain (`ra`).
+    #[store(intern = "ra")]
+    pub access: String,
     /// Where the access is delivered: the Environment its harness launches in.
     #[store(intern = "pc")]
     pub place: String,

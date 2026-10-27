@@ -14,6 +14,6 @@ Interned column domains:
 
 | Table | Column | Domain |
 |---|---|---|
-| `access_delivery` | `access` | `ad` |
+| `access_delivery` | `access` | `ra` |
 | `access_delivery` | `place` | `pc` |
 | `access_delivery` | `harness` | `it` |
