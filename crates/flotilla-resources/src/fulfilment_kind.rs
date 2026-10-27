@@ -290,12 +290,15 @@ pub struct FulfilmentKindSpec {
     pub realisation: FulfilmentRealisation,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, flotilla_schema::Stored)]
 #[serde(rename_all = "snake_case")]
 pub enum FulfilmentCostClass {
     #[default]
+    #[store(code = "oi")]
     OwnedIdle,
+    #[store(code = "si")]
     SubscriptionIncluded,
+    #[store(code = "me")]
     Metered,
 }
 
