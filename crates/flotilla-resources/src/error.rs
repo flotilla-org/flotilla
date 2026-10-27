@@ -81,6 +81,14 @@ impl ResourceError {
         Self::NotFound { name: name.into() }
     }
 
+    /// Status CAS evidence captured under the store's authoritative lock or transaction.
+    pub fn status_version_conflict(name: &str, expected: &str, current: &str) -> Self {
+        Self::conflict(
+            name,
+            format!("stale resourceVersion: expected={expected}, current={current}, intervening_writer=unavailable (not recorded)"),
+        )
+    }
+
     pub fn conflict(name: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Conflict { name: name.into(), message: message.into() }
     }

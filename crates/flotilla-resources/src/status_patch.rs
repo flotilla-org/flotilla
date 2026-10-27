@@ -23,6 +23,11 @@
 pub trait StatusPatch<S>: Send + Sync {
     fn apply(&self, status: &mut S);
 
+    /// Payload-free transition name to include when optimistic retries are exhausted.
+    fn diagnostic_name(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Whether applying this patch to `before`, producing `after`, must be committed.
     /// The default commits every application.
     fn requires_write(&self, _before: &S, _after: &S) -> bool {
