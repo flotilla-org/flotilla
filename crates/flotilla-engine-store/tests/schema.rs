@@ -63,11 +63,11 @@ fn convoy_store_codes_are_the_production_codes() {
     }
 }
 
-// Behaviour (#3938): a decided store created before the Person consumer keeps the old CHECK on
-// `message.receiver_kind`, which opening cannot change. It is refused at open, naming the codes,
-// rather than at a person's first acknowledgement; a current store opens.
+// Behaviour (#3938, #3972): a decided store created before the Person consumer keeps the old CHECK
+// on `message.receiver_kind`. Opening rebuilds the table with the wider CHECK rather than letting a
+// person's first acknowledgement fail; a current store opens.
 #[test]
-fn a_store_whose_receiver_kinds_predate_the_person_consumer_is_refused_at_open() {
+fn a_store_whose_receiver_kinds_predate_the_person_consumer_is_widened_at_open() {
     use flotilla_schema_sqlite::{Store, StoreError};
     let current = schema_ddl(&registry().expect("registry"), DdlMode::IfNotExists);
     let previous = current.replace(
@@ -77,12 +77,12 @@ fn a_store_whose_receiver_kinds_predate_the_person_consumer_is_refused_at_open()
     assert_ne!(previous, current, "the previous generation's CHECK is reconstructed");
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
     connection.execute_batch(&previous).expect("previous schema");
-    match Store::open(connection, "home", registry().expect("registry")) {
-        Err(StoreError::KindCodeDrift { table, column, missing }) => {
-            assert_eq!((table.as_str(), column.as_str(), missing), ("message", "receiver_kind", vec!["pe".to_owned()]));
-        }
-        other => panic!("refused at open, not {:?}", other.map(|_| "opened")),
-    }
+    let store = Store::open(connection, "home", registry().expect("registry")).expect("the previous generation opens");
+    let sql: String = store
+        .into_connection()
+        .query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'message'", [], |row| row.get(0))
+        .expect("message table");
+    assert!(sql.contains(r#"CHECK ("receiver_kind" IN ('as', 'co', 'pe'))"#), "widened to the Person consumer: {sql}");
     // A CHECK that cannot be read fails closed rather than passing as current.
     let unchecked = current.replace(r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'co', 'pe'))"#, r#""receiver_kind" TEXT"#);
     let connection = rusqlite::Connection::open_in_memory().expect("connection");

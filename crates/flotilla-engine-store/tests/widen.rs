@@ -158,8 +158,9 @@ fn a_store_with_an_unreadable_code_check_is_refused() {
         .expect("old store")
         .into_connection();
     let sql: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE name = 'message'", [], |row| row.get(0)).expect("table");
-    let unchecked =
-        sql.replace(" CHECK (\"receiver_kind\" IN ('as'))", "").replace("CREATE TABLE \"message\"", "CREATE TABLE \"unchecked\"");
+    let start = sql.find(" CHECK (\"receiver_kind\" IN (").expect("receiver_kind CHECK");
+    let end = start + sql[start..].find("))").expect("end of CHECK") + 2;
+    let unchecked = format!("{}{}", &sql[..start], &sql[end..]).replace("CREATE TABLE \"message\"", "CREATE TABLE \"unchecked\"");
     assert_ne!(unchecked, sql);
     conn.execute_batch(&format!(
         "PRAGMA foreign_keys = OFF; DROP VIEW message_view; DROP TABLE message; {unchecked}; ALTER TABLE unchecked RENAME TO message;"
