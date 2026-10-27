@@ -581,7 +581,8 @@ impl ResourceManifestReconciler {
             && existing.pointer("/spec/charter").is_none_or(Value::is_null)
             && !annotations.contains_key(MANIFEST_RECONCILER_ROOT_ANNOTATION)
             && (annotations.contains_key(flotilla_charter::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION)
-                || labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some("whole-repository-project"))
+                || labels.get(MANAGED_BY_LABEL).map(String::as_str)
+                    == Some(flotilla_resources::definition_provenance::WHOLE_REPOSITORY_PROJECT_MANAGER))
         {
             // The explicit registration transfers a legacy-generated Project.
             // Unrelated unmanaged objects retain the ordinary adoption refusal.

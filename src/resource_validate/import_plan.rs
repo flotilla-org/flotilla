@@ -49,7 +49,7 @@ pub(super) const PLAN: &[(&str, Plan)] = &[
     ("ImageLayer", Plan::Imported("definitions import (#3824 layer 2b)")),
     ("ManifestRoot", Plan::Imported("ManifestRoot import (#3824 layer 2c)")),
     ("WorkflowTemplate", Plan::Imported("definitions import (#3824 layer 2b)")),
-    ("Project", Plan::Moving("#3824 layer 3")),
+    ("Project", Plan::Imported("definitions import (#3824 layer 3b)")),
     ("Repository", Plan::Imported("Repository import (#3824 layer 3a)")),
     ("FulfilmentKind", Plan::Moving("#3824 layer 4")),
     ("Host", Plan::Moving("#3824 layer 4")),
@@ -147,12 +147,12 @@ mod tests {
         let mut report = Report::default();
         report.count("dispatchholds", 3);
         report.count("events", 2);
-        report.count("projects", 0);
+        report.count("artifacts", 0);
         report.count("messages", 9);
         assert_eq!(report.dropped, BTreeMap::from([("DispatchHold", 3), ("Event", 2)]));
         assert!(!report.blocks_import(), "dropped and imported rows never block the import");
-        report.count("projects", 1);
-        assert_eq!(report.moving, BTreeMap::from([("Project", ("#3824 layer 3", 1))]));
+        report.count("artifacts", 1);
+        assert_eq!(report.moving, BTreeMap::from([("Artifact", ("#3824 layer 7", 1))]));
         assert!(!report.blocks_import(), "a kind still moving stays on the old store until its layer");
         let mut unknown = Report::default();
         unknown.count("widgets", 1);

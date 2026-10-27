@@ -36,6 +36,7 @@ pub mod definition;
 pub mod environment;
 pub mod image_build;
 pub mod manifest_root;
+pub mod project;
 pub mod repository;
 pub mod terminal_session;
 

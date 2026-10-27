@@ -1,5 +1,6 @@
 //! The declared definition kinds' records (#3824 layer 2b-ii): Forge, FleetDesignation,
-//! CredentialSpec, CredentialGrant, CrewDefaults, ImageLayer and WorkflowTemplate.
+//! CredentialSpec, CredentialGrant, CrewDefaults, ImageLayer and WorkflowTemplate, and Project
+//! (layer 3b).
 //!
 //! On the engine each is a plain record at the home that declared it, with a typed
 //! [`DefinitionOrigin`] in place of the provenance labels and annotations the old store keeps
@@ -15,10 +16,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     definition_provenance::{
-        CHARTER_REVISION_ANNOTATION, CHARTER_SCOPE_ANNOTATION, CHARTER_SOURCE_ANNOTATION, MANIFEST_MANAGED_BY_VALUE,
-        MANIFEST_PATH_ANNOTATION, MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_REVISION_ANNOTATION, MANIFEST_SOURCE_ANNOTATION,
-        MATERIALIZED_PROJECT_ANNOTATION, PROJECT_IMAGE_MANAGER, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
-        SOURCE_REPOSITORY_ANNOTATION,
+        BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION, CHARTER_REVISION_ANNOTATION, CHARTER_SCOPE_ANNOTATION,
+        CHARTER_SOURCE_ANNOTATION, DECLARATION_FILE_ANNOTATION, MANIFEST_MANAGED_BY_VALUE, MANIFEST_PATH_ANNOTATION,
+        MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_REVISION_ANNOTATION, MANIFEST_SOURCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION,
+        PROJECT_IMAGE_MANAGER, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
+        WHOLE_REPOSITORY_PROJECT_MANAGER,
     },
     MANAGED_BY_LABEL, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
 };
@@ -63,6 +65,12 @@ pub enum DefinitionOrigin {
     /// A workflow snapshot admission prepared; its name is content-addressed.
     #[store(code = "sn")]
     Snapshot,
+    /// A Project project operations materialised from a repository's `project.yaml` declaration.
+    #[store(code = "pd")]
+    ProjectDeclaration { repository: String, commit: String, file: String },
+    /// A Project project operations generated for one whole repository.
+    #[store(code = "wr")]
+    WholeRepository,
 }
 
 /// A charter document's provenance: the charter's source and revision, and the `namespace/project`
@@ -128,6 +136,18 @@ pub fn origin(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, 
             entry_path: annotation(SOURCE_ENTRY_PATH_ANNOTATION)?,
         });
     }
+    // A declaration-backed Project stays the declaration's even when a whole-repository label
+    // survives from before its registration, as project operations read it.
+    if annotations.contains_key(BOOTSTRAP_REPOSITORY_ANNOTATION) {
+        return Ok(DefinitionOrigin::ProjectDeclaration {
+            repository: annotation(BOOTSTRAP_REPOSITORY_ANNOTATION)?,
+            commit: annotation(BOOTSTRAP_COMMIT_ANNOTATION)?,
+            file: annotation(DECLARATION_FILE_ANNOTATION)?,
+        });
+    }
+    if managed_by == Some(WHOLE_REPOSITORY_PROJECT_MANAGER) {
+        return Ok(DefinitionOrigin::WholeRepository);
+    }
     Ok(DefinitionOrigin::Operator)
 }
 
@@ -169,6 +189,15 @@ pub fn stamp(origin: &DefinitionOrigin) -> (BTreeMap<String, String>, BTreeMap<S
             pairs(&[(MATERIALIZED_PROJECT_ANNOTATION, project), (SOURCE_COMMIT_ANNOTATION, commit)]),
         ),
         DefinitionOrigin::Snapshot => (pairs(&[(PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND)]), BTreeMap::new()),
+        DefinitionOrigin::ProjectDeclaration { repository, commit, file } => (
+            BTreeMap::new(),
+            pairs(&[
+                (BOOTSTRAP_REPOSITORY_ANNOTATION, repository),
+                (BOOTSTRAP_COMMIT_ANNOTATION, commit),
+                (DECLARATION_FILE_ANNOTATION, file),
+            ]),
+        ),
+        DefinitionOrigin::WholeRepository => (pairs(&[(MANAGED_BY_LABEL, WHOLE_REPOSITORY_PROJECT_MANAGER)]), BTreeMap::new()),
     }
 }
 
@@ -187,7 +216,7 @@ mod tests {
     // definition written with an origin reads back with it through the labels and annotations.
     #[hegel::test]
     fn every_origin_reads_back_from_its_stamps(tc: hegel::TestCase) {
-        let origin = match tc.draw(gs::integers::<u8>().min_value(0).max_value(4)) {
+        let origin = match tc.draw(gs::integers::<u8>().min_value(0).max_value(6)) {
             0 => DefinitionOrigin::Operator,
             1 => DefinitionOrigin::Manifest {
                 root: text(&tc),
@@ -199,6 +228,8 @@ mod tests {
             },
             2 => DefinitionOrigin::ProjectOps { project: text(&tc), repository: text(&tc), commit: text(&tc), entry_path: text(&tc) },
             3 => DefinitionOrigin::ProjectImage { project: text(&tc), commit: text(&tc) },
+            4 => DefinitionOrigin::ProjectDeclaration { repository: text(&tc), commit: text(&tc), file: text(&tc) },
+            5 => DefinitionOrigin::WholeRepository,
             _ => DefinitionOrigin::Snapshot,
         };
         let (labels, annotations) = stamp(&origin);
