@@ -2526,6 +2526,9 @@ impl Aggregator {
                 (host, host.map(HostName::new))
             }
         };
+        // Until the target's Host record replicates, an agentless SSH vessel
+        // briefly reads as its own acting daemon (no cross-host direct reason);
+        // the Host event rebuilds the row.
         let acting = reference
             .and_then(|reference| self.acting_daemon(reference))
             .or_else(|| carried_by.clone())
