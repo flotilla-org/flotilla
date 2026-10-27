@@ -2494,11 +2494,13 @@ dependencies = [
  "flotilla-build-features-sqlite",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-cbor",
  "flotilla-quint-testkit",
  "flotilla-schema",
  "flotilla-schema-sqlite",
  "flotilla-state-machines",
  "rusqlite",
+ "serde",
  "serde_json",
  "tracing",
 ]

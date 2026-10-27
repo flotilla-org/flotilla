@@ -321,25 +321,31 @@ impl S3BlobStore {
             signing_time: None,
         })
     }
+    /// Where the store's objects live, for errors and alerts: endpoint, bucket and prefix.
+    pub fn location(&self) -> String {
+        format!("{}{}/{}", self.endpoint, self.bucket, self.prefix)
+    }
     #[cfg(test)]
-    fn with_signing_time(mut self, time: DateTime<Utc>) -> Self {
+    pub(crate) fn with_signing_time(mut self, time: DateTime<Utc>) -> Self {
         self.signing_time = Some(time);
         self
     }
-    fn object_url(&self, digest: &BlobDigest) -> Result<Url, String> {
+    /// The URL of `key` under the store's prefix. A key is its own canonical path: blob digests
+    /// are hex, and named keys are percent-encoded by their owner ([`S3BlobStore::put_named`]).
+    fn object_url(&self, key: &str) -> Result<Url, String> {
         let mut url = self.endpoint.clone();
         let path = format!(
             "{}/{}/{}{}",
             self.endpoint.path().trim_end_matches('/'),
             self.bucket,
             if self.prefix.is_empty() { String::new() } else { format!("{}/", self.prefix) },
-            digest.0
+            key
         );
         url.set_path(&path);
         Ok(url)
     }
-    fn signed_request(&self, method: reqwest::Method, digest: &BlobDigest, body: Option<&[u8]>) -> Result<reqwest::Request, String> {
-        let url = self.object_url(digest)?;
+    fn signed_request(&self, method: reqwest::Method, key: &str, body: Option<&[u8]>) -> Result<reqwest::Request, String> {
+        let url = self.object_url(key)?;
         let payload_hash = format!("{:x}", Sha256::digest(body.unwrap_or_default()));
         let now = self.signing_time.unwrap_or_else(Utc::now);
         let date = now.format("%Y%m%d").to_string();
@@ -386,7 +392,7 @@ impl S3BlobStore {
         digest: &BlobDigest,
         body: Option<&[u8]>,
     ) -> Result<http::Response<bytes::Bytes>, String> {
-        let request = self.signed_request(method, digest, body)?;
+        let request = self.signed_request(method, digest.as_str(), body)?;
         self.http.execute(request, &ChannelLabel::Http("blob-store".into())).await
     }
     fn check(status: http::StatusCode, expected: &[http::StatusCode]) -> Result<(), String> {
@@ -398,15 +404,44 @@ impl S3BlobStore {
     }
     async fn put_object(&self, bytes: &[u8], media_type: Option<&str>) -> Result<BlobDigest, String> {
         let digest = BlobDigest::of(bytes);
-        let mut request = self.signed_request(reqwest::Method::PUT, &digest, Some(bytes))?;
+        self.put_key(digest.as_str(), bytes, media_type).await?;
+        Ok(digest)
+    }
+    async fn put_key(&self, key: &str, bytes: &[u8], media_type: Option<&str>) -> Result<(), String> {
+        let mut request = self.signed_request(reqwest::Method::PUT, key, Some(bytes))?;
         if let Some(media_type) = media_type {
             request
                 .headers_mut()
                 .insert(reqwest::header::CONTENT_TYPE, media_type.parse().map_err(|error| format!("invalid media type: {error}"))?);
         }
         let response = self.http.execute(request, &ChannelLabel::Http("blob-store".into())).await?;
-        Self::check(response.status(), &[http::StatusCode::OK, http::StatusCode::CREATED])?;
-        Ok(digest)
+        Self::check(response.status(), &[http::StatusCode::OK, http::StatusCode::CREATED])
+    }
+    fn named_key(key: &str) -> Result<&str, String> {
+        let valid = !key.is_empty()
+            && !key.starts_with('/')
+            && !key.contains("//")
+            && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/' | b'%'));
+        if valid {
+            Ok(key)
+        } else {
+            Err(format!("object key {key:?} is not a canonical path"))
+        }
+    }
+    /// Stores `bytes` under a named key beside the content-addressed blobs: the archive's bundles
+    /// (#3939), named by the identity they hold. `key` must already be percent-encoded.
+    pub async fn put_named(&self, key: &str, bytes: &[u8], media_type: &str) -> Result<(), String> {
+        self.put_key(Self::named_key(key)?, bytes, Some(media_type)).await
+    }
+    /// The object stored under a named key, if any.
+    pub async fn get_named(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        let request = self.signed_request(reqwest::Method::GET, Self::named_key(key)?, None)?;
+        let response = self.http.execute(request, &ChannelLabel::Http("blob-store".into())).await?;
+        if response.status() == http::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::check(response.status(), &[http::StatusCode::OK])?;
+        Ok(Some(response.into_body().to_vec()))
     }
 }
 
@@ -465,7 +500,7 @@ impl BlobStore for S3BlobStore {
         Ok(Some(bytes))
     }
     async fn get_file(&self, digest: &BlobDigest, path: &Path) -> Result<Option<u64>, String> {
-        let request = self.signed_request(reqwest::Method::GET, digest, None)?;
+        let request = self.signed_request(reqwest::Method::GET, digest.as_str(), None)?;
         let status = self.http.execute_to_file(request, &ChannelLabel::Http("blob-store".into()), path).await?;
         if status == http::StatusCode::NOT_FOUND {
             return Ok(None);

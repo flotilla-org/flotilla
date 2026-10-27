@@ -234,6 +234,13 @@ impl SocketDaemon {
             other => Err(format!("unexpected artifact list response: {other:?}")),
         }
     }
+    /// One archived engine resource, read from its bundle (#3939).
+    pub async fn archive_read(&self, kind: String, name: String, home: Option<String>) -> Result<serde_json::Value, String> {
+        match into_success_response(self.request(Request::ArchiveRead { kind, name, home }).await?)? {
+            Response::ArchiveRead { resource } => Ok(resource),
+            other => Err(format!("unexpected archive read response: {other:?}")),
+        }
+    }
     /// Connect to a running daemon at the given Unix socket path.
     ///
     /// Requires a bounded, stateful Hello handshake before starting the shared

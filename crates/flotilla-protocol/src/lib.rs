@@ -448,6 +448,13 @@ pub enum Request {
         kind: Option<String>,
         subject: Option<String>,
     },
+    /// Read one archived engine resource from its bundle in the object store (#3939): `kind` by
+    /// name or code, `home` defaulting to the serving daemon's.
+    ArchiveRead {
+        kind: String,
+        name: String,
+        home: Option<String>,
+    },
     Execute {
         command: Command,
     },
@@ -519,6 +526,9 @@ pub enum Response {
     },
     ArtifactList {
         items: Vec<serde_json::Value>,
+    },
+    ArchiveRead {
+        resource: serde_json::Value,
     },
     Execute {
         command_id: u64,

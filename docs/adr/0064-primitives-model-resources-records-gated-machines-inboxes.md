@@ -230,6 +230,8 @@ Lifecycle endings are stored as state data in the kind's table, as one flat enum
 - **The archive is read-only and typed,** with the same derived relational schema. Retention is indefinite by default. Per-kind deletion comes later, terminal recordings first.
 - **Identity** (#3392 G2, as revised by G9). Every host keeps the identity row of each resource it has seen, live, deleted or archived, as a tombstone until the resource is expunged. A host that finds an identity with no current row routes the read to the archive. Expunge alone removes an identity row and its name string.
 
+ADR 0064 archive: bundles (log entries plus end-state snapshot) go to an object store, not an archive host; a queryable archive is rebuilt from bundles when needed.
+
 **Replication.**
 - **One sequence per home.** Its value is a resource's `version`. Each write appends one event to the home's log in home order (#3392 G8), and the stream carries events. Replicas apply each event's effect through the same lowering as the home's own write, append the event to their copy of the home's log, and do not re-run machines. A replica catches up on a resource from its snapshot plus the resource's events after it.
 - **Encoding and liveness.** The stream is CBOR (ADR 0063). Its keepalive is the link-liveness signal.

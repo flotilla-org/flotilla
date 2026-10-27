@@ -11,6 +11,7 @@ use tracing::warn;
 
 use super::{caller::missing_crew_message, client_connection::QuerySubscriptions, remote_commands::RemoteCommandRouter};
 use crate::artifact::{ArtifactBody, ArtifactPutInput, ArtifactService};
+use crate::runtime::archive;
 
 const INTERACTIVE_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -322,6 +323,35 @@ impl<'a> RequestDispatcher<'a> {
         }
     }
 
+    async fn dispatch_request_archive_read(&self, id: u64, request: Request) -> Message {
+        let Request::ArchiveRead { kind, name, home } = request else {
+            return Message::error_response(id, "ArchiveRead request selected the wrong handler");
+        };
+        let result = Box::pin(async {
+            if self.caller.crew.is_some() {
+                return Err(DispatcherError::new(DispatcherErrorClass::Forbidden, "archive reads are for operators"));
+            }
+            if !self.authenticated_user {
+                self.daemon.principal_for_surface(self.session_id)?.ok_or_else(|| {
+                    DispatcherError::new(DispatcherErrorClass::Forbidden, "archive read requires a connected operator principal")
+                })?;
+            }
+            let registry = crate::runtime::decided_registry().map_err(|error| format!("decided store registry: {error:?}"))?;
+            let targets = archive::targets(&self.daemon.config_store().load_daemon_config()?.blob_stores)?;
+            let home = home.unwrap_or_else(|| self.daemon.node_id().as_str().to_owned());
+            match archive::read_by_name(&targets, &registry, &kind, &name, &home).await {
+                Ok(Some(resource)) => Ok(Response::ArchiveRead { resource }),
+                Ok(None) => Err(DispatcherError::new(DispatcherErrorClass::Missing, format!("no archived {kind} {name} homed at {home}"))),
+                Err(error) => Err(DispatcherError::from(error)),
+            }
+        })
+        .await;
+        match result {
+            Ok(response) => Message::ok_response(id, response),
+            Err(error) => Message::error_response(id, error),
+        }
+    }
+
     async fn dispatch_request_execute(&self, id: u64, request: Request) -> Message {
         let Request::Execute { command } = request else {
             return Message::error_response(id, "Execute request selected the wrong handler");
@@ -526,6 +556,7 @@ impl<'a> RequestDispatcher<'a> {
             request @ Request::ArtifactPut { .. } => Box::pin(self.dispatch_request_artifact_put(id, request)).await,
             request @ Request::ArtifactGet { .. } => Box::pin(self.dispatch_request_artifact_get(id, request)).await,
             request @ Request::ArtifactList { .. } => Box::pin(self.dispatch_request_artifact_list(id, request)).await,
+            request @ Request::ArchiveRead { .. } => Box::pin(self.dispatch_request_archive_read(id, request)).await,
             request @ Request::Execute { .. } => Box::pin(self.dispatch_request_execute(id, request)).await,
             request @ Request::Cancel { .. } => Box::pin(self.dispatch_request_cancel(id, request)).await,
             request @ Request::Refresh { .. } => Box::pin(self.dispatch_request_refresh(id, request)).await,
