@@ -238,6 +238,13 @@ pub enum RepositoryRead<'a> {
 #[async_trait]
 pub trait CheckoutVcsResolver: Send + Sync {
     async fn vcs_for(&self, environment: Option<&flotilla_protocol::EnvironmentId>, path: &Path) -> Result<Arc<dyn Vcs>, String>;
+
+    /// Resolve the VCS in the environment a resource's `env_ref` names. The
+    /// default treats `env_ref` as an environment id; resolvers that map
+    /// `env_ref` differently override it, and an unknown one should be an error.
+    async fn vcs_for_env_ref(&self, env_ref: &str, path: &Path) -> Result<Arc<dyn Vcs>, String> {
+        self.vcs_for(Some(&flotilla_protocol::EnvironmentId::new(env_ref)), path).await
+    }
 }
 
 pub struct FixedVcsResolver(pub Arc<dyn Vcs>);
