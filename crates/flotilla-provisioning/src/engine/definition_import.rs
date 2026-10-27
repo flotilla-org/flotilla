@@ -25,22 +25,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_engine_store::Rehearsal;
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
-    builtins::is_builtin,
-    definition_provenance::{
-        CHARTER_REVISION_ANNOTATION, CHARTER_SCOPE_ANNOTATION, CHARTER_SOURCE_ANNOTATION, MANIFEST_MANAGED_BY_VALUE,
-        MANIFEST_PATH_ANNOTATION, MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_REVISION_ANNOTATION, MANIFEST_SOURCE_ANNOTATION,
-        MATERIALIZED_PROJECT_ANNOTATION, PROJECT_IMAGE_MANAGER, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
-        SOURCE_REPOSITORY_ANNOTATION,
-    },
-    CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec, ObjectMeta, Resource,
-    ResourceObject, WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
+    builtins::is_builtin, definitions::declares, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer,
+    ImageLayerResourceSpec, ObjectMeta, Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use flotilla_schema::Kind;
 use flotilla_store::{definition_is_live, merge_definition_copies};
 
 use super::import::{ImportRefusal, ImportReport};
 use crate::stored::definition::{
-    self as stored, CharterOrigin, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, DefinitionOrigin,
+    self as stored, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, DefinitionOrigin,
     FleetDesignationDefinition, ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
 };
 
@@ -185,7 +178,8 @@ where
             continue;
         }
         let live: Vec<_> = copies.iter().copied().filter(|copy| copy.object.metadata.deletion_timestamp.is_none()).collect();
-        let declaring: Vec<_> = live.iter().copied().filter(|copy| declares(&copy.object.metadata)).collect();
+        let declaring: Vec<_> =
+            live.iter().copied().filter(|copy| declares(&copy.object.metadata.labels, &copy.object.metadata.annotations)).collect();
         let homes = if declaring.is_empty() {
             // An undeclared name stays with the home that created it.
             live.iter()
@@ -310,60 +304,8 @@ pub fn label(origin: &DefinitionOrigin) -> &'static str {
     }
 }
 
-/// Whether a copy's own metadata says a manifest declares it. Project operations also stamp the
-/// reconciler root on what they materialise from an ops root, but never a manifest source: a copy
-/// with a source entry path and no manifest source is project ops'.
-fn declares(meta: &ObjectMeta) -> bool {
-    let project_ops =
-        meta.annotations.contains_key(SOURCE_ENTRY_PATH_ANNOTATION) && !meta.annotations.contains_key(MANIFEST_SOURCE_ANNOTATION);
-    meta.labels.get(MANAGED_BY_LABEL).is_some_and(|value| value == MANIFEST_MANAGED_BY_VALUE)
-        || (meta.annotations.contains_key(MANIFEST_RECONCILER_ROOT_ANNOTATION) && !project_ops)
-}
-
-/// The origin a copy's writer stamped on it. A copy naming an origin without all of its fields
-/// is refused with the missing key named.
+/// The origin a copy's writer stamped on it: [`flotilla_resources::definitions::origin`], which
+/// the write path reads too.
 pub fn origin(meta: &ObjectMeta) -> Result<DefinitionOrigin, String> {
-    let annotation = |key: &str| meta.annotations.get(key).cloned().ok_or_else(|| format!("no `{key}` annotation"));
-    let managed_by = meta.labels.get(MANAGED_BY_LABEL).map(String::as_str);
-    // Precedence: admission alone writes a snapshot, under a content-addressed name no manifest
-    // declares, so the snapshot label is read first; then a project image, a manifest and project ops.
-    if meta.labels.get(PREPARED_SNAPSHOT_LABEL).is_some_and(|value| value == WORKFLOW_SNAPSHOT_KIND) {
-        return Ok(DefinitionOrigin::Snapshot);
-    }
-    if managed_by == Some(PROJECT_IMAGE_MANAGER) {
-        return Ok(DefinitionOrigin::ProjectImage {
-            project: annotation(MATERIALIZED_PROJECT_ANNOTATION)?,
-            commit: annotation(SOURCE_COMMIT_ANNOTATION)?,
-        });
-    }
-    if declares(meta) {
-        let charter = [CHARTER_SOURCE_ANNOTATION, CHARTER_REVISION_ANNOTATION, CHARTER_SCOPE_ANNOTATION]
-            .iter()
-            .any(|key| meta.annotations.contains_key(*key))
-            .then(|| {
-                Ok::<_, String>(CharterOrigin {
-                    source: annotation(CHARTER_SOURCE_ANNOTATION)?,
-                    revision: annotation(CHARTER_REVISION_ANNOTATION)?,
-                    scope: annotation(CHARTER_SCOPE_ANNOTATION)?,
-                })
-            })
-            .transpose()?;
-        return Ok(DefinitionOrigin::Manifest {
-            root: annotation(MANIFEST_RECONCILER_ROOT_ANNOTATION)?,
-            source: annotation(MANIFEST_SOURCE_ANNOTATION)?,
-            path: annotation(MANIFEST_PATH_ANNOTATION)?,
-            revision: annotation(MANIFEST_REVISION_ANNOTATION)?,
-            charter,
-            materialized_project: meta.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).cloned(),
-        });
-    }
-    if meta.annotations.contains_key(MATERIALIZED_PROJECT_ANNOTATION) {
-        return Ok(DefinitionOrigin::ProjectOps {
-            project: annotation(MATERIALIZED_PROJECT_ANNOTATION)?,
-            repository: annotation(SOURCE_REPOSITORY_ANNOTATION)?,
-            commit: annotation(SOURCE_COMMIT_ANNOTATION)?,
-            entry_path: annotation(SOURCE_ENTRY_PATH_ANNOTATION)?,
-        });
-    }
-    Ok(DefinitionOrigin::Operator)
+    flotilla_resources::definitions::origin(&meta.labels, &meta.annotations)
 }

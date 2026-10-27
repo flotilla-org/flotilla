@@ -21,49 +21,8 @@ use flotilla_resources::{
     RepositoryTrust, RoleDefinition, WorkflowTemplateSpec,
 };
 use flotilla_schema::{Frozen, KindRegistry, RegistryError, Stored};
-use serde::{Deserialize, Serialize};
 
-/// Where a definition came from: the one writer that declared it, with what that writer needs to
-/// find its own definitions again. It replaces the provenance labels and annotations.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
-pub enum DefinitionOrigin {
-    /// Applied by an operator (`resource apply`, `workflow-template apply`), declared by no source.
-    #[store(code = "op")]
-    Operator,
-    /// Declared by a document of a manifest tree, applied by its ManifestRoot's reconciler.
-    #[store(code = "mf")]
-    Manifest {
-        /// The ManifestRoot whose reconciler applies it.
-        root: String,
-        /// The tree's source and the document's path and revision in it.
-        source: String,
-        path: String,
-        revision: String,
-        /// A charter document's source, revision and delegated scope.
-        #[store(flatten)]
-        charter: Option<CharterOrigin>,
-        /// The project a charter operational entry materialises its workflow for.
-        materialized_project: Option<String>,
-    },
-    /// Materialised by project operations from an operational entry in a project's repository.
-    #[store(code = "po")]
-    ProjectOps { project: String, repository: String, commit: String, entry_path: String },
-    /// A project's image layer, read from its primary repository's `.flotilla/image/`.
-    #[store(code = "pi")]
-    ProjectImage { project: String, commit: String },
-    /// A workflow snapshot admission prepared; its name is content-addressed.
-    #[store(code = "sn")]
-    Snapshot,
-}
-
-/// A charter document's provenance: the charter's source and revision, and the `namespace/project`
-/// scope it was delegated.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
-pub struct CharterOrigin {
-    pub source: String,
-    pub revision: String,
-    pub scope: String,
-}
+pub use flotilla_resources::definitions::{CharterOrigin, DefinitionOrigin};
 
 /// A Forge, as the engine stores it: kind code `fo`.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]

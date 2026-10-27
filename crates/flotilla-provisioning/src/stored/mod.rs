@@ -85,6 +85,7 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     registry.register::<Resource<terminal_session::TerminalSession>>()?;
     account::register(registry)?;
     manifest_root::register(registry)?;
+    definition::register(registry)?;
     Ok(())
 }
 

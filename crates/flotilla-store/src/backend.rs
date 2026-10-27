@@ -28,39 +28,59 @@ macro_rules! dispatch_backend {
     };
 }
 
+/// The engine's definition records, once installed: shared by every handle cloned or derived from
+/// one backend (#3824 layer 2b-ii).
+type DefinitionSlot = std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<dyn flotilla_resources::definitions::DefinitionRecords>>>>;
+
 /// Cloneable handle chosen by the composition root.
 #[derive(Debug, Clone)]
-pub struct ResourceBackend(std::sync::Arc<dyn crate::Store>);
+pub struct ResourceBackend {
+    store: std::sync::Arc<dyn crate::Store>,
+    definitions: DefinitionSlot,
+}
 impl ResourceBackend {
     pub fn new(store: impl Into<Self>) -> Self {
         store.into()
     }
     pub fn from_arc(store: std::sync::Arc<dyn crate::Store>) -> Self {
-        Self(store)
+        Self { store, definitions: DefinitionSlot::default() }
+    }
+    /// Serves the declared definition kinds from `records`, the engine's, behind `[primitives]`:
+    /// every handle cloned or derived from this backend reads and writes them there. A daemon
+    /// runtime restarted over the same backend installs its reopened records in place of the last.
+    pub fn install_definition_records(&self, records: std::sync::Arc<dyn flotilla_resources::definitions::DefinitionRecords>) {
+        *self.definitions.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(records);
+    }
+    /// The engine's records for `kind`, when installed and `kind` is a declared definition kind.
+    pub(crate) fn definition_records(&self, kind: &str) -> Option<std::sync::Arc<dyn flotilla_resources::definitions::DefinitionRecords>> {
+        if !flotilla_resources::definitions::is_definition_kind(kind) {
+            return None;
+        }
+        self.definitions.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
     pub fn store(&self) -> &dyn crate::Store {
-        &*self.0
+        &*self.store
     }
     pub fn with_read_observer(self, observer: std::sync::Arc<dyn crate::ReadObserver>) -> Self {
-        Self(self.0.with_read_observer(observer))
+        Self { store: self.store.with_read_observer(observer), definitions: self.definitions.clone() }
     }
     pub fn read_observer(&self) -> Option<&dyn crate::ReadObserver> {
-        self.0.read_observer()
+        self.store.read_observer()
     }
     pub(crate) async fn hierarchy_admission(&self, kind: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         if !crate::project_hierarchy::is_hierarchy_kind(kind) {
             return None;
         }
-        Some(self.0.hierarchy_admission()?.lock_owned().await)
+        Some(self.store.hierarchy_admission()?.lock_owned().await)
     }
     pub fn with_local_root(self, root: NodeId) -> Self {
-        Self(self.0.with_local_root(root))
+        Self { store: self.store.with_local_root(root), definitions: self.definitions.clone() }
     }
     pub fn local_root(&self) -> Result<NodeId, ResourceError> {
-        self.0.local_root()
+        self.store.local_root()
     }
     pub fn serves_read_views(&self) -> bool {
-        self.0.serves_read_views()
+        self.store.serves_read_views()
     }
     pub fn using<T: Resource>(&self, namespace: &str) -> TypedResolver<T> {
         TypedResolver { backend: self.clone(), namespace: namespace.to_string(), lifecycle_status_reads: None, _marker: PhantomData }
@@ -93,13 +113,13 @@ impl ResourceBackend {
     }
 
     pub async fn diagnostics(&self) -> Result<Option<ResourceStoreDiagnostics>, ResourceError> {
-        self.0.diagnostics().await
+        self.store.diagnostics().await
     }
     pub(crate) async fn delete_decode_quarantine<T: Resource>(&self, namespace: &str, name: &str) -> Result<bool, ResourceError> {
-        self.0.delete_decode_quarantine_typed::<T>(namespace, name).await
+        self.store.delete_decode_quarantine_typed::<T>(namespace, name).await
     }
     async fn record_field_ownership_violation(&self, violation: FieldOwnershipViolation) -> Result<(), ResourceError> {
-        self.0.record_field_ownership_violation(violation).await
+        self.store.record_field_ownership_violation(violation).await
     }
 }
 
@@ -271,6 +291,9 @@ impl<T: Resource> ReplicaReadResolver<T> {
 
     pub(crate) async fn list_sources(&self) -> Result<ReadResourceList<T>, ResourceError> {
         ensure_replication_enabled::<T>()?;
+        if let Some(reads) = self.backend.definitions::<T>(&self.namespace).engine_reads().await {
+            return reads.map(|items| ReadResourceList { items });
+        }
         if self.backend.serves_read_views() {
             return Err(ResourceError::invalid("HTTP replica-source lists use the resource API"));
         }
@@ -309,6 +332,10 @@ impl<T: Resource> ReplicaReadResolver<T> {
 
     pub async fn watch(&self) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
         ensure_replication_enabled::<T>()?;
+        if let Some(watch) = self.backend.definitions::<T>(&self.namespace).engine_watch().await {
+            // The engine's records stream their changes; the current ones are read by `list`.
+            return watch.map(|(_, stream)| stream);
+        }
         if self.backend.serves_read_views() {
             let backend = &self.backend;
             return backend.watch_including_replicas_typed::<T>(&self.namespace).await;
@@ -577,7 +604,26 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn get(&self, name: &str) -> Result<ResourceObject<T>, ResourceError> {
+        if let Some(local) = self.engine_local().await {
+            return local?.into_iter().find(|object| object.metadata.name == name).ok_or_else(|| ResourceError::not_found(name));
+        }
         dispatch_backend!(self, get_typed, name)
+    }
+
+    /// This home's own records of an engine-served definition kind (#3824 layer 2b-ii), as the
+    /// old store's local rows: no built-ins and no other home's records.
+    async fn engine_local(&self) -> Option<Result<Vec<ResourceObject<T>>, ResourceError>> {
+        let reads = self.backend.definitions::<T>(&self.namespace).engine_reads().await?;
+        Some(reads.map(|reads| {
+            reads
+                .into_iter()
+                .filter(|read| {
+                    matches!(read.provenance, ResourceProvenance::Local)
+                        && !flotilla_resources::builtins::is_builtin(T::API_PATHS.kind, &read.object.metadata.name)
+                })
+                .map(|read| read.object)
+                .collect()
+        }))
     }
 
     /// Read the local collection's list/watch position without decoding objects.
@@ -592,10 +638,20 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn list(&self) -> Result<ResourceList<T>, ResourceError> {
+        if let Some(local) = self.engine_local().await {
+            return Ok(ResourceList { items: local?, resource_version: String::new(), generation: None });
+        }
         dispatch_backend!(self, list_typed)
     }
 
     pub async fn list_matching_labels(&self, required: &BTreeMap<String, String>) -> Result<ResourceList<T>, ResourceError> {
+        if let Some(local) = self.engine_local().await {
+            let items = local?
+                .into_iter()
+                .filter(|object| required.iter().all(|(key, value)| object.metadata.labels.get(key) == Some(value)))
+                .collect();
+            return Ok(ResourceList { items, resource_version: String::new(), generation: None });
+        }
         dispatch_backend!(self, list_typed_matching_labels, required)
     }
 
@@ -661,6 +717,20 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
+        if let Some(watch) = self.backend.definitions::<T>(&self.namespace).engine_watch().await {
+            // An engine-served kind streams every home's changes; there is no position to resume
+            // from, so a watcher lists again on each start.
+            let (_, stream) = watch?;
+            let events = stream.map(|event| {
+                event.map(|event| match event {
+                    ReadWatchEvent::Added(read) => crate::WatchEvent::Added(read.object),
+                    ReadWatchEvent::Modified(read) => crate::WatchEvent::Modified(read.object),
+                    ReadWatchEvent::Deleted(read) => crate::WatchEvent::Deleted(read.object),
+                    ReadWatchEvent::DeletedByName { tombstone, .. } => crate::WatchEvent::DeletedByName(tombstone),
+                })
+            });
+            return Ok(WatchStream::new(None, events.boxed()));
+        }
         dispatch_backend!(self, watch_typed, start)
     }
 }
@@ -736,12 +806,12 @@ impl<T: Resource> TypedResolver<T> {
 impl std::ops::Deref for ResourceBackend {
     type Target = dyn crate::Store;
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        &*self.store
     }
 }
 
 impl<S: crate::Store + 'static> From<S> for ResourceBackend {
     fn from(store: S) -> Self {
-        Self(std::sync::Arc::new(store))
+        Self::from_arc(std::sync::Arc::new(store))
     }
 }
