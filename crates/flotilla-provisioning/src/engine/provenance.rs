@@ -55,18 +55,26 @@ const INLINE_CHARTER: &str = "inline charter ";
 
 /// The repository a charter source names, by its key: `{repo}@{branch}:{path}`, as charter
 /// delegation writes a repository pointer's. A branch holds no `:` (git refuses one), so the path
-/// follows the last `:`, and the repository precedes the `@` before it. Only a remote URL names a
-/// key here: an ssh remote's needs its host resolved, which a store read cannot do. An inline
-/// charter's source names no repository; another source that names none is warned of, since its
-/// change then holds the root's revision alone.
+/// follows the last `:`. Only a remote URL names a key here (an ssh remote's needs its host
+/// resolved, which a store read cannot do), and a remote URL's path holds no `@`, so the repository
+/// ends at the first `@` after its authority: a branch may hold `@`, a repository path may not. An
+/// inline charter's source names no repository; another source that names none is warned of, since
+/// its change then holds the root's revision alone.
 fn charter_repository(source: &str) -> Option<RepositoryKey> {
     if source.starts_with(INLINE_CHARTER) {
         return None;
     }
     let repository = source
         .rsplit_once(':')
-        .and_then(|(pointer, _)| pointer.rsplit_once('@'))
-        .and_then(|(repo, _)| RepositorySpec::remote(repo).ok())
+        .and_then(|(pointer, _)| {
+            // The path starts at the first `/` after the scheme's `://`; the authority before it
+            // may hold a user's `@`.
+            let authority = pointer.find("://").map_or(0, |scheme| scheme + 3);
+            let path = authority + pointer[authority..].find('/')?;
+            let separator = path + pointer[path..].find('@')?;
+            Some(&pointer[..separator])
+        })
+        .and_then(|repo| RepositorySpec::remote(repo).ok())
         .map(|spec| spec.key());
     if repository.is_none() {
         tracing::warn!(%source, "a charter source names no repository; its change holds the root's revision alone");
@@ -224,7 +232,8 @@ mod tests {
         for (source, repo) in [
             ("https://example.test/app-ops@reviewed:charter", "https://example.test/app-ops"),
             ("https://example.test/app-ops@main:", "https://example.test/app-ops"),
-            ("https://example.test/app-ops@release/2026@q4:charter", "https://example.test/app-ops@release/2026"),
+            ("https://example.test/app-ops@release/2026@q4:charter", "https://example.test/app-ops"),
+            ("https://bot@example.test/app-ops@main:charter", "https://bot@example.test/app-ops"),
         ] {
             assert_eq!(charter_repository(source), Some(key(repo)), "{source}");
         }
