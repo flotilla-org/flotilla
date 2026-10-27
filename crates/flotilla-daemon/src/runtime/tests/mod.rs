@@ -86,12 +86,12 @@ use flotilla_resources::{
     DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch,
     Forge, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch, InputMeta, LifecycleAuthority,
-    ManifestRoot, ModelProbeState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
-    PlacementStatus, Project, Repository, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceError, ResourceList, Selector,
-    StatusPatch, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, VesselRequirement, VesselSpec, VesselStatus, WorkPhase,
-    WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ENV,
-    CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
+    ModelProbeState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, PlacementStatus, Project,
+    Repository, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceError, ResourceList, Selector, StatusPatch,
+    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState,
+    WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV,
+    MANAGED_BY_LABEL,
 };
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},

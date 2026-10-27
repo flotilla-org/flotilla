@@ -84,6 +84,7 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     register_provisioning(registry)?;
     registry.register::<Resource<terminal_session::TerminalSession>>()?;
     account::register(registry)?;
+    manifest_root::register(registry)?;
     Ok(())
 }
 
@@ -111,6 +112,7 @@ pub fn diagrams() -> BTreeMap<String, String> {
         diagram::<checkout::Checkout>(),
         diagram::<terminal_session::TerminalSession>(),
         diagram::<account::AccountBinding>(),
+        diagram::<manifest_root::ManifestRoot>(),
     ])
 }
 

@@ -312,6 +312,7 @@ mod tests {
         subscriptions: super::super::projection_ports::LeafSubscriptionDiagnostics,
         fleet: FleetService,
         accounts: flotilla_store::OldStoreAccounts,
+        manifest_roots: flotilla_store::OldStoreManifestRoots,
     }
 
     #[async_trait]
@@ -365,6 +366,7 @@ mod tests {
             ));
             let fleet = FleetService::new(AggregatorProjectionState::new(), host_name.clone(), None);
             let accounts = flotilla_store::OldStoreAccounts::new(backend.clone());
+            let manifest_roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
             Self {
                 temp,
                 backend,
@@ -377,6 +379,7 @@ mod tests {
                 subscriptions,
                 fleet,
                 accounts,
+                manifest_roots,
             }
         }
 
@@ -395,6 +398,7 @@ mod tests {
                 lifecycles: &flotilla_projections::ports::NoLifecycleReads,
                 convoy_engine: &NO_CONVOY_ENGINE,
                 accounts: &self.accounts,
+                manifest_roots: &self.manifest_roots,
             }
         }
 

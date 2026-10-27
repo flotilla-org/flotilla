@@ -16,13 +16,13 @@ use std::{
 
 use flotilla_charter::charter_store::read_charter_source;
 use flotilla_resources::{
-    CharterSource, ControllerRetry, DocumentKey, DocumentPhase, DocumentState, EventRegarding, InputMeta, LeafMaker, ManifestRoot,
-    ManifestRootSpec, ManifestRootStatus, ObjectEvent, ResolutionAction, ResolutionOutcome, ResourceError, RetryCeiling,
-    StallEvidenceSource, StallRung, StalledCondition, MANAGED_BY_LABEL,
+    manifest_roots::{ManifestRoots, PassReport, RootDeclaration, RootView},
+    CharterSource, DocumentKey, DocumentPhase, DocumentState, EventRegarding, ManifestRootSpec, ObjectEvent, ResolutionAction,
+    ResolutionOutcome, ResourceError, MANAGED_BY_LABEL,
 };
 use flotilla_store::{
     apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, validate_resource_document, EventRecorder,
-    ResourceBackend,
+    OldStoreManifestRoots, ResourceBackend,
 };
 use flotilla_vcs::vcs::Vcs;
 use serde::Deserialize;
@@ -94,6 +94,7 @@ pub struct ManifestPassReport {
 
 pub struct ResourceManifestReconciler {
     backend: ResourceBackend,
+    roots: Arc<dyn ManifestRoots>,
     default_namespace: String,
     root: PathBuf,
     source: String,
@@ -117,68 +118,44 @@ pub(crate) fn manifest_root_name(host: &str, path: &Path, source: &str) -> Strin
     format!("manifest-{}", digest[..8].iter().map(|byte| format!("{byte:02x}")).collect::<String>())
 }
 
+/// Declares this host's root for `path` and `source` through `roots`, refusing a root of that name
+/// another host or source declares.
 pub(crate) async fn materialize_manifest_root(
-    backend: &ResourceBackend,
+    roots: &dyn ManifestRoots,
     namespace: &str,
     path: &Path,
     source: &str,
     host: &str,
-) -> Result<flotilla_resources::ResourceObject<ManifestRoot>, String> {
-    let roots = backend.using::<ManifestRoot>(namespace);
-    let name = manifest_root_name(host, path, source);
-    match roots.get(&name).await {
-        Ok(root) => {
-            if root.spec.host != host {
-                return Err(format!("ManifestRoot {name} belongs to another host"));
-            }
-            if root.spec.path != path.to_string_lossy() || root.spec.source != source {
-                return Err(format!("ManifestRoot {name} has a conflicting declaration"));
-            }
-            Ok(root)
-        }
-        Err(ResourceError::NotFound { .. }) => {
-            let spec = ManifestRootSpec {
-                binding: None,
-                host: host.to_string(),
-                path: path.to_string_lossy().into_owned(),
-                source: source.to_string(),
-                suspended: Default::default(),
-                resolutions: Default::default(),
-            };
-            roots
-                .create(&InputMeta::builder().name(name).build(), &spec)
-                .await
-                .map_err(|error| format!("materialize ManifestRoot: {error}"))
-        }
-        Err(error) => Err(format!("read ManifestRoot: {error}")),
-    }
+    binding: Option<CharterSource>,
+) -> Result<RootView, String> {
+    let declaration = RootDeclaration {
+        host: host.to_string(),
+        path: path.to_string_lossy().into_owned(),
+        source: source.to_string(),
+        binding,
+        ops: false,
+    };
+    roots.declare(namespace, &manifest_root_name(host, path, source), declaration).await
 }
 
 pub(crate) async fn materialize_bound_manifest_root(
-    backend: &ResourceBackend,
+    roots: &dyn ManifestRoots,
     namespace: &str,
     config: &flotilla_config::ResourceManifestsConfig,
 ) -> Result<(), String> {
     if let Some(binding) = &config.binding {
         binding.validate()?;
     }
-    let root = materialize_manifest_root(backend, namespace, &config.dir, &config.source, &config.reconciler_root).await?;
-    if root.spec.binding != config.binding {
-        let mut spec = root.spec.clone();
-        spec.binding.clone_from(&config.binding);
-        backend
-            .using::<ManifestRoot>(namespace)
-            .update(&InputMeta::from(&root.metadata), &root.metadata.resource_version, &spec)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
+    materialize_manifest_root(roots, namespace, &config.dir, &config.source, &config.reconciler_root, config.binding.clone())
+        .await
+        .map(drop)
 }
 
 impl ResourceManifestReconciler {
     pub(crate) fn new(backend: ResourceBackend, default_namespace: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         Self {
             events: EventRecorder::new(backend.clone()),
+            roots: Arc::new(OldStoreManifestRoots::new(backend.clone())),
             backend,
             default_namespace: default_namespace.into(),
             root: root.into(),
@@ -208,6 +185,13 @@ impl ResourceManifestReconciler {
         self
     }
 
+    /// Reads and writes this reconciler's root through `roots` (the daemon's: the engine's behind
+    /// `[primitives]`) rather than the old store's.
+    pub fn with_roots(mut self, roots: Arc<dyn ManifestRoots>) -> Self {
+        self.roots = roots;
+        self
+    }
+
     pub fn with_vcs(mut self, vcs: Arc<dyn Vcs>) -> Self {
         self.vcs = Some(vcs);
         self
@@ -224,7 +208,9 @@ impl ResourceManifestReconciler {
         loop {
             // A deleted declaration is restored by the daemon materializer on
             // the next supervised start, not by the status-only reconciler.
-            self.backend.using::<ManifestRoot>(&self.default_namespace).get(&self.root_name()).await?;
+            if self.roots.root(&self.default_namespace, &self.root_name()).await.map_err(ResourceError::other)?.is_none() {
+                return Err(ResourceError::not_found(format!("ManifestRoot {}", self.root_name())));
+            }
             let report = match self.reconcile_once().await {
                 Ok(report) => {
                     if let Some(previous) = last_root_error.take() {
@@ -263,7 +249,7 @@ impl ResourceManifestReconciler {
     #[cfg(test)]
     async fn reconcile_once_for_test(&mut self) -> Result<ManifestPassReport, String> {
         materialize_bound_manifest_root(
-            &self.backend,
+            &*self.roots,
             &self.default_namespace,
             &flotilla_config::ResourceManifestsConfig {
                 binding: self.binding.clone(),
@@ -274,68 +260,6 @@ impl ResourceManifestReconciler {
         )
         .await?;
         self.reconcile_once().await
-    }
-
-    async fn publish_status(&self, status: ManifestRootStatus) -> Result<(), String> {
-        let roots = self.backend.using::<ManifestRoot>(&self.default_namespace);
-        let root_name = self.root_name();
-        for _ in 0..3 {
-            let current = roots.get(&root_name).await.map_err(|error| error.to_string())?;
-            if current.status.as_ref() == Some(&status) {
-                return Ok(());
-            }
-            let mut status = status.clone();
-            if let Some(current_status) = &current.status {
-                for (key, state) in &mut status.documents {
-                    if let Some(current_state) = current_status.documents.get(key) {
-                        // A concurrent pass may have claimed the current token
-                        // after this pass read status. Preserve that claim unless
-                        // this pass has its own terminal result for the token.
-                        let current_token = current.spec.resolutions.get(key).map(|resolution| resolution.token.as_str());
-                        if current_token.is_some()
-                            && current_state.resolved_token.as_deref() == current_token
-                            && (state.resolved_token != current_state.resolved_token
-                                || state.resolution_outcome == Some(ResolutionOutcome::Started)
-                                || state.resolution_outcome.is_none())
-                        {
-                            state.resolved_token.clone_from(&current_state.resolved_token);
-                            state.resolution_outcome.clone_from(&current_state.resolution_outcome);
-                        }
-                    }
-                }
-            }
-            match roots.update_status(&root_name, &current.metadata.resource_version, &status).await {
-                Ok(_) => return Ok(()),
-                Err(ResourceError::Conflict { .. }) => continue,
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        Err("ManifestRoot status conflict retry budget exhausted".to_string())
-    }
-
-    async fn claim_resolution(&self, key: &DocumentKey, token: &str, previous: Option<&DocumentState>) -> Result<bool, String> {
-        let roots = self.backend.using::<ManifestRoot>(&self.default_namespace);
-        let root_name = self.root_name();
-        for _ in 0..3 {
-            let root = roots.get(&root_name).await.map_err(|error| error.to_string())?;
-            if root.spec.resolutions.get(key).map(|resolution| resolution.token.as_str()) != Some(token) {
-                return Ok(false);
-            }
-            let mut status = root.status.unwrap_or_default();
-            if status.documents.get(key).and_then(|state| state.resolved_token.as_deref()) == Some(token) {
-                return Ok(false);
-            }
-            let mut state = previous.cloned().unwrap_or_else(|| document_state(DocumentPhase::Refused, None, None, None, None, None));
-            state.resolved_token = Some(token.to_string());
-            state.resolution_outcome = Some(ResolutionOutcome::Started);
-            status.documents.insert(key.clone(), state);
-            match roots.update_status(&root_name, &root.metadata.resource_version, &status).await {
-                Ok(_) => return Ok(true),
-                Err(ResourceError::Conflict { .. }) => continue,
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        Err("ManifestRoot resolution claim conflict retry budget exhausted".to_string())
     }
 
     pub async fn reconcile_once(&mut self) -> Result<ManifestPassReport, String> {
@@ -365,16 +289,16 @@ impl ResourceManifestReconciler {
 
     async fn reconcile_pass(&mut self) -> Result<ManifestPassReport, String> {
         let root_resource = self
-            .backend
-            .using::<ManifestRoot>(&self.default_namespace)
-            .get(&self.root_name())
+            .roots
+            .root(&self.default_namespace, &self.root_name())
             .await
-            .map_err(|error| format!("read ManifestRoot: {error}"))?;
+            .map_err(|error| format!("read ManifestRoot: {error}"))?
+            .ok_or_else(|| format!("read ManifestRoot: {} is not declared", self.root_name()))?;
         let inputs = self.load_inputs().await;
         let (revision, mut files) = match inputs {
             Ok(inputs) => inputs,
             Err(error) => {
-                self.publish_source_failure(&root_resource, &error).await?;
+                self.publish_source_failure(&error).await?;
                 return Err(error);
             }
         };
@@ -395,7 +319,7 @@ impl ResourceManifestReconciler {
             }
             Ok(None) => false,
             Err(error) => {
-                self.publish_source_failure(&root_resource, &error).await?;
+                self.publish_source_failure(&error).await?;
                 return Err(error);
             }
         };
@@ -417,7 +341,7 @@ impl ResourceManifestReconciler {
                                     self.root_name(),
                                     path.display()
                                 );
-                                self.publish_source_failure(&root_resource, &error).await?;
+                                self.publish_source_failure(&error).await?;
                                 return Err(error);
                             }
                         }
@@ -442,7 +366,7 @@ impl ResourceManifestReconciler {
                 Ok::<_, String>(())
             });
             if let Err(error) = validation {
-                self.publish_source_failure(&root_resource, &error).await?;
+                self.publish_source_failure(&error).await?;
                 return Err(error);
             }
         }
@@ -459,8 +383,7 @@ impl ResourceManifestReconciler {
                 .collect::<BTreeSet<_>>()
         });
         let mut report = ManifestPassReport::default();
-        let mut status = root_resource.status.clone().unwrap_or_default();
-        let previous = status.documents.clone();
+        let previous = root_resource.status.documents.clone();
         let mut documents = BTreeMap::new();
         for (path, parsed) in files {
             let relative = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
@@ -473,7 +396,7 @@ impl ResourceManifestReconciler {
                         namespace: String::new(),
                         name: String::new(),
                     };
-                    let state = document_state(DocumentPhase::Refused, Some(reason.clone()), None, None, None, previous.get(&key));
+                    let state = refused_state(reason.clone(), previous.get(&key));
                     documents.insert(key, state);
                     report.errors.push(ManifestDocumentError { path: relative, reason });
                     continue;
@@ -518,7 +441,7 @@ impl ResourceManifestReconciler {
                         documents.insert(key, state);
                     }
                     Err(reason) => {
-                        let state = document_state(DocumentPhase::Refused, Some(reason.clone()), None, None, None, previous.get(&key));
+                        let state = refused_state(reason.clone(), previous.get(&key));
                         documents.insert(key, state);
                         let path =
                             if index == 0 { relative.clone() } else { PathBuf::from(format!("{}#{}", relative.display(), index + 1)) };
@@ -527,54 +450,14 @@ impl ResourceManifestReconciler {
                 }
             }
         }
-        status.documents = documents;
-        status.source_error = None;
         if let Some(desired) = &charter_layers {
             self.prune_charter_image_layers(desired).await?;
         }
-        if report.errors.is_empty() && status.documents.values().all(|state| state.phase == DocumentPhase::Applied) {
-            status.applied_revision = Some(revision);
-        }
-        let refusals = status
-            .documents
-            .iter()
-            .filter(|(_, state)| state.phase == DocumentPhase::Refused)
-            .map(|(key, state)| format!("{}: {}", key.path, state.reason.as_deref().unwrap_or("manifest document refused")))
-            .collect::<Vec<_>>();
-        status.stalled = (!refusals.is_empty()).then(|| {
-            let evidence = refusals.join("; ");
-            let now = chrono::Utc::now();
-            let retry = ControllerRetry::terminal(None, now, evidence.clone());
-            StalledCondition {
-                leaves: Vec::new(),
-                maker: Some(LeafMaker::Controller {
-                    resource_kind: "ManifestRoot".into(),
-                    name: Some(self.root_name()),
-                    retry,
-                    ceiling: RetryCeiling::default(),
-                }),
-                evidence,
-                source: StallEvidenceSource::LeafEngine,
-                cause: None,
-                began_at: now,
-                rung: StallRung::Operator,
-                supervisor: None,
-                supervision_message: None,
-                supervision_index: None,
-                supervision_exhausted: false,
-                reason: None,
-                proposed_disposition: None,
-                nudge_history: Vec::new(),
-            }
-        });
-        if let (Some(previous_stall), Some(stall)) =
-            (root_resource.status.as_ref().and_then(|status| status.stalled.as_ref()), status.stalled.as_mut())
-        {
-            if previous_stall.evidence == stall.evidence {
-                *stall = previous_stall.clone();
-            }
-        }
-        self.publish_status(status).await?;
+        // Every declared document has a state by now, refused or not: the pass is complete, so it
+        // advances the applied revision and prunes the records of documents no longer declared
+        // (the ManifestRoot spec's rule). Refusals and drift are judged from the records it leaves.
+        let pass = PassReport { revision, complete: true, documents, at: chrono::Utc::now() };
+        self.roots.record_pass(&self.default_namespace, &self.root_name(), pass).await?;
         Ok(report)
     }
 
@@ -640,10 +523,8 @@ impl ResourceManifestReconciler {
         Ok(())
     }
 
-    async fn publish_source_failure(&self, root: &flotilla_resources::ResourceObject<ManifestRoot>, error: &str) -> Result<(), String> {
-        let status =
-            flotilla_charter::charter_store::source_status(root.status.clone().unwrap_or_default(), None, Some(error), &self.root_name());
-        self.publish_status(status).await
+    async fn publish_source_failure(&self, error: &str) -> Result<(), String> {
+        self.roots.record_source(&self.default_namespace, &self.root_name(), None, Some(error)).await
     }
 
     async fn reconcile_document(
@@ -671,9 +552,12 @@ impl ResourceManifestReconciler {
             // pending until the operator removes this key from suspended.
             let live_hash =
                 existing.as_ref().map(|object| resource_document_spec_hash(object).map_err(|error| error.to_string())).transpose()?;
-            let baseline = existing.as_ref().map(|object| string_map(object, "annotations")).transpose()?.and_then(|annotations| {
-                annotations.get(MANIFEST_BASELINE_HASH_ANNOTATION).or_else(|| annotations.get(LAST_APPLIED_HASH_ANNOTATION)).cloned()
-            });
+            let baseline = existing
+                .as_ref()
+                .map(|object| string_map(object, "annotations"))
+                .transpose()?
+                .and_then(|annotations| baseline_annotation(&annotations))
+                .or_else(|| previous.and_then(|state| state.baseline_hash.clone()));
             report.unchanged += 1;
             return Ok(document_state(DocumentPhase::Suspended, None, live_hash, Some(desired_hash), baseline, previous));
         }
@@ -709,13 +593,12 @@ impl ResourceManifestReconciler {
             return Ok(document_state(DocumentPhase::Applied, None, Some(hash.clone()), Some(desired_hash), Some(hash), previous));
         }
         let live_hash = resource_document_spec_hash(&existing).map_err(|error| format!("{identity}: {error}"))?;
-        let baseline =
-            annotations.get(MANIFEST_BASELINE_HASH_ANNOTATION).or_else(|| annotations.get(LAST_APPLIED_HASH_ANNOTATION)).cloned();
+        let baseline = baseline_annotation(&annotations).or_else(|| previous.and_then(|state| state.baseline_hash.clone()));
         if let Some(resolution) = resolution.filter(|resolution| {
             resolution.action != ResolutionAction::Sync
                 || labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(MANIFEST_MANAGED_BY_VALUE)
         }) {
-            if self.claim_resolution(key, &resolution.token, previous).await? {
+            if self.roots.claim_resolution(&self.default_namespace, &self.root_name(), key, &resolution.token).await? {
                 let action_result: Result<ResolutionOutcome, String> = async {
                     match resolution.action {
                         ResolutionAction::Sync => {
@@ -733,11 +616,10 @@ impl ResourceManifestReconciler {
                                 .value;
                             let fresh_hash = resource_document_spec_hash(&refreshed).map_err(|error| error.to_string())?;
                             let root = self
-                                .backend
-                                .using::<ManifestRoot>(&self.default_namespace)
-                                .get(&self.root_name())
-                                .await
-                                .map_err(|error| error.to_string())?;
+                                .roots
+                                .root(&self.default_namespace, &self.root_name())
+                                .await?
+                                .ok_or_else(|| format!("{identity}: ManifestRoot {} vanished while adopting", self.root_name()))?;
                             if root.spec.resolutions.get(key).map(|request| request.token.as_str()) != Some(resolution.token.as_str()) {
                                 return Err(format!("{identity}: adopt resolution changed while reconciling"));
                             }
@@ -998,6 +880,20 @@ impl ResourceManifestReconciler {
     }
 }
 
+/// A definition's baseline as its annotations record it. ADR 0047 N→N+1: the annotations stay the
+/// first source while definitions carry them (they move onto the engine without them, #3824 layer
+/// 2b-ii); the root's baseline record, the same hash, answers for a definition without them.
+fn baseline_annotation(annotations: &BTreeMap<String, String>) -> Option<String> {
+    annotations.get(MANIFEST_BASELINE_HASH_ANNOTATION).or_else(|| annotations.get(LAST_APPLIED_HASH_ANNOTATION)).cloned()
+}
+
+/// A document refused before it was judged: a refusal changes nothing live, so the baseline its
+/// root recorded stands.
+fn refused_state(reason: String, previous: Option<&DocumentState>) -> DocumentState {
+    let baseline = previous.and_then(|state| state.baseline_hash.clone());
+    document_state(DocumentPhase::Refused, Some(reason), None, None, baseline, previous)
+}
+
 fn document_state(
     phase: DocumentPhase,
     reason: Option<String>,
@@ -1175,6 +1071,8 @@ fn string_map(document: &Value, field: &str) -> Result<BTreeMap<String, String>,
 #[cfg(test)]
 mod tests {
     use std::{process::Command, time::Duration};
+
+    use flotilla_resources::ManifestRoot;
 
     use chrono::Utc;
     use flotilla_config::ConfigStore;
@@ -1671,7 +1569,9 @@ mod tests {
         let parent = tempfile::tempdir().expect("tempdir");
         let root = parent.path().join("not-created-yet");
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        materialize_manifest_root(&backend, NAMESPACE, &root, "local", "local").await.expect("materialize root");
+        materialize_manifest_root(&OldStoreManifestRoots::new(backend.clone()), NAMESPACE, &root, "local", "local", None)
+            .await
+            .expect("materialize root");
         let task = tokio::spawn(ResourceManifestReconciler::new(backend.clone(), NAMESPACE, root.clone()).run(Duration::from_millis(5)));
         tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -1976,6 +1876,78 @@ mod tests {
         assert_eq!(resolver.get("sync-me").await.expect("policy").spec.pool, "manifest");
     }
 
+    // Behaviour (#3824 layer 2c, the 2026-10-26 ruling): over the engine's ManifestRoot, a pass
+    // records each document's baseline on the root; drift is judged from that record for a
+    // definition with no baseline annotation (as definitions on the engine will have none) and left
+    // untouched; and a sync request settles once.
+    #[tokio::test]
+    async fn over_the_engine_roots_drift_is_judged_from_the_root_baseline_and_a_sync_settles_once() {
+        use flotilla_provisioning::engine::manifest_root::EngineManifestRoots;
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir.path().join("policy.yaml"), &manifest("sync-me", "manifest"));
+        let store = tempfile::tempdir().expect("store dir");
+        let mut kinds = flotilla_schema::KindRegistry::new();
+        flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register");
+        let service =
+            Arc::new(flotilla_schema_sqlite::stream::Service::open(&store.path().join("decided.sqlite"), "home", kinds).expect("store"));
+        let roots: Arc<dyn ManifestRoots> =
+            Arc::new(EngineManifestRoots::open(service, Arc::new(flotilla_resources::SystemClock)).expect("engine roots"));
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path()).with_roots(Arc::clone(&roots));
+        reconciler.reconcile_once_for_test().await.expect("creation");
+        let name = reconciler.root_name();
+        let applied = resolver.get("sync-me").await.expect("policy");
+        let baseline = roots.root(NAMESPACE, &name).await.expect("read").expect("root").baseline(&key("sync-me")).map(str::to_owned);
+        assert_eq!(baseline.as_deref(), applied.metadata.annotations.get(MANIFEST_BASELINE_HASH_ANNOTATION).map(String::as_str));
+
+        // With the baseline annotations gone, the live spec still matches the root's baseline, so a
+        // source change applies rather than reading as drift.
+        let strip = |metadata: &flotilla_resources::ObjectMeta| {
+            let mut meta = InputMeta::from(metadata);
+            meta.annotations.remove(MANIFEST_BASELINE_HASH_ANNOTATION);
+            meta.annotations.remove(LAST_APPLIED_HASH_ANNOTATION);
+            meta
+        };
+        resolver.update(&strip(&applied.metadata), &applied.metadata.resource_version, &applied.spec).await.expect("strip annotations");
+        write(&dir.path().join("policy.yaml"), &manifest("sync-me", "manifest-2"));
+        let report = reconciler.reconcile_once_for_test().await.expect("source change");
+        assert_eq!((report.updated, report.drifted), (1, 0), "{report:?}");
+        assert_eq!(resolver.get("sync-me").await.expect("policy").spec.pool, "manifest-2");
+
+        // A live edit, with the annotations gone again: drift is judged from the root's record.
+        let current = resolver.get("sync-me").await.expect("policy");
+        resolver
+            .update(
+                &strip(&current.metadata),
+                &current.metadata.resource_version,
+                &PlacementPolicySpec::builder().pool("live".to_string()).build(),
+            )
+            .await
+            .expect("live edit");
+        assert_eq!(reconciler.reconcile_once_for_test().await.expect("drift pass").drifted, 1);
+        assert_eq!(resolver.get("sync-me").await.expect("policy").spec.pool, "live", "drift is left untouched");
+
+        // A refused document's refusal makes the stall; removing the document clears it, though the
+        // other document still drifts.
+        write(&dir.path().join("bad.yaml"), "invalid: [");
+        reconciler.reconcile_once_for_test().await.expect("refusal pass");
+        assert!(roots.root(NAMESPACE, &name).await.expect("read").expect("root").status.stalled.is_some());
+        std::fs::remove_file(dir.path().join("bad.yaml")).expect("remove refused document");
+        assert_eq!(reconciler.reconcile_once_for_test().await.expect("removal pass").drifted, 1);
+        let root = roots.root(NAMESPACE, &name).await.expect("read").expect("root");
+        assert!(root.status.stalled.is_none(), "{:?}", root.status.stalled);
+        assert_eq!(root.status.documents.keys().collect::<Vec<_>>(), [&key("sync-me")]);
+
+        let token = roots.request_resolution(NAMESPACE, &name, &key("sync-me"), ResolutionAction::Sync, "operator").await.expect("request");
+        assert_eq!(reconciler.reconcile_once_for_test().await.expect("sync pass").updated, 1);
+        assert_eq!(resolver.get("sync-me").await.expect("policy").spec.pool, "manifest-2");
+        let root = roots.root(NAMESPACE, &name).await.expect("read").expect("root");
+        assert_eq!(root.status.documents[&key("sync-me")].resolved_token.as_deref(), Some(token.as_str()));
+        assert_eq!(root.status.documents[&key("sync-me")].resolution_outcome, Some(ResolutionOutcome::Synced));
+        assert_eq!(reconciler.reconcile_once_for_test().await.expect("settled pass").unchanged, 1);
+    }
+
     #[tokio::test]
     async fn claimed_resolution_is_not_replayed_after_reconciler_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1995,10 +1967,11 @@ mod tests {
             .expect("live edit");
         reconciler.reconcile_once_for_test().await.expect("drift pass");
         set_resolution(&backend, key("interrupted"), ResolutionAction::Sync, "token-1").await;
-        let root = test_root(&backend).await;
-        let status = root.status.expect("status");
-        let previous = &status.documents[&key("interrupted")];
-        assert!(reconciler.claim_resolution(&key("interrupted"), "token-1", Some(previous)).await.expect("claim"));
+        assert!(reconciler
+            .roots
+            .claim_resolution(NAMESPACE, &reconciler.root_name(), &key("interrupted"), "token-1")
+            .await
+            .expect("claim"));
 
         let mut restarted = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         assert_eq!(restarted.reconcile_once_for_test().await.expect("restart pass").drifted, 1);
@@ -2267,6 +2240,7 @@ mod registered_charter_tests {
         CharterPointer, PlacementPolicy, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, RepositoryKey,
         ResourceProvenance,
     };
+    use flotilla_resources::{InputMeta, ManifestRoot};
     use flotilla_store_memory::InMemoryBackend;
 
     use super::*;

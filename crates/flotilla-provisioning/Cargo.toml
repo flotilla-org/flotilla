@@ -26,6 +26,7 @@ serde_json = { workspace = true }
 flotilla-engine-store = { path = "../flotilla-engine-store" }
 futures = { workspace = true }
 strum = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
@@ -46,7 +47,6 @@ flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
 serde = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
 flotilla-core = { path = "../flotilla-core" }
 hegeltest = "=0.48.1"
 tempfile = { workspace = true }

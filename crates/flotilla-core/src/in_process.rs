@@ -93,7 +93,7 @@ use flotilla_resources::{
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec,
     CrewCompletionPending, Forge, ForgeKind, InputMeta, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope,
-    LifecycleAuthority, ManifestRoot, ObservedChangeRequestState, PlacementPolicy, Project, Repository, RepositoryIdentity, RepositoryKey,
+    LifecycleAuthority, ObservedChangeRequestState, PlacementPolicy, Project, Repository, RepositoryIdentity, RepositoryKey,
     RepositorySpec, ResourceError, ResourceObject, ResourceProvenance, SystemClock, TerminalSessionTarget, TurnDeliveryRung, WatchEvent,
     WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
@@ -715,6 +715,7 @@ pub struct InProcessDaemon {
     /// The account kinds' records (#3824 layer 1): the old store's, or the engine's once
     /// installed behind `[primitives]`.
     accounts: Arc<flotilla_store::SwitchedAccounts>,
+    manifest_roots: Arc<flotilla_store::SwitchedManifestRoots>,
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
     event_source: Arc<BroadcastEventSink>,
@@ -906,6 +907,7 @@ impl InProcessDaemon {
             namespace: &self.provisioning_namespace,
             port: self,
             resource_backend: &self.resource_backend,
+            manifest_roots: &*self.manifest_roots,
             config: &self.config,
             active_commands: &self.active_commands,
             observed_checkout_reconciliation: &self.observed_checkout_reconciliation,
@@ -923,6 +925,7 @@ impl InProcessDaemon {
             port: self,
             resource_backend: &self.resource_backend,
             observed_resource_backend: &self.observed_resource_backend,
+            manifest_roots: &*self.manifest_roots,
             event_sink: &self.event_sink,
             node_id: &self.node_id,
             clock: &self.clock,
@@ -1260,6 +1263,7 @@ impl InProcessDaemon {
         let observed_checkout_reconciliation = Arc::new(Mutex::new(()));
         let lifecycle_reads = Arc::new(flotilla_resources::lifecycle_reads::LateLifecycleReads::default());
         let accounts = Arc::new(flotilla_store::SwitchedAccounts::new(resource_backend.clone()));
+        let manifest_roots = Arc::new(flotilla_store::SwitchedManifestRoots::new(resource_backend.clone()));
         let checkout_providers = Arc::new(
             CheckoutProviders::builder()
                 .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
@@ -1365,6 +1369,7 @@ impl InProcessDaemon {
             change_stream_rounds: Default::default(),
             lifecycle_reads: Arc::clone(&lifecycle_reads),
             accounts,
+            manifest_roots,
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
@@ -2211,6 +2216,16 @@ impl InProcessDaemon {
     /// The account kinds' records: the engine's once installed, the old store's before.
     pub fn account_records(&self) -> Arc<dyn flotilla_resources::account_access::AccountRecords> {
         self.accounts.clone()
+    }
+
+    /// Installs the engine's ManifestRoots during composition (#3824 layer 2c).
+    pub fn install_manifest_roots(&self, roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>) -> Result<(), String> {
+        self.manifest_roots.install(roots)
+    }
+
+    /// The ManifestRoots: the engine's once installed, the old store's before.
+    pub fn manifest_roots(&self) -> Arc<dyn flotilla_resources::manifest_roots::ManifestRoots> {
+        self.manifest_roots.clone()
     }
 
     /// Refuse engine-enabled startup until its lifecycle read port is installed.
@@ -3682,6 +3697,7 @@ impl InProcessDaemon {
         ProjectService {
             image_layer_refresh: Arc::clone(&self.image_layer_refresh),
             resource_backend: &self.resource_backend,
+            manifest_roots: &*self.manifest_roots,
             observed_resource_backend: &self.observed_resource_backend,
             clock: &self.clock,
             namespace: &self.provisioning_namespace,
@@ -4233,6 +4249,7 @@ impl InProcessDaemon {
             fleet: &self.fleet,
             convoy_engine: &self.convoy_engine_path,
             accounts: &*self.accounts,
+            manifest_roots: &*self.manifest_roots,
         }
     }
 
@@ -4324,11 +4341,11 @@ impl InProcessDaemon {
     /// Raw bound fleet manifests at the current source head, for candidate-side
     /// validation. Returning raw text lets the candidate use its own decoder.
     pub async fn charter_input_inventory(&self, namespace: &str) -> Result<Vec<flotilla_charter::ops_entry::OperationalEntryFile>, String> {
-        let roots = self.resource_backend.using::<ManifestRoot>(namespace).list().await.map_err(|error| error.to_string())?;
+        let roots = flotilla_resources::manifest_roots::ManifestRoots::roots(&*self.manifest_roots, namespace).await?;
         let vcs = self.local_charter_vcs()?;
         let mut files = Vec::new();
-        for root in roots.items {
-            if root.spec.host != self.environment_manager.local_host_id().as_str() || root.metadata.name.starts_with("ops-") {
+        for root in roots {
+            if !root.local || root.spec.host != self.environment_manager.local_host_id().as_str() || root.name.starts_with("ops-") {
                 continue;
             }
             let Some(source) = root.spec.binding else {
@@ -4343,7 +4360,7 @@ impl InProcessDaemon {
                         Path::new(path).extension().and_then(|ext| ext.to_str()).is_some_and(|ext| matches!(ext, "yaml" | "yml" | "json"))
                     })
                     .map(|(path, contents)| flotilla_charter::ops_entry::OperationalEntryFile {
-                        path: format!("{}/{path}", root.metadata.name),
+                        path: format!("{}/{path}", root.name),
                         contents,
                     }),
             );

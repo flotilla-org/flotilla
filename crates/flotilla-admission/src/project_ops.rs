@@ -269,6 +269,8 @@ pub trait ProjectOperations: Send + Sync {
 pub struct ProjectService<'a> {
     pub image_layer_refresh: Arc<tokio::sync::Mutex<crate::project_image_layers::LayerRefreshState>>,
     pub resource_backend: &'a ResourceBackend,
+    /// The ops roots of this host's project charter bindings (#3824 layer 2c).
+    pub manifest_roots: &'a dyn flotilla_resources::manifest_roots::ManifestRoots,
     pub observed_resource_backend: &'a ResourceBackend,
     pub clock: &'a Arc<dyn Clock>,
     pub namespace: &'a std::sync::RwLock<String>,
@@ -619,25 +621,11 @@ impl ProjectService<'_> {
                 })
             })
             .collect::<BTreeSet<_>>();
-        let roots = self.resource_backend.using::<flotilla_resources::ManifestRoot>(&namespace);
-        for root in roots
-            .query_declared(&flotilla_store::StoreQuery {
-                labels: BTreeMap::from([(MANAGED_BY_LABEL.into(), "ops-charter".into())]),
-                fields: BTreeMap::from([("spec.host".into(), self.repository_index.host.to_string())]),
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| error.to_string())?
-            .items
-            .into_iter()
-            .map(|source| source.object)
-        {
-            if root.spec.host == self.repository_index.host
-                && root.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some("ops-charter")
-                && !desired.contains(&root.metadata.name)
+        for root in self.manifest_roots.roots(&namespace).await? {
+            if root.local && root.name.starts_with("ops-") && root.spec.host == self.repository_index.host && !desired.contains(&root.name)
             {
                 // Removing a source retires its health, not the records it authored.
-                roots.delete(&root.metadata.name).await.map_err(|error| error.to_string())?;
+                self.manifest_roots.retire(&namespace, &root.name).await?;
             }
         }
         for project in projects {
@@ -692,7 +680,7 @@ impl ProjectService<'_> {
         bootstrap: Option<&ProjectDeclarationInspection>,
         entry_path: &mut Option<String>,
     ) -> Result<(Vec<String>, Vec<String>), String> {
-        use flotilla_resources::{CharterSource, ManifestRoot, ManifestRootSpec};
+        use flotilla_resources::{manifest_roots::RootDeclaration, CharterSource};
         let namespace = self.provisioning_namespace();
         let lock = flotilla_charter::charter_store::authoring_lock(&namespace);
         let _guard = lock.lock().await;
@@ -703,7 +691,6 @@ impl ProjectService<'_> {
             // continue authoring or pruning through previous ops member bindings.
             return Ok((Vec::new(), vec!["operational entries managed by registered charter".into()]));
         }
-        let roots = self.resource_backend.using::<ManifestRoot>(&namespace);
         let mut names = Vec::new();
         for member in &project.spec.repositories {
             let Some(binding) = &member.charter_store else {
@@ -717,58 +704,21 @@ impl ProjectService<'_> {
                 CharterSource::Repository { repo, path, .. } => (repo.clone(), path.clone()),
                 CharterSource::LocalDirectory { directory } => ("local".into(), directory.clone()),
             };
-            let current = match roots.get(&name).await {
-                Ok(root) => Some(root),
-                Err(ResourceError::NotFound { .. }) => None,
-                Err(error) => return Err(error.to_string()),
-            };
-            let mut spec = current.as_ref().map(|root| root.spec.clone()).unwrap_or_else(|| {
-                ManifestRootSpec::builder().host(binding.host.clone()).path(path.clone()).source(source.clone()).build()
-            });
-            spec.binding = Some(binding.source.clone());
-            spec.host.clone_from(&binding.host);
-            spec.path = path;
-            spec.source = source;
-            match current {
-                Some(root) if root.spec != spec => {
-                    roots
-                        .update(&InputMeta::from(&root.metadata), &root.metadata.resource_version, &spec)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
-                None => {
-                    roots
-                        .create(
-                            &InputMeta::builder()
-                                .name(name.clone())
-                                .labels(BTreeMap::from([(MANAGED_BY_LABEL.into(), "ops-charter".into())]))
-                                .build(),
-                            &spec,
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
-                _ => {}
-            }
+            let declaration =
+                RootDeclaration { host: binding.host.clone(), path, source, binding: Some(binding.source.clone()), ops: true };
+            self.manifest_roots.declare(&namespace, &name, declaration).await?;
             names.push(name);
         }
         let mut revisions = BTreeMap::new();
         let result = self.materialize_project_operational_entries_inner(project_name, bootstrap, entry_path, &mut revisions).await;
         for name in names {
-            let publication_error = |error: ResourceError| match &result {
-                Err(source_error) => format!("{source_error}; publish ManifestRoot/{name} status: {error}"),
-                Ok(_) => format!("publish ManifestRoot/{name} status: {error}"),
-            };
-            let root = roots.get(&name).await.map_err(publication_error)?;
-            let status = flotilla_charter::charter_store::source_status(
-                root.status.clone().unwrap_or_default(),
-                revisions.remove(&name),
-                result.as_ref().err().map(String::as_str),
-                &name,
-            );
-            if root.status.as_ref() != Some(&status) {
-                roots.update_status(&name, &root.metadata.resource_version, &status).await.map_err(publication_error)?;
-            }
+            let error = result.as_ref().err().map(String::as_str);
+            self.manifest_roots.record_source(&namespace, &name, revisions.remove(&name), error).await.map_err(
+                |publication| match &result {
+                    Err(source_error) => format!("{source_error}; publish ManifestRoot/{name} status: {publication}"),
+                    Ok(_) => format!("publish ManifestRoot/{name} status: {publication}"),
+                },
+            )?;
         }
         result
     }
@@ -1795,6 +1745,7 @@ mod tests {
             let service = ProjectService {
                 image_layer_refresh: Default::default(),
                 resource_backend: &backend,
+                manifest_roots: Box::leak(Box::new(flotilla_store::OldStoreManifestRoots::new(backend.clone()))),
                 observed_resource_backend: &observed,
                 clock: &clock,
                 namespace: &namespace,
@@ -1969,6 +1920,7 @@ mod tests {
         let service = ProjectService {
             image_layer_refresh: Default::default(),
             resource_backend: &backend,
+            manifest_roots: Box::leak(Box::new(flotilla_store::OldStoreManifestRoots::new(backend.clone()))),
             observed_resource_backend: &observed,
             clock: &clock,
             namespace: &namespace,

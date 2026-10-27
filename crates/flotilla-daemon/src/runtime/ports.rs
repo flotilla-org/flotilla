@@ -22,7 +22,7 @@ use flotilla_provisioning::reconcilers::{
 use flotilla_resources::checkout_path::checkout_path_from_status_and_spec;
 use flotilla_resources::{
     ChangeRequest, Checkout, CheckoutIntegrationStatus, CheckoutSpec, Clone, ClonePhase, Convoy, ConvoyTeardownRuntime, Demand, DemandKind,
-    DemandSpec, Forge, ForgeIdentity, InputMeta, ManifestRoot, Resource, ResourceError, ResourceObject,
+    DemandSpec, Forge, ForgeIdentity, InputMeta, Resource, ResourceError, ResourceObject,
 };
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
 use flotilla_vcs::vcs::CheckoutMaterialisationError;
@@ -57,8 +57,8 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
         match normalized.as_str() {
             "convoyensure" | "convoyensures" => self.state.daemon.reconcile_convoy_ensure_now(namespace, name, &*self.state).await,
             "manifestroot" | "manifestroots" => {
-                let root = self.state.daemon.resource_backend().using::<ManifestRoot>(namespace).get(name).await
-                    .map_err(|error| error.to_string())?;
+                let roots = self.state.daemon.manifest_roots();
+                let root = roots.root(namespace, name).await?.ok_or_else(|| format!("ManifestRoot {name} not found"))?;
                 if root.spec.host != self.local_root {
                     return Err(format!("manifest root `{name}` is owned by another host; route reconcile-now to that host"));
                 }
@@ -71,7 +71,8 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                         .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone())
                         .with_binding(manifests.binding.clone())
                         .with_vcs(if manifests.binding.is_some() { self.state.daemon.local_charter_vcs()? }
-                            else { self.state.daemon.local_vcs_for_checkout(&manifests.dir).await? });
+                            else { self.state.daemon.local_vcs_for_checkout(&manifests.dir).await? })
+                        .with_roots(roots);
                 let report = reconciler.reconcile_once().await?;
                 Ok(format!(
                     "manifest root {name}: {} created, {} updated, {} unchanged, {} errors",

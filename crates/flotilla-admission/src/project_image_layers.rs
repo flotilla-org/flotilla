@@ -521,6 +521,7 @@ mod tests {
         let service = ProjectService {
             image_layer_refresh: Default::default(),
             resource_backend: &backend,
+            manifest_roots: Box::leak(Box::new(flotilla_store::OldStoreManifestRoots::new(backend.clone()))),
             observed_resource_backend: &observed,
             clock: &clock,
             namespace: &namespace,
@@ -590,6 +591,7 @@ mod tests {
         ProjectService {
             image_layer_refresh: Default::default(),
             resource_backend: backend,
+            manifest_roots: Box::leak(Box::new(flotilla_store::OldStoreManifestRoots::new(backend.clone()))),
             observed_resource_backend: observed,
             clock,
             namespace,

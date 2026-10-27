@@ -119,6 +119,8 @@ pub struct ProjectionsActions<'a> {
     pub port: &'a dyn ProjectionsActionPort,
     pub resource_backend: &'a ResourceBackend,
     pub observed_resource_backend: &'a ResourceBackend,
+    /// The ManifestRoots the views read (#3824 layer 2c).
+    pub manifest_roots: &'a dyn flotilla_resources::manifest_roots::ManifestRoots,
     pub event_sink: &'a Arc<dyn EventSink>,
     pub node_id: &'a NodeId,
     pub clock: &'a Arc<dyn Clock>,
@@ -329,6 +331,31 @@ impl ProjectionsActions<'_> {
                     Err(error) => Ok(CommandValue::Error { message: error.to_string() }),
                 }
             }
+            CommandAction::QueryManifestRoots { namespace } => match self.manifest_roots.roots(namespace).await {
+                Ok(roots) => {
+                    let records = roots
+                        .into_iter()
+                        .map(|root| {
+                            let object = serde_json::json!({
+                                "apiVersion": "flotilla.work/v1",
+                                "kind": "ManifestRoot",
+                                "metadata": { "name": root.name, "namespace": namespace },
+                                "spec": root.spec,
+                                "status": root.status,
+                            });
+                            resource_record(ResourceRecordType::Current, object, self.node_id)
+                        })
+                        .collect();
+                    Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
+                        "ManifestRoot".into(),
+                        "manifestroots".into(),
+                        namespace.clone(),
+                        ResourceCursor::from_position(String::new(), None),
+                        records,
+                    ))))
+                }
+                Err(message) => Ok(CommandValue::Error { message }),
+            },
             CommandAction::QueryResourceGet { namespace, kind, name } => {
                 // Take the collection cursor before reading the object. A
                 // concurrent mutation can then be replayed (at worst as a
