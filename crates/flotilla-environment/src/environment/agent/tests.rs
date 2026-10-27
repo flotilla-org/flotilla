@@ -412,6 +412,26 @@ async fn delivery_operations_cross_the_agent(agent: Arc<dyn TestAgent>) {
     assert_eq!(vessel.writable_base().await.unwrap(), Path::new(super::super::runner::CONTAINED_WRITABLE_CONFIG_BASE));
 }
 
+// #3909: a pushed artifact becomes a verified store entry, and a link into it reads as
+// the pushed bytes; bytes that do not hash to the digest, or a kind the store cannot
+// unpack, leave nothing behind.
+over_each_transport!(artifacts_cross_the_agent_by_digest);
+async fn artifacts_cross_the_agent_by_digest(agent: Arc<dyn TestAgent>) {
+    let directory = tempfile::tempdir().unwrap();
+    let vessel: Arc<dyn VesselAgent> = Arc::new(runner_for(&agent, directory.path()));
+    let local = directory.path().join("harness");
+    std::fs::write(&local, b"pinned harness").unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(b"pinned harness"));
+    let link = directory.path().join("home/.flotilla/harness/bin/claude");
+    let other = format!("{:x}", Sha256::digest(b"other bytes"));
+    let refused = vessel.push_artifact(&other, &local, PinUnpack::File).await.expect_err("a mismatched digest");
+    assert!(vessel.link_artifact(&link, &other, Path::new("")).await.is_err(), "nothing was stored: {refused}");
+    vessel.push_artifact(&sha256, &local, PinUnpack::File).await.unwrap();
+    vessel.link_artifact(&link, &sha256, Path::new("")).await.unwrap();
+    assert_eq!(std::fs::read(&link).unwrap(), b"pinned harness");
+    assert!(vessel.push_artifact(&sha256, &local, PinUnpack::TarXz).await.unwrap_err().contains("tar.xz"));
+}
+
 // Issue 3486: flotilla's CLI cycle is separate from drydock's. Updating files
 // changes what exec sees while the same agent incarnation continues running.
 over_each_transport!(pushing_new_cli_layer_does_not_reexec_agent);

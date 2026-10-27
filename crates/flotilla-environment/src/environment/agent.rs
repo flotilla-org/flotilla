@@ -9,10 +9,13 @@ use std::{
 };
 
 use async_trait::async_trait;
-use drydock_agent::{Client, Configuration, Endpoint, Exec, ExecEvent, ExitStatus, FileOptions, GuestForward, HostForward};
+use drydock_agent::{
+    ArtifactSource, Client, Configuration, Endpoint, Exec, ExecEvent, ExitStatus, Fetch, FileOptions, GuestForward, HostForward, Unpack,
+};
 use drydock_protocol::Platform;
 use drydock_transport::{Limits, Transport};
 use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
+use flotilla_resources::PinUnpack;
 use sha2::{Digest, Sha256};
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -532,6 +535,15 @@ fn collect(source: &Path, destination: &Path, files: &mut Vec<FileEntry>, links:
     Ok(())
 }
 
+/// The store's unpack kind for a pin's. The store unpacks `tar` and `tar.gz` archives.
+fn store_unpack(unpack: PinUnpack) -> Result<Unpack, String> {
+    match unpack {
+        PinUnpack::File => Ok(Unpack::File { mode: 0o555 }),
+        PinUnpack::TarGz => Ok(Unpack::TarGz),
+        PinUnpack::TarXz => Err("the vessel agent's store cannot unpack a tar.xz artifact".into()),
+    }
+}
+
 #[async_trait]
 impl VesselAgent for Arc<AgentRunner> {
     fn commands(&self) -> Arc<dyn CommandRunner> {
@@ -575,6 +587,30 @@ impl VesselAgent for Arc<AgentRunner> {
             .symlink(path, target, &options)
             .await
             .map_err(|error| format!("link {} to {}: {error}", path.display(), target.display()))
+    }
+    async fn fetch_artifact(&self, sha256: &str, urls: &[String], unpack: PinUnpack) -> Result<(), String> {
+        let sources = urls.iter().map(|url| ArtifactSource::Upstream { url: url.clone() }).collect();
+        let fetch = Fetch { sources, unpack: store_unpack(unpack)? };
+        self.client().await?.fetch_artifact(sha256, &fetch).await.map(drop).map_err(|error| format!("fetch artifact {sha256}: {error}"))
+    }
+    async fn push_artifact(&self, sha256: &str, file: &Path, unpack: PinUnpack) -> Result<(), String> {
+        let fetch = Fetch { sources: vec![ArtifactSource::Push], unpack: store_unpack(unpack)? };
+        let content = tokio::fs::File::open(file).await.map_err(|error| format!("open {}: {error}", file.display()))?;
+        let length = content.metadata().await.map_err(|error| format!("stat {}: {error}", file.display()))?.len();
+        self.client()
+            .await?
+            .fetch_artifact_or_push(sha256, &fetch, length, content)
+            .await
+            .map(drop)
+            .map_err(|error| format!("push artifact {sha256}: {error}"))
+    }
+    async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
+        let options = FileOptions { parents: true, ..FileOptions::default() };
+        self.client()
+            .await?
+            .link_artifact(path, sha256, member, &options)
+            .await
+            .map_err(|error| format!("link {} to artifact {sha256}: {error}", path.display()))
     }
     async fn ready(&self) -> Result<(), String> {
         self.healthy().await;
