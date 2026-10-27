@@ -467,6 +467,10 @@ impl Pending {
     }
 }
 
+/// One write transaction. Its home's sequence numbers changes and entries alike (#4024): a write
+/// that opens its own change takes two sequences, the change's and then its entry's, and later
+/// writes naming an opened change take one each. So a resource's version is never "the count of
+/// its writes"; read versions from the stamps writes return.
 pub struct Write<'s> {
     tx: Transaction<'s>,
     runtime: &'s mut Runtime,
