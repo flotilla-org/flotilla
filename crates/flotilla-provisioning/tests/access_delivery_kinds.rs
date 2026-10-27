@@ -57,3 +57,47 @@ fn access_delivery_statements_search_by_key() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+// Behaviour (#3964, ADR 0047): an access delivery reads back as written, through the resource
+// store's serde form and through the generated tables' codec. The generator spans every
+// mechanism, no needs through several, a retry or none, and timestamps across the epoch.
+#[hegel::test]
+fn access_delivery_round_trips(tc: hegel::TestCase) {
+    use access_delivery::{DeliveredNeed, DeliveryMechanism, DeliveryRetry};
+    use flotilla_resources::AccessDeliverySpec;
+    use flotilla_schema::{Decoder, Encoder, Timestamp};
+    use hegel::generators as gs;
+    const MECHANISMS: [DeliveryMechanism; 6] = [
+        DeliveryMechanism::HostPathReadOnlyLive,
+        DeliveryMechanism::HostPathReadOnlySnapshot,
+        DeliveryMechanism::HostPathReadWriteLive,
+        DeliveryMechanism::HostPathReadWriteSnapshot,
+        DeliveryMechanism::AgentFetchUrl,
+        DeliveryMechanism::AgentPush,
+    ];
+    let text = || gs::text().max_size(12);
+    let at = || Timestamp::from_micros(tc.draw(gs::integers::<i64>().min_value(-1 << 40).max_value(1 << 40)));
+    let needs = (0..tc.draw(gs::integers::<usize>().max_value(3)))
+        .map(|_| {
+            let mechanism = MECHANISMS[tc.draw(gs::integers::<usize>().max_value(MECHANISMS.len() - 1))];
+            (tc.draw(text()), DeliveredNeed { mechanism, digest: tc.draw(text()), at: at() })
+        })
+        .collect();
+    let retry = tc.draw(gs::booleans()).then(|| DeliveryRetry {
+        need: tc.draw(text()),
+        attempts: tc.draw(gs::integers::<u32>()),
+        error: tc.draw(text()),
+        next_at: at(),
+    });
+    let spec = AccessDeliverySpec {
+        access: tc.draw(text()),
+        place: tc.draw(text()),
+        harness: tc.draw(text()),
+        home: tc.draw(text()),
+        needs,
+        retry,
+    };
+    let json = serde_json::to_value(&spec).expect("serialize");
+    assert_eq!(serde_json::from_value::<AccessDeliverySpec>(json).expect("deserialize"), spec);
+    assert_eq!(Decoder::decode::<AccessDeliverySpec>(Encoder::encode(&spec).expect("encode")).expect("decode"), spec);
+}

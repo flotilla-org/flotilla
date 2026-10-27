@@ -574,8 +574,14 @@ struct CrewSpecRecord {
     labels: BTreeMap<String, String>,
 }
 
+/// The interim caller-home label #3953 wrote on frozen crews (r879). Vessel delivery
+/// (#3964) derives each crew's home at launch instead. ADR 0047: accepted and dropped
+/// on decode; remove one roll after #3964.
+const RETIRED_CREW_HOME_KEY_LABEL: &str = "flotilla.work/requester-home-key";
+
 impl From<CrewSpecRecord> for CrewSpec {
     fn from(mut record: CrewSpecRecord) -> Self {
+        record.labels.remove(RETIRED_CREW_HOME_KEY_LABEL);
         for expectation in record.completion_conditions {
             match expectation {
                 CrewCompletionExpectation::Legacy(LegacyCompletionExpectation::DecisionLedger) => {
@@ -1240,7 +1246,7 @@ fn validate_vessel(
         }
 
         for key in process.labels.keys() {
-            if key.starts_with(crate::labels::RESERVED_PREFIX) && key != crate::account_access::CREW_HOME_KEY_LABEL {
+            if key.starts_with(crate::labels::RESERVED_PREFIX) {
                 push_error(
                     errors,
                     ValidationError::ReservedLabelKey { vessel: vessel.name.clone(), role: process.role.clone(), key: key.clone() },
@@ -1484,6 +1490,20 @@ mod tests {
         let rewritten = serde_json::to_value(&vessel).expect("serialize vessel");
         assert!(rewritten.get("stance").is_none(), "stance must not be written back: {rewritten}");
         assert_eq!(rewritten, written);
+    }
+
+    // ADR 0047, #3964: a frozen crew written by r879 carries #3953's caller-home label.
+    // It decodes with the label dropped, keeps the crew's own labels, and is never written back.
+    #[test]
+    fn retired_crew_home_label_is_accepted_and_dropped() {
+        let mut crew = crew("coder", agent("code"));
+        crew.labels.insert("team".into(), "kept".into());
+        let written = serde_json::to_value(&crew).expect("serialize crew");
+        let mut stored = written.clone();
+        stored["labels"]["flotilla.work/requester-home-key"] = serde_json::json!("agent-homes/requesters/c/coder/claude");
+
+        let decoded: CrewSpec = serde_json::from_value(stored).expect("r879 crew decodes");
+        assert_eq!(serde_json::to_value(&decoded).expect("serialize crew"), written);
     }
 
     #[test]

@@ -15,6 +15,10 @@ pub const CREDENTIAL_PERMISSIONS_ENV: &str = "FLOTILLA_CREDENTIAL_PERMISSIONS";
 pub const CREDENTIAL_PERMISSIONS_SESSION_TAG: &str = "flotilla-credential-permissions";
 /// Per-role skill selections composed at crew launch, never stored in an Environment recipe.
 pub const CREW_SKILLS_ENV: &str = "FLOTILLA_CREW_SKILLS";
+/// The interim role-to-home-key map #3953 put in an Environment's env (r879). Vessel delivery
+/// (#3964) derives each crew's home at launch instead. ADR 0047: accepted and dropped wherever
+/// the env is read; remove one roll after #3964.
+pub const RETIRED_CREW_HOME_KEYS_ENV: &str = "FLOTILLA_CREW_HOME_KEYS";
 /// Selected skills delivered to one crew at launch.
 pub const RESOLVED_SKILLS_ENV: &str = "FLOTILLA_RESOLVED_SKILLS";
 

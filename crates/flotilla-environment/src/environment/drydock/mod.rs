@@ -258,6 +258,7 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                     | flotilla_resources::CREDENTIAL_SCOPES_ENV
                     | flotilla_resources::CREDENTIAL_PERMISSIONS_ENV
                     | flotilla_resources::CREW_SKILLS_ENV
+                    | flotilla_resources::RETIRED_CREW_HOME_KEYS_ENV
             )
         });
         for tool in &opts.tools {

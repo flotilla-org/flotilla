@@ -476,6 +476,9 @@ pub struct ConvoyExplanation {
     /// Each requester's account bindings, open and retired (#3907).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub account_bindings: Vec<ExplainedAccountBinding>,
+    /// What the access layer delivered for each crew at each place (#3964).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_deliveries: Vec<ExplainedAccessDelivery>,
     pub evidence_ttl_seconds: u64,
     pub change_request_stale_after_seconds: u64,
     pub checkouts: Vec<ExplainedCheckout>,
@@ -530,6 +533,35 @@ pub struct ExplainedAccountBinding {
     pub epochs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provisions: Vec<ExplainedAccountProvision>,
+}
+
+/// One crew's access delivered at one place (#3964): its home, the mechanism the planner
+/// chose and the digest that landed for each need, and a failed delivery's retry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedAccessDelivery {
+    pub access: String,
+    pub place: String,
+    pub harness: String,
+    pub home: String,
+    pub needs: Vec<ExplainedDeliveredNeed>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<ExplainedDeliveryRetry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedDeliveredNeed {
+    pub need: String,
+    pub mechanism: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedDeliveryRetry {
+    pub need: String,
+    pub attempts: u32,
+    pub error: String,
+    /// RFC 3339.
+    pub next_at: String,
 }
 
 /// One binding's provision at one place.

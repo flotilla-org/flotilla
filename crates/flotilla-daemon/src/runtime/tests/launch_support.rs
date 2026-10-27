@@ -3,7 +3,6 @@ use super::*;
 pub(super) enum LaunchObservationRecord {
     Present,
     Missing,
-    MissingConvoy,
     MissingEnvironment,
 }
 
@@ -31,13 +30,7 @@ pub(super) async fn bind_account(backend: &ResourceBackend, convoy: &str, role: 
         opened_at: now,
         state: flotilla_schema::State::new(BindingState::Open, now),
     };
-    let home_key = flotilla_agent::account_access::AccountProvisioners::seeded()
-        .for_access(&access)
-        .expect("claude provisioner")
-        .home_key(&spec)
-        .expect("home key");
-    let binding =
-        flotilla_resources::account_access::PendingBinding { name: binding_name(convoy, role, &access), spec, home_key: Some(home_key) };
+    let binding = flotilla_resources::account_access::PendingBinding { name: binding_name(convoy, role, &access), spec };
     flotilla_resources::account_access::AccountRecords::open(
         &flotilla_store::OldStoreAccounts::new(backend.clone()),
         NAMESPACE,
@@ -77,12 +70,81 @@ pub(super) async fn bind_account_from_home(
         .expect("replicate binding");
 }
 
+/// Freeze one crew aboard Vessel `vessel_ref` (within-convoy name `work`) in convoy
+/// `convoy`'s workflow snapshot, as admission does: the crew's frozen skills are what
+/// its access layer delivers.
+pub(super) async fn freeze_crew(
+    backend: &ResourceBackend,
+    convoy: &str,
+    vessel_ref: &str,
+    role: &str,
+    adapter: &str,
+    skills: Vec<flotilla_resources::SkillCatalogEntry>,
+) {
+    let convoys = backend.using::<Convoy>(NAMESPACE);
+    let created = convoys
+        .create(&empty_meta(convoy), &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build())
+        .await
+        .expect("convoy");
+    let crew = CrewSpec::builder()
+        .role(role.to_string())
+        .skills(flotilla_resources::ResolvedSkills { selected: skills, provenance: Vec::new() })
+        .source(CrewSource::Agent {
+            selector: Selector { capability: "code".into(), adapter: Some(adapter.into()), model: None },
+            prompt: None,
+            brief_template: None,
+        })
+        .build();
+    convoys
+        .update_status(
+            convoy,
+            &created.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus {
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![crew]).build()],
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("frozen workflow");
+    backend
+        .using::<Vessel>(NAMESPACE)
+        .create(
+            &empty_meta(vessel_ref),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: convoy.into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "policy".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
+        .await
+        .expect("vessel");
+}
+
+/// A frozen selection of `name` from the generation's `mattpocock-skills` source.
+pub(super) fn frozen_skill(name: &str) -> flotilla_resources::SkillCatalogEntry {
+    flotilla_resources::SkillCatalogEntry {
+        source: "mattpocock-skills".into(),
+        repository: "flotilla-org/mattpocock-skills".into(),
+        revision: "1".repeat(40),
+        name: name.into(),
+        path: format!("skills/{name}"),
+    }
+}
+
 /// The token prefix a bound Claude launch starts with.
 pub(super) fn claude_token_prefix(home: &str) -> String {
     format!("CLAUDE_CODE_OAUTH_TOKEN=\"$(cat -- '{home}/.flotilla-oauth-token')\" ")
 }
 
-pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, observation: LaunchObservationRecord) {
+pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchObservationRecord) {
     let temp = TempDir::new().expect("tempdir");
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
     fs::create_dir_all(config.base_path()).expect("config directory");
@@ -108,24 +170,11 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("workspace");
     let env_id = EnvironmentId::new("contained-claude");
-    let vessel = backend
-        .using::<Vessel>(NAMESPACE)
-        .create(
-            &empty_meta("demo-work"),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "demo".into(),
-                vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("vessel");
     if !matches!(observation, LaunchObservationRecord::MissingEnvironment) {
         backend
             .using::<Environment>(NAMESPACE)
             .create(
-                &flotilla_crew::reconcilers::vessel::owned_child_meta(env_id.as_str(), &vessel, BTreeMap::new()),
+                &empty_meta(env_id.as_str()),
                 &EnvironmentSpec {
                     cloud_sandbox: None,
                     provider_address: None,
@@ -139,11 +188,7 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
                         required_agent_adapters: BTreeSet::from(["claude-code".into()]),
                         pull_policy: Default::default(),
                         mounts: Vec::new(),
-                        env: if private_home {
-                            BTreeMap::from([(flotilla_resources::CREW_SKILLS_ENV.into(), "{\"coder\":[],\"reviewer\":[]}".into())])
-                        } else {
-                            BTreeMap::new()
-                        },
+                        env: BTreeMap::new(),
                     }),
                 },
             )
@@ -234,13 +279,7 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
     };
     // Managed launch cards read durable context, just as the live command does.
     let backend = daemon.resource_backend();
-    if !matches!(observation, LaunchObservationRecord::MissingConvoy) {
-        backend
-            .using::<Convoy>(NAMESPACE)
-            .create(&empty_meta("demo"), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-            .await
-            .expect("convoy");
-    }
+    freeze_crew(&backend, "demo", "demo-work", "coder", "claude-code", Vec::new()).await;
     let terminal_meta = empty_meta("terminal-demo-work-coder");
     if matches!(observation, LaunchObservationRecord::Present) {
         backend.using::<TerminalSession>(NAMESPACE).create(&terminal_meta, &spec).await.expect("terminal context");
@@ -279,7 +318,7 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
     // The first turn includes the assignment and its capability card, never token material.
     assert!(launch.command.contains("Implement the issue."));
     assert!(launch.command.contains("## Your capabilities"));
-    if matches!(observation, LaunchObservationRecord::MissingConvoy | LaunchObservationRecord::MissingEnvironment) {
+    if matches!(observation, LaunchObservationRecord::MissingEnvironment) {
         assert!(launch.command.contains("Capabilities are currently unavailable"));
         assert!(launch.command.contains("flotilla crew capabilities"));
     } else {

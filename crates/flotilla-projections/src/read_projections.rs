@@ -1885,6 +1885,7 @@ impl ReadProjections<'_> {
             recent_events,
             lifecycle_mutations,
             account_bindings: account_binding_evidence(self.accounts, namespace, &convoy.metadata.name).await?,
+            access_deliveries: access_delivery_evidence(self.backend, namespace, &convoy.metadata.name).await?,
         };
         Ok((explanation, convoy))
     }
@@ -2199,7 +2200,57 @@ pub async fn message_views(
     Ok(message_evidence(backend, namespace, receivers, convoy, aliases).await?.0)
 }
 
-/// [`message_views`], with the held batches among the same Messages (#3455).
+/// What the access layer delivered for a convoy's crews (#3964): per access and place, the
+/// home, each need's mechanism and digest, and a failed delivery's retry.
+pub async fn access_delivery_evidence(
+    backend: &ResourceBackend,
+    namespace: &str,
+    convoy: &str,
+) -> Result<Vec<flotilla_protocol::ExplainedAccessDelivery>, String> {
+    use flotilla_resources::AccessDelivery;
+    let records = backend
+        .query_declared::<AccessDelivery>(
+            namespace,
+            &StoreQuery {
+                labels: BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), convoy.to_string())]),
+                include_replicas: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| format!("read access deliveries: {error}"))?;
+    let mut explained = records
+        .items
+        .iter()
+        .map(|record| {
+            let spec = &record.object.spec;
+            flotilla_protocol::ExplainedAccessDelivery {
+                access: spec.access.clone(),
+                place: spec.place.clone(),
+                harness: spec.harness.clone(),
+                home: spec.home.clone(),
+                needs: spec
+                    .needs
+                    .iter()
+                    .map(|(need, delivered)| flotilla_protocol::ExplainedDeliveredNeed {
+                        need: need.clone(),
+                        mechanism: delivered.mechanism.label().to_string(),
+                        digest: delivered.digest.clone(),
+                    })
+                    .collect(),
+                retry: spec.retry.as_ref().map(|retry| flotilla_protocol::ExplainedDeliveryRetry {
+                    need: retry.need.clone(),
+                    attempts: retry.attempts,
+                    error: retry.error.clone(),
+                    next_at: retry.next_at.to_datetime().map(|at| at.to_rfc3339()).unwrap_or_default(),
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+    explained.sort_by(|left, right| (&left.access, &left.place).cmp(&(&right.access, &right.place)));
+    Ok(explained)
+}
+
 /// Every account binding of a convoy's requesters, open and retired, with its provisions
 /// (#3907): `convoy explain` shows the selected account, how it was chosen and where it is.
 pub async fn account_binding_evidence(
@@ -2270,6 +2321,7 @@ pub async fn account_binding_evidence(
     Ok(explained)
 }
 
+/// [`message_views`], with the held batches among the same Messages (#3455).
 pub async fn message_evidence(
     backend: &flotilla_store::ResourceBackend,
     namespace: &str,

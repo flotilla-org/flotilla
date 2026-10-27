@@ -47,11 +47,6 @@ pub fn declared_account_access(item: &str) -> Option<AccessName> {
         .map(|declaration| AccessName(declaration.account_access.to_string()))
 }
 
-/// Admission's home assignment for a managed crew without an account binding.
-pub fn unbound_crew_home_key(convoy: &str, role: &str, adapter: &str) -> String {
-    flotilla_resources::account_access::requester_home(Path::new(""), convoy, role, adapter).display().to_string()
-}
-
 /// What a declared credential supplies for a family's access: the account it belongs to, as the
 /// declaration states it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,13 +125,11 @@ pub trait AccountProvisioner: Send + Sync {
     fn supplies(&self, consumer: &CredentialConsumer) -> Option<SuppliedAccess>;
     /// The plan for an environment kind, or the reason there is none.
     fn plan(&self, kind: EnvironmentKind) -> Result<ProvisionPlan, String>;
-    /// Assign the requester's relative home key at admission.
-    fn home_key(&self, binding: &flotilla_resources::AccountBindingSpec) -> Result<String, String>;
-    /// Resolve the recorded key under this target's writable base.
-    fn home(&self, writable_base: &Path, key: &str) -> Result<String, String>;
-    /// Write the material into the home at a place; returns the session variables that point
-    /// the harness at it. Never returns the material itself.
-    async fn deliver(&self, home: &str, material: &str, runner: &dyn CommandRunner) -> Result<Vec<(String, String)>, String>;
+    /// The session variables that point the harness at the material delivered into `home`.
+    /// Never the material itself.
+    fn environment(&self, home: &str) -> Vec<(String, String)>;
+    /// Write the material into the home at a place.
+    async fn deliver(&self, home: &str, material: &str, runner: &dyn CommandRunner) -> Result<(), String>;
     /// Delete the delivered copy from the home at a place.
     async fn remove(&self, home: &str, runner: &dyn CommandRunner) -> Result<(), String>;
 }
@@ -235,28 +228,21 @@ impl AccountProvisioner for ClaudeDirect {
         })
     }
 
-    fn home_key(&self, binding: &flotilla_resources::AccountBindingSpec) -> Result<String, String> {
-        let (convoy, role) = flotilla_resources::account_access::requester_parts(&binding.requester)
-            .ok_or("requester has no convoy/role identity for account home assignment")?;
-        Ok(flotilla_resources::account_access::requester_home(Path::new(""), &convoy, &role, "claude").display().to_string())
+    fn environment(&self, home: &str) -> Vec<(String, String)> {
+        vec![
+            ("CLAUDE_CONFIG_DIR".to_string(), home.to_string()),
+            (CLAUDE_OAUTH_TOKEN_FILE_ENV.to_string(), Path::new(home).join(CLAUDE_OAUTH_TOKEN_FILE).display().to_string()),
+        ]
     }
 
-    fn home(&self, writable_base: &Path, key: &str) -> Result<String, String> {
-        flotilla_resources::account_access::join_crew_home(writable_base, key).map(|home| home.display().to_string())
-    }
-
-    async fn deliver(&self, home: &str, material: &str, runner: &dyn CommandRunner) -> Result<Vec<(String, String)>, String> {
+    async fn deliver(&self, home: &str, material: &str, runner: &dyn CommandRunner) -> Result<(), String> {
         if !Path::new(home).is_absolute() {
             return Err(format!("requester home `{home}` is not absolute"));
         }
         let script = "umask 077 && mkdir -p \"$1\" && chmod 700 \"$1\"";
         runner.run("sh", &["-c", script, "flotilla-requester-home", home], Path::new("/"), &ChannelLabel::Default).await?;
         let token_file = Path::new(home).join(CLAUDE_OAUTH_TOKEN_FILE);
-        runner.write_file_with_mode(&token_file, material, 0o600).await?;
-        Ok(vec![
-            ("CLAUDE_CONFIG_DIR".to_string(), home.to_string()),
-            (CLAUDE_OAUTH_TOKEN_FILE_ENV.to_string(), token_file.display().to_string()),
-        ])
+        runner.write_file_with_mode(&token_file, material, 0o600).await
     }
 
     async fn remove(&self, home: &str, runner: &dyn CommandRunner) -> Result<(), String> {

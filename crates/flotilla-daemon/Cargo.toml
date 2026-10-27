@@ -27,6 +27,7 @@ flotilla-agent-connector = { path = "../flotilla-agent-connector" }
 flotilla-executor = { path = "../flotilla-executor" }
 flotilla-config = { path = "../flotilla-config" }
 flotilla-environment = { path = "../flotilla-environment" }
+flotilla-vessel-delivery = { path = "../flotilla-vessel-delivery" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 flotilla-terminal = { path = "../flotilla-terminal" }
 flotilla-discovery = { path = "../flotilla-discovery" }

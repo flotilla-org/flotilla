@@ -1,7 +1,7 @@
 //! Docker resource runtime and provisioning cleanup.
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 
@@ -27,7 +27,7 @@ use flotilla_resources::{
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
-use super::credentials::{agent_material_environment, stage_agent_environment};
+use super::credentials::stage_agent_environment;
 use super::environments::ActiveProvisionedEnvironment;
 use super::state::ControllerRuntimeState;
 use crate::environment_tools::{EnvironmentToolContext, DOCKER_PROVIDER_KIND};
@@ -264,7 +264,15 @@ impl DockerControllerRuntime {
         let mut environment_variables = spec
             .env
             .iter()
-            .filter(|(name, _)| !matches!(name.as_str(), CREDENTIAL_REFS_ENV | CREDENTIAL_SCOPES_ENV | CREDENTIAL_PERMISSIONS_ENV))
+            .filter(|(name, _)| {
+                !matches!(
+                    name.as_str(),
+                    CREDENTIAL_REFS_ENV
+                        | CREDENTIAL_SCOPES_ENV
+                        | CREDENTIAL_PERMISSIONS_ENV
+                        | flotilla_resources::RETIRED_CREW_HOME_KEYS_ENV
+                )
+            })
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
         let credential_config_fragments = match &self.state.credential_store {
@@ -450,15 +458,13 @@ impl DockerControllerRuntime {
         };
 
         let container_id = handle.backing_id().to_string();
-        let delivered_credential_environment = if let Some(store) = &self.state.credential_store {
-            match store
+        // The vessel's work credentials land aboard now; each crew's launch reads its own.
+        if let Some(store) = &self.state.credential_store {
+            if let Err(error) = store
                 .prepare_scoped_with_permissions(name, &credential_refs, &credential_scopes, &credential_permissions, handle.runner())
                 .await
             {
-                Ok(environment) => environment,
-                Err(error) => {
-                    return Err(discard_failed_environment(&handle, Some(store), self.state.agent_material.as_deref(), name, error).await)
-                }
+                return Err(discard_failed_environment(&handle, Some(store), self.state.agent_material.as_deref(), name, error).await);
             }
         } else if !credential_refs.is_empty() {
             return Err(discard_failed_environment(
@@ -469,9 +475,7 @@ impl DockerControllerRuntime {
                 "host-local credential store unavailable".to_string(),
             )
             .await);
-        } else {
-            Vec::new()
-        };
+        }
         let resolved_credential_fragments = match &self.state.credential_store {
             Some(store) => match store.vessel_config_fragments_for_runner(&credential_refs, &spec.env, &*handle.runner()).await {
                 Ok(fragments) => fragments,
@@ -502,129 +506,6 @@ impl DockerControllerRuntime {
                 error,
             )
             .await);
-        }
-        if let Some(agent_material) = &self.state.agent_material {
-            let mut environment = match agent_material_environment(
-                agent_material,
-                &spec.required_agent_adapters,
-                &spec.env,
-                resolved_agent_environment.environment.iter().chain(&delivered_credential_environment).cloned(),
-            ) {
-                Ok(environment) => environment,
-                Err(error) => {
-                    return Err(discard_failed_environment(
-                        &handle,
-                        self.state.credential_store.as_deref(),
-                        self.state.agent_material.as_deref(),
-                        name,
-                        error,
-                    )
-                    .await)
-                }
-            };
-            // ADR 0047: remove forwarding of the legacy selection key one roll
-            // after #2673, once stored environments are rewritten or reaped.
-            for key in [
-                flotilla_resources::CREW_SKILLS_ENV,
-                flotilla_resources::RESOLVED_SKILLS_ENV,
-                flotilla_resources::account_access::CREW_HOME_KEYS_ENV,
-            ] {
-                if let Some(selection) = spec.env.get(key) {
-                    environment.push((key.into(), selection.clone()));
-                }
-            }
-            let mut source_token_files = BTreeMap::new();
-            let will_stage_skills =
-                match agent_material.will_stage_skills(&spec.required_agent_adapters, &environment, &*handle.runner()).await {
-                    Ok(will_stage) => will_stage,
-                    Err(error) => {
-                        return Err(discard_failed_environment(
-                            &handle,
-                            self.state.credential_store.as_deref(),
-                            self.state.agent_material.as_deref(),
-                            name,
-                            error,
-                        )
-                        .await)
-                    }
-                };
-            if will_stage_skills {
-                let requests = match agent_material.selected_skill_source_credentials(&environment).await {
-                    Ok(requests) => requests,
-                    Err(error) => {
-                        return Err(discard_failed_environment(
-                            &handle,
-                            self.state.credential_store.as_deref(),
-                            self.state.agent_material.as_deref(),
-                            name,
-                            error,
-                        )
-                        .await)
-                    }
-                };
-                let mut prepared_by_credential: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
-                for request in requests {
-                    let token_file = if let Some((repository, token_file)) = prepared_by_credential.get(&request.credential) {
-                        if repository != &request.repository {
-                            tracing::warn!(environment = name, source = %request.source, revision = %request.revision, credential = %request.credential, error = "one credential cannot be narrowed to multiple source repositories", "skill-source credential mint failed");
-                            let error = format!(
-                                "skill source {} credential {} mint failed: one credential cannot be narrowed to multiple source repositories",
-                                request.source, request.credential
-                            );
-                            return Err(discard_failed_environment(
-                                &handle,
-                                self.state.credential_store.as_deref(),
-                                self.state.agent_material.as_deref(),
-                                name,
-                                error,
-                            )
-                            .await);
-                        }
-                        token_file.clone()
-                    } else {
-                        let Some(store) = &self.state.credential_store else {
-                            tracing::warn!(environment = name, source = %request.source, revision = %request.revision, credential = %request.credential, error = "host-local credential store unavailable", "skill-source credential mint failed");
-                            let error = format!(
-                                "skill source {} credential {} mint failed: host-local credential store unavailable",
-                                request.source, request.credential
-                            );
-                            return Err(discard_failed_environment(&handle, None, self.state.agent_material.as_deref(), name, error).await);
-                        };
-                        match store.prepare_skill_source(&request.credential, &request.repository, &*handle.runner()).await {
-                            Ok(token_file) => {
-                                prepared_by_credential.insert(request.credential.clone(), (request.repository.clone(), token_file.clone()));
-                                token_file
-                            }
-                            Err(error) => {
-                                tracing::warn!(environment = name, source = %request.source, revision = %request.revision, credential = %request.credential, %error, "skill-source credential mint failed");
-                                let error =
-                                    format!("skill source {} credential {} mint failed: {error}", request.source, request.credential);
-                                return Err(discard_failed_environment(
-                                    &handle,
-                                    self.state.credential_store.as_deref(),
-                                    self.state.agent_material.as_deref(),
-                                    name,
-                                    error,
-                                )
-                                .await);
-                            }
-                        }
-                    };
-                    source_token_files.insert(request.source, token_file);
-                }
-            }
-            if let Err(error) =
-                agent_material.stage_skills(name, &spec.required_agent_adapters, &environment, &source_token_files, &*handle.runner()).await
-            {
-                return Err(discard_failed_environment(
-                    &handle,
-                    self.state.credential_store.as_deref(),
-                    self.state.agent_material.as_deref(),
-                    name,
-                    error,
-                )
-                .await);
-            }
         }
         for delivery in &material_deliveries {
             let args = delivery.preflight.args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -726,7 +607,6 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         spec: &EnvironmentSpec,
     ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
         use flotilla_provisioning::reconcilers::EnvironmentProvisioning;
-        super::credentials::validate_environment_home_keys(spec)?;
         if let Some(cloud) = &spec.cloud_sandbox {
             let carrier = flotilla_resources::DockerEnvironmentSpec {
                 host_ref: self.state.local_host_ref.clone(),

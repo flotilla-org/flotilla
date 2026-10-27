@@ -2352,8 +2352,6 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
             .build(),
         CrewSpec::builder()
             .role("reviewer".to_string())
-            // This brief fixture bypasses admission; supply its opaque caller-owned home key.
-            .labels(BTreeMap::from([(flotilla_resources::account_access::CREW_HOME_KEY_LABEL.into(), "test-reviewer-home".into())]))
             .source(CrewSource::Agent {
                 selector: Selector::for_capability("review"),
                 prompt: Some("Review the coder's work.".to_string()),

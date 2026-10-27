@@ -151,7 +151,7 @@ pub use credential::{
     CredentialSpecSpec, LandingCredentialScope, RepositoryTrust, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV,
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG,
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, CREW_SKILLS_ENV, INITIAL_AUTHORIZATION_EPOCH,
-    RESOLVED_SKILLS_ENV,
+    RESOLVED_SKILLS_ENV, RETIRED_CREW_HOME_KEYS_ENV,
 };
 pub use crew_image_baseline::{CrewImageBaseline, CrewImageBaselineSpec};
 pub use dispatch_hold::{
@@ -257,6 +257,7 @@ pub use watch::{ResourceList, ResourcePosition, ResourceTombstone, WatchEvent, W
 #[macro_export]
 macro_rules! for_each_registered_resource {
     ($callback:ident, $($argument:expr),* $(,)?) => {{
+        $callback::<$crate::AccessDelivery>($($argument),*);
         $callback::<$crate::AccountBinding>($($argument),*);
         $callback::<$crate::AccountProvision>($($argument),*);
         $callback::<$crate::Artifact>($($argument),*);

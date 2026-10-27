@@ -292,6 +292,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         ],
         settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
         account_bindings: Vec::new(),
+        access_deliveries: Vec::new(),
     };
 
     // Every claim renders the active-process marker, including a superseded
@@ -346,6 +347,34 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         "  Grants: claude-box-accounts; epochs: 1 -> 2",
         "  Excluded claude-max: host `b1` does not hold it",
         "  Provisioned at env-b1 (agentless-ssh): claude-direct oauth-token-file:CLAUDE_CONFIG_DIR into /state/agent-homes/requesters/c1/coder/claude, update push, delivered epoch 2",
+    ] {
+        assert!(rendered.contains(expected), "{expected}\n{rendered}");
+    }
+    // Glue (#3964): explain shows each access's home, the mechanism and digest per need,
+    // and a failed delivery's retry.
+    let mut deliveries = explanation.clone();
+    deliveries.access_deliveries = vec![flotilla_protocol::ExplainedAccessDelivery {
+        access: "flotilla/c1/work/coder".into(),
+        place: "env-b1".into(),
+        harness: "claude".into(),
+        home: "/state/agent-homes/requesters/c1/coder/claude".into(),
+        needs: vec![flotilla_protocol::ExplainedDeliveredNeed {
+            need: "skills".into(),
+            mechanism: "agent-fetch(url)".into(),
+            digest: "5e1f".into(),
+        }],
+        retry: Some(flotilla_protocol::ExplainedDeliveryRetry {
+            need: "account".into(),
+            attempts: 2,
+            error: "mint failed".into(),
+            next_at: "2026-10-27T12:00:02+00:00".into(),
+        }),
+    }];
+    let rendered = format_convoy_explanation_human(&deliveries);
+    for expected in [
+        "Delivered flotilla/c1/work/coder at env-b1 (claude) into /state/agent-homes/requesters/c1/coder/claude",
+        "  skills: agent-fetch(url) 5e1f",
+        "  Failed at account (attempt 2), retrying after 2026-10-27T12:00:02+00:00: mint failed",
     ] {
         assert!(rendered.contains(expected), "{expected}\n{rendered}");
     }
@@ -520,6 +549,7 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         recent_events: Vec::new(),
         lifecycle_mutations: Vec::new(),
         account_bindings: Vec::new(),
+        access_deliveries: Vec::new(),
     };
 
     let output = format_convoy_explanation_human(&explanation);

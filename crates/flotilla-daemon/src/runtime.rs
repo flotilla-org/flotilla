@@ -1,5 +1,6 @@
 //! Daemon composition, startup restoration, and resource-controller wiring.
 
+mod access_layer;
 mod account_access;
 pub(crate) mod agentless_vessels;
 pub(crate) mod archive;
@@ -1165,6 +1166,11 @@ fn spawn_controller_loops(
             move |_backend, namespace| account_access::run_provision_controller(Arc::clone(&state), namespace, controller_resync_interval),
         )
     });
+    // #3964: each access's delivery status, removed with its place or convoy.
+    controllers.push(controller!(flotilla_resources::AccessDelivery, {
+        let state = Arc::clone(&state);
+        move |_backend: ResourceBackend, namespace: String| access_layer::status::status_controller(Arc::clone(&state), namespace)
+    }));
     controllers
 }
 

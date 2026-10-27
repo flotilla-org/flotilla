@@ -755,11 +755,6 @@ impl ConvoyAdmission {
                 &intent.account_pins,
             )
             .await?;
-        crate::account_access::apply_crew_home_keys(
-            &admission.name,
-            &mut admission.workflow.vessels,
-            &crate::account_access::pending_home_keys(&bindings),
-        )?;
         self.create_convoy_with_workflow_snapshot(
             namespace,
             &admission.name,
@@ -1464,11 +1459,6 @@ impl ConvoyAdmission {
                 &[],
             )
             .await?;
-        crate::account_access::apply_crew_home_keys(
-            &admission.name,
-            &mut admission.workflow.vessels,
-            &crate::account_access::pending_home_keys(&bindings),
-        )?;
         let workflow_value = serde_json::to_value(&admission.workflow).map_err(|error| error.to_string())?;
         let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
         ensure_prepared_workflow_snapshot(&self.backend, namespace, &workflow_name, &admission.workflow).await?;
@@ -1616,13 +1606,6 @@ impl ConvoyAdmission {
             Ok(bindings) => bindings,
             Err(message) => return CommandValue::Error { message },
         };
-        let mut workflow = workflow.clone();
-        if let Err(message) =
-            crate::account_access::apply_crew_home_keys(name, &mut workflow.vessels, &crate::account_access::pending_home_keys(&bindings))
-        {
-            return CommandValue::Error { message };
-        }
-        let workflow = &workflow;
         match self
             .create_convoy_with_workflow_snapshot(
                 namespace,
@@ -1697,24 +1680,11 @@ impl ConvoyAdmission {
         namespace: &str,
         convoy: &str,
     ) -> Result<Vec<(String, crate::account_access::BindingChange)>, String> {
-        let mut convoy = match self.backend.clone().using::<ResourceConvoy>(namespace).get(convoy).await {
+        let convoy = match self.backend.clone().using::<ResourceConvoy>(namespace).get(convoy).await {
             Ok(convoy) => convoy,
             Err(ResourceError::NotFound { .. }) => return Ok(Vec::new()),
             Err(error) => return Err(format!("read convoy `{convoy}`: {error}")),
         };
-        let keys = crate::account_access::recover_home_keys(&*self.accounts, namespace, &convoy.metadata.name).await?;
-        if let Some(mut status) = convoy.status.clone() {
-            if let Some(snapshot) = &mut status.workflow_snapshot {
-                if crate::account_access::apply_crew_home_keys(&convoy.metadata.name, &mut snapshot.vessels, &keys)? {
-                    convoy = self
-                        .backend
-                        .using::<ResourceConvoy>(namespace)
-                        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &status)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
-            }
-        }
         let now = flotilla_schema::Timestamp::from_datetime(&self.clock.now());
         let (mut changes, unbound) =
             crate::account_access::reconcile_convoy_bindings(&self.backend, &*self.accounts, namespace, &convoy, now).await?;

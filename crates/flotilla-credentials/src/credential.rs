@@ -5009,10 +5009,7 @@ interactions:
             for file in HARNESS_AUTH_FILES {
                 write(&delivered.join(file), b"delivered secret");
             }
-            // Existing base and crew sessions survive the directory separation.
-            for relative in ["sessions/base.jsonl", "crews/coder/sessions/crew.jsonl"] {
-                write(&delivered.join(relative), b"old session");
-            }
+            write(&delivered.join("sessions/base.jsonl"), b"old session");
             let home = if name == "central-login" {
                 for file in HARNESS_AUTH_FILES {
                     write(&Path::new(CONTAINED_CODEX_HOME).join(file), b"central secret");
@@ -5021,27 +5018,15 @@ interactions:
             } else {
                 prepare_harness_home(&paths, name, harness, &*runner).await.unwrap()
             };
-            let key = if name == "central-login" {
-                "agent-homes/central-checkpoint/codex/coder".to_string()
-            } else {
-                Path::new(&home).strip_prefix(CONTAINED_WRITABLE_CONFIG_BASE).unwrap().join("crews/coder").display().to_string()
-            };
-            let crew_env = registry
-                .crew_environment(
-                    "coder",
-                    &BTreeSet::from([adapter.into()]),
-                    &[
-                        (variable.into(), home.clone()),
-                        (flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(), serde_json::json!({"coder":key}).to_string()),
-                    ],
-                    &*runner,
-                )
-                .await
-                .unwrap();
-            let crew = PathBuf::from(&crew_env.iter().find(|(key, _)| key == variable).unwrap().1);
-            assert_ne!(crew, Path::new(&home), "selection must give each crew private scratch");
+            // The crew's own home, as the access layer delivers it, links the delivered login.
+            let crew = Path::new(CONTAINED_WRITABLE_CONFIG_BASE).join(format!("agent-homes/requesters/{name}/coder")).join(harness);
+            let login = registry
+                .harness_login(adapter, &[(variable.into(), home.clone())], Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
+                .expect("Codex links a login");
+            let agent = flotilla_environment::environment::vessel_ops::RunnerVesselAgent(runner.clone());
+            flotilla_environment::environment::VesselAgent::create_dir(&agent, &crew, 0o700).await.unwrap();
+            login.link(&crew, &agent).await.unwrap();
             if name != "central-login" {
-                assert_eq!(std::fs::read(runner.map(crew.join("sessions/crew.jsonl").to_str().unwrap())).unwrap(), b"old session");
                 write(&Path::new(&home).join("sessions/base.jsonl"), b"new session");
                 write(&delivered.join("auth.json"), b"rotated secret");
                 prepare_harness_home(&paths, name, harness, &*runner).await.unwrap();

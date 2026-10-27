@@ -3543,21 +3543,7 @@ async fn invalid_issue_need_admits_with_warning_in_result_and_explain() {
     let admitted = admitted_convoy(&backend, "triage-label").await;
     let baseline = backend.definitions::<WorkflowTemplate>("flotilla").get(&frozen_needs(&baseline)).await.unwrap();
     let frozen = backend.definitions::<WorkflowTemplate>("flotilla").get(&frozen_needs(&admitted)).await.unwrap();
-    // An invalid tracker hint cannot change capability needs. Caller-owned home
-    // keys belong to each admitted convoy and are unrelated to that invariant.
-    let capability_needs = |vessels: &[flotilla_resources::VesselRequirement]| {
-        vessels
-            .iter()
-            .map(|vessel| {
-                (
-                    vessel.name.clone(),
-                    vessel.needs.clone(),
-                    vessel.crew.iter().map(|crew| (crew.role.clone(), crew.needs.clone())).collect::<Vec<_>>(),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(capability_needs(&frozen.spec.vessels), capability_needs(&baseline.spec.vessels));
+    assert_eq!(frozen.spec.vessels, baseline.spec.vessels);
     let result = daemon
         .execute_query(
             Command::builder()

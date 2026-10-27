@@ -292,21 +292,6 @@ pub fn requester_home(base: &std::path::Path, convoy: &str, role: &str, harness:
     base.join("agent-homes").join("requesters").join(component(convoy)).join(component(role)).join(harness)
 }
 
-/// Admission-owned key on a recorded crew entry; consumers never derive it from identity.
-pub const CREW_HOME_KEY_LABEL: &str = "flotilla.work/requester-home-key";
-/// Role-to-relative-home-key map supplied alongside frozen skills.
-pub const CREW_HOME_KEYS_ENV: &str = "FLOTILLA_CREW_HOME_KEYS";
-pub const REQUESTER_HOME_UNAVAILABLE: &str = "RequesterHomeUnavailable:";
-
-pub fn join_crew_home(base: &std::path::Path, key: &str) -> Result<std::path::PathBuf, String> {
-    use std::path::Component;
-    let path = std::path::Path::new(key);
-    if key.is_empty() || !path.components().all(|part| matches!(part, Component::Normal(_))) {
-        return Err(format!("{REQUESTER_HOME_UNAVAILABLE} invalid relative home key `{key}`"));
-    }
-    Ok(base.join(path))
-}
-
 /// The material generation a delivery records (#3910 owner ruling 3): a short digest of the
 /// published material, so a refreshed file is told apart without storing or logging it.
 pub fn material_generation(material: &str) -> String {
@@ -344,9 +329,6 @@ pub struct BindingRecord {
     /// The store's version, compared only for equality.
     pub version: String,
     pub spec: AccountBindingSpec,
-    /// The requester's home, relative to a place's writable base: admission's assignment,
-    /// recorded so delivery and staging never derive it (#3953).
-    pub home_key: Option<String>,
 }
 
 /// A provision as its readers see it.
@@ -364,9 +346,6 @@ pub struct PendingBinding {
     /// The requester's binding name ([`binding_name`]).
     pub name: String,
     pub spec: AccountBindingSpec,
-    /// The requester's home, relative to a place's writable base: admission's assignment,
-    /// recorded so delivery and staging never derive it (#3953).
-    pub home_key: Option<String>,
 }
 
 /// What changed, for the account controllers' wake-ups.
@@ -415,8 +394,6 @@ pub trait AccountRecords: Send + Sync {
     async fn regrant(&self, namespace: &str, binding: &BindingRecord, grants: BTreeMap<GrantName, GrantScope>) -> Result<(), String>;
     /// Appends the credential's next authorisation epoch to an open binding.
     async fn observe_epoch(&self, namespace: &str, binding: &BindingRecord, epoch: EpochEntry) -> Result<(), String>;
-    /// Records an open binding's home key, for a binding an earlier generation opened without one.
-    async fn record_home_key(&self, namespace: &str, binding: &BindingRecord, key: &str) -> Result<(), String>;
     /// An explicit rebind (#3882): the requester's open binding, if any, closes for `rebind` with
     /// `delivered_until`, kept for attribution, and `opened` opens in its place.
     async fn rebind(

@@ -11,10 +11,10 @@ use flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE;
 use flotilla_environment::environment::runner::{CONTAINED_CODEX_AUTH_FILE, HARNESS_AUTH_FILES};
 use flotilla_environment::environment::ProvisionedMount;
 use flotilla_environment::environment::ProvisionedMountMode;
+use flotilla_environment::environment::{EntryKind, VesselAgent};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
-use flotilla_resources::account_access::{join_crew_home, CREW_HOME_KEYS_ENV, REQUESTER_HOME_UNAVAILABLE};
 use flotilla_vcs::providers::skill_source::stage_git_skill_sources;
 use flotilla_vcs::providers::skill_source::STAGE_DIAGNOSTIC_PREFIX;
 use flotilla_vcs::providers::skill_source::STAGE_RETRYABLE_PREFIX;
@@ -71,6 +71,109 @@ pub struct SkillSourceCredentialRequest {
     pub credential: String,
 }
 
+/// The home variable and directory name a harness's crews use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HarnessHome {
+    /// The variable that points the harness at its home (`CLAUDE_CONFIG_DIR`).
+    pub variable: &'static str,
+    /// The harness's directory name inside a requester's home (`claude`).
+    pub name: &'static str,
+}
+
+/// The login a crew links into its own home: from the vessel's delivered home, or,
+/// without one, the target's ambient login. Credentials are linked, never copied, so
+/// a refresh in one place reaches every crew (#1906).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessLogin {
+    base: Option<PathBuf>,
+}
+
+impl HarnessLogin {
+    /// Content identity of what the crew's home links to.
+    pub fn digest(&self) -> String {
+        match &self.base {
+            Some(base) => format!("delivered:{}", base.display()),
+            None => "ambient".to_string(),
+        }
+    }
+
+    /// Link the login into `home` through the vessel's agent. A delivered home's static
+    /// config seeds the crew once; later edits there never overwrite the crew's own.
+    /// Credentials are linked, never copied, so a refresh reaches every crew. Without a
+    /// delivered home, the target's ambient login is linked only when the home has
+    /// none, and the host user's configuration is never copied or written.
+    pub async fn link(&self, home: &Path, agent: &dyn VesselAgent) -> Result<(), String> {
+        let failed = |error: String| format!("link harness login into {}: {error}", home.display());
+        let Some(base) = &self.base else {
+            let ambient = agent
+                .commands()
+                .run(
+                    "sh",
+                    &["-c", r#"printf '%s' "${CODEX_HOME:-$HOME/.codex}""#, "flotilla-ambient-home"],
+                    Path::new("/"),
+                    &ChannelLabel::Default,
+                )
+                .await
+                .map_err(failed)?;
+            let (link, login) = (home.join("auth.json"), Path::new(ambient.trim()).join("auth.json"));
+            if agent.stat(&link).await.map_err(failed)?.is_none()
+                && matches!(agent.stat(&login).await.map_err(failed)?, Some(EntryKind::File | EntryKind::Symlink))
+            {
+                agent.symlink(&link, &login).await.map_err(failed)?;
+            }
+            return Ok(());
+        };
+        for file in ["config.toml", "settings.json", ".claude.json"] {
+            if agent.stat(&home.join(file)).await.map_err(failed)?.is_none() {
+                if let Some(bytes) = agent.read(&base.join(file), STATIC_CONFIG_LIMIT).await.map_err(failed)? {
+                    agent.write(&home.join(file), bytes, 0o600).await.map_err(failed)?;
+                }
+            }
+        }
+        for file in HARNESS_AUTH_FILES {
+            // A delivered login may itself be a link to the delivered material.
+            if matches!(agent.stat(&base.join(file)).await.map_err(failed)?, Some(EntryKind::File | EntryKind::Symlink)) {
+                agent.symlink(&home.join(file), &base.join(file)).await.map_err(failed)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A harness's static config file is small; anything larger is not one to seed.
+const STATIC_CONFIG_LIMIT: u64 = 1024 * 1024;
+
+/// A crew's frozen skill selection with the authorized sources it is fetched from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillTree {
+    sources: Vec<SkillSource>,
+    selected: Vec<flotilla_resources::SkillCatalogEntry>,
+}
+
+impl SkillTree {
+    /// Content identity: every source at its pinned revision, and every selected path.
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let identity = serde_json::json!({"sources": self.sources, "selected": self.selected});
+        format!("{:x}", Sha256::digest(identity.to_string().as_bytes()))
+    }
+
+    /// The source credentials staging needs, one per credentialed source.
+    pub fn credentials(&self) -> Vec<SkillSourceCredentialRequest> {
+        self.sources
+            .iter()
+            .filter_map(|source| {
+                source.credential.clone().map(|credential| SkillSourceCredentialRequest {
+                    source: source.name.clone(),
+                    repository: source.repository.clone(),
+                    revision: source.revision.clone(),
+                    credential,
+                })
+            })
+            .collect()
+    }
+}
+
 #[async_trait]
 trait AgentMaterialAdapter: Send + Sync {
     fn id(&self) -> &'static str;
@@ -84,34 +187,9 @@ trait AgentMaterialAdapter: Send + Sync {
         false
     }
 
-    fn skill_destination(&self, environment: &[(String, String)], config_base: &Path) -> Result<Option<PathBuf>, String> {
-        let variable = self.config_home_variable();
-        let Some(config_home) = environment.iter().find(|(name, _)| name == variable).map(|(_, value)| PathBuf::from(value)) else {
-            return if self.externally_managed_home_opts_out_of_skills() {
-                Ok(None)
-            } else {
-                Err(format!("contained {} skill staging requires seam-resolved `{variable}`", self.id()))
-            };
-        };
-        if !self.is_managed_config_home(&config_home, config_base) {
-            return if self.externally_managed_home_opts_out_of_skills() {
-                Ok(None)
-            } else {
-                Err(format!("contained {} skill target {} is outside {}", self.id(), config_home.display(), config_base.display()))
-            };
-        }
-        Ok(Some(config_home.join("skills")))
-    }
-
     /// Directory name of this harness's home under a host environment's
     /// flotilla-owned agent home.
     fn host_home_name(&self) -> &'static str;
-
-    /// Make the host's own login usable from a freshly selected flotilla home
-    /// without writing the host user's harness configuration.
-    async fn adopt_ambient_login(&self, _home: &Path, _runner: &dyn CommandRunner) -> Result<(), String> {
-        Ok(())
-    }
 
     fn requires_skills_for_prepare(&self, environment: &BTreeMap<String, String>) -> bool {
         !self.externally_managed_home_opts_out_of_skills() || !environment.contains_key(self.config_home_variable())
@@ -186,305 +264,92 @@ impl AgentMaterialRegistry {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) async fn stage_test_skills(
+    /// The home a crew of `adapter` runs in, when this registry manages its material.
+    pub fn harness_home(&self, adapter: &str) -> Option<HarnessHome> {
+        self.adapters
+            .get(adapter)
+            .map(|material| HarnessHome { variable: material.config_home_variable(), name: material.host_home_name() })
+    }
+
+    /// The login a crew of `adapter` links into its own home, when its harness has one
+    /// to share: the managed home the vessel's credential delivery resolved
+    /// (`environment` is the resolved launch environment), otherwise the target's
+    /// ambient login. Never one whose crews run on a bound account (#3907).
+    pub fn harness_login(&self, adapter: &str, environment: &[(String, String)], config_base: &Path) -> Option<HarnessLogin> {
+        let material = self.adapters.get(adapter)?;
+        if material.requester_bound() {
+            return None;
+        }
+        let variable = material.config_home_variable();
+        let base = environment.iter().rev().find(|(name, _)| name == variable).map(|(_, home)| PathBuf::from(home)).filter(|home| {
+            // `starts_with` compares components lexically, so a `..` could climb out of
+            // the base while appearing inside it.
+            home.is_absolute()
+                && home.components().all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+                && material.is_managed_config_home(home, config_base)
+        });
+        Some(HarnessLogin { base })
+    }
+
+    /// A crew's frozen skill selection, resolved against this generation's authorized
+    /// sources (ADR 0052): the tree the access layer delivers into the crew's home.
+    pub async fn skill_tree(&self, selected: &[flotilla_resources::SkillCatalogEntry]) -> Result<SkillTree, String> {
+        let sources = if selected.is_empty() { Ok(Vec::new()) } else { self.skills.selected_sources(selected).await };
+        match sources.and_then(|sources| {
+            one_repository_per_credential(&sources).map_err(|(source, error)| format!("{error}\n{STAGE_SOURCE_PREFIX}{source}"))?;
+            Ok(sources)
+        }) {
+            Ok(sources) => Ok(SkillTree { sources, selected: selected.to_vec() }),
+            Err(error) => Err(self.report_skill_failure(&error, selected).await),
+        }
+    }
+
+    /// Warn with the failing source, its frozen revision and its credential, and return the
+    /// error without its source marker.
+    async fn report_skill_failure(&self, error: &str, selected: &[flotilla_resources::SkillCatalogEntry]) -> String {
+        let source_name = error.lines().rev().find_map(|line| line.strip_prefix(STAGE_SOURCE_PREFIX));
+        let source = match self.skills.source.clone() {
+            Some(path) => tokio::task::spawn_blocking(move || inspect_skill_sources(&path))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|inspection| inspection.sources.into_iter().find(|source| Some(source.name.as_str()) == source_name)),
+            None => None,
+        };
+        let revision = selected
+            .iter()
+            .find(|entry| Some(entry.source.as_str()) == source_name)
+            .map(|entry| entry.revision.as_str())
+            .or_else(|| source.as_ref().map(|source| source.revision.as_str()));
+        warn!(
+            source = source_name.unwrap_or("skill-bundle"),
+            revision = revision.unwrap_or("unresolved"),
+            credential = source.as_ref().and_then(|source| source.credential.as_deref()).unwrap_or("none"),
+            %error,
+            "skill staging failed"
+        );
+        error.lines().filter(|line| !line.starts_with(STAGE_SOURCE_PREFIX)).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Place `tree` at `destination` through `runner`, fetching each source at its
+    /// pinned revision in the vessel. Removes the source token files afterwards,
+    /// whether or not staging succeeds.
+    pub async fn stage_skill_tree(
         &self,
-        environment_ref: &str,
-        required_adapters: &BTreeSet<String>,
-        environment: &[(String, String)],
+        tree: &SkillTree,
+        destination: &Path,
         source_token_files: &BTreeMap<String, PathBuf>,
         runner: &dyn CommandRunner,
     ) -> Result<(), String> {
-        let inspection = inspect_skill_sources(self.skills.source.as_ref().expect("test source"))?;
-        let selected = inspection
-            .sources
-            .iter()
-            .map(|source| flotilla_resources::SkillCatalogEntry {
-                source: source.name.clone(),
-                repository: source.repository.clone(),
-                revision: source.revision.clone(),
-                name: "private-source".to_string(),
-                path: format!("{}/private-folder", source.paths[0]),
-            })
-            .collect::<Vec<_>>();
-        let mut environment = environment.to_vec();
-        environment.push((flotilla_resources::RESOLVED_SKILLS_ENV.to_string(), serde_json::to_string(&selected).expect("test selection")));
-        self.stage_skills(environment_ref, required_adapters, &environment, source_token_files, runner).await
-    }
-
-    pub fn stage_skills<'a>(
-        &'a self,
-        environment_ref: &'a str,
-        required_adapters: &'a BTreeSet<String>,
-        environment: &'a [(String, String)],
-        source_token_files: &'a BTreeMap<String, PathBuf>,
-        runner: &'a dyn CommandRunner,
-    ) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(async move {
-            let adapters = required_adapters.iter().filter_map(|adapter_id| self.adapters.get(adapter_id.as_str())).collect::<Vec<_>>();
-            let result = async {
-                if let Some(crews) = decode_crew_skills(environment)? {
-                    let count = crews.len();
-                    if count == 0 {
-                        return remove_source_token_files(source_token_files, runner).await;
-                    }
-                    for (index, (role, selected)) in crews.into_iter().enumerate() {
-                        let mut crew_environment = self.crew_environment(&role, required_adapters, environment, runner).await?;
-                        crew_environment.retain(|(key, _)| {
-                            key != flotilla_resources::CREW_SKILLS_ENV && key != flotilla_resources::RESOLVED_SKILLS_ENV
-                        });
-                        crew_environment.push((
-                            flotilla_resources::RESOLVED_SKILLS_ENV.into(),
-                            serde_json::to_string(&selected).expect("resolved skills serialize"),
-                        ));
-                        self.skills
-                            .stage(environment_ref, &adapters, &crew_environment, source_token_files, runner, index + 1 == count)
-                            .await?;
-                    }
-                    Ok(())
-                } else {
-                    // ADR 0047: remove this legacy branch one fleet roll after #2673,
-                    // once stored environments have been rewritten or reaped.
-                    self.skills.stage(environment_ref, &adapters, environment, source_token_files, runner, true).await
-                }
-            }
-            .await;
-            if let Err(ref error) = result {
-                let selected = decode_selected_skills(environment).unwrap_or_default();
-                let source_name = error.lines().rev().find_map(|line| line.strip_prefix(STAGE_SOURCE_PREFIX));
-                let source = if let Some(path) = self.skills.source.clone() {
-                    tokio::task::spawn_blocking(move || inspect_skill_sources(&path))
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .and_then(|inspection| inspection.sources.into_iter().find(|source| Some(source.name.as_str()) == source_name))
-                } else {
-                    None
-                };
-                let revision = selected
-                    .iter()
-                    .find(|entry| Some(entry.source.as_str()) == source_name)
-                    .map(|entry| entry.revision.as_str())
-                    .or_else(|| source.as_ref().map(|source| source.revision.as_str()));
-                warn!(
-                    environment = environment_ref,
-                    source = source_name.unwrap_or("skill-bundle"),
-                    revision = revision.unwrap_or("unresolved"),
-                    credential = source.as_ref().and_then(|source| source.credential.as_deref()).unwrap_or("none"),
-                    %error,
-                    "skill staging failed"
-                );
+        match self.skills.stage(tree, destination, source_token_files, runner).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
                 if let Err(error) = remove_source_token_files(source_token_files, runner).await {
                     warn!(%error, "failed to clean skill-source tokens after staging error");
                 }
+                Err(self.report_skill_failure(&error, &tree.selected).await)
             }
-            result.map_err(|error| error.lines().filter(|line| !line.starts_with(STAGE_SOURCE_PREFIX)).collect::<Vec<_>>().join("\n"))
-        })
-    }
-
-    /// Selects a crew's private scratch home while keeping refreshed credentials
-    /// linked to the vessel's delivered material. Used by staging and launch.
-    pub fn crew_environment<'a>(
-        &'a self,
-        role: &'a str,
-        required_adapters: &'a BTreeSet<String>,
-        environment: &'a [(String, String)],
-        runner: &'a dyn CommandRunner,
-    ) -> BoxFuture<'a, Result<Vec<(String, String)>, String>> {
-        Box::pin(async move {
-            let config_base = runner.writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE)).await?;
-            let mut result = environment.to_vec();
-            let homes = decode_crew_home_keys(environment)?;
-            for adapter in required_adapters.iter().filter_map(|id| self.adapters.get(id.as_str())) {
-                let variable = adapter.config_home_variable();
-                // Provisioning stages a requester's skills into the home its binding will
-                // deliver into, so launch and staging use one directory.
-                if adapter.requester_bound() {
-                    let Some(key) = homes.get(role) else {
-                        if environment.iter().any(|(name, home)| {
-                            name == variable
-                                && Path::new(home).starts_with(config_base.join("agent-homes/requesters"))
-                                && Path::new(home)
-                                    .components()
-                                    .all(|part| matches!(part, std::path::Component::RootDir | std::path::Component::Normal(_)))
-                        }) {
-                            continue;
-                        }
-                        return Err(format!("{REQUESTER_HOME_UNAVAILABLE} crew `{role}` has no supplied home key"));
-                    };
-                    let home = join_crew_home(&config_base, key)?.display().to_string();
-                    runner
-                        .run(
-                            "sh",
-                            &["-c", "umask 077 && mkdir -p \"$1\"", "flotilla-requester-home", &home],
-                            Path::new("/"),
-                            &ChannelLabel::Default,
-                        )
-                        .await?;
-                    result.retain(|(key, _)| key != variable);
-                    result.push((variable.into(), home));
-                    continue;
-                }
-                let Some(destination) = adapter.skill_destination(environment, &config_base)? else { continue };
-                let base = destination.parent().expect("skill directory has a parent");
-                let Some(key) = homes.get(role) else {
-                    // A role-keyed skill selection requires private destinations, even for Codex.
-                    if decode_crew_skills(environment)?.is_some() {
-                        return Err(format!("{REQUESTER_HOME_UNAVAILABLE} crew `{role}` has no supplied home key"));
-                    }
-                    // Legacy/non-managed callers keep their explicit adapter home. Only
-                    // relocation is skipped; stage_skills still stages into that home.
-                    continue;
-                };
-                let home = join_crew_home(&config_base, key)?;
-                // Static config seeds scratch once: later base edits intentionally do
-                // not overwrite crew-owned config or state. Auth follows atomic
-                // rotations in the delivered base. Never copy skills or other crews' state.
-                runner
-                    .run(
-                        "sh",
-                        &[
-                            "-c",
-                            &format!(
-                                r#"set -eu
-mkdir -p "$2"
-for file in config.toml settings.json .claude.json; do
-  if [ -f "$1/$file" ] && [ ! -e "$2/$file" ]; then cp "$1/$file" "$2/$file"; fi
-done
-for file in {}; do
-  if [ -f "$1/$file" ]; then ln -sf "$1/$file" "$2/$file"; fi
-done"#,
-                                HARNESS_AUTH_FILES.join(" ")
-                            ),
-                            "flotilla-crew-home",
-                            &base.to_string_lossy(),
-                            &home.to_string_lossy(),
-                        ],
-                        Path::new("/"),
-                        &ChannelLabel::Default,
-                    )
-                    .await?;
-                result.retain(|(key, _)| key != variable);
-                result.push((variable.into(), home.to_string_lossy().into_owned()));
-            }
-            Ok(result)
-        })
-    }
-
-    /// #3655: a session on an agentless host takes the contained harness path.
-    /// The host has no image and no mounts, so each required harness's config
-    /// home is selected under the host runner's writable base: a delivered
-    /// credential home already there (the Claude OAuth or Codex key delivery)
-    /// is kept, and anything else, including a home pointing at the host
-    /// user's own configuration, is replaced by
-    /// `<base>/agent-homes/<environment>/<harness>`. Per-crew homes then follow
-    /// [`Self::crew_environment`], as they do for Docker vessels. The adapter
-    /// seeds onboarding and workspace trust into the selected home; the host
-    /// user's `~/.claude`, `~/.claude.json` and `~/.codex` are never selected.
-    pub fn host_harness_environment<'a>(
-        &'a self,
-        environment_ref: &'a str,
-        role: &'a str,
-        required_adapters: &'a BTreeSet<String>,
-        environment: &'a [(String, String)],
-        runner: &'a dyn CommandRunner,
-    ) -> BoxFuture<'a, Result<Vec<(String, String)>, String>> {
-        Box::pin(async move {
-            if !matches!(Path::new(environment_ref).components().collect::<Vec<_>>().as_slice(), [std::path::Component::Normal(_)]) {
-                return Err(format!("invalid agent home environment {environment_ref:?}"));
-            }
-            let config_base = runner
-                .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
-                .await
-                .map_err(|error| format!("resolve host agent home base: {error}"))?;
-            let mut result = environment.to_vec();
-            for adapter in required_adapters.iter().filter_map(|id| self.adapters.get(id.as_str())) {
-                let variable = adapter.config_home_variable();
-                let delivered = result
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == variable)
-                    .map(|(_, value)| PathBuf::from(value))
-                    // `starts_with` compares components lexically, so a `..`
-                    // could climb out of the base while appearing inside it.
-                    .filter(|home| {
-                        home.is_absolute()
-                            && home.starts_with(&config_base)
-                            && home.components().all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
-                    });
-                let home = match delivered {
-                    Some(home) => home,
-                    None => config_base.join("agent-homes").join(environment_ref).join(adapter.host_home_name()),
-                };
-                let home_text = home.to_string_lossy().into_owned();
-                runner
-                    .run("mkdir", &["-p", &home_text], Path::new("/"), &ChannelLabel::Default)
-                    .await
-                    .map_err(|error| format!("create {} home {home_text}: {error}", adapter.id()))?;
-                // Owner-only even when an earlier generation created the home.
-                runner
-                    .run("chmod", &["700", &home_text], Path::new("/"), &ChannelLabel::Default)
-                    .await
-                    .map_err(|error| format!("protect {} home {home_text}: {error}", adapter.id()))?;
-                adapter.adopt_ambient_login(&home, runner).await?;
-                result.retain(|(key, _)| key != variable);
-                result.push((variable.into(), home_text));
-            }
-            self.crew_environment(role, required_adapters, &result, runner).await
-        })
-    }
-
-    pub fn selected_skill_source_credentials<'a>(
-        &'a self,
-        environment: &'a [(String, String)],
-    ) -> BoxFuture<'a, Result<Vec<SkillSourceCredentialRequest>, String>> {
-        Box::pin(async move {
-            let selected: Vec<flotilla_resources::SkillCatalogEntry> = decode_selected_skills(environment)?;
-            let sources = self.skills.selected_sources(&selected).await?;
-            Ok(sources
-                .into_iter()
-                .filter_map(|source| {
-                    source.credential.map(|credential| SkillSourceCredentialRequest {
-                        source: source.name,
-                        repository: source.repository,
-                        revision: source.revision,
-                        credential,
-                    })
-                })
-                .collect())
-        })
-    }
-
-    pub fn validate_crew_home_keys(&self, required_adapters: &BTreeSet<String>, environment: &[(String, String)]) -> Result<(), String> {
-        if !required_adapters.iter().filter_map(|id| self.adapters.get(id.as_str())).any(|adapter| adapter.requester_bound()) {
-            return Ok(());
         }
-        validate_supplied_crew_home_keys(environment)
-    }
-
-    pub fn will_stage_skills<'a>(
-        &'a self,
-        required_adapters: &'a BTreeSet<String>,
-        environment: &'a [(String, String)],
-        runner: &'a dyn CommandRunner,
-    ) -> BoxFuture<'a, Result<bool, String>> {
-        Box::pin(async move {
-            let adapters = required_adapters.iter().filter_map(|adapter_id| self.adapters.get(adapter_id.as_str())).collect::<Vec<_>>();
-            if adapters.is_empty() {
-                return Ok(false);
-            }
-            let config_base = runner
-                .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
-                .await
-                .map_err(|error| format!("resolve contained agent skill base: {error}"))?;
-            self.validate_crew_home_keys(required_adapters, environment)?;
-            for adapter in adapters {
-                if adapter.requester_bound() || adapter.skill_destination(environment, &config_base)?.is_some() {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        })
     }
 
     pub fn fragments(&self, required_adapters: &BTreeSet<String>, environment: &BTreeMap<String, String>) -> Vec<Fragment> {
@@ -805,56 +670,6 @@ async fn install_read_only_copy(contents: &[u8], destination: &Path) -> Result<b
     Ok(true)
 }
 
-/// Validate the caller's home map before creating a requester-bound backing.
-pub fn validate_supplied_crew_home_keys(environment: &[(String, String)]) -> Result<(), String> {
-    let homes = decode_crew_home_keys(environment)?;
-    let crews = decode_crew_skills(environment)?.ok_or_else(|| format!("{REQUESTER_HOME_UNAVAILABLE} missing crew home selection"))?;
-    if crews.is_empty() {
-        return Err(format!("{REQUESTER_HOME_UNAVAILABLE} missing crew home selection"));
-    }
-    for role in crews.keys() {
-        let key = homes.get(role).ok_or_else(|| format!("{REQUESTER_HOME_UNAVAILABLE} crew `{role}` has no supplied home key"))?;
-        join_crew_home(Path::new(""), key)?;
-    }
-    Ok(())
-}
-
-fn decode_crew_home_keys(environment: &[(String, String)]) -> Result<BTreeMap<String, String>, String> {
-    environment
-        .iter()
-        .find(|(name, _)| name == CREW_HOME_KEYS_ENV)
-        .map(|(_, value)| {
-            serde_json::from_str(value).map_err(|error| format!("{REQUESTER_HOME_UNAVAILABLE} decode supplied home keys: {error}"))
-        })
-        .transpose()
-        .map(|keys| keys.unwrap_or_default())
-}
-
-type CrewSkills = BTreeMap<String, Vec<flotilla_resources::SkillCatalogEntry>>;
-
-fn decode_crew_skills(environment: &[(String, String)]) -> Result<Option<CrewSkills>, String> {
-    environment
-        .iter()
-        .find(|(key, _)| key == flotilla_resources::CREW_SKILLS_ENV)
-        .map(|(_, value)| serde_json::from_str(value).map_err(|error| format!("decode frozen crew skills: {error}")))
-        .transpose()
-}
-
-fn decode_selected_skills(environment: &[(String, String)]) -> Result<Vec<flotilla_resources::SkillCatalogEntry>, String> {
-    if let Some(crews) = decode_crew_skills(environment)? {
-        return Ok(crews.into_values().flatten().collect());
-    }
-    // ADR 0047: remove the old selection decoder one fleet roll after #2673,
-    // once stored environments have been rewritten or reaped.
-    match environment.iter().find(|(key, _)| key == flotilla_resources::RESOLVED_SKILLS_ENV) {
-        Some((_, value)) => serde_json::from_str(value).map_err(|error| format!("decode frozen skill selection: {error}")),
-        None => {
-            tracing::debug!("no frozen skill selection forwarded; using an empty selection for legacy provisioning");
-            Ok(Vec::new())
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 struct SkillBundleManifest {
     schema_version: u32,
@@ -942,7 +757,6 @@ fn authorize_frozen_sources(
     sources: &[SkillSource],
     declared_credentials: &BTreeMap<String, flotilla_resources::CredentialSpecSpec>,
 ) -> Result<(), String> {
-    let mut credential_repositories = BTreeMap::new();
     for source in sources {
         if let Some(credential) = &source.credential {
             let spec = declared_credentials.get(credential).ok_or_else(|| {
@@ -950,11 +764,23 @@ fn authorize_frozen_sources(
             })?;
             crate::credential::skill_source_repository(credential, spec, &source.repository)
                 .map_err(|error| format!("skill source {} revision {}: {error}", source.name, source.revision))?;
+        }
+    }
+    one_repository_per_credential(sources).map_err(|(_, error)| error)
+}
+
+/// A source credential is minted narrowed to one repository, so sources sharing a
+/// credential must share their repository.
+fn one_repository_per_credential(sources: &[SkillSource]) -> Result<(), (String, String)> {
+    let mut credential_repositories = BTreeMap::new();
+    for source in sources {
+        if let Some(credential) = &source.credential {
             if credential_repositories.insert(credential, &source.repository).is_some_and(|previous| previous != &source.repository) {
-                return Err(format!(
+                let error = format!(
                     "skill source {} credential {credential}: one credential cannot be narrowed to multiple source repositories",
                     source.name
-                ));
+                );
+                return Err((source.name.clone(), error));
             }
         }
     }
@@ -1079,44 +905,28 @@ impl SkillBundle {
         resolve_frozen_sources(&inspection.sources, selected)
     }
 
+    /// Stage `tree` at `destination` through `runner`. Removes the token files once
+    /// staging succeeds; the caller removes them after a failure.
     async fn stage(
         &self,
-        environment_ref: &str,
-        adapters: &[&Arc<dyn AgentMaterialAdapter>],
-        environment: &[(String, String)],
+        tree: &SkillTree,
+        destination: &Path,
         source_token_files: &BTreeMap<String, PathBuf>,
         runner: &dyn CommandRunner,
-        cleanup_tokens: bool,
     ) -> Result<(), String> {
-        // Each attempt owns the cache and destination swap, but backoff must
-        // leave the lock free for other crews. Cancellation releases the lock.
-        if adapters.is_empty() {
-            return if cleanup_tokens { remove_source_token_files(source_token_files, runner).await } else { Ok(()) };
-        }
         let config_base = runner
             .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
             .await
             .map_err(|error| format!("resolve contained agent skill base: {error}"))?;
-        let mut destinations = Vec::new();
-        for adapter in adapters {
-            if let Some(destination) = adapter.skill_destination(environment, &config_base)? {
-                destinations.push((adapter.id(), destination));
-            }
-        }
-        if destinations.is_empty() {
-            return if cleanup_tokens { remove_source_token_files(source_token_files, runner).await } else { Ok(()) };
-        }
-        let selected = decode_selected_skills(environment)?;
-        let sources = self.selected_sources(&selected).await?;
-        let manifest = serde_json::json!({"schema_version": 5, "sources": sources});
+        let manifest = serde_json::json!({"schema_version": 5, "sources": tree.sources});
         let mut args = vec![
             "flotilla-stage-skills".to_string(),
             format!("json:{manifest}"),
-            String::new(),
-            String::new(),
+            destination.to_string_lossy().into_owned(),
+            "true".to_string(),
             config_base.join("skill-source-cache").to_string_lossy().into_owned(),
         ];
-        for source in &sources {
+        for source in &tree.sources {
             let token_file = source_token_files.get(&source.name).map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
             args.extend([
                 source.name.clone(),
@@ -1128,31 +938,28 @@ impl SkillBundle {
             ]);
             args.extend(source.paths.clone());
             let entries =
-                selected.iter().filter(|entry| entry.source == source.name && entry.revision == source.revision).collect::<Vec<_>>();
+                tree.selected.iter().filter(|entry| entry.source == source.name && entry.revision == source.revision).collect::<Vec<_>>();
             args.push(entries.len().to_string());
             for entry in entries {
                 args.extend([entry.name.clone(), entry.path.clone()]);
             }
         }
-        let destination_count = destinations.len();
-        for (index, (adapter, destination)) in destinations.into_iter().enumerate() {
-            args[2] = destination.to_string_lossy().into_owned();
-            args[3] = (cleanup_tokens && index + 1 == destination_count).to_string();
-            for attempt in 1..=3 {
-                let result = {
-                    let _staging_guard = self.staging_lock.lock().await;
-                    stage_git_skill_sources(runner, &args).await
-                };
-                match result {
-                    Ok(_) => break,
-                    Err(error) if error.lines().any(|line| line == STAGE_RETRYABLE_PREFIX) && attempt < 3 => {
-                        tokio::time::sleep(Duration::from_secs(attempt)).await;
-                    }
-                    Err(error) => return Err(skill_stage_error(environment_ref, &error)),
+        for attempt in 1..=3 {
+            // Each attempt owns the cache and destination swap, but backoff must
+            // leave the lock free for other crews. Cancellation releases the lock.
+            let result = {
+                let _staging_guard = self.staging_lock.lock().await;
+                stage_git_skill_sources(runner, &args).await
+            };
+            match result {
+                Ok(_) => break,
+                Err(error) if error.lines().any(|line| line == STAGE_RETRYABLE_PREFIX) && attempt < 3 => {
+                    tokio::time::sleep(Duration::from_secs(attempt)).await;
                 }
+                Err(error) => return Err(skill_stage_error(&destination.to_string_lossy(), &error)),
             }
-            info!(environment = environment_ref, adapter, selected = ?selected, "staged generation-pinned contained agent skills");
         }
+        info!(destination = %destination.display(), selected = ?tree.selected, "staged generation-pinned agent skills");
         Ok(())
     }
 }
@@ -1270,30 +1077,6 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
 
     fn host_home_name(&self) -> &'static str {
         "codex"
-    }
-
-    /// The host keeps one Codex login: link its `auth.json` rather than copy
-    /// it, so a refresh rotates the single-use refresh token in one place
-    /// (#1906). Only the credential is shared; `config.toml` stays the home's
-    /// own. A delivered credential already in the home is left alone.
-    async fn adopt_ambient_login(&self, home: &Path, runner: &dyn CommandRunner) -> Result<(), String> {
-        runner
-            .run(
-                "sh",
-                &[
-                    "-c",
-                    r#"set -eu
-ambient="${CODEX_HOME:-$HOME/.codex}/auth.json"
-if [ ! -e "$1/auth.json" ] && [ ! -L "$1/auth.json" ] && [ -f "$ambient" ]; then ln -s "$ambient" "$1/auth.json"; fi"#,
-                    "flotilla-codex-ambient-login",
-                    &home.to_string_lossy(),
-                ],
-                Path::new("/"),
-                &ChannelLabel::Default,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("link host Codex login into {}: {error}", home.display()))
     }
 
     fn externally_managed_home_opts_out_of_skills(&self) -> bool {
@@ -1434,6 +1217,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[derive(Clone)]
     pub(crate) struct PromisorRunner {
         pub(crate) config_base: PathBuf,
         skills_source: PathBuf,
@@ -1671,18 +1455,6 @@ esac
         }
     }
 
-    fn registry_for_adapter(home: &Path, adapter: &str) -> AgentMaterialRegistry {
-        if adapter != "fleet-canary" {
-            return registry(home);
-        }
-        let skills = write_skill_sources(home);
-        test_registry(Arc::new(TestEnvVars::new([
-            ("HOME", home.display().to_string()),
-            (FLOTILLA_SKILLS_DIR_ENV, skills.display().to_string()),
-            ("FLOTILLA_FLEET_CANARY", "1".to_string()),
-        ])))
-    }
-
     fn registry_with_home_template(home: &Path, template: &Path) -> AgentMaterialRegistry {
         let skills = write_skill_sources(home);
         test_registry(Arc::new(TestEnvVars::new([
@@ -1851,6 +1623,41 @@ esac
 
     /// The host behind an agentless SSH runner, recording each command; its
     /// writable config base is `/host/state/flotilla`.
+    impl AgentMaterialRegistry {
+        /// Stage each manifest source's `private-folder` into the `skills` directory of
+        /// every required harness's home `environment` names, through the access layer's
+        /// staging entry point.
+        pub(crate) async fn stage_test_skills(
+            &self,
+            _crew: &str,
+            required_adapters: &BTreeSet<String>,
+            environment: &[(String, String)],
+            source_token_files: &BTreeMap<String, PathBuf>,
+            runner: &dyn CommandRunner,
+        ) -> Result<(), String> {
+            let inspection = inspect_skill_sources(self.skills.source.as_ref().expect("test source"))?;
+            let selected = inspection
+                .sources
+                .iter()
+                .map(|source| flotilla_resources::SkillCatalogEntry {
+                    source: source.name.clone(),
+                    repository: source.repository.clone(),
+                    revision: source.revision.clone(),
+                    name: "private-source".to_string(),
+                    path: format!("{}/private-folder", source.paths[0]),
+                })
+                .collect::<Vec<_>>();
+            let tree = self.skill_tree(&selected).await?;
+            for adapter in required_adapters {
+                let variable = self.harness_home(adapter).expect("managed harness").variable;
+                if let Some((_, home)) = environment.iter().find(|(name, _)| name == variable) {
+                    self.stage_skill_tree(&tree, &Path::new(home).join("skills"), source_token_files, runner).await?;
+                }
+            }
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn pinned_skills_are_staged_to_the_seam_resolved_claude_config() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2405,86 +2212,6 @@ esac
         first.await.expect("first task").expect("first staging");
     }
 
-    #[tokio::test]
-    async fn pinned_skills_are_staged_to_the_seam_resolved_codex_home() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
-        let environment = vec![
-            ("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string()),
-            ("GIT_CONFIG_GLOBAL".to_string(), "/run/flotilla/config/credentials/gitconfig".to_string()),
-            ("GITHUB_TOKEN_FILE".to_string(), "/run/flotilla/config/credentials/github-app/token".to_string()),
-        ];
-        let runner = RecordingRunner::default();
-
-        registry.stage_test_skills("crew-codex", &required, &environment, &BTreeMap::new(), &runner).await.expect("stage pinned skills");
-
-        let calls = runner.calls.lock().expect("recording runner lock should be healthy");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "sh");
-        assert!(calls[0].1.contains(&format!("{CONTAINER_CODEX_HOME}/skills")));
-        assert!(calls[0].1.contains(&"https://github.com/flotilla-org/mattpocock-skills.git".to_string()));
-        assert!(calls[0].1.contains(&"1111111111111111111111111111111111111111".to_string()));
-    }
-
-    #[tokio::test]
-    async fn pinned_skills_are_staged_to_every_required_adapter_destination() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let required = BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string(), CODEX_ADAPTER_ID.to_string()]);
-        let claude_skills = "/tmp/flotilla-config/credentials/claude-max/claude/skills";
-        let codex_skills = format!("{CONTAINER_CODEX_HOME}/skills");
-        let environment = vec![
-            ("CLAUDE_CONFIG_DIR".to_string(), "/tmp/flotilla-config/credentials/claude-max/claude".to_string()),
-            ("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string()),
-            ("GIT_CONFIG_GLOBAL".to_string(), "/run/flotilla/config/credentials/gitconfig".to_string()),
-            ("GITHUB_TOKEN_FILE".to_string(), "/run/flotilla/config/credentials/github-app/token".to_string()),
-        ];
-        let runner = RecordingRunner::default();
-
-        registry
-            .stage_test_skills("crew-mixed", &required, &environment, &BTreeMap::new(), &runner)
-            .await
-            .expect("stage pinned skills for both adapters");
-
-        let calls = runner.calls.lock().expect("recording runner lock should be healthy");
-        assert_eq!(calls.len(), 2);
-        let destinations =
-            calls.iter().map(|(_, args)| args.get(5).expect("staging call must include its destination").as_str()).collect::<BTreeSet<_>>();
-        assert_eq!(destinations, BTreeSet::from([claude_skills, codex_skills.as_str()]));
-    }
-
-    #[tokio::test]
-    async fn externally_managed_codex_home_skips_skill_staging() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
-        let environment = vec![
-            ("CODEX_HOME".to_string(), "/image/codex".to_string()),
-            ("GIT_CONFIG_GLOBAL".to_string(), "/run/flotilla/config/credentials/gitconfig".to_string()),
-            ("GITHUB_TOKEN_FILE".to_string(), "/run/flotilla/config/credentials/github-app/token".to_string()),
-        ];
-        let runner = RecordingRunner::default();
-
-        assert!(!registry.will_stage_skills(&required, &environment, &runner).await.expect("resolve external Codex skill staging"));
-
-        registry
-            .stage_test_skills(
-                "crew-codex",
-                &required,
-                &environment,
-                &BTreeMap::from([("mattpocock-skills".to_string(), PathBuf::from("/tmp/unused-skill-token"))]),
-                &runner,
-            )
-            .await
-            .expect("skip external Codex home");
-
-        assert_eq!(
-            runner.calls.lock().expect("recording runner lock should be healthy").as_slice(),
-            &[("rm".to_string(), vec!["-f".to_string(), "--".to_string(), "/tmp/unused-skill-token".to_string()])]
-        );
-    }
-
     #[test]
     fn staged_skill_source_revisions_are_reported() {
         let output = Arc::new(Mutex::new(Vec::new()));
@@ -2965,59 +2692,58 @@ esac
         assert!(!temp.path().join(".local/share/flotilla/agent-homes").exists());
     }
 
+    // Only the selected frontmatter names land in a crew's skills, even when the pinned
+    // source also supplies an unrelated skill.
     #[tokio::test]
-    async fn only_frozen_skills_land_in_both_agent_homes() {
-        // Intended: agent layouts, including the canary alias, install only the selected frontmatter names,
-        // even when the pinned source also supplies an unrelated skill.
-        for adapter in [CLAUDE_CODE_ADAPTER_ID, CODEX_ADAPTER_ID, "fleet-canary"] {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let registry = registry_for_adapter(temp.path(), adapter);
-            let bundle = registry.skills.source.as_ref().expect("source");
-            std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#).expect("manifest");
-            let runner = promisor_runner(temp.path());
-            let token = temp.path().join("token");
-            std::fs::write(&token, "test-token").expect("token");
-            let selection = vec![flotilla_resources::SkillCatalogEntry {
-                source: "private-skills".into(),
-                repository: "example/private-skills".into(),
-                revision: "1".repeat(40),
-                name: "private-source".into(),
-                path: "skills/private-folder".into(),
-            }];
-            let config_home = if adapter == CODEX_ADAPTER_ID {
-                CONTAINER_CODEX_HOME.to_string()
-            } else {
-                runner.config_base.join("claude").display().to_string()
-            };
-            let variable = if adapter == CODEX_ADAPTER_ID { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" };
-            let environment = vec![
-                (variable.to_string(), config_home.clone()),
-                (flotilla_resources::RESOLVED_SKILLS_ENV.to_string(), serde_json::to_string(&selection).expect("selection")),
-            ];
-            registry
-                .stage_skills(
-                    "selected",
-                    &BTreeSet::from([adapter.to_string()]),
-                    &environment,
-                    &BTreeMap::from([("private-skills".to_string(), token)]),
-                    &runner,
-                )
-                .await
-                .expect("stage selected");
-            let destination = if adapter == CODEX_ADAPTER_ID {
-                runner.config_base.join("codex/skills")
-            } else {
-                PathBuf::from(config_home).join("skills")
-            };
-            let names = std::fs::read_dir(&destination)
-                .expect("staged directory")
-                .filter_map(|entry| {
-                    let entry = entry.expect("entry");
-                    entry.file_type().expect("file type").is_dir().then(|| entry.file_name())
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(names, [std::ffi::OsString::from("private-source")], "{adapter} installs only the frozen selection");
-        }
+    async fn only_frozen_skills_land_in_the_home() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let bundle = registry.skills.source.as_ref().expect("source");
+        std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#).expect("manifest");
+        let runner = promisor_runner(temp.path());
+        let token = temp.path().join("token");
+        std::fs::write(&token, "test-token").expect("token");
+        let tree = registry.skill_tree(&[crew_skill("private-source", "skills/private-folder")]).await.expect("resolve");
+        let destination = runner.config_base.join("agent-homes/requesters/convoy/coder/claude/skills");
+        registry
+            .stage_skill_tree(&tree, &destination, &BTreeMap::from([("private-skills".to_string(), token.clone())]), &runner)
+            .await
+            .expect("stage selected");
+        let names = std::fs::read_dir(&destination)
+            .expect("staged directory")
+            .filter_map(|entry| {
+                let entry = entry.expect("entry");
+                entry.file_type().expect("file type").is_dir().then(|| entry.file_name())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, [std::ffi::OsString::from("private-source")], "only the frozen selection is installed");
+        assert!(!token.exists(), "the source token is removed after staging");
+    }
+
+    // A source credential is minted narrowed to one repository, so a tree whose sources
+    // share a credential across two repositories is refused before anything is delivered.
+    #[tokio::test]
+    async fn one_credential_is_not_narrowed_to_two_repositories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let bundle = registry.skills.source.as_ref().expect("source");
+        let source = |name: &str| serde_json::json!({"name": name, "repository": format!("https://github.com/example/{name}.git"), "revision": "1".repeat(40), "credential": "private-skills"});
+        let manifest = serde_json::json!({"schema_version": 5, "sources": [source("private-skills"), source("other-skills")]});
+        std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), manifest.to_string()).expect("manifest");
+        let other = flotilla_resources::SkillCatalogEntry {
+            source: "other-skills".into(),
+            repository: "example/other-skills".into(),
+            ..crew_skill("other-source", "skills/other-folder")
+        };
+        let error = registry
+            .skill_tree(&[crew_skill("private-source", "skills/private-folder"), other])
+            .await
+            .expect_err("one credential, two repositories");
+        assert!(error.contains("cannot be narrowed to multiple source repositories"), "{error}");
+        registry
+            .skill_tree(&[crew_skill("private-source", "skills/private-folder")])
+            .await
+            .expect("one repository per credential resolves");
     }
 
     fn crew_skill(name: &str, path: &str) -> flotilla_resources::SkillCatalogEntry {
@@ -3106,7 +2832,6 @@ esac
         let registry = registry(temp.path());
         let bundle = registry.skills.source.as_ref().expect("source");
         std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"2222222222222222222222222222222222222222","credential":"private-skills"}]}"#).expect("manifest");
-        let runner = promisor_runner(temp.path());
         let output = Arc::new(Mutex::new(Vec::new()));
         let writer = LogCaptureWriter(Arc::clone(&output));
         let subscriber = tracing_subscriber::fmt()
@@ -3117,17 +2842,8 @@ esac
             .with_writer(move || writer.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
-        let environment = vec![
-            ("CLAUDE_CONFIG_DIR".into(), runner.config_base.join("claude").display().to_string()),
-            (
-                flotilla_resources::RESOLVED_SKILLS_ENV.into(),
-                serde_json::to_string(&vec![crew_skill("private-source", "skills-other/private-folder")]).expect("selection"),
-            ),
-        ];
-        let error = registry
-            .stage_skills("governor", &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.into()]), &environment, &BTreeMap::new(), &runner)
-            .await
-            .expect_err("unauthorized path");
+        let error =
+            registry.skill_tree(&[crew_skill("private-source", "skills-other/private-folder")]).await.expect_err("unauthorized path");
         assert!(error.contains("outside the authorized source paths"));
         let log = String::from_utf8(output.lock().expect("log").clone()).expect("UTF-8 log");
         for expected in [
@@ -3149,7 +2865,6 @@ esac
         let temp = tempfile::tempdir().expect("tempdir");
         let registry = registry(temp.path());
         std::fs::remove_dir_all(registry.skills.source.as_ref().expect("source")).expect("remove bundle");
-        let runner = promisor_runner(temp.path());
         let output = Arc::new(Mutex::new(Vec::new()));
         let writer = LogCaptureWriter(Arc::clone(&output));
         let subscriber = tracing_subscriber::fmt()
@@ -3160,14 +2875,7 @@ esac
             .with_writer(move || writer.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
-        let environment = vec![(
-            flotilla_resources::RESOLVED_SKILLS_ENV.into(),
-            serde_json::to_string(&vec![crew_skill("private-source", "skills/private-folder")]).expect("selection"),
-        )];
-        registry
-            .stage_skills("governor", &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.into()]), &environment, &BTreeMap::new(), &runner)
-            .await
-            .expect_err("missing bundle");
+        registry.skill_tree(&[crew_skill("private-source", "skills/private-folder")]).await.expect_err("missing bundle");
         let log = String::from_utf8(output.lock().expect("log").clone()).expect("UTF-8 log");
         assert!(log.contains("source=skill-bundle") || log.contains("source=\"skill-bundle\""), "{log}");
         assert!(!log.contains("source=private-skills") && !log.contains("source=\"private-skills\""), "{log}");
@@ -3210,81 +2918,34 @@ esac
 
     // #2875: a standing governor's frozen selection survives a reboot into a
     // newer generation, retaining its revision and narrowed source credential.
-    // Fake host process boundary; home selection stays in the production registry.
-    #[derive(Default)]
-    struct HostHomeRunner {
-        calls: Mutex<Vec<Vec<String>>>,
-    }
-
-    #[async_trait]
-    impl CommandRunner for HostHomeRunner {
-        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-            self.calls.lock().expect("calls").push(std::iter::once(cmd).chain(args.iter().copied()).map(str::to_string).collect());
-            Ok(String::new())
-        }
-
-        async fn run_output(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
-            Err(format!("unexpected host command {cmd}"))
-        }
-
-        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
-            false
-        }
-
-        async fn writable_config_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
-            Ok(PathBuf::from("/host/state/flotilla"))
-        }
-    }
-
-    // #3655: credential source homes remain host-owned for delivered, personal,
-    // escaping and absent inputs. The caller supplies the crew destination;
-    // only Codex adopts ambient login, from the safely selected source home.
-    #[tokio::test]
-    async fn host_harness_homes_are_flotilla_owned_under_the_runner_base() {
+    // #3655, #3964: a Codex crew links the login of the vessel's delivered home only when
+    // that home is flotilla-managed under the target's writable base or the contained Codex
+    // home; a personal, escaping or absent home falls back to the target's ambient login.
+    // Claude crews run on their bound account and link no login.
+    #[test]
+    fn harness_login_links_only_a_managed_delivered_home() {
         let registry = test_registry(Arc::new(TestEnvVars::new([("HOME", "/controller-home")])));
-        for (adapter, variable, harness) in
-            [(CLAUDE_CODE_ADAPTER_ID, "CLAUDE_CONFIG_DIR", "claude"), (CODEX_ADAPTER_ID, "CODEX_HOME", "codex")]
-        {
-            for delivered in [
-                Some("/host/state/flotilla/agent-homes/delivered"),
-                Some("/home/crew/personal"),
-                Some("/host/state/flotilla/../../escape"),
-                None,
-            ] {
-                let runner = HostHomeRunner::default();
-                let mut environment =
-                    vec![(CREW_HOME_KEYS_ENV.into(), serde_json::json!({"coder":"agent-homes/requesters/supplied/crew"}).to_string())];
-                environment.extend(delivered.map(|home| (variable.into(), home.into())));
-                let prepared = registry
-                    .host_harness_environment("host-direct-b3", "coder", &BTreeSet::from([adapter.into()]), &environment, &runner)
-                    .await
-                    .expect("host home selection");
-                let base = Path::new("/host/state/flotilla");
-                let selected = prepared.iter().find(|(name, _)| name == variable).expect("selected home");
-                assert_eq!(Path::new(&selected.1), base.join("agent-homes/requesters/supplied/crew"), "the supplied crew destination wins");
-                let source = match delivered {
-                    Some("/host/state/flotilla/agent-homes/delivered") => base.join("agent-homes/delivered"),
-                    _ => base.join("agent-homes/host-direct-b3").join(harness),
-                }
-                .display()
-                .to_string();
-                let calls = runner.calls.lock().expect("calls");
-                assert!(calls.iter().any(|call| call == &["mkdir", "-p", &source]), "safe credential home created: {calls:?}");
-                assert!(calls.iter().any(|call| call == &["chmod", "700", &source]), "credential home owner-only: {calls:?}");
-                let adoptions =
-                    calls.iter().filter(|call| call.get(3).map(String::as_str) == Some("flotilla-codex-ambient-login")).collect::<Vec<_>>();
-                if adapter == CODEX_ADAPTER_ID {
-                    assert!(
-                        matches!(adoptions.as_slice(), [call] if call[4] == source),
-                        "ambient login uses the safe source home: {adoptions:?}"
-                    );
-                } else {
-                    assert!(adoptions.is_empty(), "Claude never adopts ambient login");
-                }
-            }
+        let base = Path::new("/host/state/flotilla");
+        let login = |adapter: &str, delivered: Option<&str>| {
+            let environment = delivered.map(|home| vec![("CODEX_HOME".to_string(), home.to_string())]).unwrap_or_default();
+            registry.harness_login(adapter, &environment, base).map(|login| login.digest())
+        };
+        for (delivered, expected) in [
+            (Some("/host/state/flotilla/agent-homes/codex-key/codex"), "delivered:/host/state/flotilla/agent-homes/codex-key/codex"),
+            (Some(CONTAINER_CODEX_HOME), "delivered:/tmp/flotilla-codex"),
+            (Some("/home/crew/.codex"), "ambient"),
+            (Some("/host/state/flotilla/agent-homes/../../../home/crew/.codex"), "ambient"),
+            (Some("relative/codex"), "ambient"),
+            (None, "ambient"),
+        ] {
+            assert_eq!(login(CODEX_ADAPTER_ID, delivered).as_deref(), Some(expected), "{delivered:?}");
         }
+        assert_eq!(login(CLAUDE_CODE_ADAPTER_ID, None), None);
+        assert_eq!(login("unmanaged-harness", None), None);
     }
 
+    // #2875: a governor's frozen selection survives a reboot into a newer generation,
+    // retaining its revision and narrowed source credential.
     #[tokio::test]
     async fn governor_frozen_skills_resolve_after_generation_restart() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3292,178 +2953,96 @@ esac
         let bundle = registry.skills.source.as_ref().expect("source");
         std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"2222222222222222222222222222222222222222","credential":"private-skills"}]}"#).expect("new generation manifest");
         let runner = promisor_runner(temp.path());
-        let base = runner.config_base.join("claude");
-        let environment = vec![
-            ("CLAUDE_CONFIG_DIR".into(), base.display().to_string()),
-            (
-                flotilla_resources::CREW_SKILLS_ENV.into(),
-                serde_json::to_string(&BTreeMap::from([("governor", vec![crew_skill("private-source", "skills/private-folder")])]))
-                    .expect("frozen skills"),
-            ),
-            (CREW_HOME_KEYS_ENV.into(), serde_json::json!({"governor":"claude/crews/governor"}).to_string()),
-        ];
-        let requests = registry.selected_skill_source_credentials(&environment).await.expect("resolve credentials");
+        let home = runner.config_base.join("agent-homes/requesters/standing/governor/claude");
+        let tree = registry.skill_tree(&[crew_skill("private-source", "skills/private-folder")]).await.expect("resolve frozen tree");
+        let requests = tree.credentials();
         assert_eq!(requests.len(), 1, "frozen revision still needs its source credential");
         assert_eq!(requests[0].revision, "1".repeat(40));
         let token = temp.path().join("token");
         std::fs::write(&token, "test-token").expect("token");
         registry
-            .stage_skills(
-                "governor",
-                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.into()]),
-                &environment,
-                &BTreeMap::from([("private-skills".into(), token)]),
-                &runner,
-            )
+            .stage_skill_tree(&tree, &home.join("skills"), &BTreeMap::from([("private-skills".into(), token)]), &runner)
             .await
             .expect("stage frozen revision after restart");
-        assert!(base.join("crews/governor/skills/private-source/SKILL.md").is_file());
-        let staged: SkillBundleManifest = serde_json::from_slice(
-            &std::fs::read(base.join("crews/governor/skills").join(SKILL_BUNDLE_MANIFEST)).expect("staged manifest"),
-        )
-        .expect("manifest");
+        assert!(home.join("skills/private-source/SKILL.md").is_file());
+        let staged: SkillBundleManifest =
+            serde_json::from_slice(&std::fs::read(home.join("skills").join(SKILL_BUNDLE_MANIFEST)).expect("staged manifest"))
+                .expect("manifest");
         assert_eq!(staged.sources[0].revision, "1".repeat(40), "staged provenance retains the admission pin");
     }
 
+    // Issue #2672: crews sharing a harness and vessel have disjoint homes, each holding
+    // exactly its frozen selection, including none, and reusing one pinned fetch. Each
+    // links the vessel's delivered login: static config seeds a crew once, a crew's own
+    // edits survive, and a refreshed login reaches every crew.
     #[tokio::test]
-    async fn crews_in_one_environment_see_only_their_own_skills() {
-        // Issue #2672: crews sharing an adapter and vessel must have disjoint
-        // homes, each containing exactly its frozen selection, including empty.
-        for (adapter, api_key) in [(CODEX_ADAPTER_ID, false), (CODEX_ADAPTER_ID, true)] {
+    async fn crews_in_one_vessel_see_only_their_own_skills_and_share_the_login() {
+        for api_key in [false, true] {
             let temp = tempfile::tempdir().expect("tempdir");
             let registry = registry(temp.path());
             let bundle = registry.skills.source.as_ref().expect("source");
             std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#).expect("manifest");
             let runner = promisor_runner(temp.path());
-            let base = if api_key {
-                runner.config_base.join("agent-homes/model-api/codex")
-            } else {
-                runner.config_base.join(if adapter == CODEX_ADAPTER_ID { "codex" } else { "claude" })
-            };
+            let base = if api_key { runner.config_base.join("agent-homes/model-api/codex") } else { runner.config_base.join("codex") };
             std::fs::create_dir_all(&base).expect("base home");
             std::fs::write(base.join("settings.json"), "{}").expect("settings");
             std::fs::write(base.join("auth.json"), "first-token").expect("auth");
-            let supplied_home = |role: &str| runner.config_base.join("agent-homes/requesters/shared").join(role).join("codex");
-            let variable = if adapter == CODEX_ADAPTER_ID { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" };
-            let virtual_base =
-                if adapter == CODEX_ADAPTER_ID && !api_key { CONTAINER_CODEX_HOME.into() } else { base.display().to_string() };
-            let token = temp.path().join("token");
-            std::fs::write(&token, "test-token").expect("token");
-            let crews = BTreeMap::from([
+            let delivered = if api_key { base.display().to_string() } else { CONTAINER_CODEX_HOME.to_string() };
+            let login = registry
+                .harness_login(CODEX_ADAPTER_ID, &[("CODEX_HOME".into(), delivered)], &runner.config_base)
+                .expect("Codex links a login");
+            let home = |role: &str| runner.config_base.join("agent-homes/requesters/shared").join(role).join("codex");
+            // The vessel's file facilities over this process's own shell and files.
+            let agent = flotilla_environment::environment::vessel_ops::RunnerVesselAgent(Arc::new(runner.clone()));
+            let crews = [
                 ("coder", vec![crew_skill("private-source", "skills/private-folder")]),
                 ("reviewer", vec![crew_skill("unselected", "skills/unselected")]),
                 ("observer", Vec::new()),
-            ]);
-            let environment = vec![
-                (variable.into(), virtual_base.clone()),
-                (flotilla_resources::CREW_SKILLS_ENV.into(), serde_json::to_string(&crews).expect("crew selections")),
-                (
-                    CREW_HOME_KEYS_ENV.into(),
-                    serde_json::to_string(
-                        &crews
-                            .keys()
-                            .map(|role| {
-                                (
-                                    *role,
-                                    supplied_home(role)
-                                        .strip_prefix(&runner.config_base)
-                                        .expect("relative supplied home")
-                                        .display()
-                                        .to_string(),
-                                )
-                            })
-                            .collect::<BTreeMap<_, _>>(),
-                    )
-                    .expect("caller homes"),
-                ),
             ];
-            // Missing private destinations must refuse, never merge role selections in the base home.
-            let missing_homes = environment.iter().filter(|(name, _)| name != CREW_HOME_KEYS_ENV).cloned().collect::<Vec<_>>();
-            let error = registry
-                .stage_skills("shared", &BTreeSet::from([adapter.into()]), &missing_homes, &BTreeMap::new(), &runner)
-                .await
-                .expect_err("managed crew staging requires caller homes");
-            assert!(error.starts_with(REQUESTER_HOME_UNAVAILABLE), "{error}");
-            registry
-                .stage_skills(
-                    "shared",
-                    &BTreeSet::from([adapter.into()]),
-                    &environment,
-                    &BTreeMap::from([("private-skills".into(), token.clone())]),
-                    &runner,
-                )
-                .await
-                .expect("stage crews");
-            assert!(supplied_home("coder").join("skills/private-source/SKILL.md").is_file());
-            assert_eq!(
-                std::fs::read_dir(supplied_home("observer").join("skills"))
-                    .expect("empty skills")
-                    .filter(|entry| entry.as_ref().expect("entry").file_type().expect("type").is_dir())
-                    .count(),
-                0
-            );
-            assert!(supplied_home("reviewer").join("skills/unselected/SKILL.md").is_file());
-            assert!(!supplied_home("reviewer").join("skills/private-source").exists());
-            assert!(!supplied_home("coder").join("skills/unselected").exists());
-            assert!(!base.join("skills/private-source").exists(), "no vessel-wide skill union");
-            assert!(!token.exists(), "source tokens are removed after all crews stage");
-            for role in ["coder", "observer", "reviewer"] {
-                let launch_env =
-                    registry.crew_environment(role, &BTreeSet::from([adapter.into()]), &environment, &runner).await.expect("launch home");
-                assert!(launch_env.contains(&(variable.into(), supplied_home(role).display().to_string())));
-                assert_eq!(std::fs::read_to_string(supplied_home(role).join("settings.json")).expect("settings"), "{}");
-                assert_eq!(std::fs::read_to_string(supplied_home(role).join("auth.json")).expect("linked auth"), "first-token");
+            for (role, selected) in &crews {
+                let token = temp.path().join(format!("token-{role}"));
+                std::fs::write(&token, "test-token").expect("token");
+                let tree = registry.skill_tree(selected).await.expect("resolve");
+                registry
+                    .stage_skill_tree(&tree, &home(role).join("skills"), &BTreeMap::from([("private-skills".into(), token)]), &runner)
+                    .await
+                    .expect("stage crew");
+                login.link(&home(role), &agent).await.expect("link login");
             }
+            assert!(home("coder").join("skills/private-source/SKILL.md").is_file());
+            let skills = |role: &str| {
+                std::fs::read_dir(home(role).join("skills"))
+                    .expect("skills")
+                    .filter_map(|entry| entry.ok().filter(|entry| entry.file_type().expect("type").is_dir()).map(|entry| entry.file_name()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(skills("coder"), ["private-source"]);
+            assert_eq!(skills("reviewer"), ["unselected"]);
+            assert!(skills("observer").is_empty());
+            assert!(!base.join("skills").exists(), "no vessel-wide skill union");
             assert_eq!(
                 std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(),
                 1,
                 "crews reuse the pinned source cache"
             );
+            for (role, _) in &crews {
+                assert_eq!(std::fs::read_to_string(home(role).join("settings.json")).expect("settings"), "{}");
+                assert_eq!(std::fs::read_to_string(home(role).join("auth.json")).expect("linked auth"), "first-token");
+            }
             std::fs::write(base.join("settings.json"), "base changed").expect("base update");
-            std::fs::write(supplied_home("coder").join("settings.json"), "crew edited").expect("crew edit");
-            registry.crew_environment("coder", &BTreeSet::from([adapter.into()]), &environment, &runner).await.expect("resume crew");
+            std::fs::write(home("coder").join("settings.json"), "crew edited").expect("crew edit");
+            login.link(&home("coder"), &agent).await.expect("relink");
             assert_eq!(
-                std::fs::read_to_string(supplied_home("coder").join("settings.json")).expect("crew settings"),
+                std::fs::read_to_string(home("coder").join("settings.json")).expect("crew settings"),
                 "crew edited",
                 "base changes never overwrite crew scratch"
             );
             let replacement = base.join("auth.new");
             std::fs::write(&replacement, "refreshed-token").expect("new auth");
             std::fs::rename(replacement, base.join("auth.json")).expect("atomic refresh");
-            for role in ["coder", "observer", "reviewer"] {
-                assert_eq!(
-                    std::fs::read_to_string(supplied_home(role).join("auth.json")).expect("refreshed linked auth"),
-                    "refreshed-token"
-                );
+            for (role, _) in &crews {
+                assert_eq!(std::fs::read_to_string(home(role).join("auth.json")).expect("refreshed linked auth"), "refreshed-token");
             }
         }
-    }
-    #[tokio::test]
-    async fn partial_crew_staging_failure_removes_source_tokens() {
-        // Review #2673: a failure after the first crew stages must still remove
-        // source tokens even though the last crew never reaches skill staging.
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let runner = promisor_runner(temp.path());
-        let token = temp.path().join("token");
-        std::fs::write(&token, "test-token").expect("token");
-        let environment = vec![
-            ("CLAUDE_CONFIG_DIR".into(), runner.config_base.join("claude").display().to_string()),
-            (flotilla_resources::CREW_SKILLS_ENV.into(), serde_json::json!({"coder": [], "reviewer/invalid": []}).to_string()),
-            (CREW_HOME_KEYS_ENV.into(), serde_json::json!({"coder":"claude/crews/coder"}).to_string()),
-        ];
-        let error = registry
-            .stage_skills(
-                "partial",
-                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.into()]),
-                &environment,
-                &BTreeMap::from([("mattpocock-skills".into(), token.clone())]),
-                &runner,
-            )
-            .await
-            .expect_err("second crew fails");
-        assert!(error.contains(REQUESTER_HOME_UNAVAILABLE), "{error}");
-        assert!(runner.config_base.join("claude/crews/coder/skills").is_dir(), "first crew staged");
-        assert!(!token.exists(), "outer error path removes tokens after partial staging");
     }
 }
