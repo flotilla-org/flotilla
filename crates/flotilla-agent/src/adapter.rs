@@ -358,6 +358,8 @@ fn is_block_only_override(source: &str) -> bool {
 /// directory is the common parent holding one worktree per repository
 /// (`<work_dir>/<workspace_slug>`). Empty for a single-repository vessel, where
 /// the work directory is the checkout itself.
+/// Multi-repository follows the convoy's repository count, not the vessel's scope
+/// length, because that count decides the on-disk layout (`vessel.rs`).
 pub fn multi_repository_checkouts<'a>(
     convoy: &'a flotilla_resources::ConvoySpec,
     repository_refs: &[flotilla_resources::RepositoryKey],
