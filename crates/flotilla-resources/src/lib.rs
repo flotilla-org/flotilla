@@ -66,6 +66,7 @@ pub use forge_read::{
 };
 #[doc(hidden)]
 pub mod definition_provenance;
+pub mod definitions;
 mod fulfilment_kind;
 #[doc(hidden)]
 pub mod host;
