@@ -168,10 +168,13 @@ impl Store {
         if !has_string_domain(&tx)? {
             return Err(StoreError::LegacyDictionarySchema);
         }
-        check_kind_columns(&tx, &kinds)?;
+        // Codes first: a widened table is rebuilt with every column, so it needs no `ADD COLUMN`,
+        // whose change to the stored text would stop the table from widening.
         check_kind_codes(&tx, &kinds)?;
+        check_kind_columns(&tx, &kinds)?;
         sync_views(&tx, &kinds)?;
         tx.commit()?;
+        // An early return leaves foreign keys off, which is safe only because it drops `conn`.
         conn.pragma_update(None, "foreign_keys", true)?;
         Self::from_connection(conn, home, kinds, options)
     }
