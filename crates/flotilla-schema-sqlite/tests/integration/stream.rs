@@ -471,3 +471,70 @@ fn oversized_resource_uses_chunks_and_restores_atomically() {
     assert_eq!(chunks, 1025);
     eprintln!("oversized: child_payload_bytes={} chunks={chunks} largest_frame_bytes={largest}", 1024 * 17 * 1024);
 }
+
+// Behaviour (#4024): a round that resumes inside a change, whose earlier entry the follower
+// already holds, sends that change again ahead of the entry naming it; recording it again is the
+// same change, so the follower applies the entry and reaches the home's prefix.
+#[test]
+fn a_round_resuming_inside_a_change_sends_the_change_again() {
+    let mut a = store("a");
+    let mut b = store("b");
+    let mut write = a.write().expect("write");
+    let change = write.open_change(&origin()).expect("change");
+    write.insert("first", &message::sample_in(addr("inbox")), change).expect("first");
+    write.commit().expect("commit");
+    sync(&mut a, &mut b, None, 1).expect("snapshot");
+    let resumed = mark(&mut b, "a").home_seq;
+    let mut write = a.write().expect("write");
+    write.insert("second", &message::sample_in(addr("inbox")), change).expect("second, under the same change");
+    write.commit().expect("commit");
+    let mut frames = Vec::new();
+    Follower::new(&mut b)
+        .receive("a", |sink| {
+            stream::serve(&mut a, Some(resumed), Timestamp(2), |bytes| {
+                frames.push(Frame::decode(bytes)?);
+                sink(bytes)
+            })
+            .map(|_| ())
+        })
+        .expect("resumed tail");
+    assert!(matches!(&frames[0], Frame::Reason(sent) if sent.seq == change.0 && change.0 < resumed), "{frames:?}");
+    assert!(present(&mut b, "a", "second"));
+    assert_eq!(mark(&mut b, "a").home_seq, a.read().expect("read").last_sequence("a").expect("last"));
+}
+
+// Behaviour (#4024): a change that skips part of the home's prefix is refused before it is
+// recorded, and the round commits nothing.
+#[test]
+fn a_change_past_the_next_sequence_is_refused() {
+    let mut a = store("a");
+    let mut b = store("b");
+    insert(&mut a, "m");
+    sync(&mut a, &mut b, None, 1).expect("snapshot");
+    let at = mark(&mut b, "a");
+    let ahead =
+        flotilla_schema::ChangeHeader { home: "a".into(), seq: at.home_seq + 2, writer: "w".into(), at: Timestamp(3), items: vec![] };
+    let refused = Follower::new(&mut b).receive("a", |sink| sink(&Frame::Reason(Box::new(ahead.clone())).encode()?));
+    assert!(matches!(refused, Err(StoreError::Stream(_))), "{refused:?}");
+    assert_eq!(mark(&mut b, "a"), at);
+    assert_eq!(b.read().expect("read").change("a", ahead.seq).expect("read"), None, "nothing was recorded");
+}
+
+// Behaviour (#4024): a change recorded again must be the same change; another writer, time or
+// items under a held sequence is the sender's error, refused and recording nothing.
+#[test]
+fn a_change_recorded_again_with_other_content_is_refused() {
+    let mut a = store("a");
+    let mut b = store("b");
+    insert(&mut a, "m");
+    let event = a.read().expect("read").changes_since("a", 0, 1).expect("event").remove(0);
+    let held = a.read().expect("read").change("a", event.change).expect("read").expect("its change");
+    let mut write = b.write().expect("write");
+    write.record_change(&held).expect("record");
+    write.record_change(&held).expect("the same change again");
+    let other = flotilla_schema::ChangeHeader { writer: "someone else".into(), ..held.clone() };
+    let refused = write.record_change(&other);
+    assert!(matches!(refused, Err(StoreError::MalformedEvent(flotilla_schema_sqlite::Malformed::ChangeMismatch { .. }))), "{refused:?}");
+    write.commit().expect("commit");
+    assert_eq!(b.read().expect("read").change("a", held.seq).expect("read"), Some(held));
+}

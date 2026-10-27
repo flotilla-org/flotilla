@@ -2023,7 +2023,12 @@ impl Ctx<'_> {
         let sequence = i64::try_from(change.seq).ok().filter(|seq| *seq > 0).ok_or(Malformed::Sequence { home_seq: change.seq })?;
         let home = self.intern(HOME_DOMAIN, &change.home)?;
         if self.conn.prepare_cached(CHANGE_EXISTS)?.query_row(params![home, sequence], |_| Ok(())).optional()?.is_some() {
-            return Ok(());
+            // Recorded again, as a stream re-sends a change before an entry naming it: the same
+            // change, or the sender's is not the home's.
+            return match self.change(&change.home, change.seq)? {
+                Some(held) if held == *change => Ok(()),
+                _ => Err(Malformed::ChangeMismatch { home: change.home.clone(), seq: change.seq }.into()),
+            };
         }
         self.insert_change(&change.home, sequence, &change.writer, change.at, &change.items)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;

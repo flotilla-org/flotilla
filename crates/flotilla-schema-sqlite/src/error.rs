@@ -154,6 +154,10 @@ pub enum Malformed {
     /// numbers each change once, so the sender reused it.
     #[error("home sequence {home_seq} of {home} is already logged")]
     ReusedSequence { home: String, home_seq: u64 },
+    /// A change recorded again with another writer, time or items than the one held: a home
+    /// writes each change once, so the sender's copy is not the home's.
+    #[error("change {seq} of {home} is already held with another header or items")]
+    ChangeMismatch { home: String, seq: u64 },
     /// Above `i64::MAX`, or 0, which no write takes (sequences start at 1).
     #[error("home sequence {home_seq} cannot be stored")]
     Sequence { home_seq: u64 },

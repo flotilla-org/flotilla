@@ -134,32 +134,30 @@ fn serve_round(
     // cursor in sequence order; an entry's change opened before the cursor (before a snapshot's
     // cut) is sent ahead of it too, once per round.
     let mut sent = std::collections::BTreeSet::new();
-    let send_changes = |read: &mut crate::Read<'_>,
-                        after: u64,
-                        before: u64,
-                        sent: &mut std::collections::BTreeSet<u64>,
-                        send: &mut dyn FnMut(&[u8]) -> Result<(), StoreError>| {
-        let seqs = read.change_seqs(&home, after, before)?;
-        for seq in &seqs {
-            let change = read.change(&home, *seq)?.ok_or_else(|| StoreError::Stream("missing change".into()))?;
-            emit(Frame::Reason(Box::new(change)), send)?;
-            sent.insert(*seq);
-        }
-        Ok::<_, StoreError>(seqs.last().copied())
+    let reason = |read: &mut crate::Read<'_>, seq: u64, send: &mut dyn FnMut(&[u8]) -> Result<(), StoreError>| {
+        let change = read.change(&home, seq)?.ok_or_else(|| StoreError::Stream("missing change".into()))?;
+        emit(Frame::Reason(Box::new(change)), send)
     };
     loop {
         let events = read.changes_since(&home, cursor, MAX_PAGE)?;
+        // The page's changes, read once: those before each entry go out ahead of it, and once the
+        // log is exhausted the changes after the last entry end the tail.
+        let through = events.last().map_or(last.saturating_add(1), |event| event.home_seq);
+        let mut changes = read.change_seqs(&home, cursor, through)?.into_iter().peekable();
         if events.is_empty() {
-            if let Some(seq) = send_changes(&mut read, cursor, last.saturating_add(1), &mut sent, &mut send)? {
+            for seq in changes {
+                reason(&mut read, seq, &mut send)?;
                 cursor = seq;
             }
             break;
         }
         for event in events {
-            send_changes(&mut read, cursor, event.home_seq, &mut sent, &mut send)?;
+            while let Some(seq) = changes.next_if(|seq| *seq < event.home_seq) {
+                reason(&mut read, seq, &mut send)?;
+                sent.insert(seq);
+            }
             if event.change <= cursor && sent.insert(event.change) {
-                let change = read.change(&home, event.change)?.ok_or_else(|| StoreError::Stream("missing change".into()))?;
-                emit(Frame::Reason(Box::new(change)), &mut send)?;
+                reason(&mut read, event.change, &mut send)?;
             }
             cursor = event.home_seq;
             emit(Frame::Change(Box::new(event)), &mut send)?;
@@ -303,12 +301,15 @@ impl<'a> Follower<'a> {
                     snapshot = None;
                 }
                 Frame::Reason(change) if change.home == home && snapshot.is_none() => {
+                    // The next sequence, or a change at or before the cursor re-sent ahead of an
+                    // entry naming it; anything later skips part of the home's prefix.
+                    if change.seq > cursor.home_seq + 1 {
+                        return Err(StoreError::Stream("tail is not the next home prefix".into()));
+                    }
                     write.record_change(&change)?;
                     if change.seq == cursor.home_seq + 1 {
                         cursor.home_seq = change.seq;
                         write.advance_watermark(home, cursor)?;
-                    } else if change.seq > cursor.home_seq {
-                        return Err(StoreError::Stream("tail is not the next home prefix".into()));
                     }
                 }
                 Frame::Change(event) if event.home == home && snapshot.is_none() => {

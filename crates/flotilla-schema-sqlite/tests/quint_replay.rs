@@ -45,17 +45,23 @@ fn replay_quint_streams() {
             let before = Stream::of(&step.before[field]);
             let after = Stream::of(&step.after[field]);
             for (index, row) in after.rows.iter().enumerate().skip(frames.len()) {
-                let frame = if row.kind == "keepalive" {
-                    Frame::Keepalive { home: "home".into(), watermark: Watermark { home_seq: sequence, applied_through: moment(row.at) } }
+                // One delivered row is a keepalive, or an entry after its change (#4024).
+                let row_frames = if row.kind == "keepalive" {
+                    vec![Frame::Keepalive {
+                        home: "home".into(),
+                        watermark: Watermark { home_seq: sequence, applied_through: moment(row.at) },
+                    }]
                 } else {
                     let mut write = source.write().unwrap();
                     write.insert(&index.to_string(), &fixtures::message::sample_in(fixtures::addr("inbox")), &fixtures::origin()).unwrap();
                     write.commit().unwrap();
-                    let event = source.read().unwrap().changes_since("home", sequence, 1).unwrap().remove(0);
+                    let mut read = source.read().unwrap();
+                    let event = read.changes_since("home", sequence, 1).unwrap().remove(0);
+                    let change = read.change("home", event.change).unwrap().expect("its change");
                     sequence = event.home_seq;
-                    Frame::Change(Box::new(event))
+                    vec![Frame::Reason(Box::new(change)), Frame::Change(Box::new(event))]
                 };
-                frames.push(frame.encode().unwrap());
+                frames.push(row_frames.iter().map(|frame| frame.encode().unwrap()).collect::<Vec<_>>());
             }
             let linked = boolean(&step.before[field]["linked"]);
             // The transport is the only fake: on a broken link it cannot hand bytes to
@@ -64,7 +70,7 @@ fn replay_quint_streams() {
                 Follower::new(&mut replica)
                     .receive("home", |sink| {
                         if linked {
-                            for frame in &frames[before.applied..after.applied] {
+                            for frame in frames[before.applied..after.applied].iter().flatten() {
                                 sink(frame)?;
                             }
                         } else {
