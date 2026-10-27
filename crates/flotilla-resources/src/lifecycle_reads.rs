@@ -31,11 +31,20 @@ pub trait LifecycleReads: Send + Sync {
         origin: Option<&str>,
     ) -> Result<Option<flotilla_protocol::LifecycleReading>, String>;
 
+    /// Current launch identity alongside its checked judgement. Adapters serving terminal
+    /// lifecycles must provide the key; synthesising one could restart the wrong launch.
+    fn try_terminal_launch(&self, name: &str, origin: Option<&str>) -> Result<Option<crate::terminal_launches::TerminalLaunch>, String> {
+        match self.try_reading(ProvisioningKind::TerminalSession, name, origin)? {
+            None => Ok(None),
+            Some(_) => Err("terminal lifecycle reader does not provide launch identity".into()),
+        }
+    }
+
     /// The reading of `name` homed at `origin` (a replica's origin root; `None` for this home), or
     /// `None` when the engine holds no such resource: the switch is off, or it was written before.
     ///
-    /// Compatibility adapter for readers that still have a status copy. Readers without a copy
-    /// use `try_reading` so a read failure cannot select stale status.
+    /// Lossy compatibility adapter. Authoritative lifecycle consumers use `try_reading`
+    /// so a read failure cannot select stale status.
     fn reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Option<flotilla_protocol::LifecycleReading> {
         match self.try_reading(kind, name, origin) {
             Ok(reading) => reading,
@@ -77,6 +86,10 @@ impl LateLifecycleReads {
 }
 
 impl LifecycleReads for LateLifecycleReads {
+    fn try_terminal_launch(&self, name: &str, origin: Option<&str>) -> Result<Option<crate::terminal_launches::TerminalLaunch>, String> {
+        self.installed.get().map_or(Ok(None), |reads| reads.try_terminal_launch(name, origin))
+    }
+
     fn try_reading(
         &self,
         kind: ProvisioningKind,

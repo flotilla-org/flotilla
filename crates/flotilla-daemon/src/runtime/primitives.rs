@@ -194,13 +194,22 @@ impl MessageDelivery {
             if self.inflight.values().any(|turn| turn.consumer.id == name) {
                 continue;
             }
-            let reason = match backend.using::<TerminalSession>(&self.namespace).get(&name).await {
-                Ok(terminal) if terminal.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running) => continue,
-                Ok(terminal) if terminal.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Stopped) => {
+            let terminal = match backend.using::<TerminalSession>(&self.namespace).get(&name).await {
+                Ok(terminal) => Some(
+                    flotilla_store::read_terminal_session(self.state.daemon.lifecycle_reads(), &terminal, None)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .0,
+                ),
+                Err(ResourceError::NotFound { .. }) => None,
+                Err(error) => return Err(error.to_string()),
+            };
+            let reason = match terminal {
+                Some(terminal) if terminal.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running) => continue,
+                Some(terminal) if terminal.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Stopped) => {
                     EndReason::Completed
                 }
-                Ok(_) | Err(ResourceError::NotFound { .. }) => EndReason::Lost,
-                Err(error) => return Err(error.to_string()),
+                _ => EndReason::Lost,
             };
             let sessions = Arc::clone(self.primitives.sessions());
             let ended = name.clone();

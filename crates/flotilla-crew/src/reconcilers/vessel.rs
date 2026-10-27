@@ -558,9 +558,9 @@ impl VesselPrepared {
         Self { phase: None, patch: PlannedPatch::Failed { message: message.into() }, actuations: Vec::new() }
     }
 
-    fn interrupted(role: String, terminal_name: &str, restart: bool, mut actuations: Vec<Actuation>) -> Self {
+    fn interrupted(role: String, terminal_name: &str, restart: bool, replaces: Option<String>, mut actuations: Vec<Actuation>) -> Self {
         if restart {
-            actuations.push(Actuation::RestartTerminalSession { name: terminal_name.to_string() });
+            actuations.push(Actuation::RestartTerminalSession { name: terminal_name.to_string(), replaces });
         }
         Self {
             phase: None,
@@ -1382,6 +1382,8 @@ impl VesselReconciler {
             let terminal_name = identity.name();
             match self.terminal_sessions.get(&terminal_name).await {
                 Ok(existing) => {
+                    let (existing, launch) =
+                        flotilla_store::read_terminal_session(Arc::clone(&self.lifecycle_reads), &existing, None).await?;
                     terminal_refs.push(terminal_name.clone());
                     let phase = existing.status.as_ref().map(|status| status.phase);
                     if phase == Some(TerminalSessionPhase::Failed) {
@@ -1413,6 +1415,7 @@ impl VesselReconciler {
                                 process.role.clone(),
                                 &terminal_name,
                                 work_phase == Some(WorkPhase::Interrupted),
+                                launch,
                                 actuations,
                             ));
                         }

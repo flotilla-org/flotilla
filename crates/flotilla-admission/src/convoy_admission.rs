@@ -1075,6 +1075,11 @@ impl ConvoyAdmission {
             snapshot.insert_definitions::<CrewDefaults>(defaults)?;
             snapshot.insert_definitions::<FleetDesignation>(fleet)?;
             snapshot.insert::<ResourceConvoy>(convoys)?;
+            let terminals = flotilla_resources::ReadResourceList {
+                items: flotilla_store::read_terminal_sources(Arc::clone(&self.lifecycle_reads), terminals.items)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            };
             snapshot.insert::<ResourceTerminalSession>(terminals)?;
             snapshot.insert::<ConvoyEnsure>(ensures)?;
         }

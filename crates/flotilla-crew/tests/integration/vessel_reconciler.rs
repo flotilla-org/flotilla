@@ -2157,6 +2157,7 @@ async fn child_failure_propagates_to_workspace_failure() {
 async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_restart(
     #[case] work_phase: WorkPhase,
     #[case] crew_phase: CrewWorkPhase,
+    #[values(false, true)] engine: bool,
 ) {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-recover", "implement", REPO_URL, GIT_REF).await;
@@ -2241,7 +2242,17 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
         .await
         .expect("terminal stopped");
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let lifecycle = flotilla_provisioning_testkit::LifecycleFixture::<
+        flotilla_provisioning::engine::terminal_session::TerminalSessionBinding,
+    >::new(false);
+    let reconciler = if engine {
+        let terminal = backend.using::<TerminalSession>(NAMESPACE).get(terminal_name).await.expect("terminal");
+        lifecycle.request(&terminal);
+        lifecycle.finish(&terminal, flotilla_provisioning_testkit::Ending::Released);
+        test_vessel_reconciler(backend.clone(), NAMESPACE).with_lifecycle_reads(lifecycle.reads.clone())
+    } else {
+        test_vessel_reconciler(backend.clone(), NAMESPACE)
+    };
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -2276,7 +2287,7 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
 
     assert!(matches!(
         recovery.actuations.as_slice(),
-        [Actuation::RestartTerminalSession { name }] if name == terminal_name
+        [Actuation::RestartTerminalSession { name, replaces }] if name == terminal_name && replaces.as_deref() == engine.then(|| format!("{terminal_name}#1")).as_deref()
     ));
 }
 

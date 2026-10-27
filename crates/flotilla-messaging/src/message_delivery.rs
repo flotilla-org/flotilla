@@ -1497,6 +1497,11 @@ impl MessageInbox {
             let terminals = self.backend.using::<TerminalSession>(&self.namespace);
             match terminals.get(&owner.name).await {
                 Ok(holder) => {
+                    let holder = if let Some(reads) = self.backend.terminal_readings() {
+                        flotilla_store::read_terminal_session(reads, &holder, None).await?.0
+                    } else {
+                        holder
+                    };
                     // The legacy queue shares this receiver gate and can still own it.
                     if flotilla_resources::delivery_hold::legacy_delivery_gate_needed(&holder) {
                         return Ok(());

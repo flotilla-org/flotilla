@@ -1256,9 +1256,11 @@ impl InProcessDaemon {
         let crew_message_path = flotilla_crew::ports::MessagePath::default();
         let convoy_engine_path = flotilla_resources::convoy::engine::EngineConvoyPath::default();
         let vessel_seats_path = flotilla_resources::vessel_seats::VesselSeatsPath::default();
+        let lifecycle_reads = Arc::new(flotilla_resources::lifecycle_reads::LateLifecycleReads::default());
         let leaf_subscriptions =
             LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher)
                 .with_clock(Arc::clone(&clock))
+                .with_lifecycle_reads(lifecycle_reads.clone())
                 .with_message_inboxes(Arc::clone(&message_inboxes))
                 .with_message_path(Arc::clone(&crew_message_path))
                 .with_convoy_engine(Arc::clone(&convoy_engine_path))
@@ -1277,7 +1279,6 @@ impl InProcessDaemon {
         ));
         let admission_free_space_path = Arc::new(std::sync::RwLock::new(admission_free_space_path));
         let observed_checkout_reconciliation = Arc::new(Mutex::new(()));
-        let lifecycle_reads = Arc::new(flotilla_resources::lifecycle_reads::LateLifecycleReads::default());
         let accounts = Arc::new(flotilla_store::SwitchedAccounts::new(resource_backend.clone()));
         let manifest_roots = Arc::new(flotilla_store::SwitchedManifestRoots::new(resource_backend.clone()));
         let checkout_providers = Arc::new(
@@ -2221,7 +2222,9 @@ impl InProcessDaemon {
 
     /// Installs the engine's provisioning readings during composition (#3629 layer 4).
     pub fn install_lifecycle_reads(&self, reads: Arc<dyn flotilla_projections::ports::LifecycleReads>) -> Result<(), String> {
-        self.lifecycle_reads.install(reads)
+        self.lifecycle_reads.install(Arc::clone(&reads))?;
+        self.resource_backend.install_terminal_readings(reads);
+        Ok(())
     }
 
     /// Installs the engine's account records during composition (#3824 layer 1).

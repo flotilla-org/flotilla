@@ -10,7 +10,7 @@ pub enum Actuation {
     CreateTerminalSession { meta: InputMeta, spec: TerminalSessionSpec },
     CreateDemand { meta: InputMeta, spec: crate::DemandSpec },
     DeleteDemand { name: String },
-    RestartTerminalSession { name: String },
+    RestartTerminalSession { name: String, replaces: Option<String> },
     PruneTerminalMessages { name: String },
     DeleteTerminalSession { name: String },
     CreateVessel { meta: InputMeta, spec: VesselSpec },

@@ -578,7 +578,10 @@ pub async fn refresh_cards(
     accounts: &dyn AccountRecords,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
-    let sessions = backend.clone().using::<TerminalSession>(namespace).list().await.map_err(|error| error.to_string())?;
+    let mut sessions = backend.clone().using::<TerminalSession>(namespace).list().await.map_err(|error| error.to_string())?;
+    for session in &mut sessions.items {
+        *session = flotilla_store::read_terminal_session(Arc::clone(&reads), session, None).await.map_err(|error| error.to_string())?.0;
+    }
     let live = sessions
         .items
         .iter()

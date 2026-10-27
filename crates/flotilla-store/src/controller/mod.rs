@@ -650,8 +650,10 @@ impl<R: Reconciler> ControllerLoop<R> {
                 }
                 Err(ResourceError::other("terminal message pruning contention persisted"))
             }
-            Actuation::RestartTerminalSession { name } => {
+            Actuation::RestartTerminalSession { name, replaces } => {
                 let resolver = backend.using::<crate::TerminalSession>(namespace);
+                let obj = resolver.get(&name).await?;
+                backend.request_terminal_replacement(&obj, replaces.as_deref(), Utc::now()).await?;
                 crate::apply_status_patch(&resolver, &name, &crate::TerminalSessionStatusPatch::MarkStarting).await.map(|_| ())
             }
             Actuation::DeleteTerminalSession { name } => {

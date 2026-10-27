@@ -364,6 +364,13 @@ impl MessageReceiverSnapshot {
         terminals: std::sync::Arc<crate::ReadResourceList<TerminalSession>>,
         ensures: std::sync::Arc<crate::ReadResourceList<ConvoyEnsure>>,
     ) -> Result<Self, ResourceError> {
+        let terminals = if let Some(reads) = backend.terminal_readings() {
+            std::sync::Arc::new(crate::ReadResourceList {
+                items: flotilla_store::read_terminal_sources(reads, terminals.items.clone()).await?,
+            })
+        } else {
+            terminals
+        };
         let mut projects = BTreeMap::new();
         let mut fleet = None;
         let mut defaults = Vec::new();

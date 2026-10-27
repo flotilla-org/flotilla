@@ -644,8 +644,16 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     .list()
                     .await
                     .map_err(|error| error.to_string())?;
-                Ok(sessions
-                    .items
+                let mut selected = Vec::with_capacity(sessions.items.len());
+                for session in sessions.items {
+                    selected.push(
+                        flotilla_store::read_terminal_session(self.state.daemon.lifecycle_reads(), &session, None)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .0,
+                    );
+                }
+                Ok(selected
                     .into_iter()
                     .filter_map(|session| {
                         if session.spec.env_ref != spec.env_ref

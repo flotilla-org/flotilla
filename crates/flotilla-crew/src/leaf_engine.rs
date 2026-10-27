@@ -108,6 +108,7 @@ pub struct LeafSubscriptionTable {
 }
 
 struct LeafSubscriptionTableInner {
+    lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     clock: Arc<dyn flotilla_resources::Clock>,
     backend: ResourceBackend,
     watch_views: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<wake::LeafViews>>>>,
@@ -151,6 +152,11 @@ enum UnableEvidenceKey {
 }
 
 impl LeafSubscriptionTable {
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>) -> Self {
+        Arc::get_mut(&mut self.inner).expect("configure lifecycle reads before sharing subscriptions").lifecycle_reads = reads;
+        self
+    }
+
     /// Use the daemon clock for stall freshness, idle grace and nudge backoff.
     pub fn with_clock(mut self, clock: Arc<dyn flotilla_resources::Clock>) -> Self {
         Arc::get_mut(&mut self.inner).expect("configure clock before sharing subscriptions").clock = clock;
@@ -220,6 +226,7 @@ impl LeafSubscriptionTable {
         let (reconciler_tx, _) = broadcast::channel(32);
         Self {
             inner: Arc::new(LeafSubscriptionTableInner {
+                lifecycle_reads: Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
                 clock: Arc::new(flotilla_resources::SystemClock),
                 backend,
                 watch_views: Default::default(),
