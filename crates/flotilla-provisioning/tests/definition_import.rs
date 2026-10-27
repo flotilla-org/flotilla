@@ -403,19 +403,24 @@ fn the_import_carries_each_definition_to_the_homes_that_declare_it() {
     assert!(records.is_empty() && report.refused.is_empty());
     assert_eq!(report.dropped.values().sum::<usize>(), 1);
 
-    // A stamp naming the manifest without its root: refused.
+    // A stamp naming the manifest without all of its fields: refused, whether the root alone is
+    // missing or only the managed-by label is left.
     let mut unstamped = at_home("alpha", Some("a-root"), forge_spec("https://x"), 1);
     unstamped.object.metadata.annotations.remove(MANIFEST_RECONCILER_ROOT_ANNOTATION);
-    let (records, report) = homes(&[unstamped]);
-    assert!(records.is_empty());
-    assert_eq!(report.refused.len(), 1);
+    let mut label_only = at_home("alpha", Some("a-root"), forge_spec("https://x"), 1);
+    label_only.object.metadata.annotations.clear();
+    for copy in [unstamped, label_only] {
+        let (records, report) = homes(&[copy]);
+        assert!(records.is_empty());
+        assert_eq!(report.refused.len(), 1);
+    }
 
-    // One name in two namespaces at one home: the engine has no namespaces, so the second is refused.
+    // One name in two namespaces at one home: the engine has no namespaces, so both are refused.
     let mut other = at_home("alpha", None, forge_spec("https://x"), 1);
     other.namespace = "lab".into();
     let (records, report) = homes(&[at_home("alpha", None, forge_spec("https://x"), 1), other]);
-    assert_eq!(records.len(), 1);
-    assert_eq!(report.refused.len(), 1);
+    assert!(records.is_empty());
+    assert_eq!(report.refused.len(), 2);
 
     // A built-in's stored copy and a retired layer: dropped and counted, never imported.
     let layers: Vec<ImageLayerResourceSpec> = shipped("ImageLayer");

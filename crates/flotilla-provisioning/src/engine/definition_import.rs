@@ -33,7 +33,7 @@ use flotilla_resources::{
         SOURCE_REPOSITORY_ANNOTATION,
     },
     CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec, ObjectMeta, Resource,
-    ResourceObject, WorkflowTemplate, MANAGED_BY_LABEL, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
+    ResourceObject, WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
 };
 use flotilla_schema::Kind;
 use flotilla_store::{definition_is_live, merge_definition_copies};
@@ -66,28 +66,45 @@ pub trait DefinitionKind {
     fn map(origin: DefinitionOrigin, spec: &<Self::Old as Resource>::Spec) -> Result<Mapped<Self::Stored>, String>;
 }
 
-macro_rules! definition_kind {
-    ($old:ty => $stored:ty, |$origin:ident, $spec:ident| $map:expr) => {
+/// A kind whose every old spec maps onto one engine record.
+macro_rules! whole_definition {
+    ($($old:ty => $stored:ty),* $(,)?) => {$(
         impl DefinitionKind for $stored {
             type Old = $old;
             type Stored = $stored;
-            fn map($origin: DefinitionOrigin, $spec: &<$old as Resource>::Spec) -> Result<Mapped<$stored>, String> {
-                $map
+            fn map(origin: DefinitionOrigin, spec: &<$old as Resource>::Spec) -> Result<Mapped<$stored>, String> {
+                Ok(Mapped::Stored(<$stored>::new(origin, spec)))
             }
         }
-    };
+    )*};
 }
 
-definition_kind!(Forge => ForgeDefinition, |origin, spec| Ok(Mapped::Stored(ForgeDefinition::new(origin, spec))));
-definition_kind!(FleetDesignation => FleetDesignationDefinition, |origin, spec| Ok(Mapped::Stored(FleetDesignationDefinition::new(origin, spec))));
-definition_kind!(CredentialSpec => CredentialSpecDefinition, |origin, spec| Ok(Mapped::Stored(CredentialSpecDefinition::new(origin, spec))));
-definition_kind!(CredentialGrant => CredentialGrantDefinition, |origin, spec| Ok(Mapped::Stored(CredentialGrantDefinition::new(origin, spec))));
-definition_kind!(CrewDefaults => CrewDefaultsDefinition, |origin, spec| Ok(Mapped::Stored(CrewDefaultsDefinition::new(origin, spec))));
-definition_kind!(ImageLayer => ImageLayerDefinition, |origin, spec| match spec {
-    ImageLayerResourceSpec::Current(layer) => ImageLayerDefinition::new(origin, layer).map(Mapped::Stored),
-    ImageLayerResourceSpec::Retired => Ok(Mapped::Dropped("retired ADR 0053 layer")),
-});
-definition_kind!(WorkflowTemplate => WorkflowTemplateDefinition, |origin, spec| WorkflowTemplateDefinition::new(origin, spec).map(Mapped::Stored));
+whole_definition!(
+    Forge => ForgeDefinition,
+    FleetDesignation => FleetDesignationDefinition,
+    CredentialSpec => CredentialSpecDefinition,
+    CredentialGrant => CredentialGrantDefinition,
+    CrewDefaults => CrewDefaultsDefinition,
+);
+
+impl DefinitionKind for ImageLayerDefinition {
+    type Old = ImageLayer;
+    type Stored = ImageLayerDefinition;
+    fn map(origin: DefinitionOrigin, spec: &ImageLayerResourceSpec) -> Result<Mapped<ImageLayerDefinition>, String> {
+        match spec {
+            ImageLayerResourceSpec::Current(layer) => ImageLayerDefinition::new(origin, layer).map(Mapped::Stored),
+            ImageLayerResourceSpec::Retired => Ok(Mapped::Dropped("retired ADR 0053 layer")),
+        }
+    }
+}
+
+impl DefinitionKind for WorkflowTemplateDefinition {
+    type Old = WorkflowTemplate;
+    type Stored = WorkflowTemplateDefinition;
+    fn map(origin: DefinitionOrigin, spec: &WorkflowTemplateSpec) -> Result<Mapped<WorkflowTemplateDefinition>, String> {
+        WorkflowTemplateDefinition::new(origin, spec).map(Mapped::Stored)
+    }
+}
 
 /// The old copies of every definition kind the import carries.
 #[derive(Default)]
@@ -143,7 +160,6 @@ where
         by_name.entry((copy.namespace.as_str(), copy.object.metadata.name.as_str())).or_default().push(copy);
     }
     let mut imported = Vec::new();
-    let mut held = BTreeMap::<(String, String), String>::new();
     for ((namespace, name), copies) in by_name {
         let refuse = |reason: String| ImportRefusal { kind, record: name.to_owned(), reason };
         if is_builtin(kind, name) {
@@ -199,26 +215,39 @@ where
                 }
             };
             match D::map(origin, &merged.spec) {
-                Ok(Mapped::Stored(record)) => {
-                    if let Some(other) = held.insert((name.to_owned(), copy.home.clone()), namespace.to_owned()) {
-                        report.refused.push(refuse(format!(
-                            "at `{}`: held in namespaces `{other}` and `{namespace}`, and the engine has no namespaces",
-                            copy.home
-                        )));
-                        continue;
-                    }
-                    imported.push(ImportedDefinition {
-                        namespace: namespace.to_owned(),
-                        name: name.to_owned(),
-                        home: copy.home.clone(),
-                        record,
-                    });
-                }
+                Ok(Mapped::Stored(record)) => imported.push(ImportedDefinition {
+                    namespace: namespace.to_owned(),
+                    name: name.to_owned(),
+                    home: copy.home.clone(),
+                    record,
+                }),
                 Ok(Mapped::Dropped(reason)) => *report.dropped.entry((kind, reason)).or_default() += 1,
                 Err(reason) => report.refused.push(refuse(format!("at `{}`: {reason}", copy.home))),
             }
         }
     }
+    // The engine has no namespaces: a name a home holds in several is refused in all of them,
+    // so no caller imports one namespace's record in place of another's.
+    let mut namespaces = BTreeMap::<(&str, &str), BTreeSet<&str>>::new();
+    for record in &imported {
+        namespaces.entry((record.name.as_str(), record.home.as_str())).or_default().insert(record.namespace.as_str());
+    }
+    let clashes: BTreeMap<(String, String), String> = namespaces
+        .into_iter()
+        .filter(|(_, held)| held.len() > 1)
+        .map(|((name, home), held)| ((name.to_owned(), home.to_owned()), held.into_iter().collect::<Vec<_>>().join("`, `")))
+        .collect();
+    imported.retain(|record| match clashes.get(&(record.name.clone(), record.home.clone())) {
+        Some(held) => {
+            report.refused.push(ImportRefusal {
+                kind,
+                record: record.name.clone(),
+                reason: format!("at `{}`: held in namespaces `{held}`, and the engine has no namespaces", record.home),
+            });
+            false
+        }
+        None => true,
+    });
     imported
 }
 
@@ -229,6 +258,7 @@ where
 {
     let kind = <D::Stored as Kind>::KIND;
     for imported in import_kind::<D>(copies, report) {
+        // Version 1: each record starts at its home as a fresh write, its old versions not carried.
         match rehearsal.restore(&imported.home, &imported.name, 1, &imported.record) {
             Ok(()) => *report.imported.entry((kind, label(imported.record.origin()))).or_default() += 1,
             Err(reason) => report.refused.push(ImportRefusal { kind, record: imported.name, reason }),
