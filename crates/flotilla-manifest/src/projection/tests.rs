@@ -293,6 +293,7 @@ fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
         CleatEndpoint { runtime_root: "/var/lib/flotilla/cleat".to_owned(), daemon: "work@3".to_owned(), session: "session-42".to_owned() };
     let mut terminal = vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).materialize("terminal-remote-coder").call();
     terminal.cleat_endpoint = Some(endpoint.clone());
+    terminal.environment_kind = Some(EnvironmentKind::Direct);
     let convoy = ConvoyRow::builder()
         .resource(reference)
         .name("remote")
@@ -326,6 +327,32 @@ fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
     assert!(fallback.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
     assert!(text(&fallback, KEY_PRIMARY_DIRECT_REASON).contains("SSH reachability"));
     assert!(!fallback.set.contains_key(KEY_PRIMARY_DIRECT_DAEMON));
+
+    // Container daemons cannot be addressed in either transport's host namespace.
+    // The kind/transport cross-product exhausts this finite projection decision.
+    for kind in [Some(EnvironmentKind::Provisioned), None] {
+        for transport in [&remote_mint, &local_mint] {
+            let mut container = convoy.clone();
+            container.vessels[0].environment_kind = kind;
+            let projected = project_catalog(&catalog_input(&[container]), transport);
+            let patches = projected.reassert_patches();
+            let patch = find_entity(&patches, &vessel_entity);
+            assert!(patch.set.contains_key(KEY_PRIMARY_DIRECT_REASON));
+            assert!(patch.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
+            for key in [
+                KEY_PRIMARY_DIRECT_TRANSPORT,
+                KEY_PRIMARY_DIRECT_HOST,
+                KEY_PRIMARY_DIRECT_RUNTIME_ROOT,
+                KEY_PRIMARY_DIRECT_DAEMON,
+                KEY_PRIMARY_DIRECT_SESSION,
+            ] {
+                assert!(!patch.set.contains_key(key), "unsafe endpoint fact {key} for {kind:?}");
+            }
+            let withdrawal = projected.diff_patches(&remote);
+            let patch = find_entity(&withdrawal, &vessel_entity);
+            assert!(patch.unset.contains(&KEY_PRIMARY_DIRECT_DAEMON.to_owned()));
+        }
+    }
 
     let mut endpoint_lost = convoy.clone();
     endpoint_lost.vessels[0].cleat_endpoint = None;

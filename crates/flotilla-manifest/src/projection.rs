@@ -12,7 +12,7 @@ use flotilla_protocol::{
         ConvoyRow, IndependentRow, ProjectRepositoriesRow, Readiness, ReadinessState, SessionPhase, StandingRoleHold, StandingRoleRow,
         SurfaceState, Timestamp, VesselRow, WorkPhase,
     },
-    HostName, ReferenceContext, ViewAddress, AWARENESS_REL_FOR_CONVOY,
+    EnvironmentKind, HostName, ReferenceContext, ViewAddress, AWARENESS_REL_FOR_CONVOY,
 };
 use flotilla_resources::{
     ChangeRequest, ChangeRequestStatus, Forge, Issue, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
@@ -589,7 +589,7 @@ fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys:
         Some((target, recipe)) if role.hold.is_none() => {
             catalog.assert_entity(entity.clone(), action_facts(&recipe, "workspace"), None);
             if let Some(vessel) = live.and_then(|convoy| (convoy.vessels.len() == 1).then(|| &convoy.vessels[0])) {
-                facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), &vessel.host, mint));
+                facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), vessel.environment_kind, &vessel.host, mint));
             }
             facts.push((KEY_WORKSPACE_PRIMARY_STATE, MetadataValue::text("ready")));
             facts.push((KEY_WORKSPACE_PRIMARY_TARGET, MetadataValue::text(target.action_target())));
@@ -772,7 +772,7 @@ fn project_awareness_entry(
             }
             _ => None,
         } {
-            facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), &vessel.host, mint));
+            facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), vessel.environment_kind, &vessel.host, mint));
         }
     }
     catalog.assert_entity(entity, facts, None);
@@ -1059,7 +1059,7 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     if let [vessel] = convoy.vessels.as_slice() {
         if let Some(recipe) = vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)) {
             catalog.assert_entity(convoy_entity.clone(), action_facts(&recipe, "workspace"), ordinal);
-            facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), &vessel.host, mint));
+            facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), vessel.environment_kind, &vessel.host, mint));
         }
     }
     if let Some(decision) = &convoy.placement_decision {
@@ -1154,7 +1154,7 @@ fn project_vessel(
     }
     if let Some(recipe) = vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)) {
         catalog.assert_entity(entity.clone(), action_facts(&recipe, "workspace"), ordinal);
-        facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), &vessel.host, mint));
+        facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), vessel.environment_kind, &vessel.host, mint));
     }
     catalog.assert_entity(entity, facts, ordinal);
 }
@@ -1185,7 +1185,10 @@ fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint
     }
     if let Some(recipe) = independent.attach.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &independent.host)) {
         catalog.assert_entity(entity.clone(), action_facts(&recipe, "pane"), ordinal);
-        facts.extend(direct_facts(independent.cleat_endpoint.as_ref(), &independent.host, mint));
+        // Independent rows have no vessel kind, so retain the host-native
+        // assumption. Container-hosted independents need their own environment
+        // evidence before they can be filtered here.
+        facts.extend(direct_facts(independent.cleat_endpoint.as_ref(), Some(EnvironmentKind::Direct), &independent.host, mint));
     }
     catalog.assert_entity(entity, facts, ordinal);
 }
@@ -1279,10 +1282,24 @@ fn action_facts(recipe: &Recipe, vehicle: &'static str) -> Vec<(String, Metadata
     facts
 }
 
-fn direct_facts(endpoint: Option<&CleatEndpoint>, host: &HostName, mint: &dyn RecipeMint) -> Vec<(&'static str, MetadataValue)> {
+fn direct_facts(
+    endpoint: Option<&CleatEndpoint>,
+    environment_kind: Option<EnvironmentKind>,
+    host: &HostName,
+    mint: &dyn RecipeMint,
+) -> Vec<(&'static str, MetadataValue)> {
     let Some(endpoint) = endpoint else {
         return vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text("no observed Cleat daemon endpoint for this session"))];
     };
+    match environment_kind {
+        Some(EnvironmentKind::Provisioned) => {
+            return vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text("Cleat daemon is inside a container; use flotilla attach"))];
+        }
+        None => {
+            return vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text("Cleat daemon environment is unknown; use flotilla attach"))];
+        }
+        Some(EnvironmentKind::Direct) => {}
+    }
     match mint.direct_transport(host) {
         Ok(transport) => {
             let (kind, address) = match transport {

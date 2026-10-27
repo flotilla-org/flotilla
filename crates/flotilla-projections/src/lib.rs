@@ -67,6 +67,7 @@ pub fn run(
                     .durable_convoy_ensures(durable.including_replicas::<flotilla_resources::ConvoyEnsure>(namespace))
                     .durable_demands(durable.clone().using::<Demand>(namespace))
                     .durable_environments(durable.clone().using::<Environment>(namespace))
+                    .durable_placement_policies(durable.including_replicas::<flotilla_resources::PlacementPolicy>(namespace))
                     .durable_sessions(durable.including_replicas::<flotilla_resources::TerminalSession>(namespace))
                     .durable_projects(durable.including_replicas::<Project>(namespace))
                     .durable_fleet_designation(durable.including_replicas::<flotilla_resources::FleetDesignation>(namespace))
