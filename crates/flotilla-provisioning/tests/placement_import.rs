@@ -201,8 +201,9 @@ fn what_the_move_cannot_carry_is_refused() {
     assert_eq!(report.dropped.get(&("PlacementPolicy", "agent adapters, an image fact the host probes")), Some(&1));
 }
 
-// Behaviour (#3824 layer 4a, review of #4003): a provider set alike by a manifest's policy and an
-// operator's takes the manifest's origin in either listing order; a cloud sandbox's provider is
+// Behaviour (#3824 layer 4a, review of #4003): a provider set by a manifest's policy and by the
+// daemon's seeded one (which names its instance, with default settings) is one record per host and
+// realisation, taking the manifest's declared settings and origin in either listing order; a cloud sandbox's provider is
 // bound to no host and named by its realisation alone; one policy name at two homes imports at
 // each; and a snapshot's settings, being dropped, cannot refuse it.
 #[test]
@@ -216,9 +217,13 @@ fn providers_and_names_import_whatever_the_order() {
         spec
     };
     let policies = [
-        copy::<PlacementPolicy>("operator-kiwi", "kiwi", &[], &[], crew_image(50)),
+        copy::<PlacementPolicy>("docker-on-kiwi", "kiwi", &[], &[], {
+            let mut seeded = crew_image(80);
+            seeded["provider_requirements"] = json!({"instance": "docker"});
+            seeded
+        }),
         copy::<PlacementPolicy>("manifest-kiwi", "kiwi", &labels, &annotations, crew_image(50)),
-        copy::<PlacementPolicy>("operator-kiwi", "feta", &[], &[], crew_image(50)),
+        copy::<PlacementPolicy>("docker-on-kiwi", "feta", &[], &[], crew_image(50)),
         copy::<PlacementPolicy>("sandbox", "kiwi", &[], &[], cloud),
         copy::<PlacementPolicy>("placement-snapshot-0123456789ab", "kiwi", &[], &[], constrained_snapshot),
     ];
@@ -237,13 +242,19 @@ fn providers_and_names_import_whatever_the_order() {
             &imported.providers.iter().find(|placed| placed.name == name && placed.home == home).unwrap_or_else(|| panic!("{name}")).record
         };
         let docker = format!("{KIWI}.docker_per_vessel");
-        assert!(matches!(provider(&docker, "kiwi").origin, DefinitionOrigin::Manifest { .. }), "reversed: {reversed}");
+        let declared = provider(&docker, "kiwi");
+        assert!(matches!(declared.origin, DefinitionOrigin::Manifest { .. }), "reversed: {reversed}");
+        assert!(
+            matches!(&declared.settings, ProviderSettings::DockerPerVessel { memory_policy, .. } if memory_policy.host_memory_percent == 50)
+        );
+        assert_eq!(imported.providers.iter().filter(|placed| placed.home == "kiwi" && placed.name.starts_with(KIWI)).count(), 1);
+        assert!(report.notes.iter().any(|note| note.contains("override those of `docker-on-kiwi`")), "{:?}", report.notes);
         assert_eq!(provider(&docker, "feta").origin, DefinitionOrigin::Operator);
         let sandbox = provider("cloud_sandbox_per_vessel", "kiwi");
         assert_eq!(sandbox.host_ref, "");
         assert!(matches!(&sandbox.settings, ProviderSettings::CloudSandboxPerVessel { env, .. } if env["A"] == "b"));
         let homes: Vec<_> =
-            imported.kinds.iter().filter(|placed| placed.name == "operator-kiwi").map(|placed| placed.home.as_str()).collect();
+            imported.kinds.iter().filter(|placed| placed.name == "docker-on-kiwi").map(|placed| placed.home.as_str()).collect();
         assert_eq!(homes, ["feta", "kiwi"]);
         assert!(imported.kinds.iter().any(|placed| placed.name == "placement-snapshot-0123456789ab"));
     }

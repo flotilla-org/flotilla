@@ -14,13 +14,14 @@ use crate::{
     HostDirectPlacementPolicyCheckout,
 };
 
-/// One provider instance's settings on one host, named `<host_ref>.<instance or realisation>`.
+/// The settings of a host's provider of one realisation, named `<host_ref>.<realisation>`: one per
+/// realisation per host, as admission resolves a policy's provider today.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentProviderSpec {
     /// The host whose provider these settings are for; empty for a provider bound to no host.
     pub host_ref: String,
-    /// The provider instance; omitted is the host's one provider of the realisation, as admission
-    /// resolves it today.
+    /// The provider instance, when one is named; omitted is the host's one provider of the
+    /// realisation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
     #[serde(flatten)]
@@ -63,7 +64,7 @@ pub enum ProviderSettings {
 }
 
 impl ProviderSettings {
-    /// The realisation's name, as the settings' record name uses it when no instance is named.
+    /// The realisation's name, as the settings' record name uses it.
     pub const fn realisation(&self) -> &'static str {
         match self {
             Self::DockerPerVessel { .. } => "docker_per_vessel",
@@ -74,10 +75,10 @@ impl ProviderSettings {
 }
 
 impl EnvironmentProviderSpec {
-    /// The settings' record name: `<host_ref>.<instance>`, else `<host_ref>.<realisation>`; the
-    /// host part is left out for a provider bound to no host.
+    /// The settings' record name: `<host_ref>.<realisation>`; the host part is left out for a
+    /// provider bound to no host.
     pub fn record_name(&self) -> String {
-        let key = self.instance.as_deref().unwrap_or(self.settings.realisation());
+        let key = self.settings.realisation();
         if self.host_ref.is_empty() {
             key.to_owned()
         } else {

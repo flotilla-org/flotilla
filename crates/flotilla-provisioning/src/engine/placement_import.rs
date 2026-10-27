@@ -12,7 +12,7 @@
 //! | PlacementPolicy with a kind of its name at its home | that kind stands; the policy gives its settings |
 //! | PlacementPolicy with none | a kind of its name: host, pool, cost class, image and the default grants a live policy's kind takes (`FulfilmentKindSpec::from_policy`); a host-direct policy takes its platform from its host's host-direct kind, and is refused without one |
 //! | A prepared placement snapshot (`placement-snapshot-*`, `-remote-placement-*`) | a Snapshot-origin kind of its name with its frozen image; its settings dropped, its host's apply |
-//! | A live policy's Docker pull and memory policy, cwd, env and checkout; host-direct checkout; a cloud sandbox's size, checkout and env | its host's EnvironmentProvider, named `<host>.<instance or realisation>`; refused when a home's policies set one provider differently |
+//! | A live policy's Docker pull and memory policy, cwd, env and checkout; host-direct checkout; a cloud sandbox's size, checkout and env | its host's EnvironmentProvider, one per realisation, named `<host>.<realisation>`; a manifest's declared settings override a seeded or operator policy's; refused when two of one rank set it differently |
 //! | `priority` | dropped: admission selects by grants and cost (ADR 0046) |
 //! | `agent_adapters` | dropped: an image fact the host probes |
 //! | `legacy_image_baseline_ref` | dropped with CrewImageBaseline |
@@ -207,14 +207,32 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
         }
     }
     for ((name, home), mut set) in providers {
-        // The record takes a declaring manifest's origin, so the manifest reconciler owns it; else
-        // the first policy's by name. Neither depends on the order the copies were listed in.
+        // A manifest's settings are declared; the daemon's seeded policy and an operator's are
+        // defaults the declaration overrides. The record takes the declaring manifest's settings and
+        // origin, so its reconciler owns it; else the first policy's by name. Neither depends on the
+        // order the copies were listed in.
+        let undeclared = |origin: &DefinitionOrigin| !matches!(origin, DefinitionOrigin::Manifest { .. });
         set.sort_by(|(left, left_origin, _), (right, right_origin, _)| {
-            let undeclared = |origin: &DefinitionOrigin| !matches!(origin, DefinitionOrigin::Manifest { .. });
             (undeclared(left_origin), left).cmp(&(undeclared(right_origin), right))
         });
         let (first, origin, spec) = &set[0];
-        let differing: Vec<_> = set.iter().filter(|(_, _, other)| other != spec).map(|(policy, _, _)| policy.as_str()).collect();
+        let rank = undeclared(origin);
+        let overridden: Vec<_> = set
+            .iter()
+            .filter(|(_, other_origin, other)| undeclared(other_origin) != rank && other != spec)
+            .map(|(policy, _, _)| policy.as_str())
+            .collect();
+        if !overridden.is_empty() {
+            report.notes.push(format!(
+                "{PROVIDERS} `{name}` at `{home}`: `{first}`'s declared settings override those of `{}`",
+                overridden.join("`, `")
+            ));
+        }
+        let differing: Vec<_> = set
+            .iter()
+            .filter(|(_, other_origin, other)| undeclared(other_origin) == rank && other != spec)
+            .map(|(policy, _, _)| policy.as_str())
+            .collect();
         if !differing.is_empty() {
             report.refused.push(ImportRefusal {
                 kind: PROVIDERS,
