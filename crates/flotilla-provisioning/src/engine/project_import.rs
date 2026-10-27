@@ -28,13 +28,13 @@ use super::{
     definition_import::{DefinitionCopy, DefinitionKind, Mapped},
     import::{ImportRefusal, ImportReport},
 };
-use crate::stored::project::{DefinitionOrigin, ProjectDefinition, ProjectOpsRecord};
+use crate::stored::project::{ProjectDefinition, ProjectOpsRecord};
 
 impl DefinitionKind for ProjectDefinition {
     type Old = Project;
     type Stored = ProjectDefinition;
-    fn map(origin: DefinitionOrigin, spec: &ProjectSpec) -> Result<Mapped<ProjectDefinition>, String> {
-        ProjectDefinition::new(origin, spec).map(Mapped::Stored)
+    fn map(_: Option<String>, spec: &ProjectSpec) -> Result<Mapped<ProjectDefinition>, String> {
+        ProjectDefinition::new(spec).map(Mapped::Stored)
     }
 }
 

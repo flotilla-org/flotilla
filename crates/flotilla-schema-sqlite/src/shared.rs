@@ -161,6 +161,8 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("change_items", CHANGE_ITEMS),
     ("change_exists", CHANGE_EXISTS),
     ("change_seqs", CHANGE_SEQS),
+    ("change_naming", CHANGE_NAMING),
+    ("log_last_change", LOG_LAST_CHANGE),
     ("log_cause", LOG_CAUSE),
     ("log_by_resource", LOG_BY_RESOURCE),
     ("log_by_home", LOG_BY_HOME),
@@ -199,6 +201,12 @@ pub(crate) const CHANGE_ITEMS: &str = "SELECT i.kind, n.s, h.s, ci.revision FROM
 pub(crate) const CHANGE_EXISTS: &str = "SELECT 1 FROM change WHERE home = ?1 AND seq = ?2";
 /// A home's changes between two of its sequences, in order: those a stream sends between entries.
 pub(crate) const CHANGE_SEQS: &str = "SELECT seq FROM change WHERE home = ?1 AND seq > ?2 AND seq < ?3 ORDER BY seq";
+/// The newest change at a home naming a record as an item, by `change_items_by_record`.
+pub(crate) const CHANGE_NAMING: &str =
+    "SELECT change_seq FROM change_items WHERE record = ?1 AND change_home = ?2 ORDER BY change_seq DESC LIMIT 1";
+/// A resource's newest entry's change, by `log_by_resource`: why it is as it is.
+pub(crate) const LOG_LAST_CHANGE: &str =
+    "SELECT (SELECT s FROM strings WHERE id = home), change FROM log WHERE resource = ?1 ORDER BY home_seq DESC LIMIT 1";
 pub(crate) const LOG_CAUSE: &str = "SELECT cause FROM log WHERE home = ?1 AND home_seq = ?2";
 /// The columns an entry is read back with, in `LogRow` order: its strings through `strings`' primary key.
 macro_rules! log_select {

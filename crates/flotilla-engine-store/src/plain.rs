@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use flotilla_schema::{Kind, KindRegistry, NewChange, RegistryError};
+use flotilla_schema::{ChangeHeader, Kind, KindRegistry, NewChange, RegistryError};
 use flotilla_schema_sqlite::{ChangeId, Loaded, Store, StoreError, Write};
 
 use crate::lock_store;
@@ -75,12 +75,25 @@ impl From<StoreError> for PlainError {
 #[derive(Debug)]
 pub struct PendingChange {
     change: NewChange,
+    joins: bool,
     opened: Mutex<Option<ChangeId>>,
 }
 
 impl PendingChange {
     pub fn new(change: NewChange) -> Self {
-        Self { change, opened: Mutex::new(None) }
+        Self { change, joins: false, opened: Mutex::new(None) }
+    }
+
+    /// A change that joins this home's newest change naming its first item, when that change has
+    /// the same writer and items: one reason, such as a root's pass at one revision, is one change
+    /// however many writes carry it. A change with no items never joins.
+    pub fn joining(change: NewChange) -> Self {
+        Self { change, joins: true, opened: Mutex::new(None) }
+    }
+
+    /// What the change records: its writer, time and items.
+    pub fn change(&self) -> &NewChange {
+        &self.change
     }
 
     /// The change, once a write has opened it.
@@ -94,6 +107,17 @@ impl PendingChange {
         let mut opened = self.opened.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(id) = *opened {
             return Ok((id, false));
+        }
+        if let Some(first) = self.change.items.first().filter(|_| self.joins) {
+            let joined = write
+                .latest_own_change_naming(&first.record)?
+                .filter(|existing| existing.writer == self.change.writer && existing.items == self.change.items);
+            if let Some(existing) = joined {
+                // Joined, not opened: a failed write leaves the existing change as it was.
+                let id = ChangeId(existing.seq);
+                *opened = Some(id);
+                return Ok((id, false));
+            }
         }
         let id = write.open_change(&self.change)?;
         *opened = Some(id);
@@ -179,6 +203,24 @@ impl PlainLog {
             let current = self.read_at::<K>(write, name, version)?;
             Ok(write.update(&current, spec, id)?.version)
         })
+    }
+
+    /// Declares `name` homed here, read at `version`, again as part of `change`, changing none of
+    /// its fields: its version moves and `change` is its last (#4024).
+    pub fn touch<K: Kind>(&self, name: &str, version: u64, change: &PendingChange) -> Result<u64, PlainError> {
+        in_change(&self.store, change, |write, id| {
+            let current = self.read_at::<K>(write, name, version)?;
+            Ok(write.touch::<K>(current.stamp(), id)?.version)
+        })
+    }
+
+    /// The change that last wrote `name` homed at `home`: why it is as it is. None for a name never
+    /// written.
+    pub fn last_change<K: Kind>(&self, name: &str, home: &str) -> Result<Option<ChangeHeader>, PlainError> {
+        let mut store = lock_store(&self.store);
+        let mut read = store.read()?;
+        let Some(id) = read.resolve(K::CODE, name, home)? else { return Ok(None) };
+        Ok(read.last_change(id)?)
     }
 
     /// Deletes `name` homed here, read at `version`, as part of `change`. Its history and identity

@@ -4,23 +4,18 @@
 //! The Project definition keeps the authored spec, 14 nested fields that no read selects by, as
 //! one frozen document, like WorkflowTemplate. Its columns are the ones a read does select by: the
 //! parent the hierarchy walks, whether it declares a charter, and its repositories by key with
-//! the host of each one's charter store. Its [`DefinitionOrigin`] replaces the provenance labels
-//! and annotations, as on the other definition kinds.
+//! the host of each one's charter store. Like the other definition kinds, its row holds only its
+//! own fields: why it was written is its change's (#4024).
 //!
 //! The old Project status has two writers. Project operations' two conditions, the declaration
 //! refusal and the operational entries' readiness, become [`ProjectOpsRecord`], one per project
 //! at the home that runs its operations: latest values, per the observation ruling. The dispatch
 //! queue is recomputed by the dispatch reconciler and is not stored (layer 3b-ii).
-//!
-//! Nothing reads or writes these tables yet: the import rehearsal restores into them, and they
-//! join the daemon's decided store with Project's writers and readers (3b-ii).
 
 use std::collections::BTreeMap;
 
 use flotilla_resources::{ProjectSpec, ProjectStatus};
 use flotilla_schema::{Frozen, KindRegistry, RegistryError, Stored, Timestamp};
-
-pub use flotilla_resources::definitions::DefinitionOrigin;
 
 /// One repository of a project, by its key: the host of its charter store, if it has one.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
@@ -32,7 +27,6 @@ pub struct ProjectMember {
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(kind = "Project", code = "pj")]
 pub struct ProjectDefinition {
-    pub origin: DefinitionOrigin,
     /// The declared parent; none inherits the designated fleet.
     pub parent: Option<String>,
     /// Whether the project declares a charter source; charter registration selects by it.
@@ -48,7 +42,7 @@ pub struct ProjectDefinition {
 impl ProjectDefinition {
     /// The record of `spec`. A spec naming one repository twice is refused: its members are
     /// keyed by repository.
-    pub fn new(origin: DefinitionOrigin, spec: &ProjectSpec) -> Result<Self, String> {
+    pub fn new(spec: &ProjectSpec) -> Result<Self, String> {
         let mut repositories = BTreeMap::new();
         for member in &spec.repositories {
             let held = ProjectMember { charter_host: member.charter_store.as_ref().map(|store| store.host.clone()) };
@@ -57,7 +51,6 @@ impl ProjectDefinition {
             }
         }
         Ok(Self {
-            origin,
             parent: spec.parent.clone(),
             chartered: spec.charter.is_some(),
             repositories,

@@ -2,22 +2,19 @@
 //! CredentialSpec, CredentialGrant, CrewDefaults, ImageLayer and WorkflowTemplate, and Project
 //! (layer 3b).
 //!
-//! On the engine each is a plain record at the home that declared it, with a typed
-//! [`DefinitionOrigin`] in place of the provenance labels and annotations the old store keeps
-//! (#3212); the engine serves them through [`crate::engine_records::EngineRecords`] behind
-//! `[primitives]`. [`origin`] reads an origin from a writer's labels and annotations, the import's
-//! mapping and the write path's alike, and [`stamp`] is its inverse, for readers that still look
-//! for the stamps. Both go with the old store at the cut-over (#3820).
+//! On the engine each is a plain record at the home that declared it, holding only its own fields:
+//! why it was written is its change's (#4024), never a column of its row. [`DefinitionOrigin`] is
+//! what the old store's provenance labels and annotations say, read from a writer's stamps by
+//! [`origin`] (the engine maps it to its change's items) and rebuilt from a record's last change
+//! for readers that still look for the stamps, which [`stamp`] writes. Both go with the old store
+//! at the cut-over (#3820).
 
 use std::collections::BTreeMap;
-
-use flotilla_schema::Stored;
-use serde::{Deserialize, Serialize};
 
 use crate::{
     definition_provenance::{
         BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION, CHARTER_REVISION_ANNOTATION, CHARTER_SCOPE_ANNOTATION,
-        CHARTER_SOURCE_ANNOTATION, DECLARATION_FILE_ANNOTATION, MANIFEST_MANAGED_BY_VALUE, MANIFEST_PATH_ANNOTATION,
+        CHARTER_SOURCE_ANNOTATION, DECLARATION_FILE, DECLARATION_FILE_ANNOTATION, MANIFEST_MANAGED_BY_VALUE, MANIFEST_PATH_ANNOTATION,
         MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_REVISION_ANNOTATION, MANIFEST_SOURCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION,
         PROJECT_IMAGE_MANAGER, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
         WHOLE_REPOSITORY_PROJECT_MANAGER,
@@ -34,50 +31,45 @@ pub fn is_definition_kind(kind: &str) -> bool {
     DEFINITION_KINDS.contains(&kind)
 }
 
-/// Where a definition came from: the one writer that declared it, with what that writer needs to
-/// find its own definitions again. It replaces the provenance labels and annotations.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
+/// Where a definition came from, as its writer's stamps say it: the one writer that declared it,
+/// with what that writer needs to find its own definitions again. Not stored: the engine writes it
+/// as its change's items and rebuilds it from them, so a value a change cannot hold is optional.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DefinitionOrigin {
     /// Applied by an operator (`resource apply`, `workflow-template apply`), declared by no source.
-    #[store(code = "op")]
     Operator,
     /// Declared by a document of a manifest tree, applied by its ManifestRoot's reconciler.
-    #[store(code = "mf")]
     Manifest {
         /// The ManifestRoot whose reconciler applies it.
         root: String,
-        /// The tree's source and the document's path and revision in it.
-        source: String,
-        path: String,
+        /// The tree's source, the document's path in it, and the revision applied. A rebuilt
+        /// origin reads the source from the root and the path from the root's baselines.
+        source: Option<String>,
+        path: Option<String>,
         revision: String,
         /// A charter document's source, revision and delegated scope.
-        #[store(flatten)]
         charter: Option<CharterOrigin>,
         /// The project a charter operational entry materialises its workflow for.
         materialized_project: Option<String>,
     },
     /// Materialised by project operations from an operational entry in a project's repository.
-    #[store(code = "po")]
-    ProjectOps { project: String, repository: String, commit: String, entry_path: String },
+    ProjectOps { project: String, repository: String, commit: String, entry_path: Option<String> },
     /// A project's image layer, read from its primary repository's `.flotilla/image/`.
-    #[store(code = "pi")]
     ProjectImage { project: String, commit: String },
     /// A workflow snapshot admission prepared; its name is content-addressed.
-    #[store(code = "sn")]
     Snapshot,
     /// A Project project operations materialised from a repository's `project.yaml` declaration.
-    #[store(code = "pd")]
-    ProjectDeclaration { repository: String, commit: String, file: String },
+    ProjectDeclaration { repository: String, commit: String },
     /// A Project project operations generated for one whole repository.
-    #[store(code = "wr")]
     WholeRepository,
 }
 
 /// A charter document's provenance: the charter's source and revision, and the `namespace/project`
-/// scope it was delegated.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
+/// scope it was delegated. The source names where the charter was read; a change does not hold
+/// it, so a rebuilt origin has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CharterOrigin {
-    pub source: String,
+    pub source: Option<String>,
     pub revision: String,
     pub scope: String,
 }
@@ -113,7 +105,7 @@ pub fn origin(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, 
             .any(|key| annotations.contains_key(*key))
             .then(|| {
                 Ok::<_, String>(CharterOrigin {
-                    source: annotation(CHARTER_SOURCE_ANNOTATION)?,
+                    source: Some(annotation(CHARTER_SOURCE_ANNOTATION)?),
                     revision: annotation(CHARTER_REVISION_ANNOTATION)?,
                     scope: annotation(CHARTER_SCOPE_ANNOTATION)?,
                 })
@@ -121,8 +113,8 @@ pub fn origin(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, 
             .transpose()?;
         return Ok(DefinitionOrigin::Manifest {
             root: annotation(MANIFEST_RECONCILER_ROOT_ANNOTATION)?,
-            source: annotation(MANIFEST_SOURCE_ANNOTATION)?,
-            path: annotation(MANIFEST_PATH_ANNOTATION)?,
+            source: Some(annotation(MANIFEST_SOURCE_ANNOTATION)?),
+            path: Some(annotation(MANIFEST_PATH_ANNOTATION)?),
             revision: annotation(MANIFEST_REVISION_ANNOTATION)?,
             charter,
             materialized_project: annotations.get(MATERIALIZED_PROJECT_ANNOTATION).cloned(),
@@ -133,7 +125,7 @@ pub fn origin(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, 
             project: annotation(MATERIALIZED_PROJECT_ANNOTATION)?,
             repository: annotation(SOURCE_REPOSITORY_ANNOTATION)?,
             commit: annotation(SOURCE_COMMIT_ANNOTATION)?,
-            entry_path: annotation(SOURCE_ENTRY_PATH_ANNOTATION)?,
+            entry_path: Some(annotation(SOURCE_ENTRY_PATH_ANNOTATION)?),
         });
     }
     // A declaration-backed Project stays the declaration's even when a whole-repository label
@@ -142,7 +134,6 @@ pub fn origin(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, 
         return Ok(DefinitionOrigin::ProjectDeclaration {
             repository: annotation(BOOTSTRAP_REPOSITORY_ANNOTATION)?,
             commit: annotation(BOOTSTRAP_COMMIT_ANNOTATION)?,
-            file: annotation(DECLARATION_FILE_ANNOTATION)?,
         });
     }
     if managed_by == Some(WHOLE_REPOSITORY_PROJECT_MANAGER) {
@@ -151,50 +142,51 @@ pub fn origin(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, 
     Ok(DefinitionOrigin::Operator)
 }
 
-/// The labels and annotations `origin`'s writer stamps, which [`origin`] reads back as `origin`.
+/// The labels and annotations `origin`'s writer stamps, which [`origin`] reads back as `origin`. A
+/// value the origin does not hold is not stamped.
 pub fn stamp(origin: &DefinitionOrigin) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     let pairs = |items: &[(&str, &str)]| items.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect();
     match origin {
         DefinitionOrigin::Operator => (BTreeMap::new(), BTreeMap::new()),
         DefinitionOrigin::Manifest { root, source, path, revision, charter, materialized_project } => {
-            let mut annotations: BTreeMap<String, String> = pairs(&[
-                (MANIFEST_RECONCILER_ROOT_ANNOTATION, root),
-                (MANIFEST_SOURCE_ANNOTATION, source),
-                (MANIFEST_PATH_ANNOTATION, path),
-                (MANIFEST_REVISION_ANNOTATION, revision),
-            ]);
+            let mut annotations: BTreeMap<String, String> =
+                pairs(&[(MANIFEST_RECONCILER_ROOT_ANNOTATION, root), (MANIFEST_REVISION_ANNOTATION, revision)]);
+            let mut optional = |key: &str, value: &Option<String>| {
+                if let Some(value) = value {
+                    annotations.insert(key.into(), value.clone());
+                }
+            };
+            optional(MANIFEST_SOURCE_ANNOTATION, source);
+            optional(MANIFEST_PATH_ANNOTATION, path);
+            optional(MATERIALIZED_PROJECT_ANNOTATION, materialized_project);
             if let Some(charter) = charter {
-                annotations.extend(pairs(&[
-                    (CHARTER_SOURCE_ANNOTATION, &charter.source),
-                    (CHARTER_REVISION_ANNOTATION, &charter.revision),
-                    (CHARTER_SCOPE_ANNOTATION, &charter.scope),
-                ]));
-            }
-            if let Some(project) = materialized_project {
-                annotations.insert(MATERIALIZED_PROJECT_ANNOTATION.into(), project.clone());
+                optional(CHARTER_SOURCE_ANNOTATION, &charter.source);
+                annotations.extend(pairs(&[(CHARTER_REVISION_ANNOTATION, &charter.revision), (CHARTER_SCOPE_ANNOTATION, &charter.scope)]));
             }
             (pairs(&[(MANAGED_BY_LABEL, MANIFEST_MANAGED_BY_VALUE)]), annotations)
         }
-        DefinitionOrigin::ProjectOps { project, repository, commit, entry_path } => (
-            BTreeMap::new(),
-            pairs(&[
+        DefinitionOrigin::ProjectOps { project, repository, commit, entry_path } => {
+            let mut annotations: BTreeMap<String, String> = pairs(&[
                 (MATERIALIZED_PROJECT_ANNOTATION, project),
                 (SOURCE_REPOSITORY_ANNOTATION, repository),
                 (SOURCE_COMMIT_ANNOTATION, commit),
-                (SOURCE_ENTRY_PATH_ANNOTATION, entry_path),
-            ]),
-        ),
+            ]);
+            if let Some(entry_path) = entry_path {
+                annotations.insert(SOURCE_ENTRY_PATH_ANNOTATION.into(), entry_path.clone());
+            }
+            (BTreeMap::new(), annotations)
+        }
         DefinitionOrigin::ProjectImage { project, commit } => (
             pairs(&[(MANAGED_BY_LABEL, PROJECT_IMAGE_MANAGER)]),
             pairs(&[(MATERIALIZED_PROJECT_ANNOTATION, project), (SOURCE_COMMIT_ANNOTATION, commit)]),
         ),
         DefinitionOrigin::Snapshot => (pairs(&[(PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND)]), BTreeMap::new()),
-        DefinitionOrigin::ProjectDeclaration { repository, commit, file } => (
+        DefinitionOrigin::ProjectDeclaration { repository, commit } => (
             BTreeMap::new(),
             pairs(&[
                 (BOOTSTRAP_REPOSITORY_ANNOTATION, repository),
                 (BOOTSTRAP_COMMIT_ANNOTATION, commit),
-                (DECLARATION_FILE_ANNOTATION, file),
+                (DECLARATION_FILE_ANNOTATION, DECLARATION_FILE),
             ]),
         ),
         DefinitionOrigin::WholeRepository => (pairs(&[(MANAGED_BY_LABEL, WHOLE_REPOSITORY_PROJECT_MANAGER)]), BTreeMap::new()),
@@ -213,22 +205,23 @@ mod tests {
     }
 
     // Behaviour (#3824 layer 2b-ii): every origin a writer can declare survives its stamps, so a
-    // definition written with an origin reads back with it through the labels and annotations.
+    // definition written with an origin reads back with it through the labels and annotations. A
+    // declaration's file is always `DECLARATION_FILE` (#4024).
     #[hegel::test]
     fn every_origin_reads_back_from_its_stamps(tc: hegel::TestCase) {
         let origin = match tc.draw(gs::integers::<u8>().min_value(0).max_value(6)) {
             0 => DefinitionOrigin::Operator,
             1 => DefinitionOrigin::Manifest {
                 root: text(&tc),
-                source: text(&tc),
-                path: text(&tc),
+                source: Some(text(&tc)),
+                path: Some(text(&tc)),
                 revision: text(&tc),
-                charter: tc.draw(gs::booleans()).then(|| CharterOrigin { source: text(&tc), revision: text(&tc), scope: text(&tc) }),
+                charter: tc.draw(gs::booleans()).then(|| CharterOrigin { source: Some(text(&tc)), revision: text(&tc), scope: text(&tc) }),
                 materialized_project: tc.draw(gs::booleans()).then(|| text(&tc)),
             },
-            2 => DefinitionOrigin::ProjectOps { project: text(&tc), repository: text(&tc), commit: text(&tc), entry_path: text(&tc) },
+            2 => DefinitionOrigin::ProjectOps { project: text(&tc), repository: text(&tc), commit: text(&tc), entry_path: Some(text(&tc)) },
             3 => DefinitionOrigin::ProjectImage { project: text(&tc), commit: text(&tc) },
-            4 => DefinitionOrigin::ProjectDeclaration { repository: text(&tc), commit: text(&tc), file: text(&tc) },
+            4 => DefinitionOrigin::ProjectDeclaration { repository: text(&tc), commit: text(&tc) },
             5 => DefinitionOrigin::WholeRepository,
             _ => DefinitionOrigin::Snapshot,
         };

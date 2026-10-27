@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use chrono::{DateTime, Utc};
 use flotilla_provisioning::engine::projects::EngineProjects;
 use flotilla_resources::{
-    definition_provenance::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE_ANNOTATION},
+    definition_provenance::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE, DECLARATION_FILE_ANNOTATION},
     Clock, DeclarationRefusedCondition, DispatchQueueEntry, InputMeta, Project, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
     RepositoryKey, SystemClock,
 };
@@ -59,7 +59,7 @@ async fn contract(backend: &ResourceBackend) {
     let stamps = BTreeMap::from([
         (BOOTSTRAP_REPOSITORY_ANNOTATION.to_owned(), REPOSITORY.to_owned()),
         (BOOTSTRAP_COMMIT_ANNOTATION.to_owned(), "abc".to_owned()),
-        (DECLARATION_FILE_ANNOTATION.to_owned(), ".flotilla/project.yaml".to_owned()),
+        (DECLARATION_FILE_ANNOTATION.to_owned(), DECLARATION_FILE.to_owned()),
     ]);
     let meta = InputMeta::builder().name("widgets".into()).annotations(stamps.clone()).build();
     definitions.apply(&meta, &spec("widgets", Some("acme"))).await.expect("declare");
@@ -139,6 +139,8 @@ async fn the_old_store_keeps_the_project_contract() {
 fn engine(directory: &std::path::Path) -> (Arc<Service>, ResourceBackend) {
     let mut kinds = flotilla_schema::KindRegistry::new();
     flotilla_provisioning::stored::project::register(&mut kinds).expect("register");
+    // The kind a declaration's change item names.
+    flotilla_provisioning::stored::repository::register(&mut kinds).expect("register repositories");
     let service = Arc::new(Service::open(&directory.join("decided.sqlite"), "alpha", kinds).expect("store"));
     let records = EngineProjects::open(Arc::clone(&service), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open");
     let backend = ResourceBackend::new(InMemoryBackend::default());

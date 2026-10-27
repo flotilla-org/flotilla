@@ -28,11 +28,11 @@ use crate::{
     query::{page_limit, Cursor, Page},
     shared::{
         check_kind_codes, check_kind_columns, has_string_domain, log_predates_changes, schema_ddl, sync_views, CHANGE_APPEND,
-        CHANGE_EXISTS, CHANGE_GET, CHANGE_ITEMS, CHANGE_ITEM_APPEND, CHANGE_SEQS, FLOOR_GET, FLOOR_RAISE, HOME_IDS_RESET, HOME_LOG_CLEAR,
-        HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ,
-        IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE,
-        LOG_EXPUNGED_AFTER, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE,
-        SHARED_STATEMENTS, STRING_ID, STRING_INSERT, WATERMARK_PUT,
+        CHANGE_EXISTS, CHANGE_GET, CHANGE_ITEMS, CHANGE_ITEM_APPEND, CHANGE_NAMING, CHANGE_SEQS, FLOOR_GET, FLOOR_RAISE, HOME_IDS_RESET,
+        HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE,
+        IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE,
+        LOG_EXPUNGED_AFTER, LOG_LAST_CHANGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST, SEQUENCE_NEXT,
+        SEQUENCE_RAISE, SHARED_STATEMENTS, STRING_ID, STRING_INSERT, WATERMARK_PUT,
     },
     sql::{KindSql, TableSql},
 };
@@ -383,6 +383,16 @@ impl Read<'_> {
         Ok(changes)
     }
 
+    /// The change of resource `id`'s newest entry: why it is as it is (#4024).
+    pub fn last_change(&mut self, id: ResourceId) -> Result<Option<ChangeHeader>, StoreError> {
+        self.ctx().last_change(id)
+    }
+
+    /// The newest change at `home` naming `record` as an item; none when no change names it.
+    pub fn latest_change_naming(&mut self, home: &str, record: &Identity) -> Result<Option<ChangeHeader>, StoreError> {
+        self.ctx().latest_change_naming(home, record)
+    }
+
     /// The sequences of `home`'s changes this store holds strictly between `after` and `before`, in
     /// order: what a stream sends between two entries, so its cursor stays a prefix of the home's
     /// sequence.
@@ -650,6 +660,13 @@ impl Write<'_> {
         self.ctx().change(home, seq)
     }
 
+    /// The newest change at this store's home naming `record` as an item: the change a write of
+    /// the same reason joins (#4024).
+    pub fn latest_own_change_naming(&mut self, record: &Identity) -> Result<Option<ChangeHeader>, StoreError> {
+        let home = self.runtime.home.clone();
+        self.ctx().latest_change_naming(&home, record)
+    }
+
     pub fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<Event>, StoreError> {
         self.ctx().changes_since(home, after, limit)
     }
@@ -719,6 +736,14 @@ impl Write<'_> {
         let new = Encoder::encode(next)?;
         let change = change.into();
         self.guarded(|ctx| ctx.update::<K>(current.stamp(), old, new, change))
+    }
+
+    /// Logs an `edit` entry of `change` that changes no row: the resource is declared again for
+    /// another reason, so its version moves and its last change is `change` (#4024). Refused as
+    /// for [`Write::update`]: `NotHome`, and `Conflict` when it moved past `current.version`.
+    pub fn touch<'c, K: Kind>(&mut self, current: Stamp, change: impl Into<InChange<'c>>) -> Result<Stamp, StoreError> {
+        let change = change.into();
+        self.guarded(|ctx| ctx.touch::<K>(current, change))
     }
 
     /// Deletes a resource's rows, logged as a `delete` entry of `change`. Its history and identity
@@ -1163,6 +1188,18 @@ impl Ctx<'_> {
         let header = Header { topic: whole_log_topic(), cause: Cause::Create, change: change.0, about: None, arguments: None };
         self.write_local(K::CODE, id, header, effect, (sequence, version), None)?;
         Ok(Stamp { id, version })
+    }
+
+    fn touch<K: Kind>(&mut self, current: Stamp, change: InChange<'_>) -> Result<Stamp, StoreError> {
+        self.owned::<K>(current.id)?;
+        let expected = expected_version(current)?;
+        let change = self.change_id(change)?;
+        let (sequence, version) = self.next_sequence()?;
+        let header = Header { topic: whole_log_topic(), cause: Cause::Edit, change: change.0, about: None, arguments: None };
+        if !self.write_local(K::CODE, current.id, header, Effect::default(), (sequence, version), Some(expected))? {
+            return Err(self.stale::<K>(current));
+        }
+        Ok(Stamp { id: current.id, version })
     }
 
     fn update<K: Kind>(&mut self, current: Stamp, mut old: Rows, mut new: Rows, change: InChange<'_>) -> Result<Stamp, StoreError> {
@@ -1986,6 +2023,25 @@ impl Ctx<'_> {
         let mut statement = self.conn.prepare_cached(CHANGE_SEQS)?;
         let seqs = statement.query_map(params![home, bound(after), bound(before)], |row| row.get::<_, i64>(0))?;
         seqs.map(|seq| u64::try_from(seq?).map_err(|_| StoreError::Corrupt { table: "change".into(), column: "seq".into() })).collect()
+    }
+
+    /// The change of resource `id`'s newest entry: why it is as it is.
+    fn last_change(&mut self, id: ResourceId) -> Result<Option<ChangeHeader>, StoreError> {
+        let last: Option<(String, i64)> =
+            self.conn.prepare_cached(LOG_LAST_CHANGE)?.query_row([id.0], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+        let Some((home, seq)) = last else { return Ok(None) };
+        let seq = u64::try_from(seq).map_err(|_| StoreError::Corrupt { table: "log".into(), column: "change".into() })?;
+        self.change(&home, seq)
+    }
+
+    /// The newest change at `home` naming `record` as an item.
+    fn latest_change_naming(&mut self, home: &str, record: &Identity) -> Result<Option<ChangeHeader>, StoreError> {
+        let (Some(record_id), Some(home_id)) = (self.resolve(record)?, self.string_id(HOME_DOMAIN, home)?) else { return Ok(None) };
+        let seq: Option<i64> =
+            self.conn.prepare_cached(CHANGE_NAMING)?.query_row(params![record_id.0, home_id], |row| row.get(0)).optional()?;
+        let Some(seq) = seq else { return Ok(None) };
+        let seq = u64::try_from(seq).map_err(|_| StoreError::Corrupt { table: "change_items".into(), column: "change_seq".into() })?;
+        self.change(home, seq)
     }
 
     /// The change a write names: opened already, or opened now.

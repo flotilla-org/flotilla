@@ -5,7 +5,8 @@
 //! each beside it; every home's are read from a resident map kept current by following the log.
 //!
 //! A Project reads as the old object:
-//! - its origin as the stamps its writers wrote, as on every definition kind;
+//! - its origin as the stamps its writers wrote, rebuilt from its last change as on every
+//!   definition kind ([`provenance`](super::provenance)): its row holds only its own fields (#4024);
 //! - its status from two sources. Project operations' conditions come from the [`ProjectOpsRecord`]
 //!   at the Project's home. The dispatch queue, its error and its attention are the dispatch
 //!   reconciler's judgement: held in memory at the home that computes it, served on that home's
@@ -22,20 +23,25 @@ use flotilla_engine_store::{
     plain::{PendingChange, PlainError, PlainLog},
 };
 use flotilla_resources::{
-    definitions::{origin, stamp},
+    definitions::{origin, stamp, DefinitionOrigin},
     engine_records::{EngineObject, EngineRecords},
     DeclarationRefusedCondition, DispatchQueueAttention, DispatchQueueEntry, OperationalEntriesCondition, ProjectSpec, ProjectStatus,
 };
 use flotilla_schema::{Identity, Kind, KindCode, NewChange, Timestamp};
-use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
+use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
 
+use super::provenance;
+use crate::stored::manifest_root::ManifestRoot;
 use crate::stored::project::{ProjectDefinition, ProjectOpsRecord};
 
 const KIND: &str = "Project";
 const PROJECT: KindCode = <ProjectDefinition as Kind>::CODE;
 const OPS: KindCode = <ProjectOpsRecord as Kind>::CODE;
+/// The ManifestRoot's code: a root's baselines hold the paths its Projects read with, so a root's
+/// change re-reads its home's Projects.
+const ROOT: KindCode = <flotilla_state_machines::Resource<ManifestRoot> as Kind>::CODE;
 
 /// How often a change stream looks for new entries in the log, as the account port's does.
 const POLL: Duration = Duration::from_millis(500);
@@ -43,13 +49,14 @@ const POLL: Duration = Duration::from_millis(500);
 /// How often a write that loses a race to another writer of its name reads and tries again.
 const WRITE_ATTEMPTS: usize = 3;
 
-/// The writer the plain-kind port records for this port's writes.
+/// The writer of the project operations' records, and of a delete.
 const WRITER: &str = "project-records";
 
-/// One home's records of one Project name, with their versions.
+/// One home's records of one Project name, with their versions; the definition with its origin,
+/// rebuilt from its last change.
 #[derive(Clone, Default)]
 struct Held {
-    project: Option<(u64, ProjectDefinition)>,
+    project: Option<(u64, ProjectDefinition, DefinitionOrigin)>,
     ops: Option<(u64, ProjectOpsRecord)>,
 }
 
@@ -89,7 +96,7 @@ fn datetime(at: Timestamp) -> chrono::DateTime<chrono::Utc> {
 
 /// `held` as the old object, with `judged` (this home's judgement) when the record is this home's.
 fn object(name: &str, home: &str, held: &Held, judged: Option<&Judged>) -> Option<Result<EngineObject, String>> {
-    let (version, project) = held.project.as_ref()?;
+    let (version, project, origin) = held.project.as_ref()?;
     let encode = |error: serde_json::Error| format!("{KIND} {name} at {home}: {error}");
     let ops = held.ops.as_ref().map(|(_, ops)| ops);
     let queue = judged.map(|judged| judged.queue.clone()).unwrap_or_default();
@@ -107,7 +114,7 @@ fn object(name: &str, home: &str, held: &Held, judged: Option<&Judged>) -> Optio
         dispatch_queue_error: queue.error,
         dispatch_queue_attention: queue.attention,
     };
-    let (labels, annotations) = stamp(&project.origin);
+    let (labels, annotations) = stamp(origin);
     let version = composed_version(*version, held.ops.as_ref().map(|(version, _)| *version), judged.map_or(0, |judged| judged.revision));
     Some((|| {
         Ok(EngineObject {
@@ -136,12 +143,21 @@ fn composed_version(project: u64, ops: Option<u64>, revision: u64) -> u64 {
 /// The low bits of a Project's version that count judgement changes.
 const JUDGEMENT_BITS: u32 = 24;
 
+/// Project `id`, with its origin as its last change says it.
+fn load_project(read: &mut Read<'_>, id: ResourceId) -> Result<Option<(String, u64, ProjectDefinition, DefinitionOrigin)>, StoreError> {
+    let Some(loaded) = read.load::<ProjectDefinition>(id)? else { return Ok(None) };
+    let change = provenance::last_change(read, id)?;
+    let origin = provenance::origin_of(read, KIND, &loaded.name, change.as_ref(), None)?;
+    Ok(Some((loaded.name, loaded.version, loaded.value, origin)))
+}
+
 fn reload(read: &mut Read<'_>, records: &mut Records, identity: &Identity) -> Result<(), StoreError> {
     let key = (identity.name.clone(), identity.home.clone());
     let id = read.resolve(identity.kind, &identity.name, &identity.home)?;
     let held = records.entry(key.clone()).or_default();
     if identity.kind == PROJECT {
-        held.project = id.map(|id| read.load::<ProjectDefinition>(id)).transpose()?.flatten().map(|loaded| (loaded.version, loaded.value));
+        held.project =
+            id.map(|id| load_project(read, id)).transpose()?.flatten().map(|(_, version, value, origin)| (version, value, origin));
     } else if identity.kind == OPS {
         held.ops = id.map(|id| read.load::<ProjectOpsRecord>(id)).transpose()?.flatten().map(|loaded| (loaded.version, loaded.value));
     }
@@ -157,8 +173,8 @@ fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), 
     loop {
         let page = read.scan::<ProjectDefinition>(home, after, 64)?;
         for id in page.ids {
-            if let Some(loaded) = read.load::<ProjectDefinition>(id)? {
-                records.entry((loaded.name, home.to_owned())).or_default().project = Some((loaded.version, loaded.value));
+            if let Some((name, version, value, origin)) = load_project(read, id)? {
+                records.entry((name, home.to_owned())).or_default().project = Some((version, value, origin));
             }
         }
         after = page.next;
@@ -211,7 +227,7 @@ impl EngineProjects {
             service,
             home,
             log,
-            resident: Mutex::new(Resident { follower: Follower::new([PROJECT, OPS]), records: Records::new() }),
+            resident: Mutex::new(Resident { follower: Follower::new([PROJECT, OPS, ROOT]), records: Records::new() }),
             judged: Mutex::default(),
             writing: Mutex::default(),
             judged_changes: tokio::sync::watch::Sender::new(0),
@@ -250,6 +266,7 @@ impl EngineProjects {
                             Followed::Changed(identity) if identity.kind == PROJECT || identity.kind == OPS => {
                                 reload(&mut read, records, &identity)?
                             }
+                            Followed::Changed(identity) if identity.kind == ROOT => rescan(&mut read, records, &identity.home)?,
                             Followed::Changed(_) => {}
                             Followed::Rescan(home) => rescan(&mut read, records, &home)?,
                         }
@@ -289,15 +306,34 @@ impl EngineProjects {
 
     /// Writes this home's record `name` of `K` as `edit` makes it from the current one (or none),
     /// re-reading and trying again when another writer of the name wins the race. `edit` returning
-    /// none leaves the record as it is.
-    fn write<K: Kind + Clone + PartialEq>(&self, name: &str, edit: impl Fn(Option<&K>) -> Result<Option<K>, String>) -> Result<(), String> {
+    /// none leaves the record as it is. A record written for `origin` is its change's: unchanged
+    /// but declared for a new reason, it is written again under that change (#4024).
+    fn write<K: Kind + Clone + PartialEq>(
+        &self,
+        name: &str,
+        origin: Option<&DefinitionOrigin>,
+        edit: impl Fn(Option<&K>) -> Result<Option<K>, String>,
+    ) -> Result<(), String> {
         for _ in 0..WRITE_ATTEMPTS {
+            let change = match origin {
+                Some(origin) => PendingChange::joining(provenance::change_of(origin, &self.home, self.now())),
+                None => PendingChange::new(NewChange::new(WRITER, self.now())),
+            };
             let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?;
             let Some(value) = edit(current.as_ref().map(|current| &current.spec))? else { return Ok(()) };
             let written = match current {
-                Some(current) if current.spec == value => return Ok(()),
-                Some(current) => self.log.edit(name, current.version, &value, &PendingChange::new(NewChange::new(WRITER, self.now()))),
-                None => self.log.create(name, &value, &PendingChange::new(NewChange::new(WRITER, self.now()))),
+                Some(current) if current.spec == value => {
+                    if origin.is_none() {
+                        return Ok(());
+                    }
+                    let last = self.log.last_change::<K>(name, &self.home).map_err(|error| error.to_string())?;
+                    if last.is_some_and(|last| last.writer == change.change().writer && last.items == change.change().items) {
+                        return Ok(());
+                    }
+                    self.log.touch::<K>(name, current.version, &change)
+                }
+                Some(current) => self.log.edit(name, current.version, &value, &change),
+                None => self.log.create(name, &value, &change),
             };
             match written {
                 Ok(_) => return Ok(()),
@@ -399,7 +435,8 @@ impl EngineRecords for EngineProjects {
     ) -> Result<EngineObject, String> {
         refuse_kind(kind)?;
         let spec: ProjectSpec = serde_json::from_value(spec).map_err(|error| format!("{KIND} spec: {error}"))?;
-        let value = ProjectDefinition::new(origin(labels, annotations)?, &spec).map_err(|error| format!("{KIND} {name}: {error}"))?;
+        let origin = origin(labels, annotations)?;
+        let value = ProjectDefinition::new(&spec).map_err(|error| format!("{KIND} {name}: {error}"))?;
         let _writing = locked(&self.writing);
         if self.log.get::<ProjectDefinition>(name, &self.home).map_err(|error| error.to_string())?.is_none() {
             // A new Project starts with no conditions: an operations record left by a delete that
@@ -407,7 +444,7 @@ impl EngineRecords for EngineProjects {
             // name out until the definition below is written.
             self.remove::<ProjectOpsRecord>(name)?;
         }
-        self.write::<ProjectDefinition>(name, |_| Ok(Some(value.clone())))?;
+        self.write::<ProjectDefinition>(name, Some(&origin), |_| Ok(Some(value.clone())))?;
         self.current(name)
     }
 
@@ -419,7 +456,7 @@ impl EngineRecords for EngineProjects {
         // Project operations' conditions are their record; once written it stays, emptied, until
         // the Project goes, so its version only moves forward.
         let ops = ProjectOpsRecord::from_status(&status);
-        self.write::<ProjectOpsRecord>(name, |current| {
+        self.write::<ProjectOpsRecord>(name, None, |current| {
             Ok(match (&ops, current) {
                 (Some(ops), _) => Some(ops.clone()),
                 (None, Some(_)) => Some(ProjectOpsRecord { refused: None, entries: None }),
@@ -448,7 +485,7 @@ impl EngineRecords for EngineProjects {
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
         let service = Arc::clone(&self.service);
-        let mut follower = Follower::new([PROJECT, OPS]);
+        let mut follower = Follower::new([PROJECT, OPS, ROOT]);
         let homes = service.homes();
         service.with_store(|store| follower.start(&mut store.read()?, &homes)).map_err(|error| error.to_string())?;
         let mut judged = self.judged_changes.subscribe();

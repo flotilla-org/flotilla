@@ -31,11 +31,30 @@ fn forge(id: &str) -> ForgeSpec {
 fn manifest(revision: &str) -> DefinitionOrigin {
     DefinitionOrigin::Manifest {
         root: "manifest-0011223344556677".into(),
-        source: "project-map".into(),
-        path: "forges/lab.yaml".into(),
+        source: Some("project-map".into()),
+        path: Some("forges/lab.yaml".into()),
         revision: revision.into(),
         charter: None,
         materialized_project: None,
+    }
+}
+
+/// Whether `read` says it is the manifest root's at `revision`. The root and revision are what both
+/// stores hold of the origin; on the engine the source and the document's path are read from the
+/// ManifestRoot record, which this contract does not hold.
+fn assert_manifest(read: &flotilla_resources::ResourceObject<Forge>, revision: &str) {
+    let found = origin(&read.metadata.labels, &read.metadata.annotations);
+    let found = found.as_ref().map(|origin| match origin {
+        DefinitionOrigin::Manifest { root, revision, .. } => Some((root.as_str(), revision.as_str())),
+        _ => None,
+    });
+    if let Ok(found) = found {
+        assert_eq!(found, Some(("manifest-0011223344556677", revision)), "{:?}", read.metadata);
+    } else {
+        // Without the root's source the stamps name no full origin; the root and revision remain.
+        assert_eq!(read.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("manifest"));
+        assert_eq!(read.metadata.annotations[MANIFEST_RECONCILER_ROOT_ANNOTATION], "manifest-0011223344556677");
+        assert_eq!(read.metadata.annotations[MANIFEST_REVISION_ANNOTATION], revision);
     }
 }
 
@@ -55,8 +74,7 @@ async fn contract(backend: &ResourceBackend) {
     forges.apply(&meta("lab", &manifest("r1")), &forge("lab")).await.expect("apply");
     let read = forges.get("lab").await.expect("get");
     assert_eq!(read.spec, forge("lab"));
-    assert_eq!(origin(&read.metadata.labels, &read.metadata.annotations), Ok(manifest("r1")));
-    assert_eq!(read.metadata.annotations[MANIFEST_RECONCILER_ROOT_ANNOTATION], "manifest-0011223344556677");
+    assert_manifest(&read, "r1");
     tokio::time::timeout(Duration::from_secs(10), watch.stream.next()).await.expect("a watch event").expect("open").expect("event");
 
     // An operator's definition sits beside it; a list holds both, and a selection by the
@@ -81,7 +99,7 @@ async fn contract(backend: &ResourceBackend) {
     revised.annotations.insert(MANIFEST_REVISION_ANNOTATION.into(), "r2".into());
     forges.update_metadata(&revised).await.expect("revise");
     let read = forges.get("lab").await.expect("get revised");
-    assert_eq!(origin(&read.metadata.labels, &read.metadata.annotations), Ok(manifest("r2")));
+    assert_manifest(&read, "r2");
 
     // A deleted definition is gone from every read.
     forges.delete("ops").await.expect("delete");
@@ -110,6 +128,10 @@ async fn the_old_store_keeps_the_definition_contract() {
 fn engine_backend(directory: &tempfile::TempDir) -> ResourceBackend {
     let mut kinds = flotilla_schema::KindRegistry::new();
     flotilla_provisioning::stored::definition::register(&mut kinds).expect("register");
+    // The kinds a definition's change items name.
+    flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register roots");
+    flotilla_provisioning::stored::repository::register(&mut kinds).expect("register repositories");
+    flotilla_provisioning::stored::project::register(&mut kinds).expect("register projects");
     let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
     let records = EngineDefinitions::open(service, Arc::new(SystemClock) as Arc<dyn Clock>).expect("open");
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -142,4 +164,57 @@ async fn the_engine_keeps_the_definition_contract() {
     contract(&backend).await;
     // Nothing reached the old store.
     assert!(backend.store().list_raw(flotilla_store::ResourceKind::of::<Forge>(), NS).await.expect("old rows").items.is_empty());
+}
+
+// Behaviour (#4024): a definition row holds only its fields; why it was written is its change. A
+// root's documents at one revision are one change however many writes carry them, an unchanged
+// document declared again at that revision writes nothing, and at a new revision it is written
+// again under the new change, which names the root at that revision.
+#[tokio::test]
+async fn on_the_engine_one_root_revision_is_one_change() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    flotilla_provisioning::stored::definition::register(&mut kinds).expect("register");
+    // The kinds a definition's change items name.
+    flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register roots");
+    flotilla_provisioning::stored::repository::register(&mut kinds).expect("register repositories");
+    flotilla_provisioning::stored::project::register(&mut kinds).expect("register projects");
+    let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.install_engine_records(Arc::new(
+        EngineDefinitions::open(Arc::clone(&service), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open"),
+    ));
+    let forges = backend.definitions::<Forge>(NS);
+    let last_change = |name: &str| {
+        service
+            .with_store(|store| {
+                let mut read = store.read()?;
+                let id = read.resolve(
+                    <flotilla_provisioning::stored::definition::ForgeDefinition as flotilla_schema::Kind>::CODE,
+                    name,
+                    "alpha",
+                )?;
+                read.last_change(id.expect("stored"))
+            })
+            .expect("read")
+            .expect("a change")
+    };
+    for name in ["lab", "lab2", "lab3"] {
+        forges.apply(&meta(name, &manifest("r1")), &forge(name)).await.expect("apply");
+    }
+    let first = last_change("lab");
+    assert_eq!(first.writer, "manifest-reconciler");
+    assert_eq!(first.items.len(), 1);
+    assert_eq!((first.items[0].record.name.as_str(), first.items[0].revision.as_deref()), ("manifest-0011223344556677", Some("r1")));
+    assert!(["lab2", "lab3"].iter().all(|name| last_change(name).seq == first.seq), "one change for the root's pass");
+
+    let version = forges.get("lab").await.expect("get").metadata.resource_version;
+    forges.apply(&meta("lab", &manifest("r1")), &forge("lab")).await.expect("again");
+    assert_eq!(forges.get("lab").await.expect("get").metadata.resource_version, version, "the same reason writes nothing");
+
+    forges.apply(&meta("lab", &manifest("r2")), &forge("lab")).await.expect("next revision");
+    let next = last_change("lab");
+    assert_ne!(next.seq, first.seq);
+    assert_eq!(next.items[0].revision.as_deref(), Some("r2"));
+    assert_manifest(&forges.get("lab").await.expect("get"), "r2");
 }
