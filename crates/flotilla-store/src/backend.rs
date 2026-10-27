@@ -772,7 +772,8 @@ impl<T: Resource> TypedResolver<T> {
             }
             _ => false,
         };
-        if let Some(records) = self.engine_owned() {
+        // A definition kind with a status (Project, #3824 layer 3b) writes it through its port too.
+        if let Some(records) = self.backend.engine_records(T::API_PATHS.kind) {
             self.engine_current(&*records, name, resource_version).await?;
             let value = serde_json::to_value(status).map_err(|error| ResourceError::decode(error.to_string()))?;
             let record = records.set_status(T::API_PATHS.kind, name, value).await.map_err(ResourceError::other)?;

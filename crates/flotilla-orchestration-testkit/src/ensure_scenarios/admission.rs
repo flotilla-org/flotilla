@@ -798,21 +798,6 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
     assert!(error.contains("conflicting observed default branches"), "unexpected readiness error: {error}");
 }
 
-pub async fn duplicate_operational_entry_refusal_records_a_project_event(factory: &dyn EnsureScenarioController) {
-    let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-
-    daemon
-        .record_project_operational_refusal("flotilla", "standing-project", "duplicate materialized WorkflowTemplate `quartermaster`")
-        .await;
-
-    let events = backend.using::<Event>("flotilla").list().await.expect("events").items;
-    assert!(events.iter().any(|event| {
-        event.spec.regarding.name == "standing-project"
-            && event.spec.reason == "DuplicateOperationalEntryRefused"
-            && event.spec.message == "duplicate materialized WorkflowTemplate `quartermaster`"
-    }));
-}
-
 pub async fn abandoned_ensure_generation_survives_a_stale_reconcile_write_and_is_superseded(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");

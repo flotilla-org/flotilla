@@ -399,17 +399,17 @@ impl<T: Resource> DefinitionResolver<T> {
         ensure_definitions::<T>()?;
         refuse_builtin::<T>(name)?;
         let _hierarchy_admission = self.backend.hierarchy_admission(T::API_PATHS.kind).await;
-        if let Some(records) = self.records() {
-            if records.get(T::API_PATHS.kind, name).await.map_err(ResourceError::other)?.is_none() {
-                return Err(ResourceError::not_found(name));
-            }
-            return records.delete(T::API_PATHS.kind, name).await.map_err(ResourceError::other);
-        }
         if T::API_PATHS.kind == "Project" {
             let hierarchy = crate::ProjectHierarchy::load_for_inspection(&self.backend, &self.namespace).await?;
             if hierarchy.fleet() == Some(name) || !hierarchy.descendants(name)?.is_empty() {
                 return Err(ResourceError::invalid(format!("Project `{name}` is the fleet or has descendants; reparent before deleting")));
             }
+        }
+        if let Some(records) = self.records() {
+            if records.get(T::API_PATHS.kind, name).await.map_err(ResourceError::other)?.is_none() {
+                return Err(ResourceError::not_found(name));
+            }
+            return records.delete(T::API_PATHS.kind, name).await.map_err(ResourceError::other);
         }
         let local_root = self.backend.local_root()?;
         let sources = self.sources_for_name(name).await?;

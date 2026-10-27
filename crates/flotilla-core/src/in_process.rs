@@ -5912,12 +5912,6 @@ impl InProcessDaemon {
 }
 
 impl InProcessDaemon {
-    pub async fn record_project_operational_refusal(&self, namespace: &str, project: &str, reason: &str) {
-        self.project_service().record_project_operational_refusal(namespace, project, reason).await;
-    }
-}
-
-impl InProcessDaemon {
     /// Access the environment collaborator used for discovery and registration.
     pub fn environment_manager(&self) -> &EnvironmentManager {
         &self.environment_manager

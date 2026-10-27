@@ -27,12 +27,12 @@ use flotilla_protocol::{
 use flotilla_resources::{checkout_path::checkout_path, definition_provenance::WHOLE_REPOSITORY_PROJECT_MANAGER};
 use flotilla_resources::{
     normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyRepositorySpec,
-    DeclarationRefusedCondition, Demand, DemandKind, DemandSpec, Forge, InputMeta, ObjectEvent, Project, ProjectRepositoryRole,
-    ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceError,
-    ResourceObject, WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
+    DeclarationRefusedCondition, Demand, DemandKind, DemandSpec, Forge, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec,
+    ProjectSpec, ProjectStatusPatch, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceError, ResourceObject,
+    WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
 };
-use flotilla_store::{apply_status_patch as apply_resource_status_patch, ensure_repository, EventRecorder, ResourceBackend};
-use tracing::{debug, warn};
+use flotilla_store::{apply_status_patch as apply_resource_status_patch, ensure_repository, ResourceBackend};
+use tracing::debug;
 
 use crate::repository_inspection::{
     LocalCheckoutInspection, OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector,
@@ -565,25 +565,11 @@ impl ProjectService<'_> {
             Err(error) => {
                 self.patch_project_operational_entries(&namespace, &declaration.name, false, error.entry_path.as_deref(), &error.message)
                     .await?;
-                self.record_project_operational_refusal(&namespace, &declaration.name, &error.message).await;
                 return Err(format!("operational entry refused: {error}"));
             }
         };
         changes.extend(operational_changes);
         Ok((changes, operational_entries))
-    }
-
-    pub async fn record_project_operational_refusal(&self, namespace: &str, project_name: &str, error: &str) {
-        let Ok(project) = self.resource_backend.definitions::<Project>(namespace).get(project_name).await else {
-            return;
-        };
-        let reason = if error.contains("duplicate") { "DuplicateOperationalEntryRefused" } else { "ProjectOperationalEntriesRefused" };
-        if let Err(record_error) = EventRecorder::new(self.resource_backend.clone())
-            .record(ObjectEvent::for_object(&project, reason, error), self.clock.now())
-            .await
-        {
-            warn!(project = %project_name, %record_error, "failed to record operational-entry refusal event");
-        }
     }
 
     pub async fn reconcile_bound_charters(&self) -> Result<(), String> {
@@ -655,7 +641,6 @@ impl ProjectService<'_> {
                     &error.message,
                 )
                 .await?;
-                self.record_project_operational_refusal(&namespace, &project.metadata.name, &error.message).await;
             }
         }
         Ok(())
