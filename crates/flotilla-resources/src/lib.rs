@@ -96,7 +96,6 @@ mod status_patch;
 #[doc(hidden)]
 pub mod terminal_session;
 #[doc(hidden)]
-pub mod usage;
 #[doc(hidden)]
 pub mod vessel;
 mod vessel_occupancy;
@@ -185,7 +184,7 @@ pub use labels::{
 pub use landing_gate::{evaluate_landing_gate, settlement_human_gate, LandingGateDecision, LANDING_APPROVE_OPTION, LANDING_REFUSE_OPTION};
 pub use leaf::{
     actor_obligation, admit_leaf, evaluate_leaf, ArtifactLeafSubject, ChangeRequestLeafSubject, ConvoyLeafSubject, IssueLeafSubject,
-    LeafEvaluation, LeafSubject, LeafValue, ThreeValue, UsageLeafSubject, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
+    LeafEvaluation, LeafSubject, LeafValue, ThreeValue, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
 };
 pub use manifest_root::{
     DocumentKey, DocumentPhase, DocumentState, ManifestRoot, ManifestRootSpec, ManifestRootStatus, ManifestRootStatusPatch, Resolution,
@@ -243,7 +242,6 @@ pub use terminal_session::{
     CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE, CONTROLLER_FENCE_UNVERIFIABLE_REASON, TERMINAL_DELIVERY_EXPIRED_REASON,
     TERMINAL_DELIVERY_NOT_SUBMITTED_REASON, TERMINAL_DELIVERY_UNCONFIRMED_REASON,
 };
-pub use usage::{Usage, UsagePace, UsageProviderCost, UsageSpec, UsageStatus, UsageStatusPatch, UsageWindow};
 pub use vessel::{
     vessel_resource_name, Vessel, VesselImage, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,

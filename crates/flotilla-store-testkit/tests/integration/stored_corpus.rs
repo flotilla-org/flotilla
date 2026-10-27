@@ -8,30 +8,35 @@ use flotilla_resources::{CrewMessageDelivery, CrewMessageSender, PendingBrief, T
 use flotilla_store::{decode_stored_resource_document, REGISTERED_RESOURCE_KINDS};
 use serde_json::Value;
 
-// #2915 step 5: Presentation was purged in r617 and is now retired.
-// Keep this allowance only until the stored corpus is refreshed; never
-// regenerate the corpus to accommodate retirement.
+// Retired kinds still in the recorded r355 corpus: Presentation (#2915 step 5, purged in r617)
+// and Usage (#3824 layer 0). Keep these allowances only until the stored corpus is refreshed;
+// never regenerate the corpus to accommodate retirement.
+const RETIRED_CORPUS_KINDS: [&str; 2] = ["Presentation", "Usage"];
+
 fn retired_corpus_files(generation: &str) -> BTreeSet<String> {
     if generation == "r355" {
-        BTreeSet::from(["Presentation.json".to_string()])
+        RETIRED_CORPUS_KINDS.iter().map(|kind| format!("{kind}.json")).collect()
     } else {
         BTreeSet::new()
     }
 }
 
-// The allowance is confined to the recorded r355 Presentation file, while
-// runtime decoding refuses the retired kind. This finite mapping is corpus glue.
+// The allowance is confined to the recorded r355 files of retired kinds, while runtime decoding
+// refuses each retired kind. This finite mapping is corpus glue.
 #[test]
-fn presentation_retirement_is_only_a_corpus_allowance() {
-    for generation in ["", "r354", "r355", "r356", "r355-extra"] {
-        let expected = if generation == "r355" { vec!["Presentation.json".to_string()] } else { Vec::new() };
-        assert_eq!(retired_corpus_files(generation), expected.into_iter().collect());
+fn retired_kinds_are_only_a_corpus_allowance() {
+    for generation in ["", "r354", "r356", "r355-extra"] {
+        assert!(retired_corpus_files(generation).is_empty());
     }
-    assert!(!REGISTERED_RESOURCE_KINDS.iter().any(|kind| kind.kind == "Presentation"));
-    let documents: Vec<Value> =
-        serde_json::from_str(include_str!("../fixtures/stored-records/r355/Presentation.json")).expect("unchanged retired corpus");
-    for document in documents {
-        assert!(decode_stored_resource_document(&document).is_err(), "retired Presentation has no runtime decoder");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stored-records/r355");
+    for kind in RETIRED_CORPUS_KINDS {
+        assert!(!REGISTERED_RESOURCE_KINDS.iter().any(|registered| registered.kind == kind), "{kind} is retired");
+        let documents: Vec<Value> =
+            serde_json::from_str(&fs::read_to_string(root.join(format!("{kind}.json"))).expect("unchanged retired corpus"))
+                .expect("corpus JSON");
+        for document in documents {
+            assert!(decode_stored_resource_document(&document).is_err(), "retired {kind} has no runtime decoder");
+        }
     }
 }
 

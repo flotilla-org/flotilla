@@ -6,6 +6,7 @@
 //! transaction. Receipts are served as a [`ReceiptLog`] from `Read::about`.
 
 pub mod archive;
+pub mod plain;
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -200,6 +201,19 @@ where
     M::Spec: PartialEq,
     Resource<M>: Kind,
 {
+    let records: Vec<_> =
+        imported.iter().map(|(home, resource)| (home.clone(), resource.name().to_owned(), resource.version().0, resource)).collect();
+    rehearse_records(kinds, &records)
+}
+
+/// [`rehearse`] for a plain kind ([`plain`]): each `(home, name, version, spec)` restored and read
+/// back as its spec.
+pub fn rehearse_plain<K: Kind + PartialEq>(kinds: KindRegistry, imported: &[(String, String, u64, K)]) -> Vec<(usize, String)> {
+    let records: Vec<_> = imported.iter().map(|(home, name, version, spec)| (home.clone(), name.clone(), *version, spec)).collect();
+    rehearse_records(kinds, &records)
+}
+
+fn rehearse_records<K: Kind + PartialEq>(kinds: KindRegistry, imported: &[(String, String, u64, &K)]) -> Vec<(usize, String)> {
     use flotilla_schema::Encoder;
     let store = rusqlite::Connection::open_in_memory()
         .map_err(|error| error.to_string())
@@ -209,26 +223,21 @@ where
         Err(error) => return (0..imported.len()).map(|index| (index, error.clone())).collect(),
     };
     let mut refused = Vec::new();
-    for (index, (home, resource)) in imported.iter().enumerate() {
+    for (index, (home, name, version, value)) in imported.iter().enumerate() {
         if home == REHEARSAL_HOME {
             refused.push((index, format!("homed at `{REHEARSAL_HOME}`, the rehearsal's own home")));
             continue;
         }
-        let result = Encoder::encode(resource).map_err(|error| error.to_string()).and_then(|rows| {
-            let snapshot = flotilla_schema_sqlite::Snapshot {
-                kind: Resource::<M>::CODE,
-                name: resource.name().to_owned(),
-                home: home.clone(),
-                version: resource.version().0,
-                rows,
-            };
+        let result = Encoder::encode(*value).map_err(|error| error.to_string()).and_then(|rows| {
+            let snapshot =
+                flotilla_schema_sqlite::Snapshot { kind: K::CODE, name: name.clone(), home: home.clone(), version: *version, rows };
             let mut write = store.write().map_err(|error| error.to_string())?;
             write.restore(&snapshot).map_err(|error| error.to_string())?;
             write.commit().map_err(|error| error.to_string())?;
             let mut read = store.read().map_err(|error| error.to_string())?;
-            let id = read.resolve(Resource::<M>::CODE, resource.name(), home).map_err(|error| error.to_string())?.ok_or("not restored")?;
-            let loaded = read.load::<Resource<M>>(id).map_err(|error| error.to_string())?.ok_or("not loaded")?;
-            if &loaded.value.with_identity(&loaded.name, loaded.version) != resource {
+            let id = read.resolve(K::CODE, name, home).map_err(|error| error.to_string())?.ok_or("not restored")?;
+            let loaded = read.load::<K>(id).map_err(|error| error.to_string())?.ok_or("not loaded")?;
+            if &loaded.value.with_identity(&loaded.name, loaded.version) != *value {
                 return Err("reads back differently".to_owned());
             }
             Ok(())

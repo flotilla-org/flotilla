@@ -5,7 +5,7 @@ use flotilla_protocol::{Leaf, LeafAddress};
 use crate::{
     address::leaf_record_name, evaluate_leaf, template_leaf, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject,
     Convoy, ConvoyLeafSubject, Forge, Issue, IssueLeafSubject, LeafSubject, MessageInbox, Resource, ResourceError, ResourceObject,
-    ThreeValue, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WorkLeafSubject,
+    ThreeValue, Vessel, VesselLeafSubject, WorkLeafSubject,
 };
 
 impl MessageInbox {
@@ -49,10 +49,8 @@ impl MessageInbox {
                 let subject = record.as_ref().map(|issue| IssueLeafSubject { issue, now, stale_after: self.issue_stale_after });
                 evaluate(subject.as_ref().map(|subject| subject as &dyn LeafSubject))
             }
-            LeafAddress::Usage { .. } => {
-                let record = self.leaf_record::<Usage>(&condition.address).await?;
-                evaluate(record.as_ref().map(UsageLeafSubject).as_ref().map(|subject| subject as &dyn LeafSubject))
-            }
+            // Usage retired (#3824): a stored usage condition still decodes, and admission refuses it.
+            LeafAddress::Usage { .. } => evaluate(None),
             LeafAddress::Artifact { .. } => {
                 let record = self.leaf_record::<Artifact>(&condition.address).await?;
                 evaluate(record.as_ref().map(ArtifactLeafSubject).as_ref().map(|subject| subject as &dyn LeafSubject))

@@ -10,8 +10,7 @@ use chrono::Utc;
 use flotilla_protocol::{DaemonEvent, LeafAddress, LeafFire, WaitSubscriptionRequest};
 use flotilla_resources::{
     admit_leaf, evaluate_leaf, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Convoy, ConvoyLeafSubject, Forge,
-    ForgeSpec, Issue, IssueLeafSubject, LeafMaker, ResourceError, ResourceObject, ThreeValue, Usage, UsageLeafSubject, Vessel,
-    VesselLeafSubject, WorkLeafSubject,
+    ForgeSpec, Issue, IssueLeafSubject, LeafMaker, ResourceError, ResourceObject, ThreeValue, Vessel, VesselLeafSubject, WorkLeafSubject,
 };
 
 use super::routing::{ObjectAddress, ObjectKind, RowDependencies};
@@ -253,7 +252,6 @@ impl LeafSubscriptionTable {
             match address.kind {
                 ObjectKind::Convoy => load!(Convoy, convoys),
                 ObjectKind::Vessel => load!(Vessel, vessels),
-                ObjectKind::Usage => load!(Usage, usages),
                 ObjectKind::Artifact => load!(Artifact, artifacts),
                 ObjectKind::ChangeRequest => {
                     let copies = self.inner.backend.including_replicas::<ChangeRequest>(namespace).get_all(&address.name).await?;
@@ -307,7 +305,6 @@ pub(super) struct OwnedLeafSubjects {
     convoys: HashMap<String, ResourceObject<Convoy>>,
     vessels: HashMap<String, ResourceObject<Vessel>>,
     change_requests: HashMap<String, ResourceObject<ChangeRequest>>,
-    usages: HashMap<String, ResourceObject<Usage>>,
     issues: HashMap<String, ResourceObject<Issue>>,
     artifacts: HashMap<String, ResourceObject<Artifact>>,
 }
@@ -318,7 +315,6 @@ impl OwnedLeafSubjects {
             convoys: &self.convoys,
             vessels: &self.vessels,
             change_requests: &self.change_requests,
-            usages: &self.usages,
             issues: &self.issues,
             artifacts: &self.artifacts,
         }
@@ -329,7 +325,6 @@ pub(super) struct LeafSubjects<'a> {
     pub(super) convoys: &'a HashMap<String, ResourceObject<Convoy>>,
     pub(super) vessels: &'a HashMap<String, ResourceObject<Vessel>>,
     pub(super) change_requests: &'a HashMap<String, ResourceObject<ChangeRequest>>,
-    pub(super) usages: &'a HashMap<String, ResourceObject<Usage>>,
     pub(super) issues: &'a HashMap<String, ResourceObject<Issue>>,
     pub(super) artifacts: &'a HashMap<String, ResourceObject<Artifact>>,
 }
@@ -342,7 +337,7 @@ pub(super) fn evaluate_row(
     names: &HashMap<LeafAddress, String>,
     staleness: LeafObservationStaleness,
 ) -> Result<Option<LeafFire>, String> {
-    let LeafSubjects { convoys, vessels, change_requests, usages, issues, artifacts } = subjects;
+    let LeafSubjects { convoys, vessels, change_requests, issues, artifacts } = subjects;
     let name = |leaf: &flotilla_protocol::Leaf| names.get(&leaf.address);
     let require_all = matches!(row.watcher, LeafWatcher::ReconcilerWake { .. });
     let mut matched = None;
@@ -378,10 +373,8 @@ pub(super) fn evaluate_row(
                 });
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
             }
-            LeafAddress::Usage { .. } => {
-                let subject = name(leaf).and_then(|name| usages.get(name)).map(UsageLeafSubject);
-                evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
-            }
+            // Usage retired (#3824): a stored usage leaf still decodes, and admission refuses it.
+            LeafAddress::Usage { .. } => evaluate_leaf(leaf, None, row.freshness_demand)?,
             LeafAddress::Artifact { .. } => {
                 let subject = name(leaf).and_then(|name| artifacts.get(name)).map(ArtifactLeafSubject);
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?

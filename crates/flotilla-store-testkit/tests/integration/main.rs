@@ -50,8 +50,6 @@ mod registry_watch_tests;
 
 mod role_cascade_tests;
 
-mod usage_tests;
-
 mod declared_queries;
 
 mod watch_view;

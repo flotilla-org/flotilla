@@ -1,6 +1,8 @@
 #[cfg(unix)]
 pub(crate) mod frozen;
 #[cfg(unix)]
+mod import_plan;
+#[cfg(unix)]
 mod lifecycle_import;
 #[cfg(unix)]
 mod message_import;
@@ -143,6 +145,7 @@ async fn validate_daemon_with_preview(
     let mut charter_namespaces = std::collections::BTreeSet::new();
     let mut message_documents = BTreeMap::<String, message_import::Documents>::new();
     let mut lifecycle_documents = BTreeMap::<String, lifecycle_import::Documents>::new();
+    let mut import_plans = BTreeMap::<String, import_plan::Report>::new();
     for (store_base, kind, namespaces) in collections {
         let replication = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.plural == kind).map(|entry| entry.replication_class);
         let query = if replication.is_some_and(|class| class != ReplicationClass::None) { "?replicaSources=true" } else { "" };
@@ -176,6 +179,9 @@ async fn validate_daemon_with_preview(
             }
             let document: Value = response.json().await.map_err(|error| eyre!("decode {label} list: {error}"))?;
             let items = document.get("items").and_then(Value::as_array).ok_or_else(|| eyre!("{label}: daemon list has no items array"))?;
+            if store_base == base {
+                import_plans.entry(namespace.clone()).or_default().count(&kind, items.len());
+            }
             for item in items {
                 count += 1;
                 let name = item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>");
@@ -263,6 +269,11 @@ async fn validate_daemon_with_preview(
         let report = documents.rehearse();
         failed |= probes.require_import && report.refused.iter().any(|refusal| !lifecycle_import::exempt(refusal));
         lifecycle_import::print(namespace, &report);
+    }
+    // Every kind the daemon holds rows of is imported, dropped or still moving (#3824).
+    for (namespace, report) in &import_plans {
+        failed |= probes.require_import && report.blocks_import();
+        import_plan::print(namespace, report);
     }
     if !retirement_inventory_failed {
         match retirement::preview(&retirement_templates, &retirement_projects, &retirement_designations) {
@@ -942,19 +953,6 @@ mod tests {
     fn parses_multiple_yaml_documents() {
         let yaml = "kind: PlacementPolicy\n---\nkind: Forge\n";
         assert_eq!(parse_documents(Path::new("resources.yaml"), yaml).expect("parse yaml").len(), 2);
-    }
-
-    #[test]
-    fn reports_a_renamed_status_field() {
-        let document = serde_json::json!({
-            "apiVersion": "flotilla.work/v1", "kind": "Usage",
-            "metadata": {"name": "quota"},
-            "spec": {"provider": "codex", "account": "test"},
-            "status": {"observed_on": "2026-09-28T00:00:00Z"}
-        });
-        let error = validate_resource_document(&document).expect_err("renamed status field must fail");
-        assert!(error.to_string().contains("status."), "{error}");
-        assert!(error.to_string().contains("observed_at"), "{error}");
     }
 
     #[test]

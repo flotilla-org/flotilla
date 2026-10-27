@@ -7,65 +7,6 @@ use flotilla_store_memory::InMemoryBackend;
 use super::*;
 
 #[tokio::test]
-async fn usage_leaf_fires_from_the_named_window_in_the_replicated_resource_path() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let provider = "codex";
-    let account = "user@example.com";
-    let records = backend.using::<Usage>("flotilla");
-    let created = records
-        .create(
-            &InputMeta::builder()
-                .name(
-                    flotilla_resources::address::record_name(
-                        &flotilla_resources::address::Address::usage(provider, account).expect("usage address"),
-                    )
-                    .expect("record name"),
-                )
-                .build(),
-            &flotilla_resources::UsageSpec { provider: provider.to_string(), account: account.to_string() },
-        )
-        .await
-        .expect("create usage record");
-    records
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &flotilla_resources::UsageStatus::builder()
-                .windows(vec![
-                    flotilla_resources::UsageWindow::builder().name("session").used_percent(8.0).build(),
-                    flotilla_resources::UsageWindow::builder().name("weekly").used_percent(100.0).build(),
-                ])
-                .observed_at(Utc::now())
-                .build(),
-        )
-        .await
-        .expect("publish usage status");
-
-    let (event_tx, _) = broadcast::channel(16);
-    let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
-        backend.clone(),
-        "test-host".to_string(),
-        Arc::new(UnavailableChangeRequests),
-        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
-    );
-    let table = LeafSubscriptionTable::new(backend, broadcast_test_sink(event_tx.clone()), refresher);
-    let mut events = event_tx.subscribe();
-    let mut usage_leaf =
-        leaf(LeafAddress::Usage { provider: provider.to_string(), account: account.to_string() }, ".windows.weekly.used-percent", "90");
-    usage_leaf.operator = LeafOperator::GreaterThan;
-    let subscription_id = table
-        .subscribe_wait(
-            uuid::Uuid::new_v4(),
-            WaitSubscriptionRequest { namespace: "flotilla".to_string(), leaves: vec![usage_leaf], freshness_demand: None },
-        )
-        .await
-        .expect("subscribe usage leaf");
-
-    assert_eq!(receive_fire(&mut events, subscription_id).await.value, "100");
-}
-
-#[tokio::test]
 async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request() {
     let authority = ResourceBackend::new(InMemoryBackend::default());
     let remote = ResourceBackend::new(InMemoryBackend::default());

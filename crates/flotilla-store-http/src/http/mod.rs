@@ -663,7 +663,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::*;
-    use crate::Usage;
+    use crate::Host;
 
     #[test]
     fn decodes_replica_name_tombstone_from_http_watch_line() {
@@ -671,7 +671,7 @@ mod tests {
             "type":"DELETED",
             "object":{
                 "apiVersion":"flotilla.work/v1",
-                "kind":"Usage",
+                "kind":"Host",
                 "metadata":{
                     "name":"lost-account",
                     "namespace":"default",
@@ -684,7 +684,7 @@ mod tests {
             }
         }"#;
 
-        let event = parse_watch_line(ResourceKind::of::<Usage>(), line).expect("decode HTTP tombstone");
+        let event = parse_watch_line(ResourceKind::of::<Host>(), line).expect("decode HTTP tombstone");
         let event = read_watch_event(event).expect("decode tombstone provenance");
 
         match event {

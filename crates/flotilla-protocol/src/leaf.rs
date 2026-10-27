@@ -50,6 +50,8 @@ pub enum LeafAddress {
     Work { convoy: String, work: String },
     ChangeRequest { service: String, scope: String, number: u64 },
     Issue { service: String, scope: String, number: u64 },
+    // Retired with the Usage kind (#3824): kept so stored conditions decode (ADR 0047), never
+    // admitted or observed. Remove one roll after #3824 layer 0.
     Usage { provider: String, account: String },
     Artifact { convoy: String, producer: String, kind: String, subject: String },
 }
