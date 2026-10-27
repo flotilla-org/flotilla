@@ -15,6 +15,9 @@ cargo_test=(cargo test --config "$PWD/../../ci/quint/cargo-config.toml" --locked
 # The provisioning lifecycle kinds (#3629) run the lifecycle graph through the decided store.
 QUINT_GRAPH_DIR="$run/graphs" "${cargo_test[@]}" -p flotilla-provisioning \
   --test lifecycle_conformance -- --ignored --nocapture 2>&1 | tee "$run/provisioning.log"
+# ManifestRoot (#3824 layer 2c), declared beside the provisioning kinds.
+QUINT_GRAPH_DIR="$run/graphs" "${cargo_test[@]}" -p flotilla-provisioning \
+  --test manifest_root_conformance -- --ignored --nocapture 2>&1 | tee "$run/manifest_root.log"
 QUINT_TRACE_DIR="$run" "${cargo_test[@]}" -p flotilla-schema-sqlite \
   --test quint_replay -- --ignored --nocapture 2>&1 | tee "$run/follower.log"
 # The crew kinds (#3629): the placement composition and Ensure through the decided store.

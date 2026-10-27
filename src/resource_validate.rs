@@ -7,7 +7,11 @@ pub(crate) mod frozen;
 #[cfg(unix)]
 mod import_plan;
 #[cfg(unix)]
+mod import_rows;
+#[cfg(unix)]
 mod lifecycle_import;
+#[cfg(unix)]
+mod manifest_root_import;
 #[cfg(unix)]
 mod message_import;
 #[cfg(unix)]
@@ -152,6 +156,7 @@ async fn validate_daemon_with_preview(
     let mut import_plans = BTreeMap::<String, import_plan::Report>::new();
     let mut account_documents = BTreeMap::<String, account_import::Documents>::new();
     let mut definition_documents = definition_import::Documents::default();
+    let mut root_documents = BTreeMap::<String, manifest_root_import::Documents>::new();
     for (store_base, kind, namespaces) in collections {
         let replication = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.plural == kind).map(|entry| entry.replication_class);
         let query = if replication.is_some_and(|class| class != ReplicationClass::None) { "?replicaSources=true" } else { "" };
@@ -215,6 +220,9 @@ async fn validate_daemon_with_preview(
                 }
                 if store_base == base && account_import::KINDS.contains(&kind.as_str()) {
                     account_documents.entry(namespace.clone()).or_default().0.entry(kind.clone()).or_default().push(item.clone());
+                }
+                if store_base == base && kind == manifest_root_import::KIND {
+                    root_documents.entry(namespace.clone()).or_default().0.entry(kind.clone()).or_default().push(item.clone());
                 }
                 if store_base == base && definition_import::KINDS.contains(&kind.as_str()) {
                     definition_documents.0.push((namespace.clone(), kind.clone(), item.clone()));
@@ -286,6 +294,11 @@ async fn validate_daemon_with_preview(
         let report = documents.rehearse();
         failed |= probes.require_import && !report.refused.is_empty();
         account_import::print(namespace, &report);
+    }
+    for (namespace, documents) in &root_documents {
+        let report = manifest_root_import::rehearse(documents);
+        failed |= probes.require_import && !report.refused.is_empty();
+        manifest_root_import::print(namespace, &report);
     }
     // One rehearsal over every namespace: the engine has no namespaces (#3824 layer 2b).
     let definitions = definition_documents.rehearse();
