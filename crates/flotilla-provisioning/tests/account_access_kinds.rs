@@ -5,7 +5,6 @@
 mod schema_support;
 
 use flotilla_provisioning::stored;
-use flotilla_resources::account_access;
 use flotilla_schema::{render_view, KindCode};
 use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store};
 use schema_support::{check, plan};
@@ -14,7 +13,7 @@ use schema_support::{check, plan};
 // in so the owner's look-over and every later change show as a diff.
 #[test]
 fn account_access_store_ddl_matches_the_snapshot() {
-    check("account_access.sql", &schema_ddl(&account_access::registry().expect("registry"), DdlMode::Create));
+    check("account_access.sql", &schema_ddl(&stored::account::registry().expect("registry"), DdlMode::Create));
 }
 
 // Behaviour (CLAUDE.md schema review): the readable view of the account access kind tables.
@@ -22,19 +21,16 @@ fn account_access_store_ddl_matches_the_snapshot() {
 fn account_access_store_schema_view_matches_the_snapshot() {
     let view = format!(
         "# Account access store schema view\n\nKind tables only; the shared tables are in `account_access.sql`.\n\n{}",
-        render_view(account_access::registry().expect("registry").iter())
+        render_view(stored::account::registry().expect("registry").iter())
     );
     check("account_access_schema_view.md", &view);
 }
 
 // Behaviour (#3373 ruling 6): the account access kinds register beside every production kind
-// under codes none of them holds, so the engine store can take them on at the cut-over.
+// under the codes the owner reviewed, held by no other kind.
 #[test]
-fn account_access_kind_codes_are_free_beside_the_production_kinds() {
-    let mut registry = stored::production_kinds().expect("production kinds");
-    for set in account_access::registry().expect("registry").iter() {
-        registry.register_table_set(set.clone()).expect("no code, name or table is held twice");
-    }
+fn account_access_kinds_hold_their_reviewed_codes_beside_the_production_kinds() {
+    let registry = stored::production_kinds().expect("production kinds");
     let held = |kind: &str| registry.iter().find(|set| set.kind == kind).map(|set| set.code);
     assert_eq!(held("AccountBinding"), Some(KindCode::new("ab")));
     assert_eq!(held("AccountProvision"), Some(KindCode::new("ap")));
@@ -44,8 +40,9 @@ fn account_access_kind_codes_are_free_beside_the_production_kinds() {
 // a declared index, and removing a binding's identity finds its provision records by index.
 #[test]
 fn account_access_statements_search_by_key() {
-    let store = Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", account_access::registry().expect("registry"))
-        .expect("open");
+    let store =
+        Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", stored::account::registry().expect("registry"))
+            .expect("open");
     let statements = store.statements();
     let conn = store.into_connection();
     let mut failures = Vec::new();

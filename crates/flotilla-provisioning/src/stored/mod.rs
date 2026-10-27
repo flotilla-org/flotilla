@@ -29,6 +29,7 @@
 //!
 //! [`Lifecycle`]: flotilla_state_machines::machines::lifecycle::Lifecycle
 
+pub mod account;
 pub mod checkout;
 pub mod clone;
 pub mod environment;
@@ -80,6 +81,7 @@ const SECOND: i64 = 1_000_000;
 pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     register_provisioning(registry)?;
     registry.register::<Resource<terminal_session::TerminalSession>>()?;
+    account::register(registry)?;
     Ok(())
 }
 
@@ -92,7 +94,7 @@ fn register_provisioning(registry: &mut KindRegistry) -> Result<(), RegistryErro
 }
 
 /// The Mermaid diagram of each kind's machine registered by [`register`], by
-/// kind name, for the decided store's table views.
+/// kind name, for the decided store's table views. A plain kind (AccountProvision) has none.
 pub fn diagrams() -> BTreeMap<String, String> {
     fn diagram<M: Machine>() -> (String, String)
     where
@@ -106,6 +108,7 @@ pub fn diagrams() -> BTreeMap<String, String> {
         diagram::<clone::Clone>(),
         diagram::<checkout::Checkout>(),
         diagram::<terminal_session::TerminalSession>(),
+        diagram::<account::AccountBinding>(),
     ])
 }
 

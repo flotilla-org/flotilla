@@ -49,6 +49,7 @@ CREATE TABLE "account_binding" (
   "selection_pinned_by" TEXT,
   "selection_index" INTEGER,
   "opened_at" INTEGER NOT NULL,
+  "home_key" TEXT,
   "state" TEXT NOT NULL CHECK ("state" IN ('cl', 'op', 'rv')),
   "state_since" INTEGER NOT NULL,
   "reason" TEXT,
@@ -108,7 +109,14 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ab', 'selection', 'pn', 'Pin'),
   ('ab', 'state', 'cl', 'Closed'),
   ('ab', 'state', 'op', 'Open'),
-  ('ab', 'state', 'rv', 'Revoked');
+  ('ab', 'state', 'rv', 'Revoked'),
+  ('ab', 'log:edge', 'cl', 'Close'),
+  ('ab', 'log:edge', 'ep', 'ObserveEpoch'),
+  ('ab', 'log:edge', 'rg', 'Regrant'),
+  ('ab', 'log:edge', 'rv', 'Revoke'),
+  ('ab', 'log:label', 'cl', 'Closed'),
+  ('ab', 'log:label', 'op', 'Open'),
+  ('ab', 'log:label', 'rv', 'Revoked');
 CREATE VIEW "account_binding_view" AS SELECT
   "account_binding"."id",
   "account_binding"."version",
@@ -121,6 +129,7 @@ CREATE VIEW "account_binding_view" AS SELECT
   "account_binding"."selection_pinned_by",
   "account_binding"."selection_index",
   "account_binding"."opened_at",
+  "account_binding"."home_key",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ab' AND "field" = 'state' AND "code" = "account_binding"."state") AS "state",
   "account_binding"."state_since",
   "account_binding"."reason",

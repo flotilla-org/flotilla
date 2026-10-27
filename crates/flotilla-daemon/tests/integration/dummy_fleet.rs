@@ -1056,6 +1056,53 @@ impl DummyDaemon {
                 at,
             )
             .expect("ensure record");
+        // #3824 layer 1: the account kinds, a binding machine and its provision, a plain kind.
+        let binding = self.transport_binding(at);
+        let mut bindings =
+            Home::<flotilla_provisioning::stored::account::AccountBinding, _>::with_log(home, StoreLog::new(service.store()))
+                .expect("binding home");
+        bindings.create("transport-binding", binding, &(), at).expect("binding record");
+        flotilla_engine_store::plain::PlainLog::new(service.store())
+            .create(
+                "transport-provision",
+                &flotilla_provisioning::stored::account::ProvisionSpec {
+                    binding: flotilla_schema::Ref::new("transport-binding", home),
+                    // The daemon's own host-direct place, which its provision controller keeps.
+                    place: flotilla_resources::host_direct_environment_name(
+                        &self.daemon.local_host_id().expect("local host id").to_string(),
+                    ),
+                    environment_kind: "host-direct".into(),
+                    plan: flotilla_resources::account_access::ProvisionPlan {
+                        implementation: "claude-direct".into(),
+                        effective_access: "account".into(),
+                        mechanism: "oauth token".into(),
+                        update_mode: flotilla_resources::account_access::UpdateMode::Push,
+                    },
+                    home: "/transport".into(),
+                    delivered: None,
+                },
+                "transport",
+                at,
+            )
+            .expect("provision record");
+    }
+
+    fn transport_binding(&self, at: flotilla_schema::Timestamp) -> flotilla_provisioning::stored::account::BindingSpec {
+        use flotilla_resources::account_access::{requester_address, AccessName, CredentialName, Selection};
+        flotilla_provisioning::stored::account::BindingSpec {
+            requester: requester_address(Some("fleet"), "transport-convoy", "coder").expect("requester"),
+            item: "claude-code".into(),
+            requirement: AccessName("claude-code:account".into()),
+            credential: CredentialName("transport-credential".into()),
+            account: None,
+            grants: Default::default(),
+            candidates: Default::default(),
+            exclusions: Default::default(),
+            selection: Selection::Draw { index: 0 },
+            epochs: flotilla_schema::Records::new(),
+            opened_at: at,
+            home_key: Some("agent-homes/requesters/transport-convoy/coder/claude".into()),
+        }
     }
 
     // A replica may consume a later edge before the driver checks its earlier
@@ -1099,13 +1146,16 @@ impl DummyDaemon {
                 let mut snapshots = Vec::new();
                 let mut read = store.read()?;
                 macro_rules! collect {
-                    ($kind:ty) => {{
-                        let code = <Resource<$kind> as flotilla_schema::Kind>::CODE;
+                    ($kind:ty) => {
+                        collect!(stored Resource<$kind>)
+                    };
+                    (stored $stored:ty) => {{
+                        let code = <$stored as flotilla_schema::Kind>::CODE;
                         covered.insert(code);
                         let mut after = None;
                         let before = snapshots.len();
                         loop {
-                            let page = read.scan::<Resource<$kind>>(&home, after, 64)?;
+                            let page = read.scan::<$stored>(&home, after, 64)?;
                             for id in page.ids {
                                 snapshots.push(read.load_snapshot(id)?.expect("snapshot"));
                             }
@@ -1114,7 +1164,7 @@ impl DummyDaemon {
                                 break;
                             }
                         }
-                        assert!(snapshots.len() > before, "transport proof has no {} record", stringify!($kind));
+                        assert!(snapshots.len() > before, "transport proof has no {} record", stringify!($stored));
                     }};
                 }
                 collect!(Message);
@@ -1128,6 +1178,8 @@ impl DummyDaemon {
                 collect!(TerminalSession);
                 collect!(Vessel);
                 collect!(Ensure);
+                collect!(flotilla_provisioning::stored::account::AccountBinding);
+                collect!(stored flotilla_provisioning::stored::account::ProvisionSpec);
                 assert_eq!(covered, registered, "every registered engine kind needs a transport fixture");
                 Ok(snapshots)
             })

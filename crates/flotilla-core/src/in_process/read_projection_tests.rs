@@ -311,6 +311,7 @@ mod tests {
         clock: Arc<dyn Clock>,
         subscriptions: super::super::projection_ports::LeafSubscriptionDiagnostics,
         fleet: FleetService,
+        accounts: flotilla_store::OldStoreAccounts,
     }
 
     #[async_trait]
@@ -363,7 +364,20 @@ mod tests {
                 refresher,
             ));
             let fleet = FleetService::new(AggregatorProjectionState::new(), host_name.clone(), None);
-            Self { temp, backend, config, registry, environments, host_name, node_id, clock: Arc::new(SystemClock), subscriptions, fleet }
+            let accounts = flotilla_store::OldStoreAccounts::new(backend.clone());
+            Self {
+                temp,
+                backend,
+                config,
+                registry,
+                environments,
+                host_name,
+                node_id,
+                clock: Arc::new(SystemClock),
+                subscriptions,
+                fleet,
+                accounts,
+            }
         }
 
         fn projections(&self) -> ReadProjections<'_> {
@@ -380,6 +394,7 @@ mod tests {
                 fleet: &self.fleet,
                 lifecycles: &flotilla_projections::ports::NoLifecycleReads,
                 convoy_engine: &NO_CONVOY_ENGINE,
+                accounts: &self.accounts,
             }
         }
 

@@ -708,6 +708,9 @@ pub struct InProcessDaemon {
     /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4), installed with
     /// the decided store's provisioning homes; none before, and none with the switch off.
     lifecycle_reads: Arc<flotilla_projections::ports::LateLifecycleReads>,
+    /// The account kinds' records (#3824 layer 1): the old store's, or the engine's once
+    /// installed behind `[primitives]`.
+    accounts: Arc<flotilla_store::SwitchedAccounts>,
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
     event_source: Arc<BroadcastEventSink>,
@@ -1252,6 +1255,7 @@ impl InProcessDaemon {
         let admission_free_space_path = Arc::new(std::sync::RwLock::new(admission_free_space_path));
         let observed_checkout_reconciliation = Arc::new(Mutex::new(()));
         let lifecycle_reads = Arc::new(flotilla_resources::lifecycle_reads::LateLifecycleReads::default());
+        let accounts = Arc::new(flotilla_store::SwitchedAccounts::new(resource_backend.clone()));
         let checkout_providers = Arc::new(
             CheckoutProviders::builder()
                 .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
@@ -1267,6 +1271,7 @@ impl InProcessDaemon {
         let crew = Arc::new(
             CrewService::builder()
                 .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
+                .accounts(accounts.clone() as Arc<dyn flotilla_resources::account_access::AccountRecords>)
                 .message_inboxes(Arc::clone(&message_inboxes))
                 .message_path(Arc::clone(&crew_message_path))
                 .convoy_engine(Arc::clone(&convoy_engine_path))
@@ -1317,6 +1322,7 @@ impl InProcessDaemon {
             self_weak: self_weak.clone(),
             admission: ConvoyAdmission::builder()
                 .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
+                .accounts(accounts.clone() as Arc<dyn flotilla_resources::account_access::AccountRecords>)
                 .backend(resource_backend.clone())
                 .observed_backend(observed_resource_backend.clone())
                 .observed_checkout_reconciliation(Arc::clone(&observed_checkout_reconciliation))
@@ -1354,6 +1360,7 @@ impl InProcessDaemon {
             decided_store: Default::default(),
             change_stream_rounds: Default::default(),
             lifecycle_reads: Arc::clone(&lifecycle_reads),
+            accounts,
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
@@ -2190,6 +2197,16 @@ impl InProcessDaemon {
     /// Installs the engine's provisioning readings during composition (#3629 layer 4).
     pub fn install_lifecycle_reads(&self, reads: Arc<dyn flotilla_projections::ports::LifecycleReads>) -> Result<(), String> {
         self.lifecycle_reads.install(reads)
+    }
+
+    /// Installs the engine's account records during composition (#3824 layer 1).
+    pub fn install_account_records(&self, records: Arc<dyn flotilla_resources::account_access::AccountRecords>) -> Result<(), String> {
+        self.accounts.install(records)
+    }
+
+    /// The account kinds' records: the engine's once installed, the old store's before.
+    pub fn account_records(&self) -> Arc<dyn flotilla_resources::account_access::AccountRecords> {
+        self.accounts.clone()
     }
 
     /// Refuse engine-enabled startup until its lifecycle read port is installed.
@@ -4211,6 +4228,7 @@ impl InProcessDaemon {
             leaf_subscriptions: &self.leaf_subscription_diagnostics,
             fleet: &self.fleet,
             convoy_engine: &self.convoy_engine_path,
+            accounts: &*self.accounts,
         }
     }
 
@@ -4587,6 +4605,7 @@ impl InProcessDaemon {
             &*source,
             self.crew.capability_cards(),
             self.lifecycle_reads(),
+            &*self.accounts,
         )
         .await
     }

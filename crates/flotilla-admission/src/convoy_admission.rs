@@ -123,6 +123,8 @@ pub struct ConvoyAdmission {
     observed_backend: ResourceBackend,
     #[builder(default = Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))]
     lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+    /// The account kinds' records: the old store's, or the engine's behind `[primitives]`.
+    accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
     observed_checkout_reconciliation: Arc<Mutex<()>>,
     config: Arc<ConfigStore>,
     discovery: Arc<DiscoveryRuntime>,
@@ -773,7 +775,7 @@ impl ConvoyAdmission {
             intent.auto_attach.into(),
         )
         .await?;
-        crate::account_access::write_bindings(&self.backend, namespace, bindings).await?;
+        self.accounts.open(namespace, bindings).await?;
         self.record_admission_naming(namespace, &admission.name, admission.naming.clone()).await;
         let address = convoy_address(&admission.spec.role, admission.spec.project_ref.as_deref());
         let warnings = admission.spec.issues.iter().flat_map(|issue| issue.placement_needs().1).collect();
@@ -1505,7 +1507,7 @@ impl ConvoyAdmission {
             crate::image_build::remove_created_builds(&self.backend, namespace, &created).await;
         }
         result?;
-        crate::account_access::write_bindings(&self.backend, namespace, bindings).await?;
+        self.accounts.open(namespace, bindings).await?;
         self.record_admission_naming(namespace, &admission.name, admission.naming.clone()).await;
         apply_resource_status_patch(
             &self.backend.using::<ResourceConvoy>(namespace),
@@ -1638,7 +1640,7 @@ impl ConvoyAdmission {
             )
             .await
         {
-            Ok(()) => match crate::account_access::write_bindings(&self.backend, namespace, bindings).await {
+            Ok(()) => match self.accounts.open(namespace, bindings).await {
                 Ok(()) => CommandValue::ConvoyCreated { name: address },
                 Err(message) => CommandValue::Error { message },
             },
@@ -1656,7 +1658,7 @@ impl ConvoyAdmission {
         workflow: &WorkflowTemplateSpec,
         placements: AdmittedPlacements<'_>,
         pins: &[(String, String)],
-    ) -> Result<Vec<crate::account_access::PendingBinding>, String> {
+    ) -> Result<Vec<flotilla_resources::account_access::PendingBinding>, String> {
         let mut by_role = BTreeMap::new();
         for (role, credential) in pins {
             if by_role.insert(role.clone(), credential.clone()).is_some() {
@@ -1700,7 +1702,7 @@ impl ConvoyAdmission {
             Err(ResourceError::NotFound { .. }) => return Ok(Vec::new()),
             Err(error) => return Err(format!("read convoy `{convoy}`: {error}")),
         };
-        let keys = crate::account_access::recover_home_keys(&self.backend, namespace, &convoy.metadata.name).await?;
+        let keys = crate::account_access::recover_home_keys(&*self.accounts, namespace, &convoy.metadata.name).await?;
         if let Some(mut status) = convoy.status.clone() {
             if let Some(snapshot) = &mut status.workflow_snapshot {
                 if crate::account_access::apply_crew_home_keys(&convoy.metadata.name, &mut snapshot.vessels, &keys)? {
@@ -1714,19 +1716,19 @@ impl ConvoyAdmission {
             }
         }
         let now = flotilla_schema::Timestamp::from_datetime(&self.clock.now());
-        let (mut changes, unbound) = crate::account_access::reconcile_convoy_bindings(&self.backend, namespace, &convoy, now).await?;
+        let (mut changes, unbound) =
+            crate::account_access::reconcile_convoy_bindings(&self.backend, &*self.accounts, namespace, &convoy, now).await?;
         if !unbound.is_empty() {
             let _admission_guard = self.lock().await;
             // Re-read under the lock: the convoy may have ended since. A requester another path
-            // (admission, a rebind) bound meanwhile keeps that binding: `write_bindings` keeps an
-            // open one.
+            // (admission, a rebind) bound meanwhile keeps that binding: `open` keeps an open one.
             let convoy = match self.backend.clone().using::<ResourceConvoy>(namespace).get(&convoy.metadata.name).await {
                 Ok(convoy) if !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) => convoy,
                 Ok(_) | Err(ResourceError::NotFound { .. }) => return Ok(changes),
                 Err(error) => return Err(format!("read convoy `{}`: {error}", convoy.metadata.name)),
             };
             changes.extend(
-                crate::account_access::bind_unbound(&self.backend, namespace, &convoy, unbound, &*self.account_random(), now).await?,
+                crate::account_access::bind_unbound(&*self.accounts, namespace, &convoy, unbound, &*self.account_random(), now).await?,
             );
         }
         Ok(changes)
@@ -1742,7 +1744,7 @@ impl ConvoyAdmission {
     ) -> Result<flotilla_resources::AccountBindingSpec, String> {
         let _admission_guard = self.lock().await;
         let now = flotilla_schema::Timestamp::from_datetime(&self.clock.now());
-        crate::account_access::rebind(&self.backend, namespace, convoy, role, pin, &*self.account_random(), now).await
+        crate::account_access::rebind(&self.backend, &*self.accounts, namespace, convoy, role, pin, &*self.account_random(), now).await
     }
 }
 
@@ -5230,6 +5232,7 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
     let host_name = HostName::new("host");
     let admission = ConvoyAdmission::builder()
         .backend(resource_backend.clone())
+        .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(resource_backend.clone())))
         .observed_backend(observed_resource_backend.clone())
         .observed_checkout_reconciliation(Arc::clone(&observed_checkout_reconciliation))
         .config(Arc::clone(&config))

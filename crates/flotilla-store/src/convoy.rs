@@ -40,27 +40,6 @@ pub async fn resolve_local_convoy_name(backend: &crate::ResourceBackend, namespa
     }
 }
 
-/// A convoy's account bindings, read by their convoy label (#3907): explain and the capability
-/// card include replicas; the binding home's own reconcile reads its local ones.
-pub async fn convoy_account_bindings(
-    backend: &crate::ResourceBackend,
-    namespace: &str,
-    convoy: &str,
-    include_replicas: bool,
-) -> Result<Vec<flotilla_resources::ResourceObject<flotilla_resources::AccountBinding>>, crate::ResourceError> {
-    let by_convoy = BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), convoy.to_string())]);
-    Ok(backend
-        .query_declared::<flotilla_resources::AccountBinding>(namespace, &crate::StoreQuery::labels(&by_convoy, include_replicas, false))
-        .await?
-        .items
-        .into_iter()
-        .map(|binding| binding.object)
-        .filter(|binding| {
-            flotilla_resources::account_access::requester_parts(&binding.spec.requester).is_some_and(|(owner, _)| owner == convoy)
-        })
-        .collect())
-}
-
 #[cfg(test)]
 mod live_query_tests {
     use super::*;

@@ -9,6 +9,7 @@ use flotilla_agent::adapter::CAPABILITIES_HEADING;
 use flotilla_capability_contract::{credential_card, CredentialCapability, SessionCapabilitySource};
 use flotilla_messaging::MessageInbox;
 use flotilla_protocol::LifecycleReading;
+use flotilla_resources::account_access::AccountRecords;
 use flotilla_resources::lifecycle_reads::{LifecycleReads, ProvisioningKind};
 use flotilla_resources::{
     message_record_name, vessel_placement_pin, Convoy, Environment, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, ImageBuild,
@@ -31,6 +32,7 @@ pub fn credential_references(session: &ResourceObject<TerminalSession>) -> Resul
 }
 
 /// Verify image capabilities from the selected origin's checked lifecycle reading.
+#[allow(clippy::too_many_arguments)]
 pub async fn session_card(
     backend: &ResourceBackend,
     namespace: &str,
@@ -39,6 +41,7 @@ pub async fn session_card(
     credentials: &[CredentialCapability],
     endpoints: &BTreeMap<String, String>,
     reads: Arc<dyn LifecycleReads>,
+    accounts: &dyn AccountRecords,
 ) -> Result<String, String> {
     let convoy = backend.including_replicas::<Convoy>(namespace).get(convoy_name).await.map_err(|error| error.to_string())?.object;
     let mut text = format!(
@@ -88,7 +91,7 @@ pub async fn session_card(
         ));
     }
     text.push_str("\n### Credentials\n");
-    text.push_str(&account_card(backend, namespace, convoy_name, &spec.role).await?);
+    text.push_str(&account_card(accounts, namespace, convoy_name, &spec.role).await?);
     text.push_str(&credential_card(credentials));
     text.push_str(&format!("\n### Session\nYou work at `{}` in environment `{}`.\n", spec.cwd, spec.env_ref));
     let environment =
@@ -137,11 +140,9 @@ pub async fn session_card(
 
 /// The requester's open account bindings (#3907): which managed credential and account its
 /// harness runs on, and how it was chosen. Never material.
-async fn account_card(backend: &ResourceBackend, namespace: &str, convoy: &str, role: &str) -> Result<String, String> {
+async fn account_card(accounts: &dyn AccountRecords, namespace: &str, convoy: &str, role: &str) -> Result<String, String> {
     use flotilla_resources::account_access::requester_parts;
-    let bindings = flotilla_store::convoy_account_bindings(backend, namespace, convoy, true)
-        .await
-        .map_err(|error| format!("read account bindings: {error}"))?;
+    let bindings = accounts.convoy_bindings(namespace, convoy, false).await?;
     let mut lines = bindings
         .iter()
         .map(|binding| &binding.spec)
@@ -536,6 +537,7 @@ async fn refresh_session_card(
     session: &ResourceObject<TerminalSession>,
     tracker: &CapabilityCardTracker,
     reads: Arc<dyn LifecycleReads>,
+    accounts: &dyn AccountRecords,
 ) -> Result<(), String> {
     let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { return Ok(()) };
     let credentials = source.credentials(&session.spec.env_ref, &credential_references(session)?).await?;
@@ -547,6 +549,7 @@ async fn refresh_session_card(
         &credentials,
         &source.endpoints(&session.spec.env_ref, &session.metadata.name).await?,
         reads,
+        accounts,
     )
     .await?;
     observe_card(backend, namespace, session, &card, tracker).await
@@ -558,6 +561,7 @@ pub async fn refresh_cards(
     source: &dyn SessionCapabilitySource,
     tracker: &CapabilityCardTracker,
     reads: Arc<dyn LifecycleReads>,
+    accounts: &dyn AccountRecords,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
     let sessions = backend.clone().using::<TerminalSession>(namespace).list().await.map_err(|error| error.to_string())?;
@@ -577,7 +581,7 @@ pub async fn refresh_cards(
         if !session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running) {
             continue;
         }
-        if let Err(error) = refresh_session_card(backend, namespace, source, &session, tracker, Arc::clone(&reads)).await {
+        if let Err(error) = refresh_session_card(backend, namespace, source, &session, tracker, Arc::clone(&reads), accounts).await {
             warn!(session = %session.metadata.name, %error, "failed to refresh session capability card");
             errors.push(format!("{}: {error}", session.metadata.name));
         }

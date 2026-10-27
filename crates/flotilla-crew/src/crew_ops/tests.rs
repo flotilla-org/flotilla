@@ -102,6 +102,7 @@ async fn fixture_with_message_path(
     let crew = Arc::new(
         CrewService::builder()
             .resource_backend(backend.clone())
+            .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())))
             .leaf_subscriptions(subscriptions)
             .work_credential_reconciler(RwLock::new(Some(reconciler)))
             .clock(Arc::new(SystemClock))

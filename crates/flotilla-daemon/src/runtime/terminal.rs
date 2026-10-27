@@ -539,6 +539,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                             &credentials,
                             &RuntimeSessionCapabilities { state: Arc::downgrade(&self.state) }.endpoints(&spec.env_ref, name).await?,
                             self.state.daemon.lifecycle_reads(),
+                            &*self.state.daemon.account_records(),
                         )
                         .await
                     }

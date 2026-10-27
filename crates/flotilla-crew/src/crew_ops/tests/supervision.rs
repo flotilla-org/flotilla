@@ -641,6 +641,7 @@ async fn lost_vessel_resume_explains_rehydration() {
     convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("interruption roll-up");
     let restarted = CrewService::builder()
         .resource_backend(backend.clone())
+        .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())))
         .leaf_subscriptions(crew.leaf_subscriptions.clone())
         .work_credential_reconciler(RwLock::new(Some(probe.clone() as Arc<dyn WorkCredentialReconciler>)))
         .clock(crew.clock.clone())
