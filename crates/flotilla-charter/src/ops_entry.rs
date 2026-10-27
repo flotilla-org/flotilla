@@ -7,9 +7,8 @@ use serde::Deserialize;
 // the annotation writers when the definitions move onto the engine (layer 2b-ii).
 pub use flotilla_resources::definition_provenance::{
     MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
+    VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
 };
-pub const VERIFICATION_PROJECT_ANNOTATION: &str = "flotilla.work/verification-command-project";
-pub const VERIFICATION_PROVENANCE_ANNOTATION: &str = "flotilla.work/verification-command-provenance";
 pub const ENSURE_PROVENANCE_ANNOTATION: &str = "flotilla.work/ensure-provenance";
 pub const PRESENTS_AS_ANNOTATION: &str = "flotilla.work/presents-as";
 pub const DECLARATION_REFUSAL_ATTENTION_PREFIX: &str = "declaration-refused-";

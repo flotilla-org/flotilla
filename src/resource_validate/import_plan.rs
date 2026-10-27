@@ -50,7 +50,7 @@ pub(super) const PLAN: &[(&str, Plan)] = &[
     ("ManifestRoot", Plan::Imported("ManifestRoot import (#3824 layer 2c)")),
     ("WorkflowTemplate", Plan::Imported("definitions import (#3824 layer 2b)")),
     ("Project", Plan::Moving("#3824 layer 3")),
-    ("Repository", Plan::Moving("#3824 layer 3")),
+    ("Repository", Plan::Imported("Repository import (#3824 layer 3a)")),
     ("FulfilmentKind", Plan::Moving("#3824 layer 4")),
     ("Host", Plan::Moving("#3824 layer 4")),
     // Converted into FulfilmentKinds of the same names, not dropped (ADR 0046 carry, 2026-10-26).

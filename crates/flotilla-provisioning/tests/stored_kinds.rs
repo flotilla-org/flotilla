@@ -56,6 +56,11 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("AccountProvision"), Some(KindCode::new("ap")));
     assert_eq!(held("ManifestRoot"), Some(KindCode::new("mr")));
     assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 15);
+    // Repository (#3824 layer 3a) joins the decided store with its writers (3a-ii); its code is
+    // pinned beside every production kind now.
+    let mut with_repository = stored::production_kinds().expect("production kinds");
+    stored::repository::register(&mut with_repository).expect("no production kind holds Repository's code");
+    assert_eq!(with_repository.iter().find(|set| set.kind == "Repository").map(|set| set.code), Some(KindCode::new("ry")));
     // The definition kinds (#3824 layer 2b), in the decided store with their writers (2b-ii).
     for (kind, code) in [
         ("Forge", "fo"),
