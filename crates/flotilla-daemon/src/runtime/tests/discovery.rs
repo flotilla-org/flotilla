@@ -111,7 +111,8 @@ async fn bad_agentless_ssh_host_does_not_block_daemon_startup_or_other_hosts() {
 
 #[tokio::test]
 async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
-    let temp = TempDir::new().expect("tempdir");
+    // The host's home holds each vessel's cleat runtime, a socket directory (SUN_LEN).
+    let temp = flotilla_test_support::TestSocketDir::new();
     let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
     let config_dir = temp.path().join("config");
     fs::create_dir_all(&config_dir).expect("config directory");
