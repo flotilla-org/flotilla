@@ -5,6 +5,12 @@
 //! `write_bytes`, `symlink`). [`RunnerVesselAgent`] offers the same facilities over a
 //! runner for environments that hand back no agent yet (#3956 Q2); step 4 gives every
 //! kind an agent and removes this module.
+//!
+//! Over a runner these are weaker than the agent's own: `symlink` unlinks and then
+//! links rather than replacing atomically, `create_dir` checks for a link before
+//! creating (a window the agent's no-follow open does not have), and `read` goes
+//! through a command's text output, so it holds only UTF-8 and checks its limit
+//! after reading.
 
 use std::{
     path::{Path, PathBuf},

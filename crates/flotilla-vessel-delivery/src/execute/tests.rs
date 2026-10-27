@@ -153,6 +153,9 @@ async fn re_runs_deliver_only_what_changed_or_failed() {
     *skills.content.lock().expect("content") = "skills v3".into();
     let error = run(needs("s3", "n2")).await.expect_err("notes fail");
     assert!(matches!(&error, DeliveryError::Step { need, .. } if need.as_str() == "notes"), "{error}");
+    // A replacement that failed partway no longer counts as the content it replaced.
+    let error = run(needs("s3", "n1")).await.expect_err("notes still fail");
+    assert!(matches!(&error, DeliveryError::Step { need, .. } if need.as_str() == "notes"), "the old digest is delivered again: {error}");
     notes.fail.store(false, Ordering::SeqCst);
     run(needs("s3", "n2")).await.expect("retry");
     assert_eq!((skills.deliveries(), notes.deliveries()), (3, 2), "the retry delivers only what failed");

@@ -54,7 +54,8 @@ pub enum DeliveryError {
     Plan(PlanError),
     /// A tree need has no delivery for its content.
     NoDelivery(NeedName),
-    /// A need's name or digest holds a tab or line break, which its record cannot hold.
+    /// A need's name, digest or guest path holds a tab or line break, which its record
+    /// cannot hold.
     Unrecordable(NeedName),
     /// A step, or reading or writing a delivery record, failed.
     Step {
@@ -112,6 +113,11 @@ pub async fn deliver(
     let landed = read.values().flatten().map(|(need, landed)| (need.clone(), landed.clone())).collect();
     // The planner refuses a tree whose home is not a home need, so every step's home is in `homes`.
     let plan = plan(needs, mechanisms, &landed, costs).map_err(DeliveryError::Plan)?;
+    if let Some(step) =
+        plan.steps.iter().find(|step| step.guest_source.as_ref().is_some_and(|source| !recordable(&source.to_string_lossy())))
+    {
+        return Err(DeliveryError::Unrecordable(step.need.clone()));
+    }
     let by_name = needs.iter().map(|need| (&need.name, need)).collect::<BTreeMap<_, _>>();
     let home_of = |need: &Need| match &need.item {
         Item::Home { .. } => need.name.clone(),
@@ -133,6 +139,16 @@ pub async fn deliver(
             Item::Home { .. } => agent.create_dir(&homes[&home], HOME_MODE).await.map_err(failed)?,
             Item::Tree { path, .. } => {
                 let tree = trees.get(&need.name).ok_or_else(|| DeliveryError::NoDelivery(need.name.clone()))?;
+                // Forget what landed before replacing it, so a replacement that fails
+                // partway is never taken for the content the record named.
+                if written.get(&home).is_some_and(|record| record.contains_key(&need.name)) {
+                    let record = &records[&home];
+                    agent
+                        .write(&homes[&home].join(DELIVERY_RECORD), encode_record(record).into_bytes(), RECORD_MODE)
+                        .await
+                        .map_err(failed)?;
+                    written.insert(home.clone(), record.clone());
+                }
                 tree.deliver(step.mechanism, step.guest_source.as_deref(), &path.under(&homes[&home]), agent).await.map_err(failed)?;
             }
         }
