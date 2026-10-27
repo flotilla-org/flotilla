@@ -701,11 +701,11 @@ async fn adoption_does_not_wait_for_initial_checkpoint() {
     adopted.destroy().await.unwrap();
 }
 
-// Behaviour (#3980 contracts 2, 3 and 7): through either agent link drydock
-// chooses, a tool's socket is an agent guest forward the guest dials at its own
-// path, and its files are pushed through the agent. A forward the agent refuses
-// fails provision naming the forward, without waiting. What drydock chose
-// (#3980 contract 9) is recorded in the provider descriptor.
+// Behaviour (#3980 contracts 2, 3 and 7; #3981): through either agent link
+// drydock chooses, the vessel agent serves a controller socket at a guest path
+// the guest dials, and pushes tool files. A forward the agent refuses fails
+// naming the forward, without waiting. What drydock chose (#3980 contract 9)
+// is recorded in the provider descriptor.
 #[tokio::test]
 async fn guest_sockets_are_agent_forwards_through_either_link() {
     for (reverse_forwards, link) in [(false, "local_forward"), (true, "reverse_forward")] {
@@ -715,23 +715,7 @@ async fn guest_sockets_are_agent_forwards_through_either_link() {
         let prepared = fixture_prepared(&host, &provider).await;
         let daemon = tokio::net::UnixListener::bind(host.root.join("daemon.sock")).unwrap();
         let guest_socket = host.root.join("vessel/run/daemon.sock");
-        let tool = EnvironmentTool::new("flotilla", host.root.join("vessel/opt/flotilla"))
-            .with_asset(EnvironmentToolAsset::new(
-                host.root.join("daemon.sock"),
-                &guest_socket,
-                EnvironmentToolAssetKind::UnixSocket,
-                EnvironmentToolAssetAccess::SharedWritable,
-                "the daemon socket",
-            ))
-            .with_asset(EnvironmentToolAsset::new(
-                host.root.join("bin/tar"),
-                host.root.join("vessel/opt/flotilla/tool"),
-                EnvironmentToolAssetKind::File,
-                EnvironmentToolAssetAccess::ReadOnly,
-                "a tool",
-            ));
-        let opts = ProvisionOpts { tools: vec![tool], ..host.opts() };
-        let handle = provider.provision(EnvironmentId::new("forwards"), &prepared, opts).await.unwrap();
+        let handle = provider.provision(EnvironmentId::new("forwards"), &prepared, host.opts()).await.unwrap();
         let report = handle.provider_descriptor().unwrap().agent_connection.expect("drydock's report is recorded");
         let expected = flotilla_protocol::provider::AgentConnectionReport {
             provider: "reference".into(),
@@ -741,6 +725,16 @@ async fn guest_sockets_are_agent_forwards_through_either_link() {
             mode: link.into(),
         };
         assert_eq!(report, expected);
+        let agent = handle.agent();
+        agent.forward_controller_socket(&guest_socket, &host.root.join("daemon.sock")).await.unwrap();
+        let tool = EnvironmentTool::new("flotilla", host.root.join("vessel/opt/flotilla")).with_asset(EnvironmentToolAsset::new(
+            host.root.join("bin/tar"),
+            host.root.join("vessel/opt/flotilla/tool"),
+            EnvironmentToolAssetKind::File,
+            EnvironmentToolAssetAccess::ReadOnly,
+            "a tool",
+        ));
+        agent.push_tools(&[tool]).await.unwrap();
         let mut guest = tokio::net::UnixStream::connect(&guest_socket).await.unwrap();
         guest.write_all(b"crew").await.unwrap();
         let (mut controller, _) = tokio::time::timeout(Duration::from_secs(5), daemon.accept()).await.unwrap().unwrap();
@@ -751,21 +745,13 @@ async fn guest_sockets_are_agent_forwards_through_either_link() {
         let pushed = std::fs::metadata(host.root.join("vessel/opt/flotilla/tool")).unwrap();
         assert_eq!(pushed.permissions().mode() & 0o777, 0o755);
         // A guest path whose parent is a file cannot be listened on.
-        let refused = EnvironmentTool::new("flotilla", host.root.join("vessel/opt/flotilla")).with_asset(EnvironmentToolAsset::new(
-            host.root.join("daemon.sock"),
-            host.root.join("hosts-file/daemon.sock"),
-            EnvironmentToolAssetKind::UnixSocket,
-            EnvironmentToolAssetAccess::SharedWritable,
-            "the daemon socket",
-        ));
         std::fs::write(host.root.join("hosts-file"), b"").unwrap();
-        let opts = ProvisionOpts { tools: vec![refused], ..host.opts() };
-        let failure = tokio::time::timeout(Duration::from_secs(5), provider.provision(EnvironmentId::new("refused"), &prepared, opts))
+        let (unservable, daemon_path) = (host.root.join("hosts-file/daemon.sock"), host.root.join("daemon.sock"));
+        let refused = agent.forward_controller_socket(&unservable, &daemon_path);
+        let message = tokio::time::timeout(Duration::from_secs(5), refused)
             .await
             .expect("a refused forward never hangs")
-            .err()
-            .expect("a refused forward fails provision");
-        let message = failure.to_string();
+            .expect_err("a refused forward fails");
         assert!(message.contains("guest forward socket-") && message.contains("hosts-file/daemon.sock"), "{message}");
         handle.destroy().await.unwrap();
     }

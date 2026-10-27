@@ -252,7 +252,8 @@ fn cloud_stored_shapes_remain_decodable() {
 }
 
 // #3777 review 2 / ADR 0047: previous-generation cloud control entries retain
-// probe verification after decode; adapter controls stay in env until #3785.
+// probe verification after decode. #3981: the retired Docker carrier's smuggled
+// entries are accepted and dropped, never written back.
 // The new fixed fixture supplements the unchanged deployed corpus.
 #[test]
 fn legacy_cloud_controls_lift_into_declared_fields() {
@@ -260,25 +261,23 @@ fn legacy_cloud_controls_lift_into_declared_fields() {
     decode_stored_resource_document(&document).unwrap();
     let spec: flotilla_resources::EnvironmentSpec = serde_json::from_value(document["spec"].clone()).unwrap();
     let cloud = spec.cloud_sandbox.unwrap();
-    assert_eq!(cloud.env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], r#"["codex"]"#);
     assert_eq!(cloud.probe_needs.len(), 2);
     let encoded = serde_json::to_value(cloud).unwrap();
-    assert_eq!(encoded["env"], serde_json::json!({"LANG":"C.UTF-8", "FLOTILLA_REQUIRED_AGENT_ADAPTERS": "[\"codex\"]"}));
+    assert_eq!(encoded["env"], serde_json::json!({"LANG":"C.UTF-8"}));
     // Explicit typed fields, including an empty set, take precedence over old
     // controls in a mixed record. Malformed retired controls cannot bypass checks.
     let mut mixed = document["spec"].clone();
     mixed["cloud_sandbox"]["probe_needs"] = serde_json::json!([]);
     let spec: flotilla_resources::EnvironmentSpec = serde_json::from_value(mixed).unwrap();
-    let cloud = spec.cloud_sandbox.unwrap();
-    assert!(cloud.probe_needs.is_empty());
-    assert_eq!(cloud.env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], r#"["codex"]"#);
+    assert!(spec.cloud_sandbox.unwrap().probe_needs.is_empty());
     let mut invalid = document["spec"].clone();
     invalid["cloud_sandbox"]["env"]["FLOTILLA_CLOUD_IMAGE_NEEDS"] = serde_json::json!("invalid JSON");
     assert!(serde_json::from_value::<flotilla_resources::EnvironmentSpec>(invalid).is_err());
-    // Adapter syntax remains the provisioning consumer's concern, as on main;
-    // the cloud decode shim must neither parse nor remove this env entry.
-    let mut adapter_control = document["spec"].clone();
-    adapter_control["cloud_sandbox"]["env"]["FLOTILLA_REQUIRED_AGENT_ADAPTERS"] = serde_json::json!("opaque adapter control");
-    let decoded: flotilla_resources::EnvironmentSpec = serde_json::from_value(adapter_control).unwrap();
-    assert_eq!(decoded.cloud_sandbox.unwrap().env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], "opaque adapter control");
+    // The carrier's credential and skill controls are dropped unparsed, as its adapter list is.
+    let mut carried = document["spec"].clone();
+    for key in ["FLOTILLA_CREDENTIAL_REFS", "FLOTILLA_CREDENTIAL_SCOPES", "FLOTILLA_CREDENTIAL_PERMISSIONS", "FLOTILLA_CREW_SKILLS"] {
+        carried["cloud_sandbox"]["env"][key] = serde_json::json!("opaque carrier control");
+    }
+    let decoded: flotilla_resources::EnvironmentSpec = serde_json::from_value(carried).unwrap();
+    assert_eq!(decoded.cloud_sandbox.unwrap().env, [("LANG".to_string(), "C.UTF-8".to_string())].into());
 }

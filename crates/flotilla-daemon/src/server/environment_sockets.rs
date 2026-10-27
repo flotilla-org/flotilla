@@ -271,6 +271,12 @@ impl EnvironmentSocketService {
         self.prepare_reached(SocketKey { environment: id, vessel: None }, SocketReach::Mounted).await
     }
 
+    /// The socket a vessel's agent forwards its crews to, where the vessel is
+    /// the whole environment (#3981).
+    pub(crate) async fn prepare_forwarded(&self, id: EnvironmentId) -> Result<DaemonHostPath, String> {
+        self.prepare_reached(SocketKey { environment: id, vessel: None }, SocketReach::Forwarded).await
+    }
+
     /// The socket one vessel's agent forwards its crews to, on an SSH
     /// host where vessels share their environment (#3792). It serves that
     /// environment.

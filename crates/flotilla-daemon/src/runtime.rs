@@ -11,6 +11,7 @@ mod health;
 mod message;
 mod ports;
 mod primitives;
+mod provider_path;
 mod seed;
 pub(crate) mod ssh_host_vessels;
 mod state;

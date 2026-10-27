@@ -394,9 +394,7 @@ async fn reconcile_cloud_environment(
     environment: &ResourceObject<Environment>,
 ) -> Result<(), String> {
     use flotilla_environment::environment::ObservationState;
-    use flotilla_provisioning::reconcilers::EnvironmentRuntime;
-    let runtime = super::docker::DockerControllerRuntime { state: state.clone() };
-    let provider = runtime.provider_for_environment(&environment.metadata.name).await?;
+    let provider = state.provider_for_environment(&environment.metadata.name).await?;
     let id = EnvironmentId::new(&environment.metadata.name);
     let cached =
         state.provisioned_environments.lock().await.values().find(|active| active.handle.id() == &id).map(|active| active.handle.clone());
@@ -408,7 +406,7 @@ async fn reconcile_cloud_environment(
         Some(handle) => match handle.observe().await.state {
             ObservationState::Running => {
                 if cached.is_none() {
-                    if let Err(error) = runtime.provision_environment(&environment.metadata.name, &environment.spec).await {
+                    if let Err(error) = super::provider_path::provision(state, &environment.metadata.name, &environment.spec).await {
                         record_cloud_health(
                             state,
                             namespace,

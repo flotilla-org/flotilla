@@ -184,6 +184,18 @@ impl<'de> Deserialize<'de> for CloudSandboxEnvironmentSpec {
         // controls on decode; write only typed fields. Explicit new fields win.
         let needs = stored.env.remove("FLOTILLA_CLOUD_IMAGE_NEEDS");
         stored.env.remove("FLOTILLA_DRYDOCK_LAB_FORWARD");
+        // ADR 0047: remove one fleet roll after #3981. The retired Docker carrier
+        // smuggled its inputs here; the vessel and access layers own them now.
+        for retired in [
+            "FLOTILLA_REQUIRED_AGENT_ADAPTERS",
+            crate::CREDENTIAL_REFS_ENV,
+            crate::CREDENTIAL_SCOPES_ENV,
+            crate::CREDENTIAL_PERMISSIONS_ENV,
+            crate::CREW_SKILLS_ENV,
+            crate::RETIRED_CREW_HOME_KEYS_ENV,
+        ] {
+            stored.env.remove(retired);
+        }
         let probe_needs = match stored.probe_needs {
             Some(needs) => needs,
             None => needs.map(|value| serde_json::from_str(&value)).transpose().map_err(serde::de::Error::custom)?.unwrap_or_default(),

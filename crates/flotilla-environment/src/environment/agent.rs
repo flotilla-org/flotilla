@@ -716,6 +716,14 @@ impl VesselAgent for Arc<AgentRunner> {
     async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String> {
         AgentRunner::push_tools(self, tools).await
     }
+    async fn forward_controller_socket(&self, guest: &Path, controller: &Path) -> Result<(), String> {
+        let id = format!("socket-{}", &format!("{:x}", Sha256::digest(guest.as_os_str().as_encoded_bytes()))[..16]);
+        let forward = GuestForward { id, unix: guest.into(), tcp: None };
+        self.put_guest_forward(forward, Endpoint::Unix(controller.into())).await.map_err(|failure| failure.to_string())
+    }
+    async fn configure_environment(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
+        AgentRunner::configure_environment(self, environment).await
+    }
     async fn forward_socket(&self, guest: &Path) -> Result<PathBuf, String> {
         if !guest.is_absolute() {
             return Err("guest socket path must be absolute".into());
