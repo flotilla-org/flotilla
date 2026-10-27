@@ -623,7 +623,8 @@ fn write_executable(path: &Path, script: &str) {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
-    let remote = TempDir::new().expect("remote host");
+    // The home holds the vessel's cleat runtime, a socket directory (SUN_LEN).
+    let remote = flotilla_test_support::TestSocketDir::new();
     let home = remote.path().join("home");
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let checkout = home.join("flotilla/repos/work");

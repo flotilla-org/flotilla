@@ -154,15 +154,17 @@ fn recording_sockets(state: &Path) -> (EnvironmentSocketService, Received) {
 
 struct Host {
     _runtime: flotilla_test_support::TestSocketDir,
-    home: tempfile::TempDir,
-    state: tempfile::TempDir,
+    home: flotilla_test_support::TestSocketDir,
+    state: flotilla_test_support::TestSocketDir,
     profile: AgentlessSshProfile,
 }
 
 fn host(runner: Arc<dyn CommandRunner>) -> Host {
     let runtime = flotilla_test_support::TestSocketDir::new();
-    let home = tempfile::tempdir().expect("home");
-    let state = tempfile::tempdir().expect("controller state");
+    // The home holds each vessel's cleat runtime and the controller state its
+    // daemon sockets: both are socket directories (SUN_LEN).
+    let home = flotilla_test_support::TestSocketDir::new();
+    let state = flotilla_test_support::TestSocketDir::new();
     let profile = AgentlessSshProfile {
         provisioning: LocalProvisioningProfile {
             environment_providers: Vec::new(),
