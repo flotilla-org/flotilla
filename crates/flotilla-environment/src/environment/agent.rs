@@ -137,6 +137,9 @@ impl Connection {
 pub(crate) const ENSURED_FILE_LIMIT: u64 = 16 * 1024 * 1024;
 /// Command output collected in memory, per stream. Generous, but finite.
 pub(crate) const OUTPUT_LIMIT: usize = 256 * 1024 * 1024;
+/// How long `healthy` waits to restore a restarted agent's configuration
+/// and forwards before dropping the client for a fresh connection.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run `exec` with `input` on its stdin. Input is written while output is
 /// read, so neither side fills its pipe. A process may exit without reading
@@ -312,7 +315,9 @@ impl AgentRunner {
                 return true;
             }
             tracing::info!("vessel agent lost its configuration; pushing it again");
-            if state.push(&client).await.is_ok() {
+            // The state lock is held across the push, so a hung link must
+            // not hold every other caller with it.
+            if matches!(tokio::time::timeout(PUSH_TIMEOUT, state.push(&client)).await, Ok(Ok(()))) {
                 return true;
             }
         }
