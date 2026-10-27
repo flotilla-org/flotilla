@@ -25,10 +25,17 @@ pub enum KindRealisation {
     /// A cloud sandbox running `sandbox_image`.
     #[store(code = "cs")]
     CloudSandboxPerVessel { sandbox_image: String },
-    /// A container per vessel. No image is the vessel's composed image (ADR 0062); an image with
-    /// no build is a literal reference; with one, the composed identity that ImageBuild realises.
+    /// A container per vessel running its composed image (ADR 0062), frozen per vessel at
+    /// admission.
     #[store(code = "dk")]
-    DockerPerVessel { image: Option<String>, image_build_ref: Option<String> },
+    DockerComposed,
+    /// A container per vessel running a literal image reference.
+    #[store(code = "dl")]
+    DockerLiteral { image: String },
+    /// A container per vessel running a composed identity, as a snapshot froze it, with the
+    /// ImageBuild that realises it.
+    #[store(code = "db")]
+    DockerBuilt { identity: String, image_build_ref: String },
     /// The host itself.
     #[store(code = "hd")]
     HostDirect,
@@ -58,12 +65,10 @@ impl FulfilmentKindDefinition {
             }
             FulfilmentRealisation::HostDirect => KindRealisation::HostDirect,
             FulfilmentRealisation::DockerPerVessel { image } => match image {
-                None => KindRealisation::DockerPerVessel { image: None, image_build_ref: None },
-                Some(DockerImageSource::Literal(image)) => {
-                    KindRealisation::DockerPerVessel { image: Some(image.clone()), image_build_ref: None }
-                }
+                None => KindRealisation::DockerComposed,
+                Some(DockerImageSource::Literal(image)) => KindRealisation::DockerLiteral { image: image.clone() },
                 Some(DockerImageSource::Built { identity, image_build_ref }) => {
-                    KindRealisation::DockerPerVessel { image: Some(identity.clone()), image_build_ref: Some(image_build_ref.clone()) }
+                    KindRealisation::DockerBuilt { identity: identity.clone(), image_build_ref: image_build_ref.clone() }
                 }
                 Some(DockerImageSource::Baseline { image_baseline_ref }) => {
                     return Err(format!("its image names CrewImageBaseline `{image_baseline_ref}`, which retires"));
@@ -86,14 +91,12 @@ impl FulfilmentKindDefinition {
                 FulfilmentRealisation::CloudSandboxPerVessel { image: sandbox_image.clone() }
             }
             KindRealisation::HostDirect => FulfilmentRealisation::HostDirect,
-            KindRealisation::DockerPerVessel { image, image_build_ref } => FulfilmentRealisation::DockerPerVessel {
-                image: match (image, image_build_ref) {
-                    (None, _) => None,
-                    (Some(image), None) => Some(DockerImageSource::Literal(image.clone())),
-                    (Some(identity), Some(build)) => {
-                        Some(DockerImageSource::Built { identity: identity.clone(), image_build_ref: build.clone() })
-                    }
-                },
+            KindRealisation::DockerComposed => FulfilmentRealisation::DockerPerVessel { image: None },
+            KindRealisation::DockerLiteral { image } => {
+                FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Literal(image.clone())) }
+            }
+            KindRealisation::DockerBuilt { identity, image_build_ref } => FulfilmentRealisation::DockerPerVessel {
+                image: Some(DockerImageSource::Built { identity: identity.clone(), image_build_ref: image_build_ref.clone() }),
             },
         };
         FulfilmentKindSpec {

@@ -104,6 +104,93 @@ fn host_ref(spec: &PlacementPolicySpec) -> &str {
     }
 }
 
+/// One kind's record at one home, with the namespaces its copies came from.
+struct KindEntry {
+    namespaces: BTreeSet<String>,
+    record: Result<FulfilmentKindDefinition, String>,
+}
+
+/// The settings one live policy carries for its host's provider.
+struct PolicySettings {
+    policy: String,
+    origin: DefinitionOrigin,
+    spec: EnvironmentProviderSpec,
+}
+
+/// What one home's policies of one provider make of it.
+enum Merged {
+    /// A record, with notes on what it overrode or folded.
+    Record {
+        origin: DefinitionOrigin,
+        spec: EnvironmentProviderSpec,
+        notes: Vec<String>,
+    },
+    /// Nothing declares them and they are the built-in default: no record; `policies` dropped.
+    Builtin {
+        policies: usize,
+    },
+    Refused(String),
+}
+
+/// The fields of two settings that differ, by their names in a manifest.
+fn differences(left: &ProviderSettings, right: &ProviderSettings) -> Vec<String> {
+    let (left, right) = (serde_json::to_value(left).unwrap_or_default(), serde_json::to_value(right).unwrap_or_default());
+    let keys: BTreeSet<&String> = left.as_object().into_iter().chain(right.as_object()).flat_map(|object| object.keys()).collect();
+    keys.into_iter().filter(|key| left.get(key.as_str()) != right.get(key.as_str())).cloned().collect()
+}
+
+/// Merges one home's policies of one provider into its settings.
+///
+/// A manifest's settings are declared; the daemon's seeded policy and an operator's are defaults the
+/// declaration overrides. The record takes the declaring rank's settings and origin (so a manifest's
+/// reconciler owns it), the first policy's by name among them; nothing depends on the order the copies
+/// were listed in. Policies of that rank must agree on the settings; an instance named by one and
+/// left out by another is kept, and two different instances are refused. Undeclared settings equal to
+/// the built-in default are not stored: a stored copy would only shadow a later declaration.
+fn merge_settings(mut set: Vec<PolicySettings>) -> Merged {
+    let undeclared = |origin: &DefinitionOrigin| !matches!(origin, DefinitionOrigin::Manifest { .. });
+    set.sort_by(|left, right| (undeclared(&left.origin), &left.policy).cmp(&(undeclared(&right.origin), &right.policy)));
+    let first = &set[0];
+    let rank = undeclared(&first.origin);
+    let (same, other): (Vec<_>, Vec<_>) = set.iter().partition(|entry| undeclared(&entry.origin) == rank);
+    for entry in &same {
+        let fields = differences(&first.spec.settings, &entry.spec.settings);
+        if !fields.is_empty() {
+            return Merged::Refused(format!(
+                "policies `{}` and `{}` set this provider differently: `{}`",
+                first.policy,
+                entry.policy,
+                fields.join("`, `")
+            ));
+        }
+    }
+    let instances: BTreeSet<&String> = same.iter().filter_map(|entry| entry.spec.instance.as_ref()).collect();
+    if instances.len() > 1 {
+        let named: Vec<_> = instances.into_iter().map(String::as_str).collect();
+        return Merged::Refused(format!("its policies name different instances `{}`", named.join("`, `")));
+    }
+    let mut spec = first.spec.clone();
+    spec.instance = instances.into_iter().next().cloned();
+    if rank && ProviderSettings::builtin(spec.settings.realisation()).as_ref() == Some(&spec.settings) {
+        return Merged::Builtin { policies: set.len() };
+    }
+    let mut notes = Vec::new();
+    let overridden: Vec<_> = other.iter().filter(|entry| entry.spec.settings != spec.settings).map(|entry| entry.policy.as_str()).collect();
+    if !overridden.is_empty() {
+        notes.push(format!("`{}`'s declared settings override those of `{}`", first.policy, overridden.join("`, `")));
+    }
+    if set.len() > 1 {
+        let policies: Vec<_> = set.iter().map(|entry| entry.policy.as_str()).collect();
+        let origins = if set.iter().any(|entry| entry.origin != first.origin) {
+            format!("; it takes `{}`'s origin", first.policy)
+        } else {
+            String::new()
+        };
+        notes.push(format!("set by policies `{}`{origins}", policies.join("`, `")));
+    }
+    Merged::Record { origin: first.origin.clone(), spec, notes }
+}
+
 /// The kind a policy with none of its name becomes. `host_platform` is the platform grant of its
 /// host's host-direct kind, which a host-direct policy needs.
 fn kind_of(spec: &PlacementPolicySpec, host_platform: Option<&FulfilmentGrant>) -> Result<FulfilmentKindSpec, String> {
@@ -120,7 +207,7 @@ fn kind_of(spec: &PlacementPolicySpec, host_platform: Option<&FulfilmentGrant>) 
 pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> ImportedPlacement {
     let mut imported = ImportedPlacement::default();
     // Every record by (name, home), with the namespaces it came from.
-    let mut kinds = BTreeMap::<(String, String), (BTreeSet<String>, Result<FulfilmentKindDefinition, String>)>::new();
+    let mut kinds = BTreeMap::<(String, String), KindEntry>::new();
     // The platform grant of each home's host-direct kind for each host, which a host-direct policy
     // with no kind of its own takes.
     let mut platforms = BTreeMap::<(String, String), FulfilmentGrant>::new();
@@ -130,17 +217,20 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
             continue;
         }
         let spec = &copy.object.spec;
-        if let (FulfilmentRealisation::HostDirect, Some(platform)) =
-            (&spec.realisation, spec.grants.iter().find(|grant| grant.0.starts_with("platform:")))
+        let record = origin(&copy.object.metadata).and_then(|origin| FulfilmentKindDefinition::new(origin, spec));
+        // Only a kind that imports lends its host's platform.
+        if let (Ok(_), FulfilmentRealisation::HostDirect, Some(platform)) =
+            (&record, &spec.realisation, spec.grants.iter().find(|grant| grant.0.starts_with("platform:")))
         {
             platforms.insert((copy.home.clone(), spec.host_ref.clone()), platform.clone());
         }
-        let record = origin(&copy.object.metadata).and_then(|origin| FulfilmentKindDefinition::new(origin, spec));
-        let entry = kinds.entry((copy.object.metadata.name.clone(), copy.home.clone())).or_insert_with(|| (BTreeSet::new(), record));
-        entry.0.insert(copy.namespace.clone());
+        let entry = kinds
+            .entry((copy.object.metadata.name.clone(), copy.home.clone()))
+            .or_insert_with(|| KindEntry { namespaces: BTreeSet::new(), record });
+        entry.namespaces.insert(copy.namespace.clone());
     }
     // Each home's settings for each provider, with the policies that set them.
-    let mut providers = BTreeMap::<(String, String), Vec<(String, DefinitionOrigin, EnvironmentProviderSpec)>>::new();
+    let mut providers = BTreeMap::<(String, String), Vec<PolicySettings>>::new();
     for copy in &copies.policies {
         let name = &copy.object.metadata.name;
         let spec = &copy.object.spec;
@@ -177,16 +267,16 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
             }
         };
         let key = (name.clone(), copy.home.clone());
-        if let Some((namespaces, _)) = kinds.get_mut(&key) {
+        if let Some(entry) = kinds.get_mut(&key) {
             // The kind of its name, which the daemon migrated from it, stands.
-            namespaces.insert(copy.namespace.clone());
+            entry.namespaces.insert(copy.namespace.clone());
         } else {
             let host = (copy.home.clone(), host_ref(spec).to_owned());
             let record = kind_of(spec, platforms.get(&host))
                 .and_then(|kind| FulfilmentKindDefinition::new(policy_origin.clone(), &kind))
                 .map_err(|reason| format!("its kind: {reason}"));
             let refused = record.is_err();
-            kinds.insert(key, (BTreeSet::from([copy.namespace.clone()]), record));
+            kinds.insert(key, KindEntry { namespaces: BTreeSet::from([copy.namespace.clone()]), record });
             if refused {
                 // A refused policy leaves no trace: its settings do not reach its host's provider.
                 continue;
@@ -196,10 +286,14 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
             *report.dropped.entry((POLICIES, "a snapshot's settings; its host's provider settings apply")).or_default() += 1;
             continue;
         };
-        providers.entry((provider.record_name(), copy.home.clone())).or_default().push((name.clone(), policy_origin, provider));
+        providers.entry((provider.record_name(), copy.home.clone())).or_default().push(PolicySettings {
+            policy: name.clone(),
+            origin: policy_origin,
+            spec: provider,
+        });
     }
     // The engine has no namespaces: a name a home holds in several is refused in all of them.
-    for ((name, home), (namespaces, record)) in kinds {
+    for ((name, home), KindEntry { namespaces, record }) in kinds {
         let refuse = |reason: String| ImportRefusal { kind: KINDS, record: name.clone(), reason: format!("at `{home}`: {reason}") };
         if namespaces.len() > 1 {
             let held: Vec<_> = namespaces.into_iter().collect();
@@ -211,54 +305,17 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
             Err(reason) => report.refused.push(refuse(reason)),
         }
     }
-    for ((name, home), mut set) in providers {
-        // A manifest's settings are declared; the daemon's seeded policy and an operator's are
-        // defaults the declaration overrides. The record takes the declaring manifest's settings and
-        // origin, so its reconciler owns it; else the first policy's by name. Neither depends on the
-        // order the copies were listed in.
-        let undeclared = |origin: &DefinitionOrigin| !matches!(origin, DefinitionOrigin::Manifest { .. });
-        set.sort_by(|(left, left_origin, _), (right, right_origin, _)| {
-            (undeclared(left_origin), left).cmp(&(undeclared(right_origin), right))
-        });
-        let (first, origin, spec) = &set[0];
-        let rank = undeclared(origin);
-        let overridden: Vec<_> = set
-            .iter()
-            .filter(|(_, other_origin, other)| undeclared(other_origin) != rank && other != spec)
-            .map(|(policy, _, _)| policy.as_str())
-            .collect();
-        if !overridden.is_empty() {
-            report.notes.push(format!(
-                "{PROVIDERS} `{name}` at `{home}`: `{first}`'s declared settings override those of `{}`",
-                overridden.join("`, `")
-            ));
+    for ((name, home), set) in providers {
+        match merge_settings(set) {
+            Merged::Record { origin, spec, notes } => {
+                report.notes.extend(notes.into_iter().map(|note| format!("{PROVIDERS} `{name}` at `{home}`: {note}")));
+                imported.providers.push(Placed { name, home, record: EnvironmentProviderDefinition::new(origin, &spec) });
+            }
+            Merged::Builtin { policies } => *report.dropped.entry((PROVIDERS, "the built-in default settings")).or_default() += policies,
+            Merged::Refused(reason) => {
+                report.refused.push(ImportRefusal { kind: PROVIDERS, record: name, reason: format!("at `{home}`: {reason}") })
+            }
         }
-        let differing: Vec<_> = set
-            .iter()
-            .filter(|(_, other_origin, other)| undeclared(other_origin) == rank && other != spec)
-            .map(|(policy, _, _)| policy.as_str())
-            .collect();
-        if !differing.is_empty() {
-            report.refused.push(ImportRefusal {
-                kind: PROVIDERS,
-                record: name,
-                reason: format!("at `{home}`: policies `{first}` and `{}` set this provider differently", differing.join("`, `")),
-            });
-            continue;
-        }
-        if rank && ProviderSettings::builtin(spec.settings.realisation()).as_ref() == Some(&spec.settings) {
-            // Nothing declares these settings, every policy of the rank agrees on them (checked above), and they are the built-in default the host's
-            // provider runs with anyway: a stored copy would only shadow a later declaration.
-            *report.dropped.entry((PROVIDERS, "the built-in default settings")).or_default() += set.len();
-            continue;
-        }
-        if set.len() > 1 {
-            let policies: Vec<_> = set.iter().map(|(policy, _, _)| policy.as_str()).collect();
-            let origins =
-                if set.iter().any(|(_, other, _)| other != origin) { format!("; it takes `{first}`'s origin") } else { String::new() };
-            report.notes.push(format!("{PROVIDERS} `{name}` at `{home}`: set alike by policies `{}`{origins}", policies.join("`, `")));
-        }
-        imported.providers.push(Placed { name, home, record: EnvironmentProviderDefinition::new(origin.clone(), spec) });
     }
     imported
 }

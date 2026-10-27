@@ -126,7 +126,7 @@ fn policies_become_kinds_and_their_hosts_provider_settings() {
     assert_eq!(snapshot.origin, DefinitionOrigin::Snapshot);
     assert_eq!(
         snapshot.realisation,
-        KindRealisation::DockerPerVessel { image: Some("sha256:abc".into()), image_build_ref: Some("image-abc-amd64".into()) }
+        KindRealisation::DockerBuilt { identity: "sha256:abc".into(), image_build_ref: "image-abc-amd64".into() }
     );
     assert_eq!(
         snapshot.spec().realisation,
@@ -282,7 +282,11 @@ fn undeclared_disagreement_is_refused_whichever_policy_holds_the_default() {
         let mut report = ImportReport::default();
         let imported = import_placement(&copies, &mut report);
         assert!(imported.providers.is_empty(), "{first} first");
-        assert!(report.refused.iter().any(|refusal| refusal.to_string().contains("set this provider differently")), "{first} first");
+        assert!(
+            report.refused.iter().any(|refusal| refusal.to_string().contains("set this provider differently: `pull_policy`")),
+            "{first} first: {:?}",
+            report.refused
+        );
         assert!(!report.dropped.contains_key(&("EnvironmentProvider", "the built-in default settings")), "{first} first");
     }
     // A host-direct policy with no host-direct kind is refused, and leaves no settings behind.
@@ -292,4 +296,45 @@ fn undeclared_disagreement_is_refused_whichever_policy_holds_the_default() {
     let imported = import_placement(&copies, &mut report);
     assert!(imported.providers.is_empty() && imported.kinds.is_empty());
     assert!(!report.dropped.contains_key(&("EnvironmentProvider", "the built-in default settings")), "{:?}", report.dropped);
+}
+
+// Behaviour (#3824 layer 4a, review of #4003): undeclared policies that agree on the settings and
+// differ only in naming the instance make one record with the instance named; two different
+// instances are refused.
+#[test]
+fn an_instance_one_policy_names_is_kept_and_two_are_refused() {
+    let named = |instance: Option<&str>| {
+        let mut spec = crew_image(50);
+        if let Some(instance) = instance {
+            spec["provider_requirements"] = json!({"instance": instance});
+        }
+        spec
+    };
+    let copies = PlacementCopies {
+        policies: vec![
+            copy::<PlacementPolicy>("seeded", "kiwi", &[], &[], named(Some("docker"))),
+            copy::<PlacementPolicy>("operator", "kiwi", &[], &[], named(None)),
+        ],
+        ..Default::default()
+    };
+    let mut report = ImportReport::default();
+    let imported = import_placement(&copies, &mut report);
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
+    assert_eq!(imported.providers.len(), 1);
+    assert_eq!(imported.providers[0].record.instance.as_deref(), Some("docker"));
+
+    let copies = PlacementCopies {
+        policies: vec![
+            copy::<PlacementPolicy>("seeded", "kiwi", &[], &[], named(Some("docker"))),
+            copy::<PlacementPolicy>("operator", "kiwi", &[], &[], named(Some("rootless"))),
+        ],
+        ..Default::default()
+    };
+    let mut report = ImportReport::default();
+    assert!(import_placement(&copies, &mut report).providers.is_empty());
+    assert!(
+        report.refused.iter().any(|refusal| refusal.to_string().contains("different instances `docker`, `rootless`")),
+        "{:?}",
+        report.refused
+    );
 }
