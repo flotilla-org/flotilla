@@ -1,0 +1,21 @@
+apiVersion: flotilla.work/v1
+kind: EnvironmentProvider
+metadata:
+  # <host>.<realisation>: the settings of feta's Docker provider (ADR 0058).
+  name: d783f8a7-6b6f-44a9-bd04-5e6e2d43f878.docker_per_vessel
+  namespace: flotilla
+# How feta's Docker provider runs every per-vessel crew, whichever fulfilment
+# kind placed it. These were docker-crew-image-feta's settings (#3824 layer 4).
+spec:
+  host_ref: d783f8a7-6b6f-44a9-bd04-5e6e2d43f878
+  realisation: docker_per_vessel
+  memory_policy:
+    host_memory_percent: 50
+    expected_concurrent_crews: 4
+    swap_bytes: 0
+  pull_policy: always
+  default_cwd: /workspace
+  env: {}
+  checkout:
+    worktree_on_host_and_mount:
+      mount_path: /workspace

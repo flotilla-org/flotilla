@@ -25,16 +25,46 @@ async fn contract(backend: ResourceBackend) {
     kinds.delete("docker-crew-image-feta").await.expect("delete kind");
 }
 
+// Behaviour (#3824 layer 4, ADR 0058): a placement realises with its host's provider record of its
+// realisation, once one is declared; a host without one keeps the settings its policy carries.
+async fn provider_settings_contract(backend: ResourceBackend) {
+    use flotilla_resources::environment_provider::{EnvironmentProvider, EnvironmentProviderSpec, ProviderSettings};
+    let policy: PlacementPolicySpec = serde_json::from_value(serde_json::json!({"pool": "cleat", "docker_per_vessel": {
+        "host_ref": "feta", "memory_policy": {"host_memory_percent": 50, "expected_concurrent_crews": 4, "swap_bytes": 0},
+        "default_cwd": "/workspace", "checkout": {"worktree_on_host_and_mount": {"mount_path": "/workspace"}}}}))
+    .expect("policy");
+    let carried = flotilla_store::provider_settings(&backend, "flotilla", &policy).await.expect("no record yet");
+    assert_eq!(carried, EnvironmentProviderSpec::from_policy(&policy).expect("policy settings"));
+
+    let mut declared = carried.clone();
+    if let ProviderSettings::DockerPerVessel { memory_policy, checkout, .. } = &mut declared.settings {
+        memory_policy.host_memory_percent = 30;
+        *checkout = DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/w".into() };
+    }
+    let providers = backend.using::<EnvironmentProvider>("flotilla");
+    providers.create(&InputMeta::builder().name("feta.docker_per_vessel".into()).build(), &declared).await.expect("declare");
+    assert_eq!(flotilla_store::provider_settings(&backend, "flotilla", &policy).await.expect("record"), declared);
+
+    // A host-direct placement on the same host reads its own realisation's settings, not Docker's.
+    let host_direct: PlacementPolicySpec =
+        serde_json::from_value(serde_json::json!({"pool": "local", "host_direct": {"host_ref": "feta", "checkout": "worktree"}}))
+            .expect("policy");
+    let settings = flotilla_store::provider_settings(&backend, "flotilla", &host_direct).await.expect("host-direct");
+    assert_eq!(settings.settings, ProviderSettings::HostDirect { host_checkout: HostDirectPlacementPolicyCheckout::Worktree });
+}
+
 #[tokio::test]
 async fn in_memory_contract() {
     contract(ResourceBackend::new(InMemoryBackend::default())).await;
+    provider_settings_contract(ResourceBackend::new(InMemoryBackend::default())).await;
 }
 
 #[tokio::test]
 async fn sqlite_contract() {
     let dir = tempfile::tempdir().expect("temp directory");
     let backend = SqliteBackend::open(dir.path().join("resources.db")).expect("sqlite backend");
-    contract(ResourceBackend::new(backend)).await;
+    contract(ResourceBackend::new(backend.clone())).await;
+    provider_settings_contract(ResourceBackend::new(backend)).await;
 }
 
 #[test]

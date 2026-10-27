@@ -1,0 +1,21 @@
+apiVersion: flotilla.work/v1
+kind: EnvironmentProvider
+metadata:
+  # <host>.<realisation>: the settings of kiwi's Docker provider (ADR 0058).
+  name: d49f4c59-811f-44aa-a4ca-d4cac66cf2a3.docker_per_vessel
+  namespace: flotilla
+# How kiwi's Docker provider runs every per-vessel crew, whichever fulfilment
+# kind placed it. These were docker-crew-image-kiwi's settings (#3824 layer 4).
+spec:
+  host_ref: d49f4c59-811f-44aa-a4ca-d4cac66cf2a3
+  realisation: docker_per_vessel
+  memory_policy:
+    host_memory_percent: 50
+    expected_concurrent_crews: 4
+    swap_bytes: 0
+  pull_policy: always
+  default_cwd: /workspace
+  env: {}
+  checkout:
+    worktree_on_host_and_mount:
+      mount_path: /workspace

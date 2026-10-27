@@ -20,16 +20,19 @@ use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading, PlacementDecision};
 use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{
-    address::artifact_slot_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot,
-    repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy,
-    CrewImageBaseline, CrewSource, CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource,
-    Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
-    PlacementPolicySpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance,
-    TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage, VesselPhase,
-    VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
-    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
-    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
+    address::artifact_slot_record_name,
+    canonicalize_repo_url,
+    environment_provider::{EnvironmentProviderSpec, ProviderSettings},
+    host_direct_environment_name, is_prepared_snapshot, repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec,
+    CheckoutWorktreeSpec, Clone, CloneSpec, CloudSandboxCheckout, Convoy, CrewImageBaseline, CrewSource, CrewWorkPhase,
+    DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource, Environment, EnvironmentMount,
+    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, InputMeta,
+    LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository, RepositoryKey, RepositorySpec, Resource,
+    ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
+    TerminalSessionSpec, Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV,
+    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND,
+    VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{delete_lifecycle_owned_matching, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
@@ -616,7 +619,11 @@ impl VesselReconciler {
             }
             Err(err) => return Err(err),
         };
-        let mut strategy = match placement_strategy(&placement_policy.spec) {
+        let settings = match flotilla_store::provider_settings(&self.backend, &self.namespace, &placement_policy.spec).await {
+            Ok(settings) => settings,
+            Err(message) => return Ok(VesselPrepared::failed(message)),
+        };
+        let mut strategy = match placement_strategy(&placement_policy.spec, &settings) {
             Ok(strategy) => strategy,
             Err(message) => return Ok(VesselPrepared::failed(message)),
         };
@@ -764,6 +771,7 @@ impl VesselReconciler {
                             meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
                             spec: cloud_environment_spec(
                                 &placement_policy,
+                                &settings,
                                 requirement
                                     .crew
                                     .iter()
@@ -789,12 +797,7 @@ impl VesselReconciler {
                                     host_direct: None,
                                     docker: Some(DockerEnvironmentSpec {
                                         image_build_ref,
-                                        memory_policy: placement_policy
-                                            .spec
-                                            .docker_per_vessel
-                                            .as_ref()
-                                            .map(|policy| policy.memory_policy.clone())
-                                            .unwrap_or_default(),
+                                        memory_policy: memory_policy(&settings),
                                         host_ref: host_ref.clone(),
                                         image: image_ref.clone(),
                                         declared_agent_adapters: declared_agent_adapters.clone(),
@@ -1258,6 +1261,7 @@ impl VesselReconciler {
                             meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
                             spec: cloud_environment_spec(
                                 &placement_policy,
+                                &settings,
                                 requirement
                                     .crew
                                     .iter()
@@ -1283,12 +1287,7 @@ impl VesselReconciler {
                                     host_direct: None,
                                     docker: Some(DockerEnvironmentSpec {
                                         image_build_ref,
-                                        memory_policy: placement_policy
-                                            .spec
-                                            .docker_per_vessel
-                                            .as_ref()
-                                            .map(|policy| policy.memory_policy.clone())
-                                            .unwrap_or_default(),
+                                        memory_policy: memory_policy(&settings),
                                         host_ref: host_ref.clone(),
                                         image: image_ref.clone(),
                                         declared_agent_adapters: declared_agent_adapters.clone(),
@@ -1814,51 +1813,62 @@ fn environment_with_credentials(
     env
 }
 
-fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, String> {
-    if let Some(cloud) = &spec.cloud_sandbox_per_vessel {
-        if spec.host_direct.is_some() || spec.docker_per_vessel.is_some() {
-            return Err("placement must select exactly one strategy".into());
-        }
-        return Ok(PlacementStrategy::CloneInVessel {
+/// How `spec` is realised with its host's provider `settings`: the policy names the host, pool and
+/// image, the settings how its provider runs a vessel (#3824 layer 4, ADR 0058).
+fn placement_strategy(spec: &PlacementPolicySpec, settings: &EnvironmentProviderSpec) -> Result<PlacementStrategy, String> {
+    match (&spec.host_direct, &spec.docker_per_vessel, &spec.cloud_sandbox_per_vessel, &settings.settings) {
+        (
+            None,
+            None,
+            Some(cloud),
+            ProviderSettings::CloudSandboxPerVessel { env, sandbox_checkout: CloudSandboxCheckout::CloneInVessel, .. },
+        ) => Ok(PlacementStrategy::CloneInVessel {
             host_ref: String::new(),
             pool: spec.pool.clone(),
             image: Some(DockerImageSource::Literal(cloud.image.clone())),
             pull_policy: DockerImagePullPolicy::IfNotPresent,
-            env: cloud.env.clone(),
+            env: env.clone(),
             clone_path: "/workspace".into(),
             default_cwd: None,
-        });
-    }
-    if let Some(HostDirectPlacementPolicySpec { host_ref, checkout: HostDirectPlacementPolicyCheckout::Worktree }) = &spec.host_direct {
-        return Ok(PlacementStrategy::HostDirect { host_ref: host_ref.clone(), pool: spec.pool.clone() });
-    }
-
-    if let Some(docker) = &spec.docker_per_vessel {
-        return match &docker.checkout {
+        }),
+        (Some(host), None, None, ProviderSettings::HostDirect { host_checkout: HostDirectPlacementPolicyCheckout::Worktree }) => {
+            Ok(PlacementStrategy::HostDirect { host_ref: host.host_ref.clone(), pool: spec.pool.clone() })
+        }
+        (None, Some(docker), None, ProviderSettings::DockerPerVessel { pull_policy, default_cwd, env, checkout, .. }) => match checkout {
             DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path }
             | DockerCheckoutStrategy::LocalCloneOnHostAndMount { mount_path } => Ok(PlacementStrategy::DockerHostCheckoutAndMount {
-                local_clone: matches!(docker.checkout, DockerCheckoutStrategy::LocalCloneOnHostAndMount { .. }),
+                local_clone: matches!(checkout, DockerCheckoutStrategy::LocalCloneOnHostAndMount { .. }),
                 host_ref: docker.host_ref.clone(),
                 pool: spec.pool.clone(),
                 image: docker.image.clone(),
-                pull_policy: docker.pull_policy,
-                env: docker.env.clone(),
+                pull_policy: *pull_policy,
+                env: env.clone(),
                 mount_path: mount_path.clone(),
-                default_cwd: docker.default_cwd.clone(),
+                default_cwd: default_cwd.clone(),
             }),
             DockerCheckoutStrategy::FreshCloneInContainer { clone_path } => Ok(PlacementStrategy::CloneInVessel {
                 host_ref: docker.host_ref.clone(),
                 pool: spec.pool.clone(),
                 image: docker.image.clone(),
-                pull_policy: docker.pull_policy,
-                env: docker.env.clone(),
+                pull_policy: *pull_policy,
+                env: env.clone(),
                 clone_path: clone_path.clone(),
-                default_cwd: docker.default_cwd.clone(),
+                default_cwd: default_cwd.clone(),
             }),
-        };
+        },
+        (None, None, None, _) | (Some(_), Some(_), _, _) | (Some(_), _, Some(_), _) | (_, Some(_), Some(_), _) => {
+            Err("placement policy must define exactly one supported strategy".to_string())
+        }
+        _ => Err(format!("provider settings `{}` are not for this placement's realisation", settings.record_name())),
     }
+}
 
-    Err("placement policy must define exactly one supported strategy".to_string())
+/// The memory policy a Docker provider's `settings` give each vessel.
+fn memory_policy(settings: &EnvironmentProviderSpec) -> flotilla_resources::EnvironmentMemoryPolicy {
+    match &settings.settings {
+        ProviderSettings::DockerPerVessel { memory_policy, .. } => memory_policy.clone(),
+        _ => Default::default(),
+    }
 }
 
 fn provisioning_patch(
@@ -1928,6 +1938,7 @@ fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &s
 // cloud input, never a Docker input, for a cloud policy.
 fn cloud_environment_spec(
     policy: &ResourceObject<PlacementPolicy>,
+    settings: &EnvironmentProviderSpec,
     probe_needs: BTreeSet<flotilla_resources::CapabilityNeed>,
     mut spec: EnvironmentSpec,
 ) -> EnvironmentSpec {
@@ -1942,7 +1953,11 @@ fn cloud_environment_spec(
         }
         spec.cloud_sandbox = Some(flotilla_resources::CloudSandboxEnvironmentSpec {
             image: cloud.image.clone(),
-            size: cloud.size.clone(),
+            size: match &settings.settings {
+                ProviderSettings::CloudSandboxPerVessel { size, .. } => size.clone(),
+                // `placement_strategy` refused other settings for a cloud policy.
+                _ => unreachable!("a cloud policy realises with cloud sandbox settings"),
+            },
             lifetime_cap_seconds: None,
             probe_needs,
             env: {
@@ -2342,7 +2357,8 @@ mod tests {
             ..Default::default()
         };
         let needs = ["toolchain:rust".parse().unwrap()].into_iter().collect();
-        let mapped = cloud_environment_spec(&policy, needs, input);
+        let settings = flotilla_resources::environment_provider::EnvironmentProviderSpec::from_policy(&policy.spec).unwrap();
+        let mapped = cloud_environment_spec(&policy, &settings, needs, input);
         assert!(mapped.docker.is_none());
         let cloud = mapped.cloud_sandbox.unwrap();
         assert_eq!(cloud.env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], r#"["codex"]"#);
@@ -2399,7 +2415,9 @@ mod tests {
             viable_not_selected: Vec::new(),
             allocation: None,
         };
-        let mut strategy = placement_strategy(&policy).expect("host-direct policy should produce a placement strategy");
+        let mut strategy =
+            placement_strategy(&policy, &flotilla_resources::environment_provider::EnvironmentProviderSpec::from_policy(&policy).unwrap())
+                .expect("host-direct policy should produce a placement strategy");
 
         strategy.canonicalize_host_ref(decision.target_host.reference.as_str());
 

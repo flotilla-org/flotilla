@@ -13,6 +13,7 @@
 //! | PlacementPolicy with none | a kind of its name: host, pool, cost class, image and the default grants a live policy's kind takes (`FulfilmentKindSpec::from_policy`); a host-direct policy takes its platform from its host's host-direct kind, and is refused without one |
 //! | A prepared placement snapshot (`placement-snapshot-*`, `-remote-placement-*`) | a Snapshot-origin kind of its name with its frozen image; its settings dropped, its host's apply |
 //! | A live policy's Docker pull and memory policy, cwd, env and checkout; host-direct checkout; a cloud sandbox's size, checkout and env | its host's EnvironmentProvider, one per realisation, named `<host>.<realisation>`; a manifest's declared settings override a seeded or operator policy's; undeclared settings equal to the built-in default are dropped; refused when two of one rank set it differently |
+//! | EnvironmentProvider (a record of its own, layer 4b-i) | 1:1, its origin from its stamps, over any settings a policy at its home carries; refused when its name is not `<host>.<realisation>` |
 //! | `priority` | dropped: admission selects by grants and cost (ADR 0046) |
 //! | `agent_adapters` | dropped: an image fact the host probes |
 //! | `legacy_image_baseline_ref` | dropped with CrewImageBaseline |
@@ -24,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_engine_store::Rehearsal;
 use flotilla_resources::{
-    environment_provider::{EnvironmentProviderSpec, ProviderSettings},
+    environment_provider::{EnvironmentProvider, EnvironmentProviderSpec, ProviderSettings},
     is_prepared_snapshot, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, PlacementPolicy, PlacementPolicySpec,
     Resource, ResourceObject, PLACEMENT_SNAPSHOT_KIND,
 };
@@ -52,6 +53,8 @@ pub struct PlacementCopy<R: Resource> {
 pub struct PlacementCopies {
     pub kinds: Vec<PlacementCopy<FulfilmentKind>>,
     pub policies: Vec<PlacementCopy<PlacementPolicy>>,
+    /// Provider settings already held as records (#3824 layer 4b-i).
+    pub providers: Vec<PlacementCopy<EnvironmentProvider>>,
 }
 
 /// One engine record the import makes: its name, home and value.
@@ -66,33 +69,6 @@ pub struct Placed<S> {
 pub struct ImportedPlacement {
     pub kinds: Vec<Placed<FulfilmentKindDefinition>>,
     pub providers: Vec<Placed<EnvironmentProviderDefinition>>,
-}
-
-/// A policy's settings for its host's provider, or why it has none to give.
-fn settings(spec: &PlacementPolicySpec) -> Result<EnvironmentProviderSpec, String> {
-    let requirements = spec.provider_requirements.clone().unwrap_or_default();
-    if !requirements.material_modes.is_empty() || requirements.checkout_strategy.is_some() || requirements.egress_enforcement.is_some() {
-        return Err("its provider requirements constrain more than the instance, which nothing carries after the move".into());
-    }
-    let (host_ref, settings) = match (&spec.docker_per_vessel, &spec.host_direct, &spec.cloud_sandbox_per_vessel) {
-        (Some(docker), None, None) => (
-            docker.host_ref.clone(),
-            ProviderSettings::DockerPerVessel {
-                pull_policy: docker.pull_policy,
-                memory_policy: docker.memory_policy.clone(),
-                default_cwd: docker.default_cwd.clone(),
-                env: docker.env.clone(),
-                checkout: docker.checkout.clone(),
-            },
-        ),
-        (None, Some(host), None) => (host.host_ref.clone(), ProviderSettings::HostDirect { host_checkout: host.checkout.clone() }),
-        (None, None, Some(cloud)) => (
-            String::new(),
-            ProviderSettings::CloudSandboxPerVessel { size: cloud.size.clone(), sandbox_checkout: cloud.checkout, env: cloud.env.clone() },
-        ),
-        _ => return Err("it defines no single realisation".into()),
-    };
-    Ok(EnvironmentProviderSpec { host_ref, instance: requirements.instance, settings })
 }
 
 /// The host a policy realises on; empty for a cloud sandbox, which is bound to none.
@@ -259,7 +235,17 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
             }
         };
         // A snapshot's settings are dropped, so nothing in them can refuse it.
-        let provider = match (!snapshot).then(|| settings(spec)).transpose() {
+        let requirements = spec.provider_requirements.clone().unwrap_or_default();
+        let constrained = !requirements.material_modes.is_empty()
+            || requirements.checkout_strategy.is_some()
+            || requirements.egress_enforcement.is_some();
+        let provider = match (!snapshot)
+            .then(|| match constrained {
+                true => Err("its provider requirements constrain more than the instance, which nothing carries after the move".to_owned()),
+                false => EnvironmentProviderSpec::from_policy(spec),
+            })
+            .transpose()
+        {
             Ok(provider) => provider,
             Err(reason) => {
                 report.refused.push(refuse(reason));
@@ -291,6 +277,34 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
             origin: policy_origin,
             spec: provider,
         });
+    }
+    // A provider's own record is its settings: it stands over any a policy carries.
+    let mut records = BTreeMap::<(String, String), (BTreeSet<String>, Result<EnvironmentProviderDefinition, String>)>::new();
+    for copy in &copies.providers {
+        if copy.object.metadata.deletion_timestamp.is_some() {
+            *report.dropped.entry((PROVIDERS, "deleted")).or_default() += 1;
+            continue;
+        }
+        let name = copy.object.metadata.name.clone();
+        let record = if name == copy.object.spec.record_name() {
+            origin(&copy.object.metadata).map(|origin| EnvironmentProviderDefinition::new(origin, &copy.object.spec))
+        } else {
+            Err(format!("its name is not `{}`, its host and realisation", copy.object.spec.record_name()))
+        };
+        records.entry((name, copy.home.clone())).or_insert_with(|| (BTreeSet::new(), record)).0.insert(copy.namespace.clone());
+    }
+    for ((name, home), (namespaces, record)) in records {
+        let refuse = |reason: String| ImportRefusal { kind: PROVIDERS, record: name.clone(), reason: format!("at `{home}`: {reason}") };
+        providers.remove(&(name.clone(), home.clone()));
+        if namespaces.len() > 1 {
+            let held: Vec<_> = namespaces.into_iter().collect();
+            report.refused.push(refuse(format!("held in namespaces `{}`, and the engine has no namespaces", held.join("`, `"))));
+            continue;
+        }
+        match record {
+            Ok(record) => imported.providers.push(Placed { name, home, record }),
+            Err(reason) => report.refused.push(refuse(reason)),
+        }
     }
     // The engine has no namespaces: a name a home holds in several is refused in all of them.
     for ((name, home), KindEntry { namespaces, record }) in kinds {

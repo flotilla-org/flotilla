@@ -52,6 +52,7 @@ pub(super) const PLAN: &[(&str, Plan)] = &[
     ("Project", Plan::Imported("definitions import (#3824 layer 3b)")),
     ("Repository", Plan::Imported("Repository import (#3824 layer 3a)")),
     ("FulfilmentKind", Plan::Imported("placement import (#3824 layer 4a)")),
+    ("EnvironmentProvider", Plan::Imported("placement import (#3824 layer 4b-i)")),
     ("Host", Plan::Moving("#3824 layer 4c")),
     // Converted into FulfilmentKinds of the same names and their hosts' provider settings, not
     // dropped (ADR 0046 carry, 2026-10-26).

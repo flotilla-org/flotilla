@@ -12,7 +12,7 @@ use flotilla_resources::{K8sResourceObject, Resource, ResourceObject};
 use serde_json::Value;
 
 /// The kinds the rehearsal reads, by their plural.
-pub(super) const KINDS: [&str; 2] = ["fulfilmentkinds", "placementpolicies"];
+pub(super) const KINDS: [&str; 3] = ["fulfilmentkinds", "placementpolicies", "environmentproviders"];
 
 /// Raw documents of every namespace, as `(namespace, plural, document)`.
 #[derive(Default)]
@@ -47,6 +47,7 @@ impl Documents {
         let copies = PlacementCopies {
             kinds: self.copies("fulfilmentkinds", &mut decoding),
             policies: self.copies("placementpolicies", &mut decoding),
+            providers: self.copies("environmentproviders", &mut decoding),
         };
         let mut report = rehearse_placement(&copies);
         report.refused.splice(0..0, decoding.refused);

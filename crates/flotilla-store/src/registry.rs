@@ -22,6 +22,7 @@ use crate::{
     ResourceObject, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
+use flotilla_resources::environment_provider::EnvironmentProvider;
 
 pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
 
@@ -63,6 +64,7 @@ enum RegisteredResource {
     ForgeRead,
     ForgeReadHeartbeat,
     FulfilmentKind,
+    EnvironmentProvider,
     Host,
     ManifestRoot,
     Message,
@@ -157,6 +159,10 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
         RegisteredResource::FulfilmentKind,
         &["fulfilmentkind", "fulfilment_kind", "fulfilment_kinds", "fulfilment-kind", "fulfilment-kinds"],
     ),
+    kind::<EnvironmentProvider>(
+        RegisteredResource::EnvironmentProvider,
+        &["environmentprovider", "environment_provider", "environment_providers", "environment-provider", "environment-providers"],
+    ),
     kind::<Host>(RegisteredResource::Host, &[]),
     kind::<ManifestRoot>(RegisteredResource::ManifestRoot, &["manifest-root", "manifest_root"]),
     kind::<PlacementPolicy>(
@@ -221,6 +227,7 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::FleetDesignation => poll_typed_resource!($body::<FleetDesignation>($($arg),*)),
             RegisteredResource::Forge => poll_typed_resource!($body::<Forge>($($arg),*)),
             RegisteredResource::FulfilmentKind => poll_typed_resource!($body::<FulfilmentKind>($($arg),*)),
+            RegisteredResource::EnvironmentProvider => poll_typed_resource!($body::<EnvironmentProvider>($($arg),*)),
             RegisteredResource::Host => poll_typed_resource!($body::<Host>($($arg),*)),
             RegisteredResource::ImageBuild => poll_typed_resource!($body::<ImageBuild>($($arg),*)),
             RegisteredResource::ImageLayer => poll_typed_resource!($body::<ImageLayer>($($arg),*)),
@@ -262,6 +269,7 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::FleetDesignation => $body::<FleetDesignation>(),
             RegisteredResource::Forge => $body::<Forge>(),
             RegisteredResource::FulfilmentKind => $body::<FulfilmentKind>(),
+            RegisteredResource::EnvironmentProvider => $body::<EnvironmentProvider>(),
             RegisteredResource::Host => $body::<Host>(),
             RegisteredResource::ImageBuild => $body::<ImageBuild>(),
             RegisteredResource::ImageLayer => $body::<ImageLayer>(),
@@ -303,6 +311,7 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::FleetDesignation => $body::<FleetDesignation>($($arg),*),
             RegisteredResource::Forge => $body::<Forge>($($arg),*),
             RegisteredResource::FulfilmentKind => $body::<FulfilmentKind>($($arg),*),
+            RegisteredResource::EnvironmentProvider => $body::<EnvironmentProvider>($($arg),*),
             RegisteredResource::Host => $body::<Host>($($arg),*),
             RegisteredResource::ImageBuild => $body::<ImageBuild>($($arg),*),
             RegisteredResource::ImageLayer => $body::<ImageLayer>($($arg),*),
@@ -426,6 +435,7 @@ pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
             RegisteredResource::FleetDesignation => crate::ResourceKind::of::<FleetDesignation>(),
             RegisteredResource::Forge => crate::ResourceKind::of::<Forge>(),
             RegisteredResource::FulfilmentKind => crate::ResourceKind::of::<FulfilmentKind>(),
+            RegisteredResource::EnvironmentProvider => crate::ResourceKind::of::<EnvironmentProvider>(),
             RegisteredResource::Host => crate::ResourceKind::of::<Host>(),
             RegisteredResource::ImageBuild => crate::ResourceKind::of::<ImageBuild>(),
             RegisteredResource::ImageLayer => crate::ResourceKind::of::<ImageLayer>(),

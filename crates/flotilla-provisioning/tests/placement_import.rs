@@ -15,7 +15,7 @@ use flotilla_resources::{
         MANIFEST_MANAGED_BY_VALUE, MANIFEST_PATH_ANNOTATION, MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_REVISION_ANNOTATION,
         MANIFEST_SOURCE_ANNOTATION,
     },
-    environment_provider::ProviderSettings,
+    environment_provider::{EnvironmentProvider, ProviderSettings},
     DockerCheckoutStrategy, DockerImagePullPolicy, FulfilmentGrant, FulfilmentKind, ObjectMeta, PlacementPolicy, Resource, ResourceObject,
     MANAGED_BY_LABEL, PREPARED_SNAPSHOT_LABEL,
 };
@@ -99,6 +99,16 @@ fn policies_become_kinds_and_their_hosts_provider_settings() {
             copy::<FulfilmentKind>("docker-crew-image-kiwi", "kiwi", &labels, &annotations, migrated_kind()),
             copy::<FulfilmentKind>("host-direct-kiwi", "kiwi", &[], &[], host_direct_kind()),
         ],
+        // udder already holds its Docker provider's settings as a record (layer 4b-i).
+        providers: vec![copy::<EnvironmentProvider>(
+            "udder.docker_per_vessel",
+            "udder",
+            &[],
+            &[],
+            json!({"host_ref": "udder",
+            "realisation": "docker_per_vessel", "memory_policy": {"host_memory_percent": 30, "expected_concurrent_crews": 2, "swap_bytes": 0},
+            "checkout": {"fresh_clone_in_container": {"clone_path": "/w"}}}),
+        )],
         policies: vec![
             copy::<PlacementPolicy>("docker-crew-image-kiwi", "kiwi", &labels, &annotations, crew_image(50)),
             // The seeded host-direct policy, before its migration made a kind of its name.
@@ -138,7 +148,9 @@ fn policies_become_kinds_and_their_hosts_provider_settings() {
     // Two live policies set kiwi's Docker provider alike: one record; the snapshot's 80% is not it.
     // The seeded host-direct policy's settings are the built-in default, so no record holds them.
     let providers: BTreeMap<_, _> = imported.providers.iter().map(|placed| (placed.name.as_str(), &placed.record)).collect();
-    assert_eq!(providers.keys().copied().collect::<Vec<_>>(), [format!("{KIWI}.docker_per_vessel")]);
+    assert_eq!(providers.keys().copied().collect::<Vec<_>>(), [format!("{KIWI}.docker_per_vessel").as_str(), "udder.docker_per_vessel"]);
+    assert!(matches!(&providers["udder.docker_per_vessel"].settings,
+        ProviderSettings::DockerPerVessel { memory_policy, .. } if memory_policy.host_memory_percent == 30));
     assert_eq!(report.dropped.get(&("EnvironmentProvider", "the built-in default settings")), Some(&1));
     let docker = providers[format!("{KIWI}.docker_per_vessel").as_str()];
     let ProviderSettings::DockerPerVessel { pull_policy, memory_policy, default_cwd, checkout, .. } = &docker.settings else {
@@ -186,6 +198,13 @@ fn what_the_move_cannot_carry_is_refused() {
             copy::<PlacementPolicy>("adapters", "udder", &[], &[], adapters),
             deleted,
         ],
+        providers: vec![copy::<EnvironmentProvider>(
+            "misnamed",
+            "kiwi",
+            &[],
+            &[],
+            json!({"host_ref": "kiwi", "realisation": "host_direct", "checkout": "worktree"}),
+        )],
     };
     let report = rehearse_placement(&copies);
     let refused: Vec<_> = report.refused.iter().map(|refusal| refusal.to_string()).collect();
@@ -195,10 +214,11 @@ fn what_the_move_cannot_carry_is_refused() {
         ("orphan-host-direct", "its host has no host-direct kind"),
         (&format!("{KIWI}.docker_per_vessel"), "set this provider differently"),
         ("clash", "the engine has no namespaces"),
+        ("misnamed", "its name is not `kiwi.host_direct`"),
     ] {
         assert!(refused.iter().any(|line| line.contains(record) && line.contains(reason)), "{record}: {reason} in {refused:#?}");
     }
-    assert_eq!(refused.len(), 5, "{refused:#?}");
+    assert_eq!(refused.len(), 6, "{refused:#?}");
     assert_eq!(report.dropped.get(&("PlacementPolicy", "deleted")), Some(&1));
     assert_eq!(report.dropped.get(&("PlacementPolicy", "agent adapters, an image fact the host probes")), Some(&1));
 }
@@ -238,7 +258,7 @@ fn providers_and_names_import_whatever_the_order() {
             listed.reverse();
         }
         let mut report = ImportReport::default();
-        let imported = import_placement(&PlacementCopies { kinds: Vec::new(), policies: listed }, &mut report);
+        let imported = import_placement(&PlacementCopies { kinds: Vec::new(), policies: listed, providers: Vec::new() }, &mut report);
         assert!(report.refused.is_empty(), "{:?}", report.refused);
         let provider = |name: &str, home: &str| {
             &imported.providers.iter().find(|placed| placed.name == name && placed.home == home).unwrap_or_else(|| panic!("{name}")).record

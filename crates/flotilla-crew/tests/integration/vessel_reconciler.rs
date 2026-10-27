@@ -1563,34 +1563,51 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
     ));
 }
 
+// Behaviour (#3824 layer 4, ADR 0058): a contained placement realises with its host's provider
+// settings (pull and memory policy, checkout), not the settings its policy still carries.
 #[tokio::test]
-async fn contained_docker_placement_propagates_never_pull_policy_to_environment() {
+async fn contained_docker_placement_realises_with_its_hosts_provider_settings() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-local-image", "implement", REPO_URL, GIT_REF).await;
+    let docker = DockerPerVesselPlacementPolicySpec {
+        legacy_image_baseline_ref: None,
+        memory_policy: Default::default(),
+        host_ref: HOST_REF.to_string(),
+        image: Some("flotilla-dev-env:latest".into()),
+        pull_policy: DockerImagePullPolicy::Always,
+        agent_adapters: Default::default(),
+        default_cwd: None,
+        env: Default::default(),
+        checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+    };
     create_policy(
         &backend,
         NAMESPACE,
         "policy-local-image",
-        PlacementPolicySpec::builder()
-            .pool("cleat".to_string())
-            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                legacy_image_baseline_ref: None,
-                memory_policy: flotilla_resources::EnvironmentMemoryPolicy {
-                    host_memory_percent: 30,
-                    expected_concurrent_crews: 3,
-                    swap_bytes: 0,
-                },
-                host_ref: HOST_REF.to_string(),
-                image: Some("flotilla-dev-env:latest".into()),
-                pull_policy: DockerImagePullPolicy::Never,
-                agent_adapters: Default::default(),
-                default_cwd: None,
-                env: Default::default(),
-                checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
-            })
-            .build(),
+        PlacementPolicySpec::builder().pool("cleat".to_string()).docker_per_vessel(docker).build(),
     )
     .await;
+    let settings = flotilla_resources::environment_provider::EnvironmentProviderSpec {
+        host_ref: HOST_REF.to_string(),
+        instance: None,
+        settings: flotilla_resources::environment_provider::ProviderSettings::DockerPerVessel {
+            pull_policy: DockerImagePullPolicy::Never,
+            memory_policy: flotilla_resources::EnvironmentMemoryPolicy {
+                host_memory_percent: 30,
+                expected_concurrent_crews: 3,
+                swap_bytes: 0,
+            },
+            default_cwd: None,
+            env: Default::default(),
+            checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+        },
+    };
+    backend
+        .clone()
+        .using::<flotilla_resources::environment_provider::EnvironmentProvider>(NAMESPACE)
+        .create(&InputMeta::builder().name(settings.record_name()).build(), &settings)
+        .await
+        .expect("declare the host's provider settings");
     // Placement freezes the exact runtime instance into the created environment
     // so later provisioning and recovery cannot switch to a different endpoint.
     let instance_key = flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;

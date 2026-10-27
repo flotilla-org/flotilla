@@ -36,14 +36,14 @@ use flotilla_resources::address::{record_name, remote_change_request_address};
 use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
 use flotilla_resources::{
-    api_version, capped_github_app_permissions, normalize_issue_source, AllocationDecision, BoundChangeRequest, CapabilityNeed,
-    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, Clock, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource, CrewSpec, Forge,
-    FulfilmentGrant, FulfilmentKind, Host as ResourceHost, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution,
-    IssueSourceUnavailable, ObjectMeta, ObservedChangeRequestState, PlacementPolicy, PlacementPolicySpec, Platform, Project, ProjectSpec,
-    ReadResourceObject, Repository, RepositoryKey, RepositoryTrust, Resource, ResourceError, ResourceObject, ResourceProvenance,
-    RoleHandoff, SupervisionTarget, TerminalCrewContext, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
-    BRIEF_ARTIFACTS_ANNOTATION, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    api_version, capped_github_app_permissions, environment_provider::EnvironmentProvider, normalize_issue_source, AllocationDecision,
+    BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, Clock,
+    Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer,
+    CredentialGrant, CredentialSpec, CrewSource, CrewSpec, Forge, FulfilmentGrant, FulfilmentKind, Host as ResourceHost, InputMeta,
+    InputValue, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, ObjectMeta, ObservedChangeRequestState, PlacementPolicy,
+    PlacementPolicySpec, Platform, Project, ProjectSpec, ReadResourceObject, Repository, RepositoryKey, RepositoryTrust, Resource,
+    ResourceError, ResourceObject, ResourceProvenance, RoleHandoff, SupervisionTarget, TerminalCrewContext, VesselRequirement,
+    WorkflowTemplate, WorkflowTemplateSpec, BRIEF_ARTIFACTS_ANNOTATION, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{HoldAct, RepositorySpec, SystemClock};
@@ -617,6 +617,7 @@ impl ConvoyAdmission {
             // Every candidate participates in routing, including pin refusals.
             snapshot.copy::<FulfilmentKind>(&self.backend).await?;
             snapshot.copy::<PlacementPolicy>(&self.backend).await?;
+            snapshot.copy::<EnvironmentProvider>(&self.backend).await?;
             snapshot.copy::<ResourceHost>(&self.backend).await?;
             self.reads(snapshot.finish())
         } else {
@@ -2131,6 +2132,11 @@ impl AdmissionReadContext<'_> {
             .query_declared::<ResourceHost>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
             .await
             .map_err(|error| error.to_string())?;
+        // Each candidate's host realises it with its provider settings (#3824 layer 4).
+        let providers = backend
+            .query_declared::<EnvironmentProvider>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
+            .await
+            .map_err(|error| error.to_string())?;
         let roles = workflows
             .iter()
             .flat_map(|workflow| workflow.spec.roles.iter().chain(workflow.spec.vessels.iter().flat_map(|vessel| &vessel.crew)))
@@ -2188,6 +2194,7 @@ impl AdmissionReadContext<'_> {
         snapshot.insert::<Repository>(repository_sources)?;
         snapshot.insert::<FulfilmentKind>(kinds)?;
         snapshot.insert::<PlacementPolicy>(policies)?;
+        snapshot.insert::<EnvironmentProvider>(providers)?;
         snapshot.insert::<CredentialGrant>(grants)?;
         snapshot.insert::<CredentialSpec>(credentials)?;
         let capped = hosts

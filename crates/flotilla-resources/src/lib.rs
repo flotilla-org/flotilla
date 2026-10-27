@@ -279,6 +279,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::ImageLayer>($($argument),*);
         $callback::<$crate::CrewDefaults>($($argument),*);
         $callback::<$crate::FulfilmentKind>($($argument),*);
+        $callback::<$crate::environment_provider::EnvironmentProvider>($($argument),*);
         $callback::<$crate::Demand>($($argument),*);
         $callback::<$crate::DispatchHold>($($argument),*);
         $callback::<$crate::DispatchDeployment>($($argument),*);

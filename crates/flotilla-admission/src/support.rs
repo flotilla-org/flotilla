@@ -376,9 +376,21 @@ pub async fn resolve_placement_provider(
         .ok_or_else(|| format!("{}: provider advertisements not observed", target.display_name))?;
     let providers: Vec<ProviderAdvertisement> = serde_json::from_value(value.clone())
         .map_err(|error| format!("{}: invalid provider advertisements: {error}", target.display_name))?;
+    // The host's provider settings decide its checkout, and name its instance when the policy
+    // does not (#3824 layer 4, ADR 0058).
+    let settings = flotilla_store::provider_settings(backend, namespace, &policy.spec).await?;
+    let mut matched = policy.spec.clone();
+    if let (Some(docker), flotilla_resources::environment_provider::ProviderSettings::DockerPerVessel { checkout, .. }) =
+        (matched.docker_per_vessel.as_mut(), &settings.settings)
+    {
+        docker.checkout = checkout.clone();
+    }
+    if let Some(instance) = settings.instance.filter(|_| !policy.metadata.labels.contains_key(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)) {
+        matched.provider_requirements.get_or_insert_with(Default::default).instance.get_or_insert(instance);
+    }
     let selected = crate::provider_placement::match_provider(
         &target.display_name,
-        &policy.spec,
+        &matched,
         policy.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
         &providers,
     )?;
