@@ -140,8 +140,8 @@ pub(super) fn frozen_skill(name: &str) -> flotilla_resources::SkillCatalogEntry 
 }
 
 /// The token prefix a bound Claude launch starts with.
-pub(super) fn claude_token_prefix(home: &str) -> String {
-    format!("CLAUDE_CODE_OAUTH_TOKEN=\"$(cat -- '{home}/.flotilla-oauth-token')\" ")
+pub(super) fn claude_token_prefix(dir: &str) -> String {
+    format!("CLAUDE_CODE_OAUTH_TOKEN=\"$(cat -- '{dir}/.flotilla-oauth-token')\" ")
 }
 
 pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchObservationRecord) {
@@ -308,9 +308,11 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         !launch.env_vars.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN"),
         "the session environment carries no token; the plan's file is the only source"
     );
+    // #4012: the token lies in the requester's material directory, outside its home.
+    let material = "/home/crew/flotilla/agent-material/requesters/demo/coder/claude";
     assert!(launch.env_vars.iter().any(|(name, value)| name == flotilla_agent::account_access::CLAUDE_OAUTH_TOKEN_FILE_ENV
-        && value == &crew_config_dir.join(".flotilla-oauth-token").display().to_string()));
-    assert!(launch.command.contains(&claude_token_prefix(&crew_config_dir.display().to_string())), "{}", launch.command);
+        && value == &format!("{material}/.flotilla-oauth-token")));
+    assert!(launch.command.contains(&claude_token_prefix(material)), "{}", launch.command);
     assert!(
         launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == crew_config_dir.display().to_string().as_str()),
         "the contained Claude process must receive the config directory owned by its adapter"

@@ -19,7 +19,10 @@ use super::agentless_vessels::{VesselKey, VesselPaths};
 use super::vessel_support::{store_entry, vessels_over, ArtifactArrival, RunnerVesselAgents};
 
 const HOST_HOME: &str = "/home/crew";
-/// What `SshCommandRunner::writable_config_base` resolves on the host.
+/// What `SshCommandRunner::writable_config_base` resolves on a host whose login has
+/// `XDG_RUNTIME_DIR`: a tmpfs a reboot clears.
+const RUNTIME_BASE: &str = "/run/user/1000/flotilla";
+/// The host user's durable state base, which harness homes live under (#4012).
 const HOST_BASE: &str = "/home/crew/.local/state/flotilla";
 const CHECKOUT: &str = "/home/crew/flotilla/repos/work";
 const ENVIRONMENT: &str = "host-direct-b3";
@@ -94,6 +97,7 @@ impl CommandRunner for FakeHost {
                 ok()
             }
             ("sh", ["-c", _, "flotilla-ambient-home"]) => Ok(format!("{HOST_HOME}/.codex")),
+            ("sh", ["-c", _, "flotilla-durable-base"]) => Ok(HOST_BASE.into()),
             ("cat", ["--", path]) => match self.entry(path) {
                 Some(HostEntry::File(content)) => Ok(content),
                 _ => Err(format!("cat: {path}: No such file")),
@@ -143,11 +147,11 @@ impl CommandRunner for FakeHost {
     }
 
     async fn writable_scratch_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
-        Ok(PathBuf::from(HOST_BASE))
+        Ok(PathBuf::from(RUNTIME_BASE))
     }
 
     async fn writable_config_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
-        Ok(PathBuf::from(HOST_BASE))
+        Ok(PathBuf::from(RUNTIME_BASE))
     }
 
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
@@ -495,25 +499,32 @@ fn assert_image_harness_environment(launch: &AgentlessLaunch) {
     }
 }
 
-// Acceptance (#3655, #3964): a Claude crew on a host whose `claude` has never run
+// Acceptance (#3655, #3964, #4012): a Claude crew on a host whose `claude` has never run
 // starts with `CLAUDE_CONFIG_DIR` at its own flotilla-owned home under the host's
-// writable base, its frozen skills staged there, seeded with onboarding, workspace trust for the
-// checkout, and attribution suppression, so no first-run dialog can appear.
+// durable state base, not its `XDG_RUNTIME_DIR`, its frozen skills staged there, seeded with
+// onboarding, workspace trust for the checkout, and attribution suppression, so no first-run
+// dialog can appear. Its token lies on the runtime base, outside the home.
 // The host user's `~/.claude.json` and `~/.claude` are never written.
 #[tokio::test]
 async fn agentless_claude_crew_starts_in_a_prepared_flotilla_home() {
     let launch = launch_on_agentless_host("claude-code").await;
-    let bound = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/claude");
     // #3929: the launched home is the recorded requester home, not a level below it.
-    let home = bound.clone();
+    let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/claude");
 
     assert_eq!(launch.value("CLAUDE_CONFIG_DIR").as_deref(), Some(home.as_str()));
     assert_staged_into_launched_home(&launch, "CLAUDE_CONFIG_DIR", "claude-code");
-    // #3907: the vessel agent wrote the bound token into the requester's home;
-    // the session environment carries no token of its own.
+    // #3907: the vessel agent wrote the bound token into the requester's material directory
+    // on the runtime base; the session environment carries no token of its own.
     assert_eq!(launch.value("CLAUDE_CODE_OAUTH_TOKEN"), None);
-    assert_eq!(launch.host.entry(format!("{bound}/.flotilla-oauth-token")), Some(HostEntry::File("oauth-secret-material".into())));
-    assert!(launch.command.contains(&claude_token_prefix(&bound)), "{}", launch.command);
+    assert_eq!(launch.host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("oauth-secret-material".into())));
+    assert!(!launch
+        .host
+        .files
+        .lock()
+        .expect("files")
+        .keys()
+        .any(|path| path.starts_with(&home) && path.ends_with(".flotilla-oauth-token")));
+    assert!(launch.command.contains(&claude_token_prefix(BOUND_MATERIAL)), "{}", launch.command);
     assert_eq!(launch.value("FLOTILLA_ENVIRONMENT_ID").as_deref(), Some(ENVIRONMENT));
     let state = launch.host.json(format!("{home}/.claude.json"));
     assert_eq!(state["hasCompletedOnboarding"], true);
@@ -526,7 +537,7 @@ async fn agentless_claude_crew_starts_in_a_prepared_flotilla_home() {
 }
 
 // Acceptance (#3655, #3964): a Codex crew on an agentless host starts with
-// `CODEX_HOME` at its own flotilla-owned home under the host's writable base, its
+// `CODEX_HOME` at its own flotilla-owned home under the host's durable state base, its
 // frozen skills staged there, with
 // workspace trust for the checkout in that home's own `config.toml`. The host
 // login is linked, never copied, and the host's `~/.codex/config.toml` is
@@ -891,7 +902,8 @@ async fn bound_agentless_crew_with(
     (runtime, host, runtime_dir)
 }
 
-const BOUND_HOME: &str = "/home/crew/.local/state/flotilla/agent-homes/requesters/demo/coder/claude";
+/// Where the bound token lies: the requester's material directory on the runtime base.
+const BOUND_MATERIAL: &str = "/run/user/1000/flotilla/agent-material/requesters/demo/coder/claude";
 const BINDING: &str = "demo.coder.claude-subscription";
 
 async fn provision(backend: &ResourceBackend) -> Option<flotilla_resources::AccountProvisionSpec> {
@@ -916,13 +928,13 @@ async fn a_refreshed_token_is_pushed_into_the_bound_home_without_moving_the_bind
     let binding = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE).get(BINDING).await.expect("binding").spec;
     let delivered = provision(&backend).await.expect("provision recorded at launch");
     assert_eq!((delivered.place.as_str(), delivered.environment_kind.as_str()), (ENVIRONMENT, "agentless-ssh"));
-    assert_eq!(delivered.home, BOUND_HOME);
-    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), Some(HostEntry::File("generation-one".into())));
+    assert_eq!(delivered.home, BOUND_MATERIAL, "the provision records where the copy lies");
+    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("generation-one".into())));
 
     fs::write(&token, "generation-two\n").expect("refreshed token");
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
-    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), Some(HostEntry::File("generation-two".into())));
+    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("generation-two".into())));
     let pushed = provision(&backend).await.expect("provision kept");
     let generation =
         |spec: &flotilla_resources::AccountProvisionSpec| spec.delivered.as_ref().map(|delivered| delivered.generation.clone());
@@ -956,7 +968,7 @@ async fn a_revoked_binding_stops_the_session_and_deletes_its_copy() {
 
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
-    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), None, "the delivered copy is deleted");
+    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), None, "the delivered copy is deleted");
     assert!(provision(&backend).await.is_none(), "the provision record is removed");
     assert!(
         matches!(backend.using::<TerminalSession>(NAMESPACE).get("terminal-demo-work-coder").await, Err(ResourceError::NotFound { .. })),
@@ -983,7 +995,7 @@ async fn a_rebound_requester_loses_its_old_copy_and_session() {
 
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
-    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), None);
+    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), None);
     // #3929: the record is kept with its delivery cleared at the withdrawn version, so a
     // relaunch that records a new delivery first is never lost.
     assert_eq!(provision(&backend).await.expect("record kept").delivered, None);
@@ -1013,13 +1025,38 @@ async fn a_restart_keeps_the_account_and_a_gone_place_is_swept() {
 
     let restarted = runtime.launch().await.expect("restart");
     let token_file = restarted.env_vars.iter().find(|(name, _)| name == "FLOTILLA_CLAUDE_OAUTH_TOKEN_FILE").map(|(_, value)| value.clone());
-    assert_eq!(token_file.as_deref(), Some(format!("{BOUND_HOME}/.flotilla-oauth-token").as_str()));
+    assert_eq!(token_file.as_deref(), Some(format!("{BOUND_MATERIAL}/.flotilla-oauth-token").as_str()));
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
     let provisions = backend.using::<flotilla_resources::AccountProvision>(NAMESPACE).list().await.expect("provisions").items;
     assert_eq!(provisions.iter().map(|record| record.spec.place.as_str()).collect::<Vec<_>>(), [ENVIRONMENT]);
     let binding = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE).get(BINDING).await.expect("binding").spec;
     assert_eq!(binding.credential.0, "claude-box-a");
+}
+
+// #4012: a provision recorded before the token moved out of the home names the old home.
+// The relaunch deletes the copy there and records the material directory, so no copy is
+// left that no record names.
+#[tokio::test]
+async fn a_relaunch_moves_a_copy_recorded_in_the_old_home() {
+    let tokens = TempDir::new().expect("token dir");
+    let token = tokens.path().join("box-a");
+    fs::write(&token, "box-a-token").expect("token");
+    let (runtime, host, _runtime_dir) = bound_agentless_crew(&token).await;
+    let backend = runtime.daemon.resource_backend();
+    let provisions = backend.using::<flotilla_resources::AccountProvision>(NAMESPACE);
+    let name = format!("{BINDING}.{ENVIRONMENT}");
+    let recorded = provisions.get(&name).await.expect("provision");
+    let old_home = format!("{RUNTIME_BASE}/agent-homes/requesters/demo/coder/claude");
+    host.put(&Path::new(&old_home).join(".flotilla-oauth-token"), "box-a-token");
+    let old = flotilla_resources::AccountProvisionSpec { home: old_home.clone(), ..recorded.spec.clone() };
+    provisions.update(&empty_meta(&name), &recorded.metadata.resource_version, &old).await.expect("pre-#4012 record");
+
+    runtime.launch().await.expect("relaunch");
+
+    assert_eq!(host.entry(format!("{old_home}/.flotilla-oauth-token")), None, "the old copy is deleted");
+    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
+    assert_eq!(provision(&backend).await.expect("provision").home, BOUND_MATERIAL);
 }
 
 // Review #3910: a binding homed on another daemon whose clock runs ahead of this place is still
@@ -1037,7 +1074,7 @@ async fn a_replica_binding_from_a_clock_ahead_keeps_its_fresh_copy() {
 
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
-    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
+    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
     assert_eq!(provision(&backend).await, Some(delivered));
     assert!(backend.using::<TerminalSession>(NAMESPACE).get("terminal-demo-work-coder").await.is_ok(), "the session keeps running");
 }
@@ -1063,11 +1100,11 @@ async fn a_withdrawal_waits_for_a_delivery_in_progress() {
     let withdrawal = tokio::spawn(async move { reconcile_place_provisions(&state, NAMESPACE).await });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(!withdrawal.is_finished(), "the withdrawal waits for the delivery");
-    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
+    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
 
     drop(delivering);
     withdrawal.await.expect("join").expect("place pass");
-    assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), None);
+    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), None);
 }
 
 // #3964 contract 4: a failed delivery records, for its access, the need it failed at and

@@ -618,10 +618,16 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
             .expect("Claude credential declaration");
         bind_account(&daemon.resource_backend(), "demo", "coder", "claude-max", "test@example.com").await;
         let state_dir = temp.path().join("state");
+        // The daemon's login has a runtime directory, as a Linux host's does.
+        let runtime_dir = temp.path().join("runtime");
+        std::fs::create_dir(&runtime_dir).expect("runtime directory");
         let credential_store = Arc::new(CredentialStore::new(
             daemon.resource_backend(),
             NAMESPACE,
-            Arc::new(TestEnvVars::new([("TEST_CLAUDE_TOKEN", "oauth-secret-material")])),
+            Arc::new(TestEnvVars::new([
+                ("TEST_CLAUDE_TOKEN", "oauth-secret-material"),
+                ("XDG_RUNTIME_DIR", &runtime_dir.display().to_string()),
+            ])),
             EnvironmentBag::new(),
             Arc::new(ProcessCommandRunner),
             state_dir.clone(),
@@ -701,13 +707,17 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
         // #3655: the daemon host's own host-direct session stays uncontained:
         // it names no flotilla environment, leaves the host user's harness
         // configuration unwritten, keeps attribution, and takes no image
-        // harness environment. #3907: its harness home is its bound home.
+        // harness environment. #3907: its harness home is its bound home, under the daemon's
+        // durable state directory, with the token in its material directory (#4012).
         for name in ["FLOTILLA_ENVIRONMENT_ID", "DISABLE_AUTOUPDATER", "LANG", "CLAUDE_CODE_OAUTH_TOKEN"] {
             assert_eq!(value(name), None, "{name}");
         }
         let bound_home = state_dir.join("agent-homes/requesters/demo/coder/claude");
         assert_eq!(value("CLAUDE_CONFIG_DIR"), Some(bound_home.display().to_string()));
-        assert_eq!(std::fs::read_to_string(bound_home.join(".flotilla-oauth-token")).expect("delivered token"), "oauth-secret-material");
+        assert!(bound_home.is_dir());
+        let token = PathBuf::from(value(flotilla_agent::account_access::CLAUDE_OAUTH_TOKEN_FILE_ENV).expect("token file"));
+        assert!(token.starts_with(&runtime_dir) && token.ends_with("agent-material/requesters/demo/coder/claude/.flotilla-oauth-token"));
+        assert_eq!(std::fs::read_to_string(token).expect("delivered token"), "oauth-secret-material");
         assert!(settings.get("attribution").is_none());
         assert!(!home.join(".claude.json").exists(), "host-direct launch wrote the host user's Claude state");
     }

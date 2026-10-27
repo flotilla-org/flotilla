@@ -125,13 +125,13 @@ pub trait AccountProvisioner: Send + Sync {
     fn supplies(&self, consumer: &CredentialConsumer) -> Option<SuppliedAccess>;
     /// The plan for an environment kind, or the reason there is none.
     fn plan(&self, kind: EnvironmentKind) -> Result<ProvisionPlan, String>;
-    /// The session variables that point the harness at the material delivered into `home`.
-    /// Never the material itself.
-    fn environment(&self, home: &str) -> Vec<(String, String)>;
-    /// Write the material into the home at a place.
-    async fn deliver(&self, home: &str, material: &str, runner: &dyn CommandRunner) -> Result<(), String>;
-    /// Delete the delivered copy from the home at a place.
-    async fn remove(&self, home: &str, runner: &dyn CommandRunner) -> Result<(), String>;
+    /// The session variables that point the harness at its durable `home` and at the material
+    /// delivered into the material directory `dir` (#4012). Never the material itself.
+    fn environment(&self, home: &str, dir: &str) -> Vec<(String, String)>;
+    /// Write the material into the requester's material directory at a place.
+    async fn deliver(&self, dir: &str, material: &str, runner: &dyn CommandRunner) -> Result<(), String>;
+    /// Delete the delivered copy from the requester's material directory at a place.
+    async fn remove(&self, dir: &str, runner: &dyn CommandRunner) -> Result<(), String>;
 }
 
 /// The registered account provisioners.
@@ -178,11 +178,13 @@ impl std::fmt::Debug for AccountProvisioners {
 /// from it when the harness starts; the token itself never enters the session's environment.
 pub const CLAUDE_OAUTH_TOKEN_FILE_ENV: &str = "FLOTILLA_CLAUDE_OAUTH_TOKEN_FILE";
 
-/// The token file's name inside the requester's home.
+/// The token file's name inside the requester's material directory.
 pub const CLAUDE_OAUTH_TOKEN_FILE: &str = ".flotilla-oauth-token";
 
 /// Claude subscription access by direct delivery (#3884): the vessel agent writes the account's
-/// OAuth token into the requester's explicit `CLAUDE_CONFIG_DIR` home.
+/// OAuth token into the requester's material directory, and the harness runs in its explicit
+/// `CLAUDE_CONFIG_DIR` home. Claude reads the token from the file its launch names rather than
+/// from its home, so the token stays on the place's runtime base while the home is durable (#4012).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClaudeDirect;
 
@@ -221,25 +223,25 @@ impl AccountProvisioner for ClaudeDirect {
         })
     }
 
-    fn environment(&self, home: &str) -> Vec<(String, String)> {
+    fn environment(&self, home: &str, dir: &str) -> Vec<(String, String)> {
         vec![
             ("CLAUDE_CONFIG_DIR".to_string(), home.to_string()),
-            (CLAUDE_OAUTH_TOKEN_FILE_ENV.to_string(), Path::new(home).join(CLAUDE_OAUTH_TOKEN_FILE).display().to_string()),
+            (CLAUDE_OAUTH_TOKEN_FILE_ENV.to_string(), Path::new(dir).join(CLAUDE_OAUTH_TOKEN_FILE).display().to_string()),
         ]
     }
 
-    async fn deliver(&self, home: &str, material: &str, runner: &dyn CommandRunner) -> Result<(), String> {
-        if !Path::new(home).is_absolute() {
-            return Err(format!("requester home `{home}` is not absolute"));
+    async fn deliver(&self, dir: &str, material: &str, runner: &dyn CommandRunner) -> Result<(), String> {
+        if !Path::new(dir).is_absolute() {
+            return Err(format!("requester material directory `{dir}` is not absolute"));
         }
         let script = "umask 077 && mkdir -p \"$1\" && chmod 700 \"$1\"";
-        runner.run("sh", &["-c", script, "flotilla-requester-home", home], Path::new("/"), &ChannelLabel::Default).await?;
-        let token_file = Path::new(home).join(CLAUDE_OAUTH_TOKEN_FILE);
+        runner.run("sh", &["-c", script, "flotilla-requester-home", dir], Path::new("/"), &ChannelLabel::Default).await?;
+        let token_file = Path::new(dir).join(CLAUDE_OAUTH_TOKEN_FILE);
         runner.write_file_with_mode(&token_file, material, 0o600).await
     }
 
-    async fn remove(&self, home: &str, runner: &dyn CommandRunner) -> Result<(), String> {
-        let token_file = Path::new(home).join(CLAUDE_OAUTH_TOKEN_FILE).display().to_string();
+    async fn remove(&self, dir: &str, runner: &dyn CommandRunner) -> Result<(), String> {
+        let token_file = Path::new(dir).join(CLAUDE_OAUTH_TOKEN_FILE).display().to_string();
         runner.run("rm", &["-f", "--", &token_file], Path::new("/"), &ChannelLabel::Default).await.map(|_| ())
     }
 }

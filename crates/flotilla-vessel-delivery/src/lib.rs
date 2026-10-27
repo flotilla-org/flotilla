@@ -19,6 +19,6 @@ mod vocabulary;
 pub use execute::{deliver, Delivered, DeliveryError, TreeDelivery, DELIVERY_RECORD};
 pub use plan::{plan, Action, CostTable, Landed, Plan, PlanError, Step};
 pub use vocabulary::{
-    Access, AccessKey, ContentDigest, FetchBy, HostPathOffer, HostReach, Item, Liveness, Mechanism, Need, NeedName, ProviderMechanisms,
-    Reachability, RelativePath, TreeSources, Visibility,
+    Access, AccessKey, ContentDigest, FetchBy, HomeBase, HostPathOffer, HostReach, Item, Liveness, Mechanism, Need, NeedName,
+    ProviderMechanisms, Reachability, RelativePath, TreeSources, Visibility,
 };
