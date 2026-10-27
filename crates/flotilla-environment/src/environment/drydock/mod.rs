@@ -319,8 +319,6 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                     image_digest: spec.image.clone(),
                     tools_digest: ::drydock::launch::build_tools_digest().map_err(|e| e.to_string())?.into(),
                     size: size(&spec.size),
-                    route: None,
-                    image_pull: None,
                 },
             )
             .await
