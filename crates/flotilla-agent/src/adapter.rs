@@ -354,6 +354,26 @@ fn is_block_only_override(source: &str) -> bool {
     source.contains("{% block") && !source.contains("{% extends")
 }
 
+/// Per-repository checkout paths in a multi-repository vessel, whose work
+/// directory is the common parent holding one worktree per repository
+/// (`<work_dir>/<workspace_slug>`). Empty for a single-repository vessel, where
+/// the work directory is the checkout itself.
+pub fn multi_repository_checkouts<'a>(
+    convoy: &'a flotilla_resources::ConvoySpec,
+    repository_refs: &[flotilla_resources::RepositoryKey],
+    work_dir: &str,
+) -> Vec<(&'a flotilla_resources::ConvoyRepositorySpec, String)> {
+    if convoy.repositories.len() < 2 {
+        return Vec::new();
+    }
+    convoy
+        .repositories
+        .iter()
+        .filter(|repository| repository_refs.contains(&repository.repo_ref))
+        .map(|repository| (repository, format!("{}/{}", work_dir.trim_end_matches('/'), repository.workspace_slug)))
+        .collect()
+}
+
 /// Appends the convoy's work context (branch, repositories, issue snapshots,
 /// human instruction) to a crew brief. Every brief whose assignment is
 /// [`CrewAssignment::CarriedIssue`] must pass through here — the assignment text
@@ -363,6 +383,7 @@ pub fn append_convoy_work_context(
     convoy: &flotilla_resources::ResourceObject<flotilla_resources::Convoy>,
     repository_refs: &[flotilla_resources::RepositoryKey],
     credential_scopes: &BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>,
+    work_dir: Option<&str>,
 ) {
     content.push_str("\n\n## Work context\n\n");
     if let Some(branch) = &convoy.spec.r#ref {
@@ -375,8 +396,18 @@ pub fn append_convoy_work_context(
     // retain admitted repository URLs and target refs as their delivery contract.
     if convoy.spec.role != "governor" || convoy.spec.project_ref.is_none() {
         content.push_str("- Repositories:\n");
+        let checkouts = work_dir.map(|dir| multi_repository_checkouts(&convoy.spec, repository_refs, dir)).unwrap_or_default();
         for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
             content.push_str(&format!("  - `{}` — {} (target `{}`)\n", repository.repo_ref, repository.url, repository.target_ref));
+            if let Some((_, path)) = checkouts.iter().find(|(checked_out, _)| checked_out.repo_ref == repository.repo_ref) {
+                let branch = convoy.spec.r#ref.as_deref().map(|branch| format!(", branch `{branch}`")).unwrap_or_default();
+                content.push_str(&format!("    checkout `{path}`{branch}, remote {}\n", repository.url));
+            }
+        }
+        if let Some(dir) = work_dir.filter(|_| !checkouts.is_empty()) {
+            content.push_str(&format!(
+                "  The work directory `{dir}` is the common parent of these checkouts and is not itself a git repository; run git commands inside a checkout.\n"
+            ));
         }
     }
     if !credential_scopes.is_empty() {
@@ -1550,7 +1581,7 @@ mod tests {
         convoy.spec.role = "governor".into();
         convoy.spec.project_ref = Some("porthole".into());
         let mut content = String::new();
-        append_convoy_work_context(&mut content, &convoy, &[repository_key], &BTreeMap::new());
+        append_convoy_work_context(&mut content, &convoy, &[repository_key], &BTreeMap::new(), None);
         assert!(content.contains("Island Project: `porthole`"));
         assert!(content.contains("resolve current repositories and roles with `flotilla crew list` on each orientation sweep"));
         assert!(!content.contains("- Repositories:"));
@@ -2007,6 +2038,7 @@ mod tests {
             &convoy,
             std::slice::from_ref(&repo_ref),
             &BTreeMap::from([("github-app".to_string(), BTreeSet::from([repo_ref.clone()]))]),
+            None,
         );
 
         assert!(content.contains("- `repo_widgets` — https://github.com/flotilla-org/flotilla (target `main`)"));
@@ -2014,6 +2046,29 @@ mod tests {
         assert!(content.contains("  - `github-app`:\n    - `repo_widgets` — https://github.com/flotilla-org/flotilla"));
         assert!(content.contains("- Bound pull request: `#1071` — Existing pull request (`repo_widgets`)"));
         assert!(content.contains("First issue body.\n\nSource-qualified reference: `https://github.com` / `flotilla-org/flotilla` / `810`"));
+    }
+
+    // #3966: a multi-repository vessel's work directory is a plain parent, so the brief names each checkout.
+    #[test]
+    fn multi_repository_work_context_names_each_checkout_path() {
+        let (mut convoy, first) = convoy_brief_fixture();
+        let mut second_repository = convoy.spec.repositories[0].clone();
+        let second = RepositoryKey("repo_gadgets".to_string());
+        second_repository.repo_ref = second.clone();
+        second_repository.url = "https://github.com/flotilla-org/gadgets".into();
+        second_repository.workspace_slug = "gadgets".into();
+        convoy.spec.repositories[0].workspace_slug = "widgets".into();
+        convoy.spec.repositories.push(second_repository);
+        convoy.spec.r#ref = Some("feature".into());
+        let mut content = String::new();
+        append_convoy_work_context(&mut content, &convoy, &[first, second], &BTreeMap::new(), Some("/work/convoy/feature"));
+        assert!(
+            content.contains("checkout `/work/convoy/feature/widgets`, branch `feature`, remote https://github.com/flotilla-org/flotilla")
+        );
+        assert!(
+            content.contains("checkout `/work/convoy/feature/gadgets`, branch `feature`, remote https://github.com/flotilla-org/gadgets")
+        );
+        assert!(content.contains("`/work/convoy/feature` is the common parent of these checkouts"));
     }
 
     #[test]
