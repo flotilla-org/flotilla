@@ -47,6 +47,10 @@ impl CheckoutVcsResolver for NoCheckoutVcs {
     async fn vcs_for(&self, _: Option<&EnvironmentId>, path: &std::path::Path) -> Result<Arc<dyn Vcs>, String> {
         Err(format!("crew fixture has no checkout VCS for {}", path.display()))
     }
+
+    async fn vcs_for_env_ref(&self, _: &str, path: &std::path::Path) -> Result<Arc<dyn Vcs>, String> {
+        self.vcs_for(None, path).await
+    }
 }
 
 // Stand-in for credential controller I/O. Assert staging precedes terminal delivery.

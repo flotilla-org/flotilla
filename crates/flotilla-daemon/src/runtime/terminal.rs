@@ -33,6 +33,7 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize, TerminalSubmission};
+use flotilla_vcs::vcs::CheckoutVcsResolver as _;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -393,11 +394,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         String::from_utf8(body).map_err(|error| format!("brief artifact is not UTF-8: {error}"))?;
                 }
                 let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
-                let vcs = if spec.env_ref == self.state.host_direct_environment_name {
-                    self.state.daemon.local_vcs_for_checkout(cwd.as_path()).await?
-                } else {
-                    self.state.daemon.vcs_for_checkout(&EnvironmentId::new(&spec.env_ref), cwd.as_path()).await?
-                };
+                let vcs = self.state.daemon.vcs_for_env_ref(&spec.env_ref, cwd.as_path()).await?;
                 let account = AccountLaunch {
                     namespace: &context.namespace,
                     convoy: &context.convoy,
@@ -491,11 +488,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 for copy_root in &brief.copies {
                     let copy_root = ExecutionEnvironmentPath::new(copy_root);
                     if copy_root != cwd {
-                        let vcs = if spec.env_ref == self.state.host_direct_environment_name {
-                            self.state.daemon.local_vcs_for_checkout(copy_root.as_path()).await?
-                        } else {
-                            self.state.daemon.vcs_for_checkout(&EnvironmentId::new(&spec.env_ref), copy_root.as_path()).await?
-                        };
+                        let vcs = self.state.daemon.vcs_for_env_ref(&spec.env_ref, copy_root.as_path()).await?;
                         adapter.prepare_with_vcs(&copy_root, &materialized_brief, &credential_env, vcs.as_ref()).await?;
                     }
                 }
@@ -845,7 +838,8 @@ impl TerminalControllerRuntime {
         }
         self.state
             .daemon
-            .environment_registry_for_environment(&EnvironmentId::new(env_ref.to_string()))
+            .resolve_environment_ref(env_ref)
+            .and_then(|environment| self.state.daemon.environment_registry_for_environment(&environment.id))
             .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
     }
 

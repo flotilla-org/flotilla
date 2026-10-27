@@ -4721,9 +4721,7 @@ impl InProcessDaemon {
         forges: &[flotilla_resources::ForgeSpec],
     ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String> {
         let path = checkout_path(checkout).ok_or("checkout path unavailable")?;
-        let runner = self.runner_for_resource_checkout(checkout).await?;
-        let environment = checkout.spec.env_ref().unwrap_or(self.local_environment_id.as_str());
-        let vcs = self.vcs_for_checkout(&EnvironmentId::new(environment), Path::new(path)).await?;
+        let (runner, vcs) = self.resource_checkout_vcs(checkout, Path::new(path)).await?;
         Ok(if let Some(convoy) = convoy {
             let id = convoy_change_request_id_for_checkout(convoy, checkout, forges);
             let observed = self.replicated_checkout_change_request(convoy, checkout, id.as_deref()).await?;
@@ -4790,8 +4788,25 @@ impl InProcessDaemon {
         .and_then(|record| record.object.status))
     }
 
-    async fn runner_for_resource_checkout(&self, _checkout: &ResourceObject<ResourceCheckout>) -> Result<Arc<dyn CommandRunner>, String> {
-        self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())
+    /// A checkout's `env_ref` names an Environment resource, which resolves
+    /// through the environment manager like every other checkout path. Observed
+    /// checkouts carry no `env_ref` and live on this host.
+    async fn resource_checkout_vcs(
+        &self,
+        checkout: &ResourceObject<ResourceCheckout>,
+        path: &Path,
+    ) -> Result<(Arc<dyn CommandRunner>, Arc<dyn flotilla_vcs::vcs::Vcs>), String> {
+        let environment = match checkout.spec.env_ref() {
+            Some(env_ref) => self
+                .resolve_environment_ref(env_ref)
+                .ok_or_else(|| format!("command runner unavailable for checkout environment {env_ref}"))?,
+            None => ResolvedEnvironment {
+                runner: self.local_command_runner().ok_or("local command runner unavailable")?,
+                id: self.local_environment_id.clone(),
+            },
+        };
+        let vcs = self.vcs_for_checkout(&environment.id, path).await?;
+        Ok((environment.runner, vcs))
     }
 
     pub async fn verify_convoy_teardown_gate(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {

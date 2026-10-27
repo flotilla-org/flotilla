@@ -603,6 +603,96 @@ async fn abandon_archive_of_a_checkout_in_an_unreachable_environment_names_it_an
     );
 }
 
+// #4032: a host-direct checkout on the daemon's own host records the host's
+// Environment resource name as `env_ref`, not the local environment id. Archive
+// and delete's fresh inspection resolve it to the local environment.
+#[tokio::test]
+async fn host_direct_checkout_on_the_daemon_host_is_archived_and_passes_delete_inspection() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").unwrap();
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = std::process::Command::new("git").current_dir(cwd).args(args).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let remote = temp.path().join("remote.git");
+    let path = temp.path().join("governor");
+    git(temp.path(), &["init", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    git(temp.path(), &["clone", remote.to_str().unwrap(), path.to_str().unwrap()]);
+    let commit = ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m"];
+    git(&path, &[&commit[..], &["base"]].concat());
+    git(&path, &["push", "origin", "main"]);
+    git(&path, &["remote", "set-head", "origin", "-a"]);
+    git(&path, &["switch", "-c", "governor"]);
+    git(&path, &[&commit[..], &["work"]].concat());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut discovery = fake_discovery_with_runner(false, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
+    discovery.repo_detectors.clear();
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::local(),
+        backend.clone(),
+        Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let env_ref = flotilla_resources::host_direct_environment_name(daemon.local_host_id().unwrap().as_str());
+    assert_ne!(env_ref, daemon.local_environment_id.as_str());
+    let repository = RepositorySpec::remote("https://github.com/acme/archive").unwrap();
+    backend.using::<Repository>("flotilla").create(&test_meta(&repository.key().to_string()), &repository).await.unwrap();
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let convoy = convoys.create(&test_meta("governor"), &ConvoySpec::builder().workflow_ref("governor".into()).build()).await.unwrap();
+    convoys
+        .update_status(
+            "governor",
+            &convoy.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus { phase: flotilla_resources::ConvoyPhase::Active, ..Default::default() },
+        )
+        .await
+        .unwrap();
+    let checkouts = backend.using::<ResourceCheckout>("flotilla");
+    let checkout = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("governor-checkout".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "governor".to_string())]))
+                .build(),
+            &ResourceCheckoutSpec::Worktree(
+                ResourceCheckoutWorktreeSpec::builder()
+                    .repo_ref(repository.key())
+                    .env_ref(env_ref)
+                    .r#ref("governor".to_string())
+                    .base_ref("main".to_string())
+                    .target_path(path.to_str().unwrap().to_string())
+                    .clone_ref("clone".to_string())
+                    .build(),
+            ),
+        )
+        .await
+        .unwrap();
+    checkouts
+        .update_status(
+            "governor-checkout",
+            &checkout.metadata.resource_version,
+            &ResourceCheckoutStatus::builder().phase(ResourceCheckoutPhase::Ready).path(path.to_str().unwrap().to_string()).build(),
+        )
+        .await
+        .unwrap();
+
+    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "governor").await.unwrap();
+    assert_eq!(
+        outcomes.iter().map(|o| (o.checkout.as_str(), o.status, o.detail.clone())).collect::<Vec<_>>(),
+        vec![("governor-checkout", CheckoutArchiveStatus::Archived, None)]
+    );
+    assert_eq!(
+        git(temp.path(), &["--git-dir", remote.to_str().unwrap(), "for-each-ref", "--format=%(refname:short)", "refs/heads"]),
+        "governor\nmain\n"
+    );
+
+    daemon.crew.teardown("flotilla", "governor", false).await.expect("fresh inspection of the archived checkout permits delete");
+}
+
 #[tokio::test]
 async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_checkout() {
     let temp = tempfile::tempdir().expect("tempdir");
