@@ -45,7 +45,7 @@ use crate::stored::definition::{
 };
 
 /// One old copy of a definition: its namespace, the object, and the home that wrote it.
-pub struct Copy<R: Resource> {
+pub struct DefinitionCopy<R: Resource> {
     pub namespace: String,
     pub object: ResourceObject<R>,
     pub home: String,
@@ -109,13 +109,13 @@ impl DefinitionKind for WorkflowTemplateDefinition {
 /// The old copies of every definition kind the import carries.
 #[derive(Default)]
 pub struct DefinitionCopies {
-    pub forges: Vec<Copy<Forge>>,
-    pub fleet_designations: Vec<Copy<FleetDesignation>>,
-    pub credential_specs: Vec<Copy<CredentialSpec>>,
-    pub credential_grants: Vec<Copy<CredentialGrant>>,
-    pub crew_defaults: Vec<Copy<CrewDefaults>>,
-    pub image_layers: Vec<Copy<ImageLayer>>,
-    pub workflow_templates: Vec<Copy<WorkflowTemplate>>,
+    pub forges: Vec<DefinitionCopy<Forge>>,
+    pub fleet_designations: Vec<DefinitionCopy<FleetDesignation>>,
+    pub credential_specs: Vec<DefinitionCopy<CredentialSpec>>,
+    pub credential_grants: Vec<DefinitionCopy<CredentialGrant>>,
+    pub crew_defaults: Vec<DefinitionCopy<CrewDefaults>>,
+    pub image_layers: Vec<DefinitionCopy<ImageLayer>>,
+    pub workflow_templates: Vec<DefinitionCopy<WorkflowTemplate>>,
 }
 
 /// Maps every copy in `copies` onto the engine, restores each record into one temporary store
@@ -150,12 +150,12 @@ pub struct ImportedDefinition<S> {
 
 /// Maps the copies of `D`'s kind onto engine records, one group of copies per namespace and name.
 /// Drops are counted and refusals listed in `report`.
-pub fn import_kind<D: DefinitionKind>(copies: &[Copy<D::Old>], report: &mut ImportReport) -> Vec<ImportedDefinition<D::Stored>>
+pub fn import_kind<D: DefinitionKind>(copies: &[DefinitionCopy<D::Old>], report: &mut ImportReport) -> Vec<ImportedDefinition<D::Stored>>
 where
     ResourceObject<D::Old>: Clone,
 {
     let kind = <D::Stored as Kind>::KIND;
-    let mut by_name = BTreeMap::<(&str, &str), Vec<&Copy<D::Old>>>::new();
+    let mut by_name = BTreeMap::<(&str, &str), Vec<&DefinitionCopy<D::Old>>>::new();
     for copy in copies {
         by_name.entry((copy.namespace.as_str(), copy.object.metadata.name.as_str())).or_default().push(copy);
     }
@@ -196,6 +196,11 @@ where
         } else {
             declaring
         };
+        if homes.is_empty() {
+            // The merge reads the name as live, yet every copy is deleted: nothing to carry.
+            report.refused.push(refuse("the merge reads it as live, but every copy is deleted".to_owned()));
+            continue;
+        }
         let folded: BTreeSet<_> =
             copies.iter().map(|copy| copy.home.as_str()).filter(|home| !homes.iter().any(|kept| kept.home == *home)).collect();
         if !folded.is_empty() {
@@ -251,7 +256,7 @@ where
     imported
 }
 
-fn rehearse_kind<D: DefinitionKind>(copies: &[Copy<D::Old>], rehearsal: &mut Rehearsal, report: &mut ImportReport)
+fn rehearse_kind<D: DefinitionKind>(copies: &[DefinitionCopy<D::Old>], rehearsal: &mut Rehearsal, report: &mut ImportReport)
 where
     D::Stored: OriginOf,
     ResourceObject<D::Old>: Clone,

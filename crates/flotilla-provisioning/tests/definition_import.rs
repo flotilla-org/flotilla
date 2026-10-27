@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_provisioning::{
-    engine::definition_import::{import_kind, rehearse_definitions, Copy, DefinitionCopies, ImportedDefinition},
+    engine::definition_import::{import_kind, rehearse_definitions, DefinitionCopies, DefinitionCopy, ImportedDefinition},
     engine::import::ImportReport,
     stored::definition::{
         CharterOrigin, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, DefinitionOrigin,
@@ -53,8 +53,8 @@ fn copy<R: Resource>(
     labels: BTreeMap<String, String>,
     annotations: BTreeMap<String, String>,
     spec: R::Spec,
-) -> Copy<R> {
-    Copy {
+) -> DefinitionCopy<R> {
+    DefinitionCopy {
         namespace: "flotilla".to_owned(),
         object: ResourceObject { metadata: meta(name, labels, annotations, 1), spec, status: None },
         home: home.to_owned(),
@@ -359,7 +359,7 @@ fn forge_spec(url: &str) -> ForgeSpec {
 // held in two namespaces at one home are refused.
 #[test]
 fn the_import_carries_each_definition_to_the_homes_that_declare_it() {
-    let homes = |copies: &[Copy<flotilla_resources::Forge>]| {
+    let homes = |copies: &[DefinitionCopy<flotilla_resources::Forge>]| {
         let mut report = ImportReport::default();
         let records = import_kind::<ForgeDefinition>(copies, &mut report);
         (records.into_iter().map(|record| (record.namespace, record.name, record.home)).collect::<Vec<_>>(), report)
@@ -384,6 +384,10 @@ fn the_import_carries_each_definition_to_the_homes_that_declare_it() {
     let (records, report) = homes(&[at_home("alpha", None, forge_spec("https://x"), 5), at_home("beta", None, forge_spec("https://x"), 3)]);
     assert_eq!(place(records), vec![row("flotilla", "f", "beta", 0)]);
     assert_eq!(report.notes.len(), 1);
+
+    // Created at the same time at two homes: the tie goes to the first home by name.
+    let (records, _) = homes(&[at_home("beta", None, forge_spec("https://x"), 3), at_home("alpha", None, forge_spec("https://x"), 3)]);
+    assert_eq!(place(records), vec![row("flotilla", "f", "alpha", 0)]);
 
     // Declared at one home, copied at another: the declaring home's record.
     let (records, report) =

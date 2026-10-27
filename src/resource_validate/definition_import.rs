@@ -5,7 +5,7 @@
 //! and names each refusal.
 
 use flotilla_provisioning::engine::{
-    definition_import::{rehearse_definitions, Copy, DefinitionCopies},
+    definition_import::{rehearse_definitions, DefinitionCopies, DefinitionCopy},
     import::{ImportRefusal, ImportReport},
 };
 use flotilla_resources::{K8sResourceObject, Resource, ResourceObject};
@@ -25,14 +25,14 @@ fn home(item: &Value) -> String {
 }
 
 impl Documents {
-    fn copies<R: Resource>(&self, plural: &str, report: &mut ImportReport) -> Vec<Copy<R>> {
+    fn copies<R: Resource>(&self, plural: &str, report: &mut ImportReport) -> Vec<DefinitionCopy<R>> {
         let mut copies = Vec::new();
         for (namespace, _, item) in self.0.iter().filter(|(_, listed, _)| listed == plural) {
             let object = serde_json::from_value::<K8sResourceObject<R>>(item.clone())
                 .map_err(|error| error.to_string())
                 .and_then(|object| ResourceObject::from_k8s_object(object).map_err(|error| error.to_string()));
             match object {
-                Ok(object) => copies.push(Copy { namespace: namespace.clone(), object, home: home(item) }),
+                Ok(object) => copies.push(DefinitionCopy { namespace: namespace.clone(), object, home: home(item) }),
                 Err(error) => report.refused.push(ImportRefusal {
                     kind: R::API_PATHS.kind,
                     record: item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>").to_owned(),
