@@ -1948,6 +1948,57 @@ mod tests {
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("settled pass").unchanged, 1);
     }
 
+    // Behaviour (#3824 layer 2b-ii): with the definition kinds and ManifestRoot both on the
+    // engine, a manifest's definition is applied with the manifest's origin, a settled document is
+    // not written again, a source change applies, and a live edit reads as drift and is left. The
+    // engine keeps no hash annotations: the root's baseline record judges both.
+    #[tokio::test]
+    async fn over_the_engine_a_manifest_definition_settles_applies_changes_and_reads_drift() {
+        use flotilla_provisioning::engine::{definitions::EngineDefinitions, manifest_root::EngineManifestRoots};
+        use flotilla_resources::{definitions::DefinitionOrigin, Forge};
+        let forge = |host: &str| {
+            format!(
+                "apiVersion: flotilla.work/v1\nkind: Forge\nmetadata:\n  name: lab\nspec:\n  forge_id: lab\n  kind: forgejo\n  hosts: [{host}]\n  https_url: https://lab.example\n  git_ssh_host: lab.example\n"
+            )
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir.path().join("forge.yaml"), &forge("lab.example"));
+        let store = tempfile::tempdir().expect("store dir");
+        let mut kinds = flotilla_schema::KindRegistry::new();
+        flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register roots");
+        flotilla_provisioning::stored::definition::register(&mut kinds).expect("register definitions");
+        let service =
+            Arc::new(flotilla_schema_sqlite::stream::Service::open(&store.path().join("decided.sqlite"), "home", kinds).expect("store"));
+        let clock: Arc<dyn flotilla_resources::Clock> = Arc::new(flotilla_resources::SystemClock);
+        let roots: Arc<dyn ManifestRoots> = Arc::new(EngineManifestRoots::open(Arc::clone(&service), Arc::clone(&clock)).expect("roots"));
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        backend.install_definition_records(Arc::new(EngineDefinitions::open(service, clock).expect("definitions")));
+        let forges = backend.definitions::<Forge>(NAMESPACE);
+        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path()).with_roots(Arc::clone(&roots));
+
+        assert_eq!(reconciler.reconcile_once_for_test().await.expect("creation").created, 1);
+        let applied = forges.get("lab").await.expect("forge");
+        let origin = flotilla_resources::definitions::origin(&applied.metadata.labels, &applied.metadata.annotations).expect("origin");
+        assert!(
+            matches!(&origin, DefinitionOrigin::Manifest { root, path, .. } if *root == reconciler.root_name() && path == "forge.yaml")
+        );
+
+        let settled = reconciler.reconcile_once_for_test().await.expect("settled pass");
+        assert_eq!((settled.unchanged, settled.updated), (1, 0), "{settled:?}");
+        assert_eq!(forges.get("lab").await.expect("forge").metadata.resource_version, applied.metadata.resource_version);
+
+        write(&dir.path().join("forge.yaml"), &forge("git.lab.example"));
+        assert_eq!(reconciler.reconcile_once_for_test().await.expect("source change").updated, 1);
+        assert!(forges.get("lab").await.expect("forge").spec.hosts.contains("git.lab.example"));
+
+        let current = forges.get("lab").await.expect("forge");
+        let mut live = current.spec.clone();
+        live.hosts.insert("live.example".into());
+        forges.apply(&InputMeta::from(&current.metadata), &live).await.expect("live edit");
+        assert_eq!(reconciler.reconcile_once_for_test().await.expect("drift pass").drifted, 1);
+        assert!(forges.get("lab").await.expect("forge").spec.hosts.contains("live.example"), "drift is left untouched");
+    }
+
     #[tokio::test]
     async fn claimed_resolution_is_not_replayed_after_reconciler_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
