@@ -149,6 +149,9 @@ fn pin_args(layer: &ImageLayerSpec, architecture: &str) -> Result<Vec<String>, S
         let artifact = declared
             .artifact(architecture)
             .ok_or_else(|| format!("image layer `{}`: pin `{pin}` has no artifact for architecture `{architecture}`", layer.name))?;
+        // Emitted as declared. A previous-shape `{arch}` template survives conversion
+        // verbatim for one roll (ADR 0047), and only its own fragment's `sed` resolves it;
+        // the stdlib fragments no longer substitute.
         args.push(arg_line(&format!("PIN_{name}_URL"), &artifact.url, &layer.name)?);
         args.push(arg_line(&format!("PIN_{name}_SHA256"), &artifact.sha256, &layer.name)?);
         args.push(arg_line(&format!("PIN_{name}_UNPACK"), artifact.unpack.as_str(), &layer.name)?);
