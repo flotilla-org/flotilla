@@ -156,21 +156,26 @@ impl Store {
         Store::open_with(conn, home, kinds, StoreOptions::default())
     }
 
-    /// Enables foreign keys, creates the shared tables and every registered kind's tables if they
-    /// do not exist, brings the `codes` rows and readable views up to date, and renders each
-    /// kind's statements once.
+    /// Creates the shared tables and every registered kind's tables if they do not exist, widens
+    /// kind tables' code CHECKs, brings the `codes` rows and readable views up to date, enables
+    /// foreign keys, and renders each kind's statements once. Foreign keys are off while the
+    /// schema is brought up to date, so widening a table can drop it without cascading.
     pub fn open_with(mut conn: Connection, home: &str, kinds: KindRegistry, options: StoreOptions) -> Result<Store, StoreError> {
-        conn.pragma_update(None, "foreign_keys", true)?;
+        conn.pragma_update(None, "foreign_keys", false)?;
         conn.set_prepared_statement_cache_capacity(options.statement_cache);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(&schema_ddl(&kinds, DdlMode::IfNotExists))?;
         if !has_string_domain(&tx)? {
             return Err(StoreError::LegacyDictionarySchema);
         }
-        check_kind_columns(&tx, &kinds)?;
+        // Codes first: a widened table is rebuilt with every column, so it needs no `ADD COLUMN`,
+        // whose change to the stored text would stop the table from widening.
         check_kind_codes(&tx, &kinds)?;
+        check_kind_columns(&tx, &kinds)?;
         sync_views(&tx, &kinds)?;
         tx.commit()?;
+        // An early return leaves foreign keys off, which is safe only because it drops `conn`.
+        conn.pragma_update(None, "foreign_keys", true)?;
         Self::from_connection(conn, home, kinds, options)
     }
 

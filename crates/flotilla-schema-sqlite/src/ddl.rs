@@ -59,7 +59,7 @@ pub fn render_ddl_with(set: &TableSet, mode: DdlMode) -> String {
     };
     let mut out = String::new();
     for table in &set.tables {
-        render_table(&mut out, set, table, exists);
+        let _ = writeln!(out, "{};", create_table(set, table, exists));
     }
     let mut indexes: Vec<_> = set.indexes.iter().cloned().chain(set.reference_indexes()).collect();
     indexes.sort_by_key(|index| index.object_name());
@@ -191,7 +191,9 @@ fn readable(set: &TableSet, table: &Table) -> (String, String) {
     (name, sql)
 }
 
-fn render_table(out: &mut String, set: &TableSet, table: &Table, exists: &str) {
+/// One table's `CREATE TABLE` statement, without its `;`. Without `IF NOT EXISTS` it is the text
+/// SQLite keeps in `sqlite_schema`, which widening an existing table compares against.
+pub(crate) fn create_table(set: &TableSet, table: &Table, exists: &str) -> String {
     let owner = quote_ident(set.parent_key_column());
     let mut lines = Vec::new();
     match table.parent {
@@ -226,7 +228,7 @@ fn render_table(out: &mut String, set: &TableSet, table: &Table, exists: &str) {
     lines.extend(table.guards.iter().map(|guard| format!("CHECK ({})", guard.check_with("\n      "))));
     // Child tables cluster on their primary key, so loading one owner's rows is one range of one b-tree.
     let options = if table.parent.is_some() { "STRICT, WITHOUT ROWID" } else { "STRICT" };
-    let _ = writeln!(out, "CREATE TABLE {exists}{} (\n  {}\n) {options};", quote_ident(&table.name), lines.join(",\n  "));
+    format!("CREATE TABLE {exists}{} (\n  {}\n) {options}", quote_ident(&table.name), lines.join(",\n  "))
 }
 
 pub(crate) fn column(column: &ColumnDef) -> String {

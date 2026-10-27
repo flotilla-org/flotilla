@@ -29,9 +29,9 @@
 //! resource keeps its identity row so cached `ResourceId`s and references to it stay valid.
 //! Collecting unused string rows is separate work (#3320 out of scope).
 //!
-//! `Store::open` creates missing tables and indexes and does not yet compare an existing database with the
-//! rendered DDL; opening the previous generation's schema belongs to the post-cut-over form of
-//! ADR 0047.
+//! `Store::open` creates missing tables and indexes, adds columns that declare a previous-generation
+//! default, and rebuilds a kind table whose only difference is fewer allowed codes (#3972); any
+//! other difference in a kind table's columns or codes refuses to open.
 
 mod ddl;
 pub use ddl::{
