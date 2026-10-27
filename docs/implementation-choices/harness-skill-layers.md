@@ -132,11 +132,59 @@ for the target architecture's entry, or for `any`. A pin with no entry for the
 target refuses the build. The stdlib fragments fetch the URL as given; only
 rust still maps the architecture, for its toolchain triple.
 
-## Not built here
+## Step 3: harness binaries through vessel delivery (2026-10-27)
 
-- **Harness fetch by the vessel agent.** This is blocked on drydock#84's
-  octet-stream file operations and on a fetch-by-digest agent operation that
-  has no ticket yet. Until both exist, agentless vessels get no harness layer
-  from this work, and no stand-in transfer is built. The pins above are the
-  entries that fetch will read.
-- **Skills.** These move to #3663.
+#3964 put vessel delivery's planner, executor and access layer on main, and
+the owner's scope ruling on this PR made the harness one of its mechanisms.
+This PR delivers harness binaries only; skills go to #3926.
+
+**Planner input is declared data (#3956 ruling).**
+- An artifact's `Visibility` is public, or private with a named authority.
+  It is declared by the artifact's source.
+- A place declares `Reachability`, meaning what its vessel can reach. The
+  default is nothing beyond its controller.
+- A public, digest-addressed tree that the vessel can reach lowers to
+  `AgentFetch { by: Digest }`. A private or unreachable one lowers to agent
+  push, which stays mandatory.
+- Costs stay in the cost table. Nothing branches on the payload's kind.
+
+**The harness need.**
+- **Which artifact.** The adapter's stdlib layer, the one providing
+  `harness:<adapter>`, gives the pin. The vessel agent's reported platform
+  picks that pin's artifact.
+- **Visibility.** A stdlib pin names a public upstream download, so its
+  sources are `{ digest: Public, controller: true }`.
+- **Placement.** The need is a read-only tree at `.flotilla/harness` in the
+  crew's home. A `file` artifact is linked at `bin/<binary>`. An archive's
+  store entry is linked as the directory itself. Both shapes put the binary
+  at `bin/<binary>`, as the image fragments do.
+- **Where it applies.** It is added only where the place does not already
+  carry the pin. A composed crew image includes the harness layers, and its
+  identity hashes their pins. An SSH host has no image, so it gets the need.
+
+**Mechanisms.**
+- **Fetch by digest.** drydock's `PUT /artifacts/{sha256}` (drydock#86)
+  fetches the upstream URL into the agent's verified, indexed store. A
+  repeat is an index lookup.
+- **Push.** The controller streams the pinned URL into a temporary file and
+  keeps it only if the digest matches. It then pushes the file through
+  drydock's resumable `push` source.
+- **Linking.** Links are drydock's recorded links, so a store entry still in
+  use is never removed.
+- **Unsupported unpack kinds.** A `tar.xz` pin is refused by name, because
+  the store unpacks only `file`, `tar` and `tar.gz`.
+
+**Launch.**
+- The executable the access layer delivered is the one the launch runs. Its
+  adapter is built through discovery's own code
+  (`AgentAdapterRegistry::delivered`).
+- Observation, exit classification and cleanup on an agentless vessel get
+  the built-in adapter even when the host has no harness installed. None of
+  them runs the binary.
+
+**Stored shape.** `AccessDelivery`'s mechanism gains `AgentFetchDigest`
+(code `fd`, written as `agent-fetch(digest)`). It is presented for the
+owner's look-over on the PR.
+
+**Untouched.** The paths #3956 deletes are not extended: `docker.rs`
+provisioning, the per-crew launch branches, and `agentless_vessels.rs`.
