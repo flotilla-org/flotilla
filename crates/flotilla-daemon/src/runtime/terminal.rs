@@ -84,6 +84,9 @@ pub(super) struct TerminalControllerRuntime {
 pub(crate) const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(200);
 
 pub(super) const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(4);
+/// How long teardown lets a typed engine turn settle before aborting it (#3894):
+/// its confirmation grace, with room for the submission itself.
+const ENGINE_TURN_SETTLE_FOR: Duration = Duration::from_secs(10);
 
 pub(crate) const DELIVERY_CONFIRMATION_STABLE_FOR: Duration = Duration::from_secs(1);
 
@@ -827,16 +830,26 @@ impl TerminalRuntime for TerminalControllerRuntime {
         };
         // A typed engine turn settles within its confirmation grace; it stays
         // reserved so the delivery adapter commits its receipt after the kill.
-        while engine_turn
-            && self
-                .state
+        // One that outlasts the bound is aborted, as any other reservation.
+        let settling = || {
+            self.state
                 .terminal_deliveries
                 .lock()
                 .expect("terminal deliveries lock poisoned")
                 .get(session_id)
                 .is_some_and(|delivery| delivery.before_submit.is_some() && !delivery.task.is_finished())
-        {
-            tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
+        };
+        let settled = tokio::time::timeout(ENGINE_TURN_SETTLE_FOR, async {
+            while engine_turn && settling() {
+                tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
+            }
+        })
+        .await;
+        if settled.is_err() {
+            warn!(%session_id, "an engine turn did not settle before teardown; aborting it");
+            if let Some(delivery) = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned").remove(session_id) {
+                delivery.task.abort();
+            }
         }
         let pool = self.pool_for_spec(spec).await?;
         if pool.tracks_session_liveness() {

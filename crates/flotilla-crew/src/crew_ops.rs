@@ -2245,6 +2245,9 @@ impl CrewService {
             // derived Done waits on that turn's delivery (#3894).
             admitted = Some(self.publish_message_intent(&context.namespace, &message_name, &intent).await?);
         }
+        // Each branch below sends the turn once its target session is settled.
+        // The old path keeps that order, since a failed send restores the crew
+        // work; the engine path already admitted the turn and only reuses it.
         let send = || async {
             match &admitted {
                 Some(admitted) => Ok(admitted.clone()),

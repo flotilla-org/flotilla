@@ -29,6 +29,8 @@ use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 // Convoy secondary watches cover work/checkouts, not arbitrary PR or artifact
 // records. A bounded retry also handles observation freshness without an event.
 const PROMISE_OBSERVATION_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+/// How soon a crew's Done held on its undelivered turn is rechecked (#3894).
+const TURN_HOLD_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct ConvoyReconciler {
@@ -76,6 +78,8 @@ pub struct ConvoyPrepared {
     /// The engine holds the convoy, yet the stored status still has the
     /// promises bootstrap seeded: admission's hand-over did not land.
     stale_seeds: bool,
+    /// A crew's derived Done waits on its undelivered turn (#3894).
+    turn_hold: bool,
 }
 
 impl ConvoyReconciler {
@@ -573,10 +577,11 @@ impl Reconciler for ConvoyReconciler {
                 .map(|_| (vessel.clone(), role.clone())),
             _ => None,
         };
-        let promise_patch = match derived {
-            Some((vessel, role)) if self.turn_awaits(obj, &vessel, &role).await? => None,
-            _ => promise_patch,
+        let turn_hold = match derived {
+            Some((vessel, role)) => self.turn_awaits(obj, &vessel, &role).await?,
+            None => false,
         };
+        let promise_patch = if turn_hold { None } else { promise_patch };
         let settlement = if is_landing {
             Some(evaluate_landing_settlement_with_disposition(
                 obj,
@@ -657,6 +662,7 @@ impl Reconciler for ConvoyReconciler {
             engine_refusal,
             viewed: viewed.clone(),
             stale_seeds,
+            turn_hold,
         })
     }
 
@@ -835,21 +841,28 @@ impl Reconciler for ConvoyReconciler {
             patch: outcome.patch,
             actuations: outcome.actuations,
             events: outcome.events.into_iter().map(|event| convoy_object_event(obj, event)).collect(),
-            requeue_after: provisioning_requeue.or_else(|| reclaim_refused.then_some(self.landing_evidence_stale_after)).or_else(|| {
-                obj.status.as_ref().filter(|status| !status.phase.is_terminal()).and_then(|status| {
-                    status
-                        .promises
-                        .values()
-                        .flat_map(BTreeMap::values)
-                        .flatten()
-                        .any(|p| {
-                            p.state == flotilla_resources::convoy::promises::PromiseState::Submitted
-                                || (p.kind == flotilla_resources::convoy::promises::PromiseKind::DecisionLedger
-                                    && p.state == flotilla_resources::convoy::promises::PromiseState::Open)
-                        })
-                        .then_some(PROMISE_OBSERVATION_RETRY)
-                })
-            }),
+            // A held Done rechecks at the engine delivery adapter's pace: no
+            // Message watch wakes this reconciler when the turn is delivered.
+            requeue_after: prepared
+                .turn_hold
+                .then_some(TURN_HOLD_RETRY)
+                .or(provisioning_requeue)
+                .or_else(|| reclaim_refused.then_some(self.landing_evidence_stale_after))
+                .or_else(|| {
+                    obj.status.as_ref().filter(|status| !status.phase.is_terminal()).and_then(|status| {
+                        status
+                            .promises
+                            .values()
+                            .flat_map(BTreeMap::values)
+                            .flatten()
+                            .any(|p| {
+                                p.state == flotilla_resources::convoy::promises::PromiseState::Submitted
+                                    || (p.kind == flotilla_resources::convoy::promises::PromiseKind::DecisionLedger
+                                        && p.state == flotilla_resources::convoy::promises::PromiseState::Open)
+                            })
+                            .then_some(PROMISE_OBSERVATION_RETRY)
+                    })
+                }),
         }
     }
 

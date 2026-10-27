@@ -577,72 +577,101 @@ async fn terminal_teardown_skips_a_session_absent_from_the_pool() {
 }
 
 // #3894: teardown never strands a typed engine turn. The kill stops a turn not
-// yet typed, lets a typed one settle, and leaves it reserved, so the engine
-// delivery adapter still records its receipt.
+// yet typed, lets a typed one settle and leaves it reserved, so the engine
+// delivery adapter still records its receipt; a turn that never settles is
+// aborted at the bound.
 #[tokio::test]
 async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
-    let temp = TempDir::new().expect("tempdir");
-    let config_path = temp.path().join("config");
-    std::fs::create_dir_all(&config_path).expect("config dir");
-    std::fs::write(config_path.join("daemon.toml"), "machine_id = \"dinghy-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(config_path));
-    let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
-    let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
-    let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
-    let runtime = TerminalControllerRuntime {
-        state: Arc::new(ControllerRuntimeState::new(
-            Arc::clone(&daemon),
-            config,
-            local_registry,
-            None,
-            profile.host_id.clone(),
-            profile.host_direct_environment_name(),
-        )),
-    };
-    let session_name = "terminal-demo-implement-coder";
-    let spec = flotilla_resources::TerminalSessionSpec {
-        env_ref: profile.host_direct_environment_name(),
-        role: "coder".to_string(),
-        source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
-        cwd: "/repo".to_string(),
-        env: Default::default(),
-        pool: "fake-terminals".to_string(),
-    };
-    pool.add_sessions(vec![flotilla_terminal::TerminalSession::builder()
-        .session_name(session_name.to_string())
-        .status(TerminalStatus::Running)
-        .command("codex".to_string())
-        .working_directory(ExecutionEnvironmentPath::new("/repo"))
-        .build()])
-        .await;
-    let before_submit = tokio_util::sync::CancellationToken::new();
-    let typed = tokio::spawn(async {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        Ok(TerminalDeliveryOutcome::Confirmed)
-    });
-    runtime.state.terminal_deliveries.lock().expect("deliveries").insert(
-        session_name.to_string(),
-        PendingTerminalDelivery {
-            message_batch: Some("engine-message-turn".into()),
-            message: "turn".into(),
-            task: typed,
-            before_submit: Some(before_submit.clone()),
-        },
-    );
+    #[derive(Debug, Clone, Copy)]
+    enum Turn {
+        Untyped,
+        Typed,
+        Hung,
+    }
+    for turn in [Turn::Untyped, Turn::Typed, Turn::Hung] {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config");
+        std::fs::create_dir_all(&config_path).expect("config dir");
+        std::fs::write(config_path.join("daemon.toml"), "machine_id = \"dinghy-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_path));
+        let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
+        let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+        let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
+        let runtime = TerminalControllerRuntime {
+            state: Arc::new(ControllerRuntimeState::new(
+                Arc::clone(&daemon),
+                config,
+                local_registry,
+                None,
+                profile.host_id.clone(),
+                profile.host_direct_environment_name(),
+            )),
+        };
+        let session_name = "terminal-demo-implement-coder";
+        let spec = flotilla_resources::TerminalSessionSpec {
+            env_ref: profile.host_direct_environment_name(),
+            role: "coder".to_string(),
+            source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
+            cwd: "/repo".to_string(),
+            env: Default::default(),
+            pool: "fake-terminals".to_string(),
+        };
+        pool.add_sessions(vec![flotilla_terminal::TerminalSession::builder()
+            .session_name(session_name.to_string())
+            .status(TerminalStatus::Running)
+            .command("codex".to_string())
+            .working_directory(ExecutionEnvironmentPath::new("/repo"))
+            .build()])
+            .await;
+        tokio::time::pause();
+        let before_submit = tokio_util::sync::CancellationToken::new();
+        let cancelled = before_submit.clone();
+        // The adapter's turn: waiting for readiness until teardown cancels it,
+        // confirming a typed submission, or hung inside one.
+        let task = tokio::spawn(async move {
+            match turn {
+                Turn::Untyped => {
+                    cancelled.cancelled().await;
+                    Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady))
+                }
+                Turn::Typed => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    Ok(TerminalDeliveryOutcome::Confirmed)
+                }
+                Turn::Hung => std::future::pending().await,
+            }
+        });
+        runtime.state.terminal_deliveries.lock().expect("deliveries").insert(
+            session_name.to_string(),
+            PendingTerminalDelivery {
+                message_batch: Some("engine-message-turn".into()),
+                message: "turn".into(),
+                task,
+                before_submit: Some(before_submit.clone()),
+            },
+        );
 
-    runtime.kill_session(session_name, (&spec).into()).await.expect("teardown kills the session");
+        runtime.kill_session(session_name, (&spec).into()).await.expect("teardown kills the session");
 
-    assert!(before_submit.is_cancelled(), "a turn not yet typed is stopped");
-    let reserved = runtime
-        .state
-        .terminal_deliveries
-        .lock()
-        .expect("deliveries")
-        .remove(session_name)
-        .expect("the turn stays reserved for its receipt");
-    assert!(reserved.task.is_finished(), "the kill waits for the typed turn to settle");
-    assert!(matches!(reserved.task.await, Ok(Ok(TerminalDeliveryOutcome::Confirmed))));
-    assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()]);
+        assert!(before_submit.is_cancelled(), "{turn:?}: teardown stops a turn before it is typed");
+        assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()], "{turn:?}");
+        let reserved = runtime.state.terminal_deliveries.lock().expect("deliveries").remove(session_name);
+        match turn {
+            Turn::Hung => assert!(reserved.is_none(), "a turn that never settles is aborted"),
+            Turn::Untyped | Turn::Typed => {
+                let reserved = reserved.expect("the settled turn stays reserved for the delivery adapter");
+                assert!(reserved.task.is_finished(), "{turn:?}: the kill waits for the turn to settle");
+                let outcome = reserved.task.await.expect("turn task");
+                match turn {
+                    Turn::Untyped => {
+                        assert!(matches!(outcome, Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady))))
+                    }
+                    _ => assert!(matches!(outcome, Ok(TerminalDeliveryOutcome::Confirmed))),
+                }
+            }
+        }
+        tokio::time::resume();
+    }
 }
 
 // #3247: while flotillad has a hook endpoint, a host-direct Claude Code crew launches with

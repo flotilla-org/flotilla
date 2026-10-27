@@ -18,6 +18,10 @@ const NAMESPACE: &str = "flotilla";
 const CREW: &str = "flotilla/demo/work/coder";
 
 async fn primitives(dir: &tempfile::TempDir) -> MessagePrimitives {
+    primitives_at(dir, Arc::new(SystemClock)).await
+}
+
+async fn primitives_at(dir: &tempfile::TempDir, clock: Arc<dyn flotilla_resources::Clock>) -> MessagePrimitives {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     backend
         .clone()
@@ -43,7 +47,7 @@ async fn primitives(dir: &tempfile::TempDir) -> MessagePrimitives {
     let service = Arc::new(
         Service::open(&dir.path().join("decided.sqlite"), "home-a", flotilla_engine_store::registry().expect("registry")).expect("store"),
     );
-    MessagePrimitives::open("home-a", service, backend, Arc::new(SystemClock)).expect("primitives")
+    MessagePrimitives::open("home-a", service, backend, clock).expect("primitives")
 }
 
 fn intent(sender: &str, receiver: &str) -> MessageSpec {
@@ -411,4 +415,39 @@ async fn fleet_identity_is_independent_of_the_designated_project() {
         assert_eq!(roles.address("nudge").expect("role").as_str(), "fleet:lab/role:nudge");
         assert_eq!(roles.fleet().as_str(), "fleet:lab");
     }
+}
+
+// Behaviour (#3894): a turn admitted to a crew and not yet delivered holds
+// that crew's derived Done, for one delivery hold at most; a delivered turn,
+// or a turn to another crew, does not.
+#[tokio::test]
+async fn an_undelivered_turn_awaits_delivery_for_one_hold() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(chrono::Utc::now()));
+    let primitives = primitives_at(&dir, clock.clone()).await;
+    let other = "flotilla/demo/work/reviewer";
+    assert!(!primitives.awaits_delivery(NAMESPACE, CREW).await.expect("read"), "nothing admitted");
+    let record = flotilla_resources::message_record_name(CREW, "system:nudge", "late");
+    primitives.admit(NAMESPACE, &record, &intent("system:nudge", CREW)).await.expect("admitted");
+    assert!(primitives.awaits_delivery(NAMESPACE, CREW).await.expect("read"), "an undelivered turn holds its crew");
+    assert!(!primitives.awaits_delivery(NAMESPACE, other).await.expect("read"), "only its own crew");
+    clock.advance(flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR);
+    assert!(!primitives.awaits_delivery(NAMESPACE, CREW).await.expect("read"), "the hold ends after one delivery hold");
+
+    let delivered = flotilla_resources::message_record_name(other, "system:nudge", "delivered");
+    primitives.admit(NAMESPACE, &delivered, &intent("system:nudge", other)).await.expect("admitted");
+    assert!(primitives.awaits_delivery(NAMESPACE, other).await.expect("read"));
+    let message = engine_message(&primitives, &delivered);
+    let consumer = primitives.register("reviewer-session", flotilla_schema::Timestamp(1)).await.expect("consumer");
+    let inbox = primitives.inbox();
+    inbox.bind(message.spec().inbox.clone(), consumer.clone()).await.expect("bind");
+    inbox.receive(&consumer, message.name(), flotilla_state_machines::Transport::Turn).await.expect("receipt");
+    inbox
+        .deliver(
+            message.name(),
+            flotilla_state_machines::machines::message::Deliver { receiver: consumer, transport: flotilla_state_machines::Transport::Turn },
+        )
+        .await
+        .expect("deliver");
+    assert!(!primitives.awaits_delivery(NAMESPACE, other).await.expect("read"), "a delivered turn no longer holds its crew");
 }
