@@ -622,9 +622,9 @@ impl VesselReconciler {
             Ok(settings) => settings,
             Err(message) => return Ok(VesselPrepared::failed(message)),
         };
-        // A cloud sandbox's size comes from its provider's settings, resolved here with the strategy.
-        let cloud_size = match &settings.settings {
-            ProviderSettings::CloudSandboxPerVessel { size, .. } => Some(size.clone()),
+        // A cloud sandbox: its policy's image and its provider's size, resolved here together.
+        let cloud = match (&placement_policy.spec.cloud_sandbox_per_vessel, &settings.settings) {
+            (Some(cloud), ProviderSettings::CloudSandboxPerVessel { size, .. }) => Some((cloud.clone(), size.clone())),
             _ => None,
         };
         let mut strategy = match placement_strategy(&placement_policy.spec, &settings) {
@@ -775,7 +775,7 @@ impl VesselReconciler {
                             meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
                             spec: cloud_environment_spec(
                                 &placement_policy,
-                                cloud_size.as_ref(),
+                                cloud.as_ref(),
                                 requirement
                                     .crew
                                     .iter()
@@ -1265,7 +1265,7 @@ impl VesselReconciler {
                             meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
                             spec: cloud_environment_spec(
                                 &placement_policy,
-                                cloud_size.as_ref(),
+                                cloud.as_ref(),
                                 requirement
                                     .crew
                                     .iter()
@@ -1945,12 +1945,11 @@ fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &s
 // cloud input, never a Docker input, for a cloud policy.
 fn cloud_environment_spec(
     policy: &ResourceObject<PlacementPolicy>,
-    cloud_size: Option<&flotilla_resources::CloudSandboxSize>,
+    cloud: Option<&(flotilla_resources::CloudSandboxPerVesselPlacementPolicySpec, flotilla_resources::CloudSandboxSize)>,
     probe_needs: BTreeSet<flotilla_resources::CapabilityNeed>,
     mut spec: EnvironmentSpec,
 ) -> EnvironmentSpec {
-    // `placement_strategy` admits a cloud policy only with cloud sandbox settings, so both are here.
-    if let (Some(cloud), Some(size)) = (&policy.spec.cloud_sandbox_per_vessel, cloud_size) {
+    if let Some((cloud, size)) = cloud {
         let docker = spec.docker.take().expect("contained staging input");
         if let Some(instance) = environment_provider_labels(policy).get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL) {
             spec.provider_address = Some(
@@ -2366,7 +2365,8 @@ mod tests {
             flotilla_resources::environment_provider::ProviderSettings::CloudSandboxPerVessel { size, .. } => size.clone(),
             other => panic!("cloud settings: {other:?}"),
         };
-        let mapped = cloud_environment_spec(&policy, Some(&size), needs, input);
+        let cloud = (policy.spec.cloud_sandbox_per_vessel.clone().unwrap(), size);
+        let mapped = cloud_environment_spec(&policy, Some(&cloud), needs, input);
         assert!(mapped.docker.is_none());
         let cloud = mapped.cloud_sandbox.unwrap();
         assert_eq!(cloud.env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], r#"["codex"]"#);
