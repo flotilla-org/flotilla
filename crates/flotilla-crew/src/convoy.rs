@@ -29,7 +29,10 @@ use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 // Convoy secondary watches cover work/checkouts, not arbitrary PR or artifact
 // records. A bounded retry also handles observation freshness without an event.
 const PROMISE_OBSERVATION_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
-/// How soon a crew's Done held on its undelivered turn is rechecked (#3894).
+/// How soon a crew's Done held on its undelivered turn is rechecked (#3894):
+/// the engine delivery adapter's pace. The hold itself lasts at most one
+/// delivery hold (`DELIVERY_HOLD_FOR`), after which an untyped turn no longer
+/// holds its crew and may be lost to teardown; the stall judge reports it.
 const TURN_HOLD_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone)]

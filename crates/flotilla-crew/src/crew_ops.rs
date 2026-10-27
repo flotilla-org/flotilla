@@ -2254,176 +2254,190 @@ impl CrewService {
                 None => self.publish_message_intent(&context.namespace, &message_name, &intent).await,
             }
         };
-        let reopened = apply_resource_status_patch(
-            &convoys,
-            &context.convoy,
-            &convoy_external_patches::handoff_crew_work(
-                context.vessel.clone(),
-                context.caller_role.clone(),
-                target.to_string(),
-                chrono::Utc::now(),
-                message.to_string(),
-            ),
-        )
-        .await
-        .map_err(|err| err.to_string())?;
-        if reopened.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-            return Err(format!("convoy `{}` became terminal during crew handoff", context.convoy));
-        }
-        if target_origin.is_some() {
-            return match send().await {
-                Ok(_) => Ok(()),
-                Err(error) => Err(self
-                    .restore_crew_work_after_delivery_failure(
-                        &convoys,
-                        &context.convoy,
-                        &reopened.metadata.resource_version,
-                        &previous_status,
-                        error,
-                    )
-                    .await),
-            };
-        }
-        self.reconcile_or_restore_crew_work(
-            &context.namespace,
-            &environment_ref,
-            &convoys,
-            &context.convoy,
-            previous_status.clone(),
-            &reopened,
-        )
-        .await?;
-        let handoff_result: Result<(), String> = async {
-            match sessions.get(&terminal_name).await {
-                Ok(existing) if existing.spec.env_ref != environment_ref => {
-                    Err(format!("crew target `{target}` moved to another environment during credential staging"))
-                }
-                Ok(existing) => match existing.status.as_ref().map(|status| status.phase) {
-                    Some(ResourceTerminalSessionPhase::Running) => send().await.map(|_| ()),
-                    Some(ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost) => {
-                        send().await.map(|_| ())?;
-                        apply_resource_status_patch(&sessions, &terminal_name, &TerminalSessionStatusPatch::MarkStarting)
-                            .await
-                            .map(|_| ())
-                            .map_err(|err| err.to_string())
-                    }
-                    Some(ResourceTerminalSessionPhase::Failed) => {
-                        Err(format!("crew target `{target}` failed provisioning and cannot be revived"))
-                    }
-                    Some(ResourceTerminalSessionPhase::Starting) | None => send().await.map(|_| ()),
-                },
-                Err(ResourceError::NotFound { .. }) => {
-                    let anchor = anchor.ok_or_else(|| format!("crew target `{target}` disappeared during credential staging"))?;
-                    let current_convoy = convoys.get(&context.convoy).await.map_err(|error| error.to_string())?;
-                    let current = self.crew_state(&context, &current_convoy).await?;
-                    let repo_roots = crew_brief_repo_roots(&self.resource_backend, &context.namespace, &convoy, &repository_refs).await;
-                    let repositories = self.resource_backend.clone().using::<Repository>(&context.namespace);
-                    let mut fork_stance = false;
-                    for repository_ref in &repository_refs {
-                        if let Ok(repository) = repositories.get(&repository_ref.to_string()).await {
-                            fork_stance |= repository.spec.is_fork();
-                        }
-                    }
-                    let mut render_options = CrewBriefTemplateResolver::with_config_dir(self.config.base_path().as_path())
-                        .render_options_with_fork_stance(
-                            brief_template.as_deref(),
-                            convoy.spec.project_ref.as_deref(),
-                            repo_roots,
-                            fork_stance,
-                        );
-                    render_options.apply_cascade(
-                        convoy
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.workflow_snapshot.as_ref())
-                            .and_then(|workflow| workflow.cascade.as_deref()),
-                        target,
-                    );
-                    render_options.has_credential_scope = !task.credential_scopes.is_empty();
-                    let mut brief = handoff_crew_brief(
-                        &context,
-                        &convoy,
-                        target,
-                        prompt.as_deref(),
-                        &current.members,
-                        task,
-                        &render_options,
-                        Some(&anchor.spec.cwd),
-                    )?;
-                    if let Some(project) = convoy.spec.project_ref.as_deref() {
-                        let address = format!("{project}/{}/{}/{target}", context.convoy, context.vessel);
-                        let book = flotilla_messaging::crew_address_book(&self.resource_backend, &context.namespace, &address)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        brief.content.push('\n');
-                        brief.content.push_str(&book.render());
-                    }
-                    if let Some(writer) = self.brief_artifact_writer.read().await.clone() {
-                        let subject = format!("{}/handoff/{}", context.convoy, uuid::Uuid::new_v4().simple());
-                        brief.artifact_digest = Some(
-                            writer
-                                .put_brief(
-                                    &context.namespace,
-                                    &context.convoy,
-                                    target,
-                                    &subject,
-                                    brief.content.as_bytes(),
-                                    render_options.charter_commit.as_deref(),
-                                )
-                                .await?,
-                        );
-                        brief.content.clear();
-                    }
-                    let terminal_meta = terminal_meta_with_vessel_credentials(identity.input_meta(), task);
-                    let anchor_environment = anchor.spec.env_ref.clone();
-                    let created = sessions
-                        .create(
-                            &terminal_meta,
-                            &flotilla_resources::TerminalSessionSpec {
-                                env_ref: anchor.spec.env_ref,
-                                role: target.to_string(),
-                                source: TerminalSessionSource::Agent {
-                                    selector: selector.clone(),
-                                    brief,
-                                    context: Box::new(TerminalCrewContext {
-                                        namespace: context.namespace.clone(),
-                                        convoy: context.convoy.clone(),
-                                        vessel_ref: context.vessel_ref.clone(),
-                                    }),
-                                    message: None,
-                                },
-                                cwd: anchor.spec.cwd,
-                                env: anchor.spec.env,
-                                pool: anchor.spec.pool,
-                            },
-                        )
-                        .await;
-                    match created {
-                        Ok(_) => {}
-                        // Reopening the target's work above lets the vessel controller
-                        // create its session concurrently. A session that now exists in
-                        // the same environment receives the message like a starting one;
-                        // one without a status yet is that session, before its first launch.
-                        Err(ResourceError::Conflict { .. })
-                            if sessions.get(&terminal_name).await.is_ok_and(|existing| {
-                                existing.spec.env_ref == anchor_environment
-                                    && existing.status.as_ref().is_none_or(|status| status.phase != ResourceTerminalSessionPhase::Failed)
-                            }) => {}
-                        Err(error) => return Err(error.to_string()),
-                    }
-                    send().await.map(|_| ())
-                }
-                Err(err) => Err(err.to_string()),
+        // A handoff that fails after its engine turn was admitted withdraws that
+        // turn, so no orphan turn reaches, or holds, the recipient.
+        let handed_off: Result<(), String> = async {
+            let reopened = apply_resource_status_patch(
+                &convoys,
+                &context.convoy,
+                &convoy_external_patches::handoff_crew_work(
+                    context.vessel.clone(),
+                    context.caller_role.clone(),
+                    target.to_string(),
+                    chrono::Utc::now(),
+                    message.to_string(),
+                ),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+            if reopened.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+                return Err(format!("convoy `{}` became terminal during crew handoff", context.convoy));
             }
+            if target_origin.is_some() {
+                return match send().await {
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(self
+                        .restore_crew_work_after_delivery_failure(
+                            &convoys,
+                            &context.convoy,
+                            &reopened.metadata.resource_version,
+                            &previous_status,
+                            error,
+                        )
+                        .await),
+                };
+            }
+            self.reconcile_or_restore_crew_work(
+                &context.namespace,
+                &environment_ref,
+                &convoys,
+                &context.convoy,
+                previous_status.clone(),
+                &reopened,
+            )
+            .await?;
+            let handoff_result: Result<(), String> = async {
+                match sessions.get(&terminal_name).await {
+                    Ok(existing) if existing.spec.env_ref != environment_ref => {
+                        Err(format!("crew target `{target}` moved to another environment during credential staging"))
+                    }
+                    Ok(existing) => match existing.status.as_ref().map(|status| status.phase) {
+                        Some(ResourceTerminalSessionPhase::Running) => send().await.map(|_| ()),
+                        Some(ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost) => {
+                            send().await.map(|_| ())?;
+                            apply_resource_status_patch(&sessions, &terminal_name, &TerminalSessionStatusPatch::MarkStarting)
+                                .await
+                                .map(|_| ())
+                                .map_err(|err| err.to_string())
+                        }
+                        Some(ResourceTerminalSessionPhase::Failed) => {
+                            Err(format!("crew target `{target}` failed provisioning and cannot be revived"))
+                        }
+                        Some(ResourceTerminalSessionPhase::Starting) | None => send().await.map(|_| ()),
+                    },
+                    Err(ResourceError::NotFound { .. }) => {
+                        let anchor = anchor.ok_or_else(|| format!("crew target `{target}` disappeared during credential staging"))?;
+                        let current_convoy = convoys.get(&context.convoy).await.map_err(|error| error.to_string())?;
+                        let current = self.crew_state(&context, &current_convoy).await?;
+                        let repo_roots = crew_brief_repo_roots(&self.resource_backend, &context.namespace, &convoy, &repository_refs).await;
+                        let repositories = self.resource_backend.clone().using::<Repository>(&context.namespace);
+                        let mut fork_stance = false;
+                        for repository_ref in &repository_refs {
+                            if let Ok(repository) = repositories.get(&repository_ref.to_string()).await {
+                                fork_stance |= repository.spec.is_fork();
+                            }
+                        }
+                        let mut render_options = CrewBriefTemplateResolver::with_config_dir(self.config.base_path().as_path())
+                            .render_options_with_fork_stance(
+                                brief_template.as_deref(),
+                                convoy.spec.project_ref.as_deref(),
+                                repo_roots,
+                                fork_stance,
+                            );
+                        render_options.apply_cascade(
+                            convoy
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.workflow_snapshot.as_ref())
+                                .and_then(|workflow| workflow.cascade.as_deref()),
+                            target,
+                        );
+                        render_options.has_credential_scope = !task.credential_scopes.is_empty();
+                        let mut brief = handoff_crew_brief(
+                            &context,
+                            &convoy,
+                            target,
+                            prompt.as_deref(),
+                            &current.members,
+                            task,
+                            &render_options,
+                            Some(&anchor.spec.cwd),
+                        )?;
+                        if let Some(project) = convoy.spec.project_ref.as_deref() {
+                            let address = format!("{project}/{}/{}/{target}", context.convoy, context.vessel);
+                            let book = flotilla_messaging::crew_address_book(&self.resource_backend, &context.namespace, &address)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            brief.content.push('\n');
+                            brief.content.push_str(&book.render());
+                        }
+                        if let Some(writer) = self.brief_artifact_writer.read().await.clone() {
+                            let subject = format!("{}/handoff/{}", context.convoy, uuid::Uuid::new_v4().simple());
+                            brief.artifact_digest = Some(
+                                writer
+                                    .put_brief(
+                                        &context.namespace,
+                                        &context.convoy,
+                                        target,
+                                        &subject,
+                                        brief.content.as_bytes(),
+                                        render_options.charter_commit.as_deref(),
+                                    )
+                                    .await?,
+                            );
+                            brief.content.clear();
+                        }
+                        let terminal_meta = terminal_meta_with_vessel_credentials(identity.input_meta(), task);
+                        let anchor_environment = anchor.spec.env_ref.clone();
+                        let created = sessions
+                            .create(
+                                &terminal_meta,
+                                &flotilla_resources::TerminalSessionSpec {
+                                    env_ref: anchor.spec.env_ref,
+                                    role: target.to_string(),
+                                    source: TerminalSessionSource::Agent {
+                                        selector: selector.clone(),
+                                        brief,
+                                        context: Box::new(TerminalCrewContext {
+                                            namespace: context.namespace.clone(),
+                                            convoy: context.convoy.clone(),
+                                            vessel_ref: context.vessel_ref.clone(),
+                                        }),
+                                        message: None,
+                                    },
+                                    cwd: anchor.spec.cwd,
+                                    env: anchor.spec.env,
+                                    pool: anchor.spec.pool,
+                                },
+                            )
+                            .await;
+                        match created {
+                            Ok(_) => {}
+                            // Reopening the target's work above lets the vessel controller
+                            // create its session concurrently. A session that now exists in
+                            // the same environment receives the message like a starting one;
+                            // one without a status yet is that session, before its first launch.
+                            Err(ResourceError::Conflict { .. })
+                                if sessions.get(&terminal_name).await.is_ok_and(|existing| {
+                                    existing.spec.env_ref == anchor_environment
+                                        && existing
+                                            .status
+                                            .as_ref()
+                                            .is_none_or(|status| status.phase != ResourceTerminalSessionPhase::Failed)
+                                }) => {}
+                            Err(error) => return Err(error.to_string()),
+                        }
+                        send().await.map(|_| ())
+                    }
+                    Err(err) => Err(err.to_string()),
+                }
+            }
+            .await;
+            if let Err(error) = handoff_result {
+                return match convoys.update_status(&context.convoy, &reopened.metadata.resource_version, &previous_status).await {
+                    Ok(_) => Err(error),
+                    Err(restore_error) => Err(format!("{error}; could not restore crew work after handoff failure: {restore_error}")),
+                };
+            }
+            Ok(())
         }
         .await;
-        if let Err(error) = handoff_result {
-            return match convoys.update_status(&context.convoy, &reopened.metadata.resource_version, &previous_status).await {
-                Ok(_) => Err(error),
-                Err(restore_error) => Err(format!("{error}; could not restore crew work after handoff failure: {restore_error}")),
-            };
+        if let (Err(_), Some(_), Some(engine)) = (&handed_off, &admitted, self.message_primitives()) {
+            if let Err(error) = engine.withdraw(&context.namespace, &message_name, &context.convoy).await {
+                tracing::warn!(convoy = %context.convoy, message = %message_name, %error, "a failed handoff's admitted turn was not withdrawn");
+            }
         }
-        Ok(())
+        handed_off
     }
 
     pub async fn resume(

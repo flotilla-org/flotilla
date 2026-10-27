@@ -624,8 +624,8 @@ async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
             .build()])
             .await;
         tokio::time::pause();
-        let before_submit = tokio_util::sync::CancellationToken::new();
-        let cancelled = before_submit.clone();
+        let engine_turn = tokio_util::sync::CancellationToken::new();
+        let cancelled = engine_turn.clone();
         // The adapter's turn: waiting for readiness until teardown cancels it,
         // confirming a typed submission, or hung inside one.
         let task = tokio::spawn(async move {
@@ -647,13 +647,13 @@ async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
                 message_batch: Some("engine-message-turn".into()),
                 message: "turn".into(),
                 task,
-                before_submit: Some(before_submit.clone()),
+                engine_turn: Some(engine_turn.clone()),
             },
         );
 
         runtime.kill_session(session_name, (&spec).into()).await.expect("teardown kills the session");
 
-        assert!(before_submit.is_cancelled(), "{turn:?}: teardown stops a turn before it is typed");
+        assert!(engine_turn.is_cancelled(), "{turn:?}: teardown stops a turn before it is typed");
         assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()], "{turn:?}");
         let reserved = runtime.state.terminal_deliveries.lock().expect("deliveries").remove(session_name);
         match turn {

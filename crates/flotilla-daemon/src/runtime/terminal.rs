@@ -50,9 +50,10 @@ pub(super) struct PendingTerminalDelivery {
     pub(super) message_batch: Option<String>,
     pub(super) message: String,
     pub(super) task: JoinHandle<Result<TerminalDeliveryOutcome, String>>,
-    /// An engine turn's: teardown cancels it before typing and lets a typed
-    /// turn settle, reserved, so the delivery adapter records its receipt (#3894).
-    pub(super) before_submit: Option<tokio_util::sync::CancellationToken>,
+    /// Present for an engine turn, which owns its receipt: teardown cancels the
+    /// token to stop a turn not yet typed, and lets a typed turn settle,
+    /// reserved, so the delivery adapter records its receipt (#3894).
+    pub(super) engine_turn: Option<tokio_util::sync::CancellationToken>,
 }
 
 pub(super) enum TerminalDeliveryLookup {
@@ -808,17 +809,17 @@ impl TerminalRuntime for TerminalControllerRuntime {
             );
         deliveries.insert(
             session_id.to_string(),
-            PendingTerminalDelivery { message_batch: None, message: message.to_string(), task, before_submit: None },
+            PendingTerminalDelivery { message_batch: None, message: message.to_string(), task, engine_turn: None },
         );
         Ok(TerminalDeliveryOutcome::Pending)
     }
 
     async fn kill_session(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<(), String> {
-        let engine_turn = {
+        let is_engine_turn = {
             let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
-            match deliveries.get(session_id).map(|delivery| delivery.before_submit.clone()) {
-                Some(Some(before_submit)) => {
-                    before_submit.cancel();
+            match deliveries.get(session_id).map(|delivery| delivery.engine_turn.clone()) {
+                Some(Some(stop_typing)) => {
+                    stop_typing.cancel();
                     true
                 }
                 Some(None) => {
@@ -837,10 +838,10 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 .lock()
                 .expect("terminal deliveries lock poisoned")
                 .get(session_id)
-                .is_some_and(|delivery| delivery.before_submit.is_some() && !delivery.task.is_finished())
+                .is_some_and(|delivery| delivery.engine_turn.is_some() && !delivery.task.is_finished())
         };
         let settled = tokio::time::timeout(ENGINE_TURN_SETTLE_FOR, async {
-            while engine_turn && settling() {
+            while is_engine_turn && settling() {
                 tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
             }
         })

@@ -410,8 +410,8 @@ impl MessageDelivery {
         }
         let session = holder.session_id.clone();
         let typed = text.clone();
-        let before_submit = tokio_util::sync::CancellationToken::new();
-        let teardown = before_submit.clone();
+        let engine_turn = tokio_util::sync::CancellationToken::new();
+        let teardown = engine_turn.clone();
         let trace_spans: Vec<_> = members.iter().map(|message| flotilla_tracing::queued_span(message, "attempt")).collect();
         let primary_span = trace_spans.first().cloned().unwrap_or_else(tracing::Span::none);
         let task = tokio::spawn(
@@ -431,7 +431,7 @@ impl MessageDelivery {
         );
         deliveries.insert(
             holder.session_id.clone(),
-            PendingTerminalDelivery { message_batch: Some(ENGINE_BATCH.into()), message: text, task, before_submit: Some(before_submit) },
+            PendingTerminalDelivery { message_batch: Some(ENGINE_BATCH.into()), message: text, task, engine_turn: Some(engine_turn) },
         );
         self.inflight.insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members });
         Ok(())

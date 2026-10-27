@@ -390,7 +390,7 @@ impl AgentTransport for TerminalControllerRuntime {
                 message_batch: Some(batch.submission.batch_id.clone()),
                 message: batch.text.clone(),
                 task,
-                before_submit: None,
+                engine_turn: None,
             },
         );
         TransportOutcome::Pending
