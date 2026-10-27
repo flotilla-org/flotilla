@@ -172,6 +172,22 @@ async fn the_engine_stores_project_operations_but_not_the_queue() {
     ] {
         apply_status_patch(&projects, "widgets", &patch).await.expect("status");
     }
+    // An operations record left behind by a delete stopped part-way is not a new Project's.
+    flotilla_engine_store::plain::PlainLog::new(service.store())
+        .create(
+            "gadgets",
+            &flotilla_provisioning::stored::project::ProjectOpsRecord {
+                refused: None,
+                entries: Some(flotilla_provisioning::stored::project::EntriesReadiness { ready: false, message: "stale".into() }),
+            },
+            "test",
+            flotilla_schema::Timestamp::from_datetime(&at(0)),
+        )
+        .expect("stale operations record");
+    let gadgets =
+        backend.definitions::<Project>(NS).apply(&InputMeta::builder().name("gadgets".into()).build(), &spec("gadgets", None)).await;
+    assert_eq!(gadgets.expect("declare").status.expect("status").operational_entries, None);
+
     let reopened = ResourceBackend::new(InMemoryBackend::default());
     reopened.install_engine_records(Arc::new(EngineProjects::open(service, Arc::new(SystemClock) as Arc<dyn Clock>).expect("reopen")));
     let status = reopened.using::<Project>(NS).get("widgets").await.expect("read").status.expect("status");

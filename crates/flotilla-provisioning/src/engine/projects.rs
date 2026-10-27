@@ -81,7 +81,10 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn datetime(at: Timestamp) -> chrono::DateTime<chrono::Utc> {
-    at.to_datetime().unwrap_or_default()
+    at.to_datetime().unwrap_or_else(|| {
+        tracing::warn!(%at, "a project operations time is outside the representable range; reading it as the epoch");
+        Default::default()
+    })
 }
 
 /// `held` as the old object, with `judged` (this home's judgement) when the record is this home's.
@@ -122,7 +125,8 @@ fn object(name: &str, home: &str, held: &Held, judged: Option<&Judged>) -> Optio
 /// The version a Project reads at: its records' latest log version, above the judgement's
 /// revision. Log versions are this home's write sequence, so they only rise, across a delete and
 /// a create of the same name too; a judgement change raises the low part under an unchanged log.
-/// A restart forgets the judgement, so its low part may repeat a version read before the restart.
+/// Two accepted gaps, both in the low part: a restart forgets the judgement, and its revision wraps
+/// after 2^24 changes under one log version; either may repeat a version read before.
 fn composed_version(project: u64, ops: Option<u64>, revision: u64) -> u64 {
     (project.max(ops.unwrap_or(0)) << JUDGEMENT_BITS) | (revision & ((1 << JUDGEMENT_BITS) - 1))
 }
@@ -385,6 +389,11 @@ impl EngineRecords for EngineProjects {
         refuse_kind(kind)?;
         let spec: ProjectSpec = serde_json::from_value(spec).map_err(|error| format!("{KIND} spec: {error}"))?;
         let value = ProjectDefinition::new(origin(labels, annotations)?, &spec).map_err(|error| format!("{KIND} {name}: {error}"))?;
+        if self.log.get::<ProjectDefinition>(name, &self.home).map_err(|error| error.to_string())?.is_none() {
+            // A new Project starts with no conditions: an operations record left by a delete that
+            // stopped part-way belongs to the one before.
+            self.remove::<ProjectOpsRecord>(name)?;
+        }
         self.write::<ProjectDefinition>(name, |_| Ok(Some(value.clone())))?;
         self.current(name)
     }
@@ -412,8 +421,10 @@ impl EngineRecords for EngineProjects {
 
     async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
         refuse_kind(kind)?;
-        self.remove::<ProjectDefinition>(name)?;
+        // The operations record first: a delete stopped between the two leaves a Project with no
+        // conditions, never conditions with no Project.
         self.remove::<ProjectOpsRecord>(name)?;
+        self.remove::<ProjectDefinition>(name)?;
         if locked(&self.judged).remove(name).is_some() {
             self.judged_changes.send_modify(|tick| *tick += 1);
         }
