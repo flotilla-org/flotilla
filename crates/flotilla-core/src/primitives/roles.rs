@@ -36,16 +36,12 @@ pub const OPERATOR: FleetRole = FleetRole {
     name: "operator",
     purpose: "Hears crew stalls escalated past every supervisor and held turns, and sends a person's rulings and messages to crews.",
 };
-/// A person's role for the gates of its context (#3938): the human gates a
-/// Demand raises today, once Demands are messages.
-pub const APPROVER: FleetRole =
-    FleetRole { name: "approver", purpose: "Decides the human gates of its context: landings and declarations held for a person." };
 
 /// The person roles, declared under the fleet and under every project:
 /// `fleet:<fleet>/role:<name>` and `project:<project>/role:<name>`. The person
 /// consumer is bound to each of them; rebinding one later hands it to another
 /// person or to an agent without re-addressing any message.
-pub const PERSON_ROLES: [FleetRole; 2] = [OPERATOR, APPROVER];
+pub const PERSON_ROLES: [FleetRole; 1] = [OPERATOR];
 
 /// The fleet roles of one fleet. The defaults can be replaced
 /// or extended ([`FleetRoles::declare`]); a sender keeps sending as the same
@@ -165,8 +161,8 @@ mod tests {
         assert_eq!(roles.person_role_of(&operator), Some("operator"));
         assert_eq!(roles.role_of(&operator), None, "a person role is not a system sender");
         assert_eq!(roles.system_sender("system:operator"), None);
-        let project: Address = "project:flotilla/role:approver".parse().expect("project role");
-        assert_eq!(roles.person_role_of(&project), Some("approver"));
+        let project: Address = "project:flotilla/role:operator".parse().expect("project role");
+        assert_eq!(roles.person_role_of(&project), Some("operator"));
         let crew: Address = "project:flotilla/convoy:demo/role:operator".parse().expect("convoy role");
         assert_eq!(roles.person_role_of(&crew), None, "a convoy's crew role is no person role");
         let overridden = roles.declare("checks", "Reports check results.").expect("override");

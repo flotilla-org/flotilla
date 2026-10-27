@@ -348,10 +348,7 @@ mod tests {
         );
         let ambiguous = map.sender_of(&message("principal:eve", "flotilla/demo/work/coder")).expect_err("ambiguous");
         assert!(ambiguous.contains("`lead`, `owner`"), "{ambiguous}");
-        assert_eq!(
-            map.receiver(&message("system:stall-judge", "principal:approver")).expect("fleet").as_str(),
-            "fleet:fleet/role:approver"
-        );
+        assert_eq!(map.receiver(&message("system:stall-judge", "principal:alice")).expect("fleet").as_str(), "fleet:fleet/role:operator");
         let about = OldSpec {
             references: vec![MessageReference::ControlRecord {
                 resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "standing"),

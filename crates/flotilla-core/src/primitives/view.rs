@@ -299,16 +299,16 @@ mod tests {
         let roles = FleetRoles::declared("fleet").expect("roles");
         let spell = |address: &str| old_address(&address.parse().expect("address"), &roles, &Charter).expect("spelled");
         assert_eq!(spell("project:flotilla/role:owner"), "principal:bob");
-        assert_eq!(spell("project:flotilla/role:approver"), "principal:approver");
+        assert_eq!(spell("project:flotilla/role:operator"), "principal:operator");
         assert_eq!(spell("fleet:fleet/role:operator"), "principal:operator");
         assert_eq!(spell("project:flotilla/role:gui-approver"), "flotilla/gui-approver");
         let conversion = Conversion { roles: &roles, forges: &[], records: &NoRecords };
         let reply = OldSpec::builder()
-            .sender(spell("project:flotilla/role:approver"))
+            .sender(spell("project:flotilla/role:operator"))
             .receiver("flotilla/gui-approver".into())
             .relation(MessageRelation::Supervisor)
             .body("approved".into())
             .build();
-        assert_eq!(conversion.sender_of(&reply).expect("approver").as_str(), "project:flotilla/role:approver");
+        assert_eq!(conversion.sender_of(&reply).expect("operator").as_str(), "project:flotilla/role:operator");
     }
 }
