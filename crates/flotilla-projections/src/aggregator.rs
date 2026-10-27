@@ -2543,6 +2543,8 @@ impl Aggregator {
         Some(HostName::new(match resolve(acting.as_str()) {
             Some(host) if !host.spec.display_name.is_empty() => host.spec.display_name.clone(),
             Some(host) => host.metadata.name.clone(),
+            // The owning daemon's Host has not replicated yet: show its ref
+            // until that Host event arrives and rebuilds the rows.
             None => acting.as_str().to_owned(),
         }))
     }
@@ -3149,7 +3151,8 @@ fn repository_source_key(namespace: &str, name: &str, provenance: &ResourceProve
     (namespace.to_string(), name.to_string(), origin)
 }
 
-/// Whether two Host records map placements to the same acting daemon.
+/// Whether two Host records map placements to the same acting daemon. Covers
+/// every Host field `acting_daemon` reads; extend it with any field read later.
 fn same_host_authority(left: &ResourceObject<flotilla_resources::Host>, right: &ResourceObject<flotilla_resources::Host>) -> bool {
     left.spec.display_name == right.spec.display_name && left.spec.connection == right.spec.connection
 }
@@ -7561,6 +7564,39 @@ mod tests {
             assert_eq!(row.readiness.blockers[0].resource.host, Some(HostName::new("udder")));
             assert!(aggregator.salience_facts().attention.iter().any(|fact| fact.target == row.resource));
         }
+    }
+
+    // #4021: Host heartbeats do not reproject vessel rows; a change to the
+    // declared authority (display name, connection) or a removal does.
+    #[tokio::test]
+    async fn host_events_report_authority_changes_only() {
+        use flotilla_resources::{HostConnection, HostSpec, HostStatus};
+        let (events, _) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events);
+        let read = |object| ReadResourceObject { object, provenance: ResourceProvenance::Local };
+        let mut host = ResourceBackend::new(InMemoryBackend::default())
+            .using::<flotilla_resources::Host>("flotilla")
+            .create(
+                &InputMeta::builder().name("host-b1".into()).build(),
+                &HostSpec {
+                    display_name: "b1".into(),
+                    connection: HostConnection::AgentlessSsh { owning_daemon: "host-udder".into(), destination: "b1.lan".into() },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("host");
+        assert!(aggregator.apply_host_event(ReadWatchEvent::Added(read(host.clone()))));
+
+        host.status = Some(HostStatus { heartbeat_at: Some(Utc::now()), ..Default::default() });
+        assert!(!aggregator.apply_host_event(ReadWatchEvent::Modified(read(host.clone()))), "heartbeat");
+
+        host.spec.connection = HostConnection::AgentlessSsh { owning_daemon: "host-feta".into(), destination: "b1.lan".into() };
+        assert!(aggregator.apply_host_event(ReadWatchEvent::Modified(read(host.clone()))), "new owning daemon");
+        assert_eq!(aggregator.acting_daemon("host-b1"), Some(HostName::new("host-feta")));
+
+        assert!(aggregator.apply_host_event(ReadWatchEvent::Deleted(read(host))));
+        assert_eq!(aggregator.acting_daemon("host-b1"), None);
     }
 
     #[tokio::test]
