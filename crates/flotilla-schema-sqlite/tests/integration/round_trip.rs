@@ -39,7 +39,7 @@ fn evolve<K: Fixture>(tc: &TestCase, store: &mut Store, name: &str, first: &K, s
         let edge = if tc.draw(gs::integers::<u8>().max_value(3)) == 0 { None } else { current.value.edge(tc, pick(step)) };
         match edge {
             Some((edge, next)) => {
-                stamp = write.apply_edge(current.stamp(), edge).expect("edge");
+                stamp = write.apply_edge(current.stamp(), edge.clone(), &flotilla_schema::NewChange::new("test", edge.at())).expect("edge");
                 model = next.stamped(Some(&current.value), stamp.version).stored().with_identity(name, stamp.version);
             }
             None => {

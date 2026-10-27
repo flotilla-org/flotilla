@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use flotilla_cbor::ErrorKind;
-use flotilla_schema::{Cause, Change, Code, Effect, Event, Hash, Identity, KindCode, Named, Step, Timestamp, Value, LOG_LIMITS};
+use flotilla_schema::{Cause, Change, Code, Effect, Event, Hash, Identity, KindCode, Named, Step, Value, LOG_LIMITS};
 use hegel::{generators as gs, TestCase};
 
 /// Every variant, with integers across the whole `i64` range (bounds included), empty and
@@ -99,10 +99,9 @@ fn events_round_trip_through_cbor(tc: TestCase) {
         home_seq: sequence(&tc),
         prev_seq: sequence(&tc),
         cause: cause(&tc),
-        writer: name(&tc),
-        at: Timestamp(tc.draw(gs::integers::<i64>())),
+        change: sequence(&tc),
         about: tc.draw(gs::booleans()).then(|| identity(&tc)),
-        payload: tc.draw(gs::booleans()).then(|| tc.draw(gs::binary().max_size(8))),
+        arguments: tc.draw(gs::booleans()).then(|| tc.draw(gs::binary().max_size(8))),
         effect: effect(&tc),
     };
     let bytes = event.encode().expect("encode");

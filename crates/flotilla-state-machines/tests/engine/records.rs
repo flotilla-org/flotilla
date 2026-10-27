@@ -204,11 +204,12 @@ impl Log<LedgerMachine> for EdgesOnly {
 
     fn edge(
         &mut self,
+        writer: &str,
         previous: &StoredState<LedgerMachine>,
         next: &Resource<LedgerMachine>,
         event: &EdgeEventOf<LedgerMachine>,
     ) -> Result<Version, LogError> {
-        self.0.edge(previous, next, event)
+        self.0.edge(writer, previous, next, event)
     }
 }
 

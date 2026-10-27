@@ -120,7 +120,7 @@ fn apply_counted<K: Kind>(store: Store, current: Stamp, edge: Edge<K>) -> (Store
     let before = (conn.total_changes(), interned(&conn));
     let mut store = Store::open(conn, LOCAL, registry()).expect("reopen");
     let mut write = store.write().expect("write");
-    let stamp = write.apply_edge(current, edge).expect("edge");
+    let stamp = write.apply_edge(current, edge.clone(), &flotilla_schema::NewChange::new("test", edge.at())).expect("edge");
     let mut changes = write.changes(current.id, current.version, 10).expect("changes");
     write.commit().expect("commit");
     let conn = store.into_connection();
@@ -229,10 +229,11 @@ fn touches_only_declared_rows<K: Fixture>(tc: &TestCase) {
         }
         // One statement per appended row, per row edit and per set field or state of a records
         // row; the root's state as one unit by one statement, and each of its other set fields by
-        // one; then the home and identity sequences and the log entry.
+        // one; then the home and identity sequences and the log entry, and the change it opened
+        // with the home sequence that change took (#4024).
         let root = usize::from(root_state_set) + root_other_sets;
         let record_sets = set_rows.iter().filter(|((index, _), _)| *index != 0).map(|(_, columns)| columns.len()).sum::<usize>();
-        let statements = inserted.len() + updated.len() + deleted.len() + record_sets + root.max(1) + 3;
+        let statements = inserted.len() + updated.len() + deleted.len() + record_sets + root.max(1) + 5;
         assert_eq!(written, statements as u64, "rows written by {change:?}");
         stamp = next;
     }
@@ -275,7 +276,7 @@ fn deliverable() -> Deliverable {
 }
 
 fn event(args: DossierEdge, from: DossierState, to: DossierState) -> DossierEvent {
-    EdgeEvent { edge: args.name(), from, to, writer: "alice".into(), at: Timestamp(6), payload: Payload { args, reads: Vec::new() } }
+    EdgeEvent { edge: args.name(), from, to, at: Timestamp(6), arguments: Payload { args, reads: Vec::new() } }
 }
 
 /// A deliverable edge on a sample dossier: it writes the dossier's state unchanged.
@@ -314,19 +315,19 @@ fn deliverables_move_and_take_evidence_through_edges() {
     let submit = staying_open(DossierEdge::Submit { deliverable: 0 })
         .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(0), Deliverable::EVIDENCE, &evidence("e1")))
         .expect("edge");
-    let submitted = write.apply_edge(inserted, submit).expect("submit");
+    let submitted = write.apply_edge(inserted, submit.clone(), &flotilla_schema::NewChange::new("test", submit.at())).expect("submit");
     let retracted_state = State::new(DeliverableState::Retracted, Timestamp(7));
     let retract = staying_open(DossierEdge::Retract { deliverable: 1, reason: "dropped".into() })
         .and_then(|edge| edge.set_in(Dossier::DELIVERABLES, Position(1), Deliverable::STATE, &retracted_state))
         .expect("edge");
-    let retracted = write.apply_edge(submitted, retract).expect("retract");
+    let retracted = write.apply_edge(submitted, retract.clone(), &flotilla_schema::NewChange::new("test", retract.at())).expect("retract");
 
     let missing = |position| {
         staying_open(DossierEdge::Submit { deliverable: position })
             .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(position), Deliverable::EVIDENCE, &evidence("e9")))
             .expect("edge")
     };
-    let refused = write.apply_edge(retracted, missing(2));
+    let refused = write.apply_edge(retracted, missing(2), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0)));
     assert!(
         matches!(&refused, Err(StoreError::NoRecord { table, key }) if table == "dossier_deliverables" && key == &[Value::Int(2)]),
         "{refused:?}"
@@ -334,9 +335,11 @@ fn deliverables_move_and_take_evidence_through_edges() {
     let retract_missing = staying_open(DossierEdge::Retract { deliverable: 5, reason: String::new() })
         .and_then(|edge| edge.set_in(Dossier::DELIVERABLES, Position(5), Deliverable::STATE, &retracted_state))
         .expect("edge");
-    let refused = write.apply_edge(retracted, retract_missing);
+    let refused = write.apply_edge(retracted, retract_missing.clone(), &flotilla_schema::NewChange::new("test", retract_missing.at()));
     assert!(matches!(&refused, Err(StoreError::NoRecord { table, .. }) if table == "dossier_deliverables"), "{refused:?}");
-    let _last = write.apply_edge(retracted, deliver()).expect("a refused edge leaves the transaction usable");
+    let _last = write
+        .apply_edge(retracted, deliver(), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0)))
+        .expect("a refused edge leaves the transaction usable");
     write.commit().expect("commit");
 
     let dossier = load(&mut store, inserted.id);
@@ -363,10 +366,16 @@ fn edges_are_owner_checked_and_optimistic() {
     let mut write = store.write().expect("write");
     let stamp = write.insert("c", &Dossier::sample(0), &origin()).expect("insert");
     let edge = deliver;
-    let moved = write.apply_edge(stamp, edge()).expect("edge");
-    assert!(matches!(write.apply_edge(stamp, edge()), Err(StoreError::Conflict { .. })));
+    let moved = write.apply_edge(stamp, edge(), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0))).expect("edge");
+    assert!(matches!(
+        write.apply_edge(stamp, edge(), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0))),
+        Err(StoreError::Conflict { .. })
+    ));
     write.delete::<Dossier>(moved, &origin()).expect("delete");
-    assert!(matches!(write.apply_edge(moved, edge()), Err(StoreError::NotFound { .. })));
+    assert!(matches!(
+        write.apply_edge(moved, edge(), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0))),
+        Err(StoreError::NotFound { .. })
+    ));
     write.commit().expect("commit");
 
     let mut remote = Store::open(Connection::open_in_memory().expect("db"), "remote", registry()).expect("open");
@@ -375,6 +384,7 @@ fn edges_are_owner_checked_and_optimistic() {
     write.commit().expect("commit");
     let change = remote.read().expect("read").changes_since("remote", 0, 1).expect("log").remove(0);
     let mut write = store.write().expect("write");
+    crate::fixtures::carry_changes(&mut remote, &mut write, std::slice::from_ref(&change));
     let Applied::Applied(far) = write.apply(&change).expect("apply") else { panic!("applied") };
     // A stale stamp is `Conflict` even when the edge is also wrong in another way (here, an
     // append under a records row that does not exist): retrying callers re-read on `Conflict`.
@@ -384,9 +394,14 @@ fn edges_are_owner_checked_and_optimistic() {
             .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence("e")))
             .expect("edge")
     };
-    write.apply_edge(current, edge()).expect("edge");
-    assert!(matches!(write.apply_edge(current, both_wrong()), Err(StoreError::Conflict { .. })));
-    assert!(matches!(write.apply_edge(far, edge()), Err(StoreError::NotHome { home, .. }) if home == "remote"));
+    write.apply_edge(current, edge(), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0))).expect("edge");
+    assert!(matches!(
+        write.apply_edge(current, both_wrong(), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0))),
+        Err(StoreError::Conflict { .. })
+    ));
+    assert!(
+        matches!(write.apply_edge(far, edge(), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0))), Err(StoreError::NotHome { home, .. }) if home == "remote")
+    );
 }
 
 // Behaviour (ruling 1, #3319's state value): every edge writes the state value, so its root `Set`
@@ -402,9 +417,16 @@ fn every_edge_writes_the_state_and_moves_the_version() {
     let mut current = inserted;
     for (label, edge) in [(DossierState::Open, unchanged as fn() -> Edge<Dossier>), (DossierState::Delivered, deliver)] {
         let mut write = store.write().expect("write");
-        let moved = write.apply_edge(current, edge()).expect("edge");
+        let moved =
+            write.apply_edge(current, edge(), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0))).expect("edge");
         assert!(moved.version > current.version);
-        assert!(matches!(write.apply_edge(current, edge()), Err(StoreError::Conflict { .. })), "stale stamp, {label:?}");
+        assert!(
+            matches!(
+                write.apply_edge(current, edge(), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0))),
+                Err(StoreError::Conflict { .. })
+            ),
+            "stale stamp, {label:?}"
+        );
         write.commit().expect("commit");
         assert_eq!(snapshot(&mut store, moved.id).version, moved.version);
         let change = store.read().expect("read").changes(moved.id, current.version, 10).expect("log").remove(0);
@@ -428,9 +450,9 @@ fn edges_carry_the_objects_they_set() {
     let placed = staying_open(DossierEdge::Promise { deliverable: 0 })
         .and_then(|edge| edge.set(Dossier::PLACEMENT, &Some(placement())))
         .expect("edge");
-    let b = write.apply_edge(b, placed).expect("edge");
+    let b = write.apply_edge(b, placed.clone(), &flotilla_schema::NewChange::new("test", placed.at())).expect("edge");
     let cleared = staying_open(DossierEdge::Promise { deliverable: 0 }).and_then(|edge| edge.set(Dossier::PLACEMENT, &None)).expect("edge");
-    let b = write.apply_edge(b, cleared).expect("edge");
+    let b = write.apply_edge(b, cleared.clone(), &flotilla_schema::NewChange::new("test", cleared.at())).expect("edge");
     write.commit().expect("commit");
     let changes = source.read().expect("read").changes(b.id, 0, 10).expect("log");
     let puts: Vec<usize> = changes.iter().map(|change| change.effect.objects.len()).collect();
@@ -439,6 +461,7 @@ fn edges_carry_the_objects_they_set() {
 
     let mut replica = Store::open(Connection::open_in_memory().expect("db"), "replica", registry()).expect("open");
     let mut write = replica.write().expect("write");
+    crate::fixtures::carry_changes(&mut source, &mut write, &changes[..2]);
     for change in &changes[..2] {
         assert!(matches!(write.apply(change).expect("apply"), Applied::Applied(_)));
     }

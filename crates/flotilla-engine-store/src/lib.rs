@@ -11,7 +11,9 @@ pub mod plain;
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use flotilla_schema::{Cbor, Event, Identity, Kind, KindRegistry, KindSpec, Labelled, Origin, RegistryError, StateData, Timestamp};
+use flotilla_schema::{
+    Cbor, ChangeItem, Event, Identity, Kind, KindRegistry, KindSpec, Labelled, NewChange, RegistryError, StateData, Timestamp,
+};
 use flotilla_schema_sqlite::{AboutCursor, Read, Stamp, Store, StoreError};
 use flotilla_state_machines::{
     machines::{
@@ -123,7 +125,7 @@ impl StoreLog {
     pub fn consumer<M: Consumer>(mut self) -> Self
     where
         M::Spec: KindSpec,
-        EdgePayload<M::Edge>: Cbor,
+        M::Edge: Cbor,
     {
         self.receipts = self.receipts.consumer::<M>();
         self
@@ -309,6 +311,16 @@ impl From<StoreError> for ReadError {
     }
 }
 
+impl StoreLog {
+    /// The change a home's write opens (#4024): its writer and time, and as its items the records
+    /// its reads named. Which reads name records is the open question on #4024; until it is ruled,
+    /// none is an item.
+    fn change(&self, writer: &str, at: Timestamp, reads: &[InputRead]) -> NewChange {
+        let items: Vec<ChangeItem> = reads.iter().filter_map(|_| None).collect();
+        NewChange::new(writer, at).with_items(items)
+    }
+}
+
 impl<M> Log<M> for StoreLog
 where
     M: Machine,
@@ -316,21 +328,24 @@ where
     M::State: StateData + Labelled<Label = Label<M>>,
     M::Write: StoredWrite<Resource<M>>,
     EdgePayload<M::Edge>: Cbor,
+    M::Edge: Cbor,
 {
     fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<M>, reads: &[InputRead]) -> Result<Version, LogError> {
-        let origin = Origin::new(writer, at).with_payload(&reads.to_vec()).map_err(refused)?;
+        let change = self.change(writer, at, reads);
         let mut store = lock_store(&self.store);
         let mut write = store.write().map_err(refused)?;
-        let stamp = write.insert(resource.name(), resource, &origin).map_err(refused)?;
+        let change = write.open_change(&change).map_err(refused)?;
+        let stamp = write.insert(resource.name(), resource, change).map_err(refused)?;
         write.commit().map_err(refused)?;
         Ok(Version(stamp.version))
     }
-    fn edge(&mut self, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
-        self.edge_with_writes(previous, next, event, &[])
+    fn edge(&mut self, writer: &str, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
+        self.edge_with_writes(writer, previous, next, event, &[])
     }
 
     fn edge_with_writes(
         &mut self,
+        writer: &str,
         previous: &StoredState<M>,
         next: &Resource<M>,
         event: &EdgeEventOf<M>,
@@ -344,7 +359,8 @@ where
         let mut write = store.write().map_err(refused)?;
         let id =
             write.resolve(Resource::<M>::CODE, next.name(), &self.home).map_err(refused)?.ok_or_else(|| LogError::new("not stored"))?;
-        let stamp = write.apply_edge(Stamp { id, version: next.version().0 }, edge).map_err(refused)?;
+        let change = write.open_change(&self.change(writer, event.at, &event.arguments.reads)).map_err(refused)?;
+        let stamp = write.apply_edge(Stamp { id, version: next.version().0 }, edge, change).map_err(refused)?;
         write.commit().map_err(refused)?;
         Ok(Version(stamp.version))
     }
@@ -387,24 +403,26 @@ impl Log<Message> for MessageLog {
         resource: Resource<Message>,
         reads: &[InputRead],
     ) -> Result<Resource<Message>, LogError> {
-        let origin = Origin::new(writer, at).with_payload(&reads.to_vec()).map_err(refused)?;
+        let change = self.inner.change(writer, at, reads);
         let mut store = lock_store(&self.inner.store);
         let mut write = store.write().map_err(refused)?;
+        let change = write.open_change(&change).map_err(refused)?;
         let mut spec = resource.spec().clone();
         spec.admitted_seq = write.last_sequence(&self.inner.home).map_err(refused)? + 1;
         let resource = resource.with_spec(spec);
-        let stamp = write.insert(resource.name(), &resource, &origin).map_err(refused)?;
+        let stamp = write.insert(resource.name(), &resource, change).map_err(refused)?;
         write.commit().map_err(refused)?;
         Ok(Resource::stored(resource.name(), resource.spec().clone(), resource.stored_state().clone(), Version(stamp.version)))
     }
 
     fn edge(
         &mut self,
+        writer: &str,
         previous: &StoredState<Message>,
         next: &Resource<Message>,
         event: &EdgeEventOf<Message>,
     ) -> Result<Version, LogError> {
-        <StoreLog as Log<Message>>::edge(&mut self.inner, previous, next, event)
+        <StoreLog as Log<Message>>::edge(&mut self.inner, writer, previous, next, event)
     }
 }
 

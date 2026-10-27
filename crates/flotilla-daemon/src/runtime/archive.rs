@@ -15,9 +15,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_engine_store::archive::{
-    bundle_key, ArchiveError, ArchiveKinds, ArchiveNote, Archiver, Bundle, Due, Prepared, Stage, BUNDLE_MEDIA_TYPE,
-};
+use flotilla_engine_store::archive::{bundle_key, ArchiveError, ArchiveKinds, Archiver, Bundle, Due, Prepared, Stage, BUNDLE_MEDIA_TYPE};
 use flotilla_resources::{Clock, ConditionValue, HostCondition};
 use flotilla_schema::{Identity, KindRegistry, Timestamp};
 use flotilla_schema_sqlite::Store;
@@ -211,9 +209,9 @@ impl ArchiveShipper {
                         report.failed.push((identity, error));
                     }
                 },
-                Due::Expunge(identity, note) => {
+                Due::Expunge(identity) => {
                     let target = identity.clone();
-                    match self.blocking(move |archiver, store| archiver.expunge(store, &target, &note, now)).await {
+                    match self.blocking(move |archiver, store| archiver.expunge(store, &target, now)).await {
                         Ok(true) => report.expunged.push(identity),
                         // Still referenced: the identity stays as the tombstone, retried next pass.
                         Ok(false) => {}
@@ -245,9 +243,8 @@ impl ArchiveShipper {
                 return Err(ShipError::Store(format!("{}: confirm: the store does not hold the uploaded bundle", store.location())));
             }
         }
-        let note = ArchiveNote { key, digest: format!("{digest:x}") };
         let target = identity.clone();
-        self.blocking(move |archiver, store| archiver.delete(store, &target, version, &note, now)).await.map_err(ShipError::Local)?;
+        self.blocking(move |archiver, store| archiver.delete(store, &target, version, now)).await.map_err(ShipError::Local)?;
         Ok(true)
     }
 
@@ -421,11 +418,20 @@ pub(crate) fn readable(bundle: &Bundle, kinds: &KindRegistry) -> Result<Value, S
             .and_then(|column| column.categories.iter().find(|(value, _)| value == code.as_str()).map(|(_, name)| name.clone()))
             .unwrap_or_else(|| code.as_str().to_owned())
     };
+    let changes: std::collections::BTreeMap<u64, &flotilla_schema::ChangeHeader> =
+        bundle.changes.iter().map(|change| (change.seq, change)).collect();
     let entries: Vec<Value> = bundle
         .entries
         .iter()
         .map(|entry| {
-            let mut value = json!({"seq": entry.home_seq, "cause": entry.cause.name(), "writer": entry.writer, "at": time(entry.at)});
+            let change = changes.get(&entry.change);
+            let mut value = json!({
+                "seq": entry.home_seq,
+                "cause": entry.cause.name(),
+                "change": entry.change,
+                "writer": change.map(|change| change.writer.clone()),
+                "at": change.map(|change| time(change.at)),
+            });
             if let flotilla_schema::Cause::Edge { edge, from, to } = &entry.cause {
                 value["edge"] = json!(edge_name(edge));
                 value["from"] = json!(label_name(from));

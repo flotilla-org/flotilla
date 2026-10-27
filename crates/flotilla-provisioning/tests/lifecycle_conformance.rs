@@ -175,8 +175,9 @@ where
             let Some(last) = entries.last() else { break };
             after = last.home_seq;
             for entry in &entries {
-                if let Some(event) = edge_event::<Machine<K>>(entry).expect("entry decodes") {
-                    if let LifecycleEdge::Attempted(attempted) = event.payload.edge {
+                let at = read.change(HOME, entry.change).expect("read").expect("its change").at;
+                if let Some(event) = edge_event::<Machine<K>>(entry, at).expect("entry decodes") {
+                    if let LifecycleEdge::Attempted(attempted) = event.arguments {
                         attempts.push(attempted.outcome);
                     }
                 }

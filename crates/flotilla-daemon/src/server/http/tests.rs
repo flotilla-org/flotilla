@@ -613,7 +613,7 @@ struct HttpStreamSample {
 #[tokio::test]
 async fn http_change_stream_requires_peer_session() {
     use flotilla_protocol::CommandValue;
-    use flotilla_schema::{KindRegistry, Origin, Timestamp};
+    use flotilla_schema::{KindRegistry, NewChange, Timestamp};
     use flotilla_schema_sqlite::stream::Service;
     let (_dir, daemon) = super::super::tests::empty_daemon().await;
     let files = tempfile::tempdir().expect("files");
@@ -627,7 +627,7 @@ async fn http_change_stream_requires_peer_session() {
                 write.insert(
                     &format!("sample-{index}"),
                     &HttpStreamSample { value: "sample".into() },
-                    &Origin::new("test", Timestamp(1)),
+                    &NewChange::new("test", Timestamp(1)),
                 )?;
             }
             write.commit()
@@ -673,7 +673,8 @@ async fn http_change_stream_requires_peer_session() {
             .expect("unrelated SQLite read progresses")
             .expect("reader task")
             .expect("read"),
-        20
+        40,
+        "twenty writes, each a change and its entry"
     );
     // HTTP continues after the routed Begin and ends at the same Keepalive.
     let chunks: Vec<_> = futures::StreamExt::collect(bodies.remove(0).into_data_stream()).await;

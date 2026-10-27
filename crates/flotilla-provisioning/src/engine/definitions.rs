@@ -15,7 +15,7 @@ use std::{
 
 use flotilla_engine_store::{
     follow::{Followed, Follower},
-    plain::{PlainError, PlainLog},
+    plain::{PendingChange, PlainError, PlainLog},
 };
 use flotilla_resources::{
     definitions::{origin, stamp, DefinitionOrigin, DEFINITION_KINDS},
@@ -23,7 +23,7 @@ use flotilla_resources::{
     CredentialGrantSpec, CredentialSpecSpec, CrewDefaultsSpec, FleetDesignationSpec, ForgeSpec, ImageLayerResourceSpec,
     WorkflowTemplateSpec,
 };
-use flotilla_schema::{Identity, Kind, KindCode, Timestamp};
+use flotilla_schema::{Identity, Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
@@ -339,8 +339,8 @@ impl EngineDefinitions {
                 // The stored value holds the origin too, so a new revision of a manifest document
                 // writes even when its spec is unchanged; an identical write logs nothing.
                 Some(current) if current.spec == value => Ok(current.version),
-                Some(current) => self.log.edit(name, current.version, &value, WRITER, now),
-                None => self.log.create(name, &value, WRITER, now),
+                Some(current) => self.log.edit(name, current.version, &value, &PendingChange::new(NewChange::new(WRITER, now))),
+                None => self.log.create(name, &value, &PendingChange::new(NewChange::new(WRITER, now))),
             };
             match written {
                 Ok(version) => return record(name.to_owned(), self.home.clone(), version, &value),
@@ -353,7 +353,7 @@ impl EngineDefinitions {
 
     fn remove<K: Definition>(&self, name: &str) -> Result<(), String> {
         let Some(current) = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())? else { return Ok(()) };
-        match self.log.delete::<K>(name, current.version, WRITER, self.now()) {
+        match self.log.delete::<K>(name, current.version, &PendingChange::new(NewChange::new(WRITER, self.now()))) {
             Ok(()) | Err(PlainError::Missing { .. }) => Ok(()),
             Err(error) => Err(format!("delete {} {name}: {error}", K::NAME)),
         }

@@ -5,12 +5,13 @@
 
 use std::fmt::Debug;
 
-use flotilla_schema::{Cbor, Identity, Kind, KindSpec, Labelled, Origin, StateData, Timestamp};
+use flotilla_schema::{Cbor, EdgeEvent, Identity, Kind, KindSpec, Labelled, NewChange, StateData, Timestamp};
 use flotilla_schema_sqlite::{Stamp, Store};
 use flotilla_state_machines::{
     edge_event,
     machines::message::{Deliver, MemoryMessageWorld, Message, MessageBody, MessageSpec, MessageState, Settle, Settlement},
-    EdgeEventOf, EdgePayload, Home, InputRead, Label, Log, LogError, Machine, Ref, Resource, StoredState, Transport, Version, WriteError,
+    EdgeEventOf, EdgePayload, Home, InputRead, Label, Log, LogError, LoggedEdgeOf, Machine, Ref, Resource, StoredState, Transport, Version,
+    WriteError,
 };
 
 use crate::fixtures::{addr, message, store, LOCAL};
@@ -32,22 +33,22 @@ where
     M::Spec: KindSpec<State = M::State>,
     M::State: StateData + Labelled<Label = Label<M>>,
     EdgePayload<M::Edge>: Cbor,
+    M::Edge: Cbor,
 {
-    fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<M>, reads: &[InputRead]) -> Result<Version, LogError> {
-        let origin = Origin::new(writer, at).with_payload(&reads.to_vec()).map_err(refused)?;
+    fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<M>, _: &[InputRead]) -> Result<Version, LogError> {
         let mut write = self.store.write().map_err(refused)?;
-        let stamp = write.insert(resource.name(), resource, &origin).map_err(refused)?;
+        let stamp = write.insert(resource.name(), resource, &NewChange::new(writer, at)).map_err(refused)?;
         write.commit().map_err(refused)?;
         Ok(Version(stamp.version))
     }
 
-    fn edge(&mut self, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
+    fn edge(&mut self, writer: &str, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
         // Every master a message's edge could name is a session at this home; none of these does.
         let master = |name: &str| Identity { kind: Resource::<Message>::CODE, name: name.to_owned(), home: LOCAL.to_owned() };
         let edge = next.stored_edge_about(previous, event, master).map_err(refused)?;
         let mut write = self.store.write().map_err(refused)?;
         let id = write.resolve(Resource::<M>::CODE, next.name(), LOCAL).map_err(refused)?.ok_or_else(|| LogError::new("not stored"))?;
-        let stamp = write.apply_edge(Stamp { id, version: next.version().0 }, edge).map_err(refused)?;
+        let stamp = write.apply_edge(Stamp { id, version: next.version().0 }, edge, &NewChange::new(writer, event.at)).map_err(refused)?;
         write.commit().map_err(refused)?;
         Ok(Version(stamp.version))
     }
@@ -83,6 +84,7 @@ where
     M::Spec: KindSpec<State = M::State> + Debug,
     M::State: StateData + Labelled<Label = Label<M>>,
     EdgePayload<M::Edge>: Cbor,
+    M::Edge: Cbor,
 {
     let mut read = home.log_mut().store.read().expect("read");
     let id = read.resolve(Resource::<M>::CODE, name, LOCAL).expect("resolve").expect("stored");
@@ -96,19 +98,20 @@ where
 fn a_home_over_the_store_adopts_each_writes_home_seq() {
     let mut home = home();
     let world = world(&["a", "b"]);
+    // Each write's change takes the sequence before the write's own (#4024).
     let created = home.create("a", message::sample_spec(), &world, at(1)).expect("created").resource.version();
-    assert_eq!(created, Version(1));
-    assert_eq!(home.create("b", message::sample_spec(), &world, at(1)).expect("created").resource.version(), Version(2));
+    assert_eq!(created, Version(2));
+    assert_eq!(home.create("b", message::sample_spec(), &world, at(1)).expect("created").resource.version(), Version(4));
     home.apply("a", deliver(), &world, at(2)).expect("delivered");
     home.apply("b", deliver(), &world, at(3)).expect("delivered");
     home.apply("a", Settle { by: Settlement::Answered }, &world, at(4)).expect("settled");
     let versions = [home.get("a").expect("a").version(), home.get("b").expect("b").version()];
-    assert_eq!(versions, [Version(5), Version(4)], "a's writes took 1, 3 and 5, b's 2 and 4");
+    assert_eq!(versions, [Version(10), Version(8)], "a's writes took 2, 6 and 10, b's 4 and 8; their changes the odd ones");
     for name in ["a", "b"] {
         let held = home.get(name).expect("held").clone();
         assert_eq!(loaded(&mut home, name), held, "the home holds what the store holds, at its version");
     }
-    assert_eq!(home.log_mut().store.read().expect("read").last_sequence(LOCAL).expect("sequence"), 5);
+    assert_eq!(home.log_mut().store.read().expect("read").last_sequence(LOCAL).expect("sequence"), 10);
 }
 
 // Behaviour (R1): history is no part of the resource the home decides on: loading the current state
@@ -135,11 +138,21 @@ fn history_is_a_paged_range_over_the_log_that_decodes_to_the_homes_events() {
         pages += 1;
         entries.extend(page);
     }
-    assert_eq!((pages, entries.iter().map(|entry| entry.home_seq).collect::<Vec<_>>()), (2, vec![1, 3, 5]), "a's entries alone");
-    let decoded: Vec<Option<EdgeEventOf<Message>>> =
-        entries.iter().map(|entry| edge_event::<Message>(entry).expect("an entry of the kind")).collect();
+    assert_eq!((pages, entries.iter().map(|entry| entry.home_seq).collect::<Vec<_>>()), (2, vec![2, 6, 10]), "a's entries alone");
+    let decoded: Vec<Option<LoggedEdgeOf<Message>>> = entries
+        .iter()
+        .map(|entry| {
+            let at = read.change(LOCAL, entry.change).expect("read").expect("its change").at;
+            edge_event::<Message>(entry, at).expect("an entry of the kind")
+        })
+        .collect();
     assert_eq!(decoded[0], None, "the create is no edge");
-    assert_eq!(decoded[1..].iter().flatten().cloned().collect::<Vec<_>>(), events, "each edge's entry is the event the home returned");
+    // The entry keeps the edge; the reads the home recorded are its change's (#4024).
+    let logged: Vec<_> = events
+        .iter()
+        .map(|event| EdgeEvent { edge: event.edge, from: event.from, to: event.to, at: event.at, arguments: event.arguments.edge.clone() })
+        .collect();
+    assert_eq!(decoded[1..].iter().flatten().cloned().collect::<Vec<_>>(), logged, "each edge's entry is the event the home returned");
     drop(read);
     let current = loaded::<Message>(&mut home, "a");
     assert_eq!(current.state(), &MessageState::Settled { receiver: Some(message::agent("s", "h")) });
@@ -160,7 +173,7 @@ fn a_write_the_store_refuses_leaves_the_homes_resource_as_it_was() {
         let current = write.load::<Resource<Message>>(id).expect("load").expect("present");
         let spec = MessageSpec { inbox: addr("elsewhere"), ..current.value.spec().clone() };
         let edited = current.value.clone().with_spec(spec);
-        write.update(&current, &edited, &Origin::new("other", at(2))).expect("edit");
+        write.update(&current, &edited, &NewChange::new("other", at(2))).expect("edit");
         write.commit().expect("commit");
     }
     let refused = home.apply("a", deliver(), &world, at(3));
@@ -174,8 +187,8 @@ fn occurrences(bytes: &[u8], needle: &[u8]) -> usize {
 }
 
 // Behaviour (#3424 ruling 4): a message's body is stored at most twice, once in `objects` and once
-// among its create entry's effect objects. The create's payload is the reads admission relied on,
-// never the request, so the entry does not also copy the spec and its body.
+// among its create entry's effect objects. The create's change names the records admission relied
+// on, never the request, so neither it nor the entry copies the spec and its body.
 #[test]
 fn a_messages_body_is_stored_at_most_twice() {
     let mut home = home();
@@ -187,8 +200,7 @@ fn a_messages_body_is_stored_at_most_twice() {
     let mut store = std::mem::replace(&mut home.log_mut().store, store());
     let entries = store.read().expect("read").changes_since(LOCAL, 0, 10).expect("log");
     let [create] = entries.as_slice() else { panic!("one entry: {entries:?}") };
-    let payload = create.payload.as_deref().unwrap_or_default();
-    assert_eq!(occurrences(payload, needle), 0, "the payload is admission's reads, not the request");
+    assert_eq!(create.arguments, None, "a create has no arguments");
     assert_eq!(occurrences(&create.encode().expect("encodes"), needle), 1, "the effect carries the body once, as its object");
 
     let conn = store.into_connection();

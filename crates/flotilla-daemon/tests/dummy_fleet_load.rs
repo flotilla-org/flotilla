@@ -343,15 +343,25 @@ fn watch_engine_messages(service: Arc<Service>, view: Arc<HomeView>) {
                 }
             };
             cursor = Some(next);
+            // A round sends each entry's change before it: the change holds the entry's time.
+            let mut times = std::collections::HashMap::new();
             for frame in frames {
-                let Frame::Change(event) = frame else { continue };
+                let event = match frame {
+                    Frame::Reason(change) => {
+                        times.insert((change.home, change.seq), change.at);
+                        continue;
+                    }
+                    Frame::Change(event) => event,
+                    _ => continue,
+                };
+                let Some(&written) = times.get(&(event.home.clone(), event.change)) else { continue };
                 match (&event.cause, &event.about) {
                     (Cause::Create, _) if event.kind == MESSAGE => {
-                        created.insert(event.identity(), event.at);
+                        created.insert(event.identity(), written);
                     }
                     (Cause::Edge { edge, .. }, Some(message)) if *edge == receive => {
                         if let Some(at) = created.remove(message) {
-                            let micros = event.at.since(at).max(0);
+                            let micros = written.since(at).max(0);
                             view.turn_delivery.record(Duration::from_micros(micros as u64));
                             if micros >= 5_000_000 {
                                 tracing::info!(name = %message.name, latency_ms = micros / 1000, "load slow engine message receipt");

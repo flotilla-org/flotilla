@@ -68,9 +68,10 @@ fn update_without_row_changes_is_a_no_op() {
     let finer = Referral { sent_at: Some(time + Duration::nanoseconds(999)), ..value.clone() };
     assert_eq!(floor(finer.sent_at.expect("set")), time);
     assert_eq!(write.update(&current, &finer, &origin()).expect("no-op below resolution"), stamp);
-    // The next real write takes the very next sequence: the no-ops consumed none.
+    // The next real write takes the very next sequences, its change's and its entry's: the no-ops
+    // consumed none and opened no change.
     let next = write.update(&current, &Referral { seq: 9, ..value.clone() }, &origin()).expect("update");
-    assert_eq!(next.version, stamp.version + 1);
+    assert_eq!(next.version, stamp.version + 2);
     write.commit().expect("commit");
 }
 

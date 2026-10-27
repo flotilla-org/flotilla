@@ -32,7 +32,9 @@ pub fn audit_domains(conn: &Connection, kinds: &KindRegistry) -> Result<(), Stor
         ("stream_history", "home", HOME_DOMAIN),
         ("stream_watermark", "home", HOME_DOMAIN),
         ("log", "home", HOME_DOMAIN),
-        ("log", "writer", WRITER_DOMAIN),
+        ("change", "home", HOME_DOMAIN),
+        ("change_items", "change_home", HOME_DOMAIN),
+        ("change", "writer", WRITER_DOMAIN),
     ] {
         check(table, column, domain)?;
     }

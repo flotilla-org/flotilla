@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::{EdgeKind, InputRead, Label, Machine};
 
 /// The document of one edge event: the typed edge with its arguments, and
-/// every read its gate and effect recorded. Stored as the event's one inline
-/// CBOR document (#3320), so its shape can change without a schema change.
+/// every read its gate and effect recorded. Its log entry stores the edge as
+/// its arguments, one inline CBOR document (#3320); the reads are its change's
+/// inputs (#4024).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgePayload<E> {
     pub edge: E,
@@ -20,7 +21,7 @@ pub struct EdgePayload<E> {
 }
 
 /// One applied edge of machine `M`: the edge kind, the labels it moved
-/// between, the home's writer, the time and the [`EdgePayload`]. Events are
+/// between, the time and the [`EdgePayload`]. Events are
 /// history for showing and auditing what happened; the current state, not a
 /// replay of events, answers what is true now.
 pub type EdgeEventOf<M> = flotilla_schema::EdgeEvent<Label<M>, EdgeKind<M>, EdgePayload<<M as Machine>::Edge>>;

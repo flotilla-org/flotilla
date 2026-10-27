@@ -13,9 +13,9 @@ use std::{
 
 use crate::DdlMode;
 use flotilla_schema::{
-    whole_log_topic, Cause, Change, Code, ColumnDef, ColumnType, DecodeError, Decoder, Edge, EdgeParts, EdgeRow, Effect, Encoder, Event,
-    Hash, Identity, IndexQuery, Kind, KindCode, KindRegistry, Named, Origin, Row, RowEdit, RowPath, Rows, TableRole, Timestamp, Value,
-    HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN,
+    whole_log_topic, Cause, Change, ChangeHeader, ChangeItem, Code, ColumnDef, ColumnType, DecodeError, Decoder, Edge, EdgeParts, EdgeRow,
+    Effect, Encoder, Event, Hash, Identity, IndexQuery, Kind, KindCode, KindRegistry, Named, NewChange, Row, RowEdit, RowPath, Rows,
+    TableRole, Timestamp, Value, HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,14 +27,40 @@ use crate::{
     error::{Malformed, StoreError},
     query::{page_limit, Cursor, Page},
     shared::{
-        check_kind_codes, check_kind_columns, has_string_domain, schema_ddl, sync_views, FLOOR_GET, FLOOR_RAISE, HOME_IDS_RESET,
-        HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE,
-        IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE,
+        check_kind_codes, check_kind_columns, has_string_domain, log_predates_changes, schema_ddl, sync_views, CHANGE_APPEND,
+        CHANGE_EXISTS, CHANGE_GET, CHANGE_ITEMS, CHANGE_ITEM_APPEND, CHANGE_SEQS, FLOOR_GET, FLOOR_RAISE, HOME_IDS_RESET, HOME_LOG_CLEAR,
+        HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ,
+        IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE,
         LOG_EXPUNGED_AFTER, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE,
         SHARED_STATEMENTS, STRING_ID, STRING_INSERT, WATERMARK_PUT,
     },
     sql::{KindSql, TableSql},
 };
+
+/// A change opened at this store's home (#4024): its sequence there. Every write names the change
+/// it belongs to; a change outlives the transaction that opened it, so later writes may name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChangeId(pub u64);
+
+/// The change a write belongs to: one already opened ([`Write::open_change`]), shared by every
+/// write of one apply, or a new one this write opens for itself.
+#[derive(Debug, Clone, Copy)]
+pub enum InChange<'a> {
+    Opened(ChangeId),
+    New(&'a NewChange),
+}
+
+impl From<ChangeId> for InChange<'_> {
+    fn from(id: ChangeId) -> Self {
+        InChange::Opened(id)
+    }
+}
+
+impl<'a> From<&'a NewChange> for InChange<'a> {
+    fn from(change: &'a NewChange) -> Self {
+        InChange::New(change)
+    }
+}
 
 /// A resource's local id: `resource_identity.id`, also its root row's primary key. Local to one
 /// database; logical rows never carry it.
@@ -164,6 +190,10 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", false)?;
         conn.set_prepared_statement_cache_capacity(options.statement_cache);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Checked before the DDL, whose `log` indexes name columns an older `log` lacks.
+        if log_predates_changes(&tx)? {
+            return Err(StoreError::LegacyLogSchema);
+        }
         tx.execute_batch(&schema_ddl(&kinds, DdlMode::IfNotExists))?;
         if !has_string_domain(&tx)? {
             return Err(StoreError::LegacyDictionarySchema);
@@ -331,6 +361,35 @@ impl Read<'_> {
         self.ctx().about(id, after, limit)
     }
 
+    /// The change `seq` homed at `home`, with its items in order, if this store holds it: who
+    /// wrote its entries, when, and what from.
+    pub fn change(&mut self, home: &str, seq: u64) -> Result<Option<ChangeHeader>, StoreError> {
+        self.ctx().change(home, seq)
+    }
+
+    /// The changes `events` belong to, each once, in the order first named: what a receiver records
+    /// before it applies them ([`Write::record_change`]).
+    pub fn changes_of(&mut self, events: &[Event]) -> Result<Vec<ChangeHeader>, StoreError> {
+        let mut seen = BTreeSet::new();
+        let mut changes = Vec::new();
+        for event in events {
+            if seen.insert((event.home.clone(), event.change)) {
+                let change = self
+                    .change(&event.home, event.change)?
+                    .ok_or_else(|| StoreError::MissingChange { home: event.home.clone(), seq: event.change })?;
+                changes.push(change);
+            }
+        }
+        Ok(changes)
+    }
+
+    /// The sequences of `home`'s changes this store holds strictly between `after` and `before`, in
+    /// order: what a stream sends between two entries, so its cursor stays a prefix of the home's
+    /// sequence.
+    pub fn change_seqs(&mut self, home: &str, after: u64, before: u64) -> Result<Vec<u64>, StoreError> {
+        self.ctx().change_seqs(home, after, before)
+    }
+
     /// The highest sequence of `home` this store has taken or applied; 0 when none.
     pub fn last_sequence(&mut self, home: &str) -> Result<u64, StoreError> {
         self.ctx().last_sequence(home)
@@ -436,7 +495,9 @@ impl Write<'_> {
             let home = ctx.intern(HOME_DOMAIN, home)?;
             let seq = i64::try_from(mark.home_seq).map_err(|_| Malformed::Sequence { home_seq: mark.home_seq })?;
             if mark.home_seq > current.home_seq {
-                let logged = ctx.conn.prepare_cached(LOG_CAUSE)?.query_row(params![home, seq], |_| Ok(())).optional()?.is_some();
+                // A home's sequence numbers its changes and its entries (#4024): either fills the prefix.
+                let logged = ctx.conn.prepare_cached(LOG_CAUSE)?.query_row(params![home, seq], |_| Ok(())).optional()?.is_some()
+                    || ctx.conn.prepare_cached(CHANGE_EXISTS)?.query_row(params![home, seq], |_| Ok(())).optional()?.is_some();
                 if mark.home_seq != current.home_seq + 1 || !logged {
                     return Err(StoreError::Stream("watermark would skip an unapplied prefix".into()));
                 }
@@ -580,6 +641,11 @@ impl Write<'_> {
     /// the last returned `home_seq`. A limit of 0 is `ZeroLimit`; one above
     /// [`MAX_PAGE`](crate::MAX_PAGE) is lowered to it. A page also stays within the store's byte
     /// budget ([`MAX_CHANGES_PAGE_BYTES`] by default) and always holds at least one entry.
+    /// The change `seq` homed at `home`, as [`Read::change`] reads it, within this write.
+    pub fn change(&mut self, home: &str, seq: u64) -> Result<Option<ChangeHeader>, StoreError> {
+        self.ctx().change(home, seq)
+    }
+
     pub fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<Event>, StoreError> {
         self.ctx().changes_since(home, after, limit)
     }
@@ -611,14 +677,32 @@ impl Write<'_> {
         self.ctx().scan::<K>(home, after, limit)
     }
 
-    /// Inserts a resource homed here, logged as a `create` entry by `origin`. Its version is the
-    /// next local home sequence, which also stamps every `records` and `history` row it holds.
-    pub fn insert<K: Kind>(&mut self, name: &str, value: &K, origin: &Origin) -> Result<Stamp, StoreError> {
-        let rows = Encoder::encode(value)?;
-        self.guarded(|ctx| ctx.insert::<K>(name, rows, origin.clone()))
+    /// Opens a change at this home (#4024): who writes, when, and the records the writes are made
+    /// from. It takes the next home sequence, before its entries'. Every write names the change it
+    /// belongs to, in this transaction or a later one, so one apply writes all its records under
+    /// one change; a change no write names records only its inputs.
+    pub fn open_change(&mut self, change: &NewChange) -> Result<ChangeId, StoreError> {
+        self.guarded(|ctx| ctx.open_change(change))
     }
 
-    /// The spec edit, logged as an `edit` entry by `origin`: writes only the fields and rows that
+    /// Records a change homed elsewhere, as replication receives it before its entries. A change
+    /// already held is left as it is.
+    pub fn record_change(&mut self, change: &ChangeHeader) -> Result<(), StoreError> {
+        self.guarded(|ctx| ctx.record_change(change))
+    }
+
+    /// Inserts a resource homed here, logged as a `create` entry of `change`. Its version is the
+    /// next local home sequence, which also stamps every `records` and `history` row it holds.
+    pub fn insert<'c, K: Kind>(&mut self, name: &str, value: &K, change: impl Into<InChange<'c>>) -> Result<Stamp, StoreError> {
+        let rows = Encoder::encode(value)?;
+        let change = change.into();
+        self.guarded(|ctx| {
+            let change = ctx.change_id(change)?;
+            ctx.insert::<K>(name, rows, change)
+        })
+    }
+
+    /// The spec edit, logged as an `edit` entry of `change`: writes only the fields and rows that
     /// differ between `current.value` and `next`, refusing if the resource moved past
     /// `current.version`. A write with no row changes is a no-op and logs nothing. What edges
     /// write is refused (`NotThroughEdge`): a changed `state` column (a label, its `since` or a
@@ -626,16 +710,21 @@ impl Write<'_> {
     /// data table. Rows nested in a spec child row the edit inserts or removes go with it, and an
     /// inserted one is stamped with this write's version. State and records move only through
     /// [`Write::apply_edge`].
-    pub fn update<K: Kind>(&mut self, current: &Loaded<K>, next: &K, origin: &Origin) -> Result<Stamp, StoreError> {
+    pub fn update<'c, K: Kind>(&mut self, current: &Loaded<K>, next: &K, change: impl Into<InChange<'c>>) -> Result<Stamp, StoreError> {
         let old = Encoder::encode(&current.value)?;
         let new = Encoder::encode(next)?;
-        self.guarded(|ctx| ctx.update::<K>(current.stamp(), old, new, origin.clone()))
+        let change = change.into();
+        self.guarded(|ctx| ctx.update::<K>(current.stamp(), old, new, change))
     }
 
-    /// Deletes a resource's rows, logged as a `delete` entry by `origin`. Its history and identity
+    /// Deletes a resource's rows, logged as a `delete` entry of `change`. Its history and identity
     /// stay (#3392 G9): a delete is an event, and only [`Write::expunge`] removes them.
-    pub fn delete<K: Kind>(&mut self, current: Stamp, origin: &Origin) -> Result<(), StoreError> {
-        self.guarded(|ctx| ctx.delete::<K>(current, origin.clone()))
+    pub fn delete<'c, K: Kind>(&mut self, current: Stamp, change: impl Into<InChange<'c>>) -> Result<(), StoreError> {
+        let change = change.into();
+        self.guarded(|ctx| {
+            let change = ctx.change_id(change)?;
+            ctx.delete::<K>(current, change)
+        })
     }
 
     /// Removes a deleted resource's history: its log entries, then its identity, in this write's
@@ -645,13 +734,17 @@ impl Write<'_> {
     ///
     /// Refused as `NotFound`, `WrongKind` or `NotHome` for a resource this store may not write,
     /// `Live` for one not deleted, and `Referenced` while another resource's row references it.
-    pub fn expunge<K: Kind>(&mut self, id: ResourceId, origin: &Origin) -> Result<u64, StoreError> {
-        self.guarded(|ctx| ctx.expunge::<K>(id, origin.clone()))
+    pub fn expunge<'c, K: Kind>(&mut self, id: ResourceId, change: impl Into<InChange<'c>>) -> Result<u64, StoreError> {
+        let change = change.into();
+        self.guarded(|ctx| {
+            let change = ctx.change_id(change)?;
+            ctx.expunge::<K>(id, change)
+        })
     }
 
     /// Applies one edge to a resource homed here, as one write at the next home sequence, logged
-    /// as an `edge` entry: the event's header (edge, from- and to-label, writer, time, master) and
-    /// payload, and an effect holding the edge's state as one unit, the fields it sets, the state's
+    /// as an `edge` entry of `change`: the event's header (edge, from- and to-label, master) and
+    /// arguments, and an effect holding the edge's state as one unit, the fields it sets, the state's
     /// collection rows it edits and the rows it appends, each at its table's next position under
     /// its parent row (read backwards through the primary key) and stamped with the write's
     /// sequence, with every object the edge's values name. A label-plus-data state's label and
@@ -664,9 +757,13 @@ impl Write<'_> {
     /// `current.version`; then `WrongFrom` when the stored label of the edge's state is not the
     /// event's `from`; then `NoRecord` for an edge on a `records` row that does not exist. Nothing
     /// is written by a refused edge, and the transaction stays usable.
-    pub fn apply_edge<K: Kind>(&mut self, current: Stamp, edge: Edge<K>) -> Result<Stamp, StoreError> {
+    pub fn apply_edge<'c, K: Kind>(&mut self, current: Stamp, edge: Edge<K>, change: impl Into<InChange<'c>>) -> Result<Stamp, StoreError> {
         let parts = edge.into_parts();
-        self.guarded(|ctx| ctx.apply_edge::<K>(current, parts))
+        let change = change.into();
+        self.guarded(|ctx| {
+            let change = ctx.change_id(change)?;
+            ctx.apply_edge::<K>(current, parts, change)
+        })
     }
 
     /// Applies an event homed elsewhere, as replication receives it: the kind must be registered
@@ -755,10 +852,10 @@ pub struct AboutPage {
 struct Header {
     topic: Code,
     cause: Cause,
-    writer: String,
-    at: Timestamp,
+    /// The entry's change, at its home.
+    change: u64,
     about: Option<Identity>,
-    payload: Option<Vec<u8>>,
+    arguments: Option<Vec<u8>>,
 }
 
 /// One `log` row as read back, in the shared select's column order.
@@ -773,9 +870,9 @@ struct LogRow {
     from: Option<String>,
     to: Option<String>,
     about: Option<i64>,
-    writer: String,
+    change: i64,
     at: i64,
-    payload: Option<Vec<u8>>,
+    arguments: Option<Vec<u8>>,
     effect: Vec<u8>,
     home: String,
 }
@@ -793,9 +890,9 @@ impl LogRow {
             from: row.get(6)?,
             to: row.get(7)?,
             about: row.get(8)?,
-            writer: row.get(9)?,
+            change: row.get(9)?,
             at: row.get(10)?,
-            payload: row.get(11)?,
+            arguments: row.get(11)?,
             effect: row.get(12)?,
             home: row.get(13)?,
         })
@@ -1040,7 +1137,7 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    fn insert<K: Kind>(&mut self, name: &str, rows: Rows, origin: Origin) -> Result<Stamp, StoreError> {
+    fn insert<K: Kind>(&mut self, name: &str, rows: Rows, change: ChangeId) -> Result<Stamp, StoreError> {
         self.sql(K::CODE)?;
         let identity = Identity { kind: K::CODE, name: name.to_owned(), home: self.runtime.home.clone() };
         let id = self.ensure_identity(&identity)?;
@@ -1059,19 +1156,12 @@ impl Ctx<'_> {
         }
         let hashes: BTreeSet<Hash> = rows.tables.iter().flatten().flat_map(|row| set_objects(None, row)).collect();
         let effect = Effect { changes, objects: carried(hashes, rows.objects)?, expunged: None };
-        let header = Header {
-            topic: whole_log_topic(),
-            cause: Cause::Create,
-            writer: origin.writer,
-            at: origin.at,
-            about: None,
-            payload: origin.payload,
-        };
+        let header = Header { topic: whole_log_topic(), cause: Cause::Create, change: change.0, about: None, arguments: None };
         self.write_local(K::CODE, id, header, effect, (sequence, version), None)?;
         Ok(Stamp { id, version })
     }
 
-    fn update<K: Kind>(&mut self, current: Stamp, mut old: Rows, mut new: Rows, origin: Origin) -> Result<Stamp, StoreError> {
+    fn update<K: Kind>(&mut self, current: Stamp, mut old: Rows, mut new: Rows, change: InChange<'_>) -> Result<Stamp, StoreError> {
         self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
         // The encoder already emits each table in key order (positions ascend, maps are
@@ -1138,15 +1228,10 @@ impl Ctx<'_> {
         let root = root_changed.then(|| (Some(&old.tables[0][0]), &new[0][0]));
         let hashes = changed.chain(root).flat_map(|(before, after)| set_objects(before, after)).collect();
         let effect = Effect { changes, objects: carried(hashes, new_objects)?, expunged: None };
+        // A no-op opens no change: only a write that logs an entry takes a change's sequence.
+        let change = self.change_id(change)?;
         let (sequence, version) = self.next_sequence()?;
-        let header = Header {
-            topic: whole_log_topic(),
-            cause: Cause::Edit,
-            writer: origin.writer,
-            at: origin.at,
-            about: None,
-            payload: origin.payload,
-        };
+        let header = Header { topic: whole_log_topic(), cause: Cause::Edit, change: change.0, about: None, arguments: None };
         if !self.write_local(K::CODE, current.id, header, effect, (sequence, version), Some(expected))? {
             return Err(self.stale::<K>(current));
         }
@@ -1169,7 +1254,7 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    fn apply_edge<K: Kind>(&mut self, current: Stamp, parts: EdgeParts) -> Result<Stamp, StoreError> {
+    fn apply_edge<K: Kind>(&mut self, current: Stamp, parts: EdgeParts, change: ChangeId) -> Result<Stamp, StoreError> {
         self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
         let EdgeParts { sets, rows, appends, collections, objects, from, event } = parts;
@@ -1308,14 +1393,7 @@ impl Ctx<'_> {
         }
         let (sequence, version) = self.next_sequence()?;
         let cause = Cause::Edge { edge: event.edge, from: event.from, to: event.to };
-        let header = Header {
-            topic: whole_log_topic(),
-            cause,
-            writer: event.writer,
-            at: event.at,
-            about: event.about,
-            payload: Some(event.payload),
-        };
+        let header = Header { topic: whole_log_topic(), cause, change: change.0, about: event.about, arguments: Some(event.arguments) };
         let effect = Effect { changes, objects, expunged: None };
         if !self.write_local(K::CODE, current.id, header, effect, (sequence, version), Some(expected))? {
             return Err(self.stale::<K>(current));
@@ -1357,18 +1435,11 @@ impl Ctx<'_> {
         Ok(self.conn.prepare_cached(sql)?.query_row(params_from_iter(params), |row| row.get::<_, Option<i64>>(0)).optional()?)
     }
 
-    fn delete<K: Kind>(&mut self, current: Stamp, origin: Origin) -> Result<(), StoreError> {
+    fn delete<K: Kind>(&mut self, current: Stamp, change: ChangeId) -> Result<(), StoreError> {
         self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
         let (sequence, version) = self.next_sequence()?;
-        let header = Header {
-            topic: whole_log_topic(),
-            cause: Cause::Delete,
-            writer: origin.writer,
-            at: origin.at,
-            about: None,
-            payload: origin.payload,
-        };
+        let header = Header { topic: whole_log_topic(), cause: Cause::Delete, change: change.0, about: None, arguments: None };
         if !self.write_local(K::CODE, current.id, header, Effect::default(), (sequence, version), Some(expected))? {
             return Err(self.stale::<K>(current));
         }
@@ -1376,7 +1447,7 @@ impl Ctx<'_> {
     }
 
     /// Removes a deleted resource's history and identity: see [`Write::expunge`].
-    fn expunge<K: Kind>(&mut self, id: ResourceId, origin: Origin) -> Result<u64, StoreError> {
+    fn expunge<K: Kind>(&mut self, id: ResourceId, change: ChangeId) -> Result<u64, StoreError> {
         let identity = self.owned::<K>(id)?;
         let live = self.conn.prepare_cached(&self.sql(K::CODE)?.root_version)?.query_row([id.0], |_| Ok(())).optional()?;
         if live.is_some() {
@@ -1384,14 +1455,7 @@ impl Ctx<'_> {
         }
         let (sequence, version) = self.next_sequence()?;
         let prev_seq = self.identity_seq(id)?;
-        let header = Header {
-            topic: whole_log_topic(),
-            cause: Cause::Expunge,
-            writer: origin.writer,
-            at: origin.at,
-            about: None,
-            payload: origin.payload,
-        };
+        let header = Header { topic: whole_log_topic(), cause: Cause::Expunge, change: change.0, about: None, arguments: None };
         self.remove_identity(id, &identity)?;
         let effect = Effect { expunged: Some(identity.clone()), ..Effect::default() };
         let bytes = effect.encode()?;
@@ -1504,6 +1568,7 @@ impl Ctx<'_> {
             }
         }
         if event.cause == Cause::Expunge {
+            self.require_change(event)?;
             return self.apply_expunge(event, known, current, sequence);
         }
         // An expunged identity has no row to hold its sequence, but its expunge entry stays: an
@@ -1514,6 +1579,7 @@ impl Ctx<'_> {
         if event.prev_seq != current {
             return Err(StoreError::Gap { expected: current, found: event.prev_seq });
         }
+        self.require_change(event)?;
         if let Cause::Edge { edge, from, to } = event.cause {
             self.check_edge(event.kind, edge, from, to)?;
         } else if event.about.is_some() || (event.cause == Cause::Delete && !event.effect.changes.is_empty()) {
@@ -1531,10 +1597,9 @@ impl Ctx<'_> {
         let header = Header {
             topic: event.topic,
             cause: event.cause,
-            writer: event.writer.clone(),
-            at: event.at,
+            change: event.change,
             about: event.about.clone(),
-            payload: event.payload.clone(),
+            arguments: event.arguments.clone(),
         };
         if !self.record(event.kind, id, &event.home, header, event.prev_seq, (&event.effect, &bytes), sequence, stored)? {
             return Err(StoreError::NotFound { id });
@@ -1575,14 +1640,8 @@ impl Ctx<'_> {
             }
             self.remove_identity(id, &identity)?;
         }
-        let header = Header {
-            topic: event.topic,
-            cause: Cause::Expunge,
-            writer: event.writer.clone(),
-            at: event.at,
-            about: None,
-            payload: event.payload.clone(),
-        };
+        let header =
+            Header { topic: event.topic, cause: Cause::Expunge, change: event.change, about: None, arguments: event.arguments.clone() };
         let bytes = event.effect.encode()?;
         self.append_log(&event.home, None, header, event.prev_seq, sequence, &bytes)?;
         let home = self.intern(HOME_DOMAIN, &event.home)?;
@@ -1647,7 +1706,7 @@ impl Ctx<'_> {
         effect: &[u8],
     ) -> Result<(), StoreError> {
         let home = self.intern(HOME_DOMAIN, home)?;
-        let writer = self.intern(WRITER_DOMAIN, &header.writer)?;
+        let change = i64::try_from(header.change).map_err(|_| Malformed::Sequence { home_seq: header.change })?;
         let about = header.about.as_ref().map(|about| self.ensure_identity(about)).transpose()?.map(|id| id.0);
         let (edge, from, to) = match header.cause {
             Cause::Edge { edge, from, to } => (Some(edge), Some(from), Some(to)),
@@ -1658,6 +1717,7 @@ impl Ctx<'_> {
         self.conn.prepare_cached(LOG_APPEND)?.execute(params![
             home,
             sequence,
+            change,
             resource.map(|id| id.0),
             prev_seq,
             header.cause.name(),
@@ -1665,9 +1725,7 @@ impl Ctx<'_> {
             from,
             to,
             about,
-            writer,
-            header.at.micros(),
-            header.payload,
+            header.arguments,
             effect,
             header.topic.as_str()
         ])?;
@@ -1811,7 +1869,7 @@ impl Ctx<'_> {
     fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<Event>, StoreError> {
         let after = i64::try_from(after).unwrap_or(i64::MAX);
         let limit = page_limit(limit)?;
-        self.events(LOG_BY_RESOURCE, params![id.0, after, limit]).map(|events| events.into_iter().map(|(_, event)| event).collect())
+        self.events(LOG_BY_RESOURCE, params![id.0, after, limit]).map(|events| events.into_iter().map(|(_, _, event)| event).collect())
     }
 
     /// Logged events homed at `home` after `after`, in home order, by the primary key.
@@ -1819,7 +1877,7 @@ impl Ctx<'_> {
         let limit = page_limit(limit)?;
         let Some(home) = self.string_id(HOME_DOMAIN, home)? else { return Ok(Vec::new()) };
         let after = i64::try_from(after).unwrap_or(i64::MAX);
-        self.events(LOG_BY_HOME, params![home, after, limit]).map(|events| events.into_iter().map(|(_, event)| event).collect())
+        self.events(LOG_BY_HOME, params![home, after, limit]).map(|events| events.into_iter().map(|(_, _, event)| event).collect())
     }
 
     /// Entries about resource `id`, in time order, by `log_about`.
@@ -1830,13 +1888,14 @@ impl Ctx<'_> {
             Some(cursor) => self.events(LOG_ABOUT_AFTER, params![id.0, cursor.at.micros(), cursor.rowid, limit])?,
         };
         let full = events.len() == usize::try_from(limit).unwrap_or(usize::MAX);
-        let next = events.last().filter(|_| full).map(|(rowid, event)| AboutCursor { at: event.at, rowid: *rowid });
-        Ok(AboutPage { events: events.into_iter().map(|(_, event)| event).collect(), next })
+        let next = events.last().filter(|_| full).map(|(rowid, at, _)| AboutCursor { at: *at, rowid: *rowid });
+        Ok(AboutPage { events: events.into_iter().map(|(_, _, event)| event).collect(), next })
     }
 
     /// Reads entries until the next would take the page past the store's byte budget; the first is
-    /// always taken, so a page is never empty while entries remain. Each comes with its rowid.
-    fn events(&mut self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<(i64, Event)>, StoreError> {
+    /// always taken, so a page is never empty while entries remain. Each comes with its rowid and
+    /// its change's time.
+    fn events(&mut self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<(i64, Timestamp, Event)>, StoreError> {
         let rows: Vec<LogRow> = {
             let mut statement = self.conn.prepare_cached(sql)?;
             let rows = statement.query_map(params, LogRow::read)?;
@@ -1844,7 +1903,7 @@ impl Ctx<'_> {
             let mut used = 0usize;
             for row in rows {
                 let row = row?;
-                used = used.saturating_add(row.effect.len()).saturating_add(row.payload.as_ref().map_or(0, Vec::len));
+                used = used.saturating_add(row.effect.len()).saturating_add(row.arguments.as_ref().map_or(0, Vec::len));
                 if !out.is_empty() && used > self.runtime.change_page_bytes {
                     break;
                 }
@@ -1855,7 +1914,7 @@ impl Ctx<'_> {
         rows.into_iter().map(|row| self.event(row)).collect()
     }
 
-    fn event(&mut self, row: LogRow) -> Result<(i64, Event), StoreError> {
+    fn event(&mut self, row: LogRow) -> Result<(i64, Timestamp, Event), StoreError> {
         let corrupt = |column: &str| StoreError::Corrupt { table: "log".into(), column: column.into() };
         let effect = Effect::decode(&row.effect)?;
         let identity = match row.resource {
@@ -1883,13 +1942,104 @@ impl Ctx<'_> {
             home_seq: sequence(row.home_seq, "home_seq")?,
             prev_seq: sequence(row.prev_seq, "prev_seq")?,
             cause,
-            writer: row.writer,
-            at: Timestamp(row.at),
+            change: sequence(row.change, "change")?,
             about,
-            payload: row.payload,
+            arguments: row.arguments,
             effect,
         };
-        Ok((row.rowid, event))
+        Ok((row.rowid, Timestamp(row.at), event))
+    }
+
+    /// The change `seq` homed at `home`, with its items in order.
+    fn change(&mut self, home: &str, seq: u64) -> Result<Option<ChangeHeader>, StoreError> {
+        let Some(home_id) = self.string_id(HOME_DOMAIN, home)? else { return Ok(None) };
+        let seq_param = i64::try_from(seq).map_err(|_| Malformed::Sequence { home_seq: seq })?;
+        let header: Option<(String, i64)> = self
+            .conn
+            .prepare_cached(CHANGE_GET)?
+            .query_row(params![home_id, seq_param], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        let Some((writer, at)) = header else { return Ok(None) };
+        let corrupt = |column: &str| StoreError::Corrupt { table: "change_items".into(), column: column.into() };
+        let rows: Vec<(String, String, String, Option<String>)> = {
+            let mut statement = self.conn.prepare_cached(CHANGE_ITEMS)?;
+            let rows = statement.query_map(params![home_id, seq_param], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let items = rows
+            .into_iter()
+            .map(|(kind, name, home, revision)| {
+                let kind = KindCode(Code::parse(&kind).map_err(|_| corrupt("record"))?);
+                Ok(ChangeItem { record: Identity { kind, name, home }, revision })
+            })
+            .collect::<Result<_, StoreError>>()?;
+        Ok(Some(ChangeHeader { home: home.to_owned(), seq, writer, at: Timestamp(at), items }))
+    }
+
+    fn change_seqs(&mut self, home: &str, after: u64, before: u64) -> Result<Vec<u64>, StoreError> {
+        let Some(home) = self.string_id(HOME_DOMAIN, home)? else { return Ok(Vec::new()) };
+        let bound = |seq: u64| i64::try_from(seq).unwrap_or(i64::MAX);
+        let mut statement = self.conn.prepare_cached(CHANGE_SEQS)?;
+        let seqs = statement.query_map(params![home, bound(after), bound(before)], |row| row.get::<_, i64>(0))?;
+        seqs.map(|seq| u64::try_from(seq?).map_err(|_| StoreError::Corrupt { table: "change".into(), column: "seq".into() })).collect()
+    }
+
+    /// The change a write names: opened already, or opened now.
+    fn change_id(&mut self, change: InChange<'_>) -> Result<ChangeId, StoreError> {
+        match change {
+            InChange::Opened(id) => Ok(id),
+            InChange::New(change) => self.open_change(change),
+        }
+    }
+
+    /// Opens a change at this home: see [`Write::open_change`].
+    fn open_change(&mut self, change: &NewChange) -> Result<ChangeId, StoreError> {
+        let (sequence, seq) = self.next_sequence()?;
+        let home = self.runtime.home.clone();
+        self.insert_change(&home, sequence, &change.writer, change.at, &change.items)?;
+        Ok(ChangeId(seq))
+    }
+
+    /// An entry's change arrives before it (`record_change`); without it the entry says neither
+    /// who wrote it nor why. Checked once the entry is known to be neither a duplicate nor a gap.
+    fn require_change(&mut self, event: &Event) -> Result<(), StoreError> {
+        let change = i64::try_from(event.change).map_err(|_| Malformed::Sequence { home_seq: event.change })?;
+        let held = match self.string_id(HOME_DOMAIN, &event.home)? {
+            Some(home) => self.conn.prepare_cached(CHANGE_EXISTS)?.query_row(params![home, change], |_| Ok(())).optional()?.is_some(),
+            None => false,
+        };
+        if held {
+            Ok(())
+        } else {
+            Err(StoreError::MissingChange { home: event.home.clone(), seq: event.change })
+        }
+    }
+
+    /// Records a change homed elsewhere: see [`Write::record_change`].
+    fn record_change(&mut self, change: &ChangeHeader) -> Result<(), StoreError> {
+        if change.home == self.runtime.home {
+            return Err(StoreError::OwnHome { home: change.home.clone() });
+        }
+        let sequence = i64::try_from(change.seq).ok().filter(|seq| *seq > 0).ok_or(Malformed::Sequence { home_seq: change.seq })?;
+        let home = self.intern(HOME_DOMAIN, &change.home)?;
+        if self.conn.prepare_cached(CHANGE_EXISTS)?.query_row(params![home, sequence], |_| Ok(())).optional()?.is_some() {
+            return Ok(());
+        }
+        self.insert_change(&change.home, sequence, &change.writer, change.at, &change.items)?;
+        self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
+        Ok(())
+    }
+
+    fn insert_change(&mut self, home: &str, sequence: i64, writer: &str, at: Timestamp, items: &[ChangeItem]) -> Result<(), StoreError> {
+        let home = self.intern(HOME_DOMAIN, home)?;
+        let writer = self.intern(WRITER_DOMAIN, writer)?;
+        self.conn.prepare_cached(CHANGE_APPEND)?.execute(params![home, sequence, writer, at.micros()])?;
+        for (pos, item) in items.iter().enumerate() {
+            let record = self.ensure_identity(&item.record)?;
+            let pos = i64::try_from(pos).map_err(|_| Malformed::Shape { table: "change_items".into() })?;
+            self.conn.prepare_cached(CHANGE_ITEM_APPEND)?.execute(params![home, sequence, pos, record.0, item.revision])?;
+        }
+        Ok(())
     }
 
     /// The highest sequence taken (this home) or applied (another home) for `home`; 0 when none.

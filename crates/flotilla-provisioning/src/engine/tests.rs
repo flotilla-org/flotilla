@@ -1235,6 +1235,7 @@ fn a_lifecycle_finishes_a_durable_failed_attempt_after_log_errors(tc: hegel::Tes
 
         fn edge(
             &mut self,
+            writer: &str,
             previous: &StoredState<Machine>,
             next: &Resource<Machine>,
             event: &EdgeEventOf<Machine>,
@@ -1244,7 +1245,7 @@ fn a_lifecycle_finishes_a_durable_failed_attempt_after_log_errors(tc: hegel::Tes
             {
                 return Err(LogError::new("injected GiveUp persistence failure"));
             }
-            self.inner.edge(previous, next, event)
+            self.inner.edge(writer, previous, next, event)
         }
     }
 

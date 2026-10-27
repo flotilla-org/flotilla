@@ -23,8 +23,9 @@
 //! that made it, and a receipt is a session's `Receive` edge, whose master
 //! ([`EdgeDef::about`]) is the message it is for. An edge event is a
 //! `flotilla_schema::EdgeEvent` ([`EdgeEventOf`]) whose document is an
-//! [`EdgePayload`]: the edge's arguments and its reads. Edge events are
-//! history, for showing and auditing what happened: entries in the home's
+//! [`EdgePayload`]: the edge's arguments and its reads. Its log entry keeps the
+//! edge's arguments, and its change the writer, time and reads (#4024). Edge
+//! events are history, for showing and auditing what happened: entries in the home's
 //! per-home log, read in pages by (resource, sequence), and no part of a
 //! [`Resource`] (R1), so nothing that decides reads them. Retry counts,
 //! schedules and exhaustion are judgements over the attempt tally an attempt
@@ -67,7 +68,7 @@ mod stored;
 pub use attempt::{AttemptPolicy, Cause, CauseCategory, Failure, Outcome, Retry, Schedule};
 pub use code::{changed, Coded, Datum, Edge, EdgeArg, StateValue};
 pub use home::{Created, Home, Resource, WriteError};
-pub use log::{edge_event, EntryError, Log, LogError, MemoryLog};
+pub use log::{edge_event, EntryError, Log, LogError, LoggedEdgeOf, MemoryLog};
 pub use machine::{
     Check, DeclaredEdge, DefError, Diagram, EdgeDef, EdgeKind, EndDef, Ended, Fault, Label, Machine, MachineDef, NoRecords, RecordWrite,
     StepError, WrongState,

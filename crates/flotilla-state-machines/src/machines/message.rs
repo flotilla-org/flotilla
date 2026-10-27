@@ -58,8 +58,8 @@ use crate::{
         convoy::ConvoyRequest,
         person::Person,
     },
-    states, Admission, EdgeDef, EdgePayload, Ended, Handle, Kind, Machine, MachineDef, NoRecords, Ref, Resource, Source, Table, Transport,
-    Version, WrongState,
+    states, Admission, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, NoRecords, Ref, Resource, Source, Table, Transport, Version,
+    WrongState,
 };
 
 /// What would settle the message. `Nothing` settles on delivery.
@@ -336,7 +336,7 @@ type DecodeReceipt = fn(&Event) -> Result<Option<(String, Transport)>, EventErro
 /// receipt (#3424 ruling 2): an agent session's and a person's are accepted
 /// from the start, and [`ReceiptLog::consumer`] adds a controller's kind. An entry of another
 /// kind, or of another edge, is no receipt and is skipped without decoding
-/// its payload; a `Receive` entry whose payload does not decode is refused. A
+/// its arguments; a `Receive` entry whose arguments do not decode is refused. A
 /// message's version is the number of receipts about it: entries are only
 /// appended while the message is live, so a later read never sees fewer. A
 /// message with no receipts reads as absent.
@@ -368,18 +368,18 @@ impl ReceiptLog {
     where
         M: Consumer,
         M::Spec: KindSpec,
-        EdgePayload<M::Edge>: Cbor,
+        M::Edge: Cbor,
     {
         fn decode<M: Consumer>(entry: &Event) -> Result<Option<(String, Transport)>, EventError>
         where
-            EdgePayload<M::Edge>: Cbor,
+            M::Edge: Cbor,
         {
             match entry.cause {
                 Cause::Edge { edge, .. } if edge == M::RECEIVE.code() => {}
                 _ => return Ok(None),
             }
-            let Some(payload) = entry.payload::<EdgePayload<M::Edge>>() else { return Ok(None) };
-            Ok(M::receipt(&payload?.edge).map(|(message, transport)| (message.to_owned(), transport)))
+            let Some(edge) = entry.arguments::<M::Edge>() else { return Ok(None) };
+            Ok(M::receipt(&edge?).map(|(message, transport)| (message.to_owned(), transport)))
         }
         self.consumers.insert(<M::Spec as KindSpec>::CODE, (M::CONSUMER, decode::<M>));
         self

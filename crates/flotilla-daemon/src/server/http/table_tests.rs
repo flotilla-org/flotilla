@@ -222,7 +222,7 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
         .insert(
             "one",
             &TableSample { text: "remote target".into(), number: 99, bytes: vec![], reference: None, tags: vec![] },
-            &flotilla_schema::Origin::new("test", flotilla_schema::Timestamp(1)),
+            &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(1)),
         )
         .unwrap();
     write.commit().unwrap();
@@ -241,7 +241,7 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
                         reference: Some(flotilla_schema::Ref::new("one", "remote")),
                         tags: vec!["tag".into()],
                     },
-                    &flotilla_schema::Origin::new("test", flotilla_schema::Timestamp(1)),
+                    &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(1)),
                 )?;
             }
             write.commit()

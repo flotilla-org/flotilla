@@ -19,14 +19,14 @@ use std::{
 
 use flotilla_engine_store::{
     follow::{Followed, Follower},
-    plain::{PlainError, PlainLog},
+    plain::{PendingChange, PlainError, PlainLog},
 };
 use flotilla_resources::{
     definitions::{origin, stamp},
     engine_records::{EngineObject, EngineRecords},
     DeclarationRefusedCondition, DispatchQueueAttention, DispatchQueueEntry, OperationalEntriesCondition, ProjectSpec, ProjectStatus,
 };
-use flotilla_schema::{Identity, Kind, KindCode, Timestamp};
+use flotilla_schema::{Identity, Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
@@ -296,8 +296,8 @@ impl EngineProjects {
             let Some(value) = edit(current.as_ref().map(|current| &current.spec))? else { return Ok(()) };
             let written = match current {
                 Some(current) if current.spec == value => return Ok(()),
-                Some(current) => self.log.edit(name, current.version, &value, WRITER, self.now()),
-                None => self.log.create(name, &value, WRITER, self.now()),
+                Some(current) => self.log.edit(name, current.version, &value, &PendingChange::new(NewChange::new(WRITER, self.now()))),
+                None => self.log.create(name, &value, &PendingChange::new(NewChange::new(WRITER, self.now()))),
             };
             match written {
                 Ok(_) => return Ok(()),
@@ -310,7 +310,7 @@ impl EngineProjects {
 
     fn remove<K: Kind>(&self, name: &str) -> Result<(), String> {
         let Some(current) = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())? else { return Ok(()) };
-        match self.log.delete::<K>(name, current.version, WRITER, self.now()) {
+        match self.log.delete::<K>(name, current.version, &PendingChange::new(NewChange::new(WRITER, self.now()))) {
             Ok(()) | Err(PlainError::Missing { .. }) => Ok(()),
             Err(error) => Err(format!("delete {} {name}: {error}", K::KIND)),
         }

@@ -126,7 +126,7 @@ fn port_round_trips_every_message_edge_at_the_home_sequence() {
 // the new observation stays absent until its first hook edge is written.
 #[test]
 fn legacy_session_rows_decode_after_the_documented_activity_upgrade() {
-    use flotilla_schema::{Origin, State};
+    use flotilla_schema::{NewChange, State};
     use flotilla_state_machines::{
         machines::agent_session::{Activity, AgentSessionSpec, AgentSessionState, Channel, Observe},
         Version,
@@ -139,7 +139,7 @@ fn legacy_session_rows_decode_after_the_documented_activity_upgrade() {
         Version(0),
     );
     let mut write = store.write().unwrap();
-    let stamp = write.insert("legacy", &session, &Origin::new("test", Timestamp(0))).unwrap();
+    let stamp = write.insert("legacy", &session, &NewChange::new("test", Timestamp(0))).unwrap();
     write.commit().unwrap();
     let connection = store.into_connection();
     // Reconstruct the previous generation's six-column root table around its row.
@@ -196,7 +196,7 @@ fn poisoned_writer_does_not_take_down_other_homes() {
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut locked = store.lock().unwrap();
         let mut write = locked.write().unwrap();
-        write.insert("rolled-back", &seed, &flotilla_schema::Origin::new("panicking-writer", Timestamp(2))).unwrap();
+        write.insert("rolled-back", &seed, &flotilla_schema::NewChange::new("panicking-writer", Timestamp(2))).unwrap();
         panic!("writer panicked before commit");
     }));
     assert!(panic.is_err());
@@ -206,7 +206,8 @@ fn poisoned_writer_does_not_take_down_other_homes() {
     let message = name("after-panic");
     let mut world = MemoryMessageWorld::default();
     messages.create(&message, spec(Expectation::Nothing), &world, Timestamp(3)).unwrap();
-    assert_eq!(messages.get(&message).unwrap().version().0, 2, "rolled-back sequence is reusable");
+    // The seed's change and entry took 1 and 2; this create's change and entry take 3 and 4.
+    assert_eq!(messages.get(&message).unwrap().version().0, 4, "rolled-back sequence is reusable");
     world.binding.put(&Ref::new(inbox().as_str()), InboxBinding::Unbound { since: Timestamp(0) });
     messages.apply(&message, DropMessage { reason: DropReason::Undeliverable }, &world, Timestamp(50)).unwrap();
 
@@ -224,7 +225,7 @@ fn poisoned_writer_does_not_take_down_other_homes() {
     assert_eq!(reopened.get("rolled-back"), sessions.get("rolled-back"));
     let mut locked = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut read = locked.read().unwrap();
-    assert_eq!(read.last_sequence(HOME).unwrap(), 5);
+    assert_eq!(read.last_sequence(HOME).unwrap(), 10, "five committed writes, each a change and its entry");
     let receipts = log.receipt_log(&mut read, [message.as_str()]).unwrap();
     assert!(receipts.lookup(&Ref::<Receipts>::new(message.as_str())).is_some());
 }

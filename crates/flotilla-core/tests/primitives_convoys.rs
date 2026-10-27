@@ -74,11 +74,12 @@ fn a_convoy_survives_a_restart() {
             revision: "abc".into(),
             durable: Ref::new(address("change").as_str()),
         };
-        assert_eq!(convoys.apply("c", submit, Timestamp(2)).expect("submitted"), Version(2));
+        // The admission's change and entry took 1 and 2; the submission's take 3 and 4 (#4024).
+        assert_eq!(convoys.apply("c", submit, Timestamp(2)).expect("submitted"), Version(4));
     }
     let convoys = Convoys::open("home-a", &service(&dir)).expect("reopen");
     let convoy = convoys.get("c").expect("restored");
-    assert_eq!(convoy.version(), Version(2));
+    assert_eq!(convoy.version(), Version(4));
     let (_, promise) = convoy.spec().promise(PromiseId(0)).expect("promise");
     assert_eq!(promise.progress.value, Progress::Submitted);
 }
@@ -123,12 +124,12 @@ fn a_taken_label_is_refused_after_a_restart_and_changes_nothing() {
     let error = convoys.apply("c", declare.clone(), Timestamp(2)).expect_err("a taken label");
     assert_eq!(error.refusal(), None, "the store refuses it: {error:?}");
     let convoy = convoys.get("c").expect("still there");
-    assert_eq!((convoy.version(), convoy.spec().promises.len()), (Version(1), 1), "nothing changed in memory");
+    assert_eq!((convoy.version(), convoy.spec().promises.len()), (Version(2), 1), "nothing changed in memory");
     drop(convoys);
     let convoys = Convoys::open("home-a", &service(&dir)).expect("reopen again");
     assert_eq!(convoys.get("c").expect("restored").spec().promises.len(), 1, "nothing was stored");
     let free = Declare { label: "l2-quint".into(), ..declare };
-    assert_eq!(convoys.apply("c", free, Timestamp(3)).expect("a free label"), Version(2));
+    assert_eq!(convoys.apply("c", free, Timestamp(3)).expect("a free label"), Version(4), "the refusal took no sequence");
 }
 
 // Owner ruling #3825: replacing an ended standing generation reuses its name,
@@ -214,7 +215,7 @@ fn ended_standing_generations_are_replaced_atomically(tc: hegel::TestCase) {
 // resident ended generation or poisoning its writer locks.
 #[test]
 fn a_missing_resident_generation_returns_an_error() {
-    use flotilla_schema::{Kind, Origin};
+    use flotilla_schema::{Kind, NewChange};
     use flotilla_state_machines::{
         machines::convoy::{Abandon, Convoy},
         Resource, WriteError,
@@ -243,7 +244,7 @@ fn a_missing_resident_generation_returns_an_error() {
                 let stamp = read.load::<Resource<Convoy>>(id)?.expect("stored").stamp();
                 drop(read);
                 let mut write = store.write()?;
-                let origin = Origin::new("test", Timestamp(3));
+                let origin = NewChange::new("test", Timestamp(3));
                 write.delete::<Resource<Convoy>>(stamp, &origin)?;
                 if expunge {
                     write.expunge::<Resource<Convoy>>(id, &origin)?;

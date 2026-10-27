@@ -50,13 +50,14 @@ fn snapshot_tail_resume_and_three_stores() {
         for home in ["a", "b", "c"] {
             assert!(present(host, home, &format!("{home}1")));
         }
-        assert_eq!(host.read().expect("read").last_sequence("a").expect("last"), 1);
+        // A home's sequence numbers its insert's change and then the insert (#4024).
+        assert_eq!(host.read().expect("read").last_sequence("a").expect("last"), 2);
     }
     insert(&mut a, "a2");
-    sync(&mut a, &mut b, Some(1), 2).expect("tail");
+    sync(&mut a, &mut b, Some(2), 2).expect("tail");
     assert!(present(&mut b, "a", "a2"));
     let before = mark(&mut b, "a");
-    sync(&mut a, &mut b, Some(2), 3).expect("resume idle");
+    sync(&mut a, &mut b, Some(4), 3).expect("resume idle");
     assert_eq!(mark(&mut b, "a").home_seq, before.home_seq);
     assert_eq!(mark(&mut b, "a").applied_through, Timestamp(3));
 }
@@ -81,14 +82,14 @@ fn expunge_floor_rollback_and_fresh_snapshot() {
     let mut write = a.write().expect("write");
     write.expunge::<Resource<Message>>(old.id, &origin()).expect("expunge");
     write.commit().expect("commit");
-    assert_eq!(a.read().expect("read").resume_floor("a").expect("floor"), 2);
-    insert(&mut a, "new");
+    assert_eq!(a.read().expect("read").resume_floor("a").expect("floor"), 4);
+    let new = insert(&mut a, "new");
     sync(&mut a, &mut b, Some(1), 4).expect("resnapshot");
     assert_eq!(mark(&mut b, "a").applied_through, Timestamp(100), "resnapshot cannot regress applied time");
     assert!(b.read().expect("read").resolve(Resource::<Message>::CODE, "old", "a").expect("identity").is_none());
     assert!(!present(&mut b, "a", "old"));
     assert!(present(&mut b, "a", "new"));
-    sync(&mut a, &mut b, Some(4), 5).expect("tail from fresh cut");
+    sync(&mut a, &mut b, Some(new.version), 5).expect("tail from fresh cut");
 }
 
 // Disconnecting in a snapshot or before a round commits preserves the old rows and watermark.
@@ -116,14 +117,14 @@ fn stalled_stream_and_invalid_watermarks_do_not_advance() {
     let before = mark(&mut b, "a");
     let mut write = b.write().expect("write");
     assert!(write.advance_watermark("a", Watermark { home_seq: 1, applied_through: Timestamp(9) }).is_err());
-    assert!(write.advance_watermark("a", Watermark { home_seq: 2, applied_through: Timestamp(11) }).is_err());
+    assert!(write.advance_watermark("a", Watermark { home_seq: 3, applied_through: Timestamp(11) }).is_err());
     write.commit().expect("commit refusals");
     assert_eq!(mark(&mut b, "a"), before);
-    sync(&mut a, &mut b, Some(1), 12).expect("keepalive");
+    sync(&mut a, &mut b, Some(2), 12).expect("keepalive");
     assert_eq!(mark(&mut b, "a").applied_through, Timestamp(12));
     {
         let mut write = b.write().expect("write");
-        write.advance_watermark("a", Watermark { home_seq: 1, applied_through: Timestamp(20) }).expect("pending mark");
+        write.advance_watermark("a", Watermark { home_seq: 2, applied_through: Timestamp(20) }).expect("pending mark");
     }
     assert_eq!(b.applied_watermark("a").applied_through, Timestamp(12), "rolled-back marks never reach resident gate inputs");
     let b = Store::open(b.into_connection(), "b", registry()).expect("restart");
@@ -139,6 +140,7 @@ fn topic_round_trip() {
     let mut event = a.read().expect("read").changes_since("a", 0, 1).expect("event").remove(0);
     event.topic = Code::new("project");
     let mut write = b.write().expect("write");
+    crate::fixtures::carry_changes(&mut a, &mut write, std::slice::from_ref(&event));
     write.apply(&event).expect("apply");
     write.commit().expect("commit");
     assert_eq!(b.read().expect("read").changes_since("a", 0, 1).expect("event")[0], event);
@@ -156,15 +158,16 @@ fn generated_partition_resume(tc: hegel::TestCase) {
         insert(&mut a, &format!("m{step}"));
         if tc.draw(gs::booleans()) {
             sync(&mut a, &mut b, Some(seen), step as i64).expect("resume");
-            seen = step as u64;
+            // Each insert takes its change's sequence and its own (#4024).
+            seen = 2 * step as u64;
         }
         assert_eq!(mark(&mut b, "a").home_seq, seen);
         for version in 1..=step {
-            assert_eq!(present(&mut b, "a", &format!("m{version}")), version as u64 <= seen);
+            assert_eq!(present(&mut b, "a", &format!("m{version}")), 2 * version as u64 <= seen);
         }
     }
     sync(&mut a, &mut b, Some(seen), steps as i64 + 1).expect("heal");
-    assert_eq!(mark(&mut b, "a").home_seq, steps as u64);
+    assert_eq!(mark(&mut b, "a").home_seq, 2 * steps as u64);
 }
 
 // Every kind's rows, nested records, frozen objects and identity references survive the same
@@ -225,8 +228,9 @@ fn watermark_rejects_holes_even_when_later_rows_are_stored() {
     insert(&mut a, "three");
     let events = a.read().expect("read").changes_since("a", 0, 10).expect("events");
     let mut write = b.write().expect("write");
+    crate::fixtures::carry_changes(&mut a, &mut write, &events[2..]);
     write.apply(&events[2]).expect("independent resource");
-    assert!(write.advance_watermark("a", Watermark { home_seq: 3, applied_through: Timestamp(1) }).is_err());
+    assert!(write.advance_watermark("a", Watermark { home_seq: events[2].home_seq, applied_through: Timestamp(1) }).is_err());
     assert!(write.advance_watermark("a", Watermark { home_seq: 1, applied_through: Timestamp(1) }).is_err());
     write.commit().expect("commit rows only");
     assert_eq!(b.applied_watermark("a"), Watermark::ZERO);
@@ -246,7 +250,7 @@ fn large_snapshot_crosses_identity_pages_and_cache_bounds() {
     write.commit().expect("commit");
     sync(&mut a, &mut b, None, 10).expect("large snapshot");
     let mut b = Store::open(b.into_connection(), "b", registry()).expect("restart");
-    assert_eq!(b.applied_watermark("a").home_seq, 3000);
+    assert_eq!(b.applied_watermark("a").home_seq, 6000, "each insert's change and entry");
     for index in [0, 1023, 1024, 2048, 2999] {
         assert!(present(&mut b, "a", &format!("m{index}")));
     }
@@ -278,7 +282,11 @@ fn wal_snapshot_does_not_hold_the_writer_mutex() {
                 match Frame::decode(bytes)? {
                     Frame::Begin { .. } => source.with_store(|store| {
                         let mut write = store.write()?;
-                        write.insert("later", &message::sample_in(addr("inbox")), &flotilla_schema::Origin::new("writer", Timestamp(4)))?;
+                        write.insert(
+                            "later",
+                            &message::sample_in(addr("inbox")),
+                            &flotilla_schema::NewChange::new("writer", Timestamp(4)),
+                        )?;
                         write.commit()
                     })?,
                     Frame::Resource(value) => names.push(value.name),
@@ -306,13 +314,13 @@ fn cursor_ahead_of_reset_home_gets_fresh_snapshot() {
     sync(&mut a, &mut b, None, 10).expect("old snapshot");
     let mut replacement = store("a");
     insert(&mut replacement, "replacement");
-    sync(&mut replacement, &mut b, Some(2), 11).expect("reset snapshot");
+    sync(&mut replacement, &mut b, Some(4), 11).expect("reset snapshot");
     assert!(!present(&mut b, "a", "old1"));
     assert!(!present(&mut b, "a", "old2"));
     assert!(present(&mut b, "a", "replacement"));
-    assert_eq!(mark(&mut b, "a"), Watermark { home_seq: 1, applied_through: Timestamp(11) });
+    assert_eq!(mark(&mut b, "a"), Watermark { home_seq: 2, applied_through: Timestamp(11) });
     insert(&mut replacement, "tail");
-    sync(&mut replacement, &mut b, Some(1), 12).expect("resumed tail");
+    sync(&mut replacement, &mut b, Some(2), 12).expect("resumed tail");
     assert!(present(&mut b, "a", "tail"));
 }
 

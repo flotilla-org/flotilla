@@ -1176,8 +1176,7 @@ impl DummyDaemon {
                     home: "/transport".into(),
                     delivered: None,
                 },
-                "transport",
-                at,
+                &flotilla_engine_store::plain::PendingChange::new(flotilla_schema::NewChange::new("transport", at)),
             )
             .expect("provision record");
         // #3824 layer 2c: a ManifestRoot, declared with no records yet.
@@ -1205,39 +1204,40 @@ impl DummyDaemon {
         }
         let builtin = |kind: &str| flotilla_resources::builtins::builtin_definitions(kind).expect("built-ins")[0].spec.clone();
         let origin = || DefinitionOrigin::Operator;
+        // One seeding pass, one change.
+        let change = flotilla_engine_store::plain::PendingChange::new(flotilla_schema::NewChange::new("transport", at));
         let forge: flotilla_resources::ForgeSpec = decode(serde_json::json!({
             "forge_id": "transport", "kind": "forgejo", "hosts": ["transport.example"],
             "https_url": "https://transport.example", "git_ssh_host": "transport.example"
         }));
-        log.create("transport", &ForgeDefinition::new(origin(), &forge), "transport", at).expect("forge record");
+        log.create("transport", &ForgeDefinition::new(origin(), &forge), &change).expect("forge record");
         let fleet: flotilla_resources::FleetDesignationSpec = decode(serde_json::json!({"project": "transport"}));
-        log.create("transport-fleet", &FleetDesignationDefinition::new(origin(), &fleet), "transport", at).expect("fleet record");
+        log.create("transport-fleet", &FleetDesignationDefinition::new(origin(), &fleet), &change).expect("fleet record");
         let credential: flotilla_resources::CredentialSpecSpec = decode(serde_json::json!({
             "consumer": {"adapter": "claude-oauth", "account_email": "transport@example.invalid"},
             "lifecycle": "static", "source": {"kind": "file", "path": "/transport/token"}
         }));
-        log.create("transport-credential", &CredentialSpecDefinition::new(origin(), &credential), "transport", at).expect("spec record");
+        log.create("transport-credential", &CredentialSpecDefinition::new(origin(), &credential), &change).expect("spec record");
         let grant: flotilla_resources::CredentialGrantSpec =
             decode(serde_json::json!({"credentials": ["transport-credential"], "selector": {"projects": ["transport"]}}));
-        log.create("transport-grant", &CredentialGrantDefinition::new(origin(), &grant), "transport", at).expect("grant record");
-        log.create("transport-defaults", &CrewDefaultsDefinition::new(origin(), &Default::default()), "transport", at)
-            .expect("defaults record");
+        log.create("transport-grant", &CredentialGrantDefinition::new(origin(), &grant), &change).expect("grant record");
+        log.create("transport-defaults", &CrewDefaultsDefinition::new(origin(), &Default::default()), &change).expect("defaults record");
         let layer: flotilla_resources::ImageLayerResourceSpec = decode(builtin("ImageLayer"));
         let flotilla_resources::ImageLayerResourceSpec::Current(layer) = layer else { panic!("a built-in layer is current") };
-        log.create("transport-layer", &ImageLayerDefinition::new(origin(), &layer).expect("layer"), "transport", at).expect("layer record");
+        log.create("transport-layer", &ImageLayerDefinition::new(origin(), &layer).expect("layer"), &change).expect("layer record");
         let template: flotilla_resources::WorkflowTemplateSpec = decode(builtin("WorkflowTemplate"));
-        log.create("transport-template", &WorkflowTemplateDefinition::new(origin(), &template).expect("template"), "transport", at)
+        log.create("transport-template", &WorkflowTemplateDefinition::new(origin(), &template).expect("template"), &change)
             .expect("template record");
         // #3824 layer 3a: a Repository, named by its key.
         let repository = flotilla_resources::RepositorySpec::remote("https://transport.example/transport/app").expect("repository");
         let record = flotilla_provisioning::stored::repository::RepositoryRecord::new(repository.clone()).expect("record");
-        log.create(&repository.key().to_string(), &record, "transport", at).expect("repository record");
+        log.create(&repository.key().to_string(), &record, &change).expect("repository record");
         // #3824 layer 3b: a Project, and its project operations' record.
         let project = flotilla_resources::ProjectSpec::builder().display_name("transport".into()).build();
         let record = flotilla_provisioning::stored::project::ProjectDefinition::new(origin(), &project).expect("project");
-        log.create("transport", &record, "transport", at).expect("project record");
+        log.create("transport", &record, &change).expect("project record");
         let ops = flotilla_provisioning::stored::project::ProjectOpsRecord { refused: None, entries: None };
-        log.create("transport", &ops, "transport", at).expect("project ops record");
+        log.create("transport", &ops, &change).expect("project ops record");
     }
 
     fn transport_binding(&self, at: flotilla_schema::Timestamp) -> flotilla_provisioning::stored::account::BindingSpec {

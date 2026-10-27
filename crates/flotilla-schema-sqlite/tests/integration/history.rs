@@ -3,7 +3,7 @@
 //! outlive it, edge codes are the kind's, and renamed fields still read old entries.
 
 use flotilla_schema::{
-    Cause, Change, Code, CodeEnum, Edge, EdgeEvent, Event, Identity, Kind, KindRegistry, Origin, Records, State, Stored, Timestamp,
+    Cause, Change, Code, CodeEnum, Edge, EdgeEvent, Event, Identity, Kind, KindRegistry, NewChange, Records, State, Stored, Timestamp,
 };
 use flotilla_schema_sqlite::{Applied, Malformed, ResourceId, Store, StoreError};
 use flotilla_state_machines::{
@@ -14,7 +14,7 @@ use flotilla_state_machines::{
             ReceiptLog, Receipts, Reply, Sent, Supersession,
         },
     },
-    EdgePayload, Home, Kind as ReadKind, Ref, Source, Transport, Version, WriteError,
+    Home, Kind as ReadKind, Ref, Source, Transport, Version, WriteError,
 };
 use hegel::TestCase;
 use rusqlite::Connection;
@@ -32,7 +32,7 @@ fn replica() -> Store {
 }
 
 fn dossier_event(args: DossierEdge, from: DossierState, to: DossierState, at: i64, reads: Vec<GateRead>) -> DossierEvent {
-    EdgeEvent { edge: args.name(), from, to, writer: format!("writer-{at}"), at: Timestamp(at), payload: Payload { args, reads } }
+    EdgeEvent { edge: args.name(), from, to, at: Timestamp(at), arguments: Payload { args, reads } }
 }
 
 fn read(observed: &str, version: u64) -> GateRead {
@@ -47,7 +47,9 @@ fn log(store: &mut Store, home: &str) -> Vec<Event> {
 /// Applies every entry of `home` in `source` after `after` to `target`, returning what each did.
 fn replay(source: &mut Store, target: &mut Store, after: u64) -> Vec<Applied> {
     let entries: Vec<Event> = log(source, LOCAL).into_iter().filter(|entry| entry.home_seq > after).collect();
+    let changes = source.read().expect("read").changes_of(&entries).expect("changes");
     let mut write = target.write().expect("write");
+    changes.iter().for_each(|change| write.record_change(change).expect("record"));
     let applied = entries.iter().map(|entry| write.apply(entry).expect("apply")).collect();
     write.commit().expect("commit");
     applied
@@ -55,7 +57,7 @@ fn replay(source: &mut Store, target: &mut Store, after: u64) -> Vec<Applied> {
 
 // Behaviour (#3392 G8, the edge log's coverage restated on the log): every edge appends exactly one
 // entry, in the order applied, whose header is its event: the edge code, the labels it leaves and
-// enters, its writer and time; and whose payload is the event's document, decoding to the
+// enters, and its change's writer and time; and whose arguments are the event's, decoding to the
 // arguments and recorded reads it was built with. A replica relays the same entries.
 #[test]
 fn every_edge_logs_one_entry_holding_its_event() {
@@ -70,18 +72,20 @@ fn every_edge_logs_one_entry_holding_its_event() {
     ];
     for event in &events {
         let next = if event.to == event.from { open } else { State::new(event.to, event.at) };
-        stamp = write.apply_edge(stamp, Edge::new(Dossier::STATE, &next, event).expect("edge")).expect("apply");
+        stamp =
+            write.apply_edge(stamp, Edge::new(Dossier::STATE, &next, event).expect("edge"), &NewChange::new("w", event.at)).expect("apply");
     }
     write.commit().expect("commit");
     let entries = source.read().expect("read").changes(stamp.id, 0, 10).expect("history");
     assert_eq!(entries.len(), 1 + events.len(), "the create, then one entry per edge");
     assert_eq!(entries[0].cause, Cause::Create);
     for (entry, event) in entries[1..].iter().zip(&events) {
-        let header = (entry.cause, entry.writer.as_str(), entry.at);
+        let change = source.read().expect("read").change(LOCAL, entry.change).expect("read").expect("its change");
+        let header = (entry.cause, change.writer.as_str(), change.at);
         let cause = Cause::Edge { edge: event.edge.code(), from: event.from.code(), to: event.to.code() };
-        assert_eq!(header, (cause, event.writer.as_str(), event.at));
-        let payload: Payload<DossierEdge> = entry.payload().expect("a document").expect("decodes");
-        assert_eq!(payload, event.payload);
+        assert_eq!(header, (cause, "w", event.at));
+        let arguments: Payload<DossierEdge> = entry.arguments().expect("arguments").expect("decodes");
+        assert_eq!(arguments, event.arguments);
     }
     let sequences: Vec<u64> = entries.iter().map(|entry| entry.home_seq).collect();
     assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]), "in the order applied: {sequences:?}");
@@ -92,23 +96,24 @@ fn every_edge_logs_one_entry_holding_its_event() {
     assert_eq!(target.read().expect("read").changes(id, 0, 10).expect("history"), entries);
 }
 
-// Behaviour (#3392 G8): an engine edge's entry holds the engine's document: its arguments and the
-// reads its gate recorded, which decode back with their kinds as owned text.
+// Behaviour (#3392 G8, #4024): an engine edge's entry holds the engine's arguments, the typed edge;
+// the reads its gate recorded are its change's, not the entry's.
 #[hegel::test(test_cases = 30)]
-fn an_engine_edge_entry_holds_its_recorded_reads(tc: TestCase) {
+fn an_engine_edge_entry_holds_its_arguments(tc: TestCase) {
     let row = Resource::<Message>::generate(&tc, Pick::Draw);
     let Some((edge, _)) = engine::drive(&tc, Pick::Draw, &row, message::candidates(&tc, &row)) else { return };
     let header = edge.clone().into_parts().event;
     let mut store = store();
     let mut write = store.write().expect("write");
     let stamp = write.insert(engine::NAME, &row, &origin()).expect("insert");
-    let stamp = write.apply_edge(stamp, edge).expect("edge");
+    let stamp = write.apply_edge(stamp, edge, &NewChange::new("w", header.at)).expect("edge");
     let entry = write.changes(stamp.id, stamp.version - 1, 1).expect("history").remove(0);
+    let change = write.change(LOCAL, entry.change).expect("read").expect("its change");
     write.commit().expect("commit");
-    assert_eq!(entry.payload.as_ref(), Some(&header.payload));
-    let decoded: EdgePayload<MessageEdge> = entry.payload().expect("a document").expect("decodes");
-    assert_eq!(decoded, header.payload::<EdgePayload<MessageEdge>>().expect("the event's document"));
-    assert_eq!((entry.writer.as_str(), entry.at), (header.writer.as_str(), header.at));
+    assert_eq!(entry.arguments.as_ref(), Some(&header.arguments));
+    let decoded: MessageEdge = entry.arguments().expect("arguments").expect("decodes");
+    assert_eq!(decoded, header.arguments::<MessageEdge>().expect("the event's arguments"));
+    assert_eq!((change.writer.as_str(), change.at), ("w", header.at));
 }
 
 // Behaviour (#3392 G9, A1): a delete is an event. The resource's rows go; its entries (the delete
@@ -126,13 +131,14 @@ fn a_delete_keeps_history_and_an_expunge_removes_it() {
     let stamp = write.insert("m", &message::sample(), &origin()).expect("insert");
     let current = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
     let edited = write.update(&current, &message::sample_in(addr("edited")), &origin()).expect("edit");
-    write.delete::<Resource<Message>>(edited, &Origin::new("deleter", Timestamp(9))).expect("delete");
+    write.delete::<Resource<Message>>(edited, &NewChange::new("deleter", Timestamp(9))).expect("delete");
     write.insert("other", &message::sample(), &origin()).expect("a resource that stays");
     write.commit().expect("commit");
     let history = source.read().expect("read").changes(stamp.id, 0, 10).expect("history");
     let causes: Vec<Cause> = history.iter().map(|entry| entry.cause).collect();
     assert_eq!(causes, [Cause::Create, Cause::Edit, Cause::Delete], "the history survives the delete");
-    assert_eq!((history[2].writer.as_str(), history[2].at), ("deleter", Timestamp(9)));
+    let change = source.read().expect("read").change(LOCAL, history[2].change).expect("read").expect("its change");
+    assert_eq!((change.writer.as_str(), change.at), ("deleter", Timestamp(9)));
     assert_eq!(source.read().expect("read").resolve(Resource::<Message>::CODE, "m", LOCAL).expect("resolve"), Some(stamp.id));
 
     let mut target = replica();
@@ -140,7 +146,7 @@ fn a_delete_keeps_history_and_an_expunge_removes_it() {
     let seen = source.read().expect("read").last_sequence(LOCAL).expect("last");
 
     let mut write = source.write().expect("write");
-    let expunged = write.expunge::<Resource<Message>>(stamp.id, &Origin::new("expunger", Timestamp(10))).expect("expunge");
+    let expunged = write.expunge::<Resource<Message>>(stamp.id, &NewChange::new("expunger", Timestamp(10))).expect("expunge");
     write.commit().expect("commit");
     let identity = Identity { kind: Resource::<Message>::CODE, name: "m".into(), home: LOCAL.into() };
     assert_eq!(source.read().expect("read").resolve(Resource::<Message>::CODE, "m", LOCAL).expect("resolve"), None, "the identity is gone");
@@ -205,8 +211,11 @@ fn an_expunge_refuses_live_and_referenced_resources() {
     let far = write.insert("far", &message::sample(), &origin()).expect("insert");
     write.delete::<Resource<Message>>(far, &origin()).expect("delete");
     write.commit().expect("commit");
+    let entries = remote.read().expect("read").changes_since("remote", 0, 10).expect("log");
+    let changes = remote.read().expect("read").changes_of(&entries).expect("changes");
     let mut write = store.write().expect("write");
-    for entry in remote.read().expect("read").changes_since("remote", 0, 10).expect("log") {
+    changes.iter().for_each(|change| write.record_change(change).expect("record"));
+    for entry in entries {
         write.apply(&entry).expect("apply");
     }
     let id = write.resolve(Resource::<Message>::CODE, "far", "remote").expect("resolve").expect("present");
@@ -228,13 +237,15 @@ fn entries_about_a_master_outlive_its_expunge() {
     for at in [7, 5, 6] {
         let event = dossier_event(DossierEdge::Promise { deliverable: 0 }, DossierState::Open, DossierState::Open, at, vec![]);
         let edge = Edge::new(Dossier::STATE, &open, &event).expect("edge").about(identity.clone());
-        dossier = write.apply_edge(dossier, edge).expect("edge");
+        dossier = write.apply_edge(dossier, edge, &NewChange::new("w", Timestamp(at))).expect("edge");
     }
+    let time =
+        |write: &mut flotilla_schema_sqlite::Write<'_>, entry: &Event| write.change(LOCAL, entry.change).expect("read").expect("change").at;
     let first = write.about(master.id, None, 2).expect("about");
-    let times: Vec<Timestamp> = first.events.iter().map(|entry| entry.at).collect();
+    let times: Vec<Timestamp> = first.events.iter().map(|entry| time(&mut write, entry)).collect();
     assert_eq!(times, [Timestamp(5), Timestamp(6)], "in time order");
     let rest = write.about(master.id, first.next.as_ref(), 2).expect("about");
-    assert_eq!(rest.events.iter().map(|entry| entry.at).collect::<Vec<_>>(), [Timestamp(7)]);
+    assert_eq!(rest.events.iter().map(|entry| time(&mut write, entry)).collect::<Vec<_>>(), [Timestamp(7)]);
     assert!(first.events.iter().chain(&rest.events).all(|entry| entry.about.as_ref() == Some(&identity) && entry.name == "d"));
     write.delete::<Resource<Message>>(master, &origin()).expect("delete");
     write.commit().expect("commit");
@@ -272,20 +283,23 @@ fn entries_about_a_master_on_a_restored_replica_start_at_its_snapshot() {
         Edge::new(Dossier::STATE, &open, &event).expect("edge").about(identity.clone())
     };
     for at in [5, 6] {
-        dossier = write.apply_edge(dossier, promise(at)).expect("edge");
+        dossier = write.apply_edge(dossier, promise(at), &NewChange::new("w", Timestamp(at))).expect("edge");
     }
     write.commit().expect("commit");
     let taken = source.read().expect("read").load_snapshot(dossier.id).expect("snapshot").expect("present");
     let mut write = source.write().expect("write");
     for at in [8, 7, 9] {
-        dossier = write.apply_edge(dossier, promise(at)).expect("edge");
+        dossier = write.apply_edge(dossier, promise(at), &NewChange::new("w", Timestamp(at))).expect("edge");
     }
     write.commit().expect("commit");
 
     let mut target = replica();
+    let tail = source.read().expect("read").changes(dossier.id, taken.version, 10).expect("tail");
+    let changes = source.read().expect("read").changes_of(&tail).expect("changes");
     let mut write = target.write().expect("write");
     write.restore(&taken).expect("seed");
-    for entry in source.read().expect("read").changes(dossier.id, taken.version, 10).expect("tail") {
+    changes.iter().for_each(|change| write.record_change(change).expect("record"));
+    for entry in tail {
         assert!(matches!(write.apply(&entry).expect("apply"), Applied::Applied(_)));
     }
     write.commit().expect("commit");
@@ -295,7 +309,9 @@ fn entries_about_a_master_on_a_restored_replica_start_at_its_snapshot() {
         let (mut times, mut after) = (Vec::new(), None);
         loop {
             let page = read.about(master, after.as_ref(), 2).expect("about");
-            times.extend(page.events.iter().map(|entry| entry.at.micros()));
+            for entry in &page.events {
+                times.push(read.change(LOCAL, entry.change).expect("read").expect("change").at.micros());
+            }
             match page.next {
                 Some(next) => after = Some(next),
                 None => break times,
@@ -326,20 +342,30 @@ fn edge_codes_are_checked_by_the_writer_and_by_apply() {
         edge: Stray::Stray,
         from: DossierState::Open,
         to: DossierState::Open,
-        writer: "w".into(),
         at: Timestamp(3),
-        payload: Payload { args: DossierEdge::Deliver, reads: Vec::new() },
+        arguments: Payload { args: DossierEdge::Deliver, reads: Vec::new() },
     };
-    let refused = write.apply_edge(stamp, Edge::new(Dossier::STATE, &open, &stray).expect("edge"));
+    let refused = write.apply_edge(
+        stamp,
+        Edge::new(Dossier::STATE, &open, &stray).expect("edge"),
+        &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0)),
+    );
     assert!(matches!(refused, Err(StoreError::UnknownEdge { edge, .. }) if edge == Code::new("zz")), "{refused:?}");
     let event = dossier_event(DossierEdge::Promise { deliverable: 0 }, DossierState::Open, DossierState::Open, 3, vec![]);
-    write.apply_edge(stamp, Edge::new(Dossier::STATE, &open, &event).expect("edge")).expect("a declared edge");
+    write
+        .apply_edge(
+            stamp,
+            Edge::new(Dossier::STATE, &open, &event).expect("edge"),
+            &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0)),
+        )
+        .expect("a declared edge");
     write.commit().expect("commit");
     let entries = log(&mut source, LOCAL);
     assert_eq!(entries.len(), 2, "the refused edge logged nothing");
 
     let mut target = replica();
     let mut write = target.write().expect("write");
+    crate::fixtures::carry_changes(&mut source, &mut write, &entries);
     write.apply(&entries[0]).expect("create");
     let Cause::Edge { edge, from, to } = entries[1].cause else { panic!("an edge") };
     for (cause, refusal) in [
@@ -434,6 +460,7 @@ fn renamed_fields_read_entries_written_under_their_aliases() {
 
     let mut new = open(REPLICA, |kinds| kinds.register::<After>().expect("register"));
     let mut write = new.write().expect("write");
+    crate::fixtures::carry_changes(&mut old, &mut write, &entries);
     let Applied::Applied(stamp) = write.apply(&entries[0]).expect("apply") else { panic!("applied") };
     let loaded = write.load::<After>(stamp.id).expect("load").expect("present").value;
     assert_eq!(
@@ -503,7 +530,13 @@ fn a_messages_delivery_gate_reads_the_receipts_about_it() {
     let dossier = write.insert("d", &Dossier::sample(0), &origin()).expect("insert");
     let identity = Identity { kind: Resource::<Message>::CODE, name: "m".into(), home: LOCAL.into() };
     let event = dossier_event(DossierEdge::Promise { deliverable: 0 }, DossierState::Open, DossierState::Open, 2, vec![]);
-    write.apply_edge(dossier, Edge::new(Dossier::STATE, &Dossier::sample(0).state, &event).expect("edge").about(identity)).expect("edge");
+    write
+        .apply_edge(
+            dossier,
+            Edge::new(Dossier::STATE, &Dossier::sample(0).state, &event).expect("edge").about(identity),
+            &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0)),
+        )
+        .expect("edge");
     write.commit().expect("commit");
 
     let mut home = Home::<Message>::new(LOCAL).expect("valid");
@@ -516,7 +549,7 @@ fn a_messages_delivery_gate_reads_the_receipts_about_it() {
     let receive = Receive { message: "m".into(), transport: Transport::Turn };
     let (edge, _) = engine::step(&session, "consumer", receive, &MemoryAgentSessionWorld::default(), Timestamp(3)).expect("received");
     let mut write = store.write().expect("write");
-    let received = write.apply_edge(stamp, edge).expect("receipt");
+    let received = write.apply_edge(stamp, edge.clone(), &flotilla_schema::NewChange::new("test", edge.at())).expect("receipt");
     let entry = write.changes(received.id, stamp.version, 1).expect("log").remove(0);
     write.commit().expect("commit");
     assert_eq!(entry.about.as_ref().map(|about| about.name.as_str()), Some("m"), "the receipt is about the message");
@@ -525,7 +558,7 @@ fn a_messages_delivery_gate_reads_the_receipts_about_it() {
     assert!(home.apply("m", deliver("t", Transport::Turn), &world, Timestamp(4)).is_err(), "another session's receipt does not count");
     assert!(home.apply("m", deliver("s", Transport::Notify), &world, Timestamp(4)).is_err(), "nor another transport");
     let event = home.apply("m", deliver("s", Transport::Turn), &world, Timestamp(4)).expect("delivered");
-    let read = event.payload.reads.iter().find(|read| read.kind == Receipts::NAME).expect("the receipts read");
+    let read = event.arguments.reads.iter().find(|read| read.kind == Receipts::NAME).expect("the receipts read");
     assert_eq!((read.name.as_str(), read.version), ("m", Some(Version(1))));
 
     let host = Deliver { receiver: message::agent("s", "elsewhere"), transport: Transport::Turn };

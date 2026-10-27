@@ -5,7 +5,7 @@
 
 //! See the [implementation choice](https://github.com/flotilla-org/flotilla/blob/main/docs/implementation-choices/change-stream.md).
 
-use flotilla_schema::{Event, Identity, Timestamp, LOG_LIMITS};
+use flotilla_schema::{ChangeHeader, Event, Identity, Timestamp, LOG_LIMITS};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -58,6 +58,10 @@ pub enum Frame {
         home_seq: u64,
     },
     Change(Box<Event>),
+    /// A change of the home (#4024), sent before any entry naming it. One whose sequence is the
+    /// next of the home's advances the cursor as an entry does; one before the cursor (opened
+    /// before a snapshot cut, and written into after it) is recorded and moves nothing.
+    Reason(Box<ChangeHeader>),
     Keepalive {
         home: String,
         watermark: Watermark,
@@ -126,12 +130,37 @@ fn serve_round(
             last
         }
     };
+    // Changes take sequences as entries do, so the tail is every change and entry after the
+    // cursor in sequence order; an entry's change opened before the cursor (before a snapshot's
+    // cut) is sent ahead of it too, once per round.
+    let mut sent = std::collections::BTreeSet::new();
+    let send_changes = |read: &mut crate::Read<'_>,
+                        after: u64,
+                        before: u64,
+                        sent: &mut std::collections::BTreeSet<u64>,
+                        send: &mut dyn FnMut(&[u8]) -> Result<(), StoreError>| {
+        let seqs = read.change_seqs(&home, after, before)?;
+        for seq in &seqs {
+            let change = read.change(&home, *seq)?.ok_or_else(|| StoreError::Stream("missing change".into()))?;
+            emit(Frame::Reason(Box::new(change)), send)?;
+            sent.insert(*seq);
+        }
+        Ok::<_, StoreError>(seqs.last().copied())
+    };
     loop {
         let events = read.changes_since(&home, cursor, MAX_PAGE)?;
         if events.is_empty() {
+            if let Some(seq) = send_changes(&mut read, cursor, last.saturating_add(1), &mut sent, &mut send)? {
+                cursor = seq;
+            }
             break;
         }
         for event in events {
+            send_changes(&mut read, cursor, event.home_seq, &mut sent, &mut send)?;
+            if event.change <= cursor && sent.insert(event.change) {
+                let change = read.change(&home, event.change)?.ok_or_else(|| StoreError::Stream("missing change".into()))?;
+                emit(Frame::Reason(Box::new(change)), &mut send)?;
+            }
             cursor = event.home_seq;
             emit(Frame::Change(Box::new(event)), &mut send)?;
         }
@@ -273,6 +302,15 @@ impl<'a> Follower<'a> {
                     write.advance_watermark(home, cursor)?;
                     snapshot = None;
                 }
+                Frame::Reason(change) if change.home == home && snapshot.is_none() => {
+                    write.record_change(&change)?;
+                    if change.seq == cursor.home_seq + 1 {
+                        cursor.home_seq = change.seq;
+                        write.advance_watermark(home, cursor)?;
+                    } else if change.seq > cursor.home_seq {
+                        return Err(StoreError::Stream("tail is not the next home prefix".into()));
+                    }
+                }
                 Frame::Change(event) if event.home == home && snapshot.is_none() => {
                     if event.home_seq != cursor.home_seq + 1 {
                         return Err(StoreError::Stream("tail is not the next home prefix".into()));
@@ -308,7 +346,7 @@ pub struct ReadResult {
 
 impl flotilla_cbor::Message for Frame {
     const TYPES: &'static [&'static str] =
-        &["Failure", "Read", "Begin", "Resource", "ResourceChunk", "Tombstone", "End", "Change", "Keepalive"];
+        &["Failure", "Read", "Begin", "Resource", "ResourceChunk", "Tombstone", "End", "Change", "Reason", "Keepalive"];
 }
 
 /// Bounded exceptional resource assembly, well above WORKLOAD.md's 100 KiB convoy width.

@@ -15,14 +15,14 @@ use std::{
 
 use flotilla_engine_store::{
     follow::{Followed, Follower},
-    plain::{PlainError, PlainLog},
+    plain::{PendingChange, PlainError, PlainLog},
 };
 use flotilla_resources::{
     definition_provenance::{SUPERSEDED_BY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION},
     engine_records::{EngineObject, EngineRecords},
     RepositoryKey, RepositorySpec, RepositoryStatus,
 };
-use flotilla_schema::{Kind, KindCode, Timestamp};
+use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
@@ -204,8 +204,8 @@ impl EngineRepositories {
             let value = edit(current.as_ref().map(|current| current.spec.clone()))?;
             let written = match (current, version) {
                 (Some(current), Some(version)) if current.spec == value => Ok(version),
-                (Some(_), Some(version)) => self.log.edit(name, version, &value, WRITER, self.now()),
-                _ => self.log.create(name, &value, WRITER, self.now()),
+                (Some(_), Some(version)) => self.log.edit(name, version, &value, &PendingChange::new(NewChange::new(WRITER, self.now()))),
+                _ => self.log.create(name, &value, &PendingChange::new(NewChange::new(WRITER, self.now()))),
             };
             match written {
                 Ok(version) => return object(name.to_owned(), self.home.clone(), version, &value),
@@ -311,7 +311,7 @@ impl EngineRecords for EngineRepositories {
     async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
         refuse_kind(kind)?;
         let Some(current) = self.log.get::<RepositoryRecord>(name, &self.home).map_err(|error| error.to_string())? else { return Ok(()) };
-        match self.log.delete::<RepositoryRecord>(name, current.version, WRITER, self.now()) {
+        match self.log.delete::<RepositoryRecord>(name, current.version, &PendingChange::new(NewChange::new(WRITER, self.now()))) {
             Ok(()) | Err(PlainError::Missing { .. }) => Ok(()),
             Err(error) => Err(format!("delete {KIND} {name}: {error}")),
         }

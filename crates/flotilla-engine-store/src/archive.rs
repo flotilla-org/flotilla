@@ -10,7 +10,8 @@
 //! that replicas apply; the second, a pass later, expunges its entries and identity (#3392 G9),
 //! leaving the `expunge` entry as the identity's tombstone. Expunging in the delete's own
 //! transaction would raise the home's resume floor past every follower's cursor and send each a
-//! fresh snapshot of the whole home. Both entries carry an [`ArchiveNote`] naming the bundle.
+//! fresh snapshot of the whole home. Both are entries of changes written by [`ARCHIVE_WRITER`],
+//! which is how the archive knows its own delete (#4024); the bundle is found by the identity.
 //!
 //! The guarantee before the local, irreversible delete is that every configured store answered
 //! the upload and then served back the exact bytes (same SHA-256). It is not a proof of the
@@ -25,7 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{Cause, Code, CodeEnum, Event, Identity, Kind, KindCode, Origin, Timestamp};
+use flotilla_schema::{Cause, ChangeHeader, Code, CodeEnum, Event, Identity, Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{Read, ResourceId, Snapshot, Stamp, Store, StoreError, Write, MAX_PAGE};
 use flotilla_state_machines::{Machine, Resource};
 use serde::{Deserialize, Serialize};
@@ -35,12 +36,13 @@ const DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
 /// How long a resource stays at its home after reaching an end state (ADR 0064).
 pub const ARCHIVE_AFTER_MICROS: i64 = 7 * DAY_MICROS;
 
-/// The writer of the archive's `delete` and `expunge` entries.
+/// The writer of the changes of the archive's `delete` and `expunge` entries.
 pub const ARCHIVE_WRITER: &str = "system:archive";
 
 /// The bundle format this generation writes. A later generation adds fields with serde defaults
-/// and keeps decoding this one (ADR 0047).
-pub const BUNDLE_FORMAT: u32 = 1;
+/// and keeps decoding this one (ADR 0047). Format 2 carries the entries' changes (#4024); format 1
+/// was written only behind `[primitives]`, before any production store archived, so none exists.
+pub const BUNDLE_FORMAT: u32 = 2;
 
 /// The media type of an uploaded bundle.
 pub const BUNDLE_MEDIA_TYPE: &str = "application/vnd.flotilla.archive-bundle+cbor";
@@ -52,14 +54,17 @@ pub const BUNDLE_MEDIA_TYPE: &str = "application/vnd.flotilla.archive-bundle+cbo
 pub const BUNDLE_LIMITS: flotilla_cbor::Limits =
     flotilla_cbor::Limits { max_message: 256 * 1024 * 1024, max_depth: 32, max_elements: 1 << 22, max_byte_string: 16 * 1024 * 1024 };
 
-/// One archived resource: its end state as stored and every entry of its history, in sequence
-/// order. Applying the entries to an empty store of another home, as replication applies a home's
-/// events, rebuilds the snapshot ([`Bundle::replay`]).
+/// One archived resource: its end state as stored, every entry of its history in sequence order,
+/// and the changes those entries belong to: who wrote each, when and from what (#4024). Applying
+/// the changes and entries to an empty store of another home, as replication applies a home's,
+/// rebuilds the snapshot ([`Bundle::replay`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bundle {
     pub format: u32,
     pub snapshot: Snapshot,
     pub entries: Vec<Event>,
+    #[serde(default)]
+    pub changes: Vec<ChangeHeader>,
 }
 
 impl Bundle {
@@ -89,6 +94,9 @@ impl Bundle {
     /// resource as `store` then holds it.
     pub fn replay(&self, store: &mut Store) -> Result<Option<Snapshot>, StoreError> {
         let mut write = store.write()?;
+        for change in &self.changes {
+            write.record_change(change)?;
+        }
         for entry in &self.entries {
             write.apply(entry)?;
         }
@@ -114,14 +122,6 @@ pub fn bundle_key(identity: &Identity) -> String {
             .collect()
     }
     format!("archive/{}/{}/{}", segment(&identity.home), segment(identity.kind.as_str()), segment(&identity.name))
-}
-
-/// The payload of the archive's `delete` and `expunge` entries: where the bundle is, and the
-/// SHA-256 of the bytes the store was confirmed to hold.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArchiveNote {
-    pub key: String,
-    pub digest: String,
 }
 
 /// Why the archive could not do what it was asked.
@@ -168,8 +168,8 @@ enum Status {
 }
 
 type Ended = fn(&mut Read<'_>, ResourceId, &BTreeSet<Code>) -> Result<Status, StoreError>;
-type Delete = fn(&mut Write<'_>, Stamp, &Origin) -> Result<(), StoreError>;
-type Expunge = fn(&mut Write<'_>, ResourceId, &Origin) -> Result<u64, StoreError>;
+type Delete = fn(&mut Write<'_>, Stamp, flotilla_schema_sqlite::ChangeId) -> Result<(), StoreError>;
+type Expunge = fn(&mut Write<'_>, ResourceId, flotilla_schema_sqlite::ChangeId) -> Result<u64, StoreError>;
 
 struct ArchiveKind {
     /// The codes of the machine's end labels: what an edge entry's `to` names.
@@ -206,17 +206,17 @@ impl ArchiveKinds {
                 Some(_) => Status::Live,
             })
         }
-        fn delete<M: Machine>(write: &mut Write<'_>, stamp: Stamp, origin: &Origin) -> Result<(), StoreError>
+        fn delete<M: Machine>(write: &mut Write<'_>, stamp: Stamp, change: flotilla_schema_sqlite::ChangeId) -> Result<(), StoreError>
         where
             Resource<M>: Kind,
         {
-            write.delete::<Resource<M>>(stamp, origin)
+            write.delete::<Resource<M>>(stamp, change)
         }
-        fn expunge<M: Machine>(write: &mut Write<'_>, id: ResourceId, origin: &Origin) -> Result<u64, StoreError>
+        fn expunge<M: Machine>(write: &mut Write<'_>, id: ResourceId, change: flotilla_schema_sqlite::ChangeId) -> Result<u64, StoreError>
         where
             Resource<M>: Kind,
         {
-            write.expunge::<Resource<M>>(id, origin)
+            write.expunge::<Resource<M>>(id, change)
         }
         let ends = M::definition().ends().iter().map(|end| end.state.code()).collect();
         self.kinds.insert(Resource::<M>::CODE, ArchiveKind { ends, ended: ended::<M>, delete: delete::<M>, expunge: expunge::<M> });
@@ -238,8 +238,8 @@ impl ArchiveKinds {
 pub enum Stage {
     /// At an end state since `ended_at`; ships seven days later.
     Ended,
-    /// Shipped and deleted at `at`, with its bundle at `note`; its expunge is next.
-    Deleted { at: Timestamp, note: ArchiveNote },
+    /// Shipped and deleted at `at`; its expunge is next.
+    Deleted { at: Timestamp },
 }
 
 /// One resource homed here that is waiting to archive.
@@ -264,7 +264,7 @@ pub enum Due {
     /// Bundle, upload and, once confirmed, delete.
     Ship(Identity),
     /// Expunge a shipped resource.
-    Expunge(Identity, ArchiveNote),
+    Expunge(Identity),
 }
 
 /// A bundle ready to upload, or why there is none.
@@ -313,12 +313,17 @@ impl Archiver {
                 cursor
             }
         };
+        let mut changes = BTreeMap::new();
         loop {
             let entries = read.changes_since(&self.home, cursor, MAX_PAGE)?;
             let Some(last) = entries.last() else { break };
             cursor = last.home_seq;
             for entry in &entries {
-                self.follow(entry);
+                let change = match changes.entry(entry.change) {
+                    std::collections::btree_map::Entry::Occupied(held) => held.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(slot) => slot.insert(change_of(&mut read, entry)?),
+                };
+                self.follow(entry, change);
             }
         }
         self.cursor = Some(cursor);
@@ -340,9 +345,10 @@ impl Archiver {
                         }
                         // A deleted resource is the archive's when its last entry is the archive's delete.
                         Status::Absent => {
-                            let last = read.changes(id, seq.saturating_sub(1), 1)?.pop();
-                            if let Some((entry, stage)) = last.and_then(|entry| archived_delete(&entry).map(|stage| (entry, stage))) {
-                                self.candidates.insert(identity.clone(), Candidate { identity, ended_at: entry.at, stage });
+                            let Some(entry) = read.changes(id, seq.saturating_sub(1), 1)?.pop() else { continue };
+                            let change = change_of(read, &entry)?;
+                            if let Some(stage) = archived_delete(&entry, &change) {
+                                self.candidates.insert(identity.clone(), Candidate { identity, ended_at: change.at, stage });
                             }
                         }
                         Status::Live => {}
@@ -353,16 +359,16 @@ impl Archiver {
         Ok(())
     }
 
-    fn follow(&mut self, entry: &Event) {
+    fn follow(&mut self, entry: &Event, change: &ChangeHeader) {
         let Ok(kind) = self.kinds.get(entry.kind) else { return };
         let identity = entry.identity();
         match &entry.cause {
             Cause::Edge { to, .. } if kind.ends.contains(to) => {
-                self.candidates.insert(identity.clone(), Candidate { identity, ended_at: entry.at, stage: Stage::Ended });
+                self.candidates.insert(identity.clone(), Candidate { identity, ended_at: change.at, stage: Stage::Ended });
             }
-            Cause::Delete => match archived_delete(entry) {
+            Cause::Delete => match archived_delete(entry, change) {
                 Some(stage) => {
-                    let ended_at = self.candidates.get(&identity).map_or(entry.at, |candidate| candidate.ended_at);
+                    let ended_at = self.candidates.get(&identity).map_or(change.at, |candidate| candidate.ended_at);
                     self.candidates.insert(identity.clone(), Candidate { identity, ended_at, stage });
                 }
                 // A delete the archive did not write: nothing was shipped, so nothing is expunged.
@@ -386,9 +392,7 @@ impl Archiver {
             .values()
             .filter_map(|candidate| match &candidate.stage {
                 Stage::Ended if now >= candidate.due() => Some(Due::Ship(candidate.identity.clone())),
-                Stage::Deleted { at, note } if now >= at.saturating_add(grace_micros) => {
-                    Some(Due::Expunge(candidate.identity.clone(), note.clone()))
-                }
+                Stage::Deleted { at } if now >= at.saturating_add(grace_micros) => Some(Due::Expunge(candidate.identity.clone())),
                 _ => None,
             })
             .collect()
@@ -422,25 +426,22 @@ impl Archiver {
             }
             entries.extend(page);
         }
+        let mut changes = Vec::new();
+        for seq in entries.iter().map(|entry| entry.change).collect::<BTreeSet<_>>() {
+            changes.push(read.change(&identity.home, seq)?.ok_or_else(|| ArchiveError::Missing(identity.clone()))?);
+        }
         let version = snapshot.version;
-        Ok(Prepared::Ready { bundle: Bundle { format: BUNDLE_FORMAT, snapshot, entries }, version })
+        Ok(Prepared::Ready { bundle: Bundle { format: BUNDLE_FORMAT, snapshot, entries, changes }, version })
     }
 
     /// Deletes a shipped resource at the version its bundle holds; a resource that moved since is
     /// refused (`Conflict`) and ships again.
-    pub fn delete(
-        &self,
-        store: &mut Store,
-        identity: &Identity,
-        version: u64,
-        note: &ArchiveNote,
-        at: Timestamp,
-    ) -> Result<(), ArchiveError> {
+    pub fn delete(&self, store: &mut Store, identity: &Identity, version: u64, at: Timestamp) -> Result<(), ArchiveError> {
         let kind = self.kinds.get(identity.kind)?;
-        let origin = note_origin(note, at)?;
         let mut write = store.write()?;
         let id = write.resolve(identity.kind, &identity.name, &identity.home)?.ok_or_else(|| ArchiveError::Missing(identity.clone()))?;
-        (kind.delete)(&mut write, Stamp { id, version }, &origin)?;
+        let change = write.open_change(&NewChange::new(ARCHIVE_WRITER, at))?;
+        (kind.delete)(&mut write, Stamp { id, version }, change)?;
         write.commit()?;
         Ok(())
     }
@@ -448,12 +449,12 @@ impl Archiver {
     /// Expunges a shipped, deleted resource. `false` while another resource's row still refers to
     /// it: its identity stays as the tombstone that routes reads to the bundle, and the expunge is
     /// retried on a later pass.
-    pub fn expunge(&self, store: &mut Store, identity: &Identity, note: &ArchiveNote, at: Timestamp) -> Result<bool, ArchiveError> {
+    pub fn expunge(&self, store: &mut Store, identity: &Identity, at: Timestamp) -> Result<bool, ArchiveError> {
         let kind = self.kinds.get(identity.kind)?;
-        let origin = note_origin(note, at)?;
         let mut write = store.write()?;
         let Some(id) = write.resolve(identity.kind, &identity.name, &identity.home)? else { return Ok(true) };
-        match (kind.expunge)(&mut write, id, &origin) {
+        let change = write.open_change(&NewChange::new(ARCHIVE_WRITER, at))?;
+        match (kind.expunge)(&mut write, id, change) {
             Ok(_) => {}
             Err(StoreError::Referenced { .. }) => return Ok(false),
             Err(error) => return Err(error.into()),
@@ -463,16 +464,13 @@ impl Archiver {
     }
 }
 
-fn note_origin(note: &ArchiveNote, at: Timestamp) -> Result<Origin, ArchiveError> {
-    Origin::new(ARCHIVE_WRITER, at).with_payload(note).map_err(|error| ArchiveError::Encoding(error.to_string()))
+/// The change `entry` belongs to, as this store holds it.
+fn change_of(read: &mut Read<'_>, entry: &Event) -> Result<ChangeHeader, ArchiveError> {
+    read.change(&entry.home, entry.change)?.ok_or_else(|| ArchiveError::Missing(entry.identity()))
 }
 
-/// The stage of a resource whose `entry` is the archive's delete of it. A delete by another
-/// writer, or one whose payload is not a note, is not the archive's.
-fn archived_delete(entry: &Event) -> Option<Stage> {
-    if entry.cause != Cause::Delete || entry.writer != ARCHIVE_WRITER {
-        return None;
-    }
-    let note = flotilla_cbor::from_slice(entry.payload.as_deref()?, &flotilla_schema::INLINE_LIMITS).ok()?;
-    Some(Stage::Deleted { at: entry.at, note })
+/// The stage of a resource whose `entry`, of `change`, is the archive's delete of it. A delete
+/// written by another writer is not the archive's.
+fn archived_delete(entry: &Event, change: &ChangeHeader) -> Option<Stage> {
+    (entry.cause == Cause::Delete && change.writer == ARCHIVE_WRITER).then_some(Stage::Deleted { at: change.at })
 }

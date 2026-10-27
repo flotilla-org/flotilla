@@ -121,7 +121,7 @@ fn an_answer_needs_a_reply_to_the_message_in_the_senders_inbox() {
     assert_eq!(h.apply("r", answer(), &landed(&reply(), SENDER, Some(&other)), at(1)).err(), not_a_reply);
     assert_eq!(h.apply("r", answer(), &landed(&reply(), SENDER, None), at(1)).err(), not_a_reply);
     let event = h.apply("r", answer(), &landed(&reply(), SENDER, Some(&awaited())), at(2)).expect("answered");
-    assert_eq!(event.payload.reads, [InputRead { kind: "landed".into(), name: "m2@replier-home".into(), version: Some(Version(1)) }]);
+    assert_eq!(event.arguments.reads, [InputRead { kind: "landed".into(), name: "m2@replier-home".into(), version: Some(Version(1)) }]);
     assert_eq!((state(&h), h.get("r").expect("exists").since()), (&AwaitingReplyState::Answered, at(2)));
 }
 
@@ -139,7 +139,7 @@ fn expiry_follows_the_deadline_and_never_beats_a_reply() {
     assert_eq!(h.apply("r", Expire, &present, at(6)).err(), refused(AwaitingReplyRefusal::ReplyPresent));
     let elsewhere = landed(&reply(), "project:p/role:other", Some(&awaited()));
     let event = h.apply("r", Expire, &elsewhere, at(6)).expect("expired");
-    assert_eq!(event.payload.reads, [InputRead { kind: "replies".into(), name: "m1@receiver-home".into(), version: Some(Version(1)) }]);
+    assert_eq!(event.arguments.reads, [InputRead { kind: "replies".into(), name: "m1@receiver-home".into(), version: Some(Version(1)) }]);
     assert_eq!((state(&h), h.get("r").expect("exists").since()), (&AwaitingReplyState::Expired, at(6)));
 }
 

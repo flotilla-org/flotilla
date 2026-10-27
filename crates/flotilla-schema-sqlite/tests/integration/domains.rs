@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use flotilla_schema::{Address, KindRegistry, Origin, Stored, Timestamp};
+use flotilla_schema::{Address, KindRegistry, NewChange, Stored, Timestamp};
 use flotilla_schema_sqlite::{Store, StoreError, StoreOptions};
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
@@ -31,8 +31,8 @@ fn open(conn: Connection, home: &str) -> Store {
     Store::open_with(conn, home, registry(), StoreOptions { string_cache: 1, ..StoreOptions::default() }).expect("open")
 }
 
-fn origin(text: &str) -> Origin {
-    Origin { writer: text.to_owned(), at: Timestamp(0), payload: None }
+fn origin(text: &str) -> NewChange {
+    NewChange { writer: text.to_owned(), at: Timestamp(0), items: Vec::new() }
 }
 
 // Property (#3422): equal text is deduplicated only within one domain. Every generated step
@@ -69,6 +69,7 @@ fn domains_survive_cache_rollback_restart_and_replication(tc: TestCase) {
     let events = store.read().expect("read").changes_since(&home, 0, 100).expect("events");
     let mut replica = open(Connection::open_in_memory().expect("connection"), "elsewhere");
     let mut write = replica.write().expect("replica write");
+    crate::fixtures::carry_changes(&mut store, &mut write, &events);
     for event in &events {
         write.apply(event).expect("apply");
     }
@@ -100,7 +101,8 @@ fn audit_detects_wrong_domains_in_kind_and_shared_columns() {
         ("stream_history", "home"),
         ("stream_watermark", "home"),
         ("log", "home"),
-        ("log", "writer"),
+        ("change", "home"),
+        ("change", "writer"),
     ] {
         let mut store = open(Connection::open_in_memory().expect("connection"), "local");
         let value =
@@ -120,7 +122,16 @@ fn audit_detects_wrong_domains_in_kind_and_shared_columns() {
         conn.execute("INSERT INTO strings(domain,s) VALUES ('wrong','x')", []).expect("wrong domain");
         // Foreign keys remain enabled: the injected dictionary id exists, so FK checks
         // succeed even though its domain disagrees with the referencing column.
+        // A change and its entries share their home through the (home, seq) key: corrupting
+        // one side alone needs that one check off.
+        let paired = column == "home" && matches!(table, "log" | "change");
+        if paired {
+            conn.execute("PRAGMA foreign_keys = OFF", []).expect("pragma");
+        }
         conn.execute(&format!("UPDATE {table} SET {column} = (SELECT id FROM strings WHERE domain='wrong')"), []).expect("corrupt");
+        if paired {
+            conn.execute("PRAGMA foreign_keys = ON", []).expect("pragma");
+        }
         let store = open(conn, "local");
         assert!(
             matches!(store.audit_domains(), Err(StoreError::Corrupt { table: found_table, column: found_column }) if found_table == table && found_column == column),
@@ -166,6 +177,18 @@ fn a_pre_domain_dictionary_is_refused_at_open() {
     .expect("old baseline");
     assert!(matches!(flotilla_schema_sqlite::audit_domains(&conn, &registry()), Err(StoreError::LegacyDictionarySchema)));
     assert!(matches!(Store::open(conn, "local", registry()), Err(StoreError::LegacyDictionarySchema)));
+}
+
+// Behaviour (#4024): a `log` written before changes holds each entry's writer, time and payload
+// and names no change. It has no migration, so opening refuses it, before the DDL's `log` indexes
+// meet columns it lacks.
+#[test]
+fn a_log_from_before_changes_is_refused_at_open() {
+    let conn = Connection::open_in_memory().expect("connection");
+    conn.execute_batch("CREATE TABLE log (home INTEGER NOT NULL, home_seq INTEGER NOT NULL, writer INTEGER NOT NULL, at INTEGER NOT NULL, payload BLOB) STRICT;")
+        .expect("old log");
+    let refused = Store::open(conn, "local", registry());
+    assert!(matches!(refused, Err(StoreError::LegacyLogSchema)), "{:?}", refused.err());
 }
 
 // Behaviour (#3627 look-over ruling 3): a kind table written before its parent key was named

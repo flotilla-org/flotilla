@@ -239,7 +239,7 @@ async fn watch_replays_historical_states_after_eviction() {
 // older cursors expire even for unrelated inboxes. No backend trimming occurs.
 #[tokio::test]
 async fn watch_reports_expired_when_source_history_was_expunged() {
-    use flotilla_schema::{Kind, Origin, Timestamp};
+    use flotilla_schema::{Kind, NewChange, Timestamp};
     use flotilla_state_machines::Resource;
     let store = database();
     let (backend, _) = backend(store.clone(), Arc::new(Evidence::default()), RESIDENT_BUDGET);
@@ -249,7 +249,7 @@ async fn watch_reports_expired_when_source_history_was_expunged() {
         let mut write = store.write().expect("write");
         let id = write.resolve(Resource::<Message>::CODE, &message, "test").expect("resolve").expect("present");
         let current = write.load::<Resource<Message>>(id).expect("load").expect("present");
-        let origin = Origin::new("test", Timestamp(100));
+        let origin = NewChange::new("test", Timestamp(100));
         write.delete::<Resource<Message>>(current.stamp(), &origin).expect("delete");
         write.expunge::<Resource<Message>>(id, &origin).expect("expunge");
         write.commit().expect("commit");
@@ -462,7 +462,7 @@ async fn pending_excludes_other_homes_before_value_reads() {
             flotilla_state_machines::Version(0),
         );
         let mut write = donor.write().unwrap();
-        let stamp = write.insert(&name, &resource, &flotilla_schema::Origin::new("other", flotilla_schema::Timestamp(10))).unwrap();
+        let stamp = write.insert(&name, &resource, &flotilla_schema::NewChange::new("other", flotilla_schema::Timestamp(10))).unwrap();
         write.commit().unwrap();
         snapshots.push(donor.read().unwrap().load_snapshot(stamp.id).unwrap().unwrap());
     }

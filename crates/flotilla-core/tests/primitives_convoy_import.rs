@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use chrono::Utc;
 use flotilla_core::primitives::convoy_import::{
-    check, import_convoy, rehearse, rehearse_all, ClaimHistory, ConvoyImportRefusal, ConvoyImportWorld, ImportOutcome, ImportedConvoy,
+    check, import_convoy, rehearse, rehearse_all, ConvoyImportRefusal, ConvoyImportWorld, ImportOutcome, ImportedConvoy,
 };
 use flotilla_resources::{
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, Submission, SubmissionVerdict},
@@ -280,10 +280,10 @@ fn an_open_stall_becomes_the_seats_stall_record() {
     assert!(convoy.unrecorded_stall.expect("reported").contains("operator-level"));
 }
 
-// Behaviour: the importer writes each convoy through the creation path at its home, and the
-// creation's log entry carries the claim history as its payload.
+// Behaviour: the importer writes each convoy through the creation path at its home, as one
+// `import` change at the convoy's time (#4024); the old claim history is not carried.
 #[test]
-fn the_claim_history_is_the_creations_log_entry() {
+fn the_import_is_one_change_at_the_convoys_time() {
     use flotilla_schema::{Cause, Kind};
     use flotilla_state_machines::{machines::convoy::Convoy as Engine, Resource};
     let mut old = convoy("c", ConvoyPhase::Active, vec![agent("coder", true)]);
@@ -299,9 +299,9 @@ fn the_claim_history_is_the_creations_log_entry() {
     let events = read.changes(id, 0, 10).expect("log");
     assert_eq!(events.len(), 1);
     assert!(matches!(events[0].cause, Cause::Create));
-    let history: ClaimHistory = events[0].payload().expect("a payload").expect("decodes");
-    assert_eq!(history, convoy.history);
-    assert!(history.crews[0].claim.contains("first attempt"), "{history:?}");
+    let change = read.change(HOME, events[0].change).expect("read").expect("its change");
+    assert_eq!((change.writer.as_str(), change.at), ("import", convoy.resource.since()));
+    assert!(convoy.history.crews[0].claim.contains("first attempt"), "the import still reads the claim: {:?}", convoy.history);
 }
 
 // Behaviour (the pre-roll rehearsal): every Convoy the stored-record corpus holds is imported,

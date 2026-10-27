@@ -447,19 +447,18 @@ pub fn stall_record(convoy: &ImportedConvoy) -> Result<Option<Resource<AwaitingR
 }
 
 /// Writes one imported convoy at its home in `store` through the creation
-/// path, with its open stall record if it has one: one transaction, whose
-/// convoy log entry carries the claim history as its payload. The cut-over's
-/// importer writes each convoy so; the rehearsal does the same into a
-/// scratch store.
+/// path, with its open stall record if it has one: one transaction and one
+/// `import` change (#4024). The old claim history is not carried: no reader
+/// of the engine's log asks for it. The cut-over's importer writes each convoy
+/// so; the rehearsal does the same into a scratch store.
 pub fn write(store: &mut flotilla_schema_sqlite::Store, convoy: &ImportedConvoy) -> Result<(), String> {
-    let origin =
-        flotilla_schema::Origin::new("import", convoy.resource.since()).with_payload(&convoy.history).map_err(|error| error.to_string())?;
     let stall = stall_record(convoy)?;
     let mut write = store.write().map_err(|error| error.to_string())?;
-    write.insert(convoy.resource.name(), &convoy.resource, &origin).map_err(|error| error.to_string())?;
+    let change =
+        write.open_change(&flotilla_schema::NewChange::new("import", convoy.resource.since())).map_err(|error| error.to_string())?;
+    write.insert(convoy.resource.name(), &convoy.resource, change).map_err(|error| error.to_string())?;
     if let Some(stall) = &stall {
-        let origin = flotilla_schema::Origin::new("import", stall.since());
-        write.insert(stall.name(), stall, &origin).map_err(|error| format!("stall `{}`: {error}", stall.name()))?;
+        write.insert(stall.name(), stall, change).map_err(|error| format!("stall `{}`: {error}", stall.name()))?;
     }
     write.commit().map_err(|error| error.to_string())
 }

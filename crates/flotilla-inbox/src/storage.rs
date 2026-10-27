@@ -88,7 +88,7 @@ impl Log<Message> for MemoryStore {
         );
         Ok(version)
     }
-    fn edge(&mut self, _: &StoredState<Message>, next: &Resource<Message>, _: &EdgeEventOf<Message>) -> Result<Version, LogError> {
+    fn edge(&mut self, _: &str, _: &StoredState<Message>, next: &Resource<Message>, _: &EdgeEventOf<Message>) -> Result<Version, LogError> {
         self.pending.remove(&(next.spec().inbox.clone(), next.spec().admitted_seq));
         let version = self.append(next.spec().inbox.clone(), next.name().into(), ChangeKind::Message(next.state().clone()));
         self.resources.insert(next.name().into(), Resource::stored(next.name(), next.spec().clone(), next.stored_state().clone(), version));
@@ -171,11 +171,12 @@ impl Log<Message> for MemoryInboxLog {
     }
     fn edge(
         &mut self,
+        writer: &str,
         previous: &StoredState<Message>,
         next: &Resource<Message>,
         event: &EdgeEventOf<Message>,
     ) -> Result<Version, LogError> {
-        self.0.lock().expect("memory store").edge(previous, next, event)
+        self.0.lock().expect("memory store").edge(writer, previous, next, event)
     }
 }
 impl InboxLog for MemoryInboxLog {

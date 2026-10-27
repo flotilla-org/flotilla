@@ -88,8 +88,9 @@ impl EnsureLogs for StoreLogs {
             let Some(last) = entries.last() else { return edges };
             after = last.home_seq;
             for entry in &entries {
-                if let Some(event) = edge_event::<Ensure>(entry).expect("entry decodes") {
-                    edges.push(event.payload.edge);
+                let at = read.change(HOME, entry.change).expect("read").expect("its change").at;
+                if let Some(event) = edge_event::<Ensure>(entry, at).expect("entry decodes") {
+                    edges.push(event.arguments);
                 }
             }
         }

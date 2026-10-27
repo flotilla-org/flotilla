@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use flotilla_inbox::sqlite::MessageLog;
 use flotilla_inbox_testkit::{consumer, inbox, spec, SessionPort};
-use flotilla_schema::{Kind, Origin, Timestamp};
+use flotilla_schema::{Kind, NewChange, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
     machines::message::{MemoryMessageWorld, Message},
@@ -33,13 +33,14 @@ fn transaction_assigns_admission_to_home_and_store(tc: TestCase) {
         let mut locked = store.lock().expect("store");
         let mut write = locked.write().expect("write");
         for n in 0..competitors {
-            write.insert(&format!("other-{n}"), template.resource(), &Origin::new("test", Timestamp(5))).expect("consumer insert");
+            write.insert(&format!("other-{n}"), template.resource(), &NewChange::new("test", Timestamp(5))).expect("consumer insert");
         }
         write.commit().expect("batch commit");
     }
     home.create("message", request, &MemoryMessageWorld::default(), Timestamp(10)).expect("transaction admission");
     let resident = home.get("message").expect("resident");
-    assert_eq!(resident.spec().admitted_seq, competitors as u64 + 1);
+    // Each write takes its change's sequence, then its entry's (#4024).
+    assert_eq!(resident.spec().admitted_seq, 2 * competitors as u64 + 2);
     assert_eq!(resident.version().0, resident.spec().admitted_seq);
     let mut locked = store.lock().expect("store");
     let mut read = locked.read().expect("read");

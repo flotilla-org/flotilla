@@ -9,10 +9,10 @@ use std::{
 };
 
 use flotilla_engine_store::{
-    plain::{register_plain, Plain, PlainError, PlainLog},
+    plain::{register_plain, PendingChange, Plain, PlainError, PlainLog},
     rehearse_plain,
 };
-use flotilla_schema::{Kind, KindRegistry, Stored, Timestamp};
+use flotilla_schema::{Kind, KindRegistry, NewChange, Stored, Timestamp};
 use flotilla_schema_sqlite::Store;
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
@@ -24,12 +24,19 @@ fn open(home: &str, kinds: &KindRegistry) -> Arc<Mutex<Store>> {
     Arc::new(Mutex::new(Store::open(Connection::open_in_memory().expect("SQLite"), home, kinds.clone()).expect("store")))
 }
 
-/// Applies every entry the home logged after `after` at the replica, as the change stream does,
-/// and returns the last sequence applied.
+/// Applies every entry the home logged after `after` at the replica, each after its change, as the
+/// change stream does, and returns the last sequence applied.
 fn follow(home: &Arc<Mutex<Store>>, replica: &Arc<Mutex<Store>>, after: u64) -> u64 {
-    let events = home.lock().expect("home").read().expect("read").changes_since(HOME, after, 256).expect("changes");
+    let (events, changes) = {
+        let mut home = home.lock().expect("home");
+        let mut read = home.read().expect("read");
+        let events = read.changes_since(HOME, after, 256).expect("changes");
+        let changes = read.changes_of(&events).expect("their changes");
+        (events, changes)
+    };
     let mut replica = replica.lock().expect("replica");
     let mut write = replica.write().expect("write");
+    changes.iter().for_each(|change| write.record_change(change).expect("record change"));
     let mut last = after;
     for event in &events {
         write.apply(event).expect("replica applies the home's entry");
@@ -37,6 +44,11 @@ fn follow(home: &Arc<Mutex<Store>>, replica: &Arc<Mutex<Store>>, after: u64) -> 
     }
     write.commit().expect("commit");
     last
+}
+
+/// A change of its own by "writer" at `micros`.
+fn change(micros: i64) -> PendingChange {
+    PendingChange::new(NewChange::new("writer", Timestamp::from_micros(micros)))
 }
 
 /// One drawn operation; versions are the model's, or one behind it for a stale writer.
@@ -71,6 +83,7 @@ where
     let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
     for step in 0..steps {
         let at = Timestamp::from_micros(step as i64 + 1);
+        let change = || PendingChange::new(NewChange::new("writer", at));
         let name = tc.draw(gs::integers::<usize>().min_value(0).max_value(names.len() - 1));
         let op = match tc.draw(gs::integers::<u8>().min_value(0).max_value(2)) {
             0 => Op::Create(name, spec(tc)),
@@ -84,7 +97,7 @@ where
         match op {
             Op::Create(name, spec) => {
                 let name = names[name];
-                let result = log.create(name, &spec, "writer", at);
+                let result = log.create(name, &spec, &change());
                 if model.contains_key(name) {
                     assert!(matches!(result, Err(PlainError::Exists { .. })), "a live name is refused: {result:?}");
                 } else {
@@ -96,14 +109,14 @@ where
             Op::Edit { name, spec, stale } => {
                 let name = names[name];
                 let Some((version, current)) = model.get(name).cloned() else {
-                    assert!(matches!(log.edit(name, 1, &spec, "writer", at), Err(PlainError::Missing { .. })));
+                    assert!(matches!(log.edit(name, 1, &spec, &change()), Err(PlainError::Missing { .. })));
                     continue;
                 };
                 if stale {
-                    let result = log.edit(name, version - 1, &spec, "writer", at);
+                    let result = log.edit(name, version - 1, &spec, &change());
                     assert!(matches!(result, Err(PlainError::Conflict { stored, .. }) if stored == version), "{result:?}");
                 } else {
-                    let next = log.edit(name, version, &spec, "writer", at).expect("an edit at the version read applies");
+                    let next = log.edit(name, version, &spec, &change()).expect("an edit at the version read applies");
                     if spec == current {
                         assert_eq!(next, version, "an edit that changes nothing keeps the version");
                     } else {
@@ -115,14 +128,14 @@ where
             Op::Delete { name, stale } => {
                 let name = names[name];
                 let Some((version, _)) = model.get(name).cloned() else {
-                    assert!(matches!(log.delete::<K>(name, 1, "writer", at), Err(PlainError::Missing { .. })));
+                    assert!(matches!(log.delete::<K>(name, 1, &change()), Err(PlainError::Missing { .. })));
                     continue;
                 };
                 if stale {
-                    let result = log.delete::<K>(name, version - 1, "writer", at);
+                    let result = log.delete::<K>(name, version - 1, &change());
                     assert!(matches!(result, Err(PlainError::Conflict { .. })), "{result:?}");
                 } else {
-                    log.delete::<K>(name, version, "writer", at).expect("a delete at the version read applies");
+                    log.delete::<K>(name, version, &change()).expect("a delete at the version read applies");
                     model.remove(name);
                 }
             }
@@ -194,9 +207,9 @@ fn a_deleted_name_is_created_again_at_a_new_version() {
     let (home, replica) = (open(HOME, &kinds), open(REPLICA, &kinds));
     let log = PlainLog::new(Arc::clone(&home));
     let spec = Sample { title: "a".into(), owner: "b".into(), limit: None, tags: Vec::new() };
-    let first = log.create("one", &spec, "writer", Timestamp::from_micros(1)).expect("create");
-    log.delete::<Sample>("one", first, "writer", Timestamp::from_micros(2)).expect("delete");
-    let second = log.create("one", &spec, "writer", Timestamp::from_micros(3)).expect("create again");
+    let first = log.create("one", &spec, &change(1)).expect("create");
+    log.delete::<Sample>("one", first, &change(2)).expect("delete");
+    let second = log.create("one", &spec, &change(3)).expect("create again");
     assert!(second > first);
     follow(&home, &replica, 0);
     let again = PlainLog::new(replica).get::<Sample>("one", HOME).expect("replica get");
@@ -219,13 +232,13 @@ fn a_follower_names_written_resources_and_rescans_after_a_snapshot() {
     let mut follower = Follower::new([<Sample as Kind>::CODE]);
     let pass = |follower: &mut Follower| follower.pass(&mut replica.lock().expect("replica").read().expect("read"), &homes).expect("pass");
     assert_eq!(pass(&mut follower), vec![Followed::Rescan(HOME.into())], "a home first seen is rescanned");
-    log.create("one", &spec, "writer", Timestamp::from_micros(1)).expect("create");
+    log.create("one", &spec, &change(1)).expect("create");
     let applied = follow(&home, &replica, 0);
     let one = Identity { kind: <Sample as Kind>::CODE, name: "one".into(), home: HOME.into() };
     assert_eq!(pass(&mut follower), vec![Followed::Changed(one)]);
     assert_eq!(pass(&mut follower), Vec::new(), "nothing new, nothing named");
     // A second resource reaches the replica as a snapshot, as a follower's catch-up delivers it.
-    let version = log.create("two", &spec, "writer", Timestamp::from_micros(2)).expect("create");
+    let version = log.create("two", &spec, &change(2)).expect("create");
     let snapshot = {
         let mut store = home.lock().expect("home");
         let mut read = store.read().expect("read");

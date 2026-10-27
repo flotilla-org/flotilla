@@ -8,6 +8,8 @@
 
 use rusqlite::{types::Value as SqlValue, Connection};
 
+use flotilla_schema_sqlite::SORTED_STATEMENTS as SORTED;
+
 use crate::fixtures::store;
 
 /// The detail column of each plan row.
@@ -29,7 +31,7 @@ const KEYED: [&str; 4] = ["USING INTEGER PRIMARY KEY", "USING PRIMARY KEY", "USI
 
 // Behaviour (#3320 production shape): every statement the runtime prepares reads by a primary
 // key, a unique key or a declared index: no plan row is a SCAN, every SEARCH names a key or index,
-// no result is sorted through a temporary b-tree, and every statement other than a plain insert
+// no result is sorted through a temporary b-tree (but `SORTED_STATEMENTS`, with their reason), and every statement other than a plain insert
 // searches something. Each index query uses its own partial index, and the startup scan searches
 // `resource_identity_by_home`.
 #[test]
@@ -42,7 +44,7 @@ fn every_prepared_statement_searches_by_key() {
         if rows.iter().any(|row| row.split_whitespace().any(|word| word == "SCAN")) {
             problems.push("scans");
         }
-        if rows.iter().any(|row| row.contains("USE TEMP B-TREE")) {
+        if rows.iter().any(|row| row.contains("USE TEMP B-TREE")) && !SORTED.contains(&label.as_str()) {
             problems.push("sorts through a temporary b-tree");
         }
         if rows.iter().any(|row| row.starts_with("SEARCH") && !KEYED.iter().any(|keyed| row.contains(keyed))) {
@@ -187,7 +189,7 @@ fn log_reads_search_their_own_index() {
         ("log_by_resource", "USING INDEX log_by_resource (resource=? AND home_seq>?)"),
         ("log_by_home", "USING INDEX sqlite_autoindex_log_1 (home=? AND home_seq>?)"),
         ("log_about_first", "USING INDEX log_about (about=?)"),
-        ("log_about_after", "USING INDEX log_about (about=? AND at>?)"),
+        ("log_about_after", "USING INDEX log_about (about=?)"),
         ("log_expunge", "USING COVERING INDEX log_by_resource (resource=?)"),
         ("log_expunged_after", "USING INDEX log_expunges (home=? AND home_seq>?)"),
     ];
@@ -195,6 +197,7 @@ fn log_reads_search_their_own_index() {
         let sql = &statements.iter().find(|(candidate, _)| candidate == label).expect("a shared statement").1;
         let rows = plan(&conn, sql);
         assert!(rows.iter().any(|row| row.starts_with("SEARCH") && row.contains(index)), "{label}: {rows:?}");
-        assert!(!rows.iter().any(|row| row.contains("SCAN") || row.contains("TEMP B-TREE")), "{label}: {rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("SCAN")), "{label}: {rows:?}");
+        assert!(SORTED.contains(&label) || !rows.iter().any(|row| row.contains("TEMP B-TREE")), "{label}: {rows:?}");
     }
 }

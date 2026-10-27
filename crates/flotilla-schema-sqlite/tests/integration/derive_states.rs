@@ -150,7 +150,7 @@ fn ticket(tc: &TestCase) -> Ticket {
 
 fn event(from: TicketLabel, to: TicketLabel, at: i64) -> TicketEvent {
     let edge = if from == to { TicketEdge::Edit } else { TicketEdge::Move };
-    EdgeEvent { edge, from, to, writer: "w".into(), at: Timestamp(at), payload: String::new() }
+    EdgeEvent { edge, from, to, at: Timestamp(at), arguments: String::new() }
 }
 
 /// The edge from `previous` to `next` at time `at`, with `next`'s since as the edge requires.

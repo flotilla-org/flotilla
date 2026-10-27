@@ -11,6 +11,10 @@ pub enum StoreError {
     /// The new store's pre-domain baseline has no migration path; reject it at open.
     #[error("strings table has no domain column: pre-domain dictionaries are unsupported; open a new domain-tagged store")]
     LegacyDictionarySchema,
+    /// The `log` table predates changes (#4024): its entries hold their writer, time and payload.
+    /// It has no migration path; reject it at open.
+    #[error("log table names no change: the database predates changes (#4024) and has no migration; open a new store")]
+    LegacyLogSchema,
     /// A kind table exists with other columns than its kind declares, such as one written before
     /// the parent key was named after its root table (#3627). Opening only creates missing tables,
     /// and SQLite reads an unknown double-quoted column name as a string literal, so a stale table
@@ -111,6 +115,10 @@ pub enum StoreError {
     /// `prev_seq`, `expected` the identity's sequence here.
     #[error("resource is at sequence {expected}; the change follows {found}")]
     Gap { expected: u64, found: u64 },
+    /// An entry from another home whose change this store does not hold: replication sends each
+    /// change before its first entry (#4024).
+    #[error("entry of change {seq} at {home}, which this store does not hold")]
+    MissingChange { home: String, seq: u64 },
     /// A listing asked for no rows; every listing takes a positive limit.
     #[error("a page limit must be at least 1")]
     ZeroLimit,

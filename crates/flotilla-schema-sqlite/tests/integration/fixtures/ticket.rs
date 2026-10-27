@@ -204,7 +204,7 @@ pub fn transition(
     let (from, to) = (*previous.value.label(), *value.label());
     let at = timestamp(tc);
     let edge = if from == to { TicketEdgeName::Edit } else { TicketEdgeName::Move };
-    let event = EdgeEvent { edge, from, to, writer: name(tc), at, payload: payload(tc, pick, text(tc)) };
+    let event = EdgeEvent { edge, from, to, at, arguments: payload(tc, pick, text(tc)) };
     let next = State::new(value, if from == to { previous.since } else { at });
     let built = Edge::transition(Ticket::STATE, previous, &next, &event).expect("transition");
     (built, next, event)
