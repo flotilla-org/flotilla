@@ -53,6 +53,7 @@ pub use digest::{digest_bucket, DigestQuery, PartitionDigest, DIGEST_FANOUT};
 mod dispatch_hold;
 mod dispatch_observation;
 mod environment;
+pub mod environment_provider;
 #[doc(hidden)]
 pub mod error;
 #[doc(hidden)]

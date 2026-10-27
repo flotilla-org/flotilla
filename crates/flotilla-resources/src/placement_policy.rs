@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -118,9 +119,10 @@ pub struct CloudSandboxPerVesselPlacementPolicySpec {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudSandboxCheckout {
+    #[store(code = "cv")]
     CloneInVessel,
 }
 
@@ -134,9 +136,10 @@ pub struct HostDirectPlacementPolicySpec {
     pub checkout: HostDirectPlacementPolicyCheckout,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(rename_all = "snake_case")]
 pub enum HostDirectPlacementPolicyCheckout {
+    #[store(code = "wt")]
     Worktree,
 }
 
@@ -183,20 +186,26 @@ impl DockerPerVesselPlacementPolicySpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(rename_all = "snake_case")]
 pub enum DockerImagePullPolicy {
     #[default]
+    #[store(code = "al")]
     Always,
+    #[store(code = "ip")]
     IfNotPresent,
+    #[store(code = "nv")]
     Never,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(rename_all = "snake_case")]
 pub enum DockerCheckoutStrategy {
+    #[store(code = "wm")]
     WorktreeOnHostAndMount { mount_path: String },
+    #[store(code = "lm")]
     LocalCloneOnHostAndMount { mount_path: String },
+    #[store(code = "fc")]
     FreshCloneInContainer { clone_path: String },
 }
 

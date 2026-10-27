@@ -51,10 +51,11 @@ pub(super) const PLAN: &[(&str, Plan)] = &[
     ("WorkflowTemplate", Plan::Imported("definitions import (#3824 layer 2b)")),
     ("Project", Plan::Imported("definitions import (#3824 layer 3b)")),
     ("Repository", Plan::Imported("Repository import (#3824 layer 3a)")),
-    ("FulfilmentKind", Plan::Moving("#3824 layer 4")),
-    ("Host", Plan::Moving("#3824 layer 4")),
-    // Converted into FulfilmentKinds of the same names, not dropped (ADR 0046 carry, 2026-10-26).
-    ("PlacementPolicy", Plan::Moving("#3824 layer 4")),
+    ("FulfilmentKind", Plan::Imported("placement import (#3824 layer 4a)")),
+    ("Host", Plan::Moving("#3824 layer 4c")),
+    // Converted into FulfilmentKinds of the same names and their hosts' provider settings, not
+    // dropped (ADR 0046 carry, 2026-10-26).
+    ("PlacementPolicy", Plan::Imported("placement import (#3824 layer 4a)")),
     ("ChangeRequest", Plan::Moving("#3824 layer 5")),
     ("Issue", Plan::Moving("#3824 layer 5")),
     ("ForgeRead", Plan::Moving("#3824 layer 5")),

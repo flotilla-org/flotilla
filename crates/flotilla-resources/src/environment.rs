@@ -192,7 +192,7 @@ impl<'de> Deserialize<'de> for CloudSandboxEnvironmentSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Stored)]
 pub struct CloudSandboxSize {
     pub cpus: u32,
     pub memory_bytes: u64,
@@ -417,7 +417,7 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
 /// Placement-authored budget. 80% of host RAM is divided by four for each
 /// crew's cap (about 12 GiB on a 61 GiB host). Caps are limits, not
 /// reservations: a 7.7 GiB cap OOM-killed workspace test builds (#2751).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Stored)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnvironmentMemoryPolicy {
     pub host_memory_percent: u8,

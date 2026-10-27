@@ -15,6 +15,7 @@ mod manifest_root_import;
 #[cfg(unix)]
 mod message_import;
 #[cfg(unix)]
+mod placement_import;
 mod repository_import;
 #[cfg(unix)]
 mod retirement;
@@ -159,6 +160,7 @@ async fn validate_daemon_with_preview(
     let mut account_documents = BTreeMap::<String, account_import::Documents>::new();
     let mut definition_documents = definition_import::Documents::default();
     let mut repository_documents = repository_import::Documents::default();
+    let mut placement_documents = placement_import::Documents::default();
     let mut root_documents = BTreeMap::<String, manifest_root_import::Documents>::new();
     for (store_base, kind, namespaces) in collections {
         let replication = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.plural == kind).map(|entry| entry.replication_class);
@@ -229,6 +231,9 @@ async fn validate_daemon_with_preview(
                 }
                 if store_base == base && definition_import::KINDS.contains(&kind.as_str()) {
                     definition_documents.0.push((namespace.clone(), kind.clone(), item.clone()));
+                }
+                if store_base == base && placement_import::KINDS.contains(&kind.as_str()) {
+                    placement_documents.0.push((namespace.clone(), kind.clone(), item.clone()));
                 }
                 if store_base == base && kind == repository_import::KIND {
                     repository_documents.0.push((namespace.clone(), item.clone()));
@@ -314,6 +319,10 @@ async fn validate_daemon_with_preview(
     let repositories = repository_documents.rehearse();
     failed |= probes.require_import && !repositories.refused.is_empty();
     repository_import::print(&repositories);
+    // Placement likewise, each policy into a kind and its host's provider settings (#3824 layer 4a).
+    let placement = placement_documents.rehearse();
+    failed |= probes.require_import && !placement.refused.is_empty();
+    placement_import::print(&placement);
     // Every kind the daemon holds rows of is imported, dropped or still moving (#3824).
     for (namespace, report) in &import_plans {
         failed |= probes.require_import && report.blocks_import();
