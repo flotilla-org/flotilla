@@ -37,6 +37,7 @@ pub mod import;
 pub mod manifest_root;
 pub mod manifest_root_import;
 pub mod reads;
+pub mod repositories;
 pub mod repository_import;
 pub mod terminal_session;
 #[cfg(test)]

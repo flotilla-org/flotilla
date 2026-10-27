@@ -28,41 +28,43 @@ macro_rules! dispatch_backend {
     };
 }
 
-/// The engine's definition records, once installed: shared by every handle cloned or derived from
-/// one backend (#3824 layer 2b-ii).
-type DefinitionSlot = std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<dyn flotilla_resources::definitions::DefinitionRecords>>>>;
+/// The engine ports installed behind `[primitives]`, by the resource kinds they serve: shared by
+/// every handle cloned or derived from one backend (#3824 layers 2b-ii and 3).
+type EngineSlot = std::sync::Arc<
+    std::sync::RwLock<std::collections::BTreeMap<&'static str, std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>>>,
+>;
 
 /// Cloneable handle chosen by the composition root.
 #[derive(Debug, Clone)]
 pub struct ResourceBackend {
     store: std::sync::Arc<dyn crate::Store>,
-    definitions: DefinitionSlot,
+    engines: EngineSlot,
 }
 impl ResourceBackend {
     pub fn new(store: impl Into<Self>) -> Self {
         store.into()
     }
     pub fn from_arc(store: std::sync::Arc<dyn crate::Store>) -> Self {
-        Self { store, definitions: DefinitionSlot::default() }
+        Self { store, engines: EngineSlot::default() }
     }
-    /// Serves the declared definition kinds from `records`, the engine's, behind `[primitives]`:
-    /// every handle cloned or derived from this backend reads and writes them there. A daemon
-    /// runtime restarted over the same backend installs its reopened records in place of the last.
-    pub fn install_definition_records(&self, records: std::sync::Arc<dyn flotilla_resources::definitions::DefinitionRecords>) {
-        *self.definitions.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(records);
-    }
-    /// The engine's records for `kind`, when installed and `kind` is a declared definition kind.
-    pub(crate) fn definition_records(&self, kind: &str) -> Option<std::sync::Arc<dyn flotilla_resources::definitions::DefinitionRecords>> {
-        if !flotilla_resources::definitions::is_definition_kind(kind) {
-            return None;
+    /// Serves the kinds `records` names from it, the engine's, behind `[primitives]`: every handle
+    /// cloned or derived from this backend reads and writes them there. A daemon runtime restarted
+    /// over the same backend installs its reopened ports in place of the last.
+    pub fn install_engine_records(&self, records: std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>) {
+        let mut engines = self.engines.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for kind in records.kinds() {
+            engines.insert(kind, std::sync::Arc::clone(&records));
         }
-        self.definitions.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+    /// The engine port serving `kind`, when one is installed.
+    pub(crate) fn engine_records(&self, kind: &str) -> Option<std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>> {
+        self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(kind).cloned()
     }
     pub fn store(&self) -> &dyn crate::Store {
         &*self.store
     }
     pub fn with_read_observer(self, observer: std::sync::Arc<dyn crate::ReadObserver>) -> Self {
-        Self { store: self.store.with_read_observer(observer), definitions: self.definitions.clone() }
+        Self { store: self.store.with_read_observer(observer), engines: self.engines.clone() }
     }
     pub fn read_observer(&self) -> Option<&dyn crate::ReadObserver> {
         self.store.read_observer()
@@ -74,7 +76,7 @@ impl ResourceBackend {
         Some(self.store.hierarchy_admission()?.lock_owned().await)
     }
     pub fn with_local_root(self, root: NodeId) -> Self {
-        Self { store: self.store.with_local_root(root), definitions: self.definitions.clone() }
+        Self { store: self.store.with_local_root(root), engines: self.engines.clone() }
     }
     pub fn local_root(&self) -> Result<NodeId, ResourceError> {
         self.store.local_root()
@@ -164,6 +166,15 @@ impl<T: Resource> ReplicaReadResolver<T> {
     }
 
     async fn get_local_first(&self, name: &str) -> Result<ReadResourceObject<T>, ResourceError> {
+        if let Some(reads) = self.engine_copies(name).await {
+            // This home's copy first, then the lexically first home's, as the port resolves.
+            let mut reads = reads?;
+            let local = reads.iter().position(|read| matches!(read.provenance, ResourceProvenance::Local));
+            return match local {
+                Some(index) => Ok(reads.swap_remove(index)),
+                None => reads.into_iter().next().ok_or_else(|| ResourceError::not_found(name)),
+            };
+        }
         if T::REPLICATION_CLASS == crate::ReplicationClass::None {
             return self
                 .backend
@@ -197,6 +208,9 @@ impl<T: Resource> ReplicaReadResolver<T> {
 
     /// Read every visible provenance for one name without listing the namespace.
     pub async fn get_all(&self, name: &str) -> Result<ReadResourceList<T>, ResourceError> {
+        if let Some(reads) = self.engine_copies(name).await {
+            return reads.map(|items| ReadResourceList { items });
+        }
         // These classes have at most one visible copy for a name.
         if T::REPLICATION_CLASS == crate::ReplicationClass::None || T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
             return match self.get_local_first(name).await {
@@ -287,6 +301,16 @@ impl<T: Resource> ReplicaReadResolver<T> {
             return self.backend.list_including_replicas_typed_matching_labels::<T>(&self.namespace, required).await;
         }
         self.backend.query_declared::<T>(&self.namespace, &crate::StoreQuery::labels(required, true, self.suppress_self_origin)).await
+    }
+
+    /// Every home's engine copy of `name`, for a kind the engine serves other than a definition
+    /// kind (definitions resolve through their resolver).
+    async fn engine_copies(&self, name: &str) -> Option<Result<Vec<ReadResourceObject<T>>, ResourceError>> {
+        if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
+            return None;
+        }
+        let reads = self.backend.definitions::<T>(&self.namespace).engine_reads().await?;
+        Some(reads.map(|reads| reads.into_iter().filter(|read| read.object.metadata.name == name).collect()))
     }
 
     pub(crate) async fn list_sources(&self) -> Result<ReadResourceList<T>, ResourceError> {
@@ -659,10 +683,67 @@ impl<T: Resource> TypedResolver<T> {
         if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
             return self.backend.definitions::<T>(&self.namespace).create(meta, spec).await;
         }
+        if let Some(records) = self.engine_owned() {
+            T::validate_spec(meta, spec)?;
+            if self.engine_home_record(&*records, &meta.name).await?.is_some() {
+                return Err(ResourceError::conflict(&meta.name, "resource already exists"));
+            }
+            return self.engine_apply(&*records, meta, spec).await;
+        }
         dispatch_backend!(self, create_typed, meta, spec)
     }
 
+    /// The engine port serving this kind, for a kind the old store keeps a record of per home
+    /// (#3824 layer 3): definitions are served through their resolver instead.
+    fn engine_owned(&self) -> Option<std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>> {
+        (T::REPLICATION_CLASS != crate::ReplicationClass::Definitions).then(|| self.backend.engine_records(T::API_PATHS.kind)).flatten()
+    }
+
+    /// This home's own engine record `name`, if any.
+    async fn engine_home_record(
+        &self,
+        records: &dyn flotilla_resources::engine_records::EngineRecords,
+        name: &str,
+    ) -> Result<Option<flotilla_resources::engine_records::EngineObject>, ResourceError> {
+        let home = records.home();
+        let sources = records.sources(T::API_PATHS.kind).await.map_err(ResourceError::other)?;
+        Ok(sources.into_iter().find(|record| record.name == name && record.home == home))
+    }
+
+    /// The engine record `name` at this home, refused unless it is at `resource_version`.
+    async fn engine_current(
+        &self,
+        records: &dyn flotilla_resources::engine_records::EngineRecords,
+        name: &str,
+        resource_version: &str,
+    ) -> Result<(), ResourceError> {
+        match self.engine_home_record(records, name).await? {
+            None => Err(ResourceError::not_found(name)),
+            Some(current) if current.version.to_string() != resource_version => Err(ResourceError::conflict(name, "stale resourceVersion")),
+            Some(_) => Ok(()),
+        }
+    }
+
+    async fn engine_apply(
+        &self,
+        records: &dyn flotilla_resources::engine_records::EngineRecords,
+        meta: &InputMeta,
+        spec: &T::Spec,
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        let value = serde_json::to_value(spec).map_err(|error| ResourceError::decode(error.to_string()))?;
+        let record =
+            records.apply(T::API_PATHS.kind, &meta.name, &meta.labels, &meta.annotations, value).await.map_err(ResourceError::other)?;
+        crate::definition::engine_object(&self.namespace, record)
+    }
+
     pub async fn update(&self, meta: &InputMeta, resource_version: &str, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
+        if let Some(records) = self.engine_owned() {
+            self.engine_current(&*records, &meta.name, resource_version).await?;
+            let current = self.get(&meta.name).await?;
+            T::validate_spec_update(&current.spec, spec)?;
+            T::validate_spec(meta, spec)?;
+            return self.engine_apply(&*records, meta, spec).await;
+        }
         if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
             let definitions = self.backend.definitions::<T>(&self.namespace);
             let current = definitions.get(&meta.name).await?;
@@ -691,6 +772,12 @@ impl<T: Resource> TypedResolver<T> {
             }
             _ => false,
         };
+        if let Some(records) = self.engine_owned() {
+            self.engine_current(&*records, name, resource_version).await?;
+            let value = serde_json::to_value(status).map_err(|error| ResourceError::decode(error.to_string()))?;
+            let record = records.set_status(T::API_PATHS.kind, name, value).await.map_err(ResourceError::other)?;
+            return crate::definition::engine_object(&self.namespace, record);
+        }
         if !engine_owned {
             return dispatch_backend!(self, update_status_typed, name, resource_version, status);
         }
@@ -704,6 +791,12 @@ impl<T: Resource> TypedResolver<T> {
     pub async fn delete(&self, name: &str) -> Result<(), ResourceError> {
         if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
             return self.backend.definitions::<T>(&self.namespace).delete(name).await;
+        }
+        if let Some(records) = self.engine_owned() {
+            if self.engine_home_record(&*records, name).await?.is_none() {
+                return Err(ResourceError::not_found(name));
+            }
+            return records.delete(T::API_PATHS.kind, name).await.map_err(ResourceError::other);
         }
         dispatch_backend!(self, delete_typed, name)
     }

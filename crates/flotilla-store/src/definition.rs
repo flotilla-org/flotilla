@@ -8,7 +8,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
-    definitions::{origin, stamp, DefinitionRecord, DefinitionRecords},
+    engine_records::{EngineObject, EngineRecords},
     ObjectMeta, ReadResourceObject, ReadWatchEvent,
 };
 use futures::{stream::BoxStream, StreamExt};
@@ -53,51 +53,34 @@ impl<T: Resource> DefinitionResolver<T> {
     }
 
     /// The engine's records of this kind, installed behind `[primitives]` (#3824 layer 2b-ii).
-    fn records(&self) -> Option<Arc<dyn DefinitionRecords>> {
-        self.backend.definition_records(T::API_PATHS.kind)
+    fn records(&self) -> Option<Arc<dyn EngineRecords>> {
+        self.backend.engine_records(T::API_PATHS.kind)
     }
 
-    /// An engine record as the old store's object: its origin read back as the writer's stamps, and
-    /// no merge metadata, owner references or finalizers. The engine keeps no creation time.
-    fn object(&self, record: DefinitionRecord) -> Result<ResourceObject<T>, ResourceError> {
-        let (labels, annotations) = stamp(&record.origin);
-        let spec = serde_json::from_value(record.spec)
-            .map_err(|error| ResourceError::decode(format!("{} {}: {error}", T::API_PATHS.kind, record.name)))?;
-        Ok(ResourceObject {
-            metadata: ObjectMeta {
-                name: record.name,
-                namespace: self.namespace.clone(),
-                resource_version: record.version.to_string(),
-                labels,
-                annotations,
-                owner_references: Vec::new(),
-                finalizers: Vec::new(),
-                deletion_timestamp: None,
-                creation_timestamp: DateTime::<Utc>::UNIX_EPOCH,
-                merge: None,
-            },
-            spec,
-            status: None,
-        })
+    /// An engine record as the old store's object: the stamps its port rebuilds, and no merge
+    /// metadata, owner references or finalizers. The engine keeps no creation time.
+    fn object(&self, record: EngineObject) -> Result<ResourceObject<T>, ResourceError> {
+        engine_object(&self.namespace, record)
     }
 
     /// Every engine record of this kind, with the built-ins.
-    async fn engine_list(&self, records: &dyn DefinitionRecords) -> Result<Vec<ResourceObject<T>>, ResourceError> {
+    async fn engine_list(&self, records: &dyn EngineRecords) -> Result<Vec<ResourceObject<T>>, ResourceError> {
         let listed = records.list(T::API_PATHS.kind).await.map_err(ResourceError::other)?;
         let objects = listed.into_iter().map(|record| self.object(record)).collect::<Result<Vec<_>, _>>()?;
         overlay_builtins(T::API_PATHS.kind, &self.namespace, objects, None)
     }
 
-    /// The engine's records of this kind as replica reads, each with its home as provenance, and
-    /// the built-ins as local; `None` unless the kind is served by the engine.
+    /// The engine's records of this kind as replica reads, every home's copy with its home as
+    /// provenance, and the built-ins as local; `None` unless the kind is served by the engine.
     pub(crate) async fn engine_reads(&self) -> Option<Result<Vec<ReadResourceObject<T>>, ResourceError>> {
         let records = self.records()?;
         Some(self.read_all(&*records).await)
     }
 
-    async fn read_all(&self, records: &dyn DefinitionRecords) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
+    async fn read_all(&self, records: &dyn EngineRecords) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
         let home = records.home();
-        let listed = records.list(T::API_PATHS.kind).await.map_err(ResourceError::other)?;
+        // Every home's copy, as the old store's replica reads return each origin's.
+        let listed = records.sources(T::API_PATHS.kind).await.map_err(ResourceError::other)?;
         let mut reads = Vec::with_capacity(listed.len());
         for record in listed {
             let provenance = if record.home == home {
@@ -170,13 +153,13 @@ impl<T: Resource> DefinitionResolver<T> {
     /// Writes `spec` under `meta`'s name at this home, with the origin `meta`'s stamps name.
     async fn engine_apply(
         &self,
-        records: &dyn DefinitionRecords,
+        records: &dyn EngineRecords,
         meta: &InputMeta,
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
-        let origin = origin(&meta.labels, &meta.annotations).map_err(ResourceError::invalid)?;
         let value = serde_json::to_value(spec).map_err(|error| ResourceError::decode(error.to_string()))?;
-        let record = records.apply(T::API_PATHS.kind, &meta.name, origin, value).await.map_err(ResourceError::other)?;
+        let record =
+            records.apply(T::API_PATHS.kind, &meta.name, &meta.labels, &meta.annotations, value).await.map_err(ResourceError::other)?;
         self.object(record)
     }
 
@@ -668,6 +651,32 @@ pub(crate) fn select_reads<T: Resource>(
     }
     let selected = index.names(query);
     Ok(reads.into_iter().filter(|read| selected.contains(&read.object.metadata.name)).collect())
+}
+
+/// An engine record as the old store's object in `namespace`: the labels and annotations its
+/// port rebuilds, and no merge metadata, owner references or finalizers. The engine keeps no
+/// creation time, so it reads as the epoch.
+pub(crate) fn engine_object<T: Resource>(namespace: &str, record: EngineObject) -> Result<ResourceObject<T>, ResourceError> {
+    let decode =
+        |what: &str, error: serde_json::Error| ResourceError::decode(format!("{} {} {what}: {error}", T::API_PATHS.kind, record.name));
+    let spec = serde_json::from_value(record.spec.clone()).map_err(|error| decode("spec", error))?;
+    let status = record.status.clone().map(serde_json::from_value).transpose().map_err(|error| decode("status", error))?;
+    Ok(ResourceObject {
+        metadata: ObjectMeta {
+            name: record.name,
+            namespace: namespace.to_owned(),
+            resource_version: record.version.to_string(),
+            labels: record.labels,
+            annotations: record.annotations,
+            owner_references: Vec::new(),
+            finalizers: Vec::new(),
+            deletion_timestamp: None,
+            creation_timestamp: DateTime::<Utc>::UNIX_EPOCH,
+            merge: None,
+        },
+        spec,
+        status,
+    })
 }
 
 /// A copy of `read`; `ReadResourceObject` is `Clone` only for `Clone` kinds.

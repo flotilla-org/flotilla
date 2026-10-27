@@ -1,6 +1,6 @@
 //! The declared definition kinds on the engine, behind `[primitives]` (#3824 layer 2b-ii).
 //!
-//! [`EngineDefinitions`] is the [`DefinitionRecords`] port over the decided store. This home
+//! [`EngineDefinitions`] is the [`EngineRecords`] port of the definition kinds over the decided store. This home
 //! writes its own definitions through the plain-kind port; every home's are read from a resident
 //! map kept current by following the log. No old-store record is written or read.
 //!
@@ -18,7 +18,8 @@ use flotilla_engine_store::{
     plain::{PlainError, PlainLog},
 };
 use flotilla_resources::{
-    definitions::{DefinitionOrigin, DefinitionRecord, DefinitionRecords},
+    definitions::{origin, stamp, DefinitionOrigin, DEFINITION_KINDS},
+    engine_records::{EngineObject, EngineRecords},
     CredentialGrantSpec, CredentialSpecSpec, CrewDefaultsSpec, FleetDesignationSpec, ForgeSpec, ImageLayerResourceSpec,
     WorkflowTemplateSpec,
 };
@@ -168,8 +169,9 @@ fn kind_name(code: KindCode) -> Option<&'static str> {
     codes().into_iter().find(|(held, _)| *held == code).map(|(_, name)| name)
 }
 
-/// One home's record as the resident map holds it: its spec, or why it does not encode.
-type Held = Result<DefinitionRecord, String>;
+/// One home's record as the resident map holds it: the old object it reads as, or why it does not
+/// encode.
+type Held = Result<EngineObject, String>;
 
 /// Every home's records, by kind, name and home.
 type Records = BTreeMap<(&'static str, String, String), Held>;
@@ -185,7 +187,8 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn record<K: Definition>(name: String, home: String, version: u64, value: &K) -> Held {
     let spec = value.spec().map_err(|error| format!("{} {name} at {home}: {error}", K::NAME))?;
-    Ok(DefinitionRecord { name, home, origin: value.origin().clone(), spec, version })
+    let (labels, annotations) = stamp(value.origin());
+    Ok(EngineObject { name, home, version, labels, annotations, spec, status: None })
 }
 
 /// The current row of `id` of kind `K`, if any.
@@ -325,7 +328,7 @@ impl EngineDefinitions {
         resolve(records, &self.home, kind, name)
     }
 
-    fn write<K: Definition>(&self, name: &str, origin: DefinitionOrigin, spec: Value) -> Result<DefinitionRecord, String> {
+    fn write<K: Definition>(&self, name: &str, origin: DefinitionOrigin, spec: Value) -> Result<EngineObject, String> {
         let value = K::build(origin, spec)?;
         // Writers of one name at this home are not serialised (the manifest reconciler, the CLI,
         // project ops): a write that loses a race reads again and writes over the winner, as the
@@ -358,17 +361,21 @@ impl EngineDefinitions {
 }
 
 #[async_trait::async_trait]
-impl DefinitionRecords for EngineDefinitions {
+impl EngineRecords for EngineDefinitions {
+    fn kinds(&self) -> &'static [&'static str] {
+        &DEFINITION_KINDS
+    }
+
     fn home(&self) -> String {
         self.home.clone()
     }
 
-    async fn get(&self, kind: &str, name: &str) -> Result<Option<DefinitionRecord>, String> {
+    async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
         let resident = self.refresh()?;
         self.resolve(&resident.records, kind, name).transpose()
     }
 
-    async fn list(&self, kind: &str) -> Result<Vec<DefinitionRecord>, String> {
+    async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
         let resident = self.refresh()?;
         let mut names: Vec<&String> = resident.records.keys().filter(|(held, _, _)| *held == kind).map(|(_, name, _)| name).collect();
         // The map orders by kind, then name, then home, so one name's homes are adjacent.
@@ -382,15 +389,48 @@ impl DefinitionRecords for EngineDefinitions {
             .collect())
     }
 
-    async fn apply(&self, kind: &str, name: &str, origin: DefinitionOrigin, spec: Value) -> Result<DefinitionRecord, String> {
+    async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
+        let resident = self.refresh()?;
+        Ok(resident
+            .records
+            .iter()
+            .filter(|((held, _, _), _)| *held == kind)
+            .filter_map(|(_, held)| {
+                held.clone().map_err(|error| tracing::warn!(%error, "skipping a definition record that does not encode")).ok()
+            })
+            .collect())
+    }
+
+    async fn apply(
+        &self,
+        kind: &str,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+        annotations: &BTreeMap<String, String>,
+        spec: Value,
+    ) -> Result<EngineObject, String> {
+        let origin = origin(labels, annotations)?;
         if kind == ImageLayerDefinition::NAME && decode::<ImageLayerResourceSpec>(kind, spec.clone())?.is_retired() {
             // ADR 0053's retired layers stay admissible for one roll, so that previous-generation
             // manifests still apply, and are inert for resolution. The import drops them; so does
             // a write: this home's copy is removed, and the written value is returned unstored.
             self.remove::<ImageLayerDefinition>(name)?;
-            return Ok(DefinitionRecord { name: name.to_owned(), home: self.home.clone(), origin, spec, version: 0 });
+            let (labels, annotations) = stamp(&origin);
+            return Ok(EngineObject {
+                name: name.to_owned(),
+                home: self.home.clone(),
+                version: 0,
+                labels,
+                annotations,
+                spec,
+                status: None,
+            });
         }
         by_kind!(kind, |K| self.write::<K>(name, origin, spec))
+    }
+
+    async fn set_status(&self, kind: &str, name: &str, _status: Value) -> Result<EngineObject, String> {
+        Err(format!("{kind} {name}: a definition has no status"))
     }
 
     async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
@@ -423,7 +463,15 @@ mod tests {
     use super::*;
 
     fn held(home: &str) -> Held {
-        Ok(DefinitionRecord { name: "fleet".into(), home: home.into(), origin: DefinitionOrigin::Operator, spec: Value::Null, version: 1 })
+        Ok(EngineObject {
+            name: "fleet".into(),
+            home: home.into(),
+            version: 1,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            spec: Value::Null,
+            status: None,
+        })
     }
 
     // Behaviour (#3824 layer 2b-ii, as the import placed records): a name several homes hold reads

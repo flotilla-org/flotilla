@@ -1300,7 +1300,15 @@ async fn open_provisioning_lifecycles(
         tokio::task::spawn_blocking(move || flotilla_provisioning::engine::definitions::EngineDefinitions::open(service, clock))
             .await
             .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_definition_records(Arc::new(definitions));
+    daemon.resource_backend().install_engine_records(Arc::new(definitions));
+    // #3824 layer 3a: Repository likewise.
+    let service = daemon.decided_store()?;
+    let clock = daemon.clock_for_scenarios();
+    let repositories =
+        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::repositories::EngineRepositories::open(service, clock))
+            .await
+            .map_err(|error| error.to_string())??;
+    daemon.resource_backend().install_engine_records(Arc::new(repositories));
     tokio::task::spawn_blocking(move || {
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
         let log = || StoreLog::new(Arc::clone(&store));

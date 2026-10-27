@@ -1133,6 +1133,10 @@ impl DummyDaemon {
         let template: flotilla_resources::WorkflowTemplateSpec = decode(builtin("WorkflowTemplate"));
         log.create("transport-template", &WorkflowTemplateDefinition::new(origin(), &template).expect("template"), "transport", at)
             .expect("template record");
+        // #3824 layer 3a: a Repository, named by its key.
+        let repository = flotilla_resources::RepositorySpec::remote("https://transport.example/transport/app").expect("repository");
+        let record = flotilla_provisioning::stored::repository::RepositoryRecord::new(repository.clone()).expect("record");
+        log.create(&repository.key().to_string(), &record, "transport", at).expect("repository record");
     }
 
     fn transport_binding(&self, at: flotilla_schema::Timestamp) -> flotilla_provisioning::stored::account::BindingSpec {
@@ -1236,6 +1240,7 @@ impl DummyDaemon {
                 collect!(stored flotilla_provisioning::stored::definition::CrewDefaultsDefinition);
                 collect!(stored flotilla_provisioning::stored::definition::ImageLayerDefinition);
                 collect!(stored flotilla_provisioning::stored::definition::WorkflowTemplateDefinition);
+                collect!(stored flotilla_provisioning::stored::repository::RepositoryRecord);
                 assert_eq!(covered, registered, "every registered engine kind needs a transport fixture");
                 Ok(snapshots)
             })

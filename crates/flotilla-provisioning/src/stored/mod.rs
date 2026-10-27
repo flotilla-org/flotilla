@@ -87,6 +87,7 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     account::register(registry)?;
     manifest_root::register(registry)?;
     definition::register(registry)?;
+    repository::register(registry)?;
     Ok(())
 }
 

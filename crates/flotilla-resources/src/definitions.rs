@@ -3,10 +3,10 @@
 //!
 //! On the engine each is a plain record at the home that declared it, with a typed
 //! [`DefinitionOrigin`] in place of the provenance labels and annotations the old store keeps
-//! (#3212). [`DefinitionRecords`] is the engine's records as the old store's definition reads see
-//! them; the store installs it behind `[primitives]`. [`origin`] reads an origin from a writer's
-//! labels and annotations, the import's mapping and the write path's alike, and [`stamp`] is its
-//! inverse, for readers that still look for the stamps (they move onto `origin` in 2b-ii-b).
+//! (#3212); the engine serves them through [`crate::engine_records::EngineRecords`] behind
+//! `[primitives]`. [`origin`] reads an origin from a writer's labels and annotations, the import's
+//! mapping and the write path's alike, and [`stamp`] is its inverse, for readers that still look
+//! for the stamps. Both go with the old store at the cut-over (#3820).
 
 use std::collections::BTreeMap;
 
@@ -170,38 +170,6 @@ pub fn stamp(origin: &DefinitionOrigin) -> (BTreeMap<String, String>, BTreeMap<S
         ),
         DefinitionOrigin::Snapshot => (pairs(&[(PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND)]), BTreeMap::new()),
     }
-}
-
-/// One definition as its home holds it: the resource kind's serde spec, as JSON.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DefinitionRecord {
-    pub name: String,
-    /// The home that declared it, its only writer.
-    pub home: String,
-    pub origin: DefinitionOrigin,
-    pub spec: serde_json::Value,
-    /// The record's version at its home; it moves with each edit.
-    pub version: u64,
-}
-
-/// The engine's definition records, one kind at a time by its resource kind name. A name several
-/// homes declare (a host's manifest on each host) reads as this home's record, else the
-/// lexically first home's. Writes are this home's alone.
-#[async_trait::async_trait]
-pub trait DefinitionRecords: Send + Sync + std::fmt::Debug {
-    /// This home: the writer of the records it holds.
-    fn home(&self) -> String;
-    /// `kind`'s record `name`, as [`DefinitionRecords`] resolves several homes'.
-    async fn get(&self, kind: &str, name: &str) -> Result<Option<DefinitionRecord>, String>;
-    /// Every name of `kind`, each resolved as [`DefinitionRecords::get`].
-    async fn list(&self, kind: &str) -> Result<Vec<DefinitionRecord>, String>;
-    /// Writes this home's record `name` of `kind`: created, or its spec and origin replaced.
-    async fn apply(&self, kind: &str, name: &str, origin: DefinitionOrigin, spec: serde_json::Value) -> Result<DefinitionRecord, String>;
-    /// Deletes this home's record `name` of `kind`; absent is done. Another home's copy still reads.
-    async fn delete(&self, kind: &str, name: &str) -> Result<(), String>;
-    /// A tick for each pass that found any home's definition records changed since the pass
-    /// before, from the moment it is called; watchers read the records again on each.
-    async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String>;
 }
 
 #[cfg(test)]
