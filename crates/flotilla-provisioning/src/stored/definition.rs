@@ -8,8 +8,8 @@
 //! WorkflowTemplate, store the columns their reads select by and the authored definition as one
 //! frozen document (ADR 0064, `frozen`); the others are laid out in full.
 //!
-//! Nothing reads or writes these tables yet: the cut-over import fills them, and the definition
-//! writers and readers move onto them in layer 2b-ii.
+//! Nothing reads or writes these tables yet: the import rehearsal restores into them, and they
+//! join the daemon's decided store with the definition writers and readers in layer 2b-ii.
 
 use std::collections::{BTreeMap, BTreeSet};
 

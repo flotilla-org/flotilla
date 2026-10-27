@@ -83,7 +83,6 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     register_provisioning(registry)?;
     registry.register::<Resource<terminal_session::TerminalSession>>()?;
     account::register(registry)?;
-    definition::register(registry)?;
     Ok(())
 }
 
