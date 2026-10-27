@@ -1135,6 +1135,31 @@ async fn checkout_runtime_removes_an_interrupted_fresh_clone() {
     assert!(!Path::new(&staging_path).exists());
 }
 
+// #3971: a fresh clone is the only copy of its unpublished commits, so teardown
+// holds the finalizer instead of removing them.
+#[tokio::test]
+async fn checkout_runtime_holds_a_fresh_clone_with_an_unpushed_commit() {
+    let temp = TempDir::new().expect("tempdir");
+    let origin = TestGitRepo::init(temp.path().join("origin")).with_initial_commit();
+    let target = temp.path().join("fresh-clone");
+    let target = target.to_str().expect("utf-8 target path");
+    let git = |args: &[&str]| {
+        assert!(ProcessCommand::new("git").args(args).status().expect("git should run").success());
+    };
+    git(&["clone", origin.path().to_str().expect("utf-8 origin path"), target]);
+    git(&["-C", target, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "unpushed"]);
+    let runtime =
+        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+
+    let error = runtime
+        .remove_checkout(&CheckoutRemoval::FreshClone { target_path: target.to_string() })
+        .await
+        .expect_err("unpushed commits must hold fresh clone removal");
+
+    assert!(error.contains("unpublished branch commits"), "{error}");
+    assert!(Path::new(target).join(".git").exists());
+}
+
 // #2932: teardown terminates with an explicit preservation outcome after the
 // admin directory is pruned, including forced removal and a lost Clone resource.
 #[tokio::test]

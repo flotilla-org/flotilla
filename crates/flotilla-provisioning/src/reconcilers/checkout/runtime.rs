@@ -187,6 +187,12 @@ impl CheckoutControllerRuntime {
                 Ok(CheckoutRemovalOutcome::Removed)
             }
             CheckoutRemoval::FreshClone { target_path } => {
+                // A fresh clone is the only copy of its unpublished work, so apply
+                // the guard local clones get: hold the finalizer rather than remove it.
+                if runner.path_exists(Path::new(target_path)).await? {
+                    let vcs = controller_vcs(&self.vcs, &self.runner, target_path)?;
+                    vcs.verify_local_clone_reclaimable(target_path).await?;
+                }
                 let target_path = utf8_path(target_path)?;
                 remove_checkout_path(&*runner, target_path).await?;
                 remove_checkout_path(&*runner, &clone_staging_path(target_path)).await?;

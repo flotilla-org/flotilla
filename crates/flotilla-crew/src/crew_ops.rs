@@ -603,8 +603,16 @@ impl CrewService {
         self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone()
     }
 
-    async fn local_vcs_for_checkout(&self, path: &Path) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, String> {
-        self.checkout_vcs.vcs_for(Some(&self.local_environment_id), path).await
+    /// Observed checkouts carry no environment and live on the home host.
+    async fn vcs_for_checkout_spec(
+        &self,
+        spec: &flotilla_resources::CheckoutSpec,
+        path: &Path,
+    ) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, String> {
+        match spec.env_ref() {
+            Some(env_ref) => self.checkout_vcs.vcs_for_env_ref(env_ref, path).await,
+            None => self.checkout_vcs.vcs_for(Some(&self.local_environment_id), path).await,
+        }
     }
     /// Resolve enough local identity to route to the convoy authority without
     /// reading its authority-owned Convoy or Vessel.
@@ -1887,17 +1895,20 @@ impl CrewService {
                 );
                 continue;
             }
-            let vcs = match self.local_vcs_for_checkout(Path::new(path)).await {
+            let name = checkout.metadata.name.clone();
+            let left_at = checkout_work_location(&checkout.spec, path);
+            let failed = |detail: String| {
+                warn!(checkout = %name, %detail, "best-effort abandon archive push failed");
+                CheckoutArchiveOutcome::builder()
+                    .checkout(name.clone())
+                    .status(CheckoutArchiveStatus::Failed)
+                    .detail(format!("{detail}; work not pushed, left {left_at}"))
+                    .build()
+            };
+            let vcs = match self.vcs_for_checkout_spec(&checkout.spec, Path::new(path)).await {
                 Ok(vcs) => vcs,
                 Err(error) => {
-                    warn!(checkout = %checkout.metadata.name, %error, "best-effort abandon archive push failed");
-                    outcomes.push(
-                        CheckoutArchiveOutcome::builder()
-                            .checkout(checkout.metadata.name)
-                            .status(CheckoutArchiveStatus::Failed)
-                            .detail(error)
-                            .build(),
-                    );
+                    outcomes.push(failed(error));
                     continue;
                 }
             };
@@ -1910,36 +1921,15 @@ impl CrewService {
             // An untouched checkout has no branch work to archive. If the base
             // cannot be verified, retain the best-effort push to preserve work.
             if matches!(vcs.commits_beyond_base(base_ref).await, Ok((_, 0))) {
-                outcomes.push(
-                    CheckoutArchiveOutcome::builder()
-                        .checkout(checkout.metadata.name)
-                        .status(CheckoutArchiveStatus::NothingToArchive)
-                        .build(),
-                );
+                outcomes.push(CheckoutArchiveOutcome::builder().checkout(name).status(CheckoutArchiveStatus::NothingToArchive).build());
                 continue;
             }
-            let output = vcs.push_current_branch("origin").await;
-            let outcome = match output {
+            let outcome = match vcs.push_current_branch("origin").await {
                 Ok(output) if output.success() => {
-                    CheckoutArchiveOutcome::builder().checkout(checkout.metadata.name).status(CheckoutArchiveStatus::Archived).build()
+                    CheckoutArchiveOutcome::builder().checkout(name).status(CheckoutArchiveStatus::Archived).build()
                 }
-                Ok(output) => {
-                    let detail = output.stderr.trim().to_string();
-                    warn!(checkout = %checkout.metadata.name, stderr = %detail, "best-effort abandon archive push failed");
-                    CheckoutArchiveOutcome::builder()
-                        .checkout(checkout.metadata.name)
-                        .status(CheckoutArchiveStatus::Failed)
-                        .detail(detail)
-                        .build()
-                }
-                Err(error) => {
-                    warn!(checkout = %checkout.metadata.name, %error, "best-effort abandon archive push failed");
-                    CheckoutArchiveOutcome::builder()
-                        .checkout(checkout.metadata.name)
-                        .status(CheckoutArchiveStatus::Failed)
-                        .detail(error)
-                        .build()
-                }
+                Ok(output) => failed(output.stderr.trim().to_string()),
+                Err(error) => failed(error),
             };
             outcomes.push(outcome);
         }
@@ -3842,6 +3832,17 @@ fn terminal_convoy_refusal(name: &str, cause: &str) -> String {
 
 #[cfg(test)]
 use flotilla_store_testkit::LegacyMessageFixture;
+
+/// Where a checkout's unpushed work stays when the abandon push fails: its
+/// environment (or host, for an observed checkout), path and branch.
+fn checkout_work_location(spec: &flotilla_resources::CheckoutSpec, path: &str) -> String {
+    let (place, branch) = match spec {
+        flotilla_resources::CheckoutSpec::Worktree(spec) => (spec.env_ref.as_str(), spec.r#ref.as_str()),
+        flotilla_resources::CheckoutSpec::FreshClone(spec) => (spec.env_ref.as_str(), spec.r#ref.as_str()),
+        flotilla_resources::CheckoutSpec::Observed(spec) => (spec.host_ref.as_str(), spec.r#ref.as_str()),
+    };
+    format!("on {place} at {path} (branch {branch})")
+}
 
 #[cfg(test)]
 mod vessel_ending_tests {

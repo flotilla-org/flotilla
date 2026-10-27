@@ -290,6 +290,14 @@ impl flotilla_vcs::vcs::CheckoutVcsResolver for CheckoutProviders {
     async fn vcs_for(&self, environment: Option<&EnvironmentId>, path: &Path) -> Result<Arc<dyn Vcs>, String> {
         self.vcs_for_checkout(environment.unwrap_or(&self.local_environment_id), path).await
     }
+
+    async fn vcs_for_env_ref(&self, env_ref: &str, path: &Path) -> Result<Arc<dyn Vcs>, String> {
+        let environment = self
+            .environment_manager
+            .resolve_environment_ref(env_ref)
+            .ok_or_else(|| format!("checkout environment {env_ref} is unavailable on this host"))?;
+        self.vcs_for_checkout(&environment.id, path).await
+    }
 }
 
 impl InProcessDaemon {

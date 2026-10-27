@@ -13,12 +13,12 @@ use flotilla_protocol::result_set::ConvoyChangeRequest;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId};
 use flotilla_resources::{
     BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
-    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue,
-    Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialLifecycle,
-    CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec,
-    FulfilmentRealisation, ImageAcquisitionCost, InputMeta, ObservedChangeRequestState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec, ResourceObject,
-    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus,
+    CheckoutWorktreeSpec as ResourceCheckoutWorktreeSpec, ConditionValue, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec,
+    ConvoyStatusPatch, CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
+    FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, ImageAcquisitionCost, InputMeta,
+    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository,
+    RepositorySpec, ResourceObject, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
@@ -474,7 +474,10 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
             ("stale-pushed", CheckoutArchiveStatus::Archived),
         ]
     );
-    assert_eq!(outcomes[2].detail.as_deref(), Some("remote rejected"));
+    assert_eq!(
+        outcomes[2].detail.as_deref(),
+        Some("remote rejected; work not pushed, left on archive-test at /checkouts/push-fails (branch push-fails)")
+    );
     assert_eq!(
         runner.calls().iter().filter(|(command, args)| command == "git" && args.first().is_some_and(|arg| arg == "push")).count(),
         3
@@ -545,6 +548,58 @@ async fn abandon_archive_pushes_only_checkout_with_commits_beyond_base() {
     assert_eq!(
         git(temp.path(), &["--git-dir", remote.to_str().unwrap(), "for-each-ref", "--format=%(refname:short)", "refs/heads"]),
         "advanced\nmain\n"
+    );
+}
+
+// #3971: a checkout is archived through its own environment, never the home
+// host's. An environment this host cannot reach is named, not a bare ENOENT, and
+// the report says where the unpushed work stayed.
+#[tokio::test]
+async fn abandon_archive_of_a_checkout_in_an_unreachable_environment_names_it_and_where_the_work_stayed() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").unwrap();
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut discovery = fake_discovery_with_runner(false, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
+    discovery.repo_detectors.clear();
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::local(),
+        backend.clone(),
+        Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    backend
+        .using::<ResourceCheckout>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("remote-work".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "archive-convoy".to_string())]))
+                .build(),
+            &ResourceCheckoutSpec::Worktree(
+                ResourceCheckoutWorktreeSpec::builder()
+                    .repo_ref(RepositorySpec::remote("https://github.com/acme/archive").unwrap().key())
+                    .env_ref("ssh-b1".to_string())
+                    .r#ref("feature/remote".to_string())
+                    .target_path("/only/on/b1".to_string())
+                    .clone_ref("clone".to_string())
+                    .build(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.unwrap();
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].status, CheckoutArchiveStatus::Failed);
+    assert_eq!(
+        outcomes[0].detail.as_deref(),
+        Some(
+            "checkout environment ssh-b1 is unavailable on this host; \
+             work not pushed, left on ssh-b1 at /only/on/b1 (branch feature/remote)"
+        )
     );
 }
 

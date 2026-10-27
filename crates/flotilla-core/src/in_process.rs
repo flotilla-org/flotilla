@@ -698,6 +698,10 @@ impl flotilla_vcs::vcs::CheckoutVcsResolver for InProcessDaemon {
     async fn vcs_for(&self, environment: Option<&EnvironmentId>, path: &Path) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, String> {
         self.vcs_for_checkout(environment.unwrap_or(&self.local_environment_id), path).await
     }
+
+    async fn vcs_for_env_ref(&self, env_ref: &str, path: &Path) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, String> {
+        self.checkout_providers.vcs_for_env_ref(env_ref, path).await
+    }
 }
 
 use flotilla_projections::dispatch_board::DispatchBoardInputs;
