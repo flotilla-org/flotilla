@@ -208,6 +208,11 @@ pub struct EnvironmentProviderDescriptor {
     pub host_version: String,
     pub module_version: String,
     pub capabilities: flotilla_protocol::provider::ProviderCapabilities,
+    /// What the provider reports it chose to reach the vessel's agent. Shown,
+    /// never decided on. Absent when it reports none, and in records written
+    /// before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_connection: Option<flotilla_protocol::provider::AgentConnectionReport>,
 }
 
 /// Durable references only; recovery owns their retention and deletion.

@@ -946,8 +946,10 @@ impl TerminalControllerRuntime {
             .values()
             .find(|active| active.handle.id() == &id)
             .map(|active| active.handle.clone());
-        Ok(match handle.and_then(|handle| handle.agent()) {
-            Some(agent) => agent,
+        Ok(match handle {
+            Some(handle) => handle.agent(),
+            // An environment without a provisioned handle is its host: its agent
+            // works in process, through the host runner.
             None => Arc::new(RunnerVesselAgent(self.runner_for_env(&spec.env_ref)?)),
         })
     }

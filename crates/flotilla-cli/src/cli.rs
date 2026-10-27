@@ -1065,6 +1065,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
     }
     for delivery in &explanation.access_deliveries {
         let _ = writeln!(output, "Delivered {} at {} ({}) into {}", delivery.access, delivery.place, delivery.harness, delivery.home);
+        if let Some(connection) = &delivery.agent_connection {
+            let _ = writeln!(output, "  agent connection: {connection}");
+        }
         for need in &delivery.needs {
             let _ = writeln!(output, "  {}: {} {}", need.need, need.mechanism, need.digest);
         }

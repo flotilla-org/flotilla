@@ -56,6 +56,29 @@ pub enum EgressEnforcement {
     Advisory,
 }
 
+/// What a provider reports it chose to reach a vessel's agent: the provider,
+/// the connection mode and where the vessel lives. Flotilla records and shows
+/// it, and never branches on it (#3980 contract 9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConnectionReport {
+    /// The provider instance.
+    pub provider: String,
+    /// The provider's module, such as `daytona`.
+    pub module: String,
+    /// The provider's own ID for the vessel.
+    pub vessel: String,
+    /// The endpoint the agent is reached through, without credentials.
+    pub endpoint: String,
+    /// The connection mode, such as `reverse_forward` or `local_forward`.
+    pub mode: String,
+}
+
+impl std::fmt::Display for AgentConnectionReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} via {} to {} vessel {} (provider {})", self.mode, self.endpoint, self.module, self.vessel, self.provider)
+    }
+}
+
 /// Data consumed without branching on a runtime name or class. Unsupported
 /// operations default closed. Optional operation traits remain instance-owned.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

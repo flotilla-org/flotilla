@@ -5,6 +5,9 @@ use flotilla_provider_runtime::{ChannelLabel, HttpClient};
 
 pub(super) struct AdapterHttp {
     pub provider: Arc<DrydockEnvironmentProvider>,
+    /// The host itself, for every call the adapter does not make.
+    pub host: ::drydock::client::Client,
+    pub opts: ProvisionOpts,
     pub prepared: tokio::sync::Mutex<HashMap<String, PreparedEnvironment>>,
     pub handles: tokio::sync::Mutex<HashMap<String, EnvironmentHandle>>,
 }
@@ -43,7 +46,7 @@ impl HttpClient for AdapterHttp {
                             {
                                 let handle = self
                                     .provider
-                                    .provision(EnvironmentId::new(&body.label), prepared, Default::default())
+                                    .provision(EnvironmentId::new(&body.label), prepared, self.opts.clone())
                                     .await
                                     .map_err(|error| error.to_string())?;
                                 let status = if handle.created_for_setup() { 201 } else { 200 };
@@ -75,8 +78,7 @@ impl HttpClient for AdapterHttp {
             None => {
                 let query: Vec<_> = request.url().query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
                 let query: Vec<_> = query.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                let response = api.request(request.method().clone(), &segments, &query, body.as_ref()).await.map_err(api_error)?;
-                (response.status, response.body)
+                self.host.wire(request.method().clone(), &segments, &query, body.as_ref()).await.map_err(api_error)?
             }
         };
         http::Response::builder()

@@ -1475,6 +1475,8 @@ async fn compose_drydock(
         if registry.environment_providers.contains_key(&name) {
             return Err(format!("duplicate environment provider instance {name}"));
         }
+        // Drydock's configuration owns how its vessels' agents are reached.
+        let reach = drydock::agent::AgentReach::new(provider.agent_link);
         let adapter: Arc<dyn EnvironmentProvider> = Arc::new(
             DrydockEnvironmentProvider::new(
                 Arc::new(host.client.clone()),
@@ -1482,6 +1484,7 @@ async fn compose_drydock(
                 provider.module,
                 config.state_dir().as_path().join("drydock-keys"),
             )
+            .with_agent_reach(reach)
             .with_host(host.clone())
             .with_lab_reach(lab_reach.get(&name).map(|reach| (reach.hostname.clone(), reach.port))),
         );

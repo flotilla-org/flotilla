@@ -610,6 +610,8 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_staged_into(
     let mechanisms = delivery.needs.iter().map(|need| (need.need.as_str(), need.mechanism.as_str())).collect::<BTreeMap<_, _>>();
     assert_eq!(mechanisms.get("home"), Some(&"agent-push"));
     assert_eq!(mechanisms.get("skills"), Some(&"agent-fetch(url)"));
+    // #3980: a place whose provider reports no agent connection shows none.
+    assert_eq!(delivery.agent_connection, None);
     mint_session.assert_complete();
 }
 

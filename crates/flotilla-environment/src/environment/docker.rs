@@ -747,8 +747,10 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
     fn runner(&self) -> Arc<dyn CommandRunner> {
         Arc::clone(&self.runner)
     }
-    fn agent(&self) -> Option<Arc<dyn super::VesselAgent>> {
-        self.agent.clone()
+    fn agent(&self) -> Arc<dyn super::VesselAgent> {
+        self.agent.clone().unwrap_or_else(|| {
+            Arc::new(super::vessel_ops::UnavailableAgent(format!("container {} has no live vessel agent", self.container_name)))
+        })
     }
     fn terminal_route(&self) -> Option<&dyn super::ProviderTerminalRoute> {
         Some(self)
@@ -1783,12 +1785,12 @@ mod agent_contract_tests {
         let handle =
             provider.provision(EnvironmentId::new("test"), &prepared, ProvisionOpts { tools, ..Default::default() }).await.unwrap();
         assert_eq!(std::fs::read(destination).unwrap(), b"cut-down CLI");
-        assert!(handle.agent().is_some());
+        assert!(handle.agent().ready().await.is_ok());
         assert!(handle.fallback_runner().is_some());
         assert_eq!(handle.image().as_str(), BASE);
         assert_eq!(handle.runner().run("printf", &["agent runner"], Path::new("/"), &ChannelLabel::Default).await.unwrap(), "agent runner");
         let readopted = provider.list().await.unwrap().pop().unwrap();
-        assert!(readopted.agent().is_some());
+        assert!(readopted.agent().ready().await.is_ok());
         assert_eq!(readopted.runner().run("printf", &["readopted"], Path::new("/"), &ChannelLabel::Default).await.unwrap(), "readopted");
         assert_eq!(memory.upgrades.load(Ordering::SeqCst), 1);
         handle.destroy().await.unwrap();
@@ -2050,14 +2052,14 @@ mod adoption_tests {
         }));
         let handles = provider.list().await.unwrap();
         assert_eq!(handles.len(), 3);
-        assert!(handles.iter().find(|h| h.id().as_str() == "bad").unwrap().agent().is_none());
+        assert!(handles.iter().find(|h| h.id().as_str() == "bad").unwrap().agent().ready().await.is_err());
         let old = handles.iter().find(|h| h.id().as_str() == "pre-agent").unwrap();
-        assert!(old.agent().is_none());
+        assert!(old.agent().ready().await.is_err());
         assert!(old.provisioned_mounts().is_empty());
         assert!(old.terminal_route().is_some());
         assert!(handles.iter().find(|h| h.id().as_str() == "bad").unwrap().terminal_route().is_some());
         let healthy = handles.iter().find(|h| h.id().as_str() == "healthy").unwrap();
-        assert!(healthy.agent().is_some());
+        assert!(healthy.agent().ready().await.is_ok());
         let starts = engine.starts.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(2200)).await;
         assert_eq!(engine.starts.load(Ordering::SeqCst), starts, "healthy agents need no repeated Docker exec");
@@ -2070,7 +2072,6 @@ mod adoption_tests {
         })
         .await
         .unwrap();
-        assert!(healthy.agent().is_some(), "retained handle must not keep polling a removed container");
     }
 
     struct GatedConnector {

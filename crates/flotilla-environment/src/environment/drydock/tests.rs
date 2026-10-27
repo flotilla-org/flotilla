@@ -1,11 +1,28 @@
 use super::*;
-use ::drydock::{client::Client, conformance};
-use flotilla_provider_runtime::{ChannelLabel, CommandOutput};
+use crate::environment::agent::AgentConnector;
+use ::drydock::{
+    agent::{stand_in::Gateway, SshDialer},
+    client::Client,
+    conformance,
+};
+use flotilla_provider_runtime::ChannelLabel;
 use hegel::generators as gs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// The agent build the stand-in vessel runs and the provider pushes.
+const BUILD: &[u8] = b"flotilla drydock test agent";
+
+/// A real Rust drydock host with the reference module, whose vessels declare
+/// an agent reached over SSH, and an in-process gateway serving a real agent
+/// under that reach's forwarding rules. The stand-in vessel is this host: its
+/// workspace root is the fixture's, and only `tar` and `du` are faked on the
+/// vessel's PATH, so checkpoints never archive the test host.
 struct HostFixture {
     _directory: tempfile::TempDir,
+    root: PathBuf,
+    runtime: ::drydock::runtime::Runtime,
     client: Client,
+    gateway: Arc<Gateway>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for HostFixture {
@@ -15,16 +32,22 @@ impl Drop for HostFixture {
 }
 impl HostFixture {
     async fn start() -> Self {
+        Self::with_gateway(false).await
+    }
+    /// `reverse_forwards`: whether the provider's SSH server accepts them.
+    async fn with_gateway(reverse_forwards: bool) -> Self {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let socket = directory.path().join("host.sock");
-        let host = drydock_host::Host::new(drydock_host::reference::registry());
-        let path = socket.clone();
-        // SAFETY: geteuid has no preconditions; admit only this process's UID.
-        let uid = unsafe { libc::geteuid() };
+        let root = directory.path().to_path_buf();
+        let socket = root.join("host.sock");
+        // The main server's runtime behind drydock's public router, as an
+        // embedding or socket-backed caller sees it.
+        let runtime = ::drydock::runtime::Runtime::new(drydock_host::reference::registry());
+        let router = ::drydock::api::router(Arc::new(runtime.clone()), runtime.stopping());
+        let listener = rigging_http_serve::UnixServer::bind(&socket, 0o600).await.unwrap();
         let task = tokio::spawn(async move {
-            host.serve_unix(path, uid, std::future::pending()).await.unwrap();
+            listener.serve(router, rigging_http_serve::Caller::<()>::Unix, std::future::pending()).await.unwrap();
         });
         let client = Client::unix(socket).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -34,68 +57,51 @@ impl HostFixture {
         })
         .await
         .unwrap();
+        let reach = serde_json::json!({"kind": "ssh", "endpoint": "gateway.test:22", "user": "minted-gateway-user",
+            "host_key": "ssh-ed25519 AAAA", "reverse_forwards": reverse_forwards});
         let configuration = serde_json::from_value(serde_json::json!({
             "modules":[{"name":"memory","entrypoint":"reference"}],
-            "providers":[{"name":"reference","module":"memory","settings":{"fixture":true},"credential":{"mode":"direct","credential_reference":"test"}}]
-        })).unwrap();
-        client.configure(&configuration).await.unwrap();
-        Self { _directory: directory, client, task }
+            "providers":[{"name":"reference","module":"memory","settings":{"fixture":true,"agent":true,"reach":reach,
+                "workspace_root":root.join("workspace")},"credential":{"mode":"direct","credential_reference":"test"}}]
+        }))
+        .unwrap();
+        runtime.configure(&configuration).await.unwrap();
+        std::fs::create_dir(root.join("vessel")).unwrap();
+        let gateway = Gateway::start(&root.join("vessel"), reverse_forwards, BUILD).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // `du` reports nothing to archive, refuses once `du-fails` exists and
+        // hangs while `du-hangs` does; `tar` writes a fixed archive.
+        for (name, script) in [
+            (
+                "du",
+                format!(
+                    "#!/bin/sh\n[ -e {0}/du-hangs ] && exec sleep 30\n[ -e {0}/du-fails ] && {{ printf '999999999999\\t-\\n'; exit 0; }}\nprintf '0\\t-\\n'\n",
+                    bin.display()
+                ),
+            ),
+            ("tar", "#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = -cf ] && { shift; printf archive > \"$1\"; }; shift; done\n".into()),
+        ] {
+            std::fs::write(bin.join(name), script).unwrap();
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Self { _directory: directory, root, runtime, client, gateway, task }
     }
     async fn ready(&self) {
-        self.client.credential("reference", wire::Secret::new("reference-only-test-key")).await.unwrap();
+        self.runtime.credential("reference", wire::Secret::new("reference-only-test-key")).await.unwrap();
     }
     fn provider(&self) -> DrydockEnvironmentProvider {
-        let mut provider = DrydockEnvironmentProvider::new(
-            Arc::new(self.client.clone()),
-            "reference".into(),
-            "reference".into(),
-            self._directory.path().join("keys"),
-        );
-        provider.connector = Arc::new(ReferenceGuest);
-        provider
+        self.provider_through(self.gateway.clone())
     }
-}
-// The reference module has no guest. This fake stands only for the SSH/agent
-// process boundary; every lifecycle call still runs through the real Rust host.
-struct ReferenceGuest;
-#[async_trait]
-impl reach::Connector for ReferenceGuest {
-    async fn connect(
-        &self,
-        _: &dyn ProviderApi,
-        _: &str,
-        _: &str,
-        _: &wire::Platform,
-        _: PathBuf,
-    ) -> Result<Arc<dyn reach::Guest>, String> {
-        Ok(Arc::new(Self))
+    fn provider_through(&self, dialer: Arc<dyn SshDialer>) -> DrydockEnvironmentProvider {
+        DrydockEnvironmentProvider::new(Arc::new(self.client.clone()), "reference".into(), "reference".into(), self.root.join("keys"))
+            .with_agent_reach(AgentReach::new(AgentLink::default()).with_dialer(dialer).with_timeout(Duration::from_secs(2)))
+            .with_agent_build(BUILD.to_vec())
+            .with_attach_root(self.root.join("attach"))
     }
-}
-#[async_trait]
-impl reach::Guest for ReferenceGuest {
-    fn runner(&self) -> Arc<dyn CommandRunner> {
-        Arc::new(Self)
-    }
-    async fn configure(&self, _: BTreeMap<String, String>) -> Result<(), String> {
-        Ok(())
-    }
-    async fn deliver(&self, _: EnvironmentToolAsset) -> Result<(), String> {
-        Ok(())
-    }
-}
-#[async_trait]
-impl CommandRunner for ReferenceGuest {
-    async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
-        Ok(String::new())
-    }
-    async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
-        Ok(CommandOutput { stdout: String::new(), stderr: String::new(), exit_code: Some(0) })
-    }
-    async fn exists(&self, _: &str, _: &[&str]) -> bool {
-        true
-    }
-    async fn run_to_file(&self, _: &str, _: &[&str], _: &Path, destination: &Path) -> Result<(), String> {
-        tokio::fs::write(destination, b"reference checkpoint").await.map_err(error)
+    /// Provision inputs whose guest processes find the faked tools first.
+    fn opts(&self) -> ProvisionOpts {
+        ProvisionOpts { tokens: vec![("PATH".into(), format!("{}:/usr/bin:/bin", self.root.join("bin").display()))], ..Default::default() }
     }
 }
 pub(super) fn spec() -> flotilla_resources::EnvironmentSpec {
@@ -169,9 +175,9 @@ async fn reference_lifecycle_through_environment_provider() {
     host.ready().await;
     let provider = host.provider();
     let prepared = fixture_prepared(&host, &provider).await;
-    assert!(host.provider().provision(EnvironmentId::new("crew"), &prepared, Default::default()).await.is_err());
-    let first = provider.provision(EnvironmentId::new("crew"), &prepared, Default::default()).await.unwrap();
-    let second = provider.provision(EnvironmentId::new("crew"), &prepared, Default::default()).await.unwrap();
+    assert!(host.provider().provision(EnvironmentId::new("crew"), &prepared, host.opts()).await.is_err());
+    let first = provider.provision(EnvironmentId::new("crew"), &prepared, host.opts()).await.unwrap();
+    let second = provider.provision(EnvironmentId::new("crew"), &prepared, host.opts()).await.unwrap();
     assert_eq!(first.backing_id(), second.backing_id());
     let descriptor = first.provider_descriptor().unwrap();
     assert_eq!(descriptor.kind.implementation, "reference");
@@ -201,6 +207,8 @@ async fn reference_lifecycle_through_environment_provider() {
 }
 // The Drydock checker invokes adapter lifecycle methods via an injected HTTP
 // executor. Streams retain the real host; preparation follows the main reference fixture.
+// Reach is drydock's own (its agent entry point is tested there), so the
+// adapter is not checked for it.
 #[tokio::test]
 async fn reference_passes_drydock_conformance() {
     let host = HostFixture::start().await;
@@ -222,7 +230,6 @@ async fn reference_passes_drydock_conformance() {
             conformance::Scenario::Lifecycle,
             conformance::Scenario::Observation,
             conformance::Scenario::Semantics,
-            conformance::Scenario::Reach,
             conformance::Scenario::Refusal,
             conformance::Scenario::Destroy,
         ],
@@ -238,6 +245,8 @@ async fn reference_passes_drydock_conformance() {
     };
     let adapter = Arc::new(super::conformance_test::AdapterHttp {
         provider: provider.clone(),
+        host: host.client.clone(),
+        opts: host.opts(),
         prepared: Default::default(),
         handles: Default::default(),
     });
@@ -370,20 +379,30 @@ async fn truncated_agent_streams_preserve_recovery() {
         }
     }
     let server_guard = Server(server);
-    let agent = Arc::new(drydock_agent::Client::connect(host.unwrap(), "fault-fixture").await.unwrap());
-    let runner = Arc::new(runner::AgentRunner(agent.clone()));
+    // The vessel runner is the agent's own runner, connected to the stand-in.
+    struct StandIn(tokio::sync::Mutex<Option<drydock_transport::Transport>>);
+    #[async_trait]
+    impl AgentConnector for StandIn {
+        async fn connect(&self) -> Result<drydock_agent::Client, String> {
+            let transport = self.0.lock().await.take().ok_or("the stand-in serves one link")?;
+            drydock_agent::Client::connect(transport, "fault-fixture").await.map_err(|cause| cause.to_string())
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let runner: Arc<dyn CommandRunner> =
+        Arc::new(AgentRunner::new(Arc::new(StandIn(tokio::sync::Mutex::new(Some(host.unwrap())))), directory.path().join("attach")));
     let directory = tempfile::tempdir().unwrap();
     let target = directory.path().join("checkpoint.tar");
     write_checkpoint(runner.clone(), &target, Path::new("/work")).await.unwrap();
     assert_eq!(std::fs::read(&target).unwrap(), b"archive bytes");
     mode.store(TRUNCATED, Ordering::SeqCst);
     let error = write_checkpoint(runner.clone(), &target, Path::new("/work")).await.unwrap_err();
-    assert_eq!(error, "drydock guest operation failed (UnexpectedEof)");
+    assert!(!error.contains("secret guest stderr"), "{error}");
     assert_eq!(std::fs::read(&target).unwrap(), b"archive bytes");
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     mode.store(STALLED, Ordering::SeqCst);
     let capture = tokio::spawn({
-        let target = target.clone();
+        let (runner, target) = (runner.clone(), target.clone());
         async move { write_checkpoint(runner, &target, Path::new("/work")).await }
     });
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -409,203 +428,123 @@ async fn truncated_agent_streams_preserve_recovery() {
     assert!(!server_guard.0.is_finished(), "the stand-in served throughout");
 }
 
-// One slow SSH handshake must not block another label; repeated adoption must
-// refresh the existing guest's credential environment without reconnecting it.
+// One slow agent connection must not block another label; repeated adoption
+// must refresh the existing guest's environment without reconnecting it.
 #[tokio::test]
 async fn independent_provisions_and_rotated_tokens() {
-    struct Guest {
-        environments: Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>,
-    }
-    #[async_trait]
-    impl reach::Guest for Guest {
-        fn runner(&self) -> Arc<dyn CommandRunner> {
-            Arc::new(ReferenceGuest)
-        }
-        async fn configure(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
-            self.environments.lock().unwrap().push(environment);
-            Ok(())
-        }
-        async fn deliver(&self, _: EnvironmentToolAsset) -> Result<(), String> {
-            Ok(())
-        }
-    }
-    struct Connector {
+    /// Holds the first link until released; later ones pass straight through.
+    struct Held {
+        gateway: Arc<Gateway>,
         calls: std::sync::atomic::AtomicUsize,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
-        environments: Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>,
     }
     #[async_trait]
-    impl reach::Connector for Connector {
-        async fn connect(
-            &self,
-            _: &dyn ProviderApi,
-            _: &str,
-            _: &str,
-            _: &wire::Platform,
-            _: PathBuf,
-        ) -> Result<Arc<dyn reach::Guest>, String> {
+    impl SshDialer for Held {
+        async fn dial(&self, config: drydock_transport::ssh::SshConfig) -> std::io::Result<drydock_transport::Transport> {
             if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 self.entered.notify_one();
                 self.release.notified().await;
             }
-            Ok(Arc::new(Guest { environments: self.environments.clone() }))
+            self.gateway.dial(config).await
         }
     }
     let host = HostFixture::start().await;
     host.ready().await;
-    let mut provider = host.provider();
-    let connector = Arc::new(Connector {
+    let held = Arc::new(Held {
+        gateway: host.gateway.clone(),
         calls: Default::default(),
         entered: Default::default(),
         release: Default::default(),
-        environments: Default::default(),
     });
-    provider.connector = connector.clone();
+    let provider = host.provider_through(held.clone());
     let prepared = Arc::new(fixture_prepared(&host, &provider).await);
     let provider = Arc::new(provider);
     let task = {
-        let provider = provider.clone();
-        let prepared = prepared.clone();
-        tokio::spawn(async move { provider.provision(EnvironmentId::new("slow"), &prepared, Default::default()).await })
+        let (provider, prepared, opts) = (provider.clone(), prepared.clone(), host.opts());
+        tokio::spawn(async move { provider.provision(EnvironmentId::new("slow"), &prepared, opts).await })
     };
-    connector.entered.notified().await;
-    let fast = tokio::time::timeout(Duration::from_secs(3), provider.provision(EnvironmentId::new("fast"), &prepared, Default::default()))
+    held.entered.notified().await;
+    let fast = tokio::time::timeout(Duration::from_secs(3), provider.provision(EnvironmentId::new("fast"), &prepared, host.opts()))
         .await
         .unwrap()
         .unwrap();
-    connector.release.notify_one();
+    held.release.notify_one();
     let slow = task.await.unwrap().unwrap();
-    let opts = ProvisionOpts { tokens: vec![("TEST_TOKEN".into(), "rotated".into())], ..Default::default() };
+    // The stand-in serves both vessels from one agent; retire the slow one so
+    // its configuration cannot race the rotation below.
+    slow.destroy().await.unwrap();
+    let mut opts = host.opts();
+    opts.tokens.push(("TEST_TOKEN".into(), "rotated".into()));
     let adopted = provider.provision(EnvironmentId::new("fast"), &prepared, opts).await.unwrap();
     assert_eq!(adopted.backing_id(), fast.backing_id());
-    assert_eq!(connector.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-    assert_eq!(connector.environments.lock().unwrap().last().unwrap().get("TEST_TOKEN").map(String::as_str), Some("rotated"));
+    assert_eq!(held.calls.load(std::sync::atomic::Ordering::SeqCst), 2, "adoption reuses the live agent link");
+    assert_eq!(adopted.env_vars().await.unwrap().get("TEST_TOKEN").map(String::as_str), Some("rotated"));
     fast.destroy().await.unwrap();
-    slow.destroy().await.unwrap();
 }
 
 // #3765 B1: after a controller restart, failed guest setup must leave the
 // existing, work-carrying backing available for the next adoption attempt.
 #[tokio::test]
 async fn restart_failed_adoption_preserves_backing() {
-    struct Unreachable;
-    // Fake the SSH process boundary; provision and inventory use the real host.
-    #[async_trait]
-    impl reach::Connector for Unreachable {
-        async fn connect(
-            &self,
-            _: &dyn ProviderApi,
-            _: &str,
-            _: &str,
-            _: &wire::Platform,
-            _: PathBuf,
-        ) -> Result<Arc<dyn reach::Guest>, String> {
-            Err("injected SSH failure".into())
-        }
-    }
     let host = HostFixture::start().await;
     host.ready().await;
     let provider = host.provider();
     let prepared = fixture_prepared(&host, &provider).await;
-    let first = provider.provision(EnvironmentId::new("survivor"), &prepared, Default::default()).await.unwrap();
+    let first = provider.provision(EnvironmentId::new("survivor"), &prepared, host.opts()).await.unwrap();
     let backing = first.backing_id().to_owned();
     drop(first);
     drop(provider);
-    let mut restarted = host.provider();
-    restarted.connector = Arc::new(Unreachable);
+    host.gateway.stop();
+    let restarted = host.provider();
     let prepared = fixture_prepared(&host, &restarted).await;
+    let failure = restarted.provision(EnvironmentId::new("survivor"), &prepared, host.opts()).await.err().expect("no agent answers");
     assert!(
-        matches!(restarted.provision(EnvironmentId::new("survivor"), &prepared, Default::default()).await, Err(EnvironmentProvisionError::RetryAdoption(diagnostic)) if diagnostic == "injected SSH failure")
+        matches!(&failure, EnvironmentProvisionError::RetryAdoption(diagnostic) if diagnostic.contains("did not complete its hello")),
+        "{failure}"
     );
     assert_eq!(host.client.inspect("reference", &backing).await.unwrap().id, backing);
 }
 
-// #3765 S3: after SSH closure, liveness reconnects and re-establishes the
-// configured environment and forwards without recreating the provider.
+// #3765 S3: an agent that stops answering makes the vessel Unknown, never Gone.
+// Once one answers again, liveness reconnects through drydock and restores the
+// configured environment and the lab forward without recreating the provider;
+// refreshing the lab name never duplicates its hosts entry.
 #[tokio::test]
-async fn closed_session_reconnects_on_liveness() {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    #[derive(Default)]
-    struct Recovery {
-        closed: AtomicBool,
-        fail_reconnect: AtomicBool,
-        connects: AtomicUsize,
-        configurations: AtomicUsize,
-        forwards: AtomicUsize,
-    }
-    // Fake only SSH/agent process execution; provider lifecycle uses the host.
-    struct Guest(Arc<Recovery>);
-    struct Connector(Arc<Recovery>);
-    #[async_trait]
-    impl reach::Guest for Guest {
-        async fn closed(&self) -> bool {
-            self.0.closed.load(Ordering::SeqCst)
-        }
-        fn runner(&self) -> Arc<dyn CommandRunner> {
-            Arc::new(ReferenceGuest)
-        }
-        async fn configure(&self, env: BTreeMap<String, String>) -> Result<(), String> {
-            assert_eq!(env.get("TOKEN").map(String::as_str), Some("rotated"));
-            self.0.configurations.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-        async fn configure_lab(&self, lab: Option<(String, u16)>) -> Result<(), String> {
-            assert_eq!(lab, Some(("forgejo.lab.flotilla.work".into(), 443)));
-            self.0.forwards.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-        async fn deliver(&self, _: EnvironmentToolAsset) -> Result<(), String> {
-            Ok(())
-        }
-    }
-    #[async_trait]
-    impl reach::Connector for Connector {
-        async fn connect(
-            &self,
-            _: &dyn ProviderApi,
-            _: &str,
-            _: &str,
-            _: &wire::Platform,
-            _: PathBuf,
-        ) -> Result<Arc<dyn reach::Guest>, String> {
-            if self.0.fail_reconnect.load(Ordering::SeqCst) {
-                return Err("injected unreachable SSH endpoint".into());
-            }
-            self.0.closed.store(false, Ordering::SeqCst);
-            self.0.connects.fetch_add(1, Ordering::SeqCst);
-            Ok(Arc::new(Guest(self.0.clone())))
-        }
-    }
+async fn lost_agent_reconnects_on_liveness() {
     let host = HostFixture::start().await;
     host.ready().await;
-    let recovery = Arc::new(Recovery::default());
-    let mut provider = host.provider().with_lab_reach(Some(("forgejo.lab.flotilla.work".into(), 443)));
-    provider.connector = Arc::new(Connector(recovery.clone()));
+    let lab = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let guest_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let hosts = host.root.join("hosts");
+    tokio::fs::write(&hosts, b"127.0.0.1 localhost\n").await.unwrap();
+    let mut provider = host.provider().with_lab_reach(Some(("127.0.0.1".into(), lab.local_addr().unwrap().port())));
+    provider.lab_guest = LabGuest {
+        tcp: std::net::SocketAddr::from(([127, 0, 0, 1], guest_port)),
+        socket: host.root.join("vessel/lab.sock"),
+        hosts: hosts.clone(),
+    };
     let prepared = fixture_prepared(&host, &provider).await;
-    let opts = ProvisionOpts { tokens: [("TOKEN".into(), "rotated".into())].into_iter().collect(), ..Default::default() };
-    let handle = provider.provision(EnvironmentId::new("recovery"), &prepared, opts).await.unwrap();
-    let configured = recovery.configurations.load(Ordering::SeqCst);
-    let forwarded = recovery.forwards.load(Ordering::SeqCst);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !matches!(handle.observe().await.state, ObservationState::Running) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    recovery.closed.store(true, Ordering::SeqCst);
-    recovery.fail_reconnect.store(true, Ordering::SeqCst);
+    let mut opts = host.opts();
+    opts.tokens.push(("TOKEN".into(), "rotated".into()));
+    let handle = provider.provision(EnvironmentId::new("recovery"), &prepared, opts.clone()).await.unwrap();
+    provider.provision(EnvironmentId::new("recovery"), &prepared, opts).await.unwrap();
+    assert!(matches!(handle.observe().await.state, ObservationState::Running));
+    host.gateway.stop();
     assert!(matches!(handle.observe().await.state, ObservationState::Unknown { .. }));
     assert!(matches!(host.client.inspect("reference", handle.backing_id()).await.unwrap().state, wire::Observation::Running));
-    recovery.fail_reconnect.store(false, Ordering::SeqCst);
+    host.gateway.restart().unwrap();
     let observation = handle.observe().await;
     assert!(matches!(observation.state, ObservationState::Running), "{observation:?}");
-    assert_eq!(recovery.connects.load(Ordering::SeqCst), 2);
-    assert_eq!(recovery.configurations.load(Ordering::SeqCst), configured + 1);
-    assert_eq!(recovery.forwards.load(Ordering::SeqCst), forwarded + 1);
-    handle.observe().await;
-    assert_eq!(recovery.connects.load(Ordering::SeqCst), 2);
+    assert_eq!(handle.env_vars().await.unwrap().get("TOKEN").map(String::as_str), Some("rotated"));
+    let mut guest = tokio::net::TcpStream::connect(("127.0.0.1", guest_port)).await.unwrap();
+    guest.write_all(b"lab").await.unwrap();
+    let (mut service, _) = tokio::time::timeout(Duration::from_secs(5), lab.accept()).await.unwrap().unwrap();
+    let mut received = [0; 3];
+    service.read_exact(&mut received).await.unwrap();
+    assert_eq!(&received, b"lab");
+    let names = tokio::fs::read_to_string(&hosts).await.unwrap();
+    assert_eq!(names.matches(LAB_HOSTNAME).count(), 1, "{names}");
     handle.destroy().await.unwrap();
 }
 
@@ -655,17 +594,17 @@ async fn incomplete_adoption_keypair_requires_restore() {
     let prepared = fixture_prepared(&host, &provider).await;
     for (index, missing) in ["id_ed25519", "id_ed25519.pub"].into_iter().enumerate() {
         let id = EnvironmentId::new(format!("repair-{index}"));
-        let first = provider.provision(id.clone(), &prepared, Default::default()).await.unwrap();
+        let first = provider.provision(id.clone(), &prepared, host.opts()).await.unwrap();
         let directory = key_dir(&provider.directory, &id);
         let original = tokio::fs::read(directory.join(missing)).await.unwrap();
         tokio::fs::remove_file(directory.join(missing)).await.unwrap();
-        let failure = provider.provision(id.clone(), &prepared, Default::default()).await.err().expect("adoption must not regenerate keys");
+        let failure = provider.provision(id.clone(), &prepared, host.opts()).await.err().expect("adoption must not regenerate keys");
         assert!(matches!(failure, EnvironmentProvisionError::RetryAdoption(_)));
         assert!(failure.to_string().contains("SSH keypair incomplete or missing for adopted backing"));
         assert!(!directory.join(missing).exists());
         assert_eq!(host.client.inspect("reference", first.backing_id()).await.unwrap().id, first.backing_id());
         tokio::fs::write(directory.join(missing), original).await.unwrap();
-        let recovered = provider.provision(id, &prepared, Default::default()).await.unwrap();
+        let recovered = provider.provision(id, &prepared, host.opts()).await.unwrap();
         assert_eq!(first.backing_id(), recovered.backing_id());
         recovered.destroy().await.unwrap();
     }
@@ -674,69 +613,22 @@ async fn incomplete_adoption_keypair_requires_restore() {
     let directory = key_dir(&provider.directory, &id);
     ::drydock::local::private_dir(&directory).unwrap();
     tokio::fs::write(directory.join("id_ed25519.pub"), "stale public half").await.unwrap();
-    let fresh = provider.provision(id, &prepared, Default::default()).await.unwrap();
+    let fresh = provider.provision(id, &prepared, host.opts()).await.unwrap();
     assert!(directory.join("id_ed25519").is_file());
     assert_ne!(tokio::fs::read_to_string(directory.join("id_ed25519.pub")).await.unwrap(), "stale public half");
     fresh.destroy().await.unwrap();
 }
 
 // #3765 S2: periodic refresh failure preserves the completed archive and makes
-// checkpoint staleness visible through health. Only the SSH/agent is faked.
+// checkpoint staleness visible through health. Only `du` is faked.
 #[tokio::test]
 async fn checkpoint_refresh_failure_reports_stale_health() {
-    #[derive(Clone, Default)]
-    struct Guest(Arc<std::sync::atomic::AtomicUsize>);
-    #[async_trait]
-    impl reach::Connector for Guest {
-        async fn connect(
-            &self,
-            _: &dyn ProviderApi,
-            _: &str,
-            _: &str,
-            _: &wire::Platform,
-            _: PathBuf,
-        ) -> Result<Arc<dyn reach::Guest>, String> {
-            Ok(Arc::new(self.clone()))
-        }
-    }
-    #[async_trait]
-    impl reach::Guest for Guest {
-        fn runner(&self) -> Arc<dyn CommandRunner> {
-            Arc::new(self.clone())
-        }
-        async fn configure(&self, _: BTreeMap<String, String>) -> Result<(), String> {
-            Ok(())
-        }
-        async fn deliver(&self, _: EnvironmentToolAsset) -> Result<(), String> {
-            Ok(())
-        }
-    }
-    #[async_trait]
-    impl CommandRunner for Guest {
-        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-            ReferenceGuest.run(cmd, args, cwd, label).await
-        }
-        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-            ReferenceGuest.run_output(cmd, args, cwd, label).await
-        }
-        async fn exists(&self, _: &str, _: &[&str]) -> bool {
-            true
-        }
-        async fn run_to_file(&self, _: &str, _: &[&str], _: &Path, path: &Path) -> Result<(), String> {
-            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                tokio::fs::write(path, b"complete").await.map_err(error)
-            } else {
-                Err("checkpoint exceeds budget".into())
-            }
-        }
-    }
     let host = HostFixture::start().await;
     host.ready().await;
-    let mut provider = host.provider();
-    provider.connector = Arc::new(Guest::default());
+    let provider = host.provider();
     let prepared = fixture_prepared(&host, &provider).await;
     let id = EnvironmentId::new("checkpoint-health");
-    let handle = provider.provision(id.clone(), &prepared, Default::default()).await.unwrap();
+    let handle = provider.provision(id.clone(), &prepared, host.opts()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !key_dir(&provider.directory, &id).join("checkpoint.tar").exists() {
             tokio::task::yield_now().await;
@@ -744,6 +636,7 @@ async fn checkpoint_refresh_failure_reports_stale_health() {
     })
     .await
     .unwrap();
+    std::fs::write(host.root.join("bin/du-fails"), b"").unwrap();
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
     for _ in 0..100 {
@@ -759,7 +652,7 @@ async fn checkpoint_refresh_failure_reports_stale_health() {
     .unwrap();
     assert_eq!(handle.detect_readiness().await, ProviderReadiness::Ready);
     assert!(handle.health_message().unwrap().contains("checkpoint stale"));
-    assert_eq!(tokio::fs::read(key_dir(&provider.directory, &id).join("checkpoint.tar")).await.unwrap(), b"complete");
+    assert_eq!(tokio::fs::read(key_dir(&provider.directory, &id).join("checkpoint.tar")).await.unwrap(), b"archive");
     handle.destroy().await.unwrap();
 }
 
@@ -771,9 +664,9 @@ async fn stale_snapshot_absence_is_confirmed_by_inspect() {
     host.ready().await;
     let provider = host.provider();
     let prepared = fixture_prepared(&host, &provider).await;
-    let handle = provider.provision(EnvironmentId::new("snapshot-race"), &prepared, Default::default()).await.unwrap();
+    let handle = provider.provision(EnvironmentId::new("snapshot-race"), &prepared, host.opts()).await.unwrap();
     let backing = host.client.inspect("reference", handle.backing_id()).await.unwrap();
-    let adopted = provider.handle(backing, spec().cloud_sandbox.unwrap().image, BTreeMap::new()).unwrap();
+    let adopted = provider.handle(backing, spec().cloud_sandbox.unwrap().image, BTreeMap::new(), false).unwrap();
     *adopted.watch.state.write().unwrap() = Some(ObservationState::Gone { cause: GoneCause::MissingOnList });
     assert!(matches!(adopted.observe().await.state, ObservationState::Running));
     handle.destroy().await.unwrap();
@@ -782,67 +675,90 @@ async fn stale_snapshot_absence_is_confirmed_by_inspect() {
 // A checkpoint can hang or fail without delaying initial setup or re-adoption.
 #[tokio::test]
 async fn adoption_does_not_wait_for_initial_checkpoint() {
-    #[derive(Clone, Default)]
-    struct SlowCheckpoint(Arc<tokio::sync::Notify>);
-    #[async_trait]
-    impl reach::Connector for SlowCheckpoint {
-        async fn connect(
-            &self,
-            _: &dyn ProviderApi,
-            _: &str,
-            _: &str,
-            _: &wire::Platform,
-            _: PathBuf,
-        ) -> Result<Arc<dyn reach::Guest>, String> {
-            Ok(Arc::new(self.clone()))
-        }
-    }
-    #[async_trait]
-    impl reach::Guest for SlowCheckpoint {
-        fn runner(&self) -> Arc<dyn CommandRunner> {
-            Arc::new(self.clone())
-        }
-        async fn configure(&self, _: BTreeMap<String, String>) -> Result<(), String> {
-            Ok(())
-        }
-        async fn deliver(&self, _: EnvironmentToolAsset) -> Result<(), String> {
-            Ok(())
-        }
-    }
-    #[async_trait]
-    impl CommandRunner for SlowCheckpoint {
-        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-            ReferenceGuest.run(cmd, args, cwd, label).await
-        }
-        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-            ReferenceGuest.run_output(cmd, args, cwd, label).await
-        }
-        async fn exists(&self, _: &str, _: &[&str]) -> bool {
-            true
-        }
-        async fn run_to_file(&self, _: &str, _: &[&str], _: &Path, _: &Path) -> Result<(), String> {
-            self.0.notify_one();
-            std::future::pending().await
-        }
-    }
     let host = HostFixture::start().await;
     host.ready().await;
-    let slow = SlowCheckpoint::default();
-    let mut provider = host.provider();
-    provider.connector = Arc::new(slow.clone());
+    std::fs::write(host.root.join("bin/du-hangs"), b"").unwrap();
+    let provider = host.provider();
     let prepared = fixture_prepared(&host, &provider).await;
     let id = EnvironmentId::new("slow-checkpoint");
     let first =
-        tokio::time::timeout(Duration::from_secs(5), provider.provision(id.clone(), &prepared, Default::default())).await.unwrap().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), slow.0.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), provider.provision(id.clone(), &prepared, host.opts())).await.unwrap().unwrap();
     drop(first);
     drop(provider);
-    let mut restarted = host.provider();
-    restarted.connector = Arc::new(slow.clone());
+    let restarted = host.provider();
     let prepared = fixture_prepared(&host, &restarted).await;
-    let adopted =
-        tokio::time::timeout(Duration::from_secs(5), restarted.provision(id, &prepared, Default::default())).await.unwrap().unwrap();
+    let adopted = tokio::time::timeout(Duration::from_secs(5), restarted.provision(id, &prepared, host.opts())).await.unwrap().unwrap();
     assert!(!adopted.created_for_setup());
     assert_eq!(adopted.detect_readiness().await, ProviderReadiness::Ready);
     adopted.destroy().await.unwrap();
+}
+
+// Behaviour (#3980 contracts 2, 3 and 7): through either agent link drydock
+// chooses, a tool's socket is an agent guest forward the guest dials at its own
+// path, and its files are pushed through the agent. A forward the agent refuses
+// fails provision naming the forward, without waiting. What drydock chose
+// (#3980 contract 9) is recorded in the provider descriptor.
+#[tokio::test]
+async fn guest_sockets_are_agent_forwards_through_either_link() {
+    for (reverse_forwards, link) in [(false, "local_forward"), (true, "reverse_forward")] {
+        let host = HostFixture::with_gateway(reverse_forwards).await;
+        host.ready().await;
+        let provider = host.provider();
+        let prepared = fixture_prepared(&host, &provider).await;
+        let daemon = tokio::net::UnixListener::bind(host.root.join("daemon.sock")).unwrap();
+        let guest_socket = host.root.join("vessel/run/daemon.sock");
+        let tool = EnvironmentTool::new("flotilla", host.root.join("vessel/opt/flotilla"))
+            .with_asset(EnvironmentToolAsset::new(
+                host.root.join("daemon.sock"),
+                &guest_socket,
+                EnvironmentToolAssetKind::UnixSocket,
+                EnvironmentToolAssetAccess::SharedWritable,
+                "the daemon socket",
+            ))
+            .with_asset(EnvironmentToolAsset::new(
+                host.root.join("bin/tar"),
+                host.root.join("vessel/opt/flotilla/tool"),
+                EnvironmentToolAssetKind::File,
+                EnvironmentToolAssetAccess::ReadOnly,
+                "a tool",
+            ));
+        let opts = ProvisionOpts { tools: vec![tool], ..host.opts() };
+        let handle = provider.provision(EnvironmentId::new("forwards"), &prepared, opts).await.unwrap();
+        let report = handle.provider_descriptor().unwrap().agent_connection.expect("drydock's report is recorded");
+        let expected = flotilla_protocol::provider::AgentConnectionReport {
+            provider: "reference".into(),
+            module: "memory".into(),
+            vessel: handle.backing_id().into(),
+            endpoint: "gateway.test:22".into(),
+            mode: link.into(),
+        };
+        assert_eq!(report, expected);
+        let mut guest = tokio::net::UnixStream::connect(&guest_socket).await.unwrap();
+        guest.write_all(b"crew").await.unwrap();
+        let (mut controller, _) = tokio::time::timeout(Duration::from_secs(5), daemon.accept()).await.unwrap().unwrap();
+        let mut received = [0; 4];
+        controller.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"crew");
+        use std::os::unix::fs::PermissionsExt;
+        let pushed = std::fs::metadata(host.root.join("vessel/opt/flotilla/tool")).unwrap();
+        assert_eq!(pushed.permissions().mode() & 0o777, 0o755);
+        // A guest path whose parent is a file cannot be listened on.
+        let refused = EnvironmentTool::new("flotilla", host.root.join("vessel/opt/flotilla")).with_asset(EnvironmentToolAsset::new(
+            host.root.join("daemon.sock"),
+            host.root.join("hosts-file/daemon.sock"),
+            EnvironmentToolAssetKind::UnixSocket,
+            EnvironmentToolAssetAccess::SharedWritable,
+            "the daemon socket",
+        ));
+        std::fs::write(host.root.join("hosts-file"), b"").unwrap();
+        let opts = ProvisionOpts { tools: vec![refused], ..host.opts() };
+        let failure = tokio::time::timeout(Duration::from_secs(5), provider.provision(EnvironmentId::new("refused"), &prepared, opts))
+            .await
+            .expect("a refused forward never hangs")
+            .err()
+            .expect("a refused forward fails provision");
+        let message = failure.to_string();
+        assert!(message.contains("guest forward socket-") && message.contains("hosts-file/daemon.sock"), "{message}");
+        handle.destroy().await.unwrap();
+    }
 }

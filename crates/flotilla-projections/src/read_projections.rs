@@ -2199,12 +2199,25 @@ pub async fn access_delivery_evidence(
         )
         .await
         .map_err(|error| format!("read access deliveries: {error}"))?;
+    let environments = backend.including_replicas::<flotilla_resources::Environment>(namespace);
+    let mut connections = BTreeMap::new();
+    for record in &records.items {
+        let place = &record.object.spec.place;
+        if !connections.contains_key(place) {
+            // A place whose Environment is gone or unreadable simply reports no connection.
+            let connection = environments.get(place).await.ok().and_then(|environment| {
+                environment.object.status.and_then(|status| status.provider_descriptor).and_then(|descriptor| descriptor.agent_connection)
+            });
+            connections.insert(place.clone(), connection);
+        }
+    }
     let mut explained = records
         .items
         .iter()
         .map(|record| {
             let spec = &record.object.spec;
             flotilla_protocol::ExplainedAccessDelivery {
+                agent_connection: connections.get(&spec.place).cloned().flatten(),
                 access: spec.access.clone(),
                 place: spec.place.clone(),
                 harness: spec.harness.clone(),

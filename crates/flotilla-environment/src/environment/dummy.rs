@@ -265,6 +265,10 @@ impl ProvisionedEnvironment for DummyEnvironment {
     fn runner(&self) -> Arc<dyn CommandRunner> {
         Arc::clone(&self.runner) as Arc<dyn CommandRunner>
     }
+    /// The dummy's scripted runner stands for its vessel, agent included.
+    fn agent(&self) -> Arc<dyn super::VesselAgent> {
+        Arc::new(super::vessel_ops::RunnerVesselAgent(self.runner()))
+    }
     async fn destroy(&self) -> Result<(), String> {
         if !self.destroyed.swap(true, Ordering::AcqRel) {
             if let Some(cleanup) = &self.cleanup {

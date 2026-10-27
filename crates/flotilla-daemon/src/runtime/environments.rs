@@ -342,7 +342,9 @@ pub(super) async fn reconcile_provisioned_environment(
         }
     }
 
-    if let Some(agent) = handle.agent() {
+    // A container whose agent did not answer adoption keeps its tools until it does.
+    let agent = handle.agent();
+    if agent.ready().await.is_ok() {
         let context = super::docker::DockerToolContext { state, host_ref: &spec.host_ref, jobs: tokio::sync::OnceCell::new() };
         let tools = state.environment_tools.prepare(crate::environment_tools::DOCKER_PROVIDER_KIND, env_id.as_str(), &context).await?;
         agent.push_tools(&tools).await?;

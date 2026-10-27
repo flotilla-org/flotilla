@@ -173,17 +173,15 @@ impl<'a> AttachResolver<'a> {
             .ok_or("environment has no live handle")?;
         let cwd = ExecutionEnvironmentPath::new(handle.capabilities().workspace_root);
         let agent = handle.agent();
-        if let Some(agent) = agent {
-            if agent.ready().await.is_ok() {
-                let registry = self.registry_for_resource_environment(&AttachReadContext::default(), &environment, cwd.as_path()).await?;
-                let pool = registry.terminal_pools.get("cleat").map(|(_, pool)| pool.clone()).ok_or("environment has no cleat pool")?;
-                let session = format!("flotilla-shell-{}", uuid::Uuid::new_v4());
-                pool.ensure_session(&session, "exec \"${SHELL:-/bin/sh}\" -l", &cwd, &Vec::new(), &[]).await?;
-                let endpoint = pool.cleat_endpoint(&session).await?.ok_or("shell has no cleat endpoint")?;
-                let guest = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
-                let socket = agent.forward_socket(&guest).await?;
-                return Ok(ResolvedAttach { plan: cleat_socket_attach_plan(&socket, &endpoint.session, mode), binding: Some(binding) });
-            }
+        if agent.ready().await.is_ok() {
+            let registry = self.registry_for_resource_environment(&AttachReadContext::default(), &environment, cwd.as_path()).await?;
+            let pool = registry.terminal_pools.get("cleat").map(|(_, pool)| pool.clone()).ok_or("environment has no cleat pool")?;
+            let session = format!("flotilla-shell-{}", uuid::Uuid::new_v4());
+            pool.ensure_session(&session, "exec \"${SHELL:-/bin/sh}\" -l", &cwd, &Vec::new(), &[]).await?;
+            let endpoint = pool.cleat_endpoint(&session).await?.ok_or("shell has no cleat endpoint")?;
+            let guest = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
+            let socket = agent.forward_socket(&guest).await?;
+            return Ok(ResolvedAttach { plan: cleat_socket_attach_plan(&socket, &endpoint.session, mode), binding: Some(binding) });
         }
         let plan = handle.fallback_shell_plan(cwd.as_path()).ok_or("agent unavailable and environment has no fallback shell")?;
         Ok(ResolvedAttach { plan, binding: Some(binding) })
@@ -647,10 +645,11 @@ impl<'a> AttachResolver<'a> {
             .await
             .map_err(|err| format!("environment {} lookup failed: {err}", session.spec.env_ref))?;
         if let Some(handle) = self.checked_provisioned_handle(&environment)? {
-            // Host-direct resources without vessel capabilities retain their
-            // existing pool/host routing. Every offered vessel capability is
-            // selected from the handle, independently of its provider or spec kind.
-            if handle.agent().is_some() || handle.terminal_route().is_some() || environment.spec.host_direct.is_none() {
+            // Host-direct resources retain their existing pool/host routing: the
+            // host is the vessel, and its agent works in process. Every other
+            // vessel capability is selected from the handle, independently of
+            // its provider or spec kind.
+            if handle.terminal_route().is_some() || environment.spec.host_direct.is_none() {
                 let plan = self.provisioned_attach_plan_for_session(reads, session, &environment, handle, seat).await?;
                 return Ok((plan, self.host_name.clone()));
             }
@@ -774,7 +773,7 @@ impl<'a> AttachResolver<'a> {
     ) -> Result<ResolvedAttachPlan, String> {
         let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
         let resident = async {
-            let agent = handle.agent().ok_or("resident vessel agent is absent")?;
+            let agent = handle.agent();
             agent.ready().await?;
             let registry = self.registry_for_resource_environment(reads, environment, cwd.as_path()).await?;
             let pool = registry.terminal_pools.get(&session.spec.pool).map(|(_, pool)| pool.clone()).ok_or("terminal pool unavailable")?;
@@ -1649,8 +1648,8 @@ mod tests {
             fn runner(&self) -> Arc<dyn CommandRunner> {
                 self.inner.runner()
             }
-            fn agent(&self) -> Option<Arc<dyn VesselAgent>> {
-                Some(self.resident.clone())
+            fn agent(&self) -> Arc<dyn VesselAgent> {
+                self.resident.clone()
             }
             fn fallback_runner(&self) -> Option<Arc<dyn CommandRunner>> {
                 self.inner.fallback_runner()
@@ -1695,6 +1694,10 @@ mod tests {
             }
             fn runner(&self) -> Arc<dyn CommandRunner> {
                 self.runner.clone()
+            }
+            /// The pre-agent backing's resident agent does not answer.
+            fn agent(&self) -> Arc<dyn VesselAgent> {
+                Arc::new(flotilla_environment::environment::vessel_ops::UnavailableAgent("pre-agent backing".into()))
             }
             fn fallback_runner(&self) -> Option<Arc<dyn CommandRunner>> {
                 Some(self.runner.clone())
@@ -1831,7 +1834,7 @@ mod tests {
                     Arc::new(Independent { id: EnvironmentId::new("pre-agent"), image: flotilla_protocol::ImageId::new("base"), runner })
                 }
             };
-            assert!(handle.agent().is_none(), "attachment must not bootstrap the resident agent");
+            assert!(handle.agent().ready().await.is_err(), "attachment must not bootstrap the resident agent");
             assert!(handle.provisioned_mounts().is_empty());
             let bag = real.as_ref().map(|real| EnvironmentBag::provisioned(real.baseline.clone())).unwrap_or_else(|| {
                 EnvironmentBag::new().with(flotilla_discovery_api::EnvironmentAssertion::binary("cleat", "/declared/cleat"))
@@ -1872,7 +1875,7 @@ mod tests {
                     .plan;
                 real.attach(&plan, &secondary);
             }
-            assert!(handle.agent().is_none(), "successful degraded attach does not repair agent health");
+            assert!(handle.agent().ready().await.is_err(), "successful degraded attach does not repair agent health");
             assert_eq!(
                 environments.get("pre-agent").await.unwrap().status.as_ref().and_then(|status| status.message.as_deref()),
                 Some("resident vessel agent unavailable; recovery required"),

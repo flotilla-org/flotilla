@@ -659,26 +659,24 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         };
         match active {
             Some(handle) => {
-                if handle.agent().is_some() {
-                    if let Some(registry) = self
-                        .state
-                        .agent_material
-                        .as_ref()
-                        .filter(|registry| !registry.codex_home_is_shared(environment_ref, &handle.provisioned_mounts()))
-                    {
-                        let runner = handle.runner();
-                        let capture = tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            registry.capture_environment_home(environment_ref, runner.as_ref()),
-                        )
-                        .await;
-                        match capture {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                warn!(environment = environment_ref, %error, "session capture failed; continuing environment teardown")
-                            }
-                            Err(_) => warn!(environment = environment_ref, "session capture timed out; continuing environment teardown"),
+                if let Some(registry) = self
+                    .state
+                    .agent_material
+                    .as_ref()
+                    .filter(|registry| !registry.codex_home_is_shared(environment_ref, &handle.provisioned_mounts()))
+                {
+                    let runner = handle.runner();
+                    let capture = tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        registry.capture_environment_home(environment_ref, runner.as_ref()),
+                    )
+                    .await;
+                    match capture {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            warn!(environment = environment_ref, %error, "session capture failed; continuing environment teardown")
                         }
+                        Err(_) => warn!(environment = environment_ref, "session capture timed out; continuing environment teardown"),
                     }
                 }
                 handle.destroy().await?

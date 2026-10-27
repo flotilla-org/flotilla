@@ -136,6 +136,8 @@ mod convoy_lifecycle;
 mod credential_delivery;
 mod discovery;
 mod docker;
+#[cfg(unix)]
+mod drydock_launch;
 mod environment_reads;
 mod environments;
 mod health;

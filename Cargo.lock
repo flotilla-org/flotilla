@@ -907,7 +907,7 @@ dependencies = [
 [[package]]
 name = "drydock"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=7e828be2d4854f52a13276519ca1a766c4b586a8#7e828be2d4854f52a13276519ca1a766c4b586a8"
+source = "git+https://github.com/flotilla-org/drydock?rev=327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097#327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -918,13 +918,11 @@ dependencies = [
  "drydock-agent",
  "drydock-client",
  "drydock-protocol",
+ "drydock-provider",
  "drydock-transport",
  "futures",
  "http",
- "hyper",
- "hyper-util",
  "libc",
- "percent-encoding",
  "reqwest 0.13.2",
  "rigging-http-client",
  "rigging-http-serve",
@@ -940,13 +938,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 1.1.3+spec-1.1.0",
+ "tracing",
+ "url",
  "uuid",
 ]
 
 [[package]]
 name = "drydock-agent"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=7e828be2d4854f52a13276519ca1a766c4b586a8#7e828be2d4854f52a13276519ca1a766c4b586a8"
+source = "git+https://github.com/flotilla-org/drydock?rev=327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097#327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097"
 dependencies = [
  "axum",
  "bytes",
@@ -989,11 +989,13 @@ dependencies = [
 [[package]]
 name = "drydock-client"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=7e828be2d4854f52a13276519ca1a766c4b586a8#7e828be2d4854f52a13276519ca1a766c4b586a8"
+source = "git+https://github.com/flotilla-org/drydock?rev=327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097#327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097"
 dependencies = [
+ "async-stream",
  "async-trait",
  "bytes",
  "drydock-protocol",
+ "drydock-provider",
  "futures",
  "http",
  "reqwest 0.13.2",
@@ -1009,7 +1011,7 @@ dependencies = [
 [[package]]
 name = "drydock-host"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=7e828be2d4854f52a13276519ca1a766c4b586a8#7e828be2d4854f52a13276519ca1a766c4b586a8"
+source = "git+https://github.com/flotilla-org/drydock?rev=327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097#327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1018,15 +1020,13 @@ dependencies = [
  "bytes",
  "chrono",
  "drydock-protocol",
+ "drydock-provider",
  "futures",
  "http",
- "hyper",
- "hyper-util",
  "reqwest 0.13.2",
  "rigging-http-client",
  "rigging-http-serve",
  "rigging-stream",
- "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -1039,7 +1039,7 @@ dependencies = [
 [[package]]
 name = "drydock-protocol"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=7e828be2d4854f52a13276519ca1a766c4b586a8#7e828be2d4854f52a13276519ca1a766c4b586a8"
+source = "git+https://github.com/flotilla-org/drydock?rev=327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097#327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1051,9 +1051,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "drydock-provider"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/drydock?rev=327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097#327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "drydock-protocol",
+ "hyper",
+ "hyper-util",
+ "rigging-http-client",
+ "rigging-stream",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "drydock-transport"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=7e828be2d4854f52a13276519ca1a766c4b586a8#7e828be2d4854f52a13276519ca1a766c4b586a8"
+source = "git+https://github.com/flotilla-org/drydock?rev=327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097#327ea8c9ff9d2ce4a004b36edb6c5960f9e3e097"
 dependencies = [
  "async-trait",
  "axum",
@@ -2272,6 +2292,7 @@ dependencies = [
  "chrono",
  "drydock",
  "drydock-agent",
+ "drydock-host",
  "drydock-protocol",
  "drydock-transport",
  "flotilla-address",
@@ -2596,7 +2617,7 @@ dependencies = [
  "http",
  "libc",
  "reqwest 0.13.2",
- "rigging-ssh",
+ "rigging-http-serve",
  "rigging-stream",
  "rigging-tls",
  "serde",
@@ -6034,17 +6055,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
-]
-
-[[package]]
-name = "rigging-ssh"
-version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
-dependencies = [
- "async-trait",
- "rigging-stream",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
