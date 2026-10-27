@@ -128,12 +128,14 @@ impl HostDirectRecipe {
 /// Env entries derived at launch, which no stored recipe holds (owner's
 /// look-over ruling 5): credential names, scopes and permission maps, and
 /// the crew's skills.
-pub const LAUNCH_DERIVED_ENV: [&str; 5] = [
+pub const LAUNCH_DERIVED_ENV: [&str; 6] = [
     flotilla_resources::CREDENTIAL_REFS_ENV,
     flotilla_resources::CREDENTIAL_SCOPES_ENV,
     flotilla_resources::CREDENTIAL_PERMISSIONS_ENV,
     flotilla_resources::CREW_SKILLS_ENV,
     flotilla_resources::RESOLVED_SKILLS_ENV,
+    // ADR 0047: dropped from r879 records; remove one roll after #3964.
+    flotilla_resources::RETIRED_CREW_HOME_KEYS_ENV,
 ];
 
 impl DockerRecipe {

@@ -281,29 +281,21 @@ async fn convoy_holds_and_recovers_when_terminal_pool_is_transiently_unavailable
 
 #[tokio::test]
 async fn contained_claude_launch_uses_granted_invocation_environment_without_ambient_config() {
-    assert_contained_claude_invocation_home(false, LaunchObservationRecord::Present).await;
-}
-
-#[tokio::test]
-async fn contained_claude_launch_selects_its_crew_home() {
-    // Issue #2672: new environments launch in the role home with the same
-    // granted OAuth wiring. The other test covers legacy environments.
-    assert_contained_claude_invocation_home(true, LaunchObservationRecord::Present).await;
+    assert_contained_claude_invocation_home(LaunchObservationRecord::Present).await;
 }
 
 // Advisory observation failures must not discard the inline card or prevent launch.
 #[tokio::test]
 async fn contained_claude_launch_keeps_inline_card_without_session_observation() {
-    assert_contained_claude_invocation_home(false, LaunchObservationRecord::Missing).await;
+    assert_contained_claude_invocation_home(LaunchObservationRecord::Missing).await;
 }
 
-// Capability context and endpoint reads are advisory: the assignment and
-// delivered credentials must still reach the harness when those reads fail.
+// Capability context and endpoint reads are advisory: the assignment and delivered
+// credentials must still reach the harness when those reads fail. The convoy itself is
+// not advisory: its frozen crew is what vessel delivery delivers (#3964).
 #[tokio::test]
 async fn contained_claude_launch_survives_capability_context_read_failures() {
-    for observation in [LaunchObservationRecord::MissingConvoy, LaunchObservationRecord::MissingEnvironment] {
-        assert_contained_claude_invocation_home(false, observation).await;
-    }
+    assert_contained_claude_invocation_home(LaunchObservationRecord::MissingEnvironment).await;
 }
 
 #[tokio::test]

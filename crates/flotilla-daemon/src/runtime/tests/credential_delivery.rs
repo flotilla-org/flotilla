@@ -1,6 +1,4 @@
 use super::*;
-use flotilla_provisioning::reconcilers::EnvironmentRuntime;
-use flotilla_resources::account_access::REQUESTER_HOME_UNAVAILABLE;
 use flotilla_store_memory::InMemoryBackend;
 
 #[tokio::test]
@@ -424,62 +422,38 @@ async fn agent_environment_is_staged_at_the_runner_writable_config_base() {
     assert!(!path.starts_with("/run/flotilla"));
 }
 
-// A contained Claude crew admitted by convoy start stages pinned skills in its bound
-// requester home and preserves that home at launch; missing supplied homes refuse relaunch.
-// Glue: one sequential admission-to-provisioning handoff, with real account delivery.
+// Acceptance (#3964): a Docker crew's access layer runs on the real launch path before
+// its harness starts. Its frozen skills are staged into the home its binding delivers
+// into, and the harness launches with exactly that home. Only the selected source's
+// token is minted, narrowed to its repository.
 #[tokio::test]
-async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
+async fn contained_claude_crew_launches_in_the_home_its_skills_were_staged_into() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
     fs::create_dir_all(&config_base).expect("config directory");
     fs::write(config_base.join("daemon.toml"), "machine_id = \"claude-skills-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
-    let skill_sources = write_test_credentialed_skill_sources(temp.path());
-    let selected = vec![flotilla_resources::SkillCatalogEntry {
-        source: "mattpocock-skills".into(),
-        repository: "flotilla-org/mattpocock-skills".into(),
-        revision: "1".repeat(40),
-        name: "research".into(),
-        path: "skills/research".into(),
-    }];
-    fs::write(skill_sources.join(".flotilla-skill-catalog.json"), serde_json::to_vec(&selected).expect("catalog")).expect("catalog file");
-    let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-    discovery.host_detectors = Arc::new(flotilla_discovery::detectors::default_host_detectors());
-    discovery.env = Arc::new(TestEnvVars::new([(FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string())]));
-    let daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        Arc::clone(&config),
-        discovery,
-        HostName::new("test-host"),
-        ResourceBackend::new(InMemoryBackend::default()),
-        Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
+    let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
     let backend = daemon.resource_backend();
     let app_id_path = temp.path().join("github-app.id");
     let private_key_path = temp.path().join("github-app.pem");
     fs::write(&app_id_path, "12345\n").expect("write App id");
     fs::write(&private_key_path, GITHUB_APP_TEST_PRIVATE_KEY).expect("write App private key");
-    for (name, consumer, source) in [
-        ("claude-max", CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() }, "TEST_CLAUDE_TOKEN"),
-        ("github-crew-pr", CredentialConsumer::Gh, "TEST_GITHUB_TOKEN"),
-    ] {
-        backend
-            .clone()
-            .definitions::<CredentialSpec>(NAMESPACE)
-            .create(
-                &empty_meta(name),
-                &CredentialSpecSpec {
-                    consumer,
-                    source: CredentialSource::Env { name: source.to_string() },
-                    lifecycle: CredentialLifecycle::Static,
-                    placement: CredentialPlacementRequirements::default(),
-                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
-                },
-            )
-            .await
-            .expect("credential declaration");
-    }
+    backend
+        .clone()
+        .definitions::<CredentialSpec>(NAMESPACE)
+        .create(
+            &empty_meta("claude-max"),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() },
+                source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
+            },
+        )
+        .await
+        .expect("credential declaration");
     backend
         .clone()
         .definitions::<CredentialSpec>(NAMESPACE)
@@ -503,275 +477,57 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
         )
         .await
         .expect("skill credential declaration");
-
-    let hosts = backend.using::<Host>(NAMESPACE);
-    let host = hosts.create(&empty_meta(daemon.local_host_id().expect("host").as_str()), &HostSpec::default()).await.expect("host");
-    hosts
-        .update_status(
-            &host.metadata.name,
-            &host.metadata.resource_version,
-            &HostStatus {
-                ready: true,
-                heartbeat_at: Some(Utc::now()),
-                admission_free_space_floor_bytes: Some(0),
-                capabilities: BTreeMap::from([
-                    (
-                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
-                    ),
-                    (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.into(), json!(["claude-max"])),
-                    ("docker".into(), json!(true)),
-                    ("os".into(), json!("linux")),
-                ]),
-                ..Default::default()
+    let env_id = EnvironmentId::new("contained-claude");
+    backend
+        .using::<Environment>(NAMESPACE)
+        .create(
+            &empty_meta(env_id.as_str()),
+            &EnvironmentSpec {
+                cloud_sandbox: None,
+                provider_address: None,
+                host_direct: None,
+                docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    image_build_ref: None,
+                    memory_policy: Default::default(),
+                    host_ref: "host-test".into(),
+                    image: "contained-image".into(),
+                    declared_agent_adapters: BTreeSet::from(["claude-code".into()]),
+                    required_agent_adapters: BTreeSet::from(["claude-code".into()]),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: BTreeMap::new(),
+                }),
             },
         )
         .await
-        .expect("host status");
-    let repositories = backend.using::<Repository>(NAMESPACE);
-    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
-    let repository = flotilla_store::ensure_repository(&repositories, &repository_spec.key(), &repository_spec).await.expect("repository");
-    repositories
-        .update_status(
-            &repository.metadata.name,
-            &repository.metadata.resource_version,
-            &flotilla_resources::RepositoryStatus { default_branch: Some("main".into()), ..Default::default() },
-        )
-        .await
-        .expect("default branch");
-    let image = Some(flotilla_resources::DockerImageSource::Literal("crew@sha256:abc".into()));
-    backend
-        .using::<PlacementPolicy>(NAMESPACE)
-        .create(
-            &empty_meta("crew-policy"),
-            &PlacementPolicySpec::builder()
-                .pool("cleat".into())
-                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                    legacy_image_baseline_ref: None,
-                    host_ref: daemon.local_host_id().expect("host").to_string(),
-                    image,
-                    pull_policy: flotilla_resources::DockerImagePullPolicy::IfNotPresent,
-                    memory_policy: Default::default(),
-                    agent_adapters: BTreeSet::from(["claude-code".into()]),
-                    default_cwd: None,
-                    env: Default::default(),
-                    checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".into() },
-                })
-                .build(),
-        )
-        .await
-        .expect("policy");
-    backend
-        .using::<WorkflowTemplate>(NAMESPACE)
-        .create(
-            &empty_meta("skills-workflow"),
-            &WorkflowTemplateSpec::builder()
-                .vessels(vec![VesselRequirement::builder()
-                    .name("work".into())
-                    .crew(vec![CrewSpec::builder()
-                        .role("coder".into())
-                        .labels(BTreeMap::from([(
-                            flotilla_resources::account_access::CREW_HOME_KEY_LABEL.into(),
-                            "authored/elsewhere".into(),
-                        )]))
-                        .source(CrewSource::Agent {
-                            selector: Selector { capability: "code".into(), adapter: Some("claude-code".into()), model: None },
-                            prompt: None,
-                            brief_template: None,
-                        })
-                        .build()])
-                    .build()])
-                .build(),
-        )
-        .await
-        .expect("workflow");
-    backend
-        .definitions::<flotilla_resources::Project>(NAMESPACE)
-        .create(
-            &empty_meta("skills-project"),
-            &flotilla_resources::ProjectSpec::builder()
-                .display_name("Skills".into())
-                .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(repository_spec.key()).build()])
-                .build(),
-        )
-        .await
-        .expect("project");
-    backend
-        .definitions::<flotilla_resources::CredentialGrant>(NAMESPACE)
-        .create(
-            &empty_meta("claude-grant"),
-            &flotilla_resources::CredentialGrantSpec::builder()
-                .selector(
-                    flotilla_resources::CredentialGrantSelector::builder().projects(BTreeSet::from(["skills-project".into()])).build(),
-                )
-                .credentials(BTreeSet::from(["claude-max".into()]))
-                .build(),
-        )
-        .await
-        .expect("grant");
-    let mut events = daemon.subscribe();
-    let id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::ConvoyStart {
-                    intent: Box::new(
-                        flotilla_protocol::ConvoyStartIntent::builder()
-                            .project_ref("skills-project".into())
-                            .name("skills-convoy".into())
-                            .branch("test/skills".into())
-                            .workflow_ref("skills-workflow".into())
-                            .placement_policy("crew-policy".into())
-                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                            .skills(vec!["research".into()])
-                            .build(),
-                    ),
-                })
-                .build(),
-        )
-        .await
-        .expect("admit");
-    let result = wait_for_command_result(&mut events, id).await;
-    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "admission: {result:?}");
-    let convoys = backend.using::<Convoy>(NAMESPACE);
-    let name = convoy_record_name(&backend, "skills-convoy").await;
-    let convoy_reconciler =
-        ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE)).with_vessels(backend.using::<Vessel>(NAMESPACE));
-    let mut created_vessel = None;
-    for _ in 0..4 {
-        let convoy = convoys.get(&name).await.expect("convoy");
-        let prepared = convoy_reconciler.prepare(&convoy).await.expect("prepare convoy");
-        let outcome = convoy_reconciler.reconcile(&convoy, &prepared, Utc::now());
-        if let Some((meta, spec)) = outcome.actuations.into_iter().find_map(|actuation| match actuation {
-            Actuation::CreateVessel { meta, spec } => Some((meta, spec)),
-            _ => None,
-        }) {
-            created_vessel = Some(backend.using::<Vessel>(NAMESPACE).create(&meta, &spec).await.expect("vessel"));
-            break;
-        }
-        let patch = outcome.patch.expect("convoy must advance toward Vessel");
-        flotilla_store::apply_status_patch(&convoys, &name, &patch).await.expect("advance convoy");
-    }
-    created_vessel.expect("convoy must create a Vessel within four transitions");
-    // Older snapshots and bindings have no recorded key; only the account authority repairs them.
-    let bindings = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE);
-    let binding = bindings.list().await.expect("bindings").items.into_iter().next().expect("admitted binding");
-    let admitted_home_key = binding
-        .metadata
-        .labels
-        .get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL)
-        .expect("admission records the bound home key")
-        .clone();
-    assert_ne!(admitted_home_key, "authored/elsewhere", "admission replaces authored home selection with its authority-owned key");
-    let mut old_binding = InputMeta::from(&binding.metadata);
-    old_binding.labels.remove(flotilla_resources::account_access::CREW_HOME_KEY_LABEL);
-    bindings.update(&old_binding, &binding.metadata.resource_version, &binding.spec).await.expect("old binding metadata");
-    let mut convoy = convoys.get(&name).await.expect("convoy snapshot");
-    let mut status = convoy.status.take().expect("admitted status");
-    let admitted_crew = &status.workflow_snapshot.as_ref().expect("frozen workflow").vessels[0].crew[0];
-    assert_eq!(
-        admitted_crew.labels.get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL),
-        Some(&admitted_home_key),
-        "the frozen crew receives the binding authority's key instead of the authored key"
-    );
-    for crew in status.workflow_snapshot.as_mut().expect("frozen workflow").vessels.iter_mut().flat_map(|vessel| &mut vessel.crew) {
-        crew.labels.remove(flotilla_resources::account_access::CREW_HOME_KEY_LABEL);
-    }
-    convoys.update_status(&name, &convoy.metadata.resource_version, &status).await.expect("old snapshot metadata");
-    daemon.reconcile_convoy_accounts(NAMESPACE, &name).await.expect("account authority recovers recorded homes");
-    let environments = backend.using::<Environment>(NAMESPACE);
-    let start_vessel = || {
-        let controller = flotilla_store::controller::ControllerLoop {
-            primary: backend.using::<Vessel>(NAMESPACE),
-            secondaries: Vec::new(),
-            reconciler: VesselReconciler::new(backend.clone(), NAMESPACE),
-            resync_interval: Duration::from_millis(25),
-            backend: backend.clone(),
-        };
-        tokio::spawn(controller.run())
-    };
-    let controller = start_vessel();
-    let fresh = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(environment) =
-                environments.list().await.expect("environments").items.into_iter().find(|environment| environment.spec.docker.is_some())
-            {
-                break environment;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("real Vessel controller creates Environment");
-    controller.abort();
-    let _ = controller.await;
-    // The real writer must transport admission's key even before legacy recovery is exercised.
-    let fresh_homes: BTreeMap<String, String> = serde_json::from_str(
-        fresh
-            .spec
-            .docker
-            .as_ref()
-            .expect("Docker")
-            .env
-            .get(flotilla_resources::account_access::CREW_HOME_KEYS_ENV)
-            .expect("fresh Environment receives caller homes"),
-    )
-    .expect("caller homes");
-    assert_eq!(fresh_homes.get("coder"), Some(&admitted_home_key), "the fresh writer passes the authority's key unchanged");
-    // A previous-generation Environment retains its identity but lacks the supplied home map.
-    let mut old_spec = fresh.spec.clone();
-    old_spec.docker.as_mut().expect("Docker").env.remove(flotilla_resources::account_access::CREW_HOME_KEYS_ENV);
-    environments
-        .update(&InputMeta::from(&fresh.metadata), &fresh.metadata.resource_version, &old_spec)
-        .await
-        .expect("old Environment spec");
-    let controller = start_vessel();
-    let environment = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let current = environments.get(&fresh.metadata.name).await.expect("environment");
-            if current.spec.docker.as_ref().expect("Docker").env.contains_key(flotilla_resources::account_access::CREW_HOME_KEYS_ENV) {
-                break current;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("Vessel controller repairs old Environment home map");
-    controller.abort();
-    let _ = controller.await;
-    let spec = environment.spec.docker.as_ref().expect("Docker environment");
-    let recovered_homes: BTreeMap<String, String> =
-        serde_json::from_str(spec.env.get(flotilla_resources::account_access::CREW_HOME_KEYS_ENV).expect("recovered homes"))
-            .expect("caller homes");
-    assert_eq!(recovered_homes, fresh_homes, "old Environment recovery preserves the admitted homes");
+        .expect("environment record");
+    freeze_crew(&backend, "demo", "demo-work", "coder", "claude-code", vec![frozen_skill("research")]).await;
+    bind_account(&backend, "demo", "coder", "claude-max", "test@example.com").await;
 
+    // The contained process boundary: it records what the staging script was asked to install.
     let staged = Arc::new(StdMutex::new(Vec::new()));
-    let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
-        DiscoveryMockRunner::builder()
-            .tool_exists("claude", true)
-            .on_run("claude", &["--version"], Ok("2.1.0 (Claude Code)\n".into()))
-            .on_run("sh", &["-c", "command -v \"$1\"", "flotilla-binary-discovery", "claude"], Ok("/tools/claude\n".into()))
-            .build(),
-        Some(Arc::clone(&staged)),
-    ));
-    let destroyed = Arc::new(AtomicBool::new(false));
+    let runner: Arc<dyn CommandRunner> =
+        Arc::new(CredentialInteriorRunner(DiscoveryMockRunner::builder().tool_exists("claude", true).build(), Some(Arc::clone(&staged))));
+    let bag = EnvironmentBag::new()
+        .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", env_id.to_string()))
+        .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"))
+        .with(EnvironmentAssertion::binary("git", "/usr/bin/git"));
+    let pool = Arc::new(FakeTerminalPool::new());
+    let mut contained_registry = ProviderRegistry::new();
+    contained_registry.agent_adapters = AgentAdapterRegistry::discover(&bag, Arc::clone(&runner));
+    contained_registry.terminal_pools.insert(
+        "fake-terminals",
+        ProviderDescriptor::named(ProviderCategory::TerminalPool, "fake-terminals"),
+        pool.clone(),
+    );
     let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
-        id: EnvironmentId::new(&environment.metadata.name),
+        id: env_id.clone(),
         image: ImageId::new("contained-image"),
         runner: Arc::clone(&runner),
         env_vars: HashMap::from([("HOME".to_string(), "/home/crew".to_string())]),
-        destroyed: Arc::clone(&destroyed),
+        destroyed: Arc::new(AtomicBool::new(false)),
     });
-    let mut local_registry = ProviderRegistry::new();
-    local_registry.environment_providers.insert(
-        "fixture-1",
-        ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "fixture-1"),
-        Arc::new(TestInteriorEnvironmentProvider { handle: Mutex::new(Some(handle)) }),
-    );
-    let host_env = Arc::new(TestEnvVars::new([
-        ("HOME", temp.path().join("home").display().to_string()),
-        ("TEST_CLAUDE_TOKEN", "claude-secret".to_string()),
-        ("TEST_GITHUB_TOKEN", "github-secret".to_string()),
-    ]));
+    daemon.register_provisioned_environment(env_id.clone(), handle, bag.clone(), Some(Arc::new(contained_registry))).expect("register");
     let mint_session = Session::replaying_from_str(
         r#"interactions:
   - channel: http
@@ -786,101 +542,63 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
     let credential_store = Arc::new(CredentialStore::new_with_http(
         backend.clone(),
         NAMESPACE,
-        host_env.clone(),
-        EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude")),
+        Arc::new(TestEnvVars::new([("TEST_CLAUDE_TOKEN", "oauth-secret-material")])),
+        bag,
         Arc::clone(&runner),
         Arc::new(ReplayHttpClient::new(mint_session.clone())),
         config.state_dir().as_path().to_path_buf(),
     ));
-    let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([
-        ("HOME", temp.path().join("home").display().to_string()),
-        (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
-    ]))));
+    let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([(
+        FLOTILLA_SKILLS_DIR_ENV,
+        write_test_credentialed_skill_sources(temp.path()).display().to_string(),
+    )]))));
     let state = Arc::new(
         ControllerRuntimeState::new(
-            daemon.clone(),
+            Arc::clone(&daemon),
             Arc::clone(&config),
-            Arc::new(local_registry),
-            Some(DaemonHostPath::new("/tmp/flotilla.sock")),
-            daemon.local_host_id().expect("host").to_string(),
+            Arc::new(ProviderRegistry::new()),
+            None,
+            "host-test".to_string(),
             "host-direct-host-test".to_string(),
         )
-        .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
         .with_credential_store(credential_store)
-        .with_agent_material(agent_material.clone()),
+        .with_agent_material(agent_material),
     );
-    // A Claude crew admitted by convoy start stages skills in the requester's home;
-    // the same home must be selected when that crew launches. This is sequential
-    // admission glue; retries, concurrent binding changes and launch authorization
-    // have their own lifecycle scenarios.
-    DockerControllerRuntime { state: Arc::clone(&state) }
-        .provision_environment(&environment.metadata.name, &environment.spec)
-        .await
-        .expect("provision admitted Claude vessel");
-    let access = flotilla_resources::account_access::AccessName(flotilla_agent::account_access::CLAUDE_SUBSCRIPTION.into());
-    let bound_environment = super::super::account_access::deliver_bound_account(
-        &state,
-        &super::super::account_access::AccountLaunch {
-            namespace: NAMESPACE,
-            convoy: &name,
-            role: "coder",
-            env_ref: &environment.metadata.name,
-            agentless: false,
+    let spec = flotilla_resources::TerminalSessionSpec {
+        env_ref: env_id.to_string(),
+        role: "coder".to_string(),
+        source: TerminalSessionSource::Agent {
+            selector: Selector { capability: "code".to_string(), adapter: Some("claude-code".to_string()), model: None },
+            brief: flotilla_resources::TerminalBrief {
+                artifact_digest: None,
+                path: ".flotilla/briefs/coder.md".to_string(),
+                content: "Implement the issue.".to_string(),
+                copies: Vec::new(),
+            },
+            context: Box::new(flotilla_resources::TerminalCrewContext {
+                namespace: NAMESPACE.to_string(),
+                convoy: "demo".to_string(),
+                vessel_ref: "demo-work".to_string(),
+            }),
+            message: None,
         },
-        &access,
-        Arc::clone(&runner),
-    )
-    .await
-    .expect("launch delivers admitted account binding");
-    let launch_environment = agent_material
-        .crew_environment("coder", &spec.required_agent_adapters, &bound_environment, &*runner)
-        .await
-        .expect("launch preserves bound home");
-    let launch_home = launch_environment.iter().find(|(key, _)| key == "CLAUDE_CONFIG_DIR").expect("Claude launch home").1.clone();
-    assert_eq!(
-        *staged.lock().expect("staged paths"),
-        vec![PathBuf::from(&launch_home).join("skills")],
-        "skills must reach the launched requester home"
-    );
+        cwd: temp.path().display().to_string(),
+        env: BTreeMap::new(),
+        pool: "fake-terminals".to_string(),
+    };
 
-    assert!(!destroyed.load(Ordering::SeqCst), "successful skill staging must keep the fresh vessel");
-    let provision = backend
-        .using::<flotilla_resources::AccountProvision>(NAMESPACE)
-        .list()
-        .await
-        .expect("provisions")
-        .items
-        .into_iter()
-        .next()
-        .expect("recorded account provision");
-    // The provision keeps its existing absolute-directory contract for refresh and withdrawal.
-    assert_eq!(provision.spec.home, launch_home, "the provision records the delivered launch directory");
-    // Launch may keep a delivered bound home, but lexical traversal is never a bound home.
-    let mut escaping_delivery = bound_environment.clone();
-    escaping_delivery.retain(|(key, _)| key != "CLAUDE_CONFIG_DIR");
-    let base = runner.writable_config_base(None, Path::new("/unused")).await.expect("target base");
-    escaping_delivery.push(("CLAUDE_CONFIG_DIR".into(), base.join("agent-homes/requesters/../../escape").display().to_string()));
-    let error = agent_material
-        .crew_environment("coder", &spec.required_agent_adapters, &escaping_delivery, &*runner)
-        .await
-        .expect_err("escaping delivered home refuses without a supplied key");
-    assert!(error.starts_with(REQUESTER_HOME_UNAVAILABLE), "{error}");
-    // Missing or invalid caller-supplied homes refuse before another backing is created.
-    for key in [None, Some(""), Some("../escape"), Some("/escape")] {
-        let mut missing_home = spec.clone();
-        if let Some(key) = key {
-            missing_home
-                .env
-                .insert(flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(), serde_json::json!({"coder":key}).to_string());
-        } else {
-            missing_home.env.remove(flotilla_resources::account_access::CREW_HOME_KEYS_ENV);
-        }
-        let error = DockerControllerRuntime { state: Arc::clone(&state) }
-            .provision_environment(&environment.metadata.name, &EnvironmentSpec { docker: Some(missing_home), ..environment.spec.clone() })
-            .await
-            .expect_err("missing or invalid requester home");
-        assert!(error.to_string().starts_with(REQUESTER_HOME_UNAVAILABLE), "{error}");
-    }
+    TerminalControllerRuntime { state }.ensure_session("terminal-demo-work-coder", (&spec).into(), &[]).await.expect("launch");
+
+    let home = PathBuf::from("/home/crew/flotilla/agent-homes/requesters/demo/coder/claude");
+    let ensured = pool.ensured.lock().await;
+    let [launch] = ensured.as_slice() else { panic!("expected one launch") };
+    let launched_home = launch.env_vars.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, home)| PathBuf::from(home));
+    assert_eq!(launched_home.as_ref(), Some(&home), "launch uses the home the access layer delivered");
+    assert_eq!(
+        *staged.lock().expect("staged"),
+        [StagedSkills { destination: home.join("skills"), names: vec!["research".into()] }],
+        "the crew's frozen skills are staged into that same home"
+    );
     mint_session.assert_complete();
 }
 

@@ -574,8 +574,14 @@ struct CrewSpecRecord {
     labels: BTreeMap<String, String>,
 }
 
+/// The interim caller-home label #3953 wrote on frozen crews (r879). Vessel delivery
+/// (#3964) derives each crew's home at launch instead. ADR 0047: accepted and dropped
+/// on decode; remove one roll after #3964.
+const RETIRED_CREW_HOME_KEY_LABEL: &str = "flotilla.work/requester-home-key";
+
 impl From<CrewSpecRecord> for CrewSpec {
     fn from(mut record: CrewSpecRecord) -> Self {
+        record.labels.remove(RETIRED_CREW_HOME_KEY_LABEL);
         for expectation in record.completion_conditions {
             match expectation {
                 CrewCompletionExpectation::Legacy(LegacyCompletionExpectation::DecisionLedger) => {
@@ -1240,7 +1246,7 @@ fn validate_vessel(
         }
 
         for key in process.labels.keys() {
-            if key.starts_with(crate::labels::RESERVED_PREFIX) && key != crate::account_access::CREW_HOME_KEY_LABEL {
+            if key.starts_with(crate::labels::RESERVED_PREFIX) {
                 push_error(
                     errors,
                     ValidationError::ReservedLabelKey { vessel: vessel.name.clone(), role: process.role.clone(), key: key.clone() },

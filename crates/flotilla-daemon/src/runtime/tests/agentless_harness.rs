@@ -8,7 +8,6 @@
 //! file the launch writes on the host is observable.
 
 use super::*;
-use flotilla_environment::environment::runner::HARNESS_AUTH_FILES;
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 
@@ -64,39 +63,6 @@ impl FakeHost {
         self.writes.lock().expect("writes").push(path.to_path_buf());
         self.files.lock().expect("files").insert(path.to_path_buf(), HostEntry::File(content.to_string()));
     }
-
-    /// Model the process boundary's credential-free, no-overwrite home import.
-    fn import_harness_home(&self, base: &Path, home: &Path) {
-        let snapshot = self.files.lock().expect("files").clone();
-        let auth_files = HARNESS_AUTH_FILES;
-        let mut files = self.files.lock().expect("files");
-        for (path, value) in &snapshot {
-            if let Ok(relative) = path.strip_prefix(base) {
-                if !auth_files.iter().any(|name| relative.file_name().is_some_and(|file| file == *name)) {
-                    files.entry(home.join(relative)).or_insert_with(|| value.clone());
-                }
-            }
-        }
-        for file in auth_files {
-            if snapshot.contains_key(&base.join(file)) {
-                files.insert(home.join(file), HostEntry::Link(base.join(file)));
-            }
-        }
-    }
-
-    /// `agent_material::crew_environment`'s seeding script, on this filesystem.
-    fn seed_crew_home(&self, base: &Path, home: &Path) {
-        for file in ["config.toml", "settings.json", ".claude.json"] {
-            if let (Some(HostEntry::File(content)), None) = (self.entry(base.join(file)), self.entry(home.join(file))) {
-                self.put(&home.join(file), &content);
-            }
-        }
-        for file in ["auth.json", ".credentials.json"] {
-            if self.entry(base.join(file)).is_some() {
-                self.files.lock().expect("files").insert(home.join(file), HostEntry::Link(base.join(file)));
-            }
-        }
-    }
 }
 
 fn ok() -> Result<String, String> {
@@ -113,6 +79,25 @@ impl CommandRunner for FakeHost {
             }
             ("mkdir" | "chmod" | "mv" | "rm", _) => ok(),
             ("sh", ["-c", _, "flotilla-requester-home", _]) => ok(),
+            ("sh", ["-c", _, "flotilla-create-dir", _, _]) => ok(),
+            ("sh", ["-c", _, "flotilla-stat", path]) => Ok(match self.entry(path) {
+                Some(HostEntry::File(_)) => "file\n".into(),
+                Some(HostEntry::Link(_)) => "symlink\n".into(),
+                None if self.files.lock().expect("files").keys().any(|file| file.starts_with(path)) => "directory\n".into(),
+                None => "none\n".into(),
+            }),
+            ("sh", ["-c", _, "flotilla-is-file", path]) => {
+                Ok(if matches!(self.entry(path), Some(HostEntry::File(_))) { "file\n" } else { "none\n" }.into())
+            }
+            ("sh", ["-c", _, "flotilla-symlink", target, path]) => {
+                self.files.lock().expect("files").insert(PathBuf::from(path), HostEntry::Link(PathBuf::from(target)));
+                ok()
+            }
+            ("sh", ["-c", _, "flotilla-ambient-home"]) => Ok(format!("{HOST_HOME}/.codex")),
+            ("cat", ["--", path]) => match self.entry(path) {
+                Some(HostEntry::File(content)) => Ok(content),
+                _ => Err(format!("cat: {path}: No such file")),
+            },
             ("getconf", ["_NPROCESSORS_ONLN"]) => Ok("8\n".into()),
             // Executables and sockets lie outside the modelled filesystem: the
             // delivered CLI is present and the forwarded socket is listening.
@@ -121,22 +106,6 @@ impl CommandRunner for FakeHost {
                 Some(HostEntry::File(content)) => Ok(content),
                 _ => Err(format!("cat: {path}: No such file")),
             },
-            ("sh", ["-c", _, "flotilla-harness-home", base, home]) => {
-                self.import_harness_home(Path::new(base), Path::new(home));
-                ok()
-            }
-            ("sh", ["-c", _, "flotilla-crew-home", base, home]) => {
-                self.seed_crew_home(Path::new(base), Path::new(home));
-                ok()
-            }
-            ("sh", ["-c", _, "flotilla-codex-ambient-login", home]) => {
-                let ambient = Path::new(HOST_HOME).join(".codex/auth.json");
-                let link = Path::new(home).join("auth.json");
-                if self.entry(&ambient).is_some() && self.entry(&link).is_none() {
-                    self.files.lock().expect("files").insert(link, HostEntry::Link(ambient));
-                }
-                ok()
-            }
             _ => Err(format!("unexpected host command {cmd} {args:?}")),
         }
     }
@@ -159,6 +128,13 @@ impl CommandRunner for FakeHost {
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel, _input: &[u8]) -> Result<String, String> {
+        // The staging script fetches each source in the vessel; here each selected skill lands.
+        if let Some(staged) = StagedSkills::of(args) {
+            for name in staged.names {
+                self.put(&staged.destination.join(name).join("SKILL.md"), "---\nname: staged\n---\n");
+            }
+            return ok();
+        }
         panic!("credential preparation cannot send model turns: {cmd} {args:?}")
     }
 
@@ -244,6 +220,7 @@ async fn try_launch_on_agentless_host(adapter: &str, grant_claude: bool) -> Resu
             host_environment: HostEnvironment::default(),
             checkout: CHECKOUT.to_string(),
             session_env: BTreeMap::new(),
+            skills: vec![frozen_skill("research")],
         },
         adapter,
         grant_claude,
@@ -268,6 +245,8 @@ struct AgentlessHost {
     checkout: String,
     /// What the session spec declares, as credential delivery adds to it.
     session_env: BTreeMap<String, String>,
+    /// The crew's frozen skills.
+    skills: Vec<flotilla_resources::SkillCatalogEntry>,
 }
 
 /// What the terminal pool was asked to start.
@@ -315,7 +294,7 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
         .await
         .expect("Claude credential declaration");
 
-    let AgentlessHost { runner, bag, host_environment, checkout, session_env } = host;
+    let AgentlessHost { runner, bag, host_environment, checkout, session_env, skills } = host;
     let environment_id = EnvironmentId::new(ENVIRONMENT);
     daemon
         .register_direct_environment_for_test(
@@ -348,6 +327,7 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
         vessel_agent: Err("the test's vessel agents run on the host runner".into()),
     };
     register_agentless_ssh_resources(&backend, NAMESPACE, &local_host_id, &profile).await.expect("register agentless resources");
+    freeze_crew(&backend, "demo", "demo-work", "coder", adapter, skills).await;
     let credential_store = Arc::new(CredentialStore::new(
         backend,
         NAMESPACE,
@@ -373,18 +353,11 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
         .with_agentless_vessels(Some(vessels_over(agents.clone(), temp.path())))
         .with_environment_tools(EnvironmentToolProvisioner::new(Vec::new()))
         .with_credential_store(credential_store)
-        .with_agent_material(Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([] as [(&str, &str); 0]))))),
+        .with_agent_material(Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([(
+            FLOTILLA_SKILLS_DIR_ENV,
+            write_test_skill_sources(temp.path()).display().to_string(),
+        )]))))),
     );
-    let mut session_env = session_env;
-    if adapter == "codex" {
-        session_env.insert(
-            flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(),
-            serde_json::json!({
-                "coder": flotilla_agent::account_access::unbound_crew_home_key("demo","coder",adapter)
-            })
-            .to_string(),
-        );
-    }
     let spec = flotilla_resources::TerminalSessionSpec {
         env_ref: ENVIRONMENT.to_string(),
         role: "coder".to_string(),
@@ -445,6 +418,18 @@ impl AgentlessRuntime {
     }
 }
 
+/// #3964: the access layer staged the crew's frozen skills into exactly the home its
+/// harness launches with, and recorded what landed there.
+fn assert_staged_into_launched_home(launch: &AgentlessLaunch, variable: &str) {
+    let home = launch.value(variable).expect("launched home");
+    assert!(launch.host.entry(format!("{home}/skills/research/SKILL.md")).is_some(), "skills are staged into the launched home");
+    let Some(HostEntry::File(record)) = launch.host.entry(format!("{home}/{}", flotilla_vessel_delivery::DELIVERY_RECORD)) else {
+        panic!("no delivery record in the launched home")
+    };
+    assert!(record.lines().any(|line| line.starts_with("skills\t") && line.contains("\tagent-fetch(url)\t")), "{record}");
+    assert!(record.lines().any(|line| line.starts_with("home\t") && line.contains("\thost-path(rw, live)\t")), "{record}");
+}
+
 /// No launch writes the host user's harness configuration; it reads as it did.
 fn assert_host_harness_untouched(launch: &AgentlessLaunch) {
     for (path, content) in HOST_HARNESS_FILES {
@@ -466,10 +451,9 @@ fn assert_image_harness_environment(launch: &AgentlessLaunch) {
     }
 }
 
-// Acceptance (#3655): a Claude crew on a host whose `claude` has never run
-// starts with `CLAUDE_CONFIG_DIR` at its flotilla-owned home (the delivered
-// credential home under the host's writable base, in the crew's own
-// `crews/<role>` home), seeded with onboarding, workspace trust for the
+// Acceptance (#3655, #3964): a Claude crew on a host whose `claude` has never run
+// starts with `CLAUDE_CONFIG_DIR` at its own flotilla-owned home under the host's
+// writable base, its frozen skills staged there, seeded with onboarding, workspace trust for the
 // checkout, and attribution suppression, so no first-run dialog can appear.
 // The host user's `~/.claude.json` and `~/.claude` are never written.
 #[tokio::test]
@@ -480,6 +464,7 @@ async fn agentless_claude_crew_starts_in_a_prepared_flotilla_home() {
     let home = bound.clone();
 
     assert_eq!(launch.value("CLAUDE_CONFIG_DIR").as_deref(), Some(home.as_str()));
+    assert_staged_into_launched_home(&launch, "CLAUDE_CONFIG_DIR");
     // #3907: the vessel agent wrote the bound token into the requester's home;
     // the session environment carries no token of its own.
     assert_eq!(launch.value("CLAUDE_CODE_OAUTH_TOKEN"), None);
@@ -496,17 +481,16 @@ async fn agentless_claude_crew_starts_in_a_prepared_flotilla_home() {
     assert_host_harness_untouched(&launch);
 }
 
-// Acceptance (#3655): a Codex crew on an agentless host starts with
-// `CODEX_HOME` at a flotilla-owned home under the host's writable base, with
+// Acceptance (#3655, #3964): a Codex crew on an agentless host starts with
+// `CODEX_HOME` at its own flotilla-owned home under the host's writable base, its
+// frozen skills staged there, with
 // workspace trust for the checkout in that home's own `config.toml`. The host
 // login is linked, never copied, and the host's `~/.codex/config.toml` is
 // never written.
 #[tokio::test]
 async fn agentless_codex_crew_starts_in_a_prepared_flotilla_home() {
     let launch = launch_on_agentless_host("codex").await;
-    let base = format!("{HOST_BASE}/agent-homes/{ENVIRONMENT}/codex");
-    let home =
-        Path::new(HOST_BASE).join(flotilla_agent::account_access::unbound_crew_home_key("demo", "coder", "codex")).display().to_string();
+    let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/codex");
 
     assert_eq!(launch.value("CODEX_HOME").as_deref(), Some(home.as_str()));
     assert_eq!(launch.value("FLOTILLA_ENVIRONMENT_ID").as_deref(), Some(ENVIRONMENT));
@@ -520,8 +504,8 @@ async fn agentless_codex_crew_starts_in_a_prepared_flotilla_home() {
         assert_eq!(launch.command.matches(&command).count(), 1, "invocation defines {command} once");
     }
     assert!(launch.command.contains("hooks.state="), "invocation carries hook trust records");
-    assert_eq!(launch.host.entry(format!("{home}/auth.json")), Some(HostEntry::Link(PathBuf::from(format!("{base}/auth.json")))));
-    assert_eq!(launch.host.entry(format!("{base}/auth.json")), Some(HostEntry::Link(PathBuf::from("/home/crew/.codex/auth.json"))));
+    assert_eq!(launch.host.entry(format!("{home}/auth.json")), Some(HostEntry::Link(PathBuf::from("/home/crew/.codex/auth.json"))));
+    assert_staged_into_launched_home(&launch, "CODEX_HOME");
     assert_image_harness_environment(&launch);
     assert_host_harness_untouched(&launch);
 }
@@ -689,7 +673,8 @@ async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
     write_executable(&cli_dir.join("flotilla"), "#!/bin/sh\necho generation-cli\n");
 
     let session = launch_agentless(
-        AgentlessHost { runner, bag, host_environment, checkout: checkout.display().to_string(), session_env },
+        // A real shell stands in for the host here, so the crew selects no skills to fetch.
+        AgentlessHost { runner, bag, host_environment, checkout: checkout.display().to_string(), session_env, skills: Vec::new() },
         "claude-code",
         true,
     )
@@ -743,7 +728,14 @@ async fn a_supply_overriding_a_flotilla_variable_is_a_host_configuration_error()
         HostEnvironment::new(vec![HostSupply { name: "locale".into(), path: Vec::new(), env: vec![("LANG".into(), "C.UTF-8".into())] }])
             .expect("declared supply");
     let Err(error) = launch_agentless(
-        AgentlessHost { runner: host.clone(), bag, host_environment, checkout: CHECKOUT.to_string(), session_env: BTreeMap::new() },
+        AgentlessHost {
+            runner: host.clone(),
+            bag,
+            host_environment,
+            checkout: CHECKOUT.to_string(),
+            session_env: BTreeMap::new(),
+            skills: vec![frozen_skill("research")],
+        },
         "claude-code",
         true,
     )
@@ -773,7 +765,14 @@ async fn a_supply_setting_a_family_account_variable_is_a_host_configuration_erro
     }])
     .expect("well-formed supply");
     let Err(error) = launch_agentless(
-        AgentlessHost { runner: host.clone(), bag, host_environment, checkout: CHECKOUT.to_string(), session_env: BTreeMap::new() },
+        AgentlessHost {
+            runner: host.clone(),
+            bag,
+            host_environment,
+            checkout: CHECKOUT.to_string(),
+            session_env: BTreeMap::new(),
+            skills: vec![frozen_skill("research")],
+        },
         "claude-code",
         true,
     )
@@ -814,6 +813,7 @@ async fn bound_agentless_crew_with(
             host_environment: HostEnvironment::default(),
             checkout: CHECKOUT.to_string(),
             session_env: BTreeMap::new(),
+            skills: vec![frozen_skill("research")],
         },
         "claude-code",
     )

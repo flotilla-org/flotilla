@@ -26,13 +26,13 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use flotilla_agent::account_access::{AccountProvisioners, EnvironmentKind};
+use flotilla_agent::account_access::{AccountProvisioner, AccountProvisioners, EnvironmentKind};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     account_access::{
         binding_name, material_generation, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords,
-        BindingRecord, Delivered, ProvisionRecord,
+        BindingRecord, Delivered, ProvisionPlan, ProvisionRecord,
     },
     Convoy, CredentialGrant, CredentialSpec, Environment, ReadWatchEvent, ResourceError, ResourceObject, ResourceProvenance,
     TerminalSession, TerminalSessionSource,
@@ -71,63 +71,97 @@ async fn place_environment_kind(state: &ControllerRuntimeState, launch: &Account
     EnvironmentKind::of_environment(environment.as_ref()).map_err(|reason| format!("environment `{}`: {reason}", launch.env_ref))
 }
 
-/// Deliver the requester's bound account into its home at this place and record the provision.
-/// Returns the session variables the plan sets.
-pub(super) async fn deliver_bound_account(
-    state: &ControllerRuntimeState,
-    launch: &AccountLaunch<'_>,
-    access: &AccessName,
-    runner: Arc<dyn CommandRunner>,
-) -> Result<Vec<(String, String)>, String> {
-    let accounts = state.daemon.account_records();
-    let Some(binding) = accounts.requester_binding(launch.namespace, launch.convoy, launch.role, access).await? else {
-        return Err(format!(
-            "crew `{}` has no account binding for `{access}`: its harness home is never left to an ambient login",
-            launch.role
-        ));
-    };
-    let name = binding.name.clone();
-    // The provision controller cannot withdraw this binding's copy here while it is delivered.
-    let lock = state.account_delivery_lock(&name);
-    let _delivering = lock.lock().await;
-    if let Some(reason) = binding.spec.state.value.reason() {
-        return Err(format!("crew `{}` waits: {reason}; `flotilla convoy rebind` opens a new binding", launch.role));
+/// A requester's open binding, resolved for delivery at one place: its plan there and the
+/// material it delivers. Refuses a requester with no open binding, or a place with no plan, with
+/// the reason; nothing falls through to an ambient login (#3907 contract 8).
+pub(super) struct BoundAccount {
+    binding: BindingRecord,
+    provisioner: Arc<dyn AccountProvisioner>,
+    kind: EnvironmentKind,
+    plan: ProvisionPlan,
+    epoch: String,
+    material: String,
+}
+
+impl BoundAccount {
+    pub(super) async fn resolve(state: &ControllerRuntimeState, launch: &AccountLaunch<'_>, access: &AccessName) -> Result<Self, String> {
+        let accounts = state.daemon.account_records();
+        let Some(binding) = accounts.requester_binding(launch.namespace, launch.convoy, launch.role, access).await? else {
+            return Err(format!(
+                "crew `{}` has no account binding for `{access}`: its harness home is never left to an ambient login",
+                launch.role
+            ));
+        };
+        if let Some(reason) = binding.spec.state.value.reason() {
+            return Err(format!("crew `{}` waits: {reason}; `flotilla convoy rebind` opens a new binding", launch.role));
+        }
+        let provisioner = AccountProvisioners::seeded()
+            .for_access(access)
+            .cloned()
+            .ok_or_else(|| format!("no registered implementation supplies `{access}`"))?;
+        let kind = place_environment_kind(state, launch).await?;
+        // A replaced vessel on a kind with no plan refuses the requester there; the binding never
+        // switches account to fit (#3882).
+        let plan = provisioner
+            .plan(kind)
+            .map_err(|reason| format!("account binding `{}` cannot be provisioned at `{}`: {reason}", binding.name, launch.env_ref))?;
+        let store = state.credential_store.as_ref().ok_or("host-local credential store unavailable for account delivery")?;
+        let (declaration, material) = store.account_material(&binding.spec.credential.0).await?;
+        Ok(Self { binding, provisioner, kind, plan, epoch: declaration.authorization_epoch.to_string(), material })
     }
-    let provisioners = AccountProvisioners::seeded();
-    let provisioner = provisioners.for_access(access).ok_or_else(|| format!("no registered implementation supplies `{access}`"))?;
-    let kind = place_environment_kind(state, launch).await?;
-    // A replaced vessel on a kind with no plan refuses the requester there; the binding never
-    // switches account to fit (#3882).
-    let plan = provisioner
-        .plan(kind)
-        .map_err(|reason| format!("account binding `{name}` cannot be provisioned at `{}`: {reason}", launch.env_ref))?;
-    let store = state.credential_store.as_ref().ok_or("host-local credential store unavailable for account delivery")?;
-    let (declaration, material) = store.account_material(&binding.spec.credential.0).await?;
-    let key = binding.home_key.as_deref().ok_or_else(|| {
-        format!("{} crew `{}` has no recorded home key", flotilla_resources::account_access::REQUESTER_HOME_UNAVAILABLE, launch.role)
-    })?;
-    let home = provisioner.home(&store.writable_base(&*runner).await?, key)?;
-    let record = provision_name(&name, launch.env_ref);
-    let mut provision = AccountProvisionSpec {
-        binding: Ref::new(name.clone(), binding.home.clone()),
-        place: launch.env_ref.to_string(),
-        environment_kind: kind.as_str().to_string(),
-        plan,
-        home: home.clone(),
-        delivered: None,
-    };
-    // Record the place before writing material there, so a copy is never left without a
-    // record the provision controller would withdraw. A relaunch keeps its existing record,
-    // and with it the previous delivery, until this one succeeds.
-    accounts.record_provision(launch.namespace, &record, launch.convoy, &provision, false).await?;
-    let env = provisioner.deliver(&home, &material, &*runner).await?;
-    provision.delivered = Some(Delivered {
-        epoch: declaration.authorization_epoch.to_string(),
-        generation: material_generation(&material),
-        at: delivered_at(state, &binding.spec),
-    });
-    accounts.record_provision(launch.namespace, &record, launch.convoy, &provision, true).await?;
-    Ok(env)
+
+    /// Content identity of what a delivery writes: the authorization epoch and material
+    /// generation. Marked pending unless this place's provision records it delivered, so a
+    /// copy the provision controller withdrew is never taken as landed.
+    pub(super) async fn digest(&self, state: &ControllerRuntimeState, launch: &AccountLaunch<'_>) -> Result<String, String> {
+        let generation = material_generation(&self.material);
+        let record = provision_name(&self.binding.name, launch.env_ref);
+        let delivered = state.daemon.account_records().provision(launch.namespace, &record).await?.is_some_and(|provision| {
+            provision.spec.delivered.is_some_and(|delivered| delivered.epoch == self.epoch && delivered.generation == generation)
+        });
+        let digest = format!("{}/{generation}", self.epoch);
+        Ok(if delivered { digest } else { format!("{digest}/pending") })
+    }
+
+    /// The session variables that point the harness at the material in `home`.
+    pub(super) fn environment(&self, home: &str) -> Vec<(String, String)> {
+        self.provisioner.environment(home)
+    }
+
+    /// Deliver the material into `home` through `runner` and record the provision.
+    pub(super) async fn deliver(
+        &self,
+        state: &ControllerRuntimeState,
+        launch: &AccountLaunch<'_>,
+        home: &str,
+        runner: &dyn CommandRunner,
+    ) -> Result<(), String> {
+        let accounts = state.daemon.account_records();
+        let name = &self.binding.name;
+        // The provision controller cannot withdraw this binding's copy here while it is delivered.
+        let lock = state.account_delivery_lock(name);
+        let _delivering = lock.lock().await;
+        let record = provision_name(name, launch.env_ref);
+        let mut provision = AccountProvisionSpec {
+            binding: Ref::new(name.clone(), self.binding.home.clone()),
+            place: launch.env_ref.to_string(),
+            environment_kind: self.kind.as_str().to_string(),
+            plan: self.plan.clone(),
+            home: home.to_string(),
+            delivered: None,
+        };
+        // Record the place before writing material there, so a copy is never left without a
+        // record the provision controller would withdraw. A relaunch keeps its existing record,
+        // and with it the previous delivery, until this one succeeds.
+        accounts.record_provision(launch.namespace, &record, launch.convoy, &provision, false).await?;
+        self.provisioner.deliver(home, &self.material, runner).await?;
+        provision.delivered = Some(Delivered {
+            epoch: self.epoch.clone(),
+            generation: material_generation(&self.material),
+            at: delivered_at(state, &self.binding.spec),
+        });
+        accounts.record_provision(launch.namespace, &record, launch.convoy, &provision, true).await
+    }
 }
 
 /// When a delivery under `binding` happened, on the runtime's clock, for the provision

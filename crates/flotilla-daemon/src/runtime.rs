@@ -1,5 +1,6 @@
 //! Daemon composition, startup restoration, and resource-controller wiring.
 
+mod access_layer;
 mod account_access;
 pub(crate) mod agentless_vessels;
 pub(crate) mod archive;

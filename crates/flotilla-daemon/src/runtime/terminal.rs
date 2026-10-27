@@ -20,23 +20,26 @@ use flotilla_crew::reconcilers::terminal_session::{
     TerminalRuntimeState,
 };
 use flotilla_discovery::registry::ProviderRegistry;
+use flotilla_environment::environment::{vessel_ops::RunnerVesselAgent, VesselAgent};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId, TerminalStatus};
 use flotilla_provider_runtime::execution_context::BoundLayer;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_resources::account_access::requester_home;
 use flotilla_resources::{
-    Checkout, Convoy, Environment, FulfilmentKind, ResourceError, ResourceObject, TerminalAttentionSource, TerminalAttentionState,
-    TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionTarget, Vessel,
-    CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_SESSION_TAG,
+    Checkout, Convoy, FulfilmentKind, ResourceObject, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionTarget, Vessel, CREDENTIAL_PERMISSIONS_SESSION_TAG,
+    CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_SESSION_TAG,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize, TerminalSubmission};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::account_access::{deliver_bound_account, AccountLaunch};
+use super::access_layer::{deliver_access, AccessLaunch};
+use super::account_access::{AccountLaunch, BoundAccount};
 use super::agentless_vessels::{apply_reach_environment, compose_session_environment, vessel_base, VesselAccess};
-use super::credentials::{agent_material_environment, RuntimeSessionCapabilities};
+use super::credentials::RuntimeSessionCapabilities;
 use super::state::ControllerRuntimeState;
 use crate::blob_store::BlobDigest;
 use crate::blob_store::BlobStore;
@@ -475,58 +478,51 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 } else {
                     self.state.daemon.vcs_for_checkout(&EnvironmentId::new(&spec.env_ref), cwd.as_path()).await?
                 };
-                // #3907: a requester whose item declares account access starts
-                // only in the home its binding delivers, before any harness home
-                // below is derived from it.
-                if let Some(access) = requirement.account_access() {
-                    let launch = AccountLaunch {
-                        namespace: &context.namespace,
-                        convoy: &context.convoy,
-                        role: &spec.role,
-                        env_ref: &spec.env_ref,
-                        agentless: agentless.is_some(),
-                    };
-                    let bound = deliver_bound_account(&self.state, &launch, access, launch_runner()?).await?;
-                    credential_env.retain(|(key, _)| !bound.iter().any(|(name, _)| name == key));
-                    // #3913: the binding's home and token file are the crew's bound
-                    // layer; the prepared context sets them from there.
-                    bound_material.retain(|(key, _)| !bound.iter().any(|(name, _)| name == key));
-                    bound_material.extend(bound.iter().cloned());
-                    credential_env.extend(bound);
-                }
-                if let Some(material) = &self.state.agent_material {
-                    let environment =
-                        self.state.daemon.resource_backend().including_replicas::<Environment>(&context.namespace).get(&spec.env_ref).await;
-                    let docker = match environment {
-                        Ok(environment) => environment.object.spec.docker,
-                        Err(ResourceError::NotFound { .. }) => None,
-                        Err(error) => return Err(error.to_string()),
-                    };
-                    if let Some(docker) = docker.filter(|docker| docker.env.contains_key(flotilla_resources::CREW_SKILLS_ENV)) {
-                        let required = BTreeSet::from([requirement.adapter.clone()]);
-                        let environment = agent_material_environment(material, &required, &docker.env, credential_env.iter().cloned())?;
-                        let runner = launch_runner()?;
-                        credential_env = material.crew_environment(&spec.role, &required, &environment, &*runner).await?;
+                let account = AccountLaunch {
+                    namespace: &context.namespace,
+                    convoy: &context.convoy,
+                    role: &spec.role,
+                    env_ref: &spec.env_ref,
+                    agentless: agentless.is_some(),
+                };
+                // #3964: a crew aboard a vessel gets its harness home, skills and account
+                // material from the access layer, through its vessel agent, before its
+                // harness starts. The daemon host's own sessions have no vessel: a
+                // requester there starts only in the home its binding delivers (#3907).
+                let accessed = if spec.env_ref == self.state.host_direct_environment_name {
+                    match requirement.account_access() {
+                        Some(access) => {
+                            let runner = launch_runner()?;
+                            let bound = BoundAccount::resolve(&self.state, &account, access).await?;
+                            let store = self
+                                .state
+                                .credential_store
+                                .as_ref()
+                                .ok_or("host-local credential store unavailable for account delivery")?;
+                            let home = requester_home(&store.writable_base(&*runner).await?, &context.convoy, &spec.role, "claude")
+                                .display()
+                                .to_string();
+                            bound.deliver(&self.state, &account, &home, &*runner).await?;
+                            bound.environment(&home)
+                        }
+                        None => Vec::new(),
                     }
-                }
-                // #3655: an agentless crew's harness home is flotilla-owned and
-                // lives on the host, under its runner's writable base.
-                if agentless.is_some() {
-                    let material = self
-                        .state
-                        .agent_material
-                        .as_ref()
-                        .ok_or("agentless crews require the agent material registry for their harness home")?;
-                    let required = BTreeSet::from([requirement.adapter.clone()]);
-                    credential_env = material
-                        .host_harness_environment(&spec.env_ref, &spec.role, &required, &credential_env, launch_runner()?.as_ref())
-                        .await?;
-                    if let Some(profile) = agentless {
-                        let homes = profile.accounts.homes().collect::<BTreeSet<_>>();
-                        bound_material.retain(|(name, _)| !homes.contains(name.as_str()));
-                        bound_material.extend(credential_env.iter().filter(|(name, _)| homes.contains(name.as_str())).cloned());
-                    }
-                }
+                } else {
+                    let agent = self.vessel_agent(spec, vessel.as_deref()).await?;
+                    let launch = AccessLaunch {
+                        account,
+                        vessel_ref: &context.vessel_ref,
+                        adapter: &requirement.adapter,
+                        access: requirement.account_access(),
+                    };
+                    deliver_access(&self.state, &launch, agent, &credential_env).await?
+                };
+                credential_env.retain(|(key, _)| !accessed.iter().any(|(name, _)| name == key));
+                // #3913: the access layer's home and token file are the crew's bound layer;
+                // the prepared context sets them from there.
+                bound_material.retain(|(key, _)| !accessed.iter().any(|(name, _)| name == key));
+                bound_material.extend(accessed.iter().cloned());
+                credential_env.extend(accessed);
                 if let Some(store) = &self.state.credential_store {
                     store.record_capability_endpoints(&spec.env_ref, name, &credential_env).await;
                     let card = async {
@@ -939,6 +935,27 @@ impl TerminalControllerRuntime {
         let Some(profile) = self.state.agentless_ssh.get(&spec.env_ref) else { return Ok(None) };
         let vessel = spec.vessel_ref.ok_or_else(|| format!("agentless host {} requires a session vessel identity", spec.env_ref))?;
         self.state.vessel_access(profile, vessel).await.map(Some)
+    }
+
+    /// The vessel agent a session's access layer runs through: the agentless host's
+    /// vessel agent, or the provisioned environment's.
+    async fn vessel_agent(&self, spec: TerminalSessionTarget<'_>, vessel: Option<&VesselAccess>) -> Result<Arc<dyn VesselAgent>, String> {
+        if let Some(access) = vessel {
+            return Ok(access.handle.agent());
+        }
+        let id = EnvironmentId::new(&spec.env_ref);
+        let handle = self
+            .state
+            .provisioned_environments
+            .lock()
+            .await
+            .values()
+            .find(|active| active.handle.id() == &id)
+            .map(|active| active.handle.clone());
+        Ok(match handle.and_then(|handle| handle.agent()) {
+            Some(agent) => agent,
+            None => Arc::new(RunnerVesselAgent(self.runner_for_env(&spec.env_ref)?)),
+        })
     }
 
     pub(super) async fn runner_for_spec(&self, spec: TerminalSessionTarget<'_>) -> Result<Arc<dyn CommandRunner>, String> {

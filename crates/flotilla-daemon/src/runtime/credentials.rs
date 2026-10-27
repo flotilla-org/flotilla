@@ -31,31 +31,6 @@ use tracing::{info, warn};
 use super::state::ControllerRuntimeState;
 use super::tasks::{spawn_periodic_task, PeriodicTaskStart};
 
-/// Validate caller-owned home selections at the shared EnvironmentRuntime entry,
-/// before any provider creates a backing. Path resolution stays in agent material.
-pub(super) fn validate_environment_home_keys(spec: &flotilla_resources::EnvironmentSpec) -> Result<(), String> {
-    let (required, environment) = if let Some(docker) = &spec.docker {
-        (docker.required_agent_adapters.clone(), &docker.env)
-    } else if let Some(cloud) = &spec.cloud_sandbox {
-        let required = cloud
-            .env
-            .get("FLOTILLA_REQUIRED_AGENT_ADAPTERS")
-            .map(|value| serde_json::from_str::<BTreeSet<String>>(value))
-            .transpose()
-            .map_err(|error| format!("invalid required adapter declaration: {error}"))?
-            .unwrap_or_default();
-        (required, &cloud.env)
-    } else {
-        return Ok(());
-    };
-    if required.iter().any(|adapter| flotilla_agent::account_access::declared_account_access(adapter).is_some()) {
-        flotilla_credentials::validate_supplied_crew_home_keys(
-            &environment.iter().map(|(key, value)| (key.clone(), value.clone())).collect::<Vec<_>>(),
-        )?;
-    }
-    Ok(())
-}
-
 /// Staging and launch resolve the same adapter defaults, delivered values, and
 /// explicit home overrides. Selection metadata is carried only for staging.
 pub(super) fn agent_material_environment(
@@ -69,7 +44,7 @@ pub(super) fn agent_material_environment(
         environment.retain(|(existing, _)| existing != &key);
         environment.push((key, value));
     }
-    for key in ["CODEX_HOME", "CLAUDE_CONFIG_DIR", flotilla_resources::account_access::CREW_HOME_KEYS_ENV] {
+    for key in ["CODEX_HOME", "CLAUDE_CONFIG_DIR"] {
         if let Some(value) = declared.get(key) {
             environment.retain(|(existing, _)| existing != key);
             environment.push((key.into(), value.clone()));

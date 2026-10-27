@@ -358,8 +358,7 @@ pub fn binding_record(
         opened_at: now,
         state: State::new(BindingState::Open, now),
     };
-    let home_key = assign_home_key(&name, &spec);
-    Ok(PendingBinding { name, spec, home_key })
+    Ok(PendingBinding { name, spec })
 }
 
 /// Choose bindings for every requester of an admitted workflow at its final placements.
@@ -395,76 +394,6 @@ pub async fn choose_bindings(
         pending.push(binding_record(project_ref, convoy, alternative, selected, now)?);
     }
     Ok(pending)
-}
-
-/// Copy the account authority's recorded keys into the frozen per-crew entries.
-pub fn apply_crew_home_keys(
-    convoy: &str,
-    vessels: &mut [flotilla_resources::VesselRequirement],
-    keys: &BTreeMap<String, String>,
-) -> Result<bool, String> {
-    let mut changed = false;
-    for crew in vessels.iter_mut().flat_map(|vessel| &mut vessel.crew) {
-        let CrewSource::Agent { selector, .. } = &crew.source else { continue };
-        let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
-        let key = if requirement.account_access().is_some() {
-            keys.get(&crew.role).cloned()
-        } else {
-            Some(flotilla_agent::account_access::unbound_crew_home_key(convoy, &crew.role, &requirement.adapter))
-        };
-        let before = crew.labels.remove(flotilla_resources::account_access::CREW_HOME_KEY_LABEL);
-        if let Some(key) = &key {
-            crew.labels.insert(flotilla_resources::account_access::CREW_HOME_KEY_LABEL.into(), key.clone());
-        }
-        changed |= before != key;
-    }
-    Ok(changed)
-}
-
-pub fn pending_home_keys(bindings: &[PendingBinding]) -> BTreeMap<String, String> {
-    bindings
-        .iter()
-        .filter_map(|binding| {
-            let (_, role) = flotilla_resources::account_access::requester_parts(&binding.spec.requester)?;
-            Some((role, binding.home_key.clone()?))
-        })
-        .collect()
-}
-
-/// The account authority's assignment of a binding's requester home, if its provisioner has one.
-fn assign_home_key(name: &str, spec: &AccountBindingSpec) -> Option<String> {
-    let provisioners = flotilla_agent::account_access::AccountProvisioners::seeded();
-    match provisioners.for_access(&spec.requirement)?.home_key(spec) {
-        Ok(key) => Some(key),
-        Err(error) => {
-            tracing::warn!(binding = name, %error, "account authority could not assign requester home");
-            None
-        }
-    }
-}
-
-/// Recover previous-generation bindings at their authority before publishing caller home keys.
-pub async fn recover_home_keys(accounts: &dyn AccountRecords, namespace: &str, convoy: &str) -> Result<BTreeMap<String, String>, String> {
-    let mut keys = BTreeMap::new();
-    for binding in accounts.convoy_bindings(namespace, convoy, true).await? {
-        if !binding.spec.state.value.is_open() {
-            continue;
-        }
-        let key = match binding.home_key.clone() {
-            Some(key) => Some(key),
-            None => match assign_home_key(&binding.name, &binding.spec) {
-                Some(key) => {
-                    accounts.record_home_key(namespace, &binding, &key).await?;
-                    Some(key)
-                }
-                None => None,
-            },
-        };
-        if let (Some((_, role)), Some(key)) = (requester_parts(&binding.spec.requester), key) {
-            keys.insert(role, key);
-        }
-    }
-    Ok(keys)
 }
 
 /// The reason a withdrawn authorization records (#3882).

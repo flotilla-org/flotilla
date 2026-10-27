@@ -63,19 +63,37 @@ impl CommandRunner for SshProvisioningRecordingRunner {
     }
 }
 
-pub(super) struct CredentialInteriorRunner(pub(super) DiscoveryMockRunner, pub(super) Option<Arc<StdMutex<Vec<PathBuf>>>>);
+/// What one run of the skill staging script was asked to install: its destination and
+/// the frozen skill names, read from its arguments at the vessel's process boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct StagedSkills {
+    pub(super) destination: PathBuf,
+    pub(super) names: Vec<String>,
+}
 
-impl CredentialInteriorRunner {
-    fn record_staging(&self, args: &[&str]) -> Result<(), String> {
-        if let Some(staged) = &self.1 {
-            let marker =
-                args.iter().position(|arg| *arg == "flotilla-stage-skills").ok_or("skill staging command has no argument marker")?;
-            let destination = args.get(marker + 2).ok_or("skill staging command has no destination argument")?;
-            staged.lock().expect("staged paths").push(PathBuf::from(*destination));
+impl StagedSkills {
+    /// Parse the staging script's argument layout (`flotilla_vcs`'s `stage_git_skill_sources`):
+    /// after the command identifier come the manifest, destination, cleanup flag and cache,
+    /// then per source its name, repository, revision, token, credential, path count, paths,
+    /// entry count and `(name, path)` entries.
+    pub(super) fn of(args: &[&str]) -> Option<Self> {
+        let start = args.iter().position(|arg| *arg == "flotilla-stage-skills")?;
+        let destination = PathBuf::from(args.get(start + 2)?);
+        let mut rest = args.get(start + 5..)?.iter();
+        let mut names = Vec::new();
+        while rest.next().is_some() {
+            let paths = rest.nth(4)?.parse::<usize>().ok()?;
+            let entries = rest.nth(paths)?.parse::<usize>().ok()?;
+            for _ in 0..entries {
+                names.push(rest.next()?.to_string());
+                rest.next()?;
+            }
         }
-        Ok(())
+        Some(Self { destination, names })
     }
 }
+
+pub(super) struct CredentialInteriorRunner(pub(super) DiscoveryMockRunner, pub(super) Option<Arc<StdMutex<Vec<StagedSkills>>>>);
 
 #[derive(Default)]
 pub(super) struct PersistentPathRecordingRunner {
@@ -110,17 +128,23 @@ impl CommandRunner for PersistentPathRecordingRunner {
 impl CommandRunner for CredentialInteriorRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         if cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-stage-skills")) {
-            self.record_staging(args)?;
+            if let (Some(staged), Some(skills)) = (&self.1, StagedSkills::of(args)) {
+                staged.lock().expect("staged").push(skills);
+            }
             Ok("ok".to_string())
+        } else if cmd == "sh" && (args.contains(&"flotilla-stat") || args.contains(&"flotilla-is-file")) {
+            // Nothing vessel delivery reads has landed in this stand-in's homes.
+            Ok("none\n".to_string())
         } else if cmd == "mkdir"
                 || cmd == "chmod"
                 || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight")))
                 || (cmd == "sh" && args.contains(&"flotilla-prune-skill-tokens"))
                 // This runner stands in for the contained process boundary;
                 // real scratch copying and credential links are tested in agent_material.
-                || (cmd == "sh" && args.contains(&"flotilla-crew-home"))
                 || (cmd == "sh" && args.contains(&"flotilla-harness-home"))
                 || (cmd == "sh" && args.contains(&"flotilla-requester-home"))
+                || (cmd == "sh" && args.contains(&"flotilla-create-dir"))
+                || (cmd == "sh" && args.contains(&"flotilla-symlink"))
         {
             Ok(String::new())
         } else {
@@ -138,7 +162,9 @@ impl CommandRunner for CredentialInteriorRunner {
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel, _input: &[u8]) -> Result<String, String> {
         if cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-stage-skills")) {
-            self.record_staging(args)?;
+            if let (Some(staged), Some(skills)) = (&self.1, StagedSkills::of(args)) {
+                staged.lock().expect("staged").push(skills);
+            }
         }
         Ok("ok".to_string())
     }
