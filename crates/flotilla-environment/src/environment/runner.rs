@@ -329,6 +329,26 @@ mod tests {
         }
     }
 
+    // Behaviour (#4012): which base each runner's harness homes take. A container's runner
+    // declares a persistent config base apart from its scratch base, so homes stay on the
+    // container's disk; an SSH host's runtime base is its scratch base too, so homes go to
+    // the host user's durable state base.
+    #[tokio::test]
+    async fn each_runner_kind_places_homes_on_its_durable_base() {
+        let docker =
+            DockerEnvironmentRunner::new("container".into(), Arc::new(MockRunner::new(vec![Ok(String::new()), Ok("/home/crew".into())])));
+        assert_eq!(super::home_base(&docker).await.expect("container home base"), Path::new(super::CONTAINED_WRITABLE_CONFIG_BASE));
+
+        let remote = Arc::new(MockRunner::new(vec![
+            Ok("/run/user/1000/flotilla".into()),
+            Ok("/run/user/1000/flotilla".into()),
+            Ok("/home/crew/.local/state/flotilla".into()),
+        ]));
+        let ssh = flotilla_provider_runtime::ssh_runner::SshCommandRunner::new("crew@host", false, remote.clone());
+        assert_eq!(super::home_base(&ssh).await.expect("SSH home base"), Path::new("/home/crew/.local/state/flotilla"));
+        assert!(remote.calls().last().expect("durable probe").1.iter().any(|arg| arg.contains("flotilla-durable-base")));
+    }
+
     #[cfg(unix)]
     struct DockerContainer(String);
 

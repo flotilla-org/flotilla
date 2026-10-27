@@ -1034,6 +1034,31 @@ async fn a_restart_keeps_the_account_and_a_gone_place_is_swept() {
     assert_eq!(binding.credential.0, "claude-box-a");
 }
 
+// #4012: a provision recorded before the token moved out of the home names the old home.
+// The relaunch deletes the copy there and records the material directory, so no copy is
+// left that no record names.
+#[tokio::test]
+async fn a_relaunch_moves_a_copy_recorded_in_the_old_home() {
+    let tokens = TempDir::new().expect("token dir");
+    let token = tokens.path().join("box-a");
+    fs::write(&token, "box-a-token").expect("token");
+    let (runtime, host, _runtime_dir) = bound_agentless_crew(&token).await;
+    let backend = runtime.daemon.resource_backend();
+    let provisions = backend.using::<flotilla_resources::AccountProvision>(NAMESPACE);
+    let name = format!("{BINDING}.{ENVIRONMENT}");
+    let recorded = provisions.get(&name).await.expect("provision");
+    let old_home = format!("{RUNTIME_BASE}/agent-homes/requesters/demo/coder/claude");
+    host.put(&Path::new(&old_home).join(".flotilla-oauth-token"), "box-a-token");
+    let old = flotilla_resources::AccountProvisionSpec { home: old_home.clone(), ..recorded.spec.clone() };
+    provisions.update(&empty_meta(&name), &recorded.metadata.resource_version, &old).await.expect("pre-#4012 record");
+
+    runtime.launch().await.expect("relaunch");
+
+    assert_eq!(host.entry(format!("{old_home}/.flotilla-oauth-token")), None, "the old copy is deleted");
+    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
+    assert_eq!(provision(&backend).await.expect("provision").home, BOUND_MATERIAL);
+}
+
 // Review #3910: a binding homed on another daemon whose clock runs ahead of this place is still
 // delivered from its replica, and the place pass never mistakes the fresh copy for one made
 // before the binding opened.

@@ -144,9 +144,13 @@ impl BoundAccount {
         let lock = state.account_delivery_lock(name);
         let _delivering = lock.lock().await;
         let record = provision_name(name, launch.env_ref);
-        // A copy recorded elsewhere, such as inside the home before #4012, is removed once this
-        // one lands, so the old location never keeps a copy no record names.
+        // A copy recorded elsewhere, such as inside the home before #4012, is removed before the
+        // record moves to `dir`: a failed removal leaves the old location recorded, so the next
+        // launch retries it and no copy is ever left that no record names.
         let previous = accounts.provision(launch.namespace, &record).await?.map(|provision| provision.spec.home).filter(|home| home != dir);
+        if let Some(previous) = previous {
+            self.provisioner.remove(&previous, runner).await?;
+        }
         let mut provision = AccountProvisionSpec {
             binding: Ref::new(name.clone(), self.binding.home.clone()),
             place: launch.env_ref.to_string(),
@@ -165,11 +169,7 @@ impl BoundAccount {
             generation: material_generation(&self.material),
             at: delivered_at(state, &self.binding.spec),
         });
-        accounts.record_provision(launch.namespace, &record, launch.convoy, &provision, true).await?;
-        match previous {
-            Some(previous) => self.provisioner.remove(&previous, runner).await,
-            None => Ok(()),
-        }
+        accounts.record_provision(launch.namespace, &record, launch.convoy, &provision, true).await
     }
 }
 
