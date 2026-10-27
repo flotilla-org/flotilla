@@ -2,16 +2,10 @@
 # binary; the output stage copies only its directory with COPY --link, so the
 # layer's blob is independent of the layers beneath it.
 FROM ${BASE} AS harness-claude-code-fetch
-ARG TARGETARCH
 RUN set -eu; \
-    case "${TARGETARCH}" in \
-        amd64) arch=x64 ;; \
-        arm64) arch=arm64 ;; \
-        *) echo "unsupported Claude Code architecture: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
     dest="/opt/flotilla/harnesses/claude-code/${PIN_CLAUDE_CODE_VERSION}"; \
     mkdir -p "${dest}/bin"; \
-    curl -fsSL "$(printf '%s' "${PIN_CLAUDE_CODE_URL}" | sed "s/{arch}/${arch}/g")" -o "${dest}/bin/claude"; \
+    curl -fsSL "${PIN_CLAUDE_CODE_URL}" -o "${dest}/bin/claude"; \
     printf '%s  %s\n' "${PIN_CLAUDE_CODE_SHA256}" "${dest}/bin/claude" | sha256sum --check --strict -; \
     chmod -R a+rX,go-w "${dest}"; \
     chmod 0755 "${dest}/bin/claude"

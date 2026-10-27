@@ -412,6 +412,26 @@ async fn delivery_operations_cross_the_agent(agent: Arc<dyn TestAgent>) {
     assert_eq!(vessel.writable_base().await.unwrap(), Path::new(super::super::runner::CONTAINED_WRITABLE_CONFIG_BASE));
 }
 
+// #3909: a pushed artifact becomes a verified store entry, and a link into it reads as
+// the pushed bytes; bytes that do not hash to the digest, or a kind the store cannot
+// unpack, leave nothing behind.
+over_each_transport!(artifacts_cross_the_agent_by_digest);
+async fn artifacts_cross_the_agent_by_digest(agent: Arc<dyn TestAgent>) {
+    let directory = tempfile::tempdir().unwrap();
+    let vessel: Arc<dyn VesselAgent> = Arc::new(runner_for(&agent, directory.path()));
+    let local = directory.path().join("harness");
+    std::fs::write(&local, b"pinned harness").unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(b"pinned harness"));
+    let link = directory.path().join("home/.flotilla/harness/bin/claude");
+    let other = format!("{:x}", Sha256::digest(b"other bytes"));
+    let refused = vessel.push_artifact(&other, &local, PinUnpack::File).await.expect_err("a mismatched digest");
+    assert!(vessel.link_artifact(&link, &other, Path::new("")).await.is_err(), "nothing was stored: {refused}");
+    vessel.push_artifact(&sha256, &local, PinUnpack::File).await.unwrap();
+    vessel.link_artifact(&link, &sha256, Path::new("")).await.unwrap();
+    assert_eq!(std::fs::read(&link).unwrap(), b"pinned harness");
+    assert!(vessel.push_artifact(&sha256, &local, PinUnpack::TarXz).await.unwrap_err().contains("tar.xz"));
+}
+
 // Issue 3486: flotilla's CLI cycle is separate from drydock's. Updating files
 // changes what exec sees while the same agent incarnation continues running.
 over_each_transport!(pushing_new_cli_layer_does_not_reexec_agent);
@@ -601,19 +621,24 @@ async fn pushes_complete_generations_and_retains_old_cleat_files(memory: Arc<dyn
     let runner = runner_for(&memory, guest.path());
     let sources = host.path().join("source");
     std::fs::create_dir(&sources).unwrap();
-    let cli = sources.join("flotilla");
-    let cleat = sources.join("cleat");
-    let library = sources.join("lib");
-    let terminfo = sources.join("terminfo");
+    let composition = crate::composition::flotilla_tools();
+    let cli = sources.join("bin/flotilla-vessel");
+    let cleat = sources.join("bin/cleat");
+    let library = sources.join("lib/libghostty-vt.so.0");
+    let terminfo = sources.join("share/terminfo");
+    for path in [&cli, &cleat, &library] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    }
     std::fs::create_dir_all(terminfo.join("x")).unwrap();
     std::fs::write(terminfo.join("x/xterm-ghostty"), b"terminfo").unwrap();
+    std::fs::write(terminfo.join("LICENSE"), b"license").unwrap();
     let fleet = host.path().join("fleet");
     let destination = guest.path().join("fleet");
     let mut tool = EnvironmentTool::new("fleet", destination.join("bin/flotilla"));
-    for name in ["tools", "bin", "lib", "share/terminfo"] {
+    for name in std::iter::once(PathBuf::from("tools")).chain(composition.exposed_directories()) {
         tool = tool.with_asset(EnvironmentToolAsset::new(
-            fleet.join(name),
-            destination.join(name),
+            fleet.join(&name),
+            destination.join(&name),
             EnvironmentToolAssetKind::Directory,
             EnvironmentToolAssetAccess::ReadOnly,
             "generation tools",
@@ -624,11 +649,7 @@ async fn pushes_complete_generations_and_retains_old_cleat_files(memory: Arc<dyn
         for path in [&cli, &cleat, &library] {
             std::fs::write(path, bytes).unwrap();
         }
-        let generation = crate::tools::publish(
-            &fleet,
-            &crate::tools::ToolsSource { flotilla: &cli, cleat: &cleat, library: &library, terminfo: &terminfo },
-        )
-        .unwrap();
+        let generation = crate::tools::publish(&fleet, crate::tools::Payload { composition, root: &sources }).unwrap();
         runner.push_tools(std::slice::from_ref(&tool)).await.unwrap();
         assert_eq!(std::fs::read(destination.join("bin/flotilla")).unwrap(), bytes);
         assert_eq!(std::fs::read(destination.join("bin/cleat")).unwrap(), bytes);

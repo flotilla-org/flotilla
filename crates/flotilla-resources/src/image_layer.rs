@@ -264,32 +264,132 @@ impl std::fmt::Display for ImageLayerTier {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+/// A pinned input of a layer: its version and, when it is downloaded, the
+/// exact artifact for each architecture (decision 3 on #3909). Image fragments
+/// and the vessel agent's fetch read the same entries; there are no URL
+/// templates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, bon::Builder)]
 #[serde(deny_unknown_fields)]
 pub struct ImageLayerPin {
     pub version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<ImagePinDigest>,
+    /// Keyed by architecture (`amd64`, `arm64`), or the single key
+    /// [`ANY_ARCHITECTURE`] for architecture-independent bytes. Empty for a
+    /// version-only pin.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artifacts: BTreeMap<String, PinArtifact>,
 }
 
-/// A download checksum: one lowercase hex digest, or one per architecture.
+/// The artifacts key for bytes every architecture shares.
+pub const ANY_ARCHITECTURE: &str = "any";
+
+/// One downloadable artifact, checked by its digest before use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinArtifact {
+    pub url: String,
+    /// Lowercase hex SHA-256 of the downloaded bytes.
+    pub sha256: String,
+    pub unpack: PinUnpack,
+}
+
+/// How a downloaded artifact becomes files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PinUnpack {
+    /// Used as downloaded: one file.
+    #[serde(rename = "file")]
+    File,
+    #[serde(rename = "tar.gz")]
+    TarGz,
+    #[serde(rename = "tar.xz")]
+    TarXz,
+}
+
+impl PinUnpack {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::TarGz => "tar.gz",
+            Self::TarXz => "tar.xz",
+        }
+    }
+}
+
+impl ImageLayerPin {
+    /// The artifact used on `architecture`: its own entry, else the shared one.
+    pub fn artifact(&self, architecture: &str) -> Option<&PinArtifact> {
+        self.artifacts.get(architecture).or_else(|| self.artifacts.get(ANY_ARCHITECTURE))
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageLayerPin {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let record = PinRecord::deserialize(deserializer)?;
+        match (record.artifacts, record.url, record.sha256) {
+            (Some(artifacts), None, None) => Ok(Self { version: record.version, artifacts }),
+            (Some(_), _, _) => Err(serde::de::Error::custom("pin declares `artifacts` together with the previous `url`/`sha256` fields")),
+            (None, url, sha256) => Ok(Self { version: record.version, artifacts: legacy_artifacts(url, sha256) }),
+        }
+    }
+}
+
+/// Every pin field either shape may carry. The previous shape (`url` with an
+/// optional `{arch}` template, and one `sha256` or one per architecture) is
+/// accepted and converted; only `artifacts` is written.
+///
+/// ADR 0047: remove `url`, `sha256`, [`ImagePinDigest`] and
+/// [`legacy_artifacts`] one fleet roll after explicit artifacts land.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinRecord {
+    version: String,
+    #[serde(default)]
+    artifacts: Option<BTreeMap<String, PinArtifact>>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    sha256: Option<ImagePinDigest>,
+}
+
+/// The previous shape's download checksum: one digest, or one per architecture.
+/// Decode-only (see [`PinRecord`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
-pub enum ImagePinDigest {
+pub(crate) enum ImagePinDigest {
     Single(String),
     PerArchitecture(BTreeMap<String, String>),
 }
 
-impl ImagePinDigest {
-    /// The checksum used when building for `architecture` (`amd64`, `arm64`).
-    pub fn for_architecture(&self, architecture: &str) -> Option<&str> {
-        match self {
-            Self::Single(hex) => Some(hex),
-            Self::PerArchitecture(digests) => digests.get(architecture).map(String::as_str),
+/// Convert a previous-shape pin. A URL with an `{arch}` template keeps it
+/// verbatim in each architecture's entry: that layer's own fragment still
+/// substitutes its architecture token, and nothing else can fetch it. A
+/// checksum without a URL never named a download and is dropped. `unpack` is
+/// a guess from the URL's suffix (anything else, including a query string,
+/// reads as `file`); previous-shape fragments unpack for themselves, so only
+/// a reader of the converted pin could see a wrong guess before the shim goes.
+fn legacy_artifacts(url: Option<String>, sha256: Option<ImagePinDigest>) -> BTreeMap<String, PinArtifact> {
+    let Some(url) = url else { return BTreeMap::new() };
+    let unpack = if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
+        PinUnpack::TarGz
+    } else if url.ends_with(".tar.xz") {
+        PinUnpack::TarXz
+    } else {
+        PinUnpack::File
+    };
+    let artifact = |sha256: String| PinArtifact { url: url.clone(), sha256, unpack };
+    match sha256 {
+        None => BTreeMap::from([(ANY_ARCHITECTURE.to_string(), artifact(String::new()))]),
+        Some(ImagePinDigest::Single(sha256)) => BTreeMap::from([(ANY_ARCHITECTURE.to_string(), artifact(sha256))]),
+        Some(ImagePinDigest::PerArchitecture(digests)) => {
+            digests.into_iter().map(|(architecture, sha256)| (architecture, artifact(sha256))).collect()
         }
     }
+}
+
+/// Whether `url` still carries a previous-shape `{arch}` template.
+/// ADR 0047: remove with [`legacy_artifacts`].
+pub fn is_legacy_template(url: &str) -> bool {
+    url.contains("{arch}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -476,24 +576,25 @@ fn validate_pin(name: &str, pin: &ImageLayerPin) -> Result<(), String> {
     if pin.version.trim().is_empty() {
         return Err(format!("pin `{name}` needs a version"));
     }
-    if pin.url.as_ref().is_some_and(|url| url.trim().is_empty()) {
-        return Err(format!("pin `{name}` has an empty url"));
+    if pin.artifacts.contains_key(ANY_ARCHITECTURE) && pin.artifacts.len() > 1 {
+        return Err(format!("pin `{name}` artifacts are either `{ANY_ARCHITECTURE}` or per architecture, not both"));
     }
-    if pin.url.as_ref().is_some_and(|url| url.contains("{arch}")) && matches!(pin.sha256, Some(ImagePinDigest::Single(_))) {
-        return Err(format!("pin `{name}` url varies by `{{arch}}` and needs a per-architecture sha256"));
-    }
-    match &pin.sha256 {
-        None if pin.url.is_some() => Err(format!("pin `{name}` downloads a url without a sha256")),
-        None => Ok(()),
-        Some(ImagePinDigest::Single(hex)) if is_lower_hex_sha256(hex) => Ok(()),
-        Some(ImagePinDigest::PerArchitecture(digests))
-            if !digests.is_empty()
-                && digests.iter().all(|(architecture, hex)| is_kebab_token(architecture) && is_lower_hex_sha256(hex)) =>
-        {
-            Ok(())
+    for (architecture, artifact) in &pin.artifacts {
+        if !is_kebab_token(architecture) {
+            return Err(format!("pin `{name}` architecture `{architecture}` must match [a-z0-9-]+"));
         }
-        Some(_) => Err(format!("pin `{name}` sha256 must be 64 lowercase hex (or a non-empty per-architecture map of them)")),
+        if artifact.url.trim().is_empty() {
+            return Err(format!("pin `{name}` has an empty url for `{architecture}`"));
+        }
+        // A previous-shape template with one digest names no fetchable bytes.
+        if architecture == ANY_ARCHITECTURE && is_legacy_template(&artifact.url) {
+            return Err(format!("pin `{name}` shares an `{{arch}}` url across architectures"));
+        }
+        if !is_lower_hex_sha256(&artifact.sha256) {
+            return Err(format!("pin `{name}` downloads a url without a sha256 (64 lowercase hex) for `{architecture}`"));
+        }
     }
+    Ok(())
 }
 
 fn validate_context_path(path: &str) -> Result<(), String> {

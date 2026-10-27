@@ -381,18 +381,18 @@ def repackage_guest_tools(candidates, sources, cohort):
         roots[platform] = contents
     linux = roots['linux-x86_64-gnu2.36']
     try:
-        validation.validate_guest_tools(linux, sources, str(cohort), required=True)
+        catalog = validation.validate_guest_tools(linux, sources, str(cohort), required=True)
     except ValueError as error:
         raise PromotionError(str(error)) from error
+    composition = validation.guest_composition(catalog)
     guest = {path: content for path, content in linux.items() if path.startswith(validation.GUEST_PREFIX + '/')}
-    native = {path: content for path, content in linux.items()
-              if path in validation.GUEST_NATIVE or path.startswith('share/terminfo/')}
+    native = {path: content for path, content in linux.items() if validation.guest_owner(composition, path) is not None}
     for name, target in directory_aliases['linux-x86_64-gnu2.36']:
         prefix = 'fleet-candidate-linux-x86_64-gnu2.36/'
         alias = name.removeprefix(prefix)
         source = target.removeprefix(prefix)
         for path, content in linux.items():
-            if alias.startswith('share/terminfo/') and path.startswith(source + '/'):
+            if validation.guest_owner(composition, alias) is not None and path.startswith(source + '/'):
                 native[alias + path[len(source):]] = content
     indexed = {path.removeprefix(validation.GUEST_TREE + '/'): content for path, content in guest.items()
                if path != validation.GUEST_CATALOG}

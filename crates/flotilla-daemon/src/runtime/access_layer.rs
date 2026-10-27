@@ -8,7 +8,11 @@
 //! one executor runs the plan. Launch then points the harness at the home the delivery
 //! returned; nothing derives the home again.
 
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use flotilla_credentials::{AgentMaterialRegistry, HarnessHome, HarnessLogin, SkillTree};
@@ -19,11 +23,15 @@ use flotilla_resources::{
 };
 use flotilla_vessel_delivery::{
     deliver, Access, AccessKey, ContentDigest, CostTable, DeliveryError, HostPathOffer, HostReach, Item, Liveness, Mechanism, Need,
-    NeedName, Plan, ProviderMechanisms, RelativePath, TreeDelivery, TreeSources,
+    NeedName, Plan, ProviderMechanisms, Reachability, RelativePath, TreeDelivery, TreeSources,
 };
 
-use self::status::AccessStatus;
+use self::{
+    harness::{PinnedHarness, HARNESS_PATH},
+    status::AccessStatus,
+};
 
+mod harness;
 pub(super) mod status;
 
 use super::account_access::{AccountLaunch, BoundAccount};
@@ -34,6 +42,7 @@ const HOME: &str = "home";
 const SKILLS: &str = "skills";
 const ACCOUNT: &str = "account";
 const LOGIN: &str = "login";
+const HARNESS: &str = "harness";
 /// The need a failure is recorded against when it was in planning, not in one need's step.
 const PLAN: &str = "plan";
 
@@ -48,25 +57,33 @@ pub(super) struct AccessLaunch<'a> {
     pub access: Option<&'a AccessName>,
 }
 
-/// Deliver the crew's access layer aboard its vessel through `agent`, and return the
-/// variables that point its harness at what landed: its home, and its account material.
-/// `delivered` is the launch environment credential delivery resolved, which names the
-/// vessel's delivered harness homes.
+/// What the access layer delivered for a launch.
+#[derive(Debug, Default)]
+pub(super) struct AccessDelivered {
+    /// The variables that point the harness at what landed: its home, and its account material.
+    pub environment: Vec<(String, String)>,
+    /// The pinned harness's executable aboard, where the place does not carry it.
+    pub executable: Option<PathBuf>,
+}
+
+/// Deliver the crew's access layer aboard its vessel through `agent`. `delivered` is the
+/// launch environment credential delivery resolved, which names the vessel's delivered
+/// harness homes.
 pub(super) async fn deliver_access(
     state: &Arc<ControllerRuntimeState>,
     launch: &AccessLaunch<'_>,
     agent: Arc<dyn VesselAgent>,
     delivered: &[(String, String)],
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<AccessDelivered, String> {
     let material = state.agent_material.as_ref().ok_or("vessel delivery requires the agent material registry")?;
-    let Some(harness) = material.harness_home(launch.adapter) else { return Ok(Vec::new()) };
+    let Some(harness) = material.harness_home(launch.adapter) else { return Ok(AccessDelivered::default()) };
     let crew = frozen_crew(state, &launch.account, launch.vessel_ref).await?;
     let status = AccessStatus::read(state, &launch.account, &crew.access, launch.adapter).await?;
     status.due(state)?;
     match deliver_crew(state, launch, material, &harness, crew, agent, delivered).await {
-        Ok((plan, home, environment)) => {
+        Ok((plan, home, environment, executable)) => {
             status.delivered(state, &plan, &home).await?;
-            Ok(environment)
+            Ok(AccessDelivered { environment, executable })
         }
         Err(Failed { need, error }) => {
             status.failed(state, need, &error).await?;
@@ -93,7 +110,7 @@ async fn deliver_crew(
     crew: FrozenCrew,
     agent: Arc<dyn VesselAgent>,
     delivered: &[(String, String)],
-) -> Result<(Plan, String, Vec<(String, String)>), Failed> {
+) -> Result<(Plan, String, Vec<(String, String)>, Option<PathBuf>), Failed> {
     let access = AccessKey::new(crew.access);
     let home_key = requester_home(Path::new(""), launch.account.convoy, launch.account.role, harness.name);
     let mut needs = vec![Need {
@@ -154,6 +171,17 @@ async fn deliver_crew(
             Arc::new(LoginDelivery(login)),
         );
     }
+    // #3909: where the place does not already carry the pinned harness, it lands in the
+    // home by digest, through whichever mechanism the planner chooses.
+    let pinned = if place_carries_harnesses(launch.account.agentless) {
+        None
+    } else {
+        let architecture = agent.architecture().await.map_err(failed_at(HARNESS))?;
+        PinnedHarness::resolve(launch.adapter, &architecture).map_err(failed_at(HARNESS))?
+    };
+    if let Some(pinned) = &pinned {
+        tree(&mut needs, HARNESS, pinned.sha256.clone(), HARNESS_PATH, PinnedHarness::sources(), Arc::new(pinned.clone()));
+    }
     let place = launch.account.env_ref;
     let delivered = deliver(&needs, &trees, &place_mechanisms(launch.account.agentless), &CostTable::default(), agent.as_ref())
         .await
@@ -181,20 +209,29 @@ async fn deliver_crew(
         environment.retain(|(name, _)| !bound.environment(&home).iter().any(|(bound, _)| bound == name));
         environment.extend(bound.environment(&home));
     }
-    Ok((delivered.plan, home, environment))
+    let executable = pinned.map(|pinned| pinned.executable(&Path::new(&home).join(HARNESS_PATH)));
+    Ok((delivered.plan, home, environment, executable))
 }
 
 /// What a place offers vessel delivery beyond the mandatory agent fetch and push. An SSH
 /// host's writable base is the host's own durable storage; a container's is not, so its
-/// homes are created through the agent. Step 4 of #3956 moves this declaration onto each
-/// provider instance.
+/// homes are created through the agent. Both kinds in use reach public sources: neither
+/// declares an egress policy, and their skills are already fetched aboard. Step 4 of
+/// #3956 moves this declaration onto each provider instance.
+/// Whether the place already carries the pinned harnesses. A composed crew image includes
+/// the harness layers, whose pins its identity hashes; an SSH host has no image. Step 4 of
+/// #3956 moves this declaration onto each provider instance.
+fn place_carries_harnesses(agentless: bool) -> bool {
+    !agentless
+}
+
 fn place_mechanisms(agentless: bool) -> ProviderMechanisms {
     let host_paths = if agentless {
         vec![HostPathOffer { reach: HostReach::WritableBase, access: Access::ReadWrite, liveness: Liveness::Live }]
     } else {
         Vec::new()
     };
-    ProviderMechanisms { host_paths }
+    ProviderMechanisms { host_paths, reach: Reachability { vessel_public: true } }
 }
 
 /// The crew's frozen entry, as the caller reads it from its convoy: its access key and

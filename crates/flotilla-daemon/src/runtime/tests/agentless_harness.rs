@@ -16,7 +16,7 @@ use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 
 use super::super::account_access::reconcile_place_provisions;
 use super::agentless_vessels::{VesselKey, VesselPaths};
-use super::vessel_support::{vessels_over, RunnerVesselAgents};
+use super::vessel_support::{store_entry, vessels_over, ArtifactArrival, RunnerVesselAgents};
 
 const HOST_HOME: &str = "/home/crew";
 /// What `SshCommandRunner::writable_config_base` resolves on the host.
@@ -186,6 +186,7 @@ struct AgentlessLaunch {
     command: String,
     /// What `convoy explain` shows the access layer delivered.
     deliveries: Vec<flotilla_protocol::ExplainedAccessDelivery>,
+    artifacts: Vec<(String, ArtifactArrival)>,
 }
 
 impl AgentlessLaunch {
@@ -208,9 +209,16 @@ async fn try_launch_on_agentless_host(adapter: &str, grant_claude: bool) -> Resu
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
     let launched = launch_agentless(agentless_host(&host, &runtime_dir), adapter, grant_claude).await;
     match launched {
-        Ok(session) => Ok(AgentlessLaunch { host, env: session.env_vars, command: session.command, deliveries: session.deliveries }),
+        Ok(session) => Ok(AgentlessLaunch {
+            host,
+            env: session.env_vars,
+            command: session.command,
+            deliveries: session.deliveries,
+            artifacts: session.artifacts,
+        }),
         Err(error) => {
-            assert_host_harness_untouched(&AgentlessLaunch { host, env: Vec::new(), command: String::new(), deliveries: Vec::new() });
+            let refused = AgentlessLaunch { host, env: Vec::new(), command: String::new(), deliveries: Vec::new(), artifacts: Vec::new() };
+            assert_host_harness_untouched(&refused);
             Err(error)
         }
     }
@@ -258,6 +266,8 @@ struct LaunchedSession {
     env_vars: TerminalEnvVars,
     command: String,
     deliveries: Vec<flotilla_protocol::ExplainedAccessDelivery>,
+    /// What reached the vessel agent's store.
+    artifacts: Vec<(String, ArtifactArrival)>,
 }
 
 /// The terminal runtime, agentless host and crew session spec a launch runs with.
@@ -418,7 +428,12 @@ impl AgentlessRuntime {
         assert_eq!(socket.as_ref(), Some(&vessel.daemon_socket()));
         assert_eq!(prepared.environment.get("FLOTILLA_DAEMON_SOCKET").map(PathBuf::from), socket);
         assert!(matches!(prepared.forwards.as_slice(), [(guest, _)] if *guest == vessel.daemon_socket()), "{:?}", prepared.forwards);
-        Ok(LaunchedSession { env_vars: launch.env_vars.clone(), command: launch.command.clone(), deliveries: self.deliveries().await })
+        Ok(LaunchedSession {
+            env_vars: launch.env_vars.clone(),
+            command: launch.command.clone(),
+            deliveries: self.deliveries().await,
+            artifacts: prepared.artifacts,
+        })
     }
 
     /// What `convoy explain` shows the access layer delivered for the convoy.
@@ -430,8 +445,10 @@ impl AgentlessRuntime {
 }
 
 /// #3964: the access layer staged the crew's frozen skills into exactly the home its
-/// harness launches with, and recorded what landed there.
-fn assert_staged_into_launched_home(launch: &AgentlessLaunch, variable: &str) {
+/// harness launches with, and recorded what landed there. #3909: the vessel fetched the
+/// adapter's pinned harness by digest from its upstream URL into that home, and the
+/// launch runs it.
+fn assert_staged_into_launched_home(launch: &AgentlessLaunch, variable: &str, adapter: &str) {
     let home = launch.value(variable).expect("launched home");
     assert!(launch.host.entry(format!("{home}/skills/research/SKILL.md")).is_some(), "skills are staged into the launched home");
     let Some(HostEntry::File(record)) = launch.host.entry(format!("{home}/{}", flotilla_vessel_delivery::DELIVERY_RECORD)) else {
@@ -446,6 +463,15 @@ fn assert_staged_into_launched_home(launch: &AgentlessLaunch, variable: &str) {
     let mechanisms = delivery.needs.iter().map(|need| (need.need.as_str(), need.mechanism.as_str())).collect::<BTreeMap<_, _>>();
     assert_eq!(mechanisms.get("home"), Some(&"host-path(rw, live)"));
     assert_eq!(mechanisms.get("skills"), Some(&"agent-fetch(url)"));
+    assert_eq!(mechanisms.get("harness"), Some(&"agent-fetch(digest)"));
+    let pinned = pinned_harness_sha256(adapter);
+    assert!(
+        matches!(launch.artifacts.as_slice(), [(sha256, ArtifactArrival::Fetched(urls))] if *sha256 == pinned && urls.len() == 1),
+        "{:?}",
+        launch.artifacts
+    );
+    let binary = flotilla_agent::adapter::harness_binary(adapter).expect("built-in harness");
+    assert!(launch.command.contains(&format!("{home}/.flotilla/harness/bin/{binary} ")), "{}", launch.command);
 }
 
 /// No launch writes the host user's harness configuration; it reads as it did.
@@ -482,7 +508,7 @@ async fn agentless_claude_crew_starts_in_a_prepared_flotilla_home() {
     let home = bound.clone();
 
     assert_eq!(launch.value("CLAUDE_CONFIG_DIR").as_deref(), Some(home.as_str()));
-    assert_staged_into_launched_home(&launch, "CLAUDE_CONFIG_DIR");
+    assert_staged_into_launched_home(&launch, "CLAUDE_CONFIG_DIR", "claude-code");
     // #3907: the vessel agent wrote the bound token into the requester's home;
     // the session environment carries no token of its own.
     assert_eq!(launch.value("CLAUDE_CODE_OAUTH_TOKEN"), None);
@@ -523,7 +549,7 @@ async fn agentless_codex_crew_starts_in_a_prepared_flotilla_home() {
     }
     assert!(launch.command.contains("hooks.state="), "invocation carries hook trust records");
     assert_eq!(launch.host.entry(format!("{home}/auth.json")), Some(HostEntry::Link(PathBuf::from("/home/crew/.codex/auth.json"))));
-    assert_staged_into_launched_home(&launch, "CODEX_HOME");
+    assert_staged_into_launched_home(&launch, "CODEX_HOME", "codex");
     assert_image_harness_environment(&launch);
     assert_host_harness_untouched(&launch);
 }
@@ -605,6 +631,13 @@ impl CommandRunner for LoopbackSshHost {
     }
 }
 
+/// The amd64 digest the stdlib pins for `adapter`'s harness.
+fn pinned_harness_sha256(adapter: &str) -> String {
+    let layers = flotilla_resources::stdlib::stdlib_image_layers().expect("stdlib layers");
+    let layer = layers.iter().find(|layer| layer.provides.contains(&format!("harness:{adapter}"))).expect("harness layer");
+    layer.pins.values().next().and_then(|pin| pin.artifact("amd64")).expect("amd64 artifact").sha256.clone()
+}
+
 fn write_executable(path: &Path, script: &str) {
     use std::os::unix::fs::PermissionsExt;
     fs::create_dir_all(path.parent().expect("parent")).expect("executable directory");
@@ -621,7 +654,9 @@ fn write_executable(path: &Path, script: &str) {
 // PATH is the delivered CLI, the GitHub credential wrapper, the supplies and
 // the system tail; `gh` and `flotilla` resolve to the wrapper and the CLI;
 // the profile directory is absent; `RUSTUP_HOME` is set; and no runner
-// command read the profile. Mutation check: `sh -lc` in the SSH runner fails it.
+// command read the profile. The host has no harness installed: the one that
+// runs is the pinned harness its access layer delivered (#3909). Mutation
+// check: `sh -lc` in the SSH runner fails it.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
@@ -641,20 +676,12 @@ async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
     write_executable(&home.join(".local/bin/gh"), "#!/bin/sh\necho host-gh\n");
     write_executable(&home.join(".local/bin/flotilla"), "#!/bin/sh\necho stale-flotilla\n");
     write_executable(&home.join(".cargo/bin/cargo"), "#!/bin/sh\necho cargo\n");
-    // The harness answers the delivery preflight, then reports what it sees.
-    write_executable(
-        &home.join(".local/opt/claude/bin/claude"),
-        "#!/bin/sh\n[ \"$1\" = -p ] && { printf ok; exit 0; }\n\
-         { printf '%s\\n' \"$PATH\"; command -v gh; command -v flotilla; printf '%s\\n' \"${RUSTUP_HOME-unset}\"; } > \"$HOME/harness-report\"\n",
-    );
-    let host_environment = HostEnvironment::new(vec![
-        HostSupply {
-            name: "rust".into(),
-            path: vec!["~/.cargo/bin".into()],
-            env: vec![("CARGO_HOME".into(), "~/.cargo".into()), ("RUSTUP_HOME".into(), "~/.rustup".into())],
-        },
-        HostSupply { name: "claude".into(), path: vec!["~/.local/opt/claude/bin".into()], env: Vec::new() },
-    ])
+    // No harness is installed on the host (#3909): the pinned one is delivered.
+    let host_environment = HostEnvironment::new(vec![HostSupply {
+        name: "rust".into(),
+        path: vec!["~/.cargo/bin".into()],
+        env: vec![("CARGO_HOME".into(), "~/.cargo".into()), ("RUSTUP_HOME".into(), "~/.rustup".into())],
+    }])
     .expect("declared supplies");
     let runner: Arc<dyn CommandRunner> = Arc::new(
         SshCommandRunner::new(
@@ -668,9 +695,7 @@ async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
     // Discovery reads the host's environment through the runner, as
     // registration does.
     let discovered = runner.run("env", &[], Path::new("/"), &ChannelLabel::Default).await.expect("remote env");
-    let mut bag = EnvironmentBag::new()
-        .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
-        .with(EnvironmentAssertion::binary("claude", home.join(".local/opt/claude/bin/claude").display().to_string()));
+    let mut bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("git", "/usr/bin/git"));
     for (name, value) in discovered.lines().filter_map(|line| line.split_once('=')) {
         if matches!(name, "HOME" | "PATH" | "USER" | "XDG_RUNTIME_DIR") {
             bag = bag.with(EnvironmentAssertion::env_var(name, value));
@@ -687,8 +712,14 @@ async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
 
     // The vessel's generation layer holds the delivered CLI.
     let vessel = VesselPaths::new(&bag, &VesselKey::new(&EnvironmentId::new(ENVIRONMENT), "demo-work")).expect("vessel paths");
-    let cli_dir = vessel.cli_directory();
-    write_executable(&cli_dir.join("flotilla"), "#!/bin/sh\necho generation-cli\n");
+    let cli = vessel.cli();
+    let cli_dir = cli.parent().expect("CLI directory").to_path_buf();
+    write_executable(&cli, "#!/bin/sh\necho generation-cli\n");
+    // The pinned harness's verified bytes in the vessel agent's store: it reports what it sees.
+    write_executable(
+        &store_entry(&vessel.agent, &pinned_harness_sha256("claude-code")),
+        "#!/bin/sh\n{ printf '%s\\n' \"$PATH\"; command -v gh; command -v flotilla; printf '%s\\n' \"${RUSTUP_HOME-unset}\"; } > \"$HOME/harness-report\"\n",
+    );
 
     let session = launch_agentless(
         // A real shell stands in for the host here, so the crew selects no skills to fetch.
@@ -716,7 +747,6 @@ async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
         cli_dir.display().to_string(),
         wrapper_dir.display().to_string(),
         format!("{home_text}/.cargo/bin"),
-        format!("{home_text}/.local/opt/claude/bin"),
         "/usr/local/bin".into(),
         "/usr/bin".into(),
         "/bin".into(),

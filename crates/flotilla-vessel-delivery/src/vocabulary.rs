@@ -113,12 +113,27 @@ pub enum Item {
 /// Where a tree's content can come from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TreeSources {
-    /// The controller holds the bytes, so the agent can be pushed them.
+    /// The controller holds the bytes, or can obtain them where the content's authority
+    /// and reachability allow, so the agent can be pushed them.
     pub controller: bool,
     /// The agent can fetch the tree by URL, such as a repository at a pinned revision.
     pub url: bool,
     /// The tree already exists at this path on the controller's host.
     pub host_path: Option<PathBuf>,
+    /// The content is addressed by its digest at sources of this visibility, such as a
+    /// pinned upstream release, so a vessel that can reach them may fetch it itself.
+    pub digest: Option<Visibility>,
+}
+
+/// Who may read an artifact at its sources (#3956 ruling, 2026-10-27). Declared by
+/// the artifact's source, never inferred from what kind of artifact it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Visibility {
+    /// Anyone can read it, without credentials.
+    Public,
+    /// Only holders of the named authority's credentials can read it. Those
+    /// credentials never enter a vessel, so the vessel never fetches it.
+    Private { authority: String },
 }
 
 /// Guest access to a host path.
@@ -135,10 +150,13 @@ pub enum Liveness {
     Snapshot,
 }
 
-/// How an agent fetches content. Fetch by digest (#3926, #3909) is a further variant.
+/// How an agent fetches content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FetchBy {
     Url,
+    /// By content digest into the agent's verified store (drydock#86), from sources
+    /// the vessel can reach.
+    Digest,
 }
 
 /// The mechanism a plan chose for one need, recorded in the layer's status and
@@ -168,6 +186,7 @@ impl fmt::Display for Mechanism {
                 write!(f, "host-path({access}, {liveness})")
             }
             Self::AgentFetch { by: FetchBy::Url } => f.write_str("agent-fetch(url)"),
+            Self::AgentFetch { by: FetchBy::Digest } => f.write_str("agent-fetch(digest)"),
             Self::AgentPush => f.write_str("agent-push"),
         }
     }
@@ -185,6 +204,7 @@ impl std::str::FromStr for Mechanism {
             "host-path(rw, live)" => host_path(Access::ReadWrite, Liveness::Live),
             "host-path(rw, snapshot)" => host_path(Access::ReadWrite, Liveness::Snapshot),
             "agent-fetch(url)" => Self::AgentFetch { by: FetchBy::Url },
+            "agent-fetch(digest)" => Self::AgentFetch { by: FetchBy::Digest },
             "agent-push" => Self::AgentPush,
             other => return Err(format!("unknown delivery mechanism `{other}`")),
         })
@@ -209,9 +229,19 @@ pub struct HostPathOffer {
     pub liveness: Liveness,
 }
 
+/// What a vessel can reach, declared by its place (provider capability and the
+/// environment's egress policy), never inferred from the provider's name. The
+/// default reaches nothing beyond its controller, so content is pushed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reachability {
+    /// The vessel reaches public sources, such as upstream release downloads.
+    pub vessel_public: bool,
+}
+
 /// The optional mechanisms a provider instance declares. Agent fetch and agent
 /// push are mandatory for every vessel agent and so are never declared.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProviderMechanisms {
     pub host_paths: Vec<HostPathOffer>,
+    pub reach: Reachability,
 }

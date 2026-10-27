@@ -127,17 +127,31 @@ impl VesselPaths {
         self.agent.join("flotilla.sock")
     }
 
-    /// The generation layer's `bin`, holding `flotilla` and `cleat`.
-    pub(super) fn cli_directory(&self) -> PathBuf {
-        self.state.join("bin")
+    /// The `PATH` directories of the layers published under the vessel's
+    /// state, in their declared order (#3874). With [`Self::generation_variables`]
+    /// this is the "generation layers" part of a prepared base layer (#3908).
+    pub(super) fn generation_path(&self) -> Vec<String> {
+        flotilla_environment::composition::flotilla_tools()
+            .path_entries(&self.state)
+            .into_iter()
+            .map(|directory| directory.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The variables those layers contribute, with their install paths.
+    pub(super) fn generation_variables(&self) -> Vec<(String, String)> {
+        flotilla_environment::composition::flotilla_tools().variables(&self.state)
+    }
+
+    /// Where the published CLI entry point lands in the vessel.
+    #[cfg(test)]
+    pub(super) fn cli(&self) -> PathBuf {
+        let cli = flotilla_environment::composition::flotilla_tools().member(flotilla_environment::composition::role::CLI);
+        self.state.join(cli.and_then(|member| member.install.as_deref()).expect("the CLI is published"))
     }
 
     pub(super) fn cleat_runtime(&self) -> PathBuf {
         self.state.join("cleat")
-    }
-
-    fn terminfo(&self) -> PathBuf {
-        self.state.join("share/terminfo")
     }
 }
 
@@ -882,8 +896,10 @@ pub(super) fn vessel_environment(profile: &AgentlessSshProfile, paths: &VesselPa
         ("FLOTILLA_ENVIRONMENT_ID".to_string(), profile.environment_id.to_string()),
         (CONTAINED_DAEMON_REQUIRED_ENV.to_string(), "1".to_string()),
         ("CLEAT_RUNTIME_DIR".to_string(), paths.cleat_runtime().to_string_lossy().into_owned()),
-        ("TERMINFO_DIRS".to_string(), format!("{}:/usr/share/terminfo", paths.terminfo().display())),
-    ];
+    ]
+    .into_iter()
+    .chain(paths.generation_variables())
+    .collect::<Vec<_>>();
     if let Some((name, _)) = flotilla.iter().find(|(name, _)| base.sets(name)) {
         return Err(format!(
             "host configuration error for {}: supply `{}` sets {name}, which flotilla sets",
@@ -898,10 +914,7 @@ pub(super) fn vessel_environment(profile: &AgentlessSshProfile, paths: &VesselPa
 
 /// The vessel's base layer: its generation layer, then the host's.
 pub(super) fn vessel_base(profile: &AgentlessSshProfile, paths: &VesselPaths) -> Result<BaseLayer, String> {
-    profile
-        .preparer(vec![paths.cli_directory().to_string_lossy().into_owned()])
-        .base()
-        .map_err(|error| error.for_environment(profile.environment_id.as_str()))
+    profile.preparer(paths.generation_path()).base().map_err(|error| error.for_environment(profile.environment_id.as_str()))
 }
 
 /// Point a session at its vessel's daemon forward. The CLI never spawns a
@@ -931,10 +944,8 @@ pub(super) fn compose_session_environment(
     bound: BoundLayer,
 ) -> Result<String, String> {
     let environment = &profile.environment_id;
-    let prepared = profile
-        .preparer(vec![paths.cli_directory().to_string_lossy().into_owned()])
-        .prepare(Some(bound))
-        .map_err(|error| error.for_environment(environment.as_str()))?;
+    let prepared =
+        profile.preparer(paths.generation_path()).prepare(Some(bound)).map_err(|error| error.for_environment(environment.as_str()))?;
     prepared.render_crew(env, &profile.accounts).map_err(|error| error.for_environment(environment.as_str()))?;
     let composed = env.iter().filter(|(name, _)| prepared.base().sets(name)).cloned().collect::<Vec<_>>();
     Ok(format!("{}{command}", export_lines(&composed)))

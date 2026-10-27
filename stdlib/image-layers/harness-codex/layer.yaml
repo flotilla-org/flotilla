@@ -3,7 +3,7 @@
 # carries bin/codex plus its bundled resources (rg, bwrap) located through
 # codex-package.json. sha256 values are the release asset digests published
 # by GitHub for openai/codex rust-v0.160.0, confirmed by downloading both.
-# `{arch}` is substituted by the fragment (x86_64 or aarch64).
+# The artifacts are the x86_64 and aarch64 musl packages.
 #
 # Codex has no self-updater and no environment switch for its update notice
 # (`check_for_update_on_startup` lives in the crew's config.toml); a harness
@@ -16,10 +16,15 @@ requires: []
 pins:
   codex:
     version: 0.160.0
-    url: https://github.com/openai/codex/releases/download/rust-v0.160.0/codex-package-{arch}-unknown-linux-musl.tar.gz
-    sha256:
-      amd64: 4fcc47ab57f52ff75363951a8761146cd10c8288bd86fed45487dbb204a16b71
-      arm64: 7f0fe42ff22ecfa3a47bc4a34f5b22c4218b431a4ec0aba51c7d98299f07900c
+    artifacts:
+      amd64:
+        url: https://github.com/openai/codex/releases/download/rust-v0.160.0/codex-package-x86_64-unknown-linux-musl.tar.gz
+        sha256: 4fcc47ab57f52ff75363951a8761146cd10c8288bd86fed45487dbb204a16b71
+        unpack: tar.gz
+      arm64:
+        url: https://github.com/openai/codex/releases/download/rust-v0.160.0/codex-package-aarch64-unknown-linux-musl.tar.gz
+        sha256: 7f0fe42ff22ecfa3a47bc4a34f5b22c4218b431a4ec0aba51c7d98299f07900c
+        unpack: tar.gz
 probe: |
   set -eu
   codex --version | grep -E '(^|[^0-9])0\.160\.0([^0-9.]|$)'

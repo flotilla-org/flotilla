@@ -169,6 +169,10 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                 &self.instance,
                 &wire::PrepareRequest {
                     platform: Some(platform.clone()),
+                    // The provider's builder pulls the pinned image and tools itself, as
+                    // before drydock protocol 8 named routes; no pull access is sent.
+                    route: Some(wire::ImageRouteKind::RegistryPull),
+                    image_pull: None,
                     image_digest: spec.image.clone(),
                     tools_digest: ::drydock::launch::build_tools_digest().map_err(|e| e.to_string())?.into(),
                     size: size(&spec.size),
@@ -406,6 +410,7 @@ fn empty_capabilities() -> wire::Capabilities {
         egress: wire::EgressCapability { enforcement: wire::Enforcement::Advisory, routes: vec![wire::EgressRoute::Open] },
         fallback_runner: false,
         bootstrap: wire::BootstrapRoute::Bake,
+        image_routes: vec![],
         usage: false,
         quota: false,
     }

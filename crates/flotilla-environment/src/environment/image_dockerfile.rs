@@ -6,7 +6,7 @@
 //! layer, and each layer's declared context files form one named build context.
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_resources::{ImageContextFile, ImageLayerPin, ImageLayerSpec, ImageLayerTier};
+use flotilla_resources::{ImageContextFile, ImageLayerSpec, ImageLayerTier};
 
 /// The Dockerfile frontend every generated build uses. A fixed minor keeps the
 /// frontend's language stable (`COPY --link`, `--chmod`, `RUN --mount=type=secret`)
@@ -136,21 +136,25 @@ fn split_ending(line: &str) -> (&str, &str) {
     (without_return.trim_end(), &line[without_return.len()..])
 }
 
-/// `ARG PIN_<NAME>_VERSION/_URL/_SHA256` lines for one layer, in pin-name order.
+/// `ARG PIN_<NAME>_VERSION/_URL/_SHA256` lines for one layer, in pin-name
+/// order: the artifact the pin declares for `architecture`.
 fn pin_args(layer: &ImageLayerSpec, architecture: &str) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
-    for (pin, ImageLayerPin { version, url, sha256 }) in &layer.pins {
+    for (pin, declared) in &layer.pins {
         let name = pin.to_ascii_uppercase().replace('-', "_");
-        args.push(arg_line(&format!("PIN_{name}_VERSION"), version, &layer.name)?);
-        if let Some(url) = url {
-            args.push(arg_line(&format!("PIN_{name}_URL"), url, &layer.name)?);
+        args.push(arg_line(&format!("PIN_{name}_VERSION"), &declared.version, &layer.name)?);
+        if declared.artifacts.is_empty() {
+            continue;
         }
-        if let Some(sha256) = sha256 {
-            let hex = sha256
-                .for_architecture(architecture)
-                .ok_or_else(|| format!("image layer `{}`: pin `{pin}` has no sha256 for architecture `{architecture}`", layer.name))?;
-            args.push(arg_line(&format!("PIN_{name}_SHA256"), hex, &layer.name)?);
-        }
+        let artifact = declared
+            .artifact(architecture)
+            .ok_or_else(|| format!("image layer `{}`: pin `{pin}` has no artifact for architecture `{architecture}`", layer.name))?;
+        // Emitted as declared. A previous-shape `{arch}` template survives conversion
+        // verbatim for one roll (ADR 0047), and only its own fragment's `sed` resolves it;
+        // the stdlib fragments no longer substitute.
+        args.push(arg_line(&format!("PIN_{name}_URL"), &artifact.url, &layer.name)?);
+        args.push(arg_line(&format!("PIN_{name}_SHA256"), &artifact.sha256, &layer.name)?);
+        args.push(arg_line(&format!("PIN_{name}_UNPACK"), artifact.unpack.as_str(), &layer.name)?);
     }
     Ok(args)
 }

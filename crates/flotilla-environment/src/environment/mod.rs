@@ -34,6 +34,7 @@ use flotilla_protocol::{DaemonHostPath, EnvironmentId, ExecutionEnvironmentPath,
 use serde::{Deserialize, Serialize};
 
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_resources::PinUnpack;
 
 /// Options for creating a new provisioned environment.
 ///
@@ -304,6 +305,30 @@ pub trait VesselAgent: Send + Sync {
     /// Make `path` a symbolic link to `target`, atomically replacing anything there
     /// but a directory.
     async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String>;
+    /// The guest's architecture (`amd64`, `arm64`), as the vessel's agent reports the
+    /// platform it was built for.
+    async fn architecture(&self) -> Result<String, String> {
+        Err("this vessel agent does not report its platform".into())
+    }
+    /// Make the artifact with `sha256` an entry of the agent's verified store
+    /// (drydock#86), fetched by the vessel itself from `urls` in order; a repeat is
+    /// answered from the store's index. Only bytes hashing to `sha256` are kept.
+    async fn fetch_artifact(&self, sha256: &str, urls: &[String], unpack: PinUnpack) -> Result<(), String> {
+        let _ = (urls, unpack);
+        Err(format!("this vessel agent has no artifact store to fetch {sha256} into"))
+    }
+    /// As [`VesselAgent::fetch_artifact`], with the bytes pushed from the
+    /// controller's verified local copy at `file`.
+    async fn push_artifact(&self, sha256: &str, file: &Path, unpack: PinUnpack) -> Result<(), String> {
+        let _ = (file, unpack);
+        Err(format!("this vessel agent has no artifact store to push {sha256} into"))
+    }
+    /// Point a symbolic link at `path` to the store entry for `sha256`, or to `member`
+    /// inside it, atomically. The link is recorded as a use, so the entry is kept.
+    async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
+        let _ = member;
+        Err(format!("this vessel agent has no artifact store to link {} to {sha256}", path.display()))
+    }
 }
 
 /// A live handle to a provisioned sandbox environment.

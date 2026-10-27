@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::{EnvironmentAssertion, EnvironmentBag};
 use flotilla_protocol::arg::{flatten, Arg};
 use flotilla_resources::{account_access::AccessName, Convoy, FulfilmentGrant, ResourceObject, TerminalAttentionState, TerminalBrief};
 use serde::Serialize;
@@ -582,6 +582,15 @@ impl AgentRequirement {
 impl Default for CapabilityTable {
     fn default() -> Self {
         Self::seeded()
+    }
+}
+
+/// The executable a built-in harness runs, as discovery finds it on `PATH`.
+pub fn harness_binary(adapter: &str) -> Option<&'static str> {
+    match adapter {
+        "claude-code" => Some("claude"),
+        "codex" => Some("codex"),
+        _ => None,
     }
 }
 
@@ -1275,12 +1284,28 @@ impl AgentAdapterRegistry {
         registry
     }
 
+    /// The built-in adapter for a harness delivered at `binary` (#3909), with the
+    /// variables that point it at its home: the adapter discovery builds when it finds
+    /// `binary` on `PATH`, whatever the place itself has installed.
+    pub fn delivered(
+        adapter: &str,
+        binary: &Path,
+        home: &[(String, String)],
+        runner: Arc<dyn CommandRunner>,
+    ) -> Option<Arc<dyn AgentAdapter>> {
+        let name = harness_binary(adapter)?;
+        let env = EnvironmentBag::new()
+            .with(EnvironmentAssertion::binary(name, binary))
+            .extend(home.iter().map(|(key, value)| EnvironmentAssertion::env_var(key, value)));
+        Self::discover(&env, runner).get(adapter).cloned()
+    }
+
     pub fn discover(env: &EnvironmentBag, runner: Arc<dyn CommandRunner>) -> Self {
         let mut registry = Self::default();
         if env.find_env_var("FLOTILLA_FLEET_CANARY") == Some("1") {
             registry.insert(Arc::new(fleet_canary::FleetCanaryAdapter));
         }
-        if let Some(binary) = env.find_binary("claude") {
+        if let Some(binary) = harness_binary("claude-code").and_then(|name| env.find_binary(name)) {
             let state_path = env.find_env_var("CLAUDE_CONFIG_DIR").map(|config_dir| PathBuf::from(config_dir).join(".claude.json"));
             let state_lock = Arc::new(Mutex::new(()));
             registry.insert(Arc::new(CliAgentAdapter {
@@ -1292,7 +1317,7 @@ impl AgentAdapterRegistry {
                 },
             }));
         }
-        if let Some(binary) = env.find_binary("codex") {
+        if let Some(binary) = harness_binary("codex").and_then(|name| env.find_binary(name)) {
             let config_path = env
                 .find_env_var("CODEX_HOME")
                 .map(PathBuf::from)

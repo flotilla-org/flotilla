@@ -84,8 +84,15 @@ requires: []                   # provides of lower layers this one needs
 pins:
   rustup:
     version: 1.29.1
-    url: https://static.rust-lang.org/rustup/archive/1.29.1/{arch}-unknown-linux-gnu/rustup-init
-    sha256: {amd64: "<hex>", arm64: "<hex>"}
+    artifacts:                 # per architecture, or `any` for shared bytes
+      amd64:
+        url: https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linux-gnu/rustup-init
+        sha256: "<hex>"
+        unpack: file             # file | tar.gz | tar.xz
+      arm64:
+        url: https://static.rust-lang.org/rustup/archive/1.29.1/aarch64-unknown-linux-gnu/rustup-init
+        sha256: "<hex>"
+        unpack: file
 probe: |
   rustup --version && cargo --version
 context_files: [prelude.d/40-rust.sh]
@@ -98,15 +105,22 @@ build_secrets: []
   such as a harness fetch stage, use prefixed aliases. Nothing else in the
   fragment is inspected.
 - **Pins** become build arguments emitted after every `FROM` line of the layer:
-  `PIN_<NAME>_VERSION`, `PIN_<NAME>_URL` and `PIN_<NAME>_SHA256`, where
-  `<NAME>` is the upper-snake pin name. The SHA-256 is already selected for the
-  target architecture. Fragments use those names and never declare their own
-  defaults. A pin with a `url` must carry a `sha256`, either one value or a
-  per-architecture map. Where an upstream names artifacts per architecture, the
-  stdlib writes `{arch}` in the URL and the fragment substitutes the upstream
-  token (for example `x86_64`, `x64` or `amd64`) from `TARGETARCH`. A pin
-  without a URL records a version whose integrity comes from elsewhere, such as
-  the base's apt snapshot or an npm lockfile declared as a context file.
+  `PIN_<NAME>_VERSION`, `PIN_<NAME>_URL`, `PIN_<NAME>_SHA256` and
+  `PIN_<NAME>_UNPACK`, where `<NAME>` is the upper-snake pin name. The last
+  three are the target architecture's artifact, or the shared `any` artifact;
+  a pin with no artifact for the target refuses the build. Fragments use those
+  names as given, never declare their own defaults, and need no architecture
+  mapping to choose a download.
+- **Each architecture's artifact is explicit.** It names a full URL, its
+  `sha256` and its `unpack` kind (`file`, `tar.gz` or `tar.xz`). There are no
+  URL templates. Image builds and the vessel agent's digest fetch read the same
+  entries (#3909, decision 3).
+- **The previous shape is accepted for one roll.** That shape is a `url`,
+  optionally with an `{arch}` template, plus one `sha256` or a per-architecture
+  map. It is converted and written back as `artifacts` (ADR 0047).
+- **A pin without artifacts** records a version whose integrity comes from
+  elsewhere, such as the base's apt snapshot or an npm lockfile declared as a
+  context file.
 - **Context files** are only the files listed in `context_files`, relative to
   the layer directory: UTF-8 text, carried inline in the `ImageLayer`
   definition, 256 KiB in total per layer, so the identity hashes their

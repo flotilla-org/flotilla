@@ -41,10 +41,10 @@ mod image_layer;
 pub use image_layer::stdlib;
 pub mod builtins;
 pub use image_layer::{
-    capability_satisfies, image_identity, parse_layer_directory, parse_layer_directory_with_executables, resolve_image,
+    capability_satisfies, image_identity, is_legacy_template, parse_layer_directory, parse_layer_directory_with_executables, resolve_image,
     validate_capability, EffectiveImageCatalogue, ImageCatalogue, ImageContextFile, ImageLayer, ImageLayerPin, ImageLayerResourceSpec,
-    ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImagePinDigest, ImageRequest, ImageResolutionError, ImageSelection, ResolvedImage,
-    ShadowedImageLayer, LAYER_DEFINITION_FILE, LAYER_FRAGMENT_FILE, MAX_CONTEXT_FILE_BYTES,
+    ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImageRequest, ImageResolutionError, ImageSelection, PinArtifact, PinUnpack,
+    ResolvedImage, ShadowedImageLayer, ANY_ARCHITECTURE, LAYER_DEFINITION_FILE, LAYER_FRAGMENT_FILE, MAX_CONTEXT_FILE_BYTES,
 };
 pub mod delivery_hold;
 #[doc(hidden)]

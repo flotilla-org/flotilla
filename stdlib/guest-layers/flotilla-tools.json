@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "name": "flotilla-tools",
+  "members": [
+    {"role": "agent", "file": "bin/drydock-agent", "format": "elf"},
+    {"role": "cli", "file": "bin/flotilla-vessel", "install": "bin/flotilla", "format": "elf"},
+    {
+      "role": "cleat",
+      "file": "bin/cleat",
+      "install": "bin/cleat",
+      "format": "elf",
+      "loads": {"libraries": ["libghostty-vt.so.0"], "runpath": "$ORIGIN/../lib"}
+    },
+    {"role": "cleat-library", "file": "lib/libghostty-vt.so.0", "install": "lib/libghostty-vt.so.0", "format": "elf"},
+    {
+      "role": "terminfo",
+      "tree": "share/terminfo",
+      "install": "share/terminfo",
+      "requires": [{"path": "x/xterm-ghostty", "format": "terminfo"}, {"path": "LICENSE"}]
+    }
+  ],
+  "environment": {
+    "path": ["bin"],
+    "variables": {"TERMINFO_DIRS": ["share/terminfo", "/usr/share/terminfo"]}
+  }
+}

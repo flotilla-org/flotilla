@@ -30,7 +30,7 @@ RUN set -eu; \
     esac; \
     root=/opt/flotilla/toolchains/rust; \
     export RUSTUP_HOME="${root}/rustup" CARGO_HOME="${root}/cargo"; \
-    curl -fsSL "$(printf '%s' "${PIN_RUSTUP_URL}" | sed "s/{arch}/${arch}/g")" -o /tmp/rustup-init; \
+    curl -fsSL "${PIN_RUSTUP_URL}" -o /tmp/rustup-init; \
     printf '%s  %s\n' "${PIN_RUSTUP_SHA256}" /tmp/rustup-init | sha256sum --check --strict -; \
     curl -fsSL "${PIN_RUST_URL}" -o /tmp/channel-rust.toml; \
     printf '%s  %s\n' "${PIN_RUST_SHA256}" /tmp/channel-rust.toml | sha256sum --check --strict -; \

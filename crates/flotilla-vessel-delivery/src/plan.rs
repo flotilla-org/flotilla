@@ -7,7 +7,9 @@ use std::{
     path::PathBuf,
 };
 
-use crate::vocabulary::{Access, ContentDigest, FetchBy, HostReach, Item, Liveness, Mechanism, Need, NeedName, ProviderMechanisms};
+use crate::vocabulary::{
+    Access, ContentDigest, FetchBy, HostReach, Item, Liveness, Mechanism, Need, NeedName, ProviderMechanisms, Visibility,
+};
 
 /// The relative cost of each mechanism: a policy table, not code. The planner
 /// picks the cheapest mechanism that meets a need's requirements; a tie goes to
@@ -17,12 +19,13 @@ pub struct CostTable {
     pub host_path_live: u32,
     pub host_path_snapshot: u32,
     pub agent_fetch_url: u32,
+    pub agent_fetch_digest: u32,
     pub agent_push: u32,
 }
 
 impl Default for CostTable {
     fn default() -> Self {
-        Self { host_path_live: 0, host_path_snapshot: 1, agent_fetch_url: 2, agent_push: 3 }
+        Self { host_path_live: 0, host_path_snapshot: 1, agent_fetch_url: 2, agent_fetch_digest: 2, agent_push: 3 }
     }
 }
 
@@ -32,6 +35,7 @@ impl CostTable {
             Mechanism::HostPath { liveness: Liveness::Live, .. } => self.host_path_live,
             Mechanism::HostPath { liveness: Liveness::Snapshot, .. } => self.host_path_snapshot,
             Mechanism::AgentFetch { by: FetchBy::Url } => self.agent_fetch_url,
+            Mechanism::AgentFetch { by: FetchBy::Digest } => self.agent_fetch_digest,
             Mechanism::AgentPush => self.agent_push,
         }
     }
@@ -113,7 +117,10 @@ impl std::error::Error for PlanError {}
 /// - A home is durable and writable: a read-write host path over a writable
 ///   base that is host storage, otherwise agent push creates it in the vessel.
 /// - A tree is read-only: a read-only host path whose directory contains the tree's
-///   host copy, agent fetch when it has a URL, agent push when the controller holds it.
+///   host copy, agent fetch when it has a URL, agent fetch by digest when its digest
+///   sources are public and the vessel reaches public sources, agent push when the
+///   controller holds it (#3956 ruling: a private or unreachable artifact is fetched
+///   where its authority allows and pushed).
 /// - A need whose digest already landed through the chosen mechanism, at the same
 ///   guest path, is kept, unless its home is delivered again.
 ///
@@ -190,6 +197,9 @@ fn candidates(need: &Need, mechanisms: &ProviderMechanisms) -> Vec<(Mechanism, O
             }
             if sources.url {
                 candidates.push((Mechanism::AgentFetch { by: FetchBy::Url }, None));
+            }
+            if sources.digest == Some(Visibility::Public) && mechanisms.reach.vessel_public {
+                candidates.push((Mechanism::AgentFetch { by: FetchBy::Digest }, None));
             }
             if sources.controller {
                 candidates.push((Mechanism::AgentPush, None));

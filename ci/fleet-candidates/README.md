@@ -640,12 +640,27 @@ valid for decoding and rollback, but without a catalog their guest provisioning
 reports a missing build.
 
 `share/flotilla/guest-tools/catalog.json` indexes the OCI target `linux/amd64`.
-Its tree at `share/flotilla/guest-tools/linux-amd64` contains
-`bin/{drydock-agent,flotilla-vessel,cleat}`, `lib/libghostty-vt.so.0`, and the
-complete `share/terminfo` database including aliases and license. Executable
-permissions and Cleat's `$ORIGIN/../lib` loader layout travel together. The
-catalog records the existing source set, Actions run identity (cohort), and each
-file's size and SHA-256. The run is bound to the promoted generation's
+What its tree at `share/flotilla/guest-tools/linux-amd64` contains is declared
+once, in the built source's `stdlib/guest-layers/*.json` (#3874).
+
+Today the declaration names:
+- `bin/{drydock-agent,flotilla-vessel,cleat}`;
+- `lib/libghostty-vt.so.0`, which Cleat loads through `$ORIGIN/../lib`;
+- the complete `share/terminfo` database, including aliases and the license.
+
+The validator holds no tool inventory. Production copies each declared member
+and embeds the declaration in the catalog as `layers`. That key is additive, so
+the catalog stays schema 1 and installed validators accept it. Production also
+refuses a catalog whose embedded copy differs from the source.
+
+Later doors check every member against the embedded copy, which the archive
+digest authenticates. Those checks cover missing members, undeclared files,
+native machine, loader dependencies, compiled terminfo and digests. A catalog
+without `layers` predates the declaration and is checked against the legacy
+composition for one roll (ADR 0047).
+
+The catalog records the existing source set, Actions run identity (cohort), and
+each file's size and SHA-256. The run is bound to the promoted generation's
 `source_run.api_run_id`; a source-identical build from another run is a different
 cohort.
 

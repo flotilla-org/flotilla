@@ -4,8 +4,8 @@ use std::{
 };
 
 use flotilla_resources::{
-    parse_layer_directory_with_executables, ImageContextFile, ImageLayerPin, ImageLayerSource, ImageLayerSpec, ImageLayerTier,
-    ImagePinDigest,
+    parse_layer_directory_with_executables, ImageContextFile, ImageLayerPin, ImageLayerSource, ImageLayerSpec, ImageLayerTier, PinArtifact,
+    PinUnpack,
 };
 use hegel::generators as gs;
 
@@ -29,6 +29,19 @@ fn layer(name: &str, tier: ImageLayerTier, fragment: &str) -> ImageLayerSpec {
         .build()
 }
 
+/// A pin with one artifact per `(architecture, url, sha256)`.
+fn pin(version: &str, artifacts: &[(&str, &str, String)]) -> ImageLayerPin {
+    ImageLayerPin {
+        version: version.into(),
+        artifacts: artifacts
+            .iter()
+            .map(|(architecture, url, sha256)| {
+                (architecture.to_string(), PinArtifact { url: url.to_string(), sha256: sha256.clone(), unpack: PinUnpack::TarGz })
+            })
+            .collect(),
+    }
+}
+
 fn is_from(line: &str) -> bool {
     line.split_whitespace().next().is_some_and(|word| word.eq_ignore_ascii_case("FROM"))
 }
@@ -40,15 +53,10 @@ fn expected_args(layer: &ImageLayerSpec, architecture: &str) -> Vec<String> {
     for (name, pin) in &layer.pins {
         let key = name.to_uppercase().replace('-', "_");
         args.push(format!("ARG PIN_{key}_VERSION={}\n", pin.version));
-        if let Some(url) = &pin.url {
-            args.push(format!("ARG PIN_{key}_URL={url}\n"));
-        }
-        if let Some(sha256) = &pin.sha256 {
-            let hex = match sha256 {
-                ImagePinDigest::Single(hex) => hex,
-                ImagePinDigest::PerArchitecture(map) => &map[architecture],
-            };
-            args.push(format!("ARG PIN_{key}_SHA256={hex}\n"));
+        if let Some(artifact) = pin.artifacts.get(architecture).or_else(|| pin.artifacts.get("any")) {
+            args.push(format!("ARG PIN_{key}_URL={}\n", artifact.url));
+            args.push(format!("ARG PIN_{key}_SHA256={}\n", artifact.sha256));
+            args.push(format!("ARG PIN_{key}_UNPACK={}\n", artifact.unpack.as_str()));
         }
     }
     args
@@ -96,7 +104,7 @@ fn assert_structure(layers: &[ImageLayerSpec], architecture: &str, dockerfile: &
 #[test]
 fn small_composition_renders_golden_dockerfile() {
     let mut base = layer("base", ImageLayerTier::Base, "FROM ${BASE}\nRUN apt-get update\n");
-    base.pins.insert("apt-snapshot".into(), ImageLayerPin { version: "20261012T000000Z".into(), url: None, sha256: None });
+    base.pins.insert("apt-snapshot".into(), pin("20261012T000000Z", &[]));
     let mut tool = layer(
         "tool",
         ImageLayerTier::Shared,
@@ -104,17 +112,19 @@ fn small_composition_renders_golden_dockerfile() {
     );
     tool.pins.insert(
         "tool".into(),
-        ImageLayerPin {
-            version: "2.0".into(),
-            url: Some("https://example.test/tool-{arch}.tar.gz".into()),
-            sha256: Some(ImagePinDigest::PerArchitecture(BTreeMap::from([("amd64".into(), hex('a')), ("arm64".into(), hex('b'))]))),
-        },
+        pin(
+            "2.0",
+            &[
+                ("amd64", "https://example.test/tool-x86_64.tar.gz", hex('a')),
+                ("arm64", "https://example.test/tool-aarch64.tar.gz", hex('b')),
+            ],
+        ),
     );
     tool.context_files.insert("bin/run".into(), ImageContextFile { content: "#!/bin/sh\n".into(), executable: true });
     tool.build_secrets.insert("npm-token".into());
     let generated = generate_build(&[base, tool.clone()], "arm64").expect("generate");
     let tool_args =
-        format!("ARG PIN_TOOL_VERSION=2.0\nARG PIN_TOOL_URL=https://example.test/tool-{{arch}}.tar.gz\nARG PIN_TOOL_SHA256={}\n", hex('b'));
+        format!("ARG PIN_TOOL_VERSION=2.0\nARG PIN_TOOL_URL=https://example.test/tool-aarch64.tar.gz\nARG PIN_TOOL_SHA256={}\nARG PIN_TOOL_UNPACK=tar.gz\n", hex('b'));
     let expected = format!(
         "# syntax=docker/dockerfile:1.17\n\
          \n# flotilla layer 0: base 1.0\n\
@@ -136,20 +146,13 @@ fn small_composition_renders_golden_dockerfile() {
     assert_eq!(generated.secrets, BTreeSet::from(["npm-token".to_string()]));
 }
 
-// A per-architecture checksum without the target architecture refuses the
+// A pin without an artifact for the target architecture refuses the
 // build, naming the pin and the architecture; invalid compositions are refused.
 #[test]
 fn refuses_missing_architecture_checksum_and_malformed_compositions() {
     let base = layer("base", ImageLayerTier::Base, "FROM ${BASE}\n");
     let mut tool = layer("tool", ImageLayerTier::Shared, "FROM ${BASE}\n");
-    tool.pins.insert(
-        "codex".into(),
-        ImageLayerPin {
-            version: "1".into(),
-            url: Some("https://example.test/x".into()),
-            sha256: Some(ImagePinDigest::PerArchitecture(BTreeMap::from([("amd64".into(), hex('a'))]))),
-        },
-    );
+    tool.pins.insert("codex".into(), pin("1", &[("amd64", "https://example.test/x", hex('a'))]));
     generate_build(&[base.clone(), tool.clone()], "amd64").expect("amd64 checksum present");
     let error = generate_build(&[base.clone(), tool.clone()], "arm64").expect_err("arm64 checksum absent");
     assert!(error.contains("`codex`") && error.contains("`arm64`") && error.contains("`tool`"), "{error}");
@@ -175,10 +178,10 @@ fn refuses_missing_architecture_checksum_and_malformed_compositions() {
 #[test]
 fn pin_values_needing_quotes_are_escaped() {
     let mut base = layer("base", ImageLayerTier::Base, "FROM ${BASE}\n");
-    base.pins.insert("odd".into(), ImageLayerPin { version: "1 $HOME \"q\" \\".into(), url: None, sha256: None });
+    base.pins.insert("odd".into(), pin("1 $HOME \"q\" \\", &[]));
     let generated = generate_build(&[base.clone()], "amd64").expect("generate");
     assert!(generated.dockerfile.contains("ARG PIN_ODD_VERSION=\"1 \\$HOME \\\"q\\\" \\\\\"\n"), "{}", generated.dockerfile);
-    base.pins.insert("odd".into(), ImageLayerPin { version: "1\n2".into(), url: None, sha256: None });
+    base.pins.insert("odd".into(), pin("1\n2", &[]));
     assert!(generate_build(&[base], "amd64").is_err());
 }
 
@@ -215,10 +218,7 @@ fn pin_values_with_url_punctuation_round_trip() {
     ];
     for value in values {
         let mut base = layer("base", ImageLayerTier::Base, "FROM ${BASE}\n");
-        base.pins.insert(
-            "tool".into(),
-            ImageLayerPin { version: "1".into(), url: Some(value.into()), sha256: Some(ImagePinDigest::Single(hex('a'))) },
-        );
+        base.pins.insert("tool".into(), pin("1", &[("any", value, hex('a'))]));
         let generated = generate_build(&[base], "amd64").expect("generate");
         assert_eq!(dockerfile_arg_value(&generated.dockerfile, "PIN_TOOL_URL").as_deref(), Some(value), "{}", generated.dockerfile);
     }
@@ -292,18 +292,17 @@ fn generated_dockerfile_is_deterministic_chained_and_preserves_fragments(tc: heg
         }
         let mut spec = layer(&name, tier, &fragment);
         for pin in 0..tc.draw(gs::integers::<usize>().min_value(0).max_value(2)) {
-            let sha256 = match tc.draw(gs::integers::<usize>().min_value(0).max_value(2)) {
-                0 => None,
-                1 => Some(ImagePinDigest::Single(hex('c'))),
-                _ => Some(ImagePinDigest::PerArchitecture(BTreeMap::from([("amd64".into(), hex('a')), ("arm64".into(), hex('b'))]))),
+            let artifacts = match tc.draw(gs::integers::<usize>().min_value(0).max_value(2)) {
+                0 => vec![],
+                1 => vec![("any", format!("https://example.test/p{pin}"), hex('c'))],
+                _ => vec![
+                    ("amd64", format!("https://example.test/p{pin}/x86_64"), hex('a')),
+                    ("arm64", format!("https://example.test/p{pin}/aarch64"), hex('b')),
+                ],
             };
-            // Only a per-architecture digest may pair with an `{arch}` URL;
-            // validation rejects a single digest for an arch-varying URL.
-            let url = sha256.as_ref().map(|digest| match digest {
-                ImagePinDigest::Single(_) => format!("https://example.test/p{pin}"),
-                ImagePinDigest::PerArchitecture(_) => format!("https://example.test/p{pin}/{{arch}}"),
-            });
-            spec.pins.insert(format!("p-{pin}"), ImageLayerPin { version: format!("{pin}.0"), url, sha256 });
+            let artifacts =
+                artifacts.iter().map(|(architecture, url, sha256)| (*architecture, url.as_str(), sha256.clone())).collect::<Vec<_>>();
+            spec.pins.insert(format!("p-{pin}"), self::pin(&format!("{pin}.0"), &artifacts));
         }
         if tc.draw(gs::booleans()) {
             spec.context_files
@@ -361,10 +360,9 @@ fn stdlib_base_bounds_apt_fetches_before_bootstrap() {
 
 // The shipped stdlib layers (`stdlib/image-layers/` at the workspace root,
 // the same directories the daemon embeds) compose into one Dockerfile per
-// architecture: the
-// structural contract holds, `{arch}` pin URLs are emitted verbatim, the
-// architecture's checksum is selected, and declared context files (with
-// their executable bits) become one named context per layer.
+// architecture: the structural contract holds, every pin has an artifact for
+// the target, and declared context files (with their executable bits) become
+// one named context per layer.
 #[test]
 fn stdlib_layers_generate_for_both_architectures() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stdlib/image-layers");
@@ -384,11 +382,6 @@ fn stdlib_layers_generate_for_both_architectures() {
     for architecture in ["amd64", "arm64"] {
         let generated = generate_build(&layers, architecture).expect("stdlib generates");
         assert_structure(&layers, architecture, &generated.dockerfile);
-        let codex = &layers[8].pins["codex"];
-        let ImagePinDigest::PerArchitecture(digests) = codex.sha256.as_ref().expect("codex sha") else { panic!("per-arch codex pin") };
-        assert!(generated.dockerfile.contains(&format!("ARG PIN_CODEX_URL={}\n", codex.url.as_deref().expect("url"))));
-        assert!(generated.dockerfile.contains("codex-package-{arch}-unknown-linux-musl.tar.gz"));
-        assert!(generated.dockerfile.contains(&format!("ARG PIN_CODEX_SHA256={}\n", digests[architecture])));
         assert!(generated.dockerfile.contains("FROM flotilla-layer-7 AS harness-codex-fetch\n"));
         assert!(generated.dockerfile.contains("FROM flotilla-layer-7 AS flotilla-layer-8\n"));
         let contexts: Vec<_> = generated.contexts.iter().map(|context| context.name.as_str()).collect();

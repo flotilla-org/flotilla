@@ -1,5 +1,7 @@
 //! Resolve a complete guest build from the installed, verified generation.
-//! Controller-native binaries never participate in this lookup.
+//! Controller-native binaries never participate in this lookup. What the build
+//! must contain comes from this release's composition declaration
+//! ([`crate::composition`]), never from the payload being checked.
 //! [Workload and invalidation choices](../../../docs/implementation-choices/guest-tools.md).
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11,9 +13,10 @@ use drydock_protocol::Platform;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::composition::{self, Composition, FileFormat, Source};
+
 const PREFIX: &str = "share/flotilla/guest-tools";
 const TREE: &str = "share/flotilla/guest-tools/linux-amd64";
-const NATIVE: &[&str] = &["bin/drydock-agent", "bin/flotilla-vessel", "bin/cleat", "lib/libghostty-vt.so.0"];
 
 #[derive(Deserialize)]
 struct Catalog {
@@ -34,10 +37,11 @@ struct File {
     size_bytes: u64,
 }
 
-/// All paths have been validated together before any connection or guest push.
+/// All members have been validated together before any connection or guest push.
 #[derive(Clone)]
 pub struct GuestTools {
     root: PathBuf,
+    composition: &'static Composition,
 }
 impl GuestTools {
     pub fn installed(platform: &Platform) -> Result<Self, String> {
@@ -63,10 +67,15 @@ impl GuestTools {
         Self::resolve(generation, guest)
     }
     pub fn resolve(generation: &Path, platform: &Platform) -> Result<Self, String> {
+        Self::resolve_with(generation, platform, composition::flotilla_tools())
+    }
+    /// Verify `generation`'s guest build against `composition`.
+    pub fn resolve_with(generation: &Path, platform: &Platform, composition: &'static Composition) -> Result<Self, String> {
         let refuse = |message: String| format!("guest platform {platform}: {message}");
         if platform != &linux_amd64() {
             return Err(refuse("NoPlatformBuild: only linux/amd64 is admitted".into()));
         }
+        let machine = composition::elf_machine(&platform.architecture).ok_or_else(|| refuse("NoPlatformBuild: no native format".into()))?;
         let read = |path: &Path| fs::read(path).map_err(|e| refuse(format!("missing or unreadable artifact {}: {e}", path.display())));
         let catalog_path = generation.join(PREFIX).join("catalog.json");
         if !catalog_path.is_file() {
@@ -102,12 +111,10 @@ impl GuestTools {
         let mut declared = BTreeSet::new();
         for file in &entry.files {
             let path = Path::new(&file.path);
-            if path.components().any(|part| !matches!(part, std::path::Component::Normal(_)))
-                || (!NATIVE.contains(&file.path.as_str()) && !file.path.starts_with("share/terminfo/"))
-                || !declared.insert(file.path.clone())
-            {
+            if path.components().any(|part| !matches!(part, std::path::Component::Normal(_))) || !declared.insert(file.path.clone()) {
                 return Err(refuse(format!("unsafe or duplicate artifact {}", file.path)));
             }
+            let member = owner(composition, &file.path).ok_or_else(|| refuse(format!("undeclared artifact {}", file.path)))?;
             let path = root.join(path);
             if !path.canonicalize().map_err(|e| refuse(e.to_string()))?.starts_with(root.canonicalize().map_err(|e| refuse(e.to_string()))?)
             {
@@ -121,20 +128,35 @@ impl GuestTools {
             if content.len() as u64 != file.size_bytes || format!("{:x}", Sha256::digest(&content)) != file.sha256 {
                 return Err(refuse(format!("digest/size mismatch: {}", file.path)));
             }
-            if NATIVE.contains(&file.path.as_str()) {
-                validate_native(&content, &file.path).map_err(refuse)?;
-                use std::os::unix::fs::PermissionsExt;
-                if fs::metadata(&path).map_err(|e| refuse(e.to_string()))?.permissions().mode() & 0o111 == 0 {
-                    return Err(refuse(format!("native artifact is not executable: {}", file.path)));
+            match (&member.source, member.format) {
+                (Source::File(_), Some(FileFormat::Elf)) => {
+                    composition::validate_elf(&content, &file.path, machine, member.loads.as_ref()).map_err(refuse)?;
+                    use std::os::unix::fs::PermissionsExt;
+                    if metadata.permissions().mode() & 0o111 == 0 {
+                        return Err(refuse(format!("native artifact is not executable: {}", file.path)));
+                    }
                 }
-            }
-            if file.path == "share/terminfo/x/xterm-ghostty" && !content.starts_with(&[0x1a, 1]) && !content.starts_with(&[0x1e, 2]) {
-                return Err(refuse("invalid compiled terminfo".into()));
+                (Source::File(_), Some(FileFormat::Terminfo)) => composition::validate_terminfo(&content, &file.path).map_err(refuse)?,
+                (Source::Tree(tree), _) => {
+                    let entry = file.path.strip_prefix(tree).map(|rest| rest.trim_start_matches('/'));
+                    if member
+                        .requires
+                        .iter()
+                        .any(|required| Some(required.path.as_str()) == entry && required.format == Some(FileFormat::Terminfo))
+                    {
+                        composition::validate_terminfo(&content, &file.path).map_err(refuse)?;
+                    }
+                }
+                (Source::File(_), None) => {}
             }
         }
-        for name in NATIVE.iter().copied().chain(["share/terminfo/x/xterm-ghostty", "share/terminfo/LICENSE"]) {
-            if !declared.contains(name) {
-                return Err(refuse(format!("missing artifact {name}")));
+        for member in &composition.members {
+            let required: Vec<String> = match &member.source {
+                Source::File(file) => vec![file.clone()],
+                Source::Tree(tree) => member.requires.iter().map(|entry| format!("{tree}/{}", entry.path)).collect(),
+            };
+            if let Some(missing) = required.into_iter().find(|name| !declared.contains(name)) {
+                return Err(refuse(format!("missing {} artifact {missing}", member.role)));
             }
         }
         fn inventory(root: &Path, relative: &Path, files: &mut BTreeSet<String>) -> Result<(), String> {
@@ -160,94 +182,48 @@ impl GuestTools {
         if actual != declared {
             return Err(refuse("unindexed or missing guest artifacts".into()));
         }
-        Ok(Self { root })
+        Ok(Self { root, composition })
+    }
+    /// The verified file a typed caller needs, by its declared role.
+    pub fn file(&self, role: &str) -> PathBuf {
+        match self.composition.member(role).map(|member| &member.source) {
+            Some(Source::File(file)) => self.root.join(file),
+            _ => unreachable!("the composition declares file role `{role}`"),
+        }
+    }
+    pub fn composition(&self) -> &'static Composition {
+        self.composition
+    }
+    /// The verified tree, laid out by the members' generation paths.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
     pub fn agent(&self) -> PathBuf {
-        self.root.join("bin/drydock-agent")
-    }
-    pub fn flotilla(&self) -> PathBuf {
-        self.root.join("bin/flotilla-vessel")
-    }
-    pub fn cleat(&self) -> PathBuf {
-        self.root.join("bin/cleat")
-    }
-    pub fn library(&self) -> PathBuf {
-        self.root.join("lib/libghostty-vt.so.0")
-    }
-    pub fn terminfo(&self) -> PathBuf {
-        self.root.join("share/terminfo")
+        self.file(composition::role::AGENT)
     }
 }
+
+/// The member whose file or tree contains `path`.
+fn owner<'a>(composition: &'a Composition, path: &str) -> Option<&'a composition::Member> {
+    composition.members.iter().find(|member| match &member.source {
+        Source::File(file) => file == path,
+        Source::Tree(tree) => Path::new(path).starts_with(tree) && path != tree,
+    })
+}
+
 pub fn linux_amd64() -> Platform {
     Platform::new("linux", "amd64")
 }
 
-pub fn validate_native(bytes: &[u8], artifact: &str) -> Result<(), String> {
-    if bytes.len() < 64 || !bytes.starts_with(b"\x7fELF\x02\x01") || bytes[18..20] != [62, 0] {
-        return Err(format!("invalid ELF64 little-endian amd64 artifact {artifact}"));
-    }
-    if artifact != "bin/cleat" {
-        return Ok(());
-    }
-    let invalid = || format!("incompatible cleat native loader layout: {artifact}");
-    let number = |offset: usize, size: usize| -> Result<u64, String> {
-        let part = bytes.get(offset..offset.checked_add(size).ok_or_else(invalid)?).ok_or_else(invalid)?;
-        Ok(part.iter().enumerate().fold(0u64, |n, (i, b)| n | (u64::from(*b) << (8 * i))))
+/// Verify bytes read for `role` against this release's declaration, for
+/// callers that read a member themselves (the agent bootstrap).
+pub fn validate_native(bytes: &[u8], role: &str, platform: &Platform) -> Result<(), String> {
+    let member = composition::flotilla_tools().member(role).ok_or_else(|| format!("no guest member `{role}`"))?;
+    let machine = composition::elf_machine(&platform.architecture).ok_or_else(|| format!("guest platform {platform}: no native format"))?;
+    let name = match &member.source {
+        Source::File(file) | Source::Tree(file) => file,
     };
-    let table = usize::try_from(number(32, 8)?).map_err(|_| invalid())?;
-    let stride = number(54, 2)? as usize;
-    let count = number(56, 2)? as usize;
-    if stride < 56 || table.checked_add(stride.checked_mul(count).ok_or_else(invalid)?).is_none_or(|end| end > bytes.len()) {
-        return Err(invalid());
-    }
-    let mut loads = Vec::new();
-    let mut dynamic = None;
-    for index in 0..count {
-        let start = table + stride * index;
-        let segment = (number(start + 8, 8)?, number(start + 16, 8)?, number(start + 32, 8)?);
-        match number(start, 4)? {
-            1 => loads.push(segment),
-            2 => dynamic = Some(segment),
-            _ => {}
-        }
-    }
-    let (offset, _, size) = dynamic.ok_or_else(invalid)?;
-    let end = offset.checked_add(size).ok_or_else(invalid)?;
-    if end > bytes.len() as u64 || size % 16 != 0 {
-        return Err(invalid());
-    }
-    let mut tags = Vec::new();
-    for start in (offset as usize..end as usize).step_by(16) {
-        let tag = number(start, 8)?;
-        if tag == 0 {
-            break;
-        }
-        tags.push((tag, number(start + 8, 8)?));
-    }
-    let strings = tags.iter().find_map(|(tag, value)| (*tag == 5).then_some(*value)).ok_or_else(invalid)?;
-    let (offset, address, _) =
-        loads.into_iter().find(|(_, address, size)| strings >= *address && strings - address < *size).ok_or_else(invalid)?;
-    let base = offset.checked_add(strings - address).ok_or_else(invalid)?;
-    let mut library = false;
-    let mut relative = false;
-    for (tag, value) in tags {
-        if !matches!(tag, 1 | 15 | 29) {
-            continue;
-        }
-        let start = usize::try_from(base.checked_add(value).ok_or_else(invalid)?).map_err(|_| invalid())?;
-        let tail = bytes.get(start..).ok_or_else(invalid)?;
-        let string = &tail[..tail.iter().position(|b| *b == 0).ok_or_else(invalid)?];
-        if tag == 1 && string == b"libghostty-vt.so.0" {
-            library = true;
-        }
-        if matches!(tag, 15 | 29) && string.split(|b| *b == b':').any(|part| part == b"$ORIGIN/../lib") {
-            relative = true;
-        }
-    }
-    if !library || !relative {
-        return Err(invalid());
-    }
-    Ok(())
+    composition::validate_elf(bytes, name, machine, member.loads.as_ref())
 }
 
 #[cfg(test)]
@@ -262,7 +238,7 @@ mod tests {
     fn controller_identity_cannot_replace_guest_build(tc: hegel::TestCase) {
         use hegel::generators as gs;
         let controller = tc.draw(gs::integers::<usize>().min_value(0).max_value(1));
-        let fault = tc.draw(gs::integers::<usize>().min_value(0).max_value(10));
+        let fault = tc.draw(gs::integers::<usize>().min_value(0).max_value(13));
         let temporary = tempfile::tempdir().expect("generation");
         let root = temporary.path();
         let files = write_guest_fixture(root);
@@ -270,6 +246,19 @@ mod tests {
         manifest["platform"] = ["linux-x86_64-gnu2.36", "darwin-aarch64"][controller].into();
         fs::write(root.join("manifest.json"), serde_json::to_vec(&manifest).expect("manifest")).expect("manifest");
         let native = root.join(TREE).join("bin/cleat");
+        let rewrite_catalog = |path: &str, bytes: &[u8]| {
+            let mut catalog: serde_json::Value =
+                serde_json::from_slice(&fs::read(root.join(PREFIX).join("catalog.json")).expect("catalog")).expect("catalog");
+            let record = catalog["platforms"]["linux/amd64"]["files"]
+                .as_array_mut()
+                .expect("records")
+                .iter_mut()
+                .find(|record| record["path"] == path)
+                .expect("record");
+            record["sha256"] = format!("{:x}", Sha256::digest(bytes)).into();
+            record["size_bytes"] = bytes.len().into();
+            fs::write(root.join(PREFIX).join("catalog.json"), serde_json::to_vec(&catalog).expect("catalog")).expect("catalog mutation");
+        };
         match fault {
             0 => {}
             1 => fs::remove_file(root.join(TREE).join("bin/drydock-agent")).expect("remove member"),
@@ -286,27 +275,40 @@ mod tests {
             }
             6 => fs::remove_file(root.join(TREE).join("lib/libghostty-vt.so.0")).expect("library"),
             7 => fs::remove_file(root.join(TREE).join("share/terminfo/x/xterm-ghostty-alias")).expect("alias"),
-            8 | 9 => {
+            8 | 9 | 12 | 13 => {
                 let mut bytes = fs::read(&native).expect("native fixture");
-                if fault == 8 {
-                    bytes[18] = 183;
-                } else {
-                    let start = bytes.windows(b"$ORIGIN/../lib".len()).position(|part| part == b"$ORIGIN/../lib").expect("rpath");
-                    bytes[start] = b'/';
+                let field =
+                    |bytes: &[u8], at: usize, size: usize| bytes[at..at + size].iter().rev().fold(0, |n, b| n << 8 | usize::from(*b));
+                match fault {
+                    8 => bytes[18] = 183,
+                    9 => {
+                        let start = bytes.windows(b"$ORIGIN/../lib".len()).position(|part| part == b"$ORIGIN/../lib").expect("rpath");
+                        bytes[start] = b'/';
+                    }
+                    // Program headers past the end of the file.
+                    12 => bytes.truncate(field(&bytes, 32, 8) + 8),
+                    // A dynamic section that is not a whole number of entries.
+                    _ => {
+                        let (table, stride) = (field(&bytes, 32, 8), field(&bytes, 54, 2));
+                        let dynamic =
+                            (0..field(&bytes, 56, 2)).map(|i| table + stride * i).find(|&at| field(&bytes, at, 4) == 2).expect("dynamic");
+                        bytes[dynamic + 32] ^= 8;
+                    }
                 }
                 fs::write(&native, &bytes).expect("native mutation");
-                let mut catalog: serde_json::Value = serde_json::from_slice(&files[&format!("{PREFIX}/catalog.json")]).expect("catalog");
-                let record = catalog["platforms"]["linux/amd64"]["files"]
-                    .as_array_mut()
-                    .expect("records")
-                    .iter_mut()
-                    .find(|record| record["path"] == "bin/cleat")
-                    .expect("cleat record");
-                record["sha256"] = format!("{:x}", Sha256::digest(&bytes)).into();
-                fs::write(root.join(PREFIX).join("catalog.json"), serde_json::to_vec(&catalog).expect("catalog"))
-                    .expect("catalog mutation");
+                rewrite_catalog("bin/cleat", &bytes);
             }
             10 => fs::write(root.join(TREE).join("share/terminfo/unindexed"), b"unverified").expect("extra artifact"),
+            11 => {
+                // An undeclared member indexed by the catalog cannot validate itself.
+                fs::write(root.join(TREE).join("bin/extra"), b"extra").expect("extra member");
+                let mut catalog: serde_json::Value =
+                    serde_json::from_slice(&fs::read(root.join(PREFIX).join("catalog.json")).expect("catalog")).expect("catalog");
+                catalog["platforms"]["linux/amd64"]["files"].as_array_mut().expect("records").push(serde_json::json!({
+                    "path": "bin/extra", "sha256": format!("{:x}", Sha256::digest(b"extra")), "size_bytes": 5
+                }));
+                fs::write(root.join(PREFIX).join("catalog.json"), serde_json::to_vec(&catalog).expect("catalog")).expect("catalog");
+            }
             _ => unreachable!(),
         }
         let controller = [linux_amd64(), Platform::new("darwin", "arm64")][controller].clone();
@@ -314,10 +316,48 @@ mod tests {
         if fault == 0 {
             let tools = result.expect("matching guest build");
             assert_eq!(fs::read(tools.agent()).expect("agent"), files[&format!("{TREE}/bin/drydock-agent")]);
-            assert_eq!(fs::read(tools.flotilla()).expect("CLI"), files[&format!("{TREE}/bin/flotilla-vessel")]);
+            assert_eq!(fs::read(tools.file(composition::role::CLI)).expect("CLI"), files[&format!("{TREE}/bin/flotilla-vessel")]);
         } else {
             assert!(result.err().expect("invalid guest build must refuse").contains("guest platform linux/amd64"));
         }
         assert!(GuestTools::resolve(root, &Platform::new("linux", "arm64")).err().expect("unsupported target").contains("NoPlatformBuild"));
+    }
+
+    // #3874 acceptance: a declared additional tool and companion tree validate
+    // through the declaration alone; the shipped declaration refuses them, and
+    // dropping a declared companion entry is refused by name.
+    #[test]
+    fn an_added_tool_and_companion_validate_through_the_declaration_alone() {
+        let temporary = tempfile::tempdir().expect("generation");
+        let root = temporary.path();
+        write_guest_fixture(root);
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(PREFIX).join("catalog.json")).expect("catalog")).expect("catalog");
+        for (path, bytes) in [("bin/extra", &b"#!/bin/sh\n"[..]), ("share/extra/data/manifest", b"companion")] {
+            fs::create_dir_all(root.join(TREE).join(path).parent().expect("parent")).expect("parent");
+            fs::write(root.join(TREE).join(path), bytes).expect("extra file");
+            catalog["platforms"]["linux/amd64"]["files"].as_array_mut().expect("records").push(serde_json::json!({
+                "path": path, "sha256": format!("{:x}", Sha256::digest(bytes)), "size_bytes": bytes.len()
+            }));
+        }
+        fs::write(root.join(PREFIX).join("catalog.json"), serde_json::to_vec(&catalog).expect("catalog")).expect("catalog");
+        let mut extended = serde_json::to_value(composition::flotilla_tools()).expect("declaration");
+        let members = extended["members"].as_array_mut().expect("members");
+        members.push(serde_json::json!({"role": "extra", "file": "bin/extra", "install": "bin/extra"}));
+        members.push(serde_json::json!({"role": "extra-data", "tree": "share/extra", "install": "share/extra", "requires": [{"path": "data/manifest"}]}));
+        let extended: &'static Composition = Box::leak(Box::new(Composition::parse(&extended.to_string()).expect("extended declaration")));
+        let tools = GuestTools::resolve_with(root, &linux_amd64(), extended).expect("extended build validates");
+        assert_eq!(fs::read(tools.file("extra")).expect("extra"), b"#!/bin/sh\n");
+        assert!(GuestTools::resolve(root, &linux_amd64()).err().expect("shipped declaration").contains("undeclared artifact bin/extra"));
+        fs::remove_file(root.join(TREE).join("share/extra/data/manifest")).expect("drop companion");
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(PREFIX).join("catalog.json")).expect("catalog")).expect("catalog");
+        catalog["platforms"]["linux/amd64"]["files"]
+            .as_array_mut()
+            .expect("records")
+            .retain(|record| record["path"] != "share/extra/data/manifest");
+        fs::write(root.join(PREFIX).join("catalog.json"), serde_json::to_vec(&catalog).expect("catalog")).expect("catalog");
+        let error = GuestTools::resolve_with(root, &linux_amd64(), extended).err().expect("missing companion");
+        assert!(error.contains("missing extra-data artifact share/extra/data/manifest"), "{error}");
     }
 }

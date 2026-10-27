@@ -248,7 +248,7 @@ async fn two_vessels_on_one_host_each_get_their_own_agent_and_socket() {
         assert_eq!(std::fs::metadata(&vessel.paths.agent).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(shell(vessel, "printf %s \"$FLOTILLA_DAEMON_SOCKET\"").await, vessel.paths.daemon_socket().display().to_string());
         assert_eq!(shell(vessel, "printf %s \"$FLOTILLA_ENVIRONMENT_ID\"").await, ENVIRONMENT);
-        assert!(shell(vessel, "printf %s \"$PATH\"").await.starts_with(&vessel.paths.cli_directory().display().to_string()));
+        assert!(shell(vessel, "printf %s \"$PATH\"").await.starts_with(&vessel.paths.generation_path().join(":")));
         assert!(vessel.paths.cleat_runtime().is_dir());
     }
 
@@ -410,7 +410,7 @@ fn vessel_environment_is_composed_from_the_layer_supplies_and_forward() {
     let paths = VesselPaths::new(&host.profile.env_bag, &VesselKey::new(&host.profile.environment_id, "v")).expect("paths");
     let environment = vessel_environment(&host.profile, &paths).expect("environment");
     let home = host.home.path().display().to_string();
-    assert_eq!(environment["PATH"], format!("{}:{home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin", paths.cli_directory().display()));
+    assert_eq!(environment["PATH"], format!("{}:{home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin", paths.generation_path().join(":")));
     assert_eq!(environment["CARGO_HOME"], format!("{home}/.cargo"));
     assert_eq!(environment["HOME"], home);
     assert_eq!(environment["USER"], "crew");
