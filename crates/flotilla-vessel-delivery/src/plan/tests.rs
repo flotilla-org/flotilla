@@ -3,13 +3,13 @@ use std::{collections::BTreeMap, path::PathBuf};
 use hegel::generators as gs;
 
 use super::*;
-use crate::vocabulary::{HostPathOffer, Reachability, RelativePath, TreeSources, Visibility};
+use crate::vocabulary::{HomeBase, HostPathOffer, Reachability, RelativePath, TreeSources, Visibility};
 
 fn home(name: &str) -> Need {
     Need {
         name: NeedName::new(name),
         digest: ContentDigest::new(format!("{name}-key")),
-        item: Item::Home { key: RelativePath::new(format!("agent-homes/{name}")).expect("key") },
+        item: Item::Home { key: RelativePath::new(format!("agent-homes/{name}")).expect("key"), base: HomeBase::Durable },
     }
 }
 

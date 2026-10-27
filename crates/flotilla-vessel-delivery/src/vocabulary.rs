@@ -104,10 +104,21 @@ pub struct Need {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Item {
-    /// A durable, writable directory at `key` under the target's writable base.
-    Home { key: RelativePath },
+    /// A writable directory at `key` under the target's base for `base`.
+    Home { key: RelativePath, base: HomeBase },
     /// A tree placed read-only at `path` inside the home need named `home`.
     Tree { home: NeedName, path: RelativePath, sources: TreeSources },
+}
+
+/// Which of the target's bases a home lives under (#4012).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HomeBase {
+    /// The durable home base, which outlives a reboot: a harness home, holding the
+    /// occupant's own state and transcripts.
+    Durable,
+    /// The writable base, which on a host may be a tmpfs: material such as a token
+    /// file, which a reboot may clear and the next delivery puts back.
+    Runtime,
 }
 
 /// Where a tree's content can come from.
@@ -214,8 +225,8 @@ impl std::str::FromStr for Mechanism {
 /// What a host-path offer reaches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostReach {
-    /// The target's writable base is itself durable host storage, as on an SSH
-    /// host whose agent runs on the host's own filesystem.
+    /// The target's bases are themselves host storage, as on an SSH host whose
+    /// agent runs on the host's own filesystem.
     WritableBase,
     /// The controller-host directory `host` is visible in the guest at `guest`.
     Directory { host: PathBuf, guest: PathBuf },

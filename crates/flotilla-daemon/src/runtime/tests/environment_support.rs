@@ -177,7 +177,13 @@ impl CommandRunner for CredentialInteriorRunner {
         self.0.path_exists(path).await
     }
 
+    // As a container's runner does, it declares a persistent config base apart from its
+    // scratch base, so harness homes stay on the container's own disk (#4012).
     async fn writable_scratch_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
+        Ok(PathBuf::from("/tmp/flotilla"))
+    }
+
+    async fn writable_config_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
         Ok(PathBuf::from("/home/crew/flotilla"))
     }
 

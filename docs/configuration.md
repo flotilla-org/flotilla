@@ -154,14 +154,19 @@ tool session, which names no vessel, is refused.
 
 A crew on an agentless host takes the same harness path as a Docker crew
 (#3655). Its session names its environment (`FLOTILLA_ENVIRONMENT_ID`), and its
-harness runs from a flotilla-owned home under the SSH runner's writable base,
-not from the login user's own configuration:
+harness runs from a flotilla-owned home, not from the login user's own
+configuration. Homes live under the login user's durable state base,
+`$XDG_STATE_HOME/flotilla` or else `~/.local/state/flotilla`, so they and the
+harness's session transcripts survive a reboot. Credential material stays on
+the runtime base, `$XDG_RUNTIME_DIR/flotilla` when the login has one, which a
+reboot clears and the next launch fills again (#4012):
 
 - Claude Code runs in its requester's bound home
-  (`<base>/agent-homes/requesters/<convoy>/<role>/claude`, #3907), with a
-  per-crew `crews/<role>` home inside it. The vessel agent writes the bound
-  account's OAuth token into that home, and the launch reads it from there as
-  the harness starts. Onboarding, workspace trust for the checkout and
+  (`<state base>/agent-homes/requesters/<convoy>/<role>/claude`, #3907). The
+  vessel agent writes the bound account's OAuth token into the requester's
+  material directory
+  (`<runtime base>/agent-material/requesters/<convoy>/<role>/claude`), and the
+  launch reads it from there as the harness starts. Onboarding, workspace trust for the checkout and
   attribution suppression are seeded there. A Claude crew needs an account
   binding, chosen at admission from the `claude-oauth` credentials its grants
   authorize: the login user's own Claude login is not used, and a launch

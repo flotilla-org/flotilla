@@ -1634,9 +1634,18 @@ impl CredentialStore {
         Ok((spec, material.trim().to_string()))
     }
 
-    /// The writable base a runner's deliveries live under.
+    /// The writable base a runner's deliveries live under. It prefers `$XDG_RUNTIME_DIR`, so
+    /// on a host it may be a tmpfs: it holds only what the next delivery puts back.
     pub async fn writable_base(&self, runner: &dyn CommandRunner) -> Result<PathBuf, String> {
         Ok(self.delivery_paths(runner).await?.base)
+    }
+
+    /// The daemon host's durable home base (#4012): the daemon's own state directory, which
+    /// is `$XDG_STATE_HOME/flotilla`, else `~/.local/state/flotilla`, unless configured
+    /// elsewhere. Harness homes on the daemon's own host live under it, never under
+    /// [`Self::writable_base`].
+    pub fn home_base(&self) -> &Path {
+        &self.state_dir
     }
 
     async fn spec(&self, name: &str) -> Result<CredentialSpecSpec, String> {

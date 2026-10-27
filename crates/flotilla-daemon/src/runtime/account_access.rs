@@ -123,17 +123,19 @@ impl BoundAccount {
         Ok(if delivered { digest } else { format!("{digest}/pending") })
     }
 
-    /// The session variables that point the harness at the material in `home`.
-    pub(super) fn environment(&self, home: &str) -> Vec<(String, String)> {
-        self.provisioner.environment(home)
+    /// The session variables that point the harness at its durable `home` and at the material
+    /// in the material directory `dir`.
+    pub(super) fn environment(&self, home: &str, dir: &str) -> Vec<(String, String)> {
+        self.provisioner.environment(home, dir)
     }
 
-    /// Deliver the material into `home` through `runner` and record the provision.
+    /// Deliver the material into the material directory `dir` through `runner` and record the
+    /// provision.
     pub(super) async fn deliver(
         &self,
         state: &ControllerRuntimeState,
         launch: &AccountLaunch<'_>,
-        home: &str,
+        dir: &str,
         runner: &dyn CommandRunner,
     ) -> Result<(), String> {
         let accounts = state.daemon.account_records();
@@ -142,25 +144,32 @@ impl BoundAccount {
         let lock = state.account_delivery_lock(name);
         let _delivering = lock.lock().await;
         let record = provision_name(name, launch.env_ref);
+        // A copy recorded elsewhere, such as inside the home before #4012, is removed once this
+        // one lands, so the old location never keeps a copy no record names.
+        let previous = accounts.provision(launch.namespace, &record).await?.map(|provision| provision.spec.home).filter(|home| home != dir);
         let mut provision = AccountProvisionSpec {
             binding: Ref::new(name.clone(), self.binding.home.clone()),
             place: launch.env_ref.to_string(),
             environment_kind: self.kind.as_str().to_string(),
             plan: self.plan.clone(),
-            home: home.to_string(),
+            home: dir.to_string(),
             delivered: None,
         };
         // Record the place before writing material there, so a copy is never left without a
         // record the provision controller would withdraw. A relaunch keeps its existing record,
         // and with it the previous delivery, until this one succeeds.
         accounts.record_provision(launch.namespace, &record, launch.convoy, &provision, false).await?;
-        self.provisioner.deliver(home, &self.material, runner).await?;
+        self.provisioner.deliver(dir, &self.material, runner).await?;
         provision.delivered = Some(Delivered {
             epoch: self.epoch.clone(),
             generation: material_generation(&self.material),
             at: delivered_at(state, &self.binding.spec),
         });
-        accounts.record_provision(launch.namespace, &record, launch.convoy, &provision, true).await
+        accounts.record_provision(launch.namespace, &record, launch.convoy, &provision, true).await?;
+        match previous {
+            Some(previous) => self.provisioner.remove(&previous, runner).await,
+            None => Ok(()),
+        }
     }
 }
 

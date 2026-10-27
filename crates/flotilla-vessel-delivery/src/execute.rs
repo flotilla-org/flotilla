@@ -17,7 +17,7 @@ use flotilla_environment::environment::VesselAgent;
 
 use crate::{
     plan::{plan, Action, CostTable, Landed, Plan, PlanError, Step},
-    vocabulary::{ContentDigest, Item, Mechanism, Need, NeedName, ProviderMechanisms},
+    vocabulary::{ContentDigest, HomeBase, Item, Mechanism, Need, NeedName, ProviderMechanisms},
 };
 
 /// Each home's record of what landed in it, read back to plan a re-run.
@@ -97,14 +97,23 @@ pub async fn deliver(
     if let Some(need) = needs.iter().find(|need| matches!(need.item, Item::Tree { .. }) && !trees.contains_key(&need.name)) {
         return Err(DeliveryError::NoDelivery(need.name.clone()));
     }
-    let base = agent.writable_base().await.map_err(DeliveryError::Agent)?;
-    let homes = needs
-        .iter()
-        .filter_map(|need| match &need.item {
-            Item::Home { key } => Some((need.name.clone(), key.under(&base))),
-            Item::Tree { .. } => None,
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut bases = BTreeMap::new();
+    let mut homes = BTreeMap::new();
+    for need in needs {
+        let Item::Home { key, base } = &need.item else { continue };
+        let resolved = match bases.get(base) {
+            Some(resolved) => resolved,
+            None => {
+                let resolved = match base {
+                    HomeBase::Durable => agent.home_base().await,
+                    HomeBase::Runtime => agent.writable_base().await,
+                }
+                .map_err(DeliveryError::Agent)?;
+                bases.entry(*base).or_insert(resolved)
+            }
+        };
+        homes.insert(need.name.clone(), key.under(resolved));
+    }
     let mut read = BTreeMap::new();
     for (name, home) in &homes {
         let record = agent

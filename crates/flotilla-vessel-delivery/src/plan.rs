@@ -114,8 +114,8 @@ impl std::error::Error for PlanError {}
 
 /// Lower every need to the cheapest mechanism that meets its requirements.
 ///
-/// - A home is durable and writable: a read-write host path over a writable
-///   base that is host storage, otherwise agent push creates it in the vessel.
+/// - A home is writable: a read-write host path over the target's bases when they
+///   are host storage, otherwise agent push creates it in the vessel.
 /// - A tree is read-only: a read-only host path whose directory contains the tree's
 ///   host copy, agent fetch when it has a URL, agent fetch by digest when its digest
 ///   sources are public and the vessel reaches public sources, agent push when the

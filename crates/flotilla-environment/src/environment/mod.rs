@@ -289,8 +289,14 @@ pub trait VesselAgent: Send + Sync {
     /// Run commands in the vessel, through the agent.
     fn commands(&self) -> Arc<dyn CommandRunner>;
     /// The base under which this vessel's writable state lives: the contained
-    /// base in a container, the host runner's base on a shared host.
+    /// base in a container, the host runner's base on a shared host. On a host it
+    /// may be a tmpfs, so it holds only what the next launch delivers again.
     async fn writable_base(&self) -> Result<PathBuf, String>;
+    /// The durable base harness homes live under (#4012), never a tmpfs: see
+    /// [`runner::home_base`].
+    async fn home_base(&self) -> Result<PathBuf, String> {
+        runner::home_base(&*self.commands()).await
+    }
     /// What is at `path`, or `None` when nothing is.
     async fn stat(&self, path: &Path) -> Result<Option<EntryKind>, String>;
     /// Create the directory `path`, and any missing parents with the agent's default

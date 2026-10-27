@@ -203,7 +203,8 @@ pub struct AccountProvisionSpec {
     /// by the environment provider.
     pub environment_kind: String,
     pub plan: ProvisionPlan,
-    /// The requester's home at the place, which the plan delivers into (`CLAUDE_CONFIG_DIR`).
+    /// The requester's material directory at the place, which the plan delivers into. Before
+    /// #4012 this was the requester's home itself; either way it is where the copy lies.
     pub home: String,
     pub delivered: Option<Delivered>,
 }
@@ -275,11 +276,26 @@ impl AccountBindingSpec {
     }
 }
 
-/// A requester's home for one harness under a place's writable base:
+/// A requester's home for one harness under a place's durable home base (#4012):
 /// `<base>/agent-homes/requesters/<convoy>/<role>/<harness>` (#3910 ruling 4). Names are encoded
 /// injectively: a name of ASCII alphanumerics, `-` and `_` is used as it is; any other has the
 /// rest replaced by `-` and a digest of the whole name appended, so `a.b` and `a-b` never share.
 pub fn requester_home(base: &std::path::Path, convoy: &str, role: &str, harness: &str) -> std::path::PathBuf {
+    requester_path(base, "agent-homes", convoy, role, harness)
+}
+
+/// Where a place's requester material directories live under its runtime base.
+pub const REQUESTER_MATERIAL_DIR: &str = "agent-material";
+
+/// A requester's material directory for one harness under a place's runtime base (#4012):
+/// `<base>/agent-material/requesters/<convoy>/<role>/<harness>`, encoded as [`requester_home`].
+/// Secrets such as a token file live here rather than in the durable home, so a reboot that
+/// clears the runtime base clears them and the next launch delivers them again.
+pub fn requester_material(base: &std::path::Path, convoy: &str, role: &str, harness: &str) -> std::path::PathBuf {
+    requester_path(base, REQUESTER_MATERIAL_DIR, convoy, role, harness)
+}
+
+fn requester_path(base: &std::path::Path, tree: &str, convoy: &str, role: &str, harness: &str) -> std::path::PathBuf {
     fn component(name: &str) -> String {
         use sha2::{Digest, Sha256};
         let plain = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
@@ -289,7 +305,7 @@ pub fn requester_home(base: &std::path::Path, convoy: &str, role: &str, harness:
         let sanitized = name.chars().map(|c| if plain(c) { c } else { '-' }).collect::<String>();
         format!("{sanitized}.{}", &format!("{:x}", Sha256::digest(name.as_bytes()))[..12])
     }
-    base.join("agent-homes").join("requesters").join(component(convoy)).join(component(role)).join(harness)
+    base.join(tree).join("requesters").join(component(convoy)).join(component(role)).join(harness)
 }
 
 /// The material generation a delivery records (#3910 owner ruling 3): a short digest of the

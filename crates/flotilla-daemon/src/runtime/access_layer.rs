@@ -3,10 +3,11 @@
 //! vessel through the vessel agent, the same way for every environment kind.
 //!
 //! The launch path builds one request per crew: an opaque access key, the harness, the
-//! home (its key under the target's writable base), the crew's resolved skill tree and its
-//! account material. The planner lowers each need to a mechanism the place offers, and the
-//! one executor runs the plan. Launch then points the harness at the home the delivery
-//! returned; nothing derives the home again.
+//! home (its key under the target's durable home base), the crew's resolved skill tree and
+//! its account material (in a material directory under the target's runtime base, #4012).
+//! The planner lowers each need to a mechanism the place offers, and the one executor runs
+//! the plan. Launch then points the harness at the home the delivery returned; nothing
+//! derives the home again.
 
 use std::{
     collections::BTreeMap,
@@ -16,14 +17,15 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_credentials::{AgentMaterialRegistry, HarnessHome, HarnessLogin, SkillTree};
-use flotilla_environment::environment::VesselAgent;
+use flotilla_environment::environment::{vessel_ops, VesselAgent};
+use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
-    account_access::{requester_home, AccessName},
+    account_access::{requester_home, requester_material, AccessName},
     Convoy, Environment, ResourceError, Vessel,
 };
 use flotilla_vessel_delivery::{
-    deliver, Access, AccessKey, ContentDigest, CostTable, DeliveryError, HostPathOffer, HostReach, Item, Liveness, Mechanism, Need,
-    NeedName, Plan, ProviderMechanisms, Reachability, RelativePath, TreeDelivery, TreeSources,
+    deliver, Access, AccessKey, ContentDigest, CostTable, DeliveryError, HomeBase, HostPathOffer, HostReach, Item, Liveness, Mechanism,
+    Need, NeedName, Plan, ProviderMechanisms, Reachability, RelativePath, TreeDelivery, TreeSources,
 };
 
 use self::{
@@ -39,6 +41,8 @@ use super::credentials::agent_material_environment;
 use super::state::ControllerRuntimeState;
 
 const HOME: &str = "home";
+/// The requester's material directory, on the runtime base: secrets a reboot may clear.
+const SECRETS: &str = "secrets";
 const SKILLS: &str = "skills";
 const ACCOUNT: &str = "account";
 const LOGIN: &str = "login";
@@ -92,6 +96,25 @@ pub(super) async fn deliver_access(
     }
 }
 
+/// Deliver a requester's account on the daemon's own host, which has no vessel: the daemon
+/// writes it through `runner` (#3907), in the layout the access layer uses aboard a vessel.
+/// The home is under the daemon's own durable state directory, and the material under the
+/// credential store's runtime base (#4012). The daemon's host carries its own harness.
+pub(super) async fn deliver_host_account(
+    state: &ControllerRuntimeState,
+    launch: &AccountLaunch<'_>,
+    access: &AccessName,
+    runner: &dyn CommandRunner,
+) -> Result<AccessDelivered, String> {
+    let bound = BoundAccount::resolve(state, launch, access).await?;
+    let store = state.credential_store.as_ref().ok_or("host-local credential store unavailable for account delivery")?;
+    let home = requester_home(store.home_base(), launch.convoy, launch.role, "claude");
+    let dir = requester_material(&store.writable_base(runner).await?, launch.convoy, launch.role, "claude").display().to_string();
+    vessel_ops::create_dir(runner, &home, 0o700).await?;
+    bound.deliver(state, launch, &dir, runner).await?;
+    Ok(AccessDelivered { environment: bound.environment(&home.display().to_string(), &dir), executable: None })
+}
+
 /// A delivery that failed at one need: the need it was preparing or delivering.
 struct Failed {
     need: String,
@@ -112,28 +135,35 @@ async fn deliver_crew(
     delivered: &[(String, String)],
 ) -> Result<(Plan, String, Vec<(String, String)>, Option<PathBuf>), Failed> {
     let access = AccessKey::new(crew.access);
-    let home_key = requester_home(Path::new(""), launch.account.convoy, launch.account.role, harness.name);
-    let mut needs = vec![Need {
-        name: NeedName::new(HOME),
-        digest: ContentDigest::new(home_key.display().to_string()),
-        item: Item::Home { key: RelativePath::new(home_key).map_err(failed_at(HOME))? },
-    }];
+    let (convoy, role) = (launch.account.convoy, launch.account.role);
+    let home = |name: &str, key: std::path::PathBuf, base: HomeBase| -> Result<Need, Failed> {
+        Ok(Need {
+            name: NeedName::new(name),
+            digest: ContentDigest::new(key.display().to_string()),
+            item: Item::Home { key: RelativePath::new(key).map_err(failed_at(name))?, base },
+        })
+    };
+    let mut needs = vec![home(HOME, requester_home(Path::new(""), convoy, role, harness.name), HomeBase::Durable)?];
     let mut trees: BTreeMap<NeedName, Arc<dyn TreeDelivery>> = BTreeMap::new();
-    let mut tree =
-        |needs: &mut Vec<Need>, name: &str, digest: String, path: &str, sources: TreeSources, delivery: Arc<dyn TreeDelivery>| {
-            needs.push(Need {
-                name: NeedName::new(name),
-                digest: ContentDigest::new(digest),
-                item: Item::Tree { home: NeedName::new(HOME), path: RelativePath::new(path).expect("a constant relative path"), sources },
-            });
-            trees.insert(NeedName::new(name), delivery);
-        };
+    let mut tree = |needs: &mut Vec<Need>,
+                    name: &str,
+                    digest: String,
+                    (home, path): (&str, &str),
+                    sources: TreeSources,
+                    delivery: Arc<dyn TreeDelivery>| {
+        needs.push(Need {
+            name: NeedName::new(name),
+            digest: ContentDigest::new(digest),
+            item: Item::Tree { home: NeedName::new(home), path: RelativePath::new(path).expect("a constant relative path"), sources },
+        });
+        trees.insert(NeedName::new(name), delivery);
+    };
     let skills = material.skill_tree(&crew.skills).await.map_err(failed_at(SKILLS))?;
     tree(
         &mut needs,
         SKILLS,
         skills.digest(),
-        "skills",
+        (HOME, "skills"),
         TreeSources { url: true, ..TreeSources::default() },
         Arc::new(SkillsDelivery { state: state.clone(), material: material.clone(), tree: skills }),
     );
@@ -142,11 +172,14 @@ async fn deliver_crew(
         None => None,
     };
     if let Some(bound) = &bound {
+        // The token stays off the durable home: a reboot may clear it, with the record that
+        // it landed, and the next launch delivers it again.
+        needs.push(home(SECRETS, requester_material(Path::new(""), convoy, role, harness.name), HomeBase::Runtime)?);
         tree(
             &mut needs,
             ACCOUNT,
             bound.digest(state, &launch.account).await.map_err(failed_at(ACCOUNT))?,
-            flotilla_agent::account_access::CLAUDE_OAUTH_TOKEN_FILE,
+            (SECRETS, flotilla_agent::account_access::CLAUDE_OAUTH_TOKEN_FILE),
             TreeSources { controller: true, ..TreeSources::default() },
             Arc::new(AccountDelivery { state: state.clone(), launch: OwnedAccountLaunch::of(&launch.account), bound: bound.clone() }),
         );
@@ -166,7 +199,7 @@ async fn deliver_crew(
             &mut needs,
             LOGIN,
             login.digest(),
-            "auth.json",
+            (HOME, "auth.json"),
             TreeSources { controller: true, ..TreeSources::default() },
             Arc::new(LoginDelivery(login)),
         );
@@ -180,7 +213,7 @@ async fn deliver_crew(
         PinnedHarness::resolve(launch.adapter, &architecture).map_err(failed_at(HARNESS))?
     };
     if let Some(pinned) = &pinned {
-        tree(&mut needs, HARNESS, pinned.sha256.clone(), HARNESS_PATH, PinnedHarness::sources(), Arc::new(pinned.clone()));
+        tree(&mut needs, HARNESS, pinned.sha256.clone(), (HOME, HARNESS_PATH), PinnedHarness::sources(), Arc::new(pinned.clone()));
     }
     let place = launch.account.env_ref;
     let delivered = deliver(&needs, &trees, &place_mechanisms(launch.account.agentless), &CostTable::default(), agent.as_ref())
@@ -195,29 +228,24 @@ async fn deliver_crew(
     for step in &delivered.plan.steps {
         tracing::debug!(%access, place, need = %step.need, mechanism = %step.mechanism, action = ?step.action, "vessel delivery");
     }
-    let home = delivered
-        .homes
-        .get(&NeedName::new(HOME))
-        .ok_or_else(|| Failed {
-            need: HOME.to_string(),
-            error: format!("deliver access `{access}` aboard `{place}`: no home was delivered"),
-        })?
-        .display()
-        .to_string();
+    let landed = |need: &str| {
+        delivered.homes.get(&NeedName::new(need)).map(|home| home.display().to_string()).ok_or_else(|| Failed {
+            need: need.to_string(),
+            error: format!("deliver access `{access}` aboard `{place}`: no `{need}` home was delivered"),
+        })
+    };
+    let home = landed(HOME)?;
     let mut environment = vec![(harness.variable.to_string(), home.clone())];
     if let Some(bound) = bound {
-        environment.retain(|(name, _)| !bound.environment(&home).iter().any(|(bound, _)| bound == name));
-        environment.extend(bound.environment(&home));
+        let bound = bound.environment(&home, &landed(SECRETS)?);
+        environment.retain(|(name, _)| !bound.iter().any(|(bound, _)| bound == name));
+        environment.extend(bound);
     }
     let executable = pinned.map(|pinned| pinned.executable(&Path::new(&home).join(HARNESS_PATH)));
     Ok((delivered.plan, home, environment, executable))
 }
 
 /// What a place offers vessel delivery beyond the mandatory agent fetch and push. An SSH
-/// host's writable base is the host's own durable storage; a container's is not, so its
-/// homes are created through the agent. Both kinds in use reach public sources: neither
-/// declares an egress policy, and their skills are already fetched aboard. Step 4 of
-/// #3956 moves this declaration onto each provider instance.
 /// Whether the place already carries the pinned harnesses. A composed crew image includes
 /// the harness layers, whose pins its identity hashes; an SSH host has no image. Step 4 of
 /// #3956 moves this declaration onto each provider instance.
@@ -225,6 +253,11 @@ fn place_carries_harnesses(agentless: bool) -> bool {
     !agentless
 }
 
+/// What a place offers vessel delivery beyond the mandatory agent fetch and push. An SSH
+/// host's bases are the host's own storage; a container's are not, so its homes are
+/// created through the agent. Both kinds in use reach public sources: neither declares an
+/// egress policy, and their skills are already fetched aboard. Step 4 of #3956 moves this
+/// declaration onto each provider instance.
 fn place_mechanisms(agentless: bool) -> ProviderMechanisms {
     let host_paths = if agentless {
         vec![HostPathOffer { reach: HostReach::WritableBase, access: Access::ReadWrite, liveness: Liveness::Live }]
@@ -350,7 +383,7 @@ impl OwnedAccountLaunch {
     }
 }
 
-/// The crew's bound account material (#3907), written into its home.
+/// The crew's bound account material (#3907), written into its material directory.
 struct AccountDelivery {
     state: Arc<ControllerRuntimeState>,
     launch: OwnedAccountLaunch,
@@ -360,8 +393,8 @@ struct AccountDelivery {
 #[async_trait]
 impl TreeDelivery for AccountDelivery {
     async fn deliver(&self, _: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<(), String> {
-        let home = target.parent().ok_or("account material needs its home")?.display().to_string();
-        self.bound.deliver(&self.state, &self.launch.borrow(), &home, &*agent.commands()).await
+        let dir = target.parent().ok_or("account material needs its material directory")?.display().to_string();
+        self.bound.deliver(&self.state, &self.launch.borrow(), &dir, &*agent.commands()).await
     }
 }
 

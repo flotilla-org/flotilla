@@ -54,11 +54,45 @@ impl CredentialDeliveryPaths {
     }
 }
 
+/// Resolves the user's durable state base: `$XDG_STATE_HOME/flotilla` when that is absolute
+/// and usable, otherwise `~/.local/state/flotilla`. Anything it creates is owner-only.
+const DURABLE_STATE_BASE_SCRIPT: &str = "umask 077; \
+                                         for state in \"${XDG_STATE_HOME:-}\" \"${HOME:+$HOME/.local/state}\"; do \
+                                             case \"$state\" in /*) ;; *) continue ;; esac; \
+                                             if mkdir -p \"$state/flotilla\" 2>/dev/null \
+                                                 && [ -d \"$state/flotilla\" ] && [ -w \"$state/flotilla\" ]; then \
+                                                 printf '%s' \"$state/flotilla\"; exit 0; \
+                                             fi; \
+                                         done; \
+                                         exit 1";
+
+/// The durable base a target's harness homes live under (#4012), resolved in the runner's own
+/// filesystem world. A runner whose config base differs from its scratch base declares a
+/// persistent place of its own, such as a container's disk, and homes stay there. A runner
+/// whose config base is its scratch base, such as a host login's `$XDG_RUNTIME_DIR` (a tmpfs),
+/// declares none, so homes go under the user's durable state base instead.
+pub async fn home_base(runner: &dyn CommandRunner) -> Result<PathBuf, String> {
+    let fallback = Path::new(CONTAINED_WRITABLE_CONFIG_BASE);
+    let config = runner.writable_config_base(None, fallback).await?;
+    if config != runner.writable_scratch_base(None, fallback).await? {
+        return Ok(config);
+    }
+    let base = runner
+        .run("sh", &["-c", DURABLE_STATE_BASE_SCRIPT, "flotilla-durable-base"], Path::new("/"), &ChannelLabel::Default)
+        .await
+        .map_err(|error| format!("find the durable state directory: {error}"))?;
+    let base = PathBuf::from(base.trim());
+    if !base.is_absolute() {
+        return Err(format!("find the durable state directory: `{}` is not absolute", base.display()));
+    }
+    Ok(base)
+}
+
 /// Delivery-derived exclusions; auth links are excluded at every depth too.
 #[cfg(unix)]
 pub(crate) fn contained_credential_exclusions() -> Vec<String> {
     let paths = CredentialDeliveryPaths::new(CONTAINED_WRITABLE_CONFIG_BASE.into());
-    [paths.base.join("credentials"), paths.skill_source_dir()]
+    [paths.base.join("credentials"), paths.skill_source_dir(), paths.base.join(flotilla_resources::account_access::REQUESTER_MATERIAL_DIR)]
         .into_iter()
         .map(|p| p.to_string_lossy().trim_start_matches('/').to_string())
         .chain(HARNESS_AUTH_FILES.iter().map(|p| p.to_string()))
@@ -260,6 +294,39 @@ mod tests {
         let runner = DockerEnvironmentRunner::new("container".into(), inner);
         let result = runner.run_with_timeout("zellij", &["action"], Path::new("/work"), &ChannelLabel::Default, timeout).await;
         assert_eq!(result.expect_err("deadline"), "zellij timed out after 500ms");
+    }
+
+    // Behaviour (#4012): a host's durable state base is `$XDG_STATE_HOME/flotilla` when that
+    // is absolute and usable, otherwise `~/.local/state/flotilla`, whatever the login's
+    // `XDG_RUNTIME_DIR`; what it creates is owner-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_durable_state_base_follows_xdg_state_home_then_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("temp");
+        let (home, state, runtime) = (temp.path().join("home"), temp.path().join("state"), temp.path().join("runtime"));
+        for directory in [&home, &runtime] {
+            std::fs::create_dir(directory).expect("directory");
+        }
+        let resolve = |xdg_state_home: &str| {
+            let assignments = [
+                "PATH=/usr/bin:/bin".to_string(),
+                format!("HOME={}", home.display()),
+                format!("XDG_RUNTIME_DIR={}", runtime.display()),
+                format!("XDG_STATE_HOME={xdg_state_home}"),
+            ];
+            async move {
+                let mut args = vec!["-i"];
+                args.extend(assignments.iter().map(String::as_str));
+                args.extend(["sh", "-c", super::DURABLE_STATE_BASE_SCRIPT, "flotilla-durable-base"]);
+                ProcessCommandRunner.run("env", &args, Path::new("/"), &ChannelLabel::Default).await.expect("durable base")
+            }
+        };
+        assert_eq!(resolve(&state.display().to_string()).await, state.join("flotilla").display().to_string());
+        assert_eq!(std::fs::metadata(state.join("flotilla")).expect("base").permissions().mode() & 0o777, 0o700);
+        for unusable in ["", "relative/state", "/proc/flotilla-unwritable"] {
+            assert_eq!(resolve(unusable).await, home.join(".local/state/flotilla").display().to_string(), "{unusable:?}");
+        }
     }
 
     #[cfg(unix)]

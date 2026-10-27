@@ -26,7 +26,6 @@ use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId, TerminalStatus};
 use flotilla_provider_runtime::execution_context::BoundLayer;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_resources::account_access::requester_home;
 use flotilla_resources::{
     Checkout, Convoy, FulfilmentKind, ResourceObject, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
     TerminalSessionPhase, TerminalSessionSource, TerminalSessionTarget, Vessel, CREDENTIAL_PERMISSIONS_SESSION_TAG,
@@ -37,8 +36,8 @@ use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, T
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::access_layer::{deliver_access, AccessDelivered, AccessLaunch};
-use super::account_access::{AccountLaunch, BoundAccount};
+use super::access_layer::{deliver_access, deliver_host_account, AccessDelivered, AccessLaunch};
+use super::account_access::AccountLaunch;
 use super::agentless_vessels::{apply_reach_environment, compose_session_environment, vessel_base, VesselAccess};
 use super::credentials::RuntimeSessionCapabilities;
 use super::state::ControllerRuntimeState;
@@ -488,20 +487,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 // requester there starts only in the home its binding delivers (#3907).
                 let delivered = if spec.env_ref == self.state.host_direct_environment_name {
                     match requirement.account_access() {
-                        Some(access) => {
-                            let runner = launch_runner()?;
-                            let bound = BoundAccount::resolve(&self.state, &account, access).await?;
-                            let store = self
-                                .state
-                                .credential_store
-                                .as_ref()
-                                .ok_or("host-local credential store unavailable for account delivery")?;
-                            let home = requester_home(&store.writable_base(&*runner).await?, &context.convoy, &spec.role, "claude")
-                                .display()
-                                .to_string();
-                            bound.deliver(&self.state, &account, &home, &*runner).await?;
-                            AccessDelivered { environment: bound.environment(&home), executable: None }
-                        }
+                        Some(access) => deliver_host_account(&self.state, &account, access, &*launch_runner()?).await?,
                         None => AccessDelivered::default(),
                     }
                 } else {

@@ -10,13 +10,14 @@ use flotilla_environment::environment::{vessel_ops::RunnerVesselAgent, EntryKind
 use flotilla_provider_runtime::{CommandRunner, ProcessCommandRunner};
 
 use super::*;
-use crate::vocabulary::{RelativePath, TreeSources};
+use crate::vocabulary::{HomeBase, RelativePath, TreeSources};
 
 /// A vessel whose agent is this process: real `sh` and files under a temporary
-/// writable base, through the runner-backed facilities. It stands in for the
-/// drydock agent's process boundary only.
+/// durable home base and a temporary writable base, through the runner-backed
+/// facilities. It stands in for the drydock agent's process boundary only.
 struct LocalVessel {
     base: tempfile::TempDir,
+    runtime: tempfile::TempDir,
 }
 
 #[async_trait]
@@ -34,6 +35,9 @@ impl VesselAgent for LocalVessel {
         Arc::new(ProcessCommandRunner)
     }
     async fn writable_base(&self) -> Result<PathBuf, String> {
+        Ok(self.runtime.path().to_path_buf())
+    }
+    async fn home_base(&self) -> Result<PathBuf, String> {
         Ok(self.base.path().to_path_buf())
     }
     async fn stat(&self, path: &Path) -> Result<Option<EntryKind>, String> {
@@ -54,6 +58,10 @@ impl VesselAgent for LocalVessel {
 }
 
 impl LocalVessel {
+    fn new() -> Self {
+        Self { base: tempfile::tempdir().expect("base"), runtime: tempfile::tempdir().expect("runtime base") }
+    }
+
     fn local(&self) -> RunnerVesselAgent {
         RunnerVesselAgent(self.commands())
     }
@@ -104,7 +112,7 @@ fn needs(skills: &str, notes: &str) -> Vec<Need> {
         Need {
             name: NeedName::new("home"),
             digest: ContentDigest::new("home"),
-            item: Item::Home { key: RelativePath::new("agent-homes/requesters/c/coder/claude").expect("key") },
+            item: Item::Home { key: RelativePath::new("agent-homes/requesters/c/coder/claude").expect("key"), base: HomeBase::Durable },
         },
         tree("skills", skills),
         tree("notes", notes),
@@ -113,12 +121,12 @@ fn needs(skills: &str, notes: &str) -> Vec<Need> {
 
 // Behaviour (#3964 contract 3): the one executor runs each step through the
 // vessel agent, keyed by content digest. A home is created owner-only at its
-// key under the writable base, each tree lands inside it, and a re-run is a
+// key under the durable home base, each tree lands inside it, and a re-run is a
 // no-op for what landed: only a changed digest, or a step that failed, is
 // delivered again.
 #[tokio::test]
 async fn re_runs_deliver_only_what_changed_or_failed() {
-    let vessel = LocalVessel { base: tempfile::tempdir().expect("base") };
+    let vessel = LocalVessel::new();
     let (skills, notes) = (Tree::new("skills v1"), Tree::new("notes v1"));
     let trees = BTreeMap::from([
         (NeedName::new("skills"), skills.clone() as Arc<dyn TreeDelivery>),
@@ -132,7 +140,7 @@ async fn re_runs_deliver_only_what_changed_or_failed() {
 
     let first = run(needs("s1", "n1")).await.expect("first delivery");
     let home = vessel.base.path().join("agent-homes/requesters/c/coder/claude");
-    assert_eq!(first.homes[&NeedName::new("home")], home, "the home is its key under the writable base");
+    assert_eq!(first.homes[&NeedName::new("home")], home, "the home is its key under the durable home base");
     assert_eq!(std::fs::metadata(&home).expect("home").permissions().mode() & 0o777, 0o700);
     assert_eq!(std::fs::read_to_string(home.join("skills/skills/SKILL.md")).expect("skills"), "skills v1");
     assert_eq!((skills.deliveries(), notes.deliveries()), (1, 1));
@@ -174,11 +182,30 @@ async fn re_runs_deliver_only_what_changed_or_failed() {
     assert_eq!((skills.deliveries(), notes.deliveries()), (3, 4));
 }
 
+// Behaviour (#4012): a runtime home lands under the writable base, apart from the
+// durable home base, with its trees and its own record, so clearing the runtime
+// base clears what it holds together with the record that it landed.
+#[tokio::test]
+async fn a_runtime_home_lands_under_the_writable_base() {
+    let vessel = LocalVessel::new();
+    let mut needs = needs("s1", "n1");
+    needs[0].item = Item::Home { key: RelativePath::new("agent-material/c").expect("key"), base: HomeBase::Runtime };
+    let trees = BTreeMap::from([
+        (NeedName::new("skills"), Tree::new("skills") as Arc<dyn TreeDelivery>),
+        (NeedName::new("notes"), Tree::new("notes") as Arc<dyn TreeDelivery>),
+    ]);
+    let delivered = deliver(&needs, &trees, &ProviderMechanisms::default(), &CostTable::default(), &vessel).await.expect("delivery");
+    let home = vessel.runtime.path().join("agent-material/c");
+    assert_eq!(delivered.homes[&NeedName::new("home")], home);
+    assert!(home.join("skills/skills/SKILL.md").is_file() && home.join(DELIVERY_RECORD).is_file());
+    assert_eq!(std::fs::read_dir(vessel.base.path()).expect("durable base").count(), 0, "nothing lands on the durable base");
+}
+
 // Behaviour: a tree with no delivery for its content, or a name its record cannot
 // hold, is refused before anything is written.
 #[tokio::test]
 async fn undeliverable_needs_are_refused() {
-    let vessel = LocalVessel { base: tempfile::tempdir().expect("base") };
+    let vessel = LocalVessel::new();
     let trees = BTreeMap::from([(NeedName::new("skills"), Tree::new("skills") as Arc<dyn TreeDelivery>)]);
     let error = deliver(&needs("s1", "n1"), &trees, &ProviderMechanisms::default(), &CostTable::default(), &vessel)
         .await
