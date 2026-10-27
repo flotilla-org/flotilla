@@ -12,7 +12,7 @@ use std::{
 
 use chrono::Utc;
 use flotilla_protocol::NodeId;
-use flotilla_resources::{ReadResourceObject, ReplicaCursor, ResourceProvenance};
+use flotilla_resources::{Convoy, ReadResourceObject, ReplicaCursor, Resource, ResourceProvenance};
 use flotilla_resources::{ResourceList, ResourceTombstone, WatchStart};
 use futures::{stream, StreamExt};
 use serde_json::Value;
@@ -1404,7 +1404,7 @@ impl InMemoryBackend {
             let existing = store.objects.get(name).cloned().ok_or_else(|| ResourceError::not_found(name))?;
             let mut object = Self::decode_object(resource_kind, existing)?;
             if object.metadata.resource_version != resource_version {
-                if resource_kind.paths.kind == "Convoy" {
+                if resource_kind.paths.kind == Convoy::API_PATHS.kind {
                     return Err(ResourceError::status_version_conflict(name, resource_version, &object.metadata.resource_version));
                 }
                 return Err(ResourceError::conflict(name, "stale resourceVersion"));

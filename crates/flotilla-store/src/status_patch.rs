@@ -144,10 +144,11 @@ where
         }
     }
 
-    let mut message = "status patch retry budget exhausted".to_string();
-    if let Some(patch) = patch.diagnostic_name() {
-        message.push_str(&format!("; patch={patch}; caller={caller}; {}", conflicts.join("; ")));
-    }
+    let message = if let Some(patch) = patch.diagnostic_name() {
+        format!("status patch retry budget exhausted; patch={patch}; caller={caller}; {}", conflicts.join("; "))
+    } else {
+        "status patch retry budget exhausted".to_string()
+    };
     Err(ResourceError::conflict(name, message))
 }
 
