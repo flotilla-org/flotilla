@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 pub enum Actuation {
     CreateRepository { key: crate::RepositoryKey, spec: crate::RepositorySpec },
     CreateEnvironment { meta: InputMeta, spec: EnvironmentSpec },
+    UpdateEnvironmentHomeKeys { name: String, keys: std::collections::BTreeMap<String, String> },
     CreateClone { meta: InputMeta, spec: CloneSpec },
     RetryClone { name: String, failed_at: DateTime<Utc> },
     CreateCheckout { meta: InputMeta, spec: CheckoutSpec },

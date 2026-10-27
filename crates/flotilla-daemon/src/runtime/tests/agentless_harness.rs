@@ -375,6 +375,16 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
         .with_credential_store(credential_store)
         .with_agent_material(Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([] as [(&str, &str); 0]))))),
     );
+    let mut session_env = session_env;
+    if adapter == "codex" {
+        session_env.insert(
+            flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(),
+            serde_json::json!({
+                "coder": flotilla_agent::account_access::unbound_crew_home_key("demo","coder",adapter)
+            })
+            .to_string(),
+        );
+    }
     let spec = flotilla_resources::TerminalSessionSpec {
         env_ref: ENVIRONMENT.to_string(),
         role: "coder".to_string(),
@@ -495,7 +505,8 @@ async fn agentless_claude_crew_starts_in_a_prepared_flotilla_home() {
 async fn agentless_codex_crew_starts_in_a_prepared_flotilla_home() {
     let launch = launch_on_agentless_host("codex").await;
     let base = format!("{HOST_BASE}/agent-homes/{ENVIRONMENT}/codex");
-    let home = format!("{base}/crews/coder");
+    let home =
+        Path::new(HOST_BASE).join(flotilla_agent::account_access::unbound_crew_home_key("demo", "coder", "codex")).display().to_string();
 
     assert_eq!(launch.value("CODEX_HOME").as_deref(), Some(home.as_str()));
     assert_eq!(launch.value("FLOTILLA_ENVIRONMENT_ID").as_deref(), Some(ENVIRONMENT));

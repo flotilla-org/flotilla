@@ -5002,11 +5002,9 @@ interactions:
         let paths = CredentialDeliveryPaths::new(CONTAINED_WRITABLE_CONFIG_BASE.into());
         let registry = AgentMaterialRegistry::new(Arc::new(TestEnv(BTreeMap::new())));
         let mut sessions = vec![PathBuf::from("/workspace/work.txt"), PathBuf::from("/var/lib/flotilla/cleat/session")];
-        for (name, harness, adapter, variable) in [
-            ("claude-max", "claude", "claude-code", "CLAUDE_CONFIG_DIR"),
-            ("model-api", "codex", "codex", "CODEX_HOME"),
-            ("central-login", "codex", "codex", "CODEX_HOME"),
-        ] {
+        for (name, harness, adapter, variable) in
+            [("model-api", "codex", "codex", "CODEX_HOME"), ("central-login", "codex", "codex", "CODEX_HOME")]
+        {
             let delivered = paths.credential_dir(name).join(harness);
             for file in HARNESS_AUTH_FILES {
                 write(&delivered.join(file), b"delivered secret");
@@ -5023,8 +5021,21 @@ interactions:
             } else {
                 prepare_harness_home(&paths, name, harness, &*runner).await.unwrap()
             };
+            let key = if name == "central-login" {
+                "agent-homes/central-checkpoint/codex/coder".to_string()
+            } else {
+                Path::new(&home).strip_prefix(CONTAINED_WRITABLE_CONFIG_BASE).unwrap().join("crews/coder").display().to_string()
+            };
             let crew_env = registry
-                .crew_environment("coder", &BTreeSet::from([adapter.into()]), &[(variable.into(), home.clone())], &*runner)
+                .crew_environment(
+                    "coder",
+                    &BTreeSet::from([adapter.into()]),
+                    &[
+                        (variable.into(), home.clone()),
+                        (flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(), serde_json::json!({"coder":key}).to_string()),
+                    ],
+                    &*runner,
+                )
                 .await
                 .unwrap();
             let crew = PathBuf::from(&crew_env.iter().find(|(key, _)| key == variable).unwrap().1);

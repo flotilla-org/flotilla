@@ -45,6 +45,30 @@ const VESSEL_INTERRUPTED_REQUEUE_AFTER: Duration = Duration::from_millis(250);
 const VESSEL_PROVISIONING_STUCK_SECONDS: i64 = 2 * 60;
 const CHECKOUT_RECREATE_BACKOFF: Duration = Duration::from_secs(60);
 
+// Interim caller-home transport; #3956 replaces this label/env-map bridge.
+struct CrewHomeTransport<'a>(&'a BTreeMap<String, String>);
+
+impl CrewHomeTransport<'_> {
+    fn insert_into(&self, environment: &mut BTreeMap<String, String>) {
+        environment.insert(
+            flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(),
+            serde_json::to_string(self.0).expect("recorded home keys serialize"),
+        );
+    }
+
+    fn update_existing(&self, name: &str, spec: &EnvironmentSpec) -> Option<Actuation> {
+        let current_keys = spec
+            .cloud_sandbox
+            .as_ref()
+            .map(|cloud| &cloud.env)
+            .or_else(|| spec.docker.as_ref().map(|docker| &docker.env))
+            .and_then(|env| env.get(flotilla_resources::account_access::CREW_HOME_KEYS_ENV))
+            .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok());
+        (!self.0.is_empty() && current_keys.as_ref() != Some(self.0))
+            .then(|| Actuation::UpdateEnvironmentHomeKeys { name: name.into(), keys: self.0.clone() })
+    }
+}
+
 // Compare the grants we own, independent of serialization order and unrelated
 // policy mounts. Legacy config/hooks overlays identify old shared roots too, so
 // removing an entire repository still detects its stale writable grants.
@@ -642,6 +666,34 @@ impl VesselReconciler {
             Ok(adapters) => adapters,
             Err(message) => return Ok(VesselPrepared::failed(message)),
         };
+        let home_keys = requirement
+            .crew
+            .iter()
+            .filter_map(|crew| {
+                crew.labels.get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL).map(|key| (crew.role.clone(), key.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let home_transport = CrewHomeTransport(&home_keys);
+        for crew in &requirement.crew {
+            let CrewSource::Agent { selector, .. } = &crew.source else { continue };
+            let account = flotilla_agent::adapter::CapabilityTable::seeded()
+                .resolve_selector(selector)
+                .map_err(ResourceError::other)?
+                .account_access()
+                .is_some();
+            if account && !home_keys.contains_key(&crew.role) {
+                return Ok(VesselPrepared::provisioning(
+                    &placement_policy,
+                    placement_decision.clone(),
+                    format!(
+                        "{} waiting for crew `{}` recorded home key",
+                        flotilla_resources::account_access::REQUESTER_HOME_UNAVAILABLE,
+                        crew.role
+                    ),
+                    Vec::new(),
+                ));
+            }
+        }
         // A composed image installs exactly the harnesses its roles resolve
         // to; interior discovery verifies them instead of the policy's list.
         if composed_image(&placement_policy, None).is_some() || placement_policy.spec.cloud_sandbox_per_vessel.is_some() {
@@ -723,6 +775,15 @@ impl VesselReconciler {
                 let env_name = environment_name(&obj.metadata.name);
                 let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
+                        if let Some(update) = home_transport.update_existing(&env_name, &existing.spec) {
+                            actuations.push(update);
+                            return Ok(VesselPrepared::provisioning(
+                                &placement_policy,
+                                placement_decision.clone(),
+                                "updating recorded crew homes",
+                                actuations,
+                            ));
+                        }
                         let dependency = self.environment_dependency(&existing)?;
                         if let Some(prepared) = dependency.unavailable {
                             return Ok(prepared);
@@ -799,6 +860,7 @@ impl VesselReconciler {
                                         env: environment_with_credentials(
                                             {
                                                 let mut env = env.clone();
+                                                home_transport.insert_into(&mut env);
                                                 env.insert(
                                                     flotilla_resources::CREW_SKILLS_ENV.to_string(),
                                                     serde_json::to_string(
@@ -1163,6 +1225,15 @@ impl VesselReconciler {
                 let env_name = environment_name(&obj.metadata.name);
                 let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
+                        if let Some(update) = home_transport.update_existing(&env_name, &existing.spec) {
+                            actuations.push(update);
+                            return Ok(VesselPrepared::provisioning(
+                                &placement_policy,
+                                placement_decision.clone(),
+                                "updating recorded crew homes",
+                                actuations,
+                            ));
+                        }
                         // Docker bind mounts cannot change in place. Refuse a stale
                         // grant set until the environment is explicitly recreated.
                         let existing_git_mounts = existing
@@ -1293,6 +1364,7 @@ impl VesselReconciler {
                                         env: environment_with_credentials(
                                             {
                                                 let mut env = env.clone();
+                                                home_transport.insert_into(&mut env);
                                                 env.insert(
                                                     flotilla_resources::CREW_SKILLS_ENV.to_string(),
                                                     serde_json::to_string(
@@ -1563,7 +1635,16 @@ impl VesselReconciler {
                             role: process.role.clone(),
                             source,
                             cwd: terminal_cwd.clone(),
-                            env: Default::default(),
+                            env: process
+                                .labels
+                                .get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL)
+                                .map(|key| {
+                                    BTreeMap::from([(
+                                        flotilla_resources::account_access::CREW_HOME_KEYS_ENV.into(),
+                                        serde_json::json!({ &process.role: key }).to_string(),
+                                    )])
+                                })
+                                .unwrap_or_default(),
                             pool: strategy.pool().to_string(),
                         },
                     });
@@ -1964,7 +2045,9 @@ fn environment_provider_labels(policy: &ResourceObject<PlacementPolicy>) -> BTre
     labels
 }
 
-fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {
+/// Metadata for a child actuated by a Vessel, retaining its placement authority and ownership.
+#[doc(hidden)]
+pub fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {
     extra_labels.insert(VESSEL_REF_LABEL.to_string(), workspace.metadata.name.clone());
     InputMeta::builder()
         .name(name.to_string())

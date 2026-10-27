@@ -173,18 +173,15 @@ impl DockerControllerRuntime {
         spec: &flotilla_resources::DockerEnvironmentSpec,
     ) -> Result<EnvironmentProvisioning, EnvironmentProvisionError> {
         let legacy_baseline = self.legacy_baseline_for_environment(name).await?;
-        let (mut environment_spec, instance, convoy) =
+        let (mut environment_spec, instance) =
             match self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(name).await {
                 Ok(environment) => (
                     environment.spec,
                     environment.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned(),
-                    environment.metadata.labels.get(flotilla_resources::CONVOY_LABEL).cloned(),
                 ),
-                Err(ResourceError::NotFound { .. }) => (
-                    EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) },
-                    None,
-                    None,
-                ),
+                Err(ResourceError::NotFound { .. }) => {
+                    (EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) }, None)
+                }
                 Err(error) => return Err(error.to_string().into()),
             };
         if environment_spec.cloud_sandbox.is_none() {
@@ -527,18 +524,15 @@ impl DockerControllerRuntime {
             };
             // ADR 0047: remove forwarding of the legacy selection key one roll
             // after #2673, once stored environments are rewritten or reaped.
-            for key in [flotilla_resources::CREW_SKILLS_ENV, flotilla_resources::RESOLVED_SKILLS_ENV] {
+            for key in [
+                flotilla_resources::CREW_SKILLS_ENV,
+                flotilla_resources::RESOLVED_SKILLS_ENV,
+                flotilla_resources::account_access::CREW_HOME_KEYS_ENV,
+            ] {
                 if let Some(selection) = spec.env.get(key) {
                     environment.push((key.into(), selection.clone()));
                 }
             }
-            // #3907: requester-bound crews' skills are staged in their requesters' homes, named by
-            // the vessel's convoy. Without its Environment record that convoy is unknown.
-            if convoy.is_none() {
-                tracing::warn!(environment = name, "no convoy for this vessel; requester-bound skills cannot be staged in requester homes");
-            }
-            environment
-                .extend(convoy.iter().map(|convoy| (flotilla_resources::account_access::REQUESTER_CONVOY_ENV.to_string(), convoy.clone())));
             let mut source_token_files = BTreeMap::new();
             let will_stage_skills =
                 match agent_material.will_stage_skills(&spec.required_agent_adapters, &environment, &*handle.runner()).await {
@@ -732,6 +726,7 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         spec: &EnvironmentSpec,
     ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
         use flotilla_provisioning::reconcilers::EnvironmentProvisioning;
+        super::credentials::validate_environment_home_keys(spec)?;
         if let Some(cloud) = &spec.cloud_sandbox {
             let carrier = flotilla_resources::DockerEnvironmentSpec {
                 host_ref: self.state.local_host_ref.clone(),

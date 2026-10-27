@@ -112,7 +112,10 @@ pub(super) async fn deliver_bound_account(
         .map_err(|reason| format!("account binding `{name}` cannot be provisioned at `{}`: {reason}", launch.env_ref))?;
     let store = state.credential_store.as_ref().ok_or("host-local credential store unavailable for account delivery")?;
     let (declaration, material) = store.account_material(&binding.object.spec.credential.0).await?;
-    let home = provisioner.home(&store.writable_base(&*runner).await?, launch.convoy, launch.role);
+    let key = binding.object.metadata.labels.get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL).ok_or_else(|| {
+        format!("{} crew `{}` has no recorded home key", flotilla_resources::account_access::REQUESTER_HOME_UNAVAILABLE, launch.role)
+    })?;
+    let home = provisioner.home(&store.writable_base(&*runner).await?, key)?;
     let record = provision_name(&name, launch.env_ref);
     let mut provision = AccountProvisionSpec {
         binding: Ref::new(name.clone(), binding_home),

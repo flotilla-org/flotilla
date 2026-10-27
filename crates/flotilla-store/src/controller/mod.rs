@@ -593,6 +593,23 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let resolver = backend.using::<crate::Environment>(namespace);
                 Self::create_if_missing(&resolver, meta, spec).await
             }
+            Actuation::UpdateEnvironmentHomeKeys { name, keys } => {
+                let resolver = backend.using::<crate::Environment>(namespace);
+                let current = resolver.get(&name).await?;
+                let mut spec = current.spec.clone();
+                let environment = if let Some(cloud) = spec.cloud_sandbox.as_mut() {
+                    &mut cloud.env
+                } else if let Some(docker) = spec.docker.as_mut() {
+                    &mut docker.env
+                } else {
+                    return Err(ResourceError::other("caller home keys require a contained environment"));
+                };
+                environment.insert(
+                    crate::account_access::CREW_HOME_KEYS_ENV.into(),
+                    serde_json::to_string(&keys).map_err(|error| ResourceError::other(error.to_string()))?,
+                );
+                resolver.update(&crate::InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await.map(|_| ())
+            }
             Actuation::CreateClone { meta, spec } => {
                 let resolver = backend.using::<crate::Clone>(namespace);
                 Self::create_if_missing(&resolver, meta, spec).await
