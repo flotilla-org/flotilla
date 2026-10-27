@@ -19,8 +19,6 @@ use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 
-pub(crate) const DEFAULT_CONTROLLER_IDLE: Duration = Duration::from_secs(1);
-
 const ENDPOINT_CACHE_TTL: Duration = Duration::from_secs(1);
 const RECORDING_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const RECORDING_PRUNE_SCRIPT: &str = r#"[ -d "$1/$2/sessions" ] || exit 0
@@ -74,7 +72,6 @@ enum ScreenActivityWire {
 pub struct CleatTerminalPool {
     runner: Arc<dyn CommandRunner>,
     binary: String,
-    controller_idle: Duration,
     environment: ControlledTerminalEnvironment,
     /// Whether this cleat accepts `launch --env-clear` (cleat#318).
     launch_capability: tokio::sync::OnceCell<bool>,
@@ -94,19 +91,12 @@ impl CleatTerminalPool {
         Self {
             runner: environment.runner(runner),
             binary: binary.into(),
-            controller_idle: DEFAULT_CONTROLLER_IDLE,
             environment,
             launch_capability: tokio::sync::OnceCell::new(),
             attach_capability: tokio::sync::OnceCell::new(),
             endpoint_cache: tokio::sync::Mutex::new(None),
             last_recording_prune: tokio::sync::Mutex::new(Instant::now()),
         }
-    }
-
-    /// Default matches cleat's existing one-second screen quiet period.
-    pub fn with_controller_idle(mut self, window: Duration) -> Self {
-        self.controller_idle = window;
-        self
     }
 
     async fn dead_recording_daemons(runner: &dyn CommandRunner, binary: &str) -> Result<Vec<DaemonInfo>, String> {
@@ -215,7 +205,11 @@ impl CleatTerminalPool {
         for variable in &encoded_env {
             args.extend(["--env", variable]);
         }
-        let encoded_tags = tags.iter().map(|tag| format!("{}={}", tag.key, tag.value)).collect::<Vec<_>>();
+        if let Some(recognizer) = tags.iter().find(|tag| tag.key == "recognizer") {
+            args.extend(["--recognizer", &recognizer.value]);
+        }
+        let encoded_tags =
+            tags.iter().filter(|tag| tag.key != "recognizer").map(|tag| format!("{}={}", tag.key, tag.value)).collect::<Vec<_>>();
         for tag in &encoded_tags {
             args.push("--tag");
             args.push(tag);
@@ -391,6 +385,52 @@ impl TerminalPool for CleatTerminalPool {
         Ok(())
     }
 
+    async fn ensure_recognizer(&self, session: &str, harness: &str) -> Result<(), String> {
+        let raw = run!(self.runner, &self.binary, &["inspect", session, "--json"], Path::new("/"))?;
+        let inspection: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        if inspection.pointer("/recognizer/id").and_then(|id| id.as_str()) == Some(harness)
+            && inspection.pointer("/recognizer/error").is_none_or(|error| error.is_null())
+        {
+            return Ok(());
+        }
+        run!(self.runner, &self.binary, &["recognizer", "set", session, harness], Path::new("/"))?;
+        Ok(())
+    }
+
+    async fn abandoned_draft(&self, session: &str) -> Result<Option<String>, String> {
+        let raw = run!(self.runner, &self.binary, &["inspect", session, "--json"], Path::new("/"))?;
+        let inspection: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        // No controller history also means quiet. Cleat rechecks this predicate
+        // together with the exact draft when clearing, closing this read/write race.
+        if inspection["last_controller_input_at"].as_i64().is_some_and(|at| {
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64 - at < 120_000
+        }) {
+            return Ok(None);
+        }
+        Ok(inspection
+            .pointer("/recognizer/observation/roles")
+            .and_then(|roles| roles.as_array())
+            .and_then(|roles| roles.iter().find(|role| role["role"] == "composer"))
+            .and_then(|role| role["value"].as_str())
+            .filter(|draft| !draft.is_empty())
+            .map(str::to_owned))
+    }
+
+    async fn clear_draft(&self, session: &str, draft: &str) -> Result<bool, String> {
+        // Bind the value to its option so a draft such as --help stays text.
+        let draft = format!("--draft={draft}");
+        let args = ["clear-composer", session, &draft, "--controller-idle", "2m"];
+        let label = flotilla_provider_runtime::command_channel_label(&self.binary, &args);
+        let output = self.runner.run_output(&self.binary, &args, Path::new("/"), &label).await?;
+        if output.success() {
+            return Ok(true);
+        }
+        match (output.exit_code, output.stderr.trim().split_once(':').map(|(code, _)| code)) {
+            (Some(1), Some("not-matched" | "role-absent" | "controller-active")) | (Some(2), Some("unsupported")) => Ok(false),
+            _ => Err(output.stderr),
+        }
+    }
+
     async fn capture_screen(&self, session_name: &str) -> Result<Option<String>, String> {
         run!(self.runner, &self.binary, &["capture", session_name], Path::new("/")).map(Some)
     }
@@ -399,18 +439,14 @@ impl TerminalPool for CleatTerminalPool {
         match self.guarded_deliver(session_name, text).await? {
             TerminalSubmission::Submitted => Ok(()),
             TerminalSubmission::Refused(reason) => Err(reason),
-            TerminalSubmission::ControllerFenceUnverifiable => {
-                Err("cleat controller fence is unverifiable; inspect the held batch for same-session operator delivery".into())
-            }
         }
     }
 
     async fn guarded_deliver(&self, session_name: &str, text: &str) -> Result<TerminalSubmission, String> {
-        let idle = format!("{}ms", self.controller_idle.as_millis());
         // Cleat owns paste encoding and Enter in the same daemon transaction.
         // End option parsing before either positional argument: raw crew text
         // can itself be an option spelling such as --help or a Markdown bullet.
-        let args = ["send", "--submit", "--controller-idle", &idle, "--", session_name, text];
+        let args = ["send", "--submit", "--if", "composer[value='']", "--controller-idle", "2s", "--", session_name, text];
         let label = flotilla_provider_runtime::command_channel_label(&self.binary, &args);
         // Inspect the raw process result. Runner/spawn errors must never be
         // mistaken for a daemon's explicit pre-write rejection, even if their
@@ -420,16 +456,10 @@ impl TerminalPool for CleatTerminalPool {
             return Ok(TerminalSubmission::Submitted);
         }
         let reason = output.stderr;
-        // `send` at cleat 89cf40c has no structured-output switch. Parse only
-        // its documented reason prefix and controller.cause field, never prose.
-        let cause = reason
-            .trim()
-            .strip_prefix("controller-active: ")
-            .and_then(|diagnostic| diagnostic.rsplit_once(" (controller.cause="))
-            .and_then(|(_, cause)| cause.strip_suffix(')'));
-        match (output.exit_code, cause) {
-            (Some(1), Some("fence-pending" | "fence-settling" | "quiet-time" | "busy")) => Ok(TerminalSubmission::Refused(reason)),
-            (Some(1), Some("fence-unverifiable")) => Ok(TerminalSubmission::ControllerFenceUnverifiable),
+        match (output.exit_code, reason.trim().split_once(':').map(|(code, _)| code)) {
+            (Some(1), Some("not-matched" | "role-absent" | "controller-active")) | (Some(2), Some("unsupported")) => {
+                Ok(TerminalSubmission::Refused(reason))
+            }
             _ => Err(reason),
         }
     }
@@ -437,21 +467,6 @@ impl TerminalPool for CleatTerminalPool {
     async fn operator_deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
         run!(self.runner, &self.binary, &["send", "--submit", "--", session_name, text], Path::new("/"))?;
         Ok(())
-    }
-
-    async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
-        run!(self.runner, &self.binary, &["send-keys", session_name, "C-c"], Path::new("/"))?;
-        self.deliver(session_name, text).await
-    }
-
-    async fn guarded_retry_delivery(&self, session_name: &str, text: &str) -> Result<TerminalSubmission, String> {
-        run!(self.runner, &self.binary, &["send-keys", session_name, "C-c"], Path::new("/"))?;
-        match self.guarded_deliver(session_name, text).await? {
-            // The clear already happened; do not automatically repeat it on a
-            // temporary refusal. The permanent fence still needs a named alert.
-            TerminalSubmission::Refused(reason) => Err(reason),
-            outcome => Ok(outcome),
-        }
     }
 }
 
@@ -805,7 +820,7 @@ mod tests {
     async fn delivery_uses_one_atomic_guarded_call_per_message() {
         let texts = ["Please review commit abc123", "handoff from coder@work\n\nPlease review", "", "--help", "- bullet", "--foo"];
         let runner = Arc::new(MockRunner::new(texts.iter().map(|_| Ok(String::new())).collect()));
-        let pool = test_pool(runner.clone(), "cleat").with_controller_idle(Duration::from_millis(1750));
+        let pool = test_pool(runner.clone(), "cleat");
         for text in texts {
             let started = tokio::time::Instant::now();
             pool.deliver("reviewer-session", text).await.expect("submit");
@@ -815,7 +830,10 @@ mod tests {
         assert_eq!(calls.len(), texts.len());
         for (call, text) in calls.iter().zip(texts) {
             assert_eq!(call.0, "cleat");
-            assert_eq!(call.1, vec!["send", "--submit", "--controller-idle", "1750ms", "--", "reviewer-session", text]);
+            assert_eq!(
+                call.1,
+                vec!["send", "--submit", "--if", "composer[value='']", "--controller-idle", "2s", "--", "reviewer-session", text]
+            );
         }
     }
 
@@ -837,12 +855,12 @@ mod tests {
         use flotilla_provider_runtime::CommandOutput;
         // The shipped cleat has no JSON option for send. These raw process
         // results were captured from actual guarded sends, including every cause.
-        for (fixture, restart) in [
-            (include_str!("fixtures/controller-refusals/fence-pending.json"), false),
-            (include_str!("fixtures/controller-refusals/fence-settling.json"), false),
-            (include_str!("fixtures/controller-refusals/quiet-time.json"), false),
-            (include_str!("fixtures/controller-refusals/busy.json"), false),
-            (include_str!("fixtures/controller-refusals/fence-unverifiable.json"), true),
+        for fixture in [
+            include_str!("fixtures/controller-refusals/fence-pending.json"),
+            include_str!("fixtures/controller-refusals/fence-settling.json"),
+            include_str!("fixtures/controller-refusals/quiet-time.json"),
+            include_str!("fixtures/controller-refusals/busy.json"),
+            include_str!("fixtures/controller-refusals/fence-unverifiable.json"),
         ] {
             let captured: serde_json::Value = serde_json::from_str(fixture).unwrap();
             let reason = captured["stderr"].as_str().unwrap().to_string();
@@ -852,11 +870,85 @@ mod tests {
                 exit_code: Some(captured["exit_code"].as_i64().unwrap() as i32),
             })]));
             let result = test_pool(runner.clone(), "cleat").guarded_deliver("agent", "turn").await;
-            assert_eq!(
-                result,
-                Ok(if restart { TerminalSubmission::ControllerFenceUnverifiable } else { TerminalSubmission::Refused(reason) })
-            );
+            assert_eq!(result, Ok(TerminalSubmission::Refused(reason)));
             assert_eq!(logical_calls(&runner).len(), 1);
+        }
+    }
+
+    // Glue at the CLI process boundary: every documented selector refusal and
+    // unsupported response proves no write; generic process failures do not.
+    #[tokio::test]
+    async fn selector_refusals_are_known_unsent() {
+        use flotilla_provider_runtime::CommandOutput;
+        for (code, status) in [("not-matched", 1), ("role-absent", 1), ("controller-active", 1), ("unsupported", 2)] {
+            let reason = format!("{code}: selector refused");
+            let runner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: reason.clone(),
+                exit_code: Some(status),
+            })]));
+            assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "wake").await.unwrap(), TerminalSubmission::Refused(reason));
+        }
+    }
+
+    // Glue: launch selects the declared harness; a roll installs a missing live
+    // recognizer, and subsequent observations keep the already installed one.
+    #[tokio::test]
+    async fn crew_recognizer_is_selected_at_launch_and_repaired_live() {
+        for harness in ["codex", "claude-code"] {
+            let runner = Arc::new(MockRunner::new(vec![
+                Ok("[]".into()),
+                Ok(String::new()),
+                Ok("{\"recognizer\":null}".into()),
+                Ok(String::new()),
+                Ok(format!("{{\"recognizer\":{{\"id\":\"{harness}\"}}}}")),
+            ]));
+            let pool = test_pool(runner.clone(), "cleat");
+            pool.ensure_session(
+                "agent",
+                "harness",
+                &ExecutionEnvironmentPath::new("/workspace"),
+                &vec![],
+                &[TerminalSessionTag::new("recognizer", harness)],
+            )
+            .await
+            .unwrap();
+            pool.ensure_recognizer("agent", harness).await.unwrap();
+            pool.ensure_recognizer("agent", harness).await.unwrap();
+            let calls = logical_calls(&runner);
+            assert!(calls[1].1.windows(2).any(|pair| pair == ["--recognizer", harness]));
+            assert_eq!(calls[3].1, ["recognizer", "set", "agent", harness]);
+            assert_eq!(calls.len(), 5);
+        }
+    }
+
+    // The draft is read verbatim from recognition and cleared only by cleat's
+    // atomic exact-value and quiet-controller guard, including multiline text.
+    #[tokio::test]
+    async fn abandoned_draft_uses_guarded_clear_and_preserves_racing_input() {
+        use flotilla_provider_runtime::CommandOutput;
+        let draft = "--keep my 'draft'\nwith \\ and spaces ";
+        for (recent, clear_matches) in [(true, false), (false, false), (false, true)] {
+            let inspection = serde_json::json!({"last_controller_input_at": if recent { Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64) } else { None }, "recognizer":{"observation":{"roles":[{"role":"composer","value":draft}]}}});
+            let mut outputs = vec![Ok(CommandOutput { stdout: inspection.to_string(), stderr: String::new(), exit_code: Some(0) })];
+            if !recent {
+                outputs.push(Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: "not-matched: draft changed".into(),
+                    exit_code: Some(if clear_matches { 0 } else { 1 }),
+                }));
+            }
+            let runner = Arc::new(MockRunner::with_outputs(outputs));
+            let pool = test_pool(runner.clone(), "cleat");
+            let observed = pool.abandoned_draft("agent").await.unwrap();
+            assert_eq!(observed.as_deref(), (!recent).then_some(draft));
+            if let Some(draft) = observed {
+                assert_eq!(pool.clear_draft("agent", &draft).await.unwrap(), clear_matches);
+                assert_eq!(
+                    logical_calls(&runner)[1].1,
+                    ["clear-composer", "agent", &format!("--draft={draft}"), "--controller-idle", "2m"]
+                );
+            }
         }
     }
 
@@ -884,11 +976,8 @@ mod tests {
             "",
             "connection lost",
             "controller input is not idle",
-            "controller-active: diagnostic",
-            "controller-active: diagnostic (controller.cause=future)",
             "error: diagnostic (controller.cause=busy)",
             "write failed: controller-active: diagnostic (controller.cause=busy)",
-            "controller-active: diagnostic (controller.cause=busy) extra",
         ] {
             let runner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
                 stdout: String::new(),
@@ -908,29 +997,6 @@ mod tests {
         }
         let runner = Arc::new(MockRunner::with_outputs(vec![Err(known.into())]));
         assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn").await, Err(known.into()));
-    }
-
-    // Even the legacy clear-and-retry path must preserve the named restart
-    // condition; temporary refusals still hold because clearing already occurred.
-    #[tokio::test]
-    async fn guarded_retry_preserves_restart_failure_after_clearing() {
-        use flotilla_provider_runtime::CommandOutput;
-        for (fixture, restart) in [
-            (include_str!("fixtures/controller-refusals/fence-unverifiable.json"), true),
-            (include_str!("fixtures/controller-refusals/quiet-time.json"), false),
-        ] {
-            let captured: serde_json::Value = serde_json::from_str(fixture).unwrap();
-            let reason = captured["stderr"].as_str().unwrap().to_string();
-            let runner = Arc::new(MockRunner::with_outputs(vec![
-                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), exit_code: Some(0) }),
-                Ok(CommandOutput { stdout: String::new(), stderr: reason.clone(), exit_code: Some(1) }),
-            ]));
-            assert_eq!(
-                test_pool(runner.clone(), "cleat").guarded_retry_delivery("agent", "turn").await,
-                if restart { Ok(TerminalSubmission::ControllerFenceUnverifiable) } else { Err(reason) }
-            );
-            assert_eq!(logical_calls(&runner).len(), 2);
-        }
     }
 
     // ── attach_args tests ──────────────────────────────────────────
@@ -1095,22 +1161,6 @@ mod tests {
         let launch_env = calls[1].1.windows(2).filter(|args| args[0] == "--env").map(|args| args[1].clone()).collect::<Vec<_>>();
         let expected_env = caller_env.iter().map(|(name, value)| format!("{name}={value}")).collect::<std::collections::BTreeSet<_>>();
         assert_eq!(launch_env.into_iter().collect::<std::collections::BTreeSet<_>>(), expected_env);
-    }
-
-    #[tokio::test]
-    async fn retry_delivery_clears_a_stuck_composer_before_resubmitting() {
-        let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok(String::new())]));
-        let pool = test_pool(runner.clone(), "cleat");
-
-        pool.retry_delivery("reviewer-session", "Please review commit abc123").await.expect("retry delivery");
-
-        let calls = logical_calls(&runner);
-        assert_eq!(calls[0].1, vec!["send-keys", "reviewer-session", "C-c"]);
-        assert_eq!(calls.len(), 2);
-        assert_eq!(
-            calls[1].1,
-            vec!["send", "--submit", "--controller-idle", "1000ms", "--", "reviewer-session", "Please review commit abc123"]
-        );
     }
 }
 

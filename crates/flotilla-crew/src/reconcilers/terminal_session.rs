@@ -44,6 +44,8 @@ pub struct TerminalObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalDeliveryOutcome {
     Pending,
+    Deferred(&'static str),
+    BatchSuperseded,
     Confirmed,
     Unconfirmed(TerminalDeliveryFailure),
 }
@@ -534,10 +536,7 @@ where
                 if let Some(message) = head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
                     if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
                         condition.message_id.as_deref() == Some(message.id.as_str())
-                            && ((condition.is_controller_fence_unverifiable()
-                                && self.clock.now().signed_duration_since(condition.observed_at)
-                                    < flotilla_resources::delivery_hold::controller_fence_recheck_delay(condition.consecutive_failures))
-                                || condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
+                            && (condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
                                 || condition.reason == TERMINAL_DELIVERY_EXPIRED_REASON
                                 || (condition.reason == TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
                                     && (delivery_retry_exhausted(condition.consecutive_failures)
@@ -598,7 +597,11 @@ where
                         (&message.id, readiness, outcome, attention.map(|attention| (attention.state, attention.source))),
                     ) {
                         match outcome {
-                            TerminalDeliveryOutcome::Pending => log_delivery_decision!(debug, "wait_for_boundary_or_submission_evidence"),
+                            TerminalDeliveryOutcome::Pending
+                            | TerminalDeliveryOutcome::Deferred(_)
+                            | TerminalDeliveryOutcome::BatchSuperseded => {
+                                log_delivery_decision!(debug, "wait_for_boundary_or_submission_evidence")
+                            }
                             TerminalDeliveryOutcome::Confirmed => log_delivery_decision!(info, "submission_confirmed"),
                             TerminalDeliveryOutcome::Unconfirmed(_) => log_delivery_decision!(info, "delivery_unconfirmed"),
                         }
@@ -606,7 +609,9 @@ where
                     return Ok(match outcome {
                         // Waiting for a turn boundary must not suppress the
                         // observation that releases other queued deliveries.
-                        TerminalDeliveryOutcome::Pending => match self.runtime.observe_attention(session_id, obj.into()).await {
+                        TerminalDeliveryOutcome::Pending
+                        | TerminalDeliveryOutcome::Deferred(_)
+                        | TerminalDeliveryOutcome::BatchSuperseded => match self.runtime.observe_attention(session_id, obj.into()).await {
                             Ok(Some(observation)) => TerminalPrepared::Attention(observation),
                             Ok(None) => TerminalPrepared::MessageDeliveryPending,
                             Err(error) => {

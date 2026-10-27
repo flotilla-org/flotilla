@@ -179,16 +179,10 @@ async fn hookless_submission_needing_permission_is_confirmed_without_retry() {
         &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
         Arc::new(DiscoveryMockRunner::builder().build()),
     );
-    let outcome = deliver_and_confirm(
-        &pool,
-        adapters.get("codex").map(|a| &**a),
-        "agent",
-        "review wake",
-        TerminalDeliveryReadiness::TurnBoundary,
-        false,
-    )
-    .await
-    .expect("submit");
+    let outcome =
+        deliver_and_confirm(&pool, adapters.get("codex").map(|a| &**a), "agent", "review wake", TerminalDeliveryReadiness::TurnBoundary)
+            .await
+            .expect("submit");
     assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
     assert_eq!(pool.inner.delivered.lock().await.len(), 1);
 }
@@ -213,7 +207,7 @@ async fn hookless_submission_waits_for_delayed_working_evidence_with_composer_vi
     let adapter = adapters.get("codex").expect("adapter").clone();
     let submit_pool = pool.clone();
     let submit = tokio::spawn(async move {
-        deliver_and_confirm(&*submit_pool, Some(&*adapter), "agent", "review wake", TerminalDeliveryReadiness::TurnBoundary, false).await
+        deliver_and_confirm(&*submit_pool, Some(&*adapter), "agent", "review wake", TerminalDeliveryReadiness::TurnBoundary).await
     });
     tokio::task::yield_now().await;
     assert_eq!(pool.inner.delivered.lock().await.len(), 1);
@@ -224,83 +218,6 @@ async fn hookless_submission_waits_for_delayed_working_evidence_with_composer_vi
     tokio::time::advance(Duration::from_millis(100)).await;
     assert_eq!(submit.await.expect("task").expect("delivery"), TerminalDeliveryOutcome::Confirmed);
     assert_eq!(pool.inner.delivered.lock().await.len(), 1);
-}
-
-// #2927: a captured scrollback composer permits input, while an unknown
-// screen is held for at most five minutes and cannot paste on late release.
-#[tokio::test(start_paused = true)]
-async fn captured_scrollback_delivery_and_bounded_hold() {
-    let adapters = AgentAdapterRegistry::discover(
-        &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
-        Arc::new(DiscoveryMockRunner::builder().build()),
-    );
-    for idle in [true, false] {
-        let pool = Arc::new(HooklessComposerPool {
-            inner: FakeTerminalPool::new(),
-            submitted_screen: include_str!("../../../../flotilla-agent/src/fixtures/codex-2927/working-after-release.txt"),
-        });
-        pool.inner
-            .add_sessions(vec![ProviderTerminalSession::builder()
-                .session_name("agent".into())
-                .status(TerminalStatus::Running)
-                .screen_activity(ScreenActivity::Stable)
-                .build()])
-            .await;
-        pool.inner
-            .set_captured_screen(
-                "agent",
-                if idle {
-                    include_str!("../../../../flotilla-agent/src/fixtures/codex-2927/scrolled-back.txt")
-                } else {
-                    "unobservable screen"
-                },
-            )
-            .await;
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let inbox = flotilla_messaging::MessageInbox::new(backend, NAMESPACE);
-        inbox
-            .accept(
-                &empty_meta("turn"),
-                &flotilla_resources::MessageSpec::builder()
-                    .sender("system:test".into())
-                    .receiver("flotilla/coder".into())
-                    .relation(flotilla_resources::MessageRelation::System)
-                    .body("wake".into())
-                    .build(),
-                Utc::now(),
-            )
-            .await
-            .unwrap();
-        let task_pool = pool.clone();
-        let adapter = adapters.get("codex").unwrap().clone();
-        let started = tokio::time::Instant::now();
-        let task = tokio::spawn(async move {
-            deliver_guarded_and_confirm(&*task_pool, Some(&*adapter), "agent", "wake", &inbox, &["turn".into()]).await
-        });
-        tokio::task::yield_now().await;
-        if !idle {
-            tokio::time::advance(Duration::from_secs(299)).await;
-            tokio::task::yield_now().await;
-            assert!(!task.is_finished());
-            assert!(pool.inner.delivered.lock().await.is_empty());
-            tokio::time::advance(Duration::from_secs(1)).await;
-        }
-        let outcome = task.await.unwrap().unwrap();
-        if !idle {
-            assert!(started.elapsed() <= Duration::from_secs(300), "held task must stop at the bound");
-        }
-        assert_eq!(
-            outcome,
-            if idle {
-                TerminalDeliveryOutcome::Confirmed
-            } else {
-                TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)
-            }
-        );
-        pool.inner.set_captured_screen("agent", include_str!("../../../../flotilla-agent/src/fixtures/codex-2927/scrolled-back.txt")).await;
-        tokio::time::advance(Duration::from_secs(3600)).await;
-        assert_eq!(pool.inner.delivered.lock().await.len(), usize::from(idle));
-    }
 }
 
 // Release must reject a firing condition that changed during a screen wait,
@@ -344,18 +261,17 @@ async fn held_turn_is_revalidated_at_actual_input_boundary() {
         .unwrap();
     let task_pool = pool.clone();
     let adapter = adapters.get("codex").unwrap().clone();
-    let task =
-        tokio::spawn(
-            async move { deliver_guarded_and_confirm(&*task_pool, Some(&*adapter), "agent", "wake", &inbox, &["turn".into()]).await },
-        );
-    tokio::task::yield_now().await;
     let convoy = convoys.get("subject").await.unwrap();
     convoys
         .update_status("subject", &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() })
         .await
         .unwrap();
     pool.inner.set_captured_screen("agent", include_str!("../../../../flotilla-agent/src/fixtures/codex-2927/scrolled-back.txt")).await;
-    assert_eq!(task.await.unwrap().unwrap(), TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
+    let task =
+        tokio::spawn(
+            async move { deliver_guarded_and_confirm(&*task_pool, Some(&*adapter), "agent", "wake", &inbox, &["turn".into()]).await },
+        );
+    assert_eq!(task.await.unwrap().unwrap(), TerminalDeliveryOutcome::BatchSuperseded);
     assert!(pool.inner.delivered.lock().await.is_empty());
     assert_eq!(
         backend.using::<flotilla_resources::Message>(NAMESPACE).get("turn").await.unwrap().status.unwrap().phase,
@@ -553,174 +469,6 @@ async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_neve
     assert!(typed[1].1.find("replicated-1").expect("first body") < typed[1].1.find("replicated-2").expect("second body"));
 }
 
-// #2599: all senders share prompt readiness, FIFO order, and exact receipts.
-// Explicit-clock in-memory scenarios cover both cleat attachment states,
-// stable/active/missing pixel metadata, and history exposed by attach resize.
-#[tokio::test(start_paused = true)]
-async fn hookless_composer_delivers_review_and_supervisor_turns_with_or_without_principal() {
-    use flotilla_resources::{CrewMessageDelivery, CrewMessageSender, TerminalCrewMessage};
-    const ID: &str = "hookless-crew";
-    const COMPOSER: &str = "› Earlier submitted brief\nWorked for 10m 43s\n› Ask Codex to do anything\ngpt-6.1-sol · /workspace";
-    for attached in [false, true] {
-        for activity in [Some(ScreenActivity::Stable), Some(ScreenActivity::Active), None] {
-            let temp = TempDir::new().expect("tempdir");
-            fs::write(temp.path().join("daemon.toml"), "machine_id = \"hookless-test\"\n").expect("daemon config");
-            let config = Arc::new(ConfigStore::with_base(temp.path()));
-            let (daemon, _) = crew_daemon(config.clone()).await;
-            let backend = daemon.resource_backend();
-            let pool = Arc::new(HooklessComposerPool {
-                inner: FakeTerminalPool::new(),
-                submitted_screen: "• Working (1s • esc to interrupt)\n› Ask Codex to do anything",
-            });
-            pool.inner
-                .add_sessions(vec![ProviderTerminalSession::builder()
-                    .session_name(ID.into())
-                    .status(if attached { TerminalStatus::Running } else { TerminalStatus::Disconnected })
-                    .command("codex".into())
-                    .working_directory(ExecutionEnvironmentPath::new("/workspace"))
-                    .maybe_screen_activity(activity)
-                    .build()])
-                .await;
-            let mut registry = probe_local_provider_registry(&daemon, &config).await.expect("registry");
-            Arc::get_mut(&mut registry).expect("exclusive test registry").terminal_pools.insert(
-                "hookless",
-                ProviderDescriptor::named(ProviderCategory::TerminalPool, "hookless"),
-                pool.clone(),
-            );
-            let profile = build_local_profile(&daemon, &registry).await.expect("profile");
-            ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("environment");
-            backend
-                .using::<Convoy>(NAMESPACE)
-                .create(&empty_meta("hookless"), &ConvoySpec::builder().workflow_ref("test".into()).role("hookless".into()).build())
-                .await
-                .expect("convoy");
-            create_credential_test_session(&backend, ID, "hookless", "hookless-work", &profile.host_direct_environment_name()).await;
-            let sessions = backend.using::<TerminalSession>(NAMESPACE);
-            let mut session = sessions.get(ID).await.expect("session");
-            let mut spec = session.spec.clone();
-            spec.pool = "hookless".into();
-            let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { unreachable!() };
-            let make_message = |id: &str, sender| TerminalCrewMessage {
-                id: id.into(),
-                text: id.into(),
-                sender,
-                delivery: CrewMessageDelivery::Queued,
-                acknowledged: Default::default(),
-                following: Vec::new(),
-            };
-            let review = make_message("review-round-3", CrewMessageSender::FlotillaTurn { source: "review".into() });
-            *message = Some(review.clone());
-            let head = message.as_mut().expect("head");
-            head.append(review); // Duplicate wakes must not create a second turn.
-            head.append(make_message("supervisor-resume", CrewMessageSender::Governor { name: "porthole".into() }));
-            head.append(make_message("operator-brief", CrewMessageSender::OperatorResume { principal: None }));
-            let mut meta = InputMeta::from(&session.metadata);
-            meta.labels.extend([
-                (flotilla_resources::CONVOY_LABEL.into(), "hookless".into()),
-                (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
-                (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
-            ]);
-            let mut stored_spec = spec.clone();
-            if let TerminalSessionSource::Agent { message, .. } = &mut stored_spec.source {
-                *message = None;
-            }
-            session = sessions.update(&meta, &session.metadata.resource_version, &stored_spec).await.expect("new-only holder");
-            let mut status = session.status.clone().expect("status");
-            status.crew = Some(flotilla_resources::CrewSessionStatus {
-                id: "crew-id".into(),
-                adapter: "codex".into(),
-                model: None,
-                stance: "work".into(),
-            });
-            status.session_id = Some(ID.into());
-            status.delivered_message_id = Some("initial-brief".into());
-            sessions.update_status(ID, &session.metadata.resource_version, &status).await.expect("running status");
-            let runtime = Arc::new(TerminalControllerRuntime {
-                state: Arc::new(ControllerRuntimeState::new(
-                    daemon,
-                    config,
-                    registry,
-                    None,
-                    profile.host_id.clone(),
-                    profile.host_direct_environment_name(),
-                )),
-            });
-            // Upgrade keeps the three distinct producer identities but
-            // Message owns one batch and one evidence-backed receipt per record.
-            let inbox = runtime.state.daemon.message_inbox(NAMESPACE).await;
-            let TerminalSessionSource::Agent { message: Some(head), .. } = &spec.source else { unreachable!() };
-            for input in std::iter::once(head).chain(head.following.iter()) {
-                let intent = flotilla_resources::legacy_message_spec("flotilla/hookless/work/coder", input);
-                let name = flotilla_resources::message_record_name(&intent.receiver, &intent.sender, &input.id);
-                inbox.accept(&empty_meta(&name), &intent, Utc::now()).await.expect("new Message intent");
-            }
-            let inbox = runtime.state.daemon.message_inbox(NAMESPACE).await;
-            for screen in [
-                "• Working (10m • esc to interrupt)\n› Ask Codex to do anything",
-                "Would you like to run the following command?\n› 1. Yes\n  2. No",
-                "Unknown screen",
-                "› please wait for my draft\n\ngpt-6.1-sol · /workspace",
-                "› Ask Codex to do anything after I finish typing",
-                "› Ask Codex to do anything\n  but wait for my second line\n\ngpt-6.1-sol · /workspace",
-            ] {
-                pool.inner.set_captured_screen(ID, screen).await;
-                refresh_message_test_attention(&runtime, &backend, ID).await;
-                inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("non-boundary observation");
-                tokio::time::advance(Duration::from_millis(200)).await;
-                tokio::task::yield_now().await;
-                assert!(pool.inner.delivered.lock().await.is_empty(), "active turns and drafts must retain all input");
-                let observed = sessions.get(ID).await.expect("receiver attention after observation");
-                assert_ne!(
-                    observed.status.expect("receiver status").attention.expect("refreshed attention").state,
-                    TerminalAttentionState::Idle
-                );
-            }
-            pool.inner.set_captured_screen(ID, COMPOSER).await;
-            for _ in 0..40 {
-                tokio::time::advance(Duration::from_millis(200)).await;
-                tokio::task::yield_now().await;
-                refresh_message_test_attention(&runtime, &backend, ID).await;
-                inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("delivery observation");
-                if backend
-                    .using::<flotilla_resources::Message>(NAMESPACE)
-                    .list()
-                    .await
-                    .expect("receiver delivery receipts")
-                    .items
-                    .iter()
-                    .all(|message| message.status.as_ref().is_some_and(|status| status.phase.has_delivery_evidence()))
-                {
-                    break;
-                }
-            }
-            let records = backend.using::<flotilla_resources::Message>(NAMESPACE).list().await.expect("adopted receiver inbox").items;
-            assert_eq!(records.len(), 3);
-            assert!(records.iter().all(|message| message.status.as_ref().is_some_and(|status| status.phase.has_delivery_evidence())));
-            pool.inner.set_captured_screen(ID, COMPOSER).await;
-            inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("repeat receipt");
-            let delivered = pool.inner.delivered.lock().await;
-            assert_eq!(delivered.len(), 1, "all three upgraded inputs share one turn");
-            let text = &delivered[0].1;
-            assert!(text.find("review-round-3").expect("first body") < text.find("supervisor-resume").expect("second body"));
-            assert!(text.find("supervisor-resume").expect("first body") < text.find("operator-brief").expect("second body"));
-            assert!(delivered[0].2);
-        }
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn delivery_waits_for_the_agent_tui_to_become_idle_before_submitting() {
-    let pool = DeliveryProbePool::new(vec![ScreenActivity::Active, ScreenActivity::Stable, ScreenActivity::Active]);
-
-    let outcome = deliver_and_confirm(&pool, None, "agent", "first line\n\nsecond line", TerminalDeliveryReadiness::Startup, false)
-        .await
-        .expect("delivery outcome");
-
-    assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
-    assert!(pool.observations.load(Ordering::SeqCst) >= 3);
-    assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
-}
-
 // #2705: generate isolated redraws and short Working/Idle runs through
 // the real Codex adapter and terminal-pool boundary. No flicker permits a
 // second write; only a full stable second confirms the queued submission.
@@ -751,7 +499,6 @@ fn flickering_codex_confirmation_never_resends(tc: hegel::TestCase) {
             "agent",
             "wake",
             TerminalDeliveryReadiness::Startup,
-            false,
         )
         .await
         .expect("uncertain submission");
@@ -1032,55 +779,12 @@ async fn held_pool_delivery_scenario(mode: &str) {
 async fn accepted_but_unconfirmed_delivery_is_never_retyped() {
     let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
 
-    let outcome = deliver_and_confirm(&pool, None, "agent", "stuck handoff", TerminalDeliveryReadiness::Startup, false)
-        .await
-        .expect("delivery outcome");
+    let outcome =
+        deliver_and_confirm(&pool, None, "agent", "stuck handoff", TerminalDeliveryReadiness::Startup).await.expect("delivery outcome");
 
     assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
     assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test(start_paused = true)]
-async fn delivery_flags_a_session_that_never_becomes_idle_without_sending_bytes() {
-    let pool = DeliveryProbePool::new(vec![ScreenActivity::Active]);
-
-    let outcome = deliver_and_confirm(&pool, None, "agent", "unsafe handoff", TerminalDeliveryReadiness::Startup, false)
-        .await
-        .expect("delivery outcome");
-
-    assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
-    assert_eq!(pool.observations.load(Ordering::SeqCst), DELIVERY_READY_POLLS);
-    assert_eq!(pool.deliveries.load(Ordering::SeqCst), 0);
-    assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test(start_paused = true)]
-async fn delivery_to_an_established_busy_agent_waits_past_the_startup_deadline() {
-    let mut activities = vec![ScreenActivity::Active; DELIVERY_READY_POLLS + 10];
-    activities.extend([ScreenActivity::Stable, ScreenActivity::Active]);
-    let pool = DeliveryProbePool::new(activities);
-
-    let outcome = deliver_and_confirm(&pool, None, "agent", "handoff after this turn", TerminalDeliveryReadiness::TurnBoundary, false)
-        .await
-        .expect("delivery outcome");
-
-    assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
-    assert!(pool.observations.load(Ordering::SeqCst) > DELIVERY_READY_POLLS);
-    assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test(start_paused = true)]
-async fn replacement_delivery_clears_the_composer_before_submitting() {
-    let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable, ScreenActivity::Active]);
-
-    let outcome = deliver_and_confirm(&pool, None, "agent", "replacement handoff", TerminalDeliveryReadiness::TurnBoundary, true)
-        .await
-        .expect("delivery outcome");
-
-    assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
-    assert_eq!(pool.deliveries.load(Ordering::SeqCst), 0);
-    assert_eq!(pool.retries.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -1122,12 +826,11 @@ async fn terminal_delivery_lookup_deduplicates_same_message_and_replaces_a_diffe
 // resolves on later Working evidence (or operator closure) without duplication.
 #[hegel::test]
 fn message_batch_uses_one_pool_input_and_releases_a_late_receipt(tc: hegel::TestCase) {
-    // Generate repeated controller-input interleavings, including a single
-    // refusal and five refusals, and both receipt/closure settlement paths.
-    let refusals = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(5));
+    // Generate both settlement paths for a possibly written batch. Controller
+    // refusals are covered by the separate cleat recovery lifecycle scenario.
     let operator_closes = tc.draw(hegel::generators::booleans());
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused scenario runtime");
-    runtime.block_on(run_message_batch_pool_case(operator_closes, refusals));
+    runtime.block_on(run_message_batch_pool_case(operator_closes));
 }
 
 // Legacy queue work cannot drain or replace a Message batch's task,
@@ -1335,151 +1038,6 @@ async fn message_resync_coalesces_active_messages() {
     }
 }
 
-// The issue's queued-refusal retry also applies to legacy delivery: transient
-// controller activity retries once per boundary and permanent refusal ends at
-// the existing hold deadline, without typing input or leaking its reservation.
-#[hegel::test]
-fn legacy_controller_refusals_retry_within_a_bounded_hold(tc: hegel::TestCase) {
-    // Cover startup and turn-boundary readiness, zero through four transient
-    // refusals, and a controller that refuses for the entire hold interval.
-    let startup = tc.draw(hegel::generators::booleans());
-    let refusals = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(4));
-    let permanent = tc.draw(hegel::generators::booleans());
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused refusal runtime");
-    runtime.block_on(async {
-        let activities = if permanent {
-            vec![ScreenActivity::Stable]
-        } else {
-            let mut activities = vec![ScreenActivity::Stable; refusals + 1];
-            activities.push(ScreenActivity::Active);
-            activities
-        };
-        let pool = DeliveryProbePool::new(activities);
-        pool.controller_refusals.store(if permanent { usize::MAX } else { refusals }, Ordering::SeqCst);
-        let bound = flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
-        let started = tokio::time::Instant::now();
-        let readiness = if startup { TerminalDeliveryReadiness::Startup } else { TerminalDeliveryReadiness::TurnBoundary };
-        let result = tokio::time::timeout(
-            bound + Duration::from_secs(1),
-            deliver_and_confirm(&pool, None, "agent", "queued turn", readiness, false),
-        )
-        .await
-        .expect("legacy delivery must finish within the hold")
-        .expect("delivery outcome");
-        assert!(started.elapsed() <= bound);
-        if permanent {
-            assert_eq!(result, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
-            assert!(pool.inputs.lock().expect("input log").is_empty());
-            assert!(pool.submission_attempts.load(Ordering::SeqCst) > 0);
-        } else {
-            assert_eq!(result, TerminalDeliveryOutcome::Confirmed);
-            assert_eq!(*pool.inputs.lock().expect("input log"), vec!["queued turn"]);
-            assert_eq!(pool.submission_attempts.load(Ordering::SeqCst), refusals + 1);
-        }
-        assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
-    });
-}
-
-// #3460: delivery waiting on an idle crew that cannot take a turn says why,
-// with the recovery command, instead of "waiting for a fresh idle holder
-// observation". The transport still refuses: the crew is not ready.
-#[tokio::test]
-async fn delivery_wait_names_an_idle_crew_composer_obstruction() {
-    use flotilla_agent_connector::{AgentTransport, DeliveryTarget};
-    use flotilla_resources::{ScreenObstruction, TerminalAttention, TerminalAttentionSource, TerminalAttentionState};
-    let temp = TempDir::new().expect("tempdir");
-    let config_base = temp.path().join("config");
-    fs::create_dir_all(&config_base).expect("config directory");
-    fs::write(config_base.join("daemon.toml"), "machine_id = \"obstruction-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(config_base));
-    let daemon = InProcessDaemon::new(
-        Vec::new(),
-        Arc::clone(&config),
-        fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
-        HostName::new("dinghy"),
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-    let sessions = daemon.resource_backend().using::<TerminalSession>(NAMESPACE);
-    let created = sessions
-        .create(
-            &empty_meta("crew-terminal"),
-            &flotilla_resources::TerminalSessionSpec {
-                env_ref: "host-direct-host-test".into(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Tool { command: "codex".into() },
-                cwd: "/workspace".into(),
-                env: Default::default(),
-                pool: "cleat".into(),
-            },
-        )
-        .await
-        .expect("session");
-    let runtime = super::super::terminal::TerminalControllerRuntime {
-        state: Arc::new(ControllerRuntimeState::new(
-            Arc::clone(&daemon),
-            config,
-            Arc::new(ProviderRegistry::new()),
-            None,
-            "host-test".to_string(),
-            "host-direct-host-test".to_string(),
-        )),
-    };
-    let target = DeliveryTarget {
-        namespace: NAMESPACE.into(),
-        holder: "crew-terminal".into(),
-        session: Some("crew-session".into()),
-        crew_id: None,
-        harness: None,
-        live_shapes: None,
-    };
-    let mut status = TerminalSessionStatus {
-        phase: TerminalSessionPhase::Running,
-        session_id: Some("crew-session".into()),
-        attention: Some(TerminalAttention {
-            state: TerminalAttentionState::Unobservable,
-            as_of: Utc::now(),
-            source: TerminalAttentionSource::Screen,
-        }),
-        ..Default::default()
-    };
-    let mut version = created.metadata.resource_version;
-    for obstruction in [None, Some(ScreenObstruction::ComposerText { reply: Some("6;24;9t".into()), chars: 7 })] {
-        status.screen_obstruction = obstruction.clone();
-        version = sessions.update_status("crew-terminal", &version, &status).await.expect("status").metadata.resource_version;
-        let observation = runtime.observe(&target, None).await.expect("observation");
-        assert!(!observation.ready);
-        let reason = observation.waiting_reason.expect("waiting reason");
-        match obstruction {
-            None => assert_eq!(reason, "waiting for a fresh idle holder observation"),
-            Some(_) => {
-                assert!(reason.starts_with("waiting on the holder: idle, composer holds unsent text `6;24;9t`"), "{reason}");
-                assert!(reason.contains("`cleat send-keys crew-session C-u`"), "{reason}");
-            }
-        }
-    }
-}
-
-// A permanent cleat refusal exits confirmation immediately, before any write or
-// receipt, and reaches the transport as a named failure rather than an ambiguity.
-#[tokio::test(start_paused = true)]
-async fn unverifiable_controller_fence_is_known_unsent_without_a_confirmation_wait() {
-    let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
-    pool.controller_fence_unverifiable.store(true, Ordering::SeqCst);
-    let started = tokio::time::Instant::now();
-    let outcome = super::super::terminal::submit_and_confirm(&pool, None, "agent", "turn", false).await.expect("refusal");
-    assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable));
-    assert_eq!(started.elapsed(), Duration::ZERO);
-    assert_eq!(pool.submission_attempts.load(Ordering::SeqCst), 1);
-    assert!(pool.inputs.lock().expect("input log").is_empty());
-    assert_eq!(
-        super::super::message::message_transport_outcome(Ok(outcome)),
-        flotilla_agent_connector::TransportOutcome::ControllerFenceUnverifiable {
-            reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into()
-        }
-    );
-}
-
 // Environment boundary fixture: retain the same interior runner while exposing
 // the provider's realized mounts to the production environment manager.
 struct CodexTestEnvironment {
@@ -1512,12 +1070,13 @@ impl ProvisionedEnvironment for CodexTestEnvironment {
     }
 }
 
-// #3799: a known-unsent fence refusal is recoverable in the same child,
-// either by a newly verifiable guard or by explicit operator authorization.
+// #3961: controller input from an attachment or terminal-response source cannot
+// hold an idle crew indefinitely. Empty and abandoned composers recover in the
+// same session with one delivery, saved draft attention, and no operator.
 #[tokio::test(start_paused = true)]
-async fn fence_hold_recovers_through_terminal_pool_in_the_same_session() {
+async fn controller_input_detach_and_empty_or_abandoned_composer_delivers_without_operator() {
     use flotilla_resources::{Message, MessageRelation, MessageSpec, ROLE_LABEL, VESSEL_LABEL};
-    for operator in [false, true] {
+    for (attached, abandoned) in [(false, false), (true, false), (false, true), (true, true)] {
         let temp = TempDir::new().expect("cross-host Message fixture operation succeeds");
         fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-pool-test\"\n")
             .expect("cross-host Message fixture operation succeeds");
@@ -1527,16 +1086,22 @@ async fn fence_hold_recovers_through_terminal_pool_in_the_same_session() {
         let mut probe = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
         probe.submission_error = false;
         probe.working_after_delivery = true;
-        probe.controller_fence_unverifiable.store(true, Ordering::SeqCst);
+        probe.recent_controller_input.store(true, Ordering::SeqCst);
+        probe.controller_attached.store(attached, Ordering::SeqCst);
+        if abandoned {
+            *probe.draft.lock().unwrap() = Some("--saved draft\nwith 'quotes' and \\".into());
+        }
 
         probe.screens = vec!["› Ask Codex to do anything".into(); 1000];
         probe.screens.push("new tool output\n• Working (1s • esc to interrupt)\n› Ask Codex to do anything".into());
         let pool = Arc::new(probe);
+        let runner = Arc::new(ControllerCleatRunner { probe: pool.clone(), recognizer_installed: AtomicBool::new(false) });
+        let cleat = Arc::new(flotilla_terminal::cleat::CleatTerminalPool::new(runner, "cleat", &EnvironmentBag::new()));
         let mut registry = probe_local_provider_registry(&daemon, &config).await.expect("cross-host Message fixture operation succeeds");
         Arc::get_mut(&mut registry).expect("cross-host Message fixture operation succeeds").terminal_pools.insert(
             "message-probe",
             ProviderDescriptor::named(ProviderCategory::TerminalPool, "message-probe"),
-            pool.clone(),
+            cleat,
         );
         let profile = build_local_profile(&daemon, &registry).await.expect("cross-host Message fixture operation succeeds");
         ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("cross-host Message fixture operation succeeds");
@@ -1605,28 +1170,13 @@ async fn fence_hold_recovers_through_terminal_pool_in_the_same_session() {
         tokio::task::yield_now().await;
         inbox.reconcile_delivery(&keystroke_router(&runtime.state), now + chrono::Duration::seconds(1)).await.unwrap();
         assert!(pool.inputs.lock().unwrap().is_empty(), "refusal writes no input");
-        assert_eq!(
-            flotilla_resources::crew_attention(sessions.get("agent").await.unwrap().status.as_ref(), now),
-            Some(flotilla_protocol::CrewAttention::ControllerFenceUnverifiable)
-        );
-        if operator {
-            let mut events = daemon.subscribe();
-            let id = daemon
-                .execute(
-                    Command::builder()
-                        .action(CommandAction::MessageDeliverBatch {
-                            namespace: NAMESPACE.into(),
-                            name: "held-turn".into(),
-                            reason: "checked session and composer".into(),
-                        })
-                        .build(),
-                )
-                .await
-                .unwrap();
-            assert!(matches!(wait_for_command_result(&mut events, id).await, CommandValue::Ok));
-        } else {
-            pool.controller_fence_unverifiable.store(false, Ordering::SeqCst);
-        }
+        let waiting = backend.using::<Message>(NAMESPACE).get("held-turn").await.unwrap().status.unwrap();
+        assert!(waiting.retry.is_none(), "controller input never consumes an attempt");
+        // Detach (or a terminal-response source falls quiet), then observe the
+        // idle empty composer. The unverifiable fence still needs a selector.
+        pool.recent_controller_input.store(false, Ordering::SeqCst);
+        pool.controller_attached.store(false, Ordering::SeqCst);
+        refresh_message_test_attention_at(&runtime, &backend, "agent", now + chrono::Duration::seconds(12)).await;
         inbox.reconcile_delivery(&keystroke_router(&runtime.state), now + chrono::Duration::seconds(12)).await.unwrap();
         for tick in 0..40 {
             tokio::task::yield_now().await;
@@ -1657,11 +1207,10 @@ async fn fence_hold_recovers_through_terminal_pool_in_the_same_session() {
         assert_eq!(pool.lifecycle_changes.load(Ordering::SeqCst), 0, "no child launch or termination during recovery");
         assert_eq!(pool.retries.load(Ordering::SeqCst), 0, "no composer-clearing or harness restart");
         assert_eq!(sessions.get("agent").await.unwrap().status.unwrap().crew.unwrap().id, "original-crew");
-        if operator {
-            let receipt = status.resolved_receiver.unwrap();
-            assert!(receipt.evidence.contains("checked session and composer"));
-            assert!(receipt.evidence.contains("cleat acknowledged explicit operator submission"));
-            assert!(!receipt.evidence.contains("Working"), "override receipt must not fabricate agent activity");
+        let saved = sessions.get("agent").await.unwrap().status.unwrap().stashed_drafts;
+        assert_eq!(saved.len(), usize::from(abandoned));
+        if abandoned {
+            assert_eq!(saved[0], "--saved draft\nwith 'quotes' and \\");
         }
     }
 }

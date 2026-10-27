@@ -1,6 +1,6 @@
 //! Terminal pool factory for cleat.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use flotilla_discovery_api::provider_config::ProviderConfigView;
@@ -10,7 +10,7 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
-use crate::cleat::{CleatTerminalPool, DEFAULT_CONTROLLER_IDLE};
+use crate::cleat::CleatTerminalPool;
 use crate::TerminalPool;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
@@ -34,10 +34,11 @@ impl Factory for CleatTerminalPoolFactory {
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         if let Some(binary) = env.find_binary("cleat") {
-            let config = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
-            let window = config.terminal_pool.controller_idle_ms.map(Duration::from_millis).unwrap_or(DEFAULT_CONTROLLER_IDLE);
+            config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
+            // The retired controller_idle_ms setting still decodes for one roll.
+            // Crew deliveries always use the owner's bounded two-second guard.
             // Cleat's VT engine chooses the child's terminal identity at launch.
-            Ok(Arc::new(CleatTerminalPool::new(runner, binary.as_path().display().to_string(), env).with_controller_idle(window)))
+            Ok(Arc::new(CleatTerminalPool::new(runner, binary.as_path().display().to_string(), env)))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("cleat".into())])
         }
@@ -103,13 +104,13 @@ mod tests {
         }
     }
 
-    // Glue: discovery forwards the configured atomic guard window to cleat.
+    // Glue: a legacy configuration cannot extend the bounded controller quiet period.
     #[tokio::test]
-    async fn session_factory_configures_controller_idle_window() {
+    async fn session_factory_ignores_legacy_controller_idle_window() {
         use flotilla_replay_testkit::testing::MockRunner;
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("cleat", "/tools/cleat"));
         let mut config = ConfigStore::with_base("/config");
-        config.1.terminal_pool.controller_idle_ms = Some(2500);
+        config.1.terminal_pool.controller_idle_ms = Some(600_000);
         let runner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
         let pool = CleatTerminalPoolFactory
             .probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner.clone())
@@ -118,7 +119,7 @@ mod tests {
         pool.deliver("agent", "turn").await.expect("atomic turn submission");
         let calls = runner.calls();
         assert_eq!(calls.len(), 1);
-        assert!(calls[0].1.windows(2).any(|args| args == ["--controller-idle", "2500ms"]));
+        assert!(calls[0].1.windows(2).any(|args| args == ["--controller-idle", "2s"]));
     }
 
     #[tokio::test]

@@ -2508,10 +2508,10 @@ fn delivery_guard_admission_compatibility() {
     assert!(!current.same_intent(&other));
 }
 
-// A legacy condition receipt that never replicates is known-unsent, but not
-// tight-looped: the deployed retry budget backs off and raises one operator gate.
+// An unobservable turn condition remains queued, without an attempt or operator
+// gate, and can be delivered after another holder observation.
 #[tokio::test]
-async fn missing_condition_receipt_exhausts_bounded_retries_without_input() {
+async fn missing_condition_receipt_waits_without_charging_an_attempt() {
     use flotilla_resources::*;
     struct GuardedTransport {
         inbox: MessageInbox,
@@ -2528,7 +2528,7 @@ async fn missing_condition_receipt_exhausts_bounded_retries_without_input() {
         async fn submit(&self, batch: &Delivery) -> TransportOutcome {
             self.inner.submissions.lock().unwrap().push(batch.submission.batch_id.clone());
             let error = self.inbox.validate_delivery_members(&batch.submission.members, at(20)).await.unwrap_err();
-            TransportOutcome::NotSubmitted { reason: error.to_string() }
+            TransportOutcome::Deferred { reason: error.to_string(), reform_batch: false }
         }
         async fn poll(&self, _: &Delivery) -> TransportOutcome {
             panic!("known-unsent guard failures have no pending write to poll")
@@ -2559,18 +2559,25 @@ async fn missing_condition_receipt_exhausts_bounded_retries_without_input() {
             working: Default::default(),
         },
     });
-    for (second, attempts) in [(20, 1), (21, 1), (79, 1), (80, 2), (81, 2), (199, 2), (200, 3), (500, 3), (10000, 3)] {
+    for (second, attempts) in [(20, 1), (21, 1), (79, 1), (80, 1), (81, 1), (199, 1), (200, 1), (500, 1), (10000, 1)] {
         inbox.reconcile_delivery(&router(&transport), at(second)).await.unwrap();
         assert_eq!(transport.inner.submissions.lock().unwrap().len(), attempts);
         let status = messages.get("legacy").await.unwrap().status.unwrap();
         assert!(status.resolved_receiver.is_none());
         assert!(status.submission.is_none());
     }
-    assert_eq!(backend.using::<Demand>("flotilla").list().await.unwrap().items.len(), 1);
-    assert!(matches!(
-        messages.get("legacy").await.unwrap().status.unwrap().retry.unwrap().disposition,
-        ControllerRetryDisposition::Terminal { .. }
-    ));
+    assert!(backend.using::<Demand>("flotilla").list().await.unwrap().items.is_empty());
+    assert!(messages.get("legacy").await.unwrap().status.unwrap().retry.is_none());
+    let terminals = backend.using::<TerminalSession>("flotilla");
+    let holder = terminals.get("terminal").await.unwrap();
+    let mut status = holder.status.unwrap();
+    status.last_output_activity_at = Some(at(10001));
+    terminals.update_status("terminal", &holder.metadata.resource_version, &status).await.unwrap();
+    let recovered = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "condition observable on next observation".into() });
+    inbox.reconcile_delivery(&router(&recovered), at(10001)).await.unwrap();
+    let delivered = messages.get("legacy").await.unwrap().status.unwrap();
+    assert!(delivered.resolved_receiver.is_some());
+    assert!(delivered.retry.is_none());
 }
 
 // #3042: a receiver batch reads each named holder kind once; adding unrelated
@@ -3142,42 +3149,13 @@ async fn submit_timeout_after_failover_holds_without_resubmission() {
     }
 }
 
-// #3799: a definitely-unsent refusal stays visible and is retried through the
-// same transport once the fence clears; no holder or agent restart is involved.
-#[tokio::test]
-async fn unverifiable_controller_fence_recovers_in_the_same_session() {
-    let (backend, inbox) = delivery_inbox().await;
-    let refused = named(
-        KEYSTROKE,
-        TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
-    );
-    inbox.reconcile_delivery(&router(&refused), at(20)).await.expect("refusal");
-    let terminals = backend.using::<flotilla_resources::TerminalSession>("flotilla");
-    let original = terminals.get("terminal").await.unwrap();
-    assert_eq!(
-        flotilla_resources::crew_attention(original.status.as_ref(), at(20)),
-        Some(flotilla_protocol::CrewAttention::ControllerFenceUnverifiable)
-    );
-    let recovered = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "same session accepted turn".into() });
-    inbox.reconcile_delivery(&router(&recovered), at(30)).await.expect("retry");
-    assert_eq!(recovered.submissions.lock().unwrap().len(), 1);
-    let current = terminals.get("terminal").await.unwrap();
-    assert_eq!(current.status.as_ref().unwrap().session_id, original.status.as_ref().unwrap().session_id);
-    for message in backend.using::<Message>("flotilla").list().await.unwrap().items {
-        assert!(message.status.unwrap().resolved_receiver.is_some(), "retried input gets a receipt");
-    }
-    assert!(current.status.unwrap().degraded.is_none(), "receipt clears held attention");
-}
-
 // #3799: every held path, including ambiguous writes and empty receipts,
 // raises crew attention on the first held pass rather than after a timeout.
 #[tokio::test]
 async fn every_held_delivery_immediately_raises_crew_attention() {
-    for outcome in [
-        TransportOutcome::Unconfirmed { reason: "ambiguous write".into() },
-        TransportOutcome::Accepted { evidence: String::new() },
-        TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
-    ] {
+    for outcome in
+        [TransportOutcome::Unconfirmed { reason: "ambiguous write".into() }, TransportOutcome::Accepted { evidence: String::new() }]
+    {
         let (backend, inbox) = delivery_inbox().await;
         let transport = named(KEYSTROKE, outcome);
         inbox.reconcile_delivery(&router(&transport), at(20)).await.unwrap();
@@ -3202,73 +3180,6 @@ async fn every_held_delivery_immediately_raises_crew_attention() {
         let terminal = backend.using::<flotilla_resources::TerminalSession>("flotilla").get("terminal").await.unwrap();
         assert!(terminal.status.unwrap().degraded.is_none(), "disposing of any member clears its held batch attention");
     }
-}
-
-// A refused batch can persist zero through two of its three member failures
-// before a store error. Restart repairs that exact batch before accepting later
-// Working evidence, never creates a receipt, and never resubmits its input.
-#[hegel::test]
-fn partial_controller_refusal_is_repaired_before_acceptance(tc: hegel::TestCase) {
-    let completed = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
-    let observations = tc.draw(gs::integers::<i64>().min_value(1).max_value(3));
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    runtime.block_on(async {
-        let (backend, inbox) = delivery_inbox().await;
-        let transport = Arc::new(FakeMessageTransport {
-            submissions: Default::default(),
-            observations: Default::default(),
-            outcome: TransportOutcome::Pending,
-            accepted: Default::default(),
-            working: Default::default(),
-        });
-        inbox.reconcile_delivery(&router(&transport), at(20)).await.expect("record original submission");
-        let reason = flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE;
-        let terminals = backend.using::<flotilla_resources::TerminalSession>("flotilla");
-        flotilla_store::apply_status_patch(
-            &terminals,
-            "terminal",
-            &flotilla_resources::TerminalSessionStatusPatch::MarkControllerFenceUnverifiable {
-                message_id: "message-0".into(),
-                message: reason.into(),
-                observed_at: at(21),
-            },
-        )
-        .await
-        .expect("durable session proof");
-        let messages = backend.using::<Message>("flotilla");
-        let names: Vec<String> = (0..3).map(|index| format!("message-{index}")).collect();
-        // Seed the actual persisted states possible before each member write.
-        for name in names.iter().take(completed) {
-            let message = messages.get(name).await.expect("member");
-            let mut status = message.status.expect("submission status");
-            assert!(status.submission.is_some());
-            status.retry = Some(flotilla_resources::ControllerRetry::terminal(None, at(21), reason));
-            status.submission = None;
-            status.failed_batch_members = names.clone();
-            MessageStatusPatch::Wait { phase: MessagePhase::Deliverable, reason: reason.into(), at: at(21) }.apply(&mut status);
-            messages.update_status(name, &message.metadata.resource_version, &status).await.expect("partial failure write");
-        }
-        transport.accepted.store(true, std::sync::atomic::Ordering::SeqCst);
-        transport.working.store(true, std::sync::atomic::Ordering::SeqCst);
-        let restarted = MessageInbox::new(backend.clone(), "flotilla");
-        for index in 0..observations {
-            restarted.reconcile_delivery(&router(&transport), at(30 + index)).await.expect("repair then observe");
-            for name in &names {
-                let status = messages.get(name).await.expect("member").status.expect("failure");
-                assert!(status.resolved_receiver.is_none(), "known-unsent input cannot receive a later activity receipt");
-                assert!(status.submission.is_none());
-                assert_eq!(status.failed_batch_members, names);
-                assert_eq!(status.reason.as_deref(), Some(reason));
-                assert!(matches!(
-                    status.retry.expect("failure").disposition,
-                    flotilla_resources::ControllerRetryDisposition::Terminal { .. }
-                ));
-            }
-            assert_eq!(transport.submissions.lock().expect("inputs").len(), 1);
-        }
-        let failure = terminals.get("terminal").await.expect("terminal").status.expect("status").degraded.expect("condition");
-        assert_eq!(failure.consecutive_failures, 1, "repair preserves the original session failure episode");
-    });
 }
 
 // #3799: one explicit operator command authorizes one same-session attempt,
@@ -3313,10 +3224,7 @@ async fn operator_delivery_of_held_batch_is_audited_and_never_automatically_repe
 #[tokio::test]
 async fn operator_delivery_authorization_does_not_follow_a_replacement_session() {
     let (backend, inbox) = delivery_inbox().await;
-    let fence = named(
-        KEYSTROKE,
-        TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
-    );
+    let fence = named(KEYSTROKE, TransportOutcome::Unconfirmed { reason: "ambiguous write".into() });
     inbox.reconcile_delivery(&router(&fence), at(20)).await.unwrap();
     inbox.deliver_held_batch("message-0", "inspected original").await.unwrap();
     // Crash/readiness interleaving after authorization consumption but before I/O.
@@ -3352,35 +3260,6 @@ async fn operator_delivery_authorization_does_not_follow_a_replacement_session()
     assert!(receipt.evidence.contains("inspected replacement"));
 }
 
-// #3799: a later guarded attempt can itself have an ambiguous write. Its old
-// definitely-unsent proof must not authorize retyping or hide the new uncertainty.
-#[tokio::test]
-async fn ambiguous_fence_recheck_loses_its_old_unsent_proof() {
-    let (backend, inbox) = delivery_inbox().await;
-    let fence = named(
-        KEYSTROKE,
-        TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
-    );
-    inbox.reconcile_delivery(&router(&fence), at(20)).await.unwrap();
-    let uncertain = named(KEYSTROKE, TransportOutcome::Unconfirmed { reason: "new write reply lost".into() });
-    inbox.reconcile_delivery(&router(&uncertain), at(30)).await.unwrap();
-    assert_eq!(uncertain.submissions.lock().unwrap().len(), 1);
-    let terminal = backend.using::<flotilla_resources::TerminalSession>("flotilla").get("terminal").await.unwrap();
-    assert_eq!(
-        flotilla_resources::crew_attention(terminal.status.as_ref(), at(30)),
-        Some(flotilla_protocol::CrewAttention::DeliveryUnconfirmed)
-    );
-    for second in [40, 500, 3600] {
-        inbox.reconcile_delivery(&router(&uncertain), at(second)).await.unwrap();
-    }
-    assert_eq!(uncertain.submissions.lock().unwrap().len(), 1);
-    for message in backend.using::<Message>("flotilla").list().await.unwrap().items {
-        let status = message.status.unwrap();
-        assert!(status.submission.is_some());
-        assert!(status.resolved_receiver.is_none());
-    }
-}
-
 // #3799: an interrupted operator command may persist only part of its batch's
 // authorization. No prefix may bypass the fence; repeating the command repairs it.
 #[hegel::test]
@@ -3390,10 +3269,7 @@ fn partial_operator_authorization_never_submits_a_batch_prefix(tc: hegel::TestCa
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     runtime.block_on(async {
         let (backend, inbox) = delivery_inbox().await;
-        let fence = named(
-            KEYSTROKE,
-            TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
-        );
+        let fence = named(KEYSTROKE, TransportOutcome::Unconfirmed { reason: "ambiguous write".into() });
         inbox.reconcile_delivery(&router(&fence), at(20)).await.unwrap();
         let messages = backend.using::<Message>("flotilla");
         // Interrupt the real command at each incomplete boundary: a member
@@ -3440,36 +3316,9 @@ fn partial_operator_authorization_never_submits_a_batch_prefix(tc: hegel::TestCa
     });
 }
 
-// Persistent deployed-cleat refusals cannot cause screen capture, send or
-// replicated status churn every ten seconds forever.
-#[tokio::test]
-async fn persistent_controller_fence_rechecks_back_off() {
-    let (backend, inbox) = delivery_inbox().await;
-    let fence = named(
-        KEYSTROKE,
-        TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
-    );
-    let mut now = 20;
-    for delay in [10, 20, 40, 80, 160, 320, 640, 900, 900] {
-        inbox.reconcile_delivery(&router(&fence), at(now)).await.unwrap();
-        let message = backend.using::<Message>("flotilla").get("message-0").await.unwrap();
-        assert_eq!(message.status.unwrap().fence_recheck_at, Some(at(now + delay)));
-        let terminal = backend.using::<flotilla_resources::TerminalSession>("flotilla").get("terminal").await.unwrap();
-        assert_eq!(terminal.status.unwrap().degraded.unwrap().observed_at, at(now), "every new refusal refreshes crash-repair proof");
-        let count = fence.submissions.lock().unwrap().len();
-        let observations = fence.observations.load(std::sync::atomic::Ordering::SeqCst);
-        for second in [now + 1, now + delay - 1] {
-            inbox.reconcile_delivery(&router(&fence), at(second)).await.unwrap();
-        }
-        assert_eq!(fence.submissions.lock().unwrap().len(), count);
-        assert_eq!(fence.observations.load(std::sync::atomic::Ordering::SeqCst), observations, "backoff avoids screen observations too");
-        now += delay;
-    }
-}
-
-// A terminal member is settled even when the surviving held batch still names it.
+// A terminal member is settled even when the surviving unsent batch still names it.
 #[hegel::test]
-fn superseded_fence_batch_member_does_not_break_repair(tc: hegel::TestCase) {
+fn superseded_batch_reforms_from_survivors_without_attempt_charge(tc: hegel::TestCase) {
     // Cover the proof's first member and both later positions, and repeated passes.
     let member = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
     let passes = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
@@ -3477,19 +3326,17 @@ fn superseded_fence_batch_member_does_not_break_repair(tc: hegel::TestCase) {
     runtime.block_on(async {
         let superseded = format!("message-{member}");
         let (backend, inbox) = delivery_inbox().await;
-        let refused = named(
-            KEYSTROKE,
-            TransportOutcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() },
-        );
+        let refused = named(KEYSTROKE, TransportOutcome::Deferred { reason: "stale batch member".into(), reform_batch: true });
         inbox.reconcile_delivery(&router(&refused), at(20)).await.unwrap();
         let mut replacement = spec(None, MessageExpectation::None);
         replacement.supersedes = Some(superseded.clone());
         inbox.accept(&InputMeta::builder().name("replacement".into()).build(), &replacement, at(21)).await.unwrap();
         assert_eq!(backend.using::<Message>("flotilla").get(&superseded).await.unwrap().status.unwrap().phase, MessagePhase::Superseded);
         for pass in 0..passes {
-            inbox.reconcile_delivery(&router(&refused), at(22 + pass as i64)).await.expect("settled members cannot poison a held batch");
+            inbox.reconcile_delivery(&router(&refused), at(22 + pass as i64)).await.expect("settled members cannot poison a unsent batch");
             for message in backend.using::<Message>("flotilla").list().await.unwrap().items {
                 let status = message.status.unwrap();
+                assert!(status.retry.is_none(), "re-forming an unsent batch consumes no attempt");
                 if message.metadata.name == superseded {
                     assert_eq!(status.phase, MessagePhase::Superseded);
                 } else {
@@ -3522,26 +3369,16 @@ fn inconsistent_held_receiver_does_not_block_another_receiver(tc: hegel::TestCas
     runtime.block_on(async {
         use flotilla_resources::*;
         let (backend, inbox) = delivery_inbox().await;
-        let refused =
-            named(KEYSTROKE, TransportOutcome::ControllerFenceUnverifiable { reason: CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() });
-        inbox.reconcile_delivery(&router(&refused), at(20)).await.unwrap();
+        let pending = named(KEYSTROKE, TransportOutcome::Pending);
+        inbox.reconcile_delivery(&router(&pending), at(20)).await.unwrap();
         let messages = backend.using::<Message>("flotilla");
-        let message = messages.get("message-0").await.unwrap();
-        let mut status = message.status.unwrap();
-        status.failed_batch_members.push("missing-member".into());
-        // A crash can leave the same rejected batch's old submission on a member.
-        if partial {
-            status.submission = Some(
-                MessageSubmission::builder()
-                    .batch_id("held".into())
-                    .crew_id("crew".into())
-                    .session("session".into())
-                    .started_at(at(20))
-                    .members(status.failed_batch_members.clone())
-                    .build(),
-            );
+        let members = if partial { 1 } else { 3 };
+        for index in 0..members {
+            let message = messages.get(&format!("message-{index}")).await.unwrap();
+            let mut status = message.status.unwrap();
+            status.submission.as_mut().unwrap().members.push("missing-member".into());
+            messages.update_status(&message.metadata.name, &message.metadata.resource_version, &status).await.unwrap();
         }
-        messages.update_status("message-0", &message.metadata.resource_version, &status).await.unwrap();
         let terminals = backend.using::<TerminalSession>("flotilla");
         let original = terminals.get("terminal").await.unwrap();
         let mut meta = InputMeta::from(&original.metadata);
@@ -3555,14 +3392,17 @@ fn inconsistent_held_receiver_does_not_block_another_receiver(tc: hegel::TestCas
         intent.receiver = format!("flotilla/convoy/work/{other_role}");
         inbox.accept(&InputMeta::builder().name("other-message".into()).build(), &intent, at(21)).await.unwrap();
         let accepted = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "received".into() });
+        // This is the same transport reporting a later receipt: retain its
+        // recorded submission instead of inventing acceptance after a restart.
+        accepted.submissions.lock().unwrap().extend(pending.submissions.lock().unwrap().clone());
         inbox.reconcile_delivery(&router(&accepted), at(22)).await.expect("receiver failure is isolated");
         assert!(messages.get("other-message").await.unwrap().status.unwrap().resolved_receiver.is_some());
         let broken = messages.get("message-0").await.unwrap().status.unwrap();
         assert!(broken.reason.unwrap().contains("missing-member"));
         let condition = terminals.get("terminal").await.unwrap().status.unwrap().degraded.unwrap();
         assert!(condition.message.contains("missing-member"));
-        assert!(condition.is_controller_fence_unverifiable(), "failure recording preserves known-unsent proof");
-        assert_eq!(condition.observed_at, at(20));
+        assert!(condition.is_delivery(), "receiver failure remains visible");
+        assert_eq!(condition.observed_at, at(22));
         assert_eq!(condition.consecutive_failures, 1);
         // Persistent errors are idempotent: no self-triggering Message or gate writes.
         let versions = messages
@@ -3586,13 +3426,16 @@ fn inconsistent_held_receiver_does_not_block_another_receiver(tc: hegel::TestCas
 
         // Repair clears both the receiver failure and its attention gate without
         // disturbing the original receipt on the healthy receiver.
-        let broken = messages.get("message-0").await.unwrap();
-        let mut repaired = broken.status.unwrap();
-        repaired.failed_batch_members.retain(|name| name != "missing-member");
-        if let Some(submission) = repaired.submission.as_mut() {
-            submission.members.retain(|name| name != "missing-member");
+        for index in 0..members {
+            let broken = messages.get(&format!("message-{index}")).await.unwrap();
+            let mut repaired = broken.status.unwrap();
+            if let Some(submission) = &mut repaired.submission {
+                submission.members.retain(|name| name != "missing-member");
+            }
+            repaired.failed_batch_members.retain(|name| name != "missing-member");
+            repaired.retry = None;
+            messages.update_status(&broken.metadata.name, &broken.metadata.resource_version, &repaired).await.unwrap();
         }
-        messages.update_status("message-0", &broken.metadata.resource_version, &repaired).await.unwrap();
         for now in [100, 200] {
             inbox.reconcile_delivery(&router(&accepted), at(now)).await.unwrap();
         }

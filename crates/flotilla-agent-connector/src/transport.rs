@@ -64,16 +64,17 @@ pub struct TransportObservation {
 pub enum TransportOutcome {
     /// Submitted; acceptance is not settled yet. Poll again.
     Pending,
+    /// Definitely unsent; wait for another observation without charging an attempt.
+    Deferred {
+        reason: String,
+        /// Stale members were removed; immediately re-form the unsent batch.
+        reform_batch: bool,
+    },
     Accepted {
         evidence: String,
     },
     /// Definitely not submitted; safe to try again or elsewhere.
     NotSubmitted {
-        reason: String,
-    },
-    /// Definitely unsent behind an unverifiable controller fence. Keep attention
-    /// visible and recheck the same guarded transport without fallback or a receipt.
-    ControllerFenceUnverifiable {
         reason: String,
     },
     /// Possibly submitted: never repeat it through another transport unless

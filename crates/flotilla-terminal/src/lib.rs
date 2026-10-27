@@ -73,8 +73,6 @@ pub enum TerminalSubmission {
     Submitted,
     /// A temporary controller refusal; keep the batch queued without a receipt.
     Refused(String),
-    /// No input was written; keep the unverifiable controller fence visible.
-    ControllerFenceUnverifiable,
 }
 
 /// Pure CLI adapter for terminal session management.
@@ -103,6 +101,21 @@ pub trait TerminalPool: Send + Sync {
         } else {
             TerminalSessionLiveness::Stopped
         })
+    }
+
+    /// Install the harness recognizer on an existing crew session.
+    async fn ensure_recognizer(&self, _session: &str, _harness: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Read a recognizer draft only after two minutes without controller input.
+    async fn abandoned_draft(&self, _session: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// Clear exactly the observed draft, atomically guarded against intervening input.
+    async fn clear_draft(&self, _session: &str, _draft: &str) -> Result<bool, String> {
+        Ok(false)
     }
 
     async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String>;
@@ -201,22 +214,6 @@ pub trait TerminalPool: Send + Sync {
     /// Callers persist authorization and intent first; an error may have written input.
     async fn operator_deliver(&self, _session_name: &str, _text: &str) -> Result<(), String> {
         Err("terminal pool does not support operator-authorized delivery".into())
-    }
-
-    /// Retry a delivery whose text is still present in a TUI composer. Pools
-    /// with keyboard-level control should clear that text before resubmitting.
-    /// This legacy API reports failures after clearing as transport errors,
-    /// including a refused submission. Callers must hold those outcomes rather
-    /// than assume the preceding clear can safely be repeated.
-    async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
-        self.deliver(session_name, text).await
-    }
-
-    /// Preserve an unverifiable refusal even on the legacy composer-clear path.
-    /// Other failures retain that path's conservative ambiguity policy.
-    async fn guarded_retry_delivery(&self, session_name: &str, text: &str) -> Result<TerminalSubmission, String> {
-        self.retry_delivery(session_name, text).await?;
-        Ok(TerminalSubmission::Submitted)
     }
 }
 

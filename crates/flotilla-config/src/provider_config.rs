@@ -64,7 +64,7 @@ pub struct ClaudeAiUtilityConfig {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TerminalPoolConfig {
-    /// Cleat's atomic submission guard window; defaults to the existing 1s quiet period.
+    /// Retired (#3961): accepted for one roll; crew deliveries always use a 2s cleat guard.
     pub controller_idle_ms: Option<u64>,
     #[serde(flatten)]
     pub preference: ProviderPreference,

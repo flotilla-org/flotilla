@@ -266,6 +266,7 @@ pub fn old_view(
             operator_delivery: None,
             delivery_history: Vec::new(),
             fence_recheck_at: None,
+            deferred_holder_version: None,
         }),
     })
 }

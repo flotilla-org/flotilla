@@ -29,7 +29,7 @@ use flotilla_core::primitives::{
     view::old_view,
     MessagePrimitives,
 };
-use flotilla_crew::reconcilers::terminal_session::{TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness};
+use flotilla_crew::reconcilers::terminal_session::{TerminalDeliveryFailure, TerminalDeliveryOutcome};
 use flotilla_inbox::{InboxBackend, Rules};
 use flotilla_resources::{ResourceError, TerminalSession, TerminalSessionPhase};
 use flotilla_schema::Timestamp;
@@ -42,7 +42,7 @@ use tracing::{debug, warn, Instrument};
 
 use super::{
     state::ControllerRuntimeState,
-    terminal::{submit_and_confirm, wait_for_delivery_ready, PendingTerminalDelivery, TerminalControllerRuntime},
+    terminal::{submit_and_confirm, PendingTerminalDelivery, TerminalControllerRuntime},
 };
 
 /// Marks a terminal delivery reserved by this adapter in the shared map.
@@ -281,7 +281,8 @@ impl MessageDelivery {
                 }
                 // Never typed (the terminal was not ready in time): nothing to hold; the next pass retries.
                 Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady))
-                | Ok(TerminalDeliveryOutcome::Pending) => {}
+                | Ok(TerminalDeliveryOutcome::Pending | TerminalDeliveryOutcome::Deferred(_) | TerminalDeliveryOutcome::BatchSuperseded) => {
+                }
                 Err(error) => debug!(%session, %error, "engine turn delivery did not complete"),
             }
         }
@@ -412,18 +413,7 @@ impl MessageDelivery {
                 for span in &_trace_spans {
                     span.in_scope(|| tracing::info!("message transport attempt"));
                 }
-                let deadline = tokio::time::Instant::now()
-                    + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
-                let ready = tokio::time::timeout_at(
-                    deadline,
-                    wait_for_delivery_ready(&*pool, adapter.as_deref(), &session, TerminalDeliveryReadiness::TurnBoundary),
-                )
-                .await;
-                match ready {
-                    Ok(Ok(true)) => submit_and_confirm(&*pool, adapter.as_deref(), &session, &typed, false).await,
-                    Ok(Ok(false)) | Ok(Err(_)) => Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)),
-                    Err(_) => Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)),
-                }
+                submit_and_confirm(&*pool, adapter.as_deref(), &session, &typed).await
             }
             .instrument(primary_span),
         );

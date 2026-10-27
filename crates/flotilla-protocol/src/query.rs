@@ -259,7 +259,7 @@ impl std::fmt::Display for CrewAttention {
         formatter.write_str(match self {
             Self::Working => "working",
             Self::NeedsInput => "needs input",
-            Self::ControllerFenceUnverifiable => "agent restart required (controller fence unverifiable)",
+            Self::ControllerFenceUnverifiable => "waiting for cleat composer evidence",
             Self::DeliveryUnconfirmed => "delivery unconfirmed",
             Self::Idle => "idle",
             Self::Unobservable => "unobservable",
