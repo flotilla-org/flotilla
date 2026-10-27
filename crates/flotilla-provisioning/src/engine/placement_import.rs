@@ -185,7 +185,12 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
             let record = kind_of(spec, platforms.get(&host))
                 .and_then(|kind| FulfilmentKindDefinition::new(policy_origin.clone(), &kind))
                 .map_err(|reason| format!("its kind: {reason}"));
+            let refused = record.is_err();
             kinds.insert(key, (BTreeSet::from([copy.namespace.clone()]), record));
+            if refused {
+                // A refused policy leaves no trace: its settings do not reach its host's provider.
+                continue;
+            }
         }
         let Some(provider) = provider else {
             *report.dropped.entry((POLICIES, "a snapshot's settings; its host's provider settings apply")).or_default() += 1;
@@ -228,12 +233,6 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
                 overridden.join("`, `")
             ));
         }
-        if rank && ProviderSettings::builtin(spec.settings.realisation()).as_ref() == Some(&spec.settings) {
-            // Nothing declares these settings, and they are the built-in default the host's
-            // provider runs with anyway: a stored copy would only shadow a later declaration.
-            *report.dropped.entry((PROVIDERS, "the built-in default settings")).or_default() += set.len();
-            continue;
-        }
         let differing: Vec<_> = set
             .iter()
             .filter(|(_, other_origin, other)| undeclared(other_origin) == rank && other != spec)
@@ -245,6 +244,12 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
                 record: name,
                 reason: format!("at `{home}`: policies `{first}` and `{}` set this provider differently", differing.join("`, `")),
             });
+            continue;
+        }
+        if rank && ProviderSettings::builtin(spec.settings.realisation()).as_ref() == Some(&spec.settings) {
+            // Nothing declares these settings, every policy of the rank agrees on them (checked above), and they are the built-in default the host's
+            // provider runs with anyway: a stored copy would only shadow a later declaration.
+            *report.dropped.entry((PROVIDERS, "the built-in default settings")).or_default() += set.len();
             continue;
         }
         if set.len() > 1 {

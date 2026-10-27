@@ -261,3 +261,35 @@ fn providers_and_names_import_whatever_the_order() {
         assert!(imported.kinds.iter().any(|placed| placed.name == "placement-snapshot-0123456789ab"));
     }
 }
+
+// Behaviour (#3824 layer 4a, review of #4003): two undeclared policies of one host and realisation
+// that disagree are refused whatever their names, even when one holds the built-in default; and a
+// policy whose kind is refused gives its host's provider nothing.
+#[test]
+fn undeclared_disagreement_is_refused_whichever_policy_holds_the_default() {
+    let default = json!({"pool": "cleat", "docker_per_vessel": {"host_ref": KIWI, "default_cwd": "/workspace",
+        "checkout": {"worktree_on_host_and_mount": {"mount_path": "/workspace"}}}});
+    let mut edited = default.clone();
+    edited["docker_per_vessel"]["pull_policy"] = json!("never");
+    for (first, second) in [("a-pol", "b-pol"), ("b-pol", "a-pol")] {
+        let copies = PlacementCopies {
+            policies: vec![
+                copy::<PlacementPolicy>(first, "kiwi", &[], &[], default.clone()),
+                copy::<PlacementPolicy>(second, "kiwi", &[], &[], edited.clone()),
+            ],
+            ..Default::default()
+        };
+        let mut report = ImportReport::default();
+        let imported = import_placement(&copies, &mut report);
+        assert!(imported.providers.is_empty(), "{first} first");
+        assert!(report.refused.iter().any(|refusal| refusal.to_string().contains("set this provider differently")), "{first} first");
+        assert!(!report.dropped.contains_key(&("EnvironmentProvider", "the built-in default settings")), "{first} first");
+    }
+    // A host-direct policy with no host-direct kind is refused, and leaves no settings behind.
+    let mut report = ImportReport::default();
+    let orphan = json!({"pool": "local", "host_direct": {"host_ref": "feta", "checkout": "worktree"}});
+    let copies = PlacementCopies { policies: vec![copy::<PlacementPolicy>("orphan", "feta", &[], &[], orphan)], ..Default::default() };
+    let imported = import_placement(&copies, &mut report);
+    assert!(imported.providers.is_empty() && imported.kinds.is_empty());
+    assert!(!report.dropped.contains_key(&("EnvironmentProvider", "the built-in default settings")), "{:?}", report.dropped);
+}
