@@ -339,7 +339,8 @@ async fn runner_and_material_contract(agent: Arc<dyn TestAgent>) {
         .run("sh", &["-c", "printf '%s|%s|%s' \"$PWD\" \"$1\" \"$FLOTILLA_AGENT_TEST\"", "test", "a' b\nc"], &cwd, &ChannelLabel::Default)
         .await
         .unwrap();
-    assert_eq!(output, format!("{}|a' b\nc|pushed environment", cwd.display()));
+    // The shell's `$PWD` is the resolved directory (`/private/var` on macOS).
+    assert_eq!(output, format!("{}|a' b\nc|pushed environment", std::fs::canonicalize(&cwd).unwrap().display()));
     let path = cwd.join("credentials").join("auth.json");
     runner.write_file_with_mode(&path, "secret", 0o400).await.unwrap();
     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o400);

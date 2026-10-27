@@ -45,7 +45,10 @@ async fn launch_through_drydock(reverse_forwards: bool, link: AgentLink) {
     runtime.configure(&configuration).await.expect("configure drydock");
     runtime.credential("stand-in", drydock_protocol::Secret::new("stand-in-key")).await.expect("credential");
     fs::create_dir(root.join("vessel")).expect("vessel directory");
-    let gateway = Gateway::start(&root.join("vessel"), reverse_forwards, BUILD).expect("gateway");
+    // The provider prepares linux/amd64 guests, so the stand-in vessel reports
+    // that platform on any test host.
+    let gateway = Gateway::start_as(&root.join("vessel"), reverse_forwards, BUILD, flotilla_environment::guest_tools::linux_amd64())
+        .expect("gateway");
     let provider = DrydockEnvironmentProvider::new(Arc::new(runtime.clone()), "stand-in".into(), "reference".into(), root.join("keys"))
         .with_agent_reach(AgentReach::new(AgentLink::default()).with_dialer(gateway.clone()).with_timeout(Duration::from_secs(5)))
         .with_agent_build(BUILD.to_vec())
