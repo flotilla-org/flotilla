@@ -35,6 +35,9 @@ use crate::stored::definition::{
 /// How often a change stream looks for new entries in the log, as the account port's does.
 const POLL: Duration = Duration::from_millis(500);
 
+/// How often a write that loses a race to another writer of its name reads and tries again.
+const WRITE_ATTEMPTS: usize = 3;
+
 /// The writer the plain-kind port records for this port's writes.
 const WRITER: &str = "definition-records";
 
@@ -324,15 +327,25 @@ impl EngineDefinitions {
 
     fn write<K: Definition>(&self, name: &str, origin: DefinitionOrigin, spec: Value) -> Result<DefinitionRecord, String> {
         let value = K::build(origin, spec)?;
-        let now = self.now();
-        let version = match self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())? {
-            // The stored value holds the origin too, so a new revision of a manifest document
-            // writes even when its spec is unchanged; an identical write logs nothing.
-            Some(current) if current.spec == value => current.version,
-            Some(current) => self.log.edit(name, current.version, &value, WRITER, now).map_err(|error| error.to_string())?,
-            None => self.log.create(name, &value, WRITER, now).map_err(|error| error.to_string())?,
-        };
-        record(name.to_owned(), self.home.clone(), version, &value)
+        // Writers of one name at this home are not serialised (the manifest reconciler, the CLI,
+        // project ops): a write that loses a race reads again and writes over the winner, as the
+        // old store's last writer won.
+        for _ in 0..WRITE_ATTEMPTS {
+            let now = self.now();
+            let written = match self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())? {
+                // The stored value holds the origin too, so a new revision of a manifest document
+                // writes even when its spec is unchanged; an identical write logs nothing.
+                Some(current) if current.spec == value => Ok(current.version),
+                Some(current) => self.log.edit(name, current.version, &value, WRITER, now),
+                None => self.log.create(name, &value, WRITER, now),
+            };
+            match written {
+                Ok(version) => return record(name.to_owned(), self.home.clone(), version, &value),
+                Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
+                Err(error) => return Err(format!("write {} {name}: {error}", K::NAME)),
+            }
+        }
+        Err(format!("write {} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers", K::NAME))
     }
 
     fn remove<K: Definition>(&self, name: &str) -> Result<(), String> {
@@ -360,7 +373,13 @@ impl DefinitionRecords for EngineDefinitions {
         let mut names: Vec<&String> = resident.records.keys().filter(|(held, _, _)| *held == kind).map(|(_, name, _)| name).collect();
         // The map orders by kind, then name, then home, so one name's homes are adjacent.
         names.dedup();
-        names.into_iter().filter_map(|name| self.resolve(&resident.records, kind, name)).collect()
+        // A record that does not encode is skipped with a warning, so it cannot hide the kind's
+        // others; a read of its own name reports it.
+        Ok(names
+            .into_iter()
+            .filter_map(|name| self.resolve(&resident.records, kind, name))
+            .filter_map(|held| held.map_err(|error| tracing::warn!(%error, "skipping a definition record that does not encode")).ok())
+            .collect())
     }
 
     async fn apply(&self, kind: &str, name: &str, origin: DefinitionOrigin, spec: Value) -> Result<DefinitionRecord, String> {
