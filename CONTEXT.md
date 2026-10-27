@@ -350,6 +350,28 @@ attached to no Convoy at all — e.g. housing a **PersistentAgent**. The Crew
 aboard the Vessels are the dramatis personae; the Legs are the script.
 _Avoid_: Task, TaskWorkspace, workspace, container.
 
+**Vessel Delivery**:
+The one environment-neutral pipeline that makes what occupants need efficiently
+available aboard a **Vessel**, after its provider reports the backing exists and
+its vessel agent is ready (#3956). It has two layers. The **vessel layer** runs
+once per vessel: tools, sockets, checkouts and the base prepared context. The
+**access layer** runs per access relation (#2914), on join and on leave: the
+harness home, skills, account material and the bound prepared context. Each layer
+plans its needs by **Lowering** and runs the plan through the vessel agent alone.
+Delivery never reads a convoy: an access is keyed by an opaque identity, the crew
+role address until the #3108 cut-over.
+_Avoid_: staging (for the whole pipeline), provisioning (for work after "agent ready").
+
+**Lowering**:
+Choosing, per need, the cheapest delivery mechanism that meets its requirements,
+from the mechanisms the selected provider instance declares. A need is a typed
+item with content identity: a tree by digest, a durable writable home, a socket,
+or environment through the prepared context. A mechanism is a host path, a
+provider volume, agent fetch (by URL or digest) or agent push. Agent fetch and
+agent push are mandatory for every vessel agent, so a plan always exists; the
+others are optimisations. Costs live in a policy table, and the chosen mechanism
+per need is recorded in the layer's status and shown by `convoy explain`.
+
 **Hull**:
 An allocated but **uncrewed** Vessel-precursor: an **Environment** plus its
 established checkouts, before any crew launches. **Vessel = Hull + Crew**

@@ -3830,6 +3830,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-vessel-delivery"
+version = "0.1.0"
+dependencies = [
+ "hegeltest",
+ "libc",
+ "proc-macro2",
+ "quote",
+ "smallvec",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -75,6 +75,7 @@ members = [
     "crates/flotilla-test-support",
     "crates/flotilla-transport",
     "crates/flotilla-tui",
+    "crates/flotilla-vessel-delivery",
     "crates/tender",
 ]
 exclude = ["crates/flotilla-manifest/fixtures/generator"]
