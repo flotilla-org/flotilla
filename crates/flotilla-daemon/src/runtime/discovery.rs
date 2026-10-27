@@ -588,6 +588,8 @@ pub(super) async fn observe_fulfilment_facts(
         }
     }
     let baselines = backend.clone().definitions::<flotilla_resources::CrewImageBaseline>(namespace);
+    // The kinds listed above are this store's own records, never replicas, so
+    // writing their observed grants stays with the daemon that authors them.
     let kind_store = backend.clone().using::<FulfilmentKind>(namespace);
     // A capped kind's free slots are counted from the vessels placed on the
     // host, as admission counts them (#4002). An agentless host's are counted

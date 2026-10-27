@@ -372,6 +372,8 @@ impl Reconciler for ConvoyReconciler {
                         });
                         // A daemon host's cap bounds only the Docker
                         // placements admission recorded as capped (#4002).
+                        // The live cap's value wins: lowering it holds admitted
+                        // convoys, removing it releases them.
                         let vessel_cap = host.as_ref().and_then(|host| match host.spec.connection {
                             HostConnection::AgentlessSsh { .. } => host.spec.max_vessels,
                             HostConnection::Daemon => selected.max_vessels.and(host.spec.max_vessels),

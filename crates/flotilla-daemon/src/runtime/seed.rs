@@ -57,8 +57,9 @@ pub(super) async fn ensure_host_exists(
                         expected_concurrent_rust_crews: existing.spec.expected_concurrent_rust_crews,
                         image_build_capacity: existing.spec.image_build_capacity.clone(),
                         // This path seeds the local daemon Host only, whose cap
-                        // bounds its Docker placements (#4002). Agentless hosts
-                        // and their cap are written by
+                        // bounds its Docker placements and which is never a
+                        // single-tenant agentless box (#4002). Agentless hosts,
+                        // their cap and tenancy are written by
                         // `register_agentless_ssh_resources`.
                         max_vessels,
                         single_tenant: false,

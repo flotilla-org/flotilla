@@ -321,7 +321,8 @@ Its Docker kinds' free slots are then counted from the vessels placed on the
 host, as for an agentless host, and a convoy that finds every candidate full
 waits in the same capacity stall. Host-direct placements on the daemon's host
 are not capped, though its vessels count against the Docker cap. Without a cap
-Docker placement stays unbounded.
+Docker placement stays unbounded. The daemon reads `max_vessels` from
+`daemon.toml` at startup, so a changed cap takes effect after a restart.
 
 The admission free-space floor below is checked against the SSH host's
 `~/dev/flotilla-repos` checkout volume using its remote `df` result.

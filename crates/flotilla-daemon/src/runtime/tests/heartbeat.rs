@@ -811,3 +811,93 @@ async fn headless_host_is_not_granted_a_gui_session() {
         assert!(kind.spec.grants.contains(&FulfilmentGrant::host_account_reach()));
     }
 }
+
+// #4002: a daemon host's capped Docker kind publishes the free slots counted
+// from every vessel placed on the host, host-direct ones included, and keeps
+// them current while a recent probe is reused.
+#[tokio::test]
+async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"docker-cap-test\"\nmax_vessels = 2\n").expect("daemon config");
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "feta", Some(2)).await.expect("host registration");
+    let policy = PlacementPolicySpec::builder()
+        .pool("cleat".to_string())
+        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+            legacy_image_baseline_ref: None,
+            memory_policy: Default::default(),
+            host_ref: host_id.clone(),
+            image: Some("crew:test".into()),
+            pull_policy: Default::default(),
+            agent_adapters: BTreeSet::new(),
+            default_cwd: None,
+            env: BTreeMap::new(),
+            checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+        })
+        .build();
+    daemon
+        .resource_backend()
+        .using::<FulfilmentKind>(NAMESPACE)
+        .create(&empty_meta("docker-feta"), &FulfilmentKindSpec::from_policy(&policy, "linux").expect("Docker kind"))
+        .await
+        .expect("Docker kind");
+    let runner = Arc::new(DiscoveryMockRunner::builder().build());
+    let observe = |previous: BTreeMap<String, FulfilmentFacts>| {
+        let backend = daemon.resource_backend();
+        let host_id = host_id.clone();
+        let runner = runner.clone();
+        async move {
+            observe_fulfilment_facts(
+                &backend,
+                NAMESPACE,
+                &host_id,
+                &["cleat".to_string()],
+                &previous,
+                FulfilmentProbeContext {
+                    providers: &detection_registry(runner.clone()),
+                    runner: runner.as_ref(),
+                    env: &TestEnvVars::default(),
+                    scratch: Path::new("/tmp/flotilla-probe-test"),
+                    observation: &Default::default(),
+                },
+                &mut ModelProbeState::default(),
+            )
+            .await
+            .expect("observe the host")
+        }
+    };
+    let first = observe(BTreeMap::new()).await;
+    assert_eq!(first["docker-feta"].free_vessel_slots, Some(2));
+
+    // A host-direct convoy admitted to the same host holds one of its slots.
+    let convoys = daemon.resource_backend().using::<flotilla_resources::Convoy>(NAMESPACE);
+    let convoy = convoys
+        .create(&empty_meta("host-direct-work"), &flotilla_resources::ConvoySpec::builder().workflow_ref("missing".to_string()).build())
+        .await
+        .expect("convoy");
+    let decision = flotilla_protocol::PlacementDecision {
+        provider_workspace_root: None,
+        policy_name: format!("host-direct-{host_id}"),
+        target_host: flotilla_protocol::PlacementTargetHost {
+            reference: flotilla_protocol::CanonicalHostId::resolved(host_id.clone()),
+            display_name: "feta".to_string(),
+        },
+        minimal_alternatives: Vec::new(),
+        escalation_reason: None,
+        refused_candidates: Vec::new(),
+        viable_not_selected: Vec::new(),
+        allocation: None,
+    };
+    convoys
+        .update_status(
+            "host-direct-work",
+            &convoy.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus { placement_decision: Some(decision), ..Default::default() },
+        )
+        .await
+        .expect("admitted placement");
+    let reused = observe(first.clone()).await;
+    assert_eq!(reused["docker-feta"].observed_at, first["docker-feta"].observed_at, "the recent probe is reused");
+    assert_eq!(reused["docker-feta"].free_vessel_slots, Some(1));
+}
