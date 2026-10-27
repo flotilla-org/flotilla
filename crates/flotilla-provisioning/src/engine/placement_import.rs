@@ -95,6 +95,15 @@ fn settings(spec: &PlacementPolicySpec) -> Result<EnvironmentProviderSpec, Strin
     Ok(EnvironmentProviderSpec { host_ref, instance: requirements.instance, settings })
 }
 
+/// The host a policy realises on; empty for a cloud sandbox, which is bound to none.
+fn host_ref(spec: &PlacementPolicySpec) -> &str {
+    match (&spec.docker_per_vessel, &spec.host_direct) {
+        (Some(docker), _) => &docker.host_ref,
+        (None, Some(host)) => &host.host_ref,
+        (None, None) => "",
+    }
+}
+
 /// The kind a policy with none of its name becomes. `host_platform` is the platform grant of its
 /// host's host-direct kind, which a host-direct policy needs.
 fn kind_of(spec: &PlacementPolicySpec, host_platform: Option<&FulfilmentGrant>) -> Result<FulfilmentKindSpec, String> {
@@ -112,29 +121,24 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
     let mut imported = ImportedPlacement::default();
     // Every record by (name, home), with the namespaces it came from.
     let mut kinds = BTreeMap::<(String, String), (BTreeSet<String>, Result<FulfilmentKindDefinition, String>)>::new();
-    let live_kinds = copies.kinds.iter().filter(|copy| copy.object.metadata.deletion_timestamp.is_none());
+    // The platform grant of each home's host-direct kind for each host, which a host-direct policy
+    // with no kind of its own takes.
+    let mut platforms = BTreeMap::<(String, String), FulfilmentGrant>::new();
     for copy in &copies.kinds {
         if copy.object.metadata.deletion_timestamp.is_some() {
             *report.dropped.entry((KINDS, "deleted")).or_default() += 1;
+            continue;
         }
-    }
-    for copy in live_kinds {
-        let record = origin(&copy.object.metadata).and_then(|origin| FulfilmentKindDefinition::new(origin, &copy.object.spec));
+        let spec = &copy.object.spec;
+        if let (FulfilmentRealisation::HostDirect, Some(platform)) =
+            (&spec.realisation, spec.grants.iter().find(|grant| grant.0.starts_with("platform:")))
+        {
+            platforms.insert((copy.home.clone(), spec.host_ref.clone()), platform.clone());
+        }
+        let record = origin(&copy.object.metadata).and_then(|origin| FulfilmentKindDefinition::new(origin, spec));
         let entry = kinds.entry((copy.object.metadata.name.clone(), copy.home.clone())).or_insert_with(|| (BTreeSet::new(), record));
         entry.0.insert(copy.namespace.clone());
     }
-    // The platform grant of each home's host-direct kind for each host, which a host-direct policy
-    // with no kind of its own takes.
-    let platforms: BTreeMap<(String, String), FulfilmentGrant> = copies
-        .kinds
-        .iter()
-        .filter(|copy| copy.object.metadata.deletion_timestamp.is_none())
-        .filter(|copy| copy.object.spec.realisation == FulfilmentRealisation::HostDirect)
-        .filter_map(|copy| {
-            let platform = copy.object.spec.grants.iter().find(|grant| grant.0.starts_with("platform:"))?;
-            Some(((copy.home.clone(), copy.object.spec.host_ref.clone()), platform.clone()))
-        })
-        .collect();
     // Each home's settings for each provider, with the policies that set them.
     let mut providers = BTreeMap::<(String, String), Vec<(String, DefinitionOrigin, EnvironmentProviderSpec)>>::new();
     for copy in &copies.policies {
@@ -164,7 +168,8 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
                 continue;
             }
         };
-        let provider = match settings(spec) {
+        // A snapshot's settings are dropped, so nothing in them can refuse it.
+        let provider = match (!snapshot).then(|| settings(spec)).transpose() {
             Ok(provider) => provider,
             Err(reason) => {
                 report.refused.push(refuse(reason));
@@ -176,16 +181,16 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
             // The kind of its name, which the daemon migrated from it, stands.
             namespaces.insert(copy.namespace.clone());
         } else {
-            let host = (copy.home.clone(), provider.host_ref.clone());
+            let host = (copy.home.clone(), host_ref(spec).to_owned());
             let record = kind_of(spec, platforms.get(&host))
                 .and_then(|kind| FulfilmentKindDefinition::new(policy_origin.clone(), &kind))
                 .map_err(|reason| format!("its kind: {reason}"));
             kinds.insert(key, (BTreeSet::from([copy.namespace.clone()]), record));
         }
-        if snapshot {
+        let Some(provider) = provider else {
             *report.dropped.entry((POLICIES, "a snapshot's settings; its host's provider settings apply")).or_default() += 1;
             continue;
-        }
+        };
         providers.entry((provider.record_name(), copy.home.clone())).or_default().push((name.clone(), policy_origin, provider));
     }
     // The engine has no namespaces: a name a home holds in several is refused in all of them.
@@ -201,7 +206,13 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
             Err(reason) => report.refused.push(refuse(reason)),
         }
     }
-    for ((name, home), set) in providers {
+    for ((name, home), mut set) in providers {
+        // The record takes a declaring manifest's origin, so the manifest reconciler owns it; else
+        // the first policy's by name. Neither depends on the order the copies were listed in.
+        set.sort_by(|(left, left_origin, _), (right, right_origin, _)| {
+            let undeclared = |origin: &DefinitionOrigin| !matches!(origin, DefinitionOrigin::Manifest { .. });
+            (undeclared(left_origin), left).cmp(&(undeclared(right_origin), right))
+        });
         let (first, origin, spec) = &set[0];
         let differing: Vec<_> = set.iter().filter(|(_, _, other)| other != spec).map(|(policy, _, _)| policy.as_str()).collect();
         if !differing.is_empty() {
@@ -214,7 +225,9 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
         }
         if set.len() > 1 {
             let policies: Vec<_> = set.iter().map(|(policy, _, _)| policy.as_str()).collect();
-            report.notes.push(format!("{PROVIDERS} `{name}` at `{home}`: set alike by policies `{}`", policies.join("`, `")));
+            let origins =
+                if set.iter().any(|(_, other, _)| other != origin) { format!("; it takes `{first}`'s origin") } else { String::new() };
+            report.notes.push(format!("{PROVIDERS} `{name}` at `{home}`: set alike by policies `{}`{origins}", policies.join("`, `")));
         }
         imported.providers.push(Placed { name, home, record: EnvironmentProviderDefinition::new(origin.clone(), spec) });
     }

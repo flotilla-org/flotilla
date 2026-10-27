@@ -200,3 +200,51 @@ fn what_the_move_cannot_carry_is_refused() {
     assert_eq!(report.dropped.get(&("PlacementPolicy", "deleted")), Some(&1));
     assert_eq!(report.dropped.get(&("PlacementPolicy", "agent adapters, an image fact the host probes")), Some(&1));
 }
+
+// Behaviour (#3824 layer 4a, review of #4003): a provider set alike by a manifest's policy and an
+// operator's takes the manifest's origin in either listing order; a cloud sandbox's provider is
+// bound to no host and named by its realisation alone; one policy name at two homes imports at
+// each; and a snapshot's settings, being dropped, cannot refuse it.
+#[test]
+fn providers_and_names_import_whatever_the_order() {
+    let (labels, annotations) = manifest();
+    let cloud = json!({"pool": "cloud", "cloud_sandbox_per_vessel": {"image": "registry.test/crew@sha256:c",
+        "size": {"cpus": 4, "memory_bytes": 8, "disk_bytes": 16}, "checkout": "clone_in_vessel", "env": {"A": "b"}}});
+    let constrained_snapshot = {
+        let mut spec = crew_image(80);
+        spec["provider_requirements"] = json!({"egress_enforcement": "enforced"});
+        spec
+    };
+    let policies = [
+        copy::<PlacementPolicy>("operator-kiwi", "kiwi", &[], &[], crew_image(50)),
+        copy::<PlacementPolicy>("manifest-kiwi", "kiwi", &labels, &annotations, crew_image(50)),
+        copy::<PlacementPolicy>("operator-kiwi", "feta", &[], &[], crew_image(50)),
+        copy::<PlacementPolicy>("sandbox", "kiwi", &[], &[], cloud),
+        copy::<PlacementPolicy>("placement-snapshot-0123456789ab", "kiwi", &[], &[], constrained_snapshot),
+    ];
+    for reversed in [false, true] {
+        let mut listed: Vec<_> = policies
+            .iter()
+            .map(|policy| PlacementCopy { namespace: policy.namespace.clone(), object: policy.object.clone(), home: policy.home.clone() })
+            .collect();
+        if reversed {
+            listed.reverse();
+        }
+        let mut report = ImportReport::default();
+        let imported = import_placement(&PlacementCopies { kinds: Vec::new(), policies: listed }, &mut report);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        let provider = |name: &str, home: &str| {
+            &imported.providers.iter().find(|placed| placed.name == name && placed.home == home).unwrap_or_else(|| panic!("{name}")).record
+        };
+        let docker = format!("{KIWI}.docker_per_vessel");
+        assert!(matches!(provider(&docker, "kiwi").origin, DefinitionOrigin::Manifest { .. }), "reversed: {reversed}");
+        assert_eq!(provider(&docker, "feta").origin, DefinitionOrigin::Operator);
+        let sandbox = provider("cloud_sandbox_per_vessel", "kiwi");
+        assert_eq!(sandbox.host_ref, "");
+        assert!(matches!(&sandbox.settings, ProviderSettings::CloudSandboxPerVessel { env, .. } if env["A"] == "b"));
+        let homes: Vec<_> =
+            imported.kinds.iter().filter(|placed| placed.name == "operator-kiwi").map(|placed| placed.home.as_str()).collect();
+        assert_eq!(homes, ["feta", "kiwi"]);
+        assert!(imported.kinds.iter().any(|placed| placed.name == "placement-snapshot-0123456789ab"));
+    }
+}
