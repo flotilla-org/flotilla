@@ -391,7 +391,8 @@ impl EngineRecords for EngineProjects {
         let value = ProjectDefinition::new(origin(labels, annotations)?, &spec).map_err(|error| format!("{KIND} {name}: {error}"))?;
         if self.log.get::<ProjectDefinition>(name, &self.home).map_err(|error| error.to_string())?.is_none() {
             // A new Project starts with no conditions: an operations record left by a delete that
-            // stopped part-way belongs to the one before.
+            // stopped part-way belongs to the one before. No status write races this: `set_status`
+            // refuses a name with no definition here, which holds until the write below.
             self.remove::<ProjectOpsRecord>(name)?;
         }
         self.write::<ProjectDefinition>(name, |_| Ok(Some(value.clone())))?;
