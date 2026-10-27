@@ -108,6 +108,29 @@ pub struct CrewCommandContext {
     pub role: Option<String>,
 }
 
+/// A message waiting in one of a person role's inboxes (#3938), as the person
+/// consumer's listing shows it. Listing one is no receipt: the person takes it
+/// by acknowledging or answering it at its home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonInboxItem {
+    /// The message's record name, which acknowledge and answer take.
+    pub message: String,
+    /// The person role's inbox it waits in.
+    pub inbox: String,
+    pub sender: String,
+    /// The daemon that holds it, where it is acknowledged or answered.
+    pub home: String,
+    /// What would settle it: nothing, a reply or an outcome.
+    pub expects: String,
+    pub body: String,
+}
+
+/// The person consumer's pending messages across its role inboxes (#3938).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonInboxResponse {
+    pub items: Vec<PersonInboxItem>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewListResponse {
     pub convoy: String,

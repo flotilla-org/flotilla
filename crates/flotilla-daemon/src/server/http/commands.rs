@@ -1519,6 +1519,17 @@ mod tests {
             let forbidden = h.call("GET", "/v1/status", None, cbor, caller.clone()).await;
             assert_eq!(forbidden.0, StatusCode::FORBIDDEN);
             assert!(forbidden.1["message"].as_str().unwrap().starts_with("EnvironmentCommandDenied:"));
+            // A crew cannot act as the person consumer (#3938).
+            for person in [
+                CommandAction::PersonInbox { namespace: None },
+                CommandAction::PersonAcknowledge { namespace: None, message: "m".into() },
+                CommandAction::PersonAnswer { namespace: None, message: "m".into(), body: "b".into() },
+            ] {
+                let command = serde_json::to_value(Command::builder().action(person).build()).unwrap();
+                let refused = h.call("POST", "/v1/commands", Some(command), cbor, caller.clone()).await;
+                assert_eq!(refused.0, StatusCode::FORBIDDEN, "{}", refused.1);
+                assert!(refused.1["message"].as_str().unwrap().starts_with("EnvironmentCommandDenied:"), "{}", refused.1);
+            }
             let command =
                 serde_json::to_value(Command::builder().action(CommandAction::QueryCrewList { context: Default::default() }).build())
                     .unwrap();

@@ -5017,7 +5017,7 @@ impl InProcessDaemon {
         let records = primitives.records(namespace).await.map_err(|error| error.to_string())?;
         let conversion = crate::primitives::convert::Conversion { roles: &roles, forges: &records.forges, records: &*records };
         let original = primitives
-            .read_view(namespace, original_id, conversion.inbox(&reply.sender).ok())
+            .read_view(namespace, original_id, conversion.sender_of(reply).ok())
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("replied-to message `{original_id}` is neither in this home's replica nor at a reachable home"))?;
@@ -5512,6 +5512,9 @@ impl InProcessDaemon {
             }
             CommandAction::MessageDeliverBatch { .. } => return boxed_action!(crew.execute_action_message_deliver_batch(id, &command)),
             CommandAction::MessageFailBatch { .. } => return boxed_action!(crew.execute_action_message_fail_batch(id, &command)),
+            CommandAction::PersonInbox { .. } | CommandAction::PersonAcknowledge { .. } | CommandAction::PersonAnswer { .. } => {
+                return boxed_action!(self.execute_action_person(id, &command))
+            }
             CommandAction::FleetPostInstall { .. } => return boxed_action!(executor.execute_action_fleet_post_install(id, &command)),
             CommandAction::ResourceStatusPatch { .. } => return boxed_action!(executor.execute_action_resource_status_patch(id, &command)),
             CommandAction::ResourceDelete { .. } => return boxed_action!(executor.execute_action_resource_delete(id, &command)),
@@ -5921,6 +5924,7 @@ impl InProcessDaemon {
     }
 }
 mod forge_demands;
+mod person_inbox;
 
 #[async_trait]
 impl crew_actions::CrewActionPort for InProcessDaemon {

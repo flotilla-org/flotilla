@@ -56,6 +56,8 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryResourceList { .. }
         | CommandAction::QueryManifestRoots { .. }
         | CommandAction::QueryResourceGet { .. }
+        // A person's inbox listing is a CLI report.
+        | CommandAction::PersonInbox { .. }
         | CommandAction::ResourceWatch { .. } => false,
 
         // Controller transport commands are unavailable to interactive surfaces.
@@ -103,6 +105,8 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::ResourceReconcileNow { .. }
         | CommandAction::MessageDeliverBatch { .. }
         | CommandAction::MessageFailBatch { .. }
+        | CommandAction::PersonAcknowledge { .. }
+        | CommandAction::PersonAnswer { .. }
         | CommandAction::ResourceStatusPatch { .. }
         | CommandAction::ResourceDelete { .. } => true,
     }

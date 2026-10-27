@@ -23,6 +23,7 @@ use flotilla_state_machines::{
             Expectation, MemoryMessageWorld, Message, MessageBody, MessageEdgeKind, MessageRef, MessageReference, MessageSpec, Relation,
             RequestBody,
         },
+        person::Person,
         vessel::{live_leases, Vessel},
     },
     placement::{Dimension, Host, Lease, Ledger, LedgerError, Request, VesselId},
@@ -42,6 +43,7 @@ fn kind_codes_are_pinned() {
         (Resource::<Convoy>::KIND, Resource::<Convoy>::CODE),
         (Resource::<Ensure>::KIND, Resource::<Ensure>::CODE),
         (Resource::<Message>::KIND, Resource::<Message>::CODE),
+        (Resource::<Person>::KIND, Resource::<Person>::CODE),
         (Resource::<Vessel>::KIND, Resource::<Vessel>::CODE),
     ];
     let expected = [
@@ -50,6 +52,7 @@ fn kind_codes_are_pinned() {
         ("Convoy", KindCode::new("cv")),
         ("Ensure", KindCode::new("en")),
         ("Message", KindCode::new("ms")),
+        ("Person", KindCode::new("pn")),
         ("Vessel", KindCode::new("ve")),
     ];
     assert_eq!(declared, expected);
@@ -273,6 +276,7 @@ fn the_log_is_the_only_history() {
     let tables = |set: flotilla_schema::TableSet| set.tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
     assert_eq!(tables(Resource::<Message>::table_set()), ["message", "message_references"]);
     assert_eq!(tables(Resource::<AgentSession>::table_set()), ["agent_session"]);
+    assert_eq!(tables(Resource::<Person>::table_set()), ["person"]);
     assert_eq!(tables(Resource::<Ensure>::table_set()), ["ensure", "ensure_recorded", "ensure_created"]);
     assert_eq!(tables(Resource::<Vessel>::table_set()), ["vessel", "vessel_shape"]);
     assert_eq!(Resource::<Message>::table_set().edges, <MessageEdgeKind as CodeEnum>::CODES);

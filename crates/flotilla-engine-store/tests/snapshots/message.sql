@@ -358,7 +358,7 @@ CREATE TABLE "message" (
   "delivery_condition" INTEGER REFERENCES "strings" ("id"),
   "state" TEXT NOT NULL CHECK ("state" IN ('aw', 'dr', 'pe', 'se')),
   "state_since" INTEGER NOT NULL,
-  "receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'co')),
+  "receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'co', 'pe')),
   "receiver_id" INTEGER REFERENCES "strings" ("id"),
   "receiver_host" INTEGER REFERENCES "strings" ("id"),
   "reason" TEXT CHECK ("reason" IN ('cu', 'ex', 'su', 'un', 'wi')),
@@ -456,6 +456,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ms', 'state', 'se', 'Settled'),
   ('ms', 'receiver_kind', 'as', 'AgentSession'),
   ('ms', 'receiver_kind', 'co', 'Controller'),
+  ('ms', 'receiver_kind', 'pe', 'Person'),
   ('ms', 'reason', 'cu', 'ConsumerUnreachable'),
   ('ms', 'reason', 'ex', 'Expired'),
   ('ms', 'reason', 'su', 'Superseded'),
@@ -500,6 +501,22 @@ CREATE VIEW "message_references_view" AS SELECT
   "message_references"."revision",
   "message_references"."subject"
 FROM "message_references";
+CREATE TABLE "person" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "state" TEXT NOT NULL CHECK ("state" IN ('ac')),
+  "state_since" INTEGER NOT NULL
+) STRICT;
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('pn', 'state', 'ac', 'Active'),
+  ('pn', 'log:edge', 'rv', 'Receive'),
+  ('pn', 'log:label', 'ac', 'Active');
+CREATE VIEW "person_view" AS SELECT
+  "person"."id",
+  "person"."version",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'pn' AND "field" = 'state' AND "code" = "person"."state") AS "state",
+  "person"."state_since"
+FROM "person";
 CREATE VIEW "log_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "l"."home") AS "home",
   "l"."home_seq",

@@ -144,7 +144,7 @@ fn the_enumeration_covers_every_kind_and_index() {
         assert!(labels.contains(&expected), "missing {expected}");
     }
     assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 17 + 3);
-    assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 10);
+    assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 11);
     assert!(!labels.iter().any(|label| label.contains("_edges")), "no kind has an edge-log table");
     assert!(
         !labels.iter().any(|label| label.starts_with("convoy_duties ") && label.ends_with(" last position")),

@@ -349,23 +349,29 @@ async fn a_cleared_stall_withdraws_its_subjects_records() {
     }
 }
 
-// Behaviour (#3730 review nit): a system producer with no fleet role, or a person until #3457, has
-// no inbox for the reply, so its send records nothing, quietly, rather than failing every pass. The
-// stall judge is a fleet role, so its sends are recorded as its own.
+// Behaviour (#3730 review nit): a system producer with no fleet role has no inbox for the reply, so
+// its send records nothing, quietly, rather than failing every pass. The stall judge is a fleet role
+// and a person holds the operator role of the project (#3938), so their sends are recorded as theirs.
 #[tokio::test]
 async fn a_sender_with_no_inbox_records_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let primitives = primitives(&dir).await;
-    for sender in ["system:no-such-producer", "principal:alice"] {
+    let ask = |sender: &str| {
         let mut ask = intent(sender, "fleet/governor");
         ask.expectation = flotilla_resources::MessageExpectation::Reply;
-        let name = flotilla_resources::message_record_name("fleet/governor", sender, "ask");
-        assert!(!primitives.await_reply(NAMESPACE, &name, &ask, "home-a", "reply", None).await.expect("nothing to await"), "{sender}");
+        (flotilla_resources::message_record_name("fleet/governor", sender, "ask"), ask)
+    };
+    let (name, unknown) = ask("system:no-such-producer");
+    assert!(!primitives.await_reply(NAMESPACE, &name, &unknown, "home-a", "reply", None).await.expect("nothing to await"));
+    for sender in ["system:stall-judge", "principal:alice"] {
+        let (name, recorded) = ask(sender);
+        assert!(
+            primitives.await_reply(NAMESPACE, &name, &recorded, "home-a", "reply", None).await.expect("the sender's record"),
+            "{sender}"
+        );
     }
-    let mut judged = intent("system:stall-judge", "fleet/governor");
-    judged.expectation = flotilla_resources::MessageExpectation::Reply;
-    let name = flotilla_resources::message_record_name("fleet/governor", "system:stall-judge", "stall-1");
-    assert!(primitives.await_reply(NAMESPACE, &name, &judged, "home-a", "reply", None).await.expect("the judge's record"));
+    let operator = flotilla_address::Address::project("fleet").and_then(|fleet| fleet.child(flotilla_address::Kind::Role, "operator"));
+    assert_eq!(primitives.awaiting().open_from(&operator.expect("operator")).expect("records").len(), 1, "a person awaits as their role");
 }
 
 // The replicated designation alone supplies the fleet name. Changing its

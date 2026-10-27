@@ -72,7 +72,8 @@ pub(crate) fn archive_kinds() -> ArchiveKinds {
         manifest_root::ManifestRoot, terminal_session::TerminalSession,
     };
     use flotilla_state_machines::machines::{
-        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, vessel::Vessel,
+        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, person::Person,
+        vessel::Vessel,
     };
     ArchiveKinds::new()
         .with::<Message>()
@@ -88,6 +89,8 @@ pub(crate) fn archive_kinds() -> ArchiveKinds {
         .with::<Ensure>()
         .with::<AccountBinding>()
         .with::<ManifestRoot>()
+        // A person consumer has no end, so it stays live and is never shipped (#3938).
+        .with::<Person>()
 }
 
 /// What one pass did.

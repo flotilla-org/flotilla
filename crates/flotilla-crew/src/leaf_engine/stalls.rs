@@ -178,7 +178,8 @@ pub(super) fn stall_subject(namespace: &str, convoy: &ResourceObject<Convoy>, co
 }
 
 pub(super) fn supervision_expectation(rung: StallRung) -> flotilla_resources::MessageExpectation {
-    // The operator has no inbox at a home until the principals model lands.
+    // An operator-rung escalation expects nothing: on the engine path the
+    // person's acknowledgement settles it (#3938), and their ruling acts on the stall.
     if rung == StallRung::Operator {
         flotilla_resources::MessageExpectation::None
     } else {

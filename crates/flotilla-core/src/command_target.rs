@@ -108,6 +108,8 @@ impl InProcessDaemon {
             | A::ResourceReconcileNow { .. }
             | A::MessageDeliverBatch { .. }
             | A::MessageFailBatch { .. }
+            | A::PersonAcknowledge { .. }
+            | A::PersonAnswer { .. }
             | A::ResourceStatusPatch { .. }
             | A::ResourceDelete { .. }
             | A::RepositoryRemoteRemove { .. } => (TargetReason::RecordHome, RemoteDelivery::Command),
@@ -128,6 +130,7 @@ impl InProcessDaemon {
             | A::QueryCrewStalls { .. }
             | A::QueryMessageContacts { .. }
             | A::QueryCrewList { .. }
+            | A::PersonInbox { .. }
             | A::QueryDaemonLogs { .. }
             | A::QueryExplainConvoy { .. }
             | A::QueryChangeStream { .. }
@@ -206,6 +209,18 @@ impl InProcessDaemon {
                 } else {
                     reason = TargetReason::LocalMutation;
                     TargetHost::Local
+                }
+            }
+            // A person's receipt is written at the message's home (#3938).
+            A::PersonAcknowledge { message, .. } | A::PersonAnswer { message, .. } => {
+                let located =
+                    self.message_primitives().map(|engine| engine.locate(message)).transpose().map_err(TargetError::RecordHome)?;
+                match located.flatten() {
+                    Some((_, home)) if home != self.node_id().as_str() => TargetHost::Node(NodeId::new(home)),
+                    _ => {
+                        reason = TargetReason::LocalMutation;
+                        TargetHost::Local
+                    }
                 }
             }
             _ => {

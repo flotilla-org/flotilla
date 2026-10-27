@@ -3,6 +3,11 @@
 //! sent message and an imported one name the same things the same way.
 //! Addresses go through the ADR 0066 normaliser with the vessel segment
 //! dropped; anything with no ADR 0066 form is refused, never guessed.
+//!
+//! A person (`principal:<name>`) has no address of their own: they send and
+//! receive as the role they hold in the context the message concerns (#3938,
+//! owner ruling on #3457). That is the project of the convoy or crew at the
+//! other end, or of a convoy the message refers to, and the fleet otherwise.
 
 use chrono::{DateTime, Utc};
 use flotilla_address::{Address, Condition, Kind};
@@ -15,7 +20,7 @@ use flotilla_state_machines::machines::message::{
     Expectation, MessageBody, MessageRef, MessageReference as Reference, MessageSpec, Relation,
 };
 
-use super::roles::FleetRoles;
+use super::roles::{FleetRoles, OPERATOR, PERSON_ROLES};
 
 /// How long an inbox may stay unbound before a message to it may be dropped
 /// as undeliverable: a crew's holder can take this long to provision or
@@ -24,9 +29,21 @@ use super::roles::FleetRoles;
 pub const UNBOUND_AFTER: chrono::Duration = chrono::Duration::hours(24);
 
 /// Resolves the old references that name stored records, which have an
-/// ADR 0066 address only through those records.
+/// ADR 0066 address only through those records, and the declarations a
+/// person's context is read from.
 pub trait ReferenceAddresses: Send + Sync {
     fn address(&self, reference: &MessageReference) -> Result<Address, String>;
+
+    /// The project a convoy belongs to, if it declares one.
+    fn convoy_project(&self, _convoy: &str) -> Option<String> {
+        None
+    }
+
+    /// The roles `project`'s own charter declares `principal` holds
+    /// (`role_definitions.<role>.principal`), by name.
+    fn principal_roles(&self, _project: &str, _principal: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// References whose records are not available: refused with their kind.
@@ -53,7 +70,7 @@ impl Conversion<'_> {
             return self.roles.system_sender(receiver).ok_or_else(|| format!("`{receiver}` names no declared fleet role"));
         }
         if receiver.starts_with("principal:") {
-            return Err(format!("`{receiver}` is a person; the person consumer comes with the principals model (#3457)"));
+            return Err(format!("`{receiver}` is a person, whose role depends on the message's context"));
         }
         if receiver.starts_with("topic:") {
             return Err(format!("`{receiver}` is a topic; resolve its subscriber's role first"));
@@ -67,6 +84,66 @@ impl Conversion<'_> {
             [project, role] => Address::project(project).and_then(|project| project.child(Kind::Role, role)).map_err(refused),
             _ => Err(format!("`{receiver}` is not a role address")),
         }
+    }
+
+    /// A person's role in `project`, or under the fleet with no project. A
+    /// project's charter may declare the roles a principal holds there; one
+    /// such role is theirs, and several are refused rather than guessed
+    /// between. With none declared, `principal:<role>` names that person role
+    /// and anyone else holds the operator role, as one person consumer holds
+    /// every person role at the roll.
+    pub fn person(&self, principal: &str, project: Option<&str>) -> Result<Address, String> {
+        let name =
+            principal.strip_prefix("principal:").filter(|name| !name.is_empty()).ok_or_else(|| format!("`{principal}` is no person"))?;
+        let default = PERSON_ROLES.iter().find(|role| role.name == name).unwrap_or(&OPERATOR).name;
+        let Some(project) = project else {
+            return Ok(self.roles.person(default).expect("a declared person role"));
+        };
+        let mut held = self.records.principal_roles(project, principal);
+        held.sort();
+        let role = match held.as_slice() {
+            [] => default,
+            [role] => role.as_str(),
+            several => {
+                return Err(format!(
+                    "`{principal}` holds roles {} in project `{project}`; the message names no one of them",
+                    several.iter().map(|role| format!("`{role}`")).collect::<Vec<_>>().join(", ")
+                ))
+            }
+        };
+        Address::project(project).and_then(|project| project.child(Kind::Role, role)).map_err(|error| format!("`{principal}`: {error}"))
+    }
+
+    /// The project an old message concerns, for a person at either end: the
+    /// project of the role at the other end, else of a convoy it refers to.
+    pub fn context(&self, old: &OldSpec) -> Option<String> {
+        let party =
+            [&old.receiver, &old.sender].into_iter().find_map(|party| self.inbox(party).ok()?.get(Kind::Project).map(str::to_owned));
+        party.or_else(|| {
+            old.references.iter().find_map(|reference| match reference {
+                MessageReference::ControlRecord { resource, .. } if resource.kind == "Convoy" => {
+                    self.records.convoy_project(&resource.name)
+                }
+                _ => None,
+            })
+        })
+    }
+
+    /// An old message's inbox, a person's role read in the message's context.
+    pub fn receiver(&self, old: &OldSpec) -> Result<Address, String> {
+        self.party(&old.receiver, old)
+    }
+
+    /// An old message's sender, a person's role read in the message's context.
+    pub fn sender_of(&self, old: &OldSpec) -> Result<Address, String> {
+        self.party(&old.sender, old)
+    }
+
+    fn party(&self, party: &str, old: &OldSpec) -> Result<Address, String> {
+        if party.starts_with("principal:") {
+            return self.person(party, self.context(old).as_deref());
+        }
+        self.inbox(party)
     }
 
     /// A stall may concern a whole convoy rather than a role inbox.
@@ -151,7 +228,7 @@ impl Conversion<'_> {
     /// The new spec of an old one. `message` maps an old message name (a
     /// reply's original, a supersession's predecessor) to its reference.
     pub fn spec(&self, old: &OldSpec, message: &dyn Fn(&str) -> Result<MessageRef, String>) -> Result<MessageSpec, String> {
-        let inbox = self.inbox(&old.receiver)?;
+        let inbox = self.receiver(old)?;
         let project = inbox.get(Kind::Project).map(str::to_owned);
         let mut references = Vec::with_capacity(old.references.len());
         let mut subject_found = old.subject.is_none();
@@ -178,7 +255,7 @@ impl Conversion<'_> {
             deadline: old.deadline.as_ref().map(timestamp),
             unbound_after: UNBOUND_AFTER.num_microseconds().expect("bounded"),
             delivery_condition,
-            ..MessageSpec::new(self.sender(&old.sender)?, inbox, relation(old.relation), body)
+            ..MessageSpec::new(self.sender_of(old)?, inbox, relation(old.relation), body)
         })
     }
 }
@@ -216,7 +293,7 @@ mod tests {
     }
 
     // Behaviour: role addresses drop the vessel; system producers send as
-    // their fleet role; people and topics have no inbox here.
+    // their fleet role; people need a message's context, and topics have no inbox here.
     #[test]
     fn receivers_and_senders_map_to_host_free_role_addresses() {
         let roles = FleetRoles::declared("fleet").expect("roles");
@@ -225,9 +302,61 @@ mod tests {
         assert_eq!(map.inbox("flotilla/gui-approver").expect("standing role").as_str(), "project:flotilla/role:gui-approver");
         assert_eq!(map.sender("system:turn-rules").expect("fleet role").as_str(), "fleet:fleet/role:turn-rules");
         assert_eq!(map.sender("system:hold").expect("held turns").as_str(), "fleet:fleet/role:turn-rules");
-        assert!(map.sender("principal:alice").is_err());
+        assert!(map.sender("principal:alice").is_err(), "a person has no address outside a message's context");
         assert!(map.inbox("topic:flotilla/reviews").is_err());
         assert!(map.inbox("system:unknown").is_err());
+    }
+
+    /// Charter declarations of the roles principals hold, by project.
+    struct Charter(Vec<(&'static str, &'static str, &'static str)>);
+    impl ReferenceAddresses for Charter {
+        fn address(&self, reference: &MessageReference) -> Result<Address, String> {
+            NoRecords.address(reference)
+        }
+        fn convoy_project(&self, convoy: &str) -> Option<String> {
+            (convoy == "standing").then(|| "widgets".to_owned())
+        }
+        fn principal_roles(&self, project: &str, principal: &str) -> Vec<String> {
+            self.0.iter().filter(|(p, who, _)| *p == project && *who == principal).map(|(_, _, role)| (*role).to_owned()).collect()
+        }
+    }
+
+    fn message(sender: &str, receiver: &str) -> OldSpec {
+        OldSpec::builder().sender(sender.into()).receiver(receiver.into()).relation(MessageRelation::Supervisor).body("hi".into()).build()
+    }
+
+    // Behaviour (#3938): a person sends and receives as the role they hold in
+    // the project the message concerns, the fleet's with no project; a role
+    // the charter declares for them is theirs, and several are refused.
+    #[test]
+    fn a_person_is_the_role_they_hold_in_the_messages_context() {
+        let roles = FleetRoles::declared("fleet").expect("roles");
+        let charter = Charter(vec![
+            ("flotilla", "principal:bob", "owner"),
+            ("flotilla", "principal:eve", "owner"),
+            ("flotilla", "principal:eve", "lead"),
+        ]);
+        let map = Conversion { roles: &roles, forges: &[], records: &charter };
+        let to_crew = message("principal:alice", "flotilla/demo/work/coder");
+        assert_eq!(map.sender_of(&to_crew).expect("operator").as_str(), "project:flotilla/role:operator");
+        assert_eq!(map.receiver(&to_crew).expect("crew").as_str(), "project:flotilla/convoy:demo/role:coder");
+        let escalated = message("flotilla/demo/work/coder", "principal:operator");
+        assert_eq!(map.receiver(&escalated).expect("operator").as_str(), "project:flotilla/role:operator");
+        assert_eq!(
+            map.sender_of(&message("principal:bob", "flotilla/demo/work/coder")).expect("owner").as_str(),
+            "project:flotilla/role:owner"
+        );
+        let ambiguous = map.sender_of(&message("principal:eve", "flotilla/demo/work/coder")).expect_err("ambiguous");
+        assert!(ambiguous.contains("`lead`, `owner`"), "{ambiguous}");
+        assert_eq!(map.receiver(&message("system:stall-judge", "principal:alice")).expect("fleet").as_str(), "fleet:fleet/role:operator");
+        let about = OldSpec {
+            references: vec![MessageReference::ControlRecord {
+                resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "standing"),
+                revision: "1".into(),
+            }],
+            ..message("system:turn-rules", "principal:implicit")
+        };
+        assert_eq!(map.receiver(&about).expect("convoy's project").as_str(), "project:widgets/role:operator");
     }
 
     // Behaviour: a crew-progress leaf addresses the role (ADR 0066 §8); a

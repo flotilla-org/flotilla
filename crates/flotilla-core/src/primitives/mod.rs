@@ -38,8 +38,8 @@ use flotilla_engine_store::StoreLog;
 use flotilla_inbox::{sqlite::SqliteInbox, ConsumerLog, ConsumerPort, InboxBackend, Observations, ReceiptScope, Supervision};
 use flotilla_resources::{
     address::{artifact_address, record_name as address_record_name, repository_address},
-    Artifact, Convoy, ForgeSpec, Message as OldMessage, MessageReference as OldReference, MessageSpec as OldSpec, ReadResourceObject,
-    Repository, ResourceError, ResourceObject, ResourceProvenance, TerminalSession,
+    Artifact, Convoy, ForgeSpec, Message as OldMessage, MessageReference as OldReference, MessageSpec as OldSpec, Project,
+    ReadResourceObject, Repository, ResourceError, ResourceObject, ResourceProvenance, TerminalSession,
 };
 use flotilla_schema::{Kind as StoredKind, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
@@ -47,7 +47,8 @@ use flotilla_state_machines::{
     machines::{
         agent_session::{AgentSession, MemoryAgentSessionWorld, Receive},
         consumer::{ConsumerKind, Receiver},
-        message::{DropReason, MemoryMessageWorld, Message, MessageRef, Supersedes},
+        message::{Deliver, DropReason, MemoryMessageWorld, Message, MessageRef, MessageState, Supersedes},
+        person::{self, Person},
     },
     Home, Resource, Transport,
 };
@@ -214,12 +215,87 @@ impl ConsumerPort for SessionReceipts {
     }
 }
 
+/// The one person consumer at the roll (#3938): bound to every person role's
+/// inbox of every project and of the fleet. People, teams and identity come
+/// with the principals model (#3457); any operator acts as this consumer.
+pub const PERSON: &str = "operator";
+
+/// The person consumers' records at this home (#3938), holding their receipts:
+/// an acknowledgement or an answer, never a surface loading the message.
+pub struct People {
+    home: Mutex<Home<Person, StoreLog>>,
+}
+
+impl People {
+    /// Creates the person's record, Active, unless it exists.
+    pub fn ensure(&self, name: &str, now: Timestamp) -> Result<bool, String> {
+        let mut home = self.home.lock().expect("person home");
+        if home.get(name).is_some() {
+            return Ok(false);
+        }
+        home.create(name, (), &(), now).map_err(|error| format!("Person `{name}`: {error:?}"))?;
+        Ok(true)
+    }
+
+    /// One keyed read of a person's record; absence means no such record.
+    pub fn get(&self, name: &str) -> Option<Resource<Person>> {
+        self.home.lock().expect("person home").get(name).cloned()
+    }
+}
+
+/// The inbox's consumer port for one person: `Receive` on their own record.
+struct PersonReceipts {
+    people: Arc<People>,
+    name: String,
+    scope: Option<ReceiptScope>,
+}
+
+impl ConsumerPort for PersonReceipts {
+    fn receipt_scope(&self) -> Option<ReceiptScope> {
+        self.scope.clone()
+    }
+    fn receive(&mut self, message: &str, transport: Transport, now: Timestamp) -> Result<(), flotilla_inbox::Error> {
+        let mut home = self.people.home.lock().expect("person home");
+        home.apply(&self.name, person::Receive { message: message.into(), transport }, &(), now)
+            .map(|_| ())
+            .map_err(|error| flotilla_inbox::Error::Consumer(format!("{error:?}")))
+    }
+}
+
+/// Every stored record of machine `M` homed at `home`.
+fn stored<M>(service: &Service, home: &str) -> Result<Vec<Resource<M>>, String>
+where
+    M: flotilla_state_machines::Machine,
+    Resource<M>: StoredKind,
+{
+    service
+        .with_store(|store| {
+            let mut read = store.read()?;
+            let mut records = Vec::new();
+            let mut after = None;
+            loop {
+                let page = read.scan::<Resource<M>>(home, after, 64)?;
+                for id in page.ids {
+                    if let Some(loaded) = read.load::<Resource<M>>(id)? {
+                        records.push(loaded.value);
+                    }
+                }
+                after = page.next;
+                if after.is_none() {
+                    return Ok(records);
+                }
+            }
+        })
+        .map_err(|error| error.to_string())
+}
+
 /// The new path at one home.
 pub struct MessagePrimitives {
     home: String,
     service: Arc<Service>,
     inbox: SqliteInbox,
     sessions: Arc<Sessions>,
+    people: Arc<People>,
     convoys: Arc<convoys::Convoys>,
     convoy_engine: Arc<convoy_engine::ConvoyEngine>,
     awaiting: Arc<awaiting::AwaitingReplies>,
@@ -263,28 +339,15 @@ impl MessagePrimitives {
         let sessions = Arc::new(Sessions {
             home: Mutex::new(Home::with_log(home, receipts.clone()).map_err(|error| format!("AgentSession home: {error:?}"))?),
         });
-        // Session records persist; reopen them so a restart keeps their receipts.
-        let names = service
-            .with_store(|store| {
-                let mut read = store.read()?;
-                let mut names = Vec::new();
-                let mut after = None;
-                loop {
-                    let page = read.scan::<Resource<AgentSession>>(home, after, 64)?;
-                    for id in page.ids {
-                        if let Some(loaded) = read.load::<Resource<AgentSession>>(id)? {
-                            names.push(loaded.value);
-                        }
-                    }
-                    after = page.next;
-                    if after.is_none() {
-                        return Ok(names);
-                    }
-                }
-            })
-            .map_err(|error| error.to_string())?;
-        for session in names {
+        let people = Arc::new(People {
+            home: Mutex::new(Home::with_log(home, receipts.clone()).map_err(|error| format!("Person home: {error:?}"))?),
+        });
+        // Consumer records persist; reopen them so a restart keeps their receipts.
+        for session in stored::<AgentSession>(&service, home)? {
             sessions.home.lock().expect("session home").restore(session).map_err(|error| format!("{error:?}"))?;
+        }
+        for person in stored::<Person>(&service, home)? {
+            people.home.lock().expect("person home").restore(person).map_err(|error| format!("{error:?}"))?;
         }
         let convoys = Arc::new(convoys::Convoys::open(home, &service)?);
         let convoy_engine = Arc::new(convoy_engine::ConvoyEngine::new(Arc::clone(&convoys), backend.clone(), Arc::clone(&clock)));
@@ -294,6 +357,7 @@ impl MessagePrimitives {
             service,
             inbox,
             sessions,
+            people,
             convoys,
             convoy_engine,
             awaiting,
@@ -320,6 +384,10 @@ impl MessagePrimitives {
     }
     pub fn sessions(&self) -> &Arc<Sessions> {
         &self.sessions
+    }
+    /// This home's person consumer records (#3938).
+    pub fn people(&self) -> &Arc<People> {
+        &self.people
     }
     /// This home's Convoy records (#3587 layer 6).
     pub fn convoys(&self) -> &Arc<convoys::Convoys> {
@@ -390,6 +458,98 @@ impl MessagePrimitives {
         Ok(consumer)
     }
 
+    /// The person consumer's identity at this home (#3938).
+    pub fn person(&self) -> Receiver {
+        Receiver { kind: ConsumerKind::Person, id: PERSON.to_owned(), host: self.home.clone() }
+    }
+
+    /// Registers the person consumer: its record exists, and the inbox writes
+    /// its receipts there.
+    pub async fn register_person(&self, now: Timestamp) -> Result<Receiver, String> {
+        let consumer = self.person();
+        // Registered consumers already have their record; skip the blocking hop.
+        if self.consumers.lock().expect("consumers").contains(&consumer) {
+            return Ok(consumer);
+        }
+        let people = Arc::clone(&self.people);
+        // A SQLite write: off the async workers.
+        tokio::task::spawn_blocking(move || people.ensure(PERSON, now)).await.map_err(|error| error.to_string())??;
+        if self.consumers.lock().expect("consumers").insert(consumer.clone()) {
+            let port = PersonReceipts { people: Arc::clone(&self.people), name: PERSON.to_owned(), scope: self.receipts.receipt_scope() };
+            if let Err(error) = self.inbox.register_async(consumer.clone(), port).await {
+                self.consumers.lock().expect("consumers").remove(&consumer);
+                return Err(error.to_string());
+            }
+        }
+        Ok(consumer)
+    }
+
+    /// Every person role's inbox in `namespace` (#3938): each person role
+    /// under the fleet and under every declared project, and each role a
+    /// project's charter declares a principal holds. A convoy with no project
+    /// is addressed under its namespace, so the namespace counts as one. The
+    /// person consumer is bound to all of them.
+    pub async fn person_inboxes(&self, namespace: &str) -> Result<BTreeSet<Address>, String> {
+        let roles = self.roles(namespace).await?;
+        let records = self.records(namespace).await.map_err(|error| error.to_string())?;
+        let mut inboxes: BTreeSet<Address> = roles::PERSON_ROLES.iter().filter_map(|role| roles.person(role.name)).collect();
+        let projects: BTreeSet<&str> = records.projects().chain([namespace]).collect();
+        for project in projects {
+            let Ok(address) = Address::project(project) else {
+                tracing::debug!(%project, "a project with no address has no person inboxes");
+                continue;
+            };
+            let declared = records.principal_backed(project).map(|(role, _)| role);
+            for role in roles::PERSON_ROLES.iter().map(|role| role.name).chain(declared) {
+                match address.child(AddressKind::Role, role) {
+                    Ok(inbox) => {
+                        inboxes.insert(inbox);
+                    }
+                    Err(error) => tracing::debug!(%project, %role, %error, "a person role with no address"),
+                }
+            }
+        }
+        Ok(inboxes)
+    }
+
+    /// The messages waiting in the person roles' inboxes (#3938), at every
+    /// home this replica follows, with their homes: each is acknowledged or
+    /// answered at its own home. Reading them writes no receipt.
+    pub async fn person_messages(&self, namespace: &str) -> Result<Vec<(String, Resource<Message>)>, String> {
+        let inboxes = self.person_inboxes(namespace).await?;
+        Ok(self
+            .messages()?
+            .into_iter()
+            .filter(|(_, message)| *message.state() == MessageState::Pending && inboxes.contains(&message.spec().inbox))
+            .collect())
+    }
+
+    /// The person acknowledges a message waiting in one of their role inboxes
+    /// homed here (#3938): their receipt, then the message's deliver, which
+    /// settles one expecting nothing and leaves one expecting a reply awaiting
+    /// it. A message the person already took is acknowledged as it is.
+    pub async fn acknowledge(&self, namespace: &str, record: &str) -> Result<Resource<Message>, String> {
+        let (id, home) = self.locate(record)?.ok_or_else(|| format!("message `{record}` is not in this home's replica"))?;
+        if home != self.home {
+            return Err(format!("message `{record}` is homed at {home}; acknowledge it there"));
+        }
+        let message =
+            self.inbox.get_async(&id).await.map_err(|error| error.to_string())?.ok_or_else(|| format!("message `{record}` is gone"))?;
+        if !self.person_inboxes(namespace).await?.contains(&message.spec().inbox) {
+            return Err(format!("message `{record}` is for `{}`, no person role", message.spec().inbox));
+        }
+        let person = self.register_person(self.world.now()).await?;
+        match message.state() {
+            MessageState::Pending => {}
+            // Acknowledged before: answering it takes nothing more.
+            taken if taken.receiver() == Some(&person) => return Ok(message),
+            taken => return Err(format!("message `{record}` was already taken: {taken:?}")),
+        }
+        self.inbox.receive(&person, &id, Transport::Turn).await.map_err(|error| error.to_string())?;
+        self.inbox.deliver(&id, Deliver { receiver: person, transport: Transport::Turn }).await.map_err(|error| error.to_string())?;
+        self.inbox.get_async(&id).await.map_err(|error| error.to_string())?.ok_or_else(|| format!("message `{record}` is gone"))
+    }
+
     /// The fleet roles of `namespace`, using the designation's fleet identity.
     pub async fn roles(&self, namespace: &str) -> Result<FleetRoles, String> {
         let roles = designated_fleet_roles(&self.backend, namespace)
@@ -408,9 +568,10 @@ impl MessagePrimitives {
         let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
         // The messages it names, read from this replica, or at their home on a miss.
         let mut referenced = BTreeMap::new();
-        for (old, inbox) in [(&intent.in_reply_to, &intent.sender), (&intent.supersedes, &intent.receiver)] {
+        // A reply's original was sent to this sender; a successor's predecessor to this receiver.
+        for (old, inbox) in [(&intent.in_reply_to, conversion.sender_of(intent)), (&intent.supersedes, conversion.receiver(intent))] {
             let Some(old) = old else { continue };
-            let read = self.read_message(old, conversion.inbox(inbox).ok()).await.map_err(ResourceError::invalid)?;
+            let read = self.read_message(old, inbox.ok()).await.map_err(ResourceError::invalid)?;
             referenced.insert(old.clone(), read);
         }
         let spec = {
@@ -488,15 +649,14 @@ impl MessagePrimitives {
         let roles = self.roles(namespace).await?;
         let records = self.records(namespace).await.map_err(|error| error.to_string())?;
         let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
-        let sender = match conversion.sender(&intent.sender) {
+        let sender = match conversion.sender_of(intent) {
             Ok(sender) => sender,
-            // A producer with no inbox at a home (a system producer with no
-            // fleet role, or a person until #3457) cannot receive the reply,
-            // so nothing awaits it there; recording nothing is the answer.
-            Err(_) if intent.sender.starts_with("system:") || intent.sender.starts_with("principal:") => return Ok(false),
+            // A system producer with no fleet role has no inbox to receive the
+            // reply, so nothing awaits it; recording nothing is the answer.
+            Err(_) if intent.sender.starts_with("system:") => return Ok(false),
             Err(error) => return Err(error),
         };
-        let recipient = conversion.inbox(&intent.receiver)?;
+        let recipient = conversion.receiver(intent)?;
         let message = MessageRef::new(Address::message(&recipient, name).map_err(|error| error.to_string())?.as_str(), home);
         let subject = about.map(|about| conversion.stall_subject(about)).transpose()?;
         // The predecessor whose record this send's record replaces, wherever it is homed.
@@ -972,6 +1132,7 @@ pub struct OldStoreRecords {
     terminals: BTreeMap<String, ResourceObject<TerminalSession>>,
     artifacts: BTreeMap<String, ResourceObject<Artifact>>,
     repositories: Vec<ResourceObject<Repository>>,
+    projects: BTreeMap<String, ResourceObject<Project>>,
 }
 
 impl OldStoreRecords {
@@ -983,6 +1144,7 @@ impl OldStoreRecords {
         terminals: Vec<ResourceObject<TerminalSession>>,
         artifacts: Vec<ResourceObject<Artifact>>,
         repositories: Vec<ResourceObject<Repository>>,
+        projects: Vec<ResourceObject<Project>>,
     ) -> Self {
         fn by_name<R: flotilla_resources::Resource>(items: Vec<ResourceObject<R>>) -> BTreeMap<String, ResourceObject<R>> {
             items.into_iter().map(|item| (item.metadata.name.clone(), item)).collect()
@@ -994,6 +1156,7 @@ impl OldStoreRecords {
             terminals: by_name(terminals),
             artifacts: by_name(artifacts),
             repositories,
+            projects: by_name(projects),
         }
     }
 
@@ -1032,7 +1195,28 @@ impl OldStoreRecords {
             .into_iter()
             .map(|repository| repository.object)
             .collect();
-        Ok(Self { namespace: namespace.to_owned(), forges, convoys, terminals, artifacts, repositories })
+        let projects = backend
+            .definitions::<Project>(namespace)
+            .list()
+            .await?
+            .into_iter()
+            .map(|project| (project.metadata.name.clone(), project))
+            .collect();
+        Ok(Self { namespace: namespace.to_owned(), forges, convoys, terminals, artifacts, repositories, projects })
+    }
+
+    /// Every project declared in this namespace, by name.
+    pub fn projects(&self) -> impl Iterator<Item = &str> {
+        self.projects.keys().map(String::as_str)
+    }
+
+    /// The roles `project`'s own charter declares a principal holds, with
+    /// that principal. Declarations stay local: an inherited role shape
+    /// names no holder in a child project.
+    pub fn principal_backed(&self, project: &str) -> impl Iterator<Item = (&str, &str)> {
+        self.projects.get(project).into_iter().flat_map(|project| {
+            project.spec.role_definitions.iter().filter_map(|(role, definition)| Some((role.as_str(), definition.principal.as_deref()?)))
+        })
     }
 
     /// The project a convoy belongs to, if it declares one.
@@ -1061,6 +1245,12 @@ impl OldStoreRecords {
 }
 
 impl ReferenceAddresses for OldStoreRecords {
+    fn convoy_project(&self, convoy: &str) -> Option<String> {
+        OldStoreRecords::convoy_project(self, convoy)
+    }
+    fn principal_roles(&self, project: &str, principal: &str) -> Vec<String> {
+        self.principal_backed(project).filter(|(_, holder)| *holder == principal).map(|(role, _)| role.to_owned()).collect()
+    }
     fn address(&self, reference: &OldReference) -> Result<Address, String> {
         match reference {
             OldReference::ControlRecord { resource, .. } if resource.kind == "Convoy" => self.convoy_address(&resource.name),
@@ -1080,6 +1270,9 @@ impl ReferenceAddresses for OldStoreRecords {
 }
 
 impl ViewLookups for OldStoreRecords {
+    fn principal_of(&self, project: &str, role: &str) -> Option<String> {
+        self.principal_backed(project).find(|(declared, _)| *declared == role).map(|(_, principal)| principal.to_owned())
+    }
     fn vessel(&self, convoy: &str, role: &str) -> Option<String> {
         self.terminals
             .values()

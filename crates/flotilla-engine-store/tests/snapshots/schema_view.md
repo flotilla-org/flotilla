@@ -16,6 +16,7 @@ Kind tables only; the shared tables are in `message.sql`.
 | `convoy_retired` | state data | 2 | – | – | – |
 | `message` | root | 23 | 5: `expectation` 2, `reason` 3 | `message_references` (child) | `pending_by_inbox` (inbox, admitted_seq), `deadline` (deadline), `by_reply` (in_reply_to), `by_supersedes` (supersedes) |
 | `message_references` | child | 5 | – | – | – |
+| `person` | root | 4 | – | – | – |
 
 Tables wider than 30 columns:
 - none

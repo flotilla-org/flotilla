@@ -594,39 +594,136 @@ impl DummyDaemon {
     }
 }
 
-// Behaviour (#3317): an operator sends as `principal:<name>`, which has no
-// declared role until the principals model (#3457); on the engine path the
-// ruling is refused with that reason, never sent as a guessed role.
+// Behaviour (#3938): an operator sends as the operator role of the convoy's
+// project. On the engine path a CLI message to a stalled crew and the
+// operator's ruling are each admitted and delivered to the crew's session as
+// an engine Message from that role, and the resumed engine Convoys deliver.
+// Each goes to its own stalled crew: whichever turn reaches a stalled crew
+// first resumes it, and a later one may find its session already ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn on_the_engine_an_operator_ruling_is_refused_until_principals() {
-    let fleet = DummyDaemon::start_on_primitives(&format!("{SCENARIO_AGENT}stall_rate = 1.0\n"), "").await;
-    fleet.dispatch("engine-stalled", CrewMix::Coder).await;
-    fleet.wait_for("engine-stalled", "stall accounting", |_| fleet.fleet.snapshot().crews_stalled > 0).await;
-    let convoy = fleet.wait_for_stall("engine-stalled").await;
-    let resumed = fleet.execute_as_operator(supervise(&convoy, CrewSupervisionAction::Resume)).await;
-    assert!(matches!(&resumed, CommandValue::Error { message } if message.contains("#3457")), "{resumed:?}");
-}
-
-// A supervisor must be able to resume a stalled engine convoy, after which its
-// change-request promise is kept and the engine Convoy is delivered.
-#[tokio::test(start_paused = true)]
-#[ignore = "operator resume is refused: principal:implicit needs the principals model (#3457); crew-supervised resume is the approved scenario"]
-async fn on_the_engine_a_stalled_coder_resumes_and_delivers() {
+async fn on_the_engine_an_operators_message_and_ruling_reach_the_crew_from_the_projects_operator() {
     use flotilla_state_machines::machines::convoy::ConvoyState;
 
-    let fleet = DummyDaemon::start_on_primitives("stall_rate = 1.0\n", "").await;
-    fleet.dispatch("engine-resume-proof", CrewMix::Coder).await;
-    fleet.wait_for("engine-resume-proof", "stall accounting", |_| fleet.fleet.snapshot().crews_stalled > 0).await;
-    let convoy = fleet.wait_for_stall("engine-resume-proof").await;
+    let fleet = DummyDaemon::start_on_primitives(&format!("{SCENARIO_AGENT}stall_rate = 1.0\n"), "").await;
     let primitives = fleet.daemon.message_primitives().expect("engine path");
-    let engine = primitives.convoys().get(&convoy.metadata.name).expect("admitted engine Convoy");
-    assert!(matches!(engine.state(), ConvoyState::Open { .. }), "the stalled convoy remains open: {engine:?}");
+    for (role, noted) in [("engine-noted", true), ("engine-ruled", false)] {
+        fleet.dispatch(role, CrewMix::Coder).await;
+        let convoy = fleet.wait_for_stall(role).await;
+        let engine = primitives.convoys().get(&convoy.metadata.name).expect("admitted engine Convoy");
+        assert!(matches!(engine.state(), ConvoyState::Open { .. }), "the stalled convoy remains open: {engine:?}");
+        let sent = if noted {
+            fleet
+                .execute_as_operator(CommandAction::ConvoyResume {
+                    namespace: Some(NAMESPACE.into()),
+                    name: convoy.metadata.name.clone(),
+                    prompt: "Operator note: the API is stable now.".into(),
+                    vessel: None,
+                    role: None,
+                    reopen: false,
+                })
+                .await
+        } else {
+            fleet.execute_as_operator(supervise(&convoy, CrewSupervisionAction::Resume)).await
+        };
+        assert!(!matches!(sent, CommandValue::Error { .. }), "{role}: {sent:?}");
+        fleet.wait_for_phase(role, ConvoyPhase::Landed).await;
+        fleet.assert_engine_delivered(&convoy.metadata.name);
+        let operator = format!("project:{NAMESPACE}/role:operator");
+        let coder = format!("project:{NAMESPACE}/convoy:{}/role:coder", convoy.metadata.name);
+        let from_operator: Vec<_> = primitives
+            .messages()
+            .expect("engine messages")
+            .into_iter()
+            .filter(|(_, message)| message.spec().sender.as_str() == operator && message.spec().inbox.as_str() == coder)
+            .collect();
+        assert_eq!(from_operator.len(), 1, "{role}: {from_operator:?}");
+        let (_, message) = &from_operator[0];
+        let receiver = message.state().receiver().unwrap_or_else(|| panic!("{role} delivered: {message:?}"));
+        assert!(primitives.sessions().get(&receiver.id).is_some(), "{role} received by the crew's session: {message:?}");
+    }
+}
 
-    let resumed = fleet.execute_as_operator(supervise(&convoy, CrewSupervisionAction::Resume)).await;
-    assert_eq!(resumed, CommandValue::Ok, "supervision must resume the engine crew");
-    fleet.wait_for_phase("engine-resume-proof", ConvoyPhase::Landed).await;
-    let engine = primitives.convoys().get(&convoy.metadata.name).expect("engine Convoy after resume");
-    assert!(matches!(engine.state(), ConvoyState::Delivered { .. }), "the engine convoy delivers: {engine:?}");
+// Behaviour (#3938): a crew stall escalated past every supervisor reaches the
+// operator role of the convoy's project, where the person consumer is bound.
+// Listing it takes nothing; the person's acknowledgement is the receipt, and
+// it settles the escalation, which expects nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_the_engine_a_stall_past_every_supervisor_reaches_the_projects_operator_and_the_person() {
+    use flotilla_resources::SupervisionTarget;
+    use flotilla_state_machines::machines::{consumer::ConsumerKind, message::MessageState};
+
+    let fleet = DummyDaemon::start_on_primitives(&format!("{SCENARIO_AGENT}stall_rate = 1.0\n"), "").await;
+    let mut workflow = CrewMix::Coder.workflow(LONG_RUNNER_TURNS);
+    workflow.supervision = Some(vec![
+        SupervisionTarget::ConvoyCrew { vessel: String::new(), role: "bosun".into() },
+        SupervisionTarget::ProjectCrew { convoy_role: "governor".into(), vessel: String::new(), role: "governor".into() },
+        SupervisionTarget::Address { address: "principal:operator".into() },
+    ]);
+    fleet
+        .backend()
+        .using::<WorkflowTemplate>(NAMESPACE)
+        .create(&InputMeta::builder().name("engine-escalated".into()).build(), &workflow)
+        .await
+        .expect("escalating workflow");
+    fleet.create_named("engine-escalated", "engine-escalated").await;
+    fleet.wait_for_stall("engine-escalated").await;
+    let inbox = CommandAction::PersonInbox { namespace: Some(NAMESPACE.into()) };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let item = loop {
+        let CommandValue::PersonInbox(listing) = fleet.execute_as_operator(inbox.clone()).await else { panic!("a person inbox") };
+        if let Some(item) = listing.items.into_iter().find(|item| item.inbox == "project:fleet/role:operator") {
+            break item;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the escalation never reached the operator role");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(item.sender, "project:fleet/convoy:engine-escalated/role:coder");
+    assert!(item.body.starts_with("Escalated from coder@implement"), "{item:?}");
+    let primitives = fleet.daemon.message_primitives().expect("engine path");
+    let (id, _) = primitives.locate(&item.message).expect("locate").expect("the escalation is homed here");
+    let pending = primitives.inbox().get_async(&id).await.expect("read").expect("escalation");
+    assert_eq!(*pending.state(), MessageState::Pending, "listing it is no receipt");
+
+    let acknowledged = fleet
+        .execute_as_operator(CommandAction::PersonAcknowledge { namespace: Some(NAMESPACE.into()), message: item.message.clone() })
+        .await;
+    assert_eq!(acknowledged, CommandValue::Ok);
+    let settled = primitives.inbox().get_async(&id).await.expect("read").expect("escalation");
+    let MessageState::Settled { receiver: Some(receiver) } = settled.state() else { panic!("settled on the receipt: {settled:?}") };
+    assert_eq!((receiver.kind, receiver.id.as_str()), (ConsumerKind::Person, flotilla_core::primitives::PERSON));
+    assert!(primitives.people().get(flotilla_core::primitives::PERSON).is_some(), "the receipt is on the person's record");
+    let CommandValue::PersonInbox(listing) = fleet.execute_as_operator(inbox).await else { panic!("a person inbox") };
+    assert!(listing.items.iter().all(|left| left.message != item.message), "an acknowledged message waits no more: {listing:?}");
+
+    // Answering it after acknowledging takes nothing more and replies to the
+    // crew as the role it was addressed to.
+    let answer = CommandAction::PersonAnswer {
+        namespace: Some(NAMESPACE.into()),
+        message: item.message.clone(),
+        body: "Carry on with the stable API.".into(),
+    };
+    assert_eq!(fleet.execute_as_operator(answer.clone()).await, CommandValue::Ok);
+    assert_eq!(fleet.execute_as_operator(answer).await, CommandValue::Ok, "the same answer again is the reply already sent");
+    let CommandValue::Error { message } = fleet
+        .execute_as_operator(CommandAction::PersonAnswer {
+            namespace: Some(NAMESPACE.into()),
+            message: item.message.clone(),
+            body: "A different answer.".into(),
+        })
+        .await
+    else {
+        panic!("a different answer to the same message is refused")
+    };
+    assert!(message.contains("already answered"), "{message}");
+    let reply = primitives
+        .messages()
+        .expect("engine messages")
+        .into_iter()
+        .map(|(_, message)| message)
+        .find(|message| message.spec().in_reply_to.as_ref().is_some_and(|original| original.name == id))
+        .expect("the answer is a reply to the escalation");
+    assert_eq!(reply.spec().sender.as_str(), "project:fleet/role:operator");
+    assert_eq!(reply.spec().inbox.as_str(), "project:fleet/convoy:engine-escalated/role:coder");
 }
 
 // A lone coder delivers its engine Convoy after realising the engine's vessel,
@@ -1183,7 +1280,7 @@ impl DummyDaemon {
         use flotilla_state_machines::{
             machines::{
                 agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message,
-                vessel::Vessel,
+                person::Person, vessel::Vessel,
             },
             Resource,
         };
@@ -1220,6 +1317,8 @@ impl DummyDaemon {
                 }
                 collect!(Message);
                 collect!(AgentSession);
+                // The delivery adapter keeps the person consumer's record.
+                collect!(Person);
                 collect!(Convoy);
                 collect!(AwaitingReply);
                 collect!(Environment);

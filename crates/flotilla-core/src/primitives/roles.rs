@@ -29,6 +29,20 @@ pub const FLEET_STORE: FleetRole =
 /// The defaults the system sends as, in declaration order.
 pub const FLEET_ROLES: [FleetRole; 5] = [TURN_RULES, NUDGE, STALL_JUDGE, CAPABILITIES, FLEET_STORE];
 
+/// A person's role for the matters of its context (#3938): crew stalls
+/// escalated past every supervisor, held turns waiting on a ruling, and the
+/// rulings and messages a person sends to crews.
+pub const OPERATOR: FleetRole = FleetRole {
+    name: "operator",
+    purpose: "Hears crew stalls escalated past every supervisor and held turns, and sends a person's rulings and messages to crews.",
+};
+
+/// The person roles, declared under the fleet and under every project:
+/// `fleet:<fleet>/role:<name>` and `project:<project>/role:<name>`. The person
+/// consumer is bound to each of them; rebinding one later hands it to another
+/// person or to an agent without re-addressing any message.
+pub const PERSON_ROLES: [FleetRole; 1] = [OPERATOR];
+
 /// The fleet roles of one fleet. The defaults can be replaced
 /// or extended ([`FleetRoles::declare`]); a sender keeps sending as the same
 /// role whichever handler is later bound to it.
@@ -88,6 +102,20 @@ impl FleetRoles {
             .then(|| inbox.name())
     }
 
+    /// A person role's inbox under the fleet: `fleet:<fleet>/role:<name>`.
+    pub fn person(&self, name: &str) -> Option<Address> {
+        PERSON_ROLES.iter().any(|role| role.name == name).then(|| self.fleet.child(Kind::Role, name).expect("person role names are valid"))
+    }
+
+    /// The person role an inbox names, under the fleet or directly under a project.
+    pub fn person_role_of<'a>(&self, inbox: &'a Address) -> Option<&'a str> {
+        let parent = inbox.parent()?;
+        (inbox.kind() == Kind::Role
+            && (parent == self.fleet || parent.kind() == Kind::Project)
+            && PERSON_ROLES.iter().any(|role| role.name == inbox.name()))
+        .then(|| inbox.name())
+    }
+
     /// The role an old `system:<name>` sender sends as. Held turns and
     /// adopted legacy messages send as turn-rules; `system:hold` survives
     /// only in their de-duplication key.
@@ -128,6 +156,15 @@ mod tests {
         let other = FleetRoles::declared("ops").expect("roles");
         assert_eq!(other.address("nudge").map(|a| a.to_string()), Some("fleet:ops/role:nudge".into()));
         assert_eq!(other.role_of(&turn_rules), None, "another fleet names other inboxes");
+        let operator = roles.person("operator").expect("person role");
+        assert_eq!(operator.as_str(), "fleet:fleet/role:operator");
+        assert_eq!(roles.person_role_of(&operator), Some("operator"));
+        assert_eq!(roles.role_of(&operator), None, "a person role is not a system sender");
+        assert_eq!(roles.system_sender("system:operator"), None);
+        let project: Address = "project:flotilla/role:operator".parse().expect("project role");
+        assert_eq!(roles.person_role_of(&project), Some("operator"));
+        let crew: Address = "project:flotilla/convoy:demo/role:operator".parse().expect("convoy role");
+        assert_eq!(roles.person_role_of(&crew), None, "a convoy's crew role is no person role");
         let overridden = roles.declare("checks", "Reports check results.").expect("override");
         assert_eq!(overridden.address("checks").map(|a| a.to_string()), Some("fleet:fleet/role:checks".into()));
     }

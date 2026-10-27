@@ -306,9 +306,9 @@ pub use query::{
     DispatchBoardRepository, DispatchBoardResponse, DispatchQueueResponse, DispatchQueueRow, DispatchReadyKey, FleetHealthResponse,
     FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaStatus, FleetStaleness,
     FleetSurfaceCounts, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListEntry, HostListResponse,
-    HostProvidersResponse, HostStatusResponse, PeerReconnectStatus, ProjectListEntry, ProjectListRepository, ProjectListResponse,
-    ProjectRepositoryRole, ProviderHealthMap, ProviderInfo, RepoProvidersResponse, RepoSummary, SleepInhibitionHealth, StallRung,
-    StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
+    HostProvidersResponse, HostStatusResponse, PeerReconnectStatus, PersonInboxItem, PersonInboxResponse, ProjectListEntry,
+    ProjectListRepository, ProjectListResponse, ProjectRepositoryRole, ProviderHealthMap, ProviderInfo, RepoProvidersResponse, RepoSummary,
+    SleepInhibitionHealth, StallRung, StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
 };
 pub use repository::{RepositoryRelation, RepositoryUpstream};
 pub use resource_ref::ResourceRef;
