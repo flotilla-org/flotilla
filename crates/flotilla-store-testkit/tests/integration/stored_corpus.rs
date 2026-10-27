@@ -29,7 +29,8 @@ fn retired_corpus_files(generation: &str) -> BTreeSet<String> {
 
 // Contract #4007 (ADR 0047): the allowance is confined to the recorded r355 files of retired
 // kinds. A purged kind's records have no runtime decoder; a retired kind's records, recorded and
-// fixed (r355 held no Usage rows), decode as retired, dropped, never as an unknown kind.
+// fixed (r355 held no Usage rows), decode as retired, dropped, never as an unknown kind; a corrupt
+// one still refuses.
 #[test]
 fn retired_corpus_kinds_decode_as_dropped_and_purged_ones_refuse() {
     for generation in ["", "r354", "r356", "r355-extra"] {
@@ -57,6 +58,10 @@ fn retired_corpus_kinds_decode_as_dropped_and_purged_ones_refuse() {
         }
         assert!(decoded > 0, "{} has a recorded or fixed record", retired.kind);
     }
+    // Dropped, not unchecked: a retired row whose status is not an object is corrupt.
+    let mut corrupt = fixed;
+    corrupt["status"] = Value::String("corrupt".into());
+    assert!(decode_stored_resource_document(&corrupt).is_err(), "a retired row's status is still an object");
 }
 
 #[test]

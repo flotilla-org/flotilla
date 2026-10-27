@@ -190,6 +190,7 @@ pub struct RetiredResourceKind {
 
 pub const RETIRED_RESOURCE_KINDS: &[RetiredResourceKind] = &[
     // Retired by #3943 (shipped in r887); remove one roll later, once the corpus is refreshed (#4007).
+    // The stored-corpus test reads each entry's r355 file, so retiring r355 forces this removal.
     RetiredResourceKind { kind: "Usage", plural: "usages", api_version: "flotilla.work/v1" },
 ];
 
@@ -1009,7 +1010,8 @@ pub fn validate_resource_document(document: &Value) -> Result<(), ResourceError>
 
 /// Decode both persisted halves of a resource without applying current write validation.
 /// The stored-record corpus uses this to enforce N→N+1 read compatibility.
-/// A retired kind's document decodes as [`StoredRecord::Retired`] once its apiVersion and spec are present.
+/// A retired kind's document decodes as [`StoredRecord::Retired`] once its apiVersion and spec are
+/// present and its status, if any, is an object. The body is deliberately not typed: it is dropped.
 pub fn decode_stored_resource_document(document: &Value) -> Result<StoredRecord, ResourceError> {
     let kind = document.get("kind").and_then(Value::as_str).ok_or_else(|| ResourceError::decode("kind: missing or non-string"))?;
     let version =
@@ -1019,6 +1021,9 @@ pub fn decode_stored_resource_document(document: &Value) -> Result<StoredRecord,
             return Err(ResourceError::decode(format!("apiVersion: expected {}, got {version}", retired.api_version)));
         }
         document.get("spec").ok_or_else(|| ResourceError::decode("spec: missing"))?;
+        if document.get("status").is_some_and(|status| !status.is_null() && !status.is_object()) {
+            return Err(ResourceError::decode("status: expected an object"));
+        }
         return Ok(StoredRecord::Retired(retired));
     }
     let registered = lookup_resource_kind(kind)?;

@@ -880,8 +880,9 @@ mod tests {
     }
 
     // Contract #3760: candidate config switches the gate, observed checkouts are
-    // exempt, rows of a retired kind are dropped (#4007), and every other refusal fails. Exhaust the finite on/off × store
-    // matrix, including empty stores, duplicate Messages and a missing designation.
+    // exempt, rows of a retired kind are dropped (#4007), and every other refusal
+    // fails. Exhaust the finite on/off × store matrix, including empty stores,
+    // duplicate Messages and a missing designation.
     // Named fleet-role Messages pass; an unnamed designation fails only when the candidate enables primitives.
     // The HTTP stand-in is the resource-socket process boundary; mapping and
     // temporary-store restoration use the real rehearsal implementations.
