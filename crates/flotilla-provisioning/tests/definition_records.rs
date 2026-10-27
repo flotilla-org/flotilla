@@ -98,15 +98,38 @@ async fn the_old_store_keeps_the_definition_contract() {
     contract(&ResourceBackend::new(InMemoryBackend::default())).await;
 }
 
-#[tokio::test]
-async fn the_engine_keeps_the_definition_contract() {
-    let directory = tempfile::tempdir().expect("temp dir");
+fn engine_backend(directory: &tempfile::TempDir) -> ResourceBackend {
     let mut kinds = flotilla_schema::KindRegistry::new();
     flotilla_provisioning::stored::definition::register(&mut kinds).expect("register");
     let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
     let records = EngineDefinitions::open(service, Arc::new(SystemClock) as Arc<dyn Clock>).expect("open");
     let backend = ResourceBackend::new(InMemoryBackend::default());
     backend.install_definition_records(Arc::new(records));
+    backend
+}
+
+// Behaviour (ADR 0053, ADR 0047): a previous generation's retired image layer still applies on the
+// engine, so its manifest is not refused during the roll, and it is inert: nothing reads it, and a
+// current layer of that name it replaces is removed, as the import drops retired layers.
+#[tokio::test]
+async fn on_the_engine_a_retired_layer_applies_and_holds_nothing() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let backend = engine_backend(&directory);
+    let layers = backend.definitions::<flotilla_resources::ImageLayer>(NS);
+    let builtin = flotilla_resources::builtins::builtin_definitions("ImageLayer").expect("built-ins")[0].spec.clone();
+    let current: flotilla_resources::ImageLayerResourceSpec = serde_json::from_value(builtin).expect("layer");
+    let name = "retiring-layer";
+    layers.apply(&meta(name, &DefinitionOrigin::Operator), &current).await.expect("current layer");
+    let retired: flotilla_resources::ImageLayerResourceSpec =
+        serde_json::from_value(serde_json::json!({"retired": true})).expect("retired");
+    layers.apply(&meta(name, &DefinitionOrigin::Operator), &retired).await.expect("a retired layer applies");
+    assert!(layers.get(name).await.is_err(), "a retired layer is inert");
+}
+
+#[tokio::test]
+async fn the_engine_keeps_the_definition_contract() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let backend = engine_backend(&directory);
     contract(&backend).await;
     // Nothing reached the old store.
     assert!(backend.store().list_raw(flotilla_store::ResourceKind::of::<Forge>(), NS).await.expect("old rows").items.is_empty());

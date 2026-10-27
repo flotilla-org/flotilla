@@ -86,8 +86,8 @@ impl Definition for ImageLayerDefinition {
     fn build(origin: DefinitionOrigin, spec: Value) -> Result<Self, String> {
         match decode::<ImageLayerResourceSpec>(Self::NAME, spec)? {
             ImageLayerResourceSpec::Current(layer) => ImageLayerDefinition::new(origin, &layer),
-            // ADR 0053's retired layers are inert, and the import drops them; none is written.
-            ImageLayerResourceSpec::Retired => Err("a retired ImageLayer is not written; delete it".into()),
+            // Handled before building: see `EngineDefinitions::apply`.
+            ImageLayerResourceSpec::Retired => Err("a retired ImageLayer has no stored form".into()),
         }
     }
     fn origin(&self) -> &DefinitionOrigin {
@@ -364,6 +364,13 @@ impl DefinitionRecords for EngineDefinitions {
     }
 
     async fn apply(&self, kind: &str, name: &str, origin: DefinitionOrigin, spec: Value) -> Result<DefinitionRecord, String> {
+        if kind == ImageLayerDefinition::NAME && decode::<ImageLayerResourceSpec>(kind, spec.clone())?.is_retired() {
+            // ADR 0053's retired layers stay admissible for one roll, so that previous-generation
+            // manifests still apply, and are inert for resolution. The import drops them; so does
+            // a write: this home's copy is removed, and the written value is returned unstored.
+            self.remove::<ImageLayerDefinition>(name)?;
+            return Ok(DefinitionRecord { name: name.to_owned(), home: self.home.clone(), origin, spec, version: 0 });
+        }
         by_kind!(kind, |K| self.write::<K>(name, origin, spec))
     }
 
