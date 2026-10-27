@@ -33,11 +33,18 @@ fn directory(host: &str, guest: &str, liveness: Liveness) -> HostPathOffer {
     HostPathOffer { reach: HostReach::Directory { host: host.into(), guest: guest.into() }, access: Access::ReadOnly, liveness }
 }
 
+fn writable_directory(host: &str, guest: &str) -> HostPathOffer {
+    HostPathOffer { access: Access::ReadWrite, ..directory(host, guest, Liveness::Live) }
+}
+
 const PUSH: Mechanism = Mechanism::AgentPush;
 const FETCH: Mechanism = Mechanism::AgentFetch { by: FetchBy::Url };
 const RW_LIVE: Mechanism = Mechanism::HostPath { access: Access::ReadWrite, liveness: Liveness::Live };
 const RO_LIVE: Mechanism = Mechanism::HostPath { access: Access::ReadOnly, liveness: Liveness::Live };
 const RO_SNAPSHOT: Mechanism = Mechanism::HostPath { access: Access::ReadOnly, liveness: Liveness::Snapshot };
+
+/// (need, digest, mechanism, guest source) as it landed.
+type Delivered = (&'static str, &'static str, Mechanism, Option<&'static str>);
 
 /// (need, mechanism, action, guest source).
 type ExpectedStep = (&'static str, Mechanism, Action, Option<&'static str>);
@@ -46,7 +53,7 @@ struct Row {
     rule: &'static str,
     needs: Vec<Need>,
     offers: Vec<HostPathOffer>,
-    delivered: Vec<(&'static str, &'static str, Mechanism)>,
+    delivered: Vec<Delivered>,
     costs: CostTable,
     /// (need, mechanism, action, guest source), in plan order.
     expected: Result<Vec<ExpectedStep>, PlanError>,
@@ -57,7 +64,7 @@ fn row(rule: &'static str, needs: Vec<Need>, offers: Vec<HostPathOffer>) -> Row 
 }
 
 impl Row {
-    fn delivered(mut self, delivered: Vec<(&'static str, &'static str, Mechanism)>) -> Self {
+    fn delivered(mut self, delivered: Vec<Delivered>) -> Self {
         self.delivered = delivered;
         self
     }
@@ -120,6 +127,19 @@ fn needs_lower_to_the_cheapest_mechanism_meeting_their_requirements() {
         )
         .plans(vec![("home", PUSH, Deliver, None), ("skills", RO_SNAPSHOT, Deliver, Some("/snap/skills/a"))]),
         row(
+            "a writable directory never serves a read-only tree",
+            vec![home("home"), tree("skills", "home", sources(false, true, Some("/host/skills/a")))],
+            vec![writable_directory("/host/skills", "/run/skills")],
+        )
+        .plans(vec![("home", PUSH, Deliver, None), ("skills", FETCH, Deliver, None)]),
+        row(
+            "a tree whose guest path moved is delivered again",
+            vec![home("home"), tree("skills", "home", sources(false, false, Some("/host/skills/a")))],
+            vec![directory("/host/skills", "/run/new", Liveness::Live)],
+        )
+        .delivered(vec![("home", "home-key", PUSH, None), ("skills", "skills-v1", RO_LIVE, Some("/run/old/a"))])
+        .plans(vec![("home", PUSH, Keep, None), ("skills", RO_LIVE, Deliver, Some("/run/new/a"))]),
+        row(
             "a host copy outside every offered directory falls back to fetch",
             vec![home("home"), tree("skills", "home", sources(false, true, Some("/elsewhere/a")))],
             vec![directory("/host", "/guest", Liveness::Live)],
@@ -136,24 +156,24 @@ fn needs_lower_to_the_cheapest_mechanism_meeting_their_requirements() {
             vec![home("home"), tree("skills", "home", sources(false, true, None))],
             vec![],
         )
-        .delivered(vec![("home", "home-key", PUSH), ("skills", "skills-v1", FETCH)])
+        .delivered(vec![("home", "home-key", PUSH, None), ("skills", "skills-v1", FETCH, None)])
         .plans(vec![("home", PUSH, Keep, None), ("skills", FETCH, Keep, None)]),
         row("new content is delivered again", vec![home("home"), tree("skills", "home", sources(false, true, None))], vec![])
-            .delivered(vec![("home", "home-key", PUSH), ("skills", "skills-v0", FETCH)])
+            .delivered(vec![("home", "home-key", PUSH, None), ("skills", "skills-v0", FETCH, None)])
             .plans(vec![("home", PUSH, Keep, None), ("skills", FETCH, Deliver, None)]),
         row(
             "content landed by another mechanism is delivered again",
             vec![home("home"), tree("skills", "home", sources(false, true, None))],
             vec![writable_base(Access::ReadWrite)],
         )
-        .delivered(vec![("home", "home-key", PUSH), ("skills", "skills-v1", FETCH)])
+        .delivered(vec![("home", "home-key", PUSH, None), ("skills", "skills-v1", FETCH, None)])
         .plans(vec![("home", RW_LIVE, Deliver, None), ("skills", FETCH, Deliver, None)]),
         row(
             "a tree whose home is delivered again is delivered again",
             vec![home("home"), tree("skills", "home", sources(false, true, None))],
             vec![],
         )
-        .delivered(vec![("home", "home-v0", PUSH), ("skills", "skills-v1", FETCH)])
+        .delivered(vec![("home", "home-v0", PUSH, None), ("skills", "skills-v1", FETCH, None)])
         .plans(vec![("home", PUSH, Deliver, None), ("skills", FETCH, Deliver, None)]),
         row("a tree must be placed in a home", vec![home("home"), tree("skills", "account", sources(false, true, None))], vec![])
             .fails(PlanError::NoHome { tree: NeedName::new("skills"), home: NeedName::new("account") }),
@@ -170,7 +190,12 @@ fn needs_lower_to_the_cheapest_mechanism_meeting_their_requirements() {
         let delivered = row
             .delivered
             .iter()
-            .map(|(need, digest, mechanism)| (NeedName::new(*need), Landed { digest: ContentDigest::new(*digest), mechanism: *mechanism }))
+            .map(|(need, digest, mechanism, source)| {
+                (
+                    NeedName::new(*need),
+                    Landed { digest: ContentDigest::new(*digest), mechanism: *mechanism, guest_source: source.map(PathBuf::from) },
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let actual = plan(&row.needs, &ProviderMechanisms { host_paths: row.offers.clone() }, &delivered, &row.costs).map(|plan| {
             plan.steps.into_iter().map(|step| (step.need.to_string(), step.mechanism, step.action, step.guest_source)).collect::<Vec<_>>()
@@ -192,8 +217,8 @@ fn needs_lower_to_the_cheapest_mechanism_meeting_their_requirements() {
 //
 // Generator: one home and zero to four trees, each with every combination of
 // controller, URL and host copy (inside or outside the offered directory), over
-// providers offering nothing, a read-only or read-write writable base, and a
-// live or snapshot directory, under every ordering of the cost table.
+// providers offering nothing, a read-only or read-write writable base, a live or
+// snapshot read-only directory and a writable one, under every ordering of the cost table.
 #[hegel::test]
 fn planning_again_over_what_landed_keeps_everything(tc: hegel::TestCase) {
     let mut needs = vec![home("home")];
@@ -215,6 +240,9 @@ fn planning_again_over_what_landed_keeps_everything(tc: hegel::TestCase) {
     if tc.draw(gs::booleans()) {
         offers.push(directory("/host", "/guest", if tc.draw(gs::booleans()) { Liveness::Live } else { Liveness::Snapshot }));
     }
+    if tc.draw(gs::booleans()) {
+        offers.push(writable_directory("/host", "/writable"));
+    }
     let costs = CostTable {
         host_path_live: tc.draw(gs::integers::<u32>().min_value(0).max_value(3)),
         host_path_snapshot: tc.draw(gs::integers::<u32>().min_value(0).max_value(3)),
@@ -235,6 +263,21 @@ fn planning_again_over_what_landed_keeps_everything(tc: hegel::TestCase) {
         }
     };
     assert!(first.steps.iter().all(|step| step.action == Action::Deliver), "nothing has landed, so everything is delivered");
+    // Every chosen mechanism meets its need's requirements.
+    for step in &first.steps {
+        match &needs.iter().find(|need| need.name == step.need).expect("planned need").item {
+            Item::Home { .. } => assert!(
+                matches!(step.mechanism, Mechanism::AgentPush | Mechanism::HostPath { access: Access::ReadWrite, .. })
+                    && step.guest_source.is_none(),
+                "a home is writable: {step:?}"
+            ),
+            Item::Tree { .. } => assert!(
+                !matches!(step.mechanism, Mechanism::HostPath { .. })
+                    || matches!(step.mechanism, Mechanism::HostPath { access: Access::ReadOnly, .. }) && step.guest_source.is_some(),
+                "a host-path tree is read-only where the guest sees it: {step:?}"
+            ),
+        }
+    }
     let again = plan(&needs, &mechanisms, &first.landed(), &costs).expect("the same needs plan again");
     assert_eq!(again.landed(), first.landed(), "the same mechanisms are chosen");
     assert!(again.steps.iter().all(|step| step.action == Action::Keep), "{again:?}");

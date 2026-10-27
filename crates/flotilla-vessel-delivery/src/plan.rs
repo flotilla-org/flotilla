@@ -37,11 +37,13 @@ impl CostTable {
     }
 }
 
-/// What landed for one need: its digest and the mechanism that delivered it.
+/// What landed for one need: its digest, the mechanism that delivered it, and for a
+/// host-path tree where the guest saw it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Landed {
     pub digest: ContentDigest,
     pub mechanism: Mechanism,
+    pub guest_source: Option<PathBuf>,
 }
 
 /// Whether a step delivers or keeps what already landed.
@@ -62,7 +64,8 @@ pub struct Step {
     pub guest_source: Option<PathBuf>,
 }
 
-/// Steps in execution order: every home before the trees placed in it.
+/// Steps in execution order: every home before the trees placed in it, and within
+/// homes and within trees in need-name order, whatever order the needs were given in.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Plan {
     pub steps: Vec<Step>,
@@ -71,7 +74,13 @@ pub struct Plan {
 impl Plan {
     /// What has landed once every step has run, for the access's status.
     pub fn landed(&self) -> BTreeMap<NeedName, Landed> {
-        self.steps.iter().map(|step| (step.need.clone(), Landed { digest: step.digest.clone(), mechanism: step.mechanism })).collect()
+        self.steps
+            .iter()
+            .map(|step| {
+                let landed = Landed { digest: step.digest.clone(), mechanism: step.mechanism, guest_source: step.guest_source.clone() };
+                (step.need.clone(), landed)
+            })
+            .collect()
     }
 }
 
@@ -103,10 +112,12 @@ impl std::error::Error for PlanError {}
 ///
 /// - A home is durable and writable: a read-write host path over a writable
 ///   base that is host storage, otherwise agent push creates it in the vessel.
-/// - A tree is read-only: a host path whose directory contains the tree's host
-///   copy, agent fetch when it has a URL, agent push when the controller holds it.
-/// - A need whose digest already landed through the chosen mechanism is kept,
-///   unless its home is delivered again.
+/// - A tree is read-only: a read-only host path whose directory contains the tree's
+///   host copy, agent fetch when it has a URL, agent push when the controller holds it.
+/// - A need whose digest already landed through the chosen mechanism, at the same
+///   guest path, is kept, unless its home is delivered again.
+///
+/// Every tree's home is validated before any mechanism is chosen.
 pub fn plan(
     needs: &[Need],
     mechanisms: &ProviderMechanisms,
@@ -117,6 +128,13 @@ pub fn plan(
     for need in needs {
         if by_name.insert(need.name.clone(), need).is_some() {
             return Err(PlanError::DuplicateNeed(need.name.clone()));
+        }
+    }
+    for need in by_name.values() {
+        if let Item::Tree { home, .. } = &need.item {
+            if !matches!(by_name.get(home).map(|need| &need.item), Some(Item::Home { .. })) {
+                return Err(PlanError::NoHome { tree: need.name.clone(), home: home.clone() });
+            }
         }
     }
     let (homes, trees): (Vec<&Need>, Vec<&Need>) = by_name.values().partition(|need| matches!(need.item, Item::Home { .. }));
@@ -132,14 +150,11 @@ pub fn plan(
             .ok_or_else(|| PlanError::NoMechanism(need.name.clone()))?;
         let home_redelivered = match &need.item {
             Item::Home { .. } => false,
-            Item::Tree { home, .. } => {
-                if !matches!(by_name.get(home).map(|need| &need.item), Some(Item::Home { .. })) {
-                    return Err(PlanError::NoHome { tree: need.name.clone(), home: home.clone() });
-                }
-                delivered_homes.contains(home)
-            }
+            Item::Tree { home, .. } => delivered_homes.contains(home),
         };
-        let landed = delivered.get(&need.name).is_some_and(|landed| landed.digest == need.digest && landed.mechanism == mechanism);
+        let landed = delivered
+            .get(&need.name)
+            .is_some_and(|landed| landed.digest == need.digest && landed.mechanism == mechanism && landed.guest_source == guest_source);
         let action = if landed && !home_redelivered { Action::Keep } else { Action::Deliver };
         if action == Action::Deliver && matches!(need.item, Item::Home { .. }) {
             delivered_homes.insert(need.name.clone());
@@ -164,7 +179,8 @@ fn candidates(need: &Need, mechanisms: &ProviderMechanisms) -> Vec<(Mechanism, O
         Item::Tree { sources, .. } => {
             if let Some(source) = &sources.host_path {
                 for offer in &mechanisms.host_paths {
-                    if let HostReach::Directory { host, guest } = &offer.reach {
+                    // A writable view would let the guest change the controller's copy.
+                    if let (HostReach::Directory { host, guest }, Access::ReadOnly) = (&offer.reach, offer.access) {
                         if let Ok(rest) = source.strip_prefix(host) {
                             candidates
                                 .push((Mechanism::HostPath { access: offer.access, liveness: offer.liveness }, Some(guest.join(rest))));
