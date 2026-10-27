@@ -30,7 +30,8 @@
 //! | `flotilla.convoy.workflow` | WorkflowTemplate resource name used by a convoy. |
 //! | `flotilla.convoy.message` | Convoy lifecycle diagnostic. |
 //! | `flotilla.work.phase` | Work phase aboard a vessel, not vessel lifecycle. |
-//! | `flotilla.vessel.host` | Host currently carrying a convoy vessel. |
+//! | `flotilla.vessel.host` | Host whose daemon acts on a convoy vessel; attach recipes address it. |
+//! | `flotilla.vessel.carried_by` | Machine a convoy vessel runs on, as information; differs from `flotilla.vessel.host` on an agentless SSH host. |
 //! | `flotilla.independent.host` | Host currently carrying an independent terminal session. |
 //! | `flotilla.vessel.env` | Execution-environment reference for a vessel. |
 //! | `flotilla.crew.roles` | Complete crew-role list aboard a vessel. |

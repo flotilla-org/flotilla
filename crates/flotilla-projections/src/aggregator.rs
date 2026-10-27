@@ -86,6 +86,7 @@ pub struct AggregatorResolvers {
     durable_repositories: ReplicaReadResolver<Repository>,
     durable_regards: TypedResolver<Regard>,
     durable_vessels: ReplicaReadResolver<Vessel>,
+    durable_hosts: ReplicaReadResolver<flotilla_resources::Host>,
     durable_checkouts: ReplicaReadResolver<Checkout>,
     durable_clones: TypedResolver<CloneResource>,
     observed_convoys: TypedResolver<Convoy>,
@@ -107,6 +108,7 @@ struct AggregatorSourceRefs<'a> {
     durable_repositories: &'a dyn AggregatorReplicaWatchSource<Repository>,
     durable_regards: &'a dyn AggregatorWatchSource<Regard>,
     durable_vessels: &'a dyn AggregatorReplicaWatchSource<Vessel>,
+    durable_hosts: &'a dyn AggregatorReplicaWatchSource<flotilla_resources::Host>,
     durable_checkouts: &'a dyn AggregatorReplicaWatchSource<Checkout>,
     durable_clones: &'a dyn AggregatorWatchSource<CloneResource>,
     observed_convoys: &'a dyn AggregatorWatchSource<Convoy>,
@@ -219,6 +221,10 @@ pub struct Aggregator {
     observed_checkouts: HashMap<ResourceRef, ResourceObject<Checkout>>,
     #[builder(skip)]
     readiness_vessels: BTreeMap<RepositorySourceKey, ReadResourceObject<Vessel>>,
+    /// Declared Host authority by resource name, which maps a vessel's
+    /// placement target to the daemon that acts on it (#4021).
+    #[builder(skip)]
+    hosts: BTreeMap<String, ResourceObject<flotilla_resources::Host>>,
     #[builder(skip)]
     placement_policies: BTreeMap<RepositorySourceKey, ReadResourceObject<PlacementPolicy>>,
     #[builder(skip)]
@@ -353,6 +359,7 @@ impl Aggregator {
             observed_checkouts: HashMap::new(),
             readiness_vessels: BTreeMap::new(),
             placement_policies: BTreeMap::new(),
+            hosts: BTreeMap::new(),
             readiness_checkouts: BTreeMap::new(),
             readiness_clones: BTreeMap::new(),
             checkout_replicas: HashMap::new(),
@@ -446,6 +453,7 @@ impl Aggregator {
             durable_repositories,
             durable_regards,
             durable_vessels,
+            durable_hosts,
             durable_checkouts,
             durable_clones,
             observed_convoys,
@@ -471,6 +479,7 @@ impl Aggregator {
             .durable_repositories(&durable_repositories)
             .durable_regards(&durable_regards)
             .durable_vessels(&durable_vessels)
+            .durable_hosts(&durable_hosts)
             .durable_checkouts(&durable_checkouts)
             .durable_clones(&durable_clones)
             .observed_convoys(&observed_convoys)
@@ -494,6 +503,7 @@ impl Aggregator {
             durable_repositories,
             durable_regards,
             durable_vessels,
+            durable_hosts,
             durable_checkouts,
             durable_clones,
             observed_convoys,
@@ -548,6 +558,8 @@ impl Aggregator {
         let mut checkout_replica_stream = self.recover_checkout_replica_watch(observed_checkout_replicas).await?;
         let (items, mut vessel_stream) = Self::recover_replica_watch(durable_vessels).await?;
         self.readiness_vessels = readiness_resources(items);
+        let (items, mut host_stream) = Self::recover_replica_watch(durable_hosts).await?;
+        self.replace_hosts(items);
         let (items, mut readiness_checkout_stream) = Self::recover_replica_watch(durable_checkouts).await?;
         self.readiness_checkouts = readiness_resources(items);
         let mut readiness_clone_stream = self.recover_clone_readiness_watch(durable_clones).await?;
@@ -732,6 +744,24 @@ impl Aggregator {
                     }
                     self.refresh_origin_hosts().await;
                     self.rebuild_local_projection().await;
+                }
+                event = host_stream.next() => {
+                    let changed = match event {
+                        Some(Ok(event)) => self.apply_host_event(event),
+                        Some(Err(ResourceError::WatchExpired { .. })) => {
+                            let (items, watch) = Self::recover_replica_watch(durable_hosts).await?;
+                            host_stream = watch;
+                            self.replace_hosts(items)
+                        }
+                        Some(Err(error)) => return Err(error),
+                        None => return Err(ResourceError::other("aggregator host watch ended")),
+                    };
+                    if changed {
+                        self.rebuild_local_projection().await;
+                        if self.rebuild_salience_projection().await {
+                            self.emit_awareness_result_sets().await;
+                        }
+                    }
                 }
                 event = readiness_checkout_stream.next() => {
                     match event {
@@ -2473,21 +2503,70 @@ impl Aggregator {
         )
     }
 
+    /// The daemon that acts on a vessel. Joins, attach and completion use it.
     fn vessel_host(&self, convoy_ref: &ResourceRef, state: Option<&WorkState>) -> HostName {
-        state
-            .and_then(|state| state.placement.as_ref())
-            .and_then(|placement| {
-                placement
-                    .fields
-                    .get("placement_decision")
-                    .and_then(|decision| decision.get("target_host"))
-                    .and_then(|host| host.get("display_name"))
-                    .or_else(|| placement.fields.get("host"))
-            })
-            .and_then(serde_json::Value::as_str)
-            .map(HostName::new)
+        self.vessel_hosts(convoy_ref, state).0
+    }
+
+    /// The daemon that acts on a vessel, and the machine the vessel runs on
+    /// (#4021). The acting daemon comes from the placement target's declared
+    /// Host authority, never from who wrote a record. Without that Host record
+    /// it is the target itself, which is right for every daemon-carrying host.
+    fn vessel_hosts(&self, convoy_ref: &ResourceRef, state: Option<&WorkState>) -> (HostName, Option<HostName>) {
+        let placement = state.and_then(|state| state.placement.as_ref());
+        let target =
+            placement.and_then(|placement| placement.fields.get("placement_decision")).and_then(|decision| decision.get("target_host"));
+        let (reference, carried_by) = match target {
+            Some(target) => (
+                target.get("ref").and_then(serde_json::Value::as_str),
+                target.get("display_name").and_then(serde_json::Value::as_str).map(HostName::new),
+            ),
+            None => {
+                let host = placement.and_then(|placement| placement.fields.get("host")).and_then(serde_json::Value::as_str);
+                (host, host.map(HostName::new))
+            }
+        };
+        let acting = reference
+            .and_then(|reference| self.acting_daemon(reference))
+            .or_else(|| carried_by.clone())
             .or_else(|| convoy_ref.host.clone())
-            .unwrap_or_else(|| self.local_host.clone())
+            .unwrap_or_else(|| self.local_host.clone());
+        (acting, carried_by)
+    }
+
+    /// The display name of the daemon acting on the Host `reference` names.
+    fn acting_daemon(&self, reference: &str) -> Option<HostName> {
+        let resolve = |reference: &str| {
+            flotilla_resources::canonical_host_id(self.hosts.values(), reference).ok().flatten().and_then(|id| self.hosts.get(id.as_str()))
+        };
+        let acting = flotilla_resources::acting_daemon_ref(resolve(reference)?);
+        Some(HostName::new(match resolve(acting.as_str()) {
+            Some(host) if !host.spec.display_name.is_empty() => host.spec.display_name.clone(),
+            Some(host) => host.metadata.name.clone(),
+            None => acting.as_str().to_owned(),
+        }))
+    }
+
+    /// Replace the Host authority; reports whether any vessel mapping input changed.
+    fn replace_hosts(&mut self, items: Vec<ReadResourceObject<flotilla_resources::Host>>) -> bool {
+        let hosts = items.into_iter().map(|read| (read.object.metadata.name.clone(), read.object)).collect::<BTreeMap<_, _>>();
+        let changed = hosts.len() != self.hosts.len()
+            || hosts.iter().any(|(name, host)| self.hosts.get(name).is_none_or(|known| !same_host_authority(known, host)));
+        self.hosts = hosts;
+        changed
+    }
+
+    /// Apply one Host event; heartbeats that change no authority report false.
+    fn apply_host_event(&mut self, event: ReadWatchEvent<flotilla_resources::Host>) -> bool {
+        match event {
+            ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) => {
+                let changed = self.hosts.get(&read.object.metadata.name).is_none_or(|known| !same_host_authority(known, &read.object));
+                self.hosts.insert(read.object.metadata.name.clone(), read.object);
+                changed
+            }
+            ReadWatchEvent::Deleted(read) => self.hosts.remove(&read.object.metadata.name).is_some(),
+            ReadWatchEvent::DeletedByName { tombstone, .. } => self.hosts.remove(&tombstone.name).is_some(),
+        }
     }
 
     /// Whether a terminal session is running: behind `[primitives]` the engine's reading of its
@@ -2861,7 +2940,7 @@ impl Aggregator {
         let placement_decision = placement
             .and_then(|placement| placement.fields.get("placement_decision"))
             .and_then(|value| serde_json::from_value(value.clone()).ok());
-        let vessel_host = self.vessel_host(convoy_ref, state);
+        let (vessel_host, carried_by) = self.vessel_hosts(convoy_ref, state);
         let vessel_resource =
             placement.and_then(|placement| placement.fields.get("vessel_ref")).and_then(serde_json::Value::as_str).map(|name| {
                 ResourceRef::new(api_version(Vessel::API_PATHS), Vessel::API_PATHS.kind, &convoy_ref.namespace, name)
@@ -3045,6 +3124,7 @@ impl Aggregator {
             )
             .depends_on(definition.depends_on.clone())
             .host(vessel_host.clone())
+            .maybe_carried_by(carried_by)
             .maybe_materialize(self.vessel_materialize(&convoy_ref.namespace, &convoy_ref.name, &definition.name, &vessel_host))
             .maybe_cleat_endpoint(self.vessel_cleat_endpoint(&convoy_ref.namespace, &convoy_ref.name, &definition.name, &vessel_host))
             .complete_work(state.is_some_and(|state| !state.phase.is_terminal()))
@@ -3067,6 +3147,11 @@ fn repository_source_key(namespace: &str, name: &str, provenance: &ResourceProve
         ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
     };
     (namespace.to_string(), name.to_string(), origin)
+}
+
+/// Whether two Host records map placements to the same acting daemon.
+fn same_host_authority(left: &ResourceObject<flotilla_resources::Host>, right: &ResourceObject<flotilla_resources::Host>) -> bool {
+    left.spec.display_name == right.spec.display_name && left.spec.connection == right.spec.connection
 }
 
 fn ensure_has_controller_status(ensure: &ResourceObject<ConvoyEnsure>) -> bool {
@@ -4193,6 +4278,7 @@ mod tests {
             .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
             .durable_regards(durable.using::<Regard>("flotilla"))
             .durable_vessels(durable.including_replicas::<Vessel>("flotilla"))
+            .durable_hosts(durable.including_replicas::<flotilla_resources::Host>("flotilla"))
             .durable_checkouts(durable.including_replicas::<Checkout>("flotilla"))
             .durable_clones(durable.using::<CloneResource>("flotilla"))
             .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
@@ -4777,6 +4863,7 @@ mod tests {
         let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_regards = ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_hosts = ScriptedSource::<flotilla_resources::Host>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_clones = ScriptedSource::<CloneResource>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -4792,6 +4879,7 @@ mod tests {
             .durable_repositories(&durable_repositories)
             .durable_regards(&durable_regards)
             .durable_vessels(&durable_vessels)
+            .durable_hosts(&durable_hosts)
             .durable_checkouts(&durable_checkouts)
             .durable_clones(&durable_clones)
             .observed_convoys(observed_convoys)
@@ -5691,6 +5779,7 @@ mod tests {
         let durable_regards = ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_hosts = ScriptedSource::<flotilla_resources::Host>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_clones = ScriptedSource::<CloneResource>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -5706,6 +5795,7 @@ mod tests {
             .durable_repositories(&durable_repositories)
             .durable_regards(&durable_regards)
             .durable_vessels(&durable_vessels)
+            .durable_hosts(&durable_hosts)
             .durable_checkouts(&durable_checkouts)
             .durable_clones(&durable_clones)
             .observed_convoys(&observed_convoys)
@@ -7372,6 +7462,107 @@ mod tests {
         assert_eq!(vessel.vessel_resource.expect("vessel resource").host, Some(HostName::new("feta")));
     }
 
+    // #4021: a vessel on an agentless SSH host is acted on by the Host's
+    // declared owning daemon, which writes every record about it. Joins use
+    // that daemon; the machine the vessel runs on is information only.
+    #[tokio::test]
+    async fn vessel_on_agentless_ssh_host_joins_records_through_its_owning_daemon() {
+        use flotilla_protocol::{result_set::ReadinessState, CanonicalHostId, PlacementDecision, PlacementTargetHost};
+        use flotilla_resources::{HostConnection, HostSpec, VesselPhase, VesselSpec, VesselStatus};
+        // A drydock cloud sandbox (Daytona) is placed on its controller's
+        // daemon Host, which the same mapping resolves to itself.
+        for (target, machine) in [("host-b1", "b1"), ("host-udder", "udder")] {
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let (events, _) = broadcast::channel(128);
+            let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events)
+                .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("udder-node", "udder")));
+            let origin = flotilla_protocol::NodeId::new("udder-node");
+            aggregator.origin_hosts.insert(origin.clone(), HostName::new("udder"));
+            let provenance = ResourceProvenance::Replica { origin_root: origin, last_synced_at: Utc::now() };
+            for (name, display_name, connection) in [
+                ("host-udder", "udder", HostConnection::Daemon),
+                ("host-b1", "b1", HostConnection::AgentlessSsh { owning_daemon: "host-udder".into(), destination: "b1.lan".into() }),
+            ] {
+                let host = backend
+                    .using::<flotilla_resources::Host>("flotilla")
+                    .create(
+                        &InputMeta::builder().name(name.into()).build(),
+                        &HostSpec { display_name: display_name.into(), connection, ..Default::default() },
+                    )
+                    .await
+                    .expect("host");
+                assert!(
+                    aggregator.apply_host_event(ReadWatchEvent::Added(ReadResourceObject { object: host, provenance: provenance.clone() }))
+                );
+            }
+
+            let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
+            let status = convoy.status.as_mut().expect("convoy status");
+            status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0]
+                .crew
+                .push(CrewSpec::builder().role("coder".to_string()).source(CrewSource::Tool { command: "codex".to_string() }).build());
+            let decision = PlacementDecision::builder()
+                .policy_name("b1".into())
+                .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(target), display_name: machine.into() })
+                .build();
+            status.work.get_mut("implement").expect("work state").placement = Some(PlacementStatus {
+                fields: BTreeMap::from([("placement_decision".to_string(), serde_json::to_value(decision).expect("decision"))]),
+            });
+
+            let mut vessel = backend
+                .using::<Vessel>("flotilla")
+                .create(
+                    &InputMeta::builder().name("ssh-vessel".into()).build(),
+                    &VesselSpec {
+                        convoy_ref: convoy.metadata.name.clone(),
+                        vessel_name: "implement".into(),
+                        placement_policy_ref: "b1".into(),
+                        adopted_checkout_refs: Default::default(),
+                    },
+                )
+                .await
+                .expect("vessel");
+            vessel.status = Some(VesselStatus { phase: VesselPhase::Provisioning, ..Default::default() });
+            apply_readiness_event(
+                &mut aggregator.readiness_vessels,
+                ReadWatchEvent::Added(ReadResourceObject { object: vessel, provenance: provenance.clone() }),
+            );
+
+            let mut session = session_object("terminal-ssh-coder").await;
+            session.spec.role = "coder".into();
+            session.metadata.labels =
+                BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone()), (VESSEL_LABEL.into(), "implement".into())]);
+            session.status.as_mut().expect("session status").attention = Some(TerminalAttention {
+                state: TerminalAttentionState::Working,
+                as_of: Utc::now(),
+                source: TerminalAttentionSource::Hook,
+            });
+            let session = ReadResourceObject { object: session, provenance };
+            let key = session_key(&session);
+            aggregator.replace_replica_sessions(vec![session]).await;
+            aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+            // Attach capability resolves asynchronously; settle it as attachable.
+            aggregator.attachable_sessions.insert(key);
+            let status = convoy.status.as_ref().expect("convoy status");
+            let row = aggregator.summarize_vessel(
+                &aggregator.convoy_ref("flotilla", &convoy.metadata.name),
+                &status.workflow_snapshot.as_ref().expect("workflow snapshot").vessels[0],
+                status.work.get("implement"),
+                None,
+                status.crew_work.get("implement"),
+            );
+
+            assert_eq!(row.host, HostName::new("udder"));
+            assert_eq!(row.carried_by, Some(HostName::new(machine)));
+            assert_eq!(row.materialize.as_deref(), Some("terminal-ssh-coder"));
+            assert_eq!(row.crew[0].session.as_deref(), Some("udder/flotilla/terminal-ssh-coder"));
+            assert_eq!(row.surface_state, SurfaceState::Working);
+            assert_eq!(row.readiness.state, ReadinessState::Provisioning);
+            assert_eq!(row.readiness.blockers[0].resource.host, Some(HostName::new("udder")));
+            assert!(aggregator.salience_facts().attention.iter().any(|fact| fact.target == row.resource));
+        }
+    }
+
     #[tokio::test]
     async fn non_terminal_work_is_completable() {
         for phase in [ResourceWorkPhase::Pending, ResourceWorkPhase::Ready, ResourceWorkPhase::Launching, ResourceWorkPhase::Running] {
@@ -7470,6 +7661,7 @@ mod tests {
                     .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
                     .durable_regards(durable.using::<Regard>("flotilla"))
                     .durable_vessels(durable.including_replicas::<Vessel>("flotilla"))
+                    .durable_hosts(durable.including_replicas::<flotilla_resources::Host>("flotilla"))
                     .durable_checkouts(durable.including_replicas::<Checkout>("flotilla"))
                     .durable_clones(durable.using::<CloneResource>("flotilla"))
                     .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
@@ -7550,6 +7742,7 @@ mod tests {
         let durable_regards = Arc::new(ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_hosts = ScriptedSource::<flotilla_resources::Host>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_clones = ScriptedSource::<CloneResource>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_sessions = Arc::new(ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]));
@@ -7571,6 +7764,7 @@ mod tests {
                 .durable_repositories(durable_repositories.as_ref())
                 .durable_regards(durable_regards.as_ref())
                 .durable_vessels(&durable_vessels)
+                .durable_hosts(&durable_hosts)
                 .durable_checkouts(&durable_checkouts)
                 .durable_clones(&durable_clones)
                 .observed_convoys(observed_convoys.as_ref())
@@ -7927,6 +8121,7 @@ mod tests {
             .durable_repositories(d.including_replicas::<Repository>("flotilla"))
             .durable_regards(d.using::<Regard>("flotilla"))
             .durable_vessels(d.including_replicas::<Vessel>("flotilla"))
+            .durable_hosts(d.including_replicas::<flotilla_resources::Host>("flotilla"))
             .durable_checkouts(d.including_replicas::<Checkout>("flotilla"))
             .durable_clones(d.using::<CloneResource>("flotilla"))
             .observed_convoys(observed.using::<Convoy>("flotilla"))

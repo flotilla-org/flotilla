@@ -414,10 +414,7 @@ pub async fn placement_actuator_host_ref(
     target: &PlacementTargetHost,
 ) -> Result<CanonicalHostId, String> {
     let host = authoritative_placement_host(backend, namespace, target, "actuator routing").await?;
-    match host.spec.connection {
-        flotilla_resources::HostConnection::AgentlessSsh { owning_daemon, .. } => Ok(CanonicalHostId::resolved(owning_daemon)),
-        flotilla_resources::HostConnection::Daemon => Ok(target.reference.clone()),
-    }
+    Ok(flotilla_resources::acting_daemon_ref(&host))
 }
 
 /// Resolve one remote independently; callers choose which remote's forge to carry.

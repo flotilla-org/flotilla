@@ -132,6 +132,16 @@ impl HostConnection {
     }
 }
 
+/// The host whose daemon acts on work placed on `host`: an agentless SSH
+/// host's declared owning daemon, otherwise the host itself. Admission routing
+/// and the vessel projection share this mapping (#4021).
+pub fn acting_daemon_ref(host: &crate::ResourceObject<Host>) -> CanonicalHostId {
+    match &host.spec.connection {
+        HostConnection::AgentlessSsh { owning_daemon, .. } => CanonicalHostId::resolved(owning_daemon.clone()),
+        HostConnection::Daemon => CanonicalHostId::resolved(host.metadata.name.clone()),
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct HostStatus {
     /// Last descriptive observation from the owning daemon, useful even offline.

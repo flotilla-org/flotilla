@@ -372,6 +372,48 @@ fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
     assert!(withdrawal.unset.contains(&KEY_PRIMARY_ACTION_RECIPE.to_owned()));
 }
 
+// #4021: a vessel on an agentless SSH host opens through its acting daemon's
+// recipe. The machine it runs on is information, never a direct path (#3995).
+#[test]
+fn vessel_on_another_machine_attaches_through_its_acting_daemon_only() {
+    use crate::keys::{KEY_READINESS_ATTACH_AVAILABLE, KEY_VESSEL_CARRIED_BY, KEY_VESSEL_HOST};
+    let reference = convoy_ref("dev", "ssh");
+    let mut terminal = vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).materialize("terminal-ssh-coder").call();
+    terminal.host = HostName::new("udder");
+    terminal.carried_by = Some(HostName::new("b1"));
+    terminal.cleat_endpoint =
+        Some(CleatEndpoint { runtime_root: "/run/cleat".to_owned(), daemon: "b1@1".to_owned(), session: "session-7".to_owned() });
+    let convoy = ConvoyRow::builder()
+        .resource(reference)
+        .name("ssh")
+        .workflow_ref("implement")
+        .phase(ConvoyPhase::Active)
+        .vessels(vec![terminal])
+        .build();
+    let routes = BTreeMap::from([("udder".to_owned(), "udder".to_owned()), ("b1".to_owned(), "b1".to_owned())]);
+    let catalog = project_catalog(&catalog_input(&[convoy]), &mint().with_host_routes(HostName::new("kiwi"), routes));
+
+    let patches = catalog.reassert_patches();
+    for target in [entity::vessel("dev", "ssh", "coder", "udder"), entity::convoy("dev", "ssh", "kiwi")] {
+        let patch = find_entity(&patches, &target);
+        assert_eq!(text(patch, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' attach --host 'udder' 'terminal-ssh-coder'");
+        assert_eq!(patch.set[KEY_READINESS_ATTACH_AVAILABLE].value, MetadataValue::Bool(true));
+        assert!(text(patch, KEY_PRIMARY_DIRECT_REASON).contains("runs on b1"), "{target:?}");
+        for key in [
+            KEY_PRIMARY_DIRECT_TRANSPORT,
+            KEY_PRIMARY_DIRECT_HOST,
+            KEY_PRIMARY_DIRECT_RUNTIME_ROOT,
+            KEY_PRIMARY_DIRECT_DAEMON,
+            KEY_PRIMARY_DIRECT_SESSION,
+        ] {
+            assert!(!patch.set.contains_key(key), "{target:?} publishes {key}");
+        }
+    }
+    let vessel = find_entity(&patches, &entity::vessel("dev", "ssh", "coder", "udder"));
+    assert_eq!(text(vessel, KEY_VESSEL_HOST), "udder");
+    assert_eq!(text(vessel, KEY_VESSEL_CARRIED_BY), "b1");
+}
+
 #[test]
 fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
     let reference = convoy_ref("dev", "cutover");
