@@ -2412,7 +2412,15 @@ mod registered_charter_tests {
         registration["spec"]["charter"]["files"] = serde_json::json!({});
         std::fs::write(&path, serde_json::to_string(&registration).expect("encode")).expect("remove layer");
         reconciler.reconcile_once().await.expect("opt out");
-        let names = layers.list().await.expect("layers").into_iter().map(|layer| layer.metadata.name).collect::<Vec<_>>();
+        // The shipped stdlib layers are always listed; only the stored layers are under test.
+        let names = layers
+            .list()
+            .await
+            .expect("layers")
+            .into_iter()
+            .map(|layer| layer.metadata.name)
+            .filter(|name| !flotilla_resources::builtins::is_builtin("ImageLayer", name))
+            .collect::<Vec<_>>();
         assert_eq!(names, [other.resource_name()]);
     }
 

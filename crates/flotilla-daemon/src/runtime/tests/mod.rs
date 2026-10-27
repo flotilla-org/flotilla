@@ -87,15 +87,15 @@ use flotilla_resources::{
     Forge, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch, InputMeta, LifecycleAuthority,
     ManifestRoot, ModelProbeState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
-    PlacementStatus, Project, ReplicationClass, Repository, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceError,
-    ResourceList, Selector, StatusPatch, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, VesselRequirement, VesselSpec,
-    VesselStatus, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
-    CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
+    PlacementStatus, Project, Repository, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceError, ResourceList, Selector,
+    StatusPatch, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, VesselRequirement, VesselSpec, VesselStatus, WorkPhase,
+    WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ENV,
+    CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
 };
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},
-    delete_resource_kind, home_bound_authorship_collisions, watch_resource_kind, watch_resource_kind_including_replicas, ResourceBackend,
+    delete_resource_kind, watch_resource_kind, watch_resource_kind_including_replicas, ResourceBackend,
 };
 use flotilla_terminal::{
     ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession as ProviderTerminalSession, TerminalSessionLiveness, TerminalSessionTag,

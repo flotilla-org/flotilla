@@ -65,7 +65,9 @@ fn shared(name: &str, tier: ImageLayerTier, provides: &[&str]) -> ImageLayerSpec
         .name(name.into())
         .version("1.0".into())
         .tier(tier)
-        .source(ImageLayerSource::Stdlib)
+        // Installation layers: the shipped stdlib is always in the catalogue (#3824 layer 2a), and
+        // an installation layer of a stdlib name takes its place.
+        .source(ImageLayerSource::Installation)
         .maybe_from((tier == ImageLayerTier::Base).then(|| format!("ubuntu@sha256:{}", "1".repeat(64))))
         .fragment("FROM ${BASE}\nRUN true\n".into())
         .probe(format!("probe {name}"))
@@ -120,7 +122,7 @@ async fn fixture() -> (ResourceBackend, Arc<Branches>) {
     backend.using::<Project>(NS).create(&InputMeta::builder().name(PROJECT.into()).build(), &project).await.expect("project");
 
     for layer in [
-        shared("base", ImageLayerTier::Base, &[]),
+        shared("base-ubuntu-24.04", ImageLayerTier::Base, &[]),
         shared("rust", ImageLayerTier::Shared, &["toolchain:rust"]),
         shared("harness-codex", ImageLayerTier::AgentRuntime, &["harness:codex"]),
         shared("crew-utilities", ImageLayerTier::AgentRuntime, &["crew:utilities"]),
@@ -205,11 +207,11 @@ async fn a_branch_layer_change_builds_a_new_identity() {
     assert_eq!(
         table,
         [
-            ("base", "stdlib", "1.0"),
-            ("rust", "stdlib", "1.0"),
+            ("base-ubuntu-24.04", "installation", "1.0"),
+            ("rust", "installation", "1.0"),
             ("app-native", "project", "1.1"),
-            ("crew-utilities", "stdlib", "1.0"),
-            ("harness-codex", "stdlib", "1.0")
+            ("crew-utilities", "installation", "1.0"),
+            ("harness-codex", "installation", "1.0")
         ]
     );
     assert!(built.layers.iter().all(|layer| layer.probe == ImageProbeReport::Passed));
@@ -252,7 +254,7 @@ async fn a_recipe_failure_is_reported_per_layer_and_reused_on_recheck() {
     assert_eq!(
         probes,
         [
-            ("base", ImageProbeReport::Passed),
+            ("base-ubuntu-24.04", ImageProbeReport::Passed),
             ("rust", ImageProbeReport::Passed),
             ("app-native", ImageProbeReport::Failed { reason: "app: not found".into() }),
             ("crew-utilities", ImageProbeReport::NotRun),
@@ -273,8 +275,8 @@ async fn a_recipe_failure_is_reported_per_layer_and_reused_on_recheck() {
 #[tokio::test]
 async fn refusals_create_no_build() {
     let (backend, branches) = fixture().await;
-    for name in ["zig-a", "zig-b"] {
-        apply_layer(&backend, &shared(name, ImageLayerTier::Shared, &["toolchain:zig"]), BTreeMap::new()).await;
+    for name in ["dup-a", "dup-b"] {
+        apply_layer(&backend, &shared(name, ImageLayerTier::Shared, &["toolchain:dup"]), BTreeMap::new()).await;
     }
     let mut invalid = project_layer_files("1.3", "RUN true");
     invalid.insert("Dockerfile.fragment".into(), b"FROM ubuntu\n".to_vec());
@@ -283,9 +285,9 @@ async fn refusals_create_no_build() {
     let cases: [(ImageCheckRequest, &[&str], &str); 5] = [
         (ImageCheckRequest { needs: vec!["toolchain:nope".into()], ..request("main") }, &[], "unresolvable image need `toolchain:nope`"),
         (
-            ImageCheckRequest { needs: vec!["toolchain:zig".into()], ..request("main") },
-            &["zig-a", "zig-b"],
-            "duplicate providers for `toolchain:zig`: zig-a, zig-b",
+            ImageCheckRequest { needs: vec!["toolchain:dup".into()], ..request("main") },
+            &["dup-a", "dup-b"],
+            "duplicate providers for `toolchain:dup`: dup-a, dup-b",
         ),
         (ImageCheckRequest { needs: vec!["hardware:gpu".into()], ..request("main") }, &[], "is a host need, not an image need"),
         (request("invalid"), &[".flotilla/image/"], "FROM"),

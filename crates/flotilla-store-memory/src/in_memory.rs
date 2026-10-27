@@ -1601,7 +1601,7 @@ impl Store for InMemoryBackend {
     async fn query_raw(&self, kind: ResourceKind, namespace: &str, query: &crate::StoreQuery) -> Result<crate::QueryResult, ResourceError> {
         let (items, query, position) = self.query_rows::<SerializedRows>(kind, namespace, query).await?;
         let items = items.into_iter().map(|(object, provenance)| ReadResourceObject { object, provenance }).collect();
-        let mut items = crate::merge_query_definitions(&query, items, &self.local_root())?;
+        let mut items = crate::merge_query_definitions(&kind, namespace, &query, items, &self.local_root())?;
         crate::sort_query_items(&mut items);
         Ok(crate::QueryResult { local_root: Some(self.local_root()), items, position })
     }

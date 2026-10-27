@@ -10,7 +10,9 @@ fn layer(name: &str, tier: ImageLayerTier, provides: &[&str]) -> ImageLayerSpec 
         .name(name.into())
         .version("1.0.0".into())
         .tier(tier)
-        .source(ImageLayerSource::Stdlib)
+        // Not stdlib: the shipped stdlib layers are built in (#3824 layer 2a); an installation
+        // layer of a stdlib name takes its place.
+        .source(ImageLayerSource::Installation)
         .maybe_from((tier == ImageLayerTier::Base).then(|| format!("ubuntu@sha256:{}", "a".repeat(64))))
         .fragment(format!("FROM ${{BASE}}\nRUN echo {name}\n"))
         .provides(provides.iter().map(|value| (*value).into()).collect())
@@ -101,7 +103,7 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
         .await
         .expect("kind");
     let catalogue = [
-        layer("base-ubuntu", ImageLayerTier::Base, &["os:ubuntu"]),
+        layer("base-ubuntu-24.04", ImageLayerTier::Base, &["os:ubuntu"]),
         layer("display-x11", ImageLayerTier::Shared, &["display:x11"]),
         layer("crew-utilities", ImageLayerTier::AgentRuntime, &["crew:utilities"]),
         layer("harness-codex", ImageLayerTier::AgentRuntime, &["harness:codex", "harness:codex@0.160.0"]),
@@ -213,7 +215,7 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     assert_eq!(builds[0].metadata.name, image_build_ref);
     assert_eq!(
         build.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(),
-        ["base-ubuntu", "display-x11", "crew-utilities", "harness-codex"]
+        ["base-ubuntu-24.04", "display-x11", "crew-utilities", "harness-codex"]
     );
     assert_eq!((build.host_ref.as_str(), &build.delivery), (host_id.as_str(), &ImageDelivery::Local));
 

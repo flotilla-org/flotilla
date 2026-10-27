@@ -475,7 +475,13 @@ pub fn declared_field_value<'a>(value: &'a Value, path: &str) -> Option<&'a Valu
 
 /// Finish a declared query once, preserving causal merge and deletion semantics
 /// for named definition inventories on embedded stores and resource HTTP alike.
+///
+/// Built-ins (#3824 layer 2a) join the merged inventory: every one when the query selects no
+/// names, the named ones when it selects names, and none when a semijoin selects (it reads only
+/// stored rows).
 pub fn merge_query_definitions(
+    kind: &crate::ResourceKind,
+    namespace: &str,
     query: &StoreQuery,
     items: Vec<crate::ReadResourceObject<crate::SerializedResource>>,
     root: &flotilla_protocol::NodeId,
@@ -483,7 +489,20 @@ pub fn merge_query_definitions(
     if !query.merged_definitions {
         return Ok(items);
     }
-    Ok(crate::definition::merge_cached_definitions(items, root)?
+    let merged = crate::definition::merge_cached_definitions(items, root)?;
+    let names = if !query.field_matches_query.is_empty() {
+        Some(BTreeSet::new())
+    } else {
+        let mut selected: Option<BTreeSet<String>> = None;
+        if let Some(name) = query.fields.get("metadata.name") {
+            selected.get_or_insert_with(BTreeSet::new).insert(name.clone());
+        }
+        if let Some(names) = query.field_values.get("metadata.name") {
+            selected.get_or_insert_with(BTreeSet::new).extend(names.iter().cloned());
+        }
+        selected
+    };
+    Ok(crate::definition::overlay_builtins(kind.paths.kind, namespace, merged, names.as_ref())?
         .into_iter()
         .map(|object| crate::ReadResourceObject { object, provenance: crate::ResourceProvenance::Local })
         .collect())

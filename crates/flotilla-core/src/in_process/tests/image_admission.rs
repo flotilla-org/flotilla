@@ -29,7 +29,7 @@ fn layer(name: &str, tier: ImageLayerTier, provides: &[&str], requires: &[&str])
         .name(name.into())
         .version("1.0.0".into())
         .tier(tier)
-        .source(if tier == ImageLayerTier::Project { ImageLayerSource::Project } else { ImageLayerSource::Stdlib })
+        .source(if tier == ImageLayerTier::Project { ImageLayerSource::Project } else { ImageLayerSource::Installation })
         .maybe_project((tier == ImageLayerTier::Project).then(|| "flotilla".to_string()))
         .maybe_from((tier == ImageLayerTier::Base).then(|| format!("ubuntu@sha256:{}", "a".repeat(64))))
         .fragment(format!("FROM ${{BASE}}\nRUN echo {name}\n"))
@@ -39,9 +39,11 @@ fn layer(name: &str, tier: ImageLayerTier, provides: &[&str], requires: &[&str])
         .build()
 }
 
+/// Installation layers named like the shipped stdlib layers, so each shadows its always-visible
+/// stdlib namesake and the catalogue keeps one base.
 fn catalogue() -> Vec<ImageLayerSpec> {
     vec![
-        layer("base-ubuntu", ImageLayerTier::Base, &["os:ubuntu"], &[]),
+        layer("base-ubuntu-24.04", ImageLayerTier::Base, &["os:ubuntu"], &[]),
         layer("rust", ImageLayerTier::Shared, &["toolchain:rust"], &[]),
         layer("zig", ImageLayerTier::Shared, &["toolchain:zig"], &[]),
         layer("display-x11", ImageLayerTier::Shared, &["display:x11"], &[]),
@@ -190,7 +192,7 @@ async fn project_selection_and_harness_derivation_freeze_one_build_per_identity(
     let (image, pins) = admit(&fixture, &workflow).await.expect("admit");
     assert!(pins.is_empty(), "one vessel needs no per-vessel pins");
     let build = build_for(&fixture, &image).await;
-    assert_eq!(layer_names(&build), ["base-ubuntu", "rust", "flotilla-native", "crew-utilities", "harness-codex"]);
+    assert_eq!(layer_names(&build), ["base-ubuntu-24.04", "rust", "flotilla-native", "crew-utilities", "harness-codex"]);
     let spec = build.spec.current().expect("current");
     assert_eq!(spec.delivery, ImageDelivery::Local);
     assert_eq!(spec.host_ref, "host-a");
@@ -215,14 +217,14 @@ async fn installation_defaults_apply_when_the_project_declares_nothing() {
         .expect("defaults");
     let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("work", vec![agent("coder", "claude")], &[])]).build();
     let (image, _) = admit(&fixture, &workflow).await.expect("admit");
-    assert_eq!(layer_names(&build_for(&fixture, &image).await), ["base-ubuntu", "zig", "crew-utilities", "harness-claude"]);
+    assert_eq!(layer_names(&build_for(&fixture, &image).await), ["base-ubuntu-24.04", "zig", "crew-utilities", "harness-claude"]);
 
     let declared = fixture.backend.using::<Project>(NS).get("flotilla").await.expect("project");
     let mut spec = declared.spec.clone();
     spec.image = Some(ImageSelection { base: None, layers: vec!["rust".into()] });
     fixture.backend.using::<Project>(NS).update(&test_meta("flotilla"), &declared.metadata.resource_version, &spec).await.expect("declare");
     let (image, _) = admit(&fixture, &workflow).await.expect("admit with project image");
-    assert_eq!(layer_names(&build_for(&fixture, &image).await), ["base-ubuntu", "rust", "crew-utilities", "harness-claude"]);
+    assert_eq!(layer_names(&build_for(&fixture, &image).await), ["base-ubuntu-24.04", "rust", "crew-utilities", "harness-claude"]);
 }
 
 // Leg needs add shared layers by provides lookup to that vessel only; vessels
@@ -238,8 +240,11 @@ async fn leg_needs_compose_per_vessel_images() {
         .build();
     let (_, pins) = admit(&fixture, &workflow).await.expect("admit");
     assert_eq!(pins.len(), 2, "different images pin each vessel");
-    assert_eq!(layer_names(&build_for(&fixture, &pins["demo"]).await), ["base-ubuntu", "display-x11", "crew-utilities", "harness-codex"]);
-    assert_eq!(layer_names(&build_for(&fixture, &pins["review"]).await), ["base-ubuntu", "crew-utilities", "harness-codex"]);
+    assert_eq!(
+        layer_names(&build_for(&fixture, &pins["demo"]).await),
+        ["base-ubuntu-24.04", "display-x11", "crew-utilities", "harness-codex"]
+    );
+    assert_eq!(layer_names(&build_for(&fixture, &pins["review"]).await), ["base-ubuntu-24.04", "crew-utilities", "harness-codex"]);
 }
 
 // Two providers of one need, or none, refuse admission naming the need, and

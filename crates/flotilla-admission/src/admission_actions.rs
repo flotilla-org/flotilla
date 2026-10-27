@@ -456,15 +456,13 @@ impl AdmissionActions<'_> {
                 description: command.description().to_string(),
             });
             let namespace = self.provisioning_namespace().await;
-            let templates = self.resource_backend.clone().using::<WorkflowTemplate>(&namespace);
+            // Through the definitions resolver: it creates or updates, and refuses a built-in's
+            // name (#3824 layer 2a) rather than storing a copy the built-in would shadow.
+            let templates = self.resource_backend.definitions::<WorkflowTemplate>(&namespace);
             let result = match parse_and_validate_workflow_template_yaml(spec_yaml) {
                 Ok(spec) => {
                     let meta = InputMeta::builder().name(name.clone()).build();
-                    let outcome = match templates.get(name).await {
-                        Ok(existing) => templates.update(&meta, &existing.metadata.resource_version, &spec).await.map(|_| ()),
-                        Err(ResourceError::NotFound { .. }) => templates.create(&meta, &spec).await.map(|_| ()),
-                        Err(err) => Err(err),
-                    };
+                    let outcome = templates.apply(&meta, &spec).await.map(|_| ());
                     match outcome {
                         Ok(()) => CommandValue::WorkflowTemplateApplied { name: name.clone() },
                         Err(err) => CommandValue::Error { message: err.to_string() },

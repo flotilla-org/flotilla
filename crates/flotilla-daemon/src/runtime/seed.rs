@@ -12,7 +12,7 @@ use flotilla_resources::{
     canonical_host_id, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec, DockerCheckoutStrategy,
     DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, FulfilmentKind, FulfilmentKindSpec, Host, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, InputMeta, PlacementPolicy, PlacementPolicySpec,
-    Repository, ResourceError, ResourceObject, WorkflowTemplate, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
+    Repository, ResourceError, ResourceObject, PLACEMENT_SNAPSHOT_KIND,
 };
 use flotilla_store::ResourceBackend;
 use tracing::warn;
@@ -33,66 +33,6 @@ pub(super) async fn register_startup_resources(
         .map_err(|error| format!("ensure_host_direct_environment_exists: {error}"))?;
     discover_local_clones(daemon, &backend, namespace, profile).await.map_err(|error| format!("discover_local_clones: {error}"))?;
     ensure_default_policies(&backend, namespace, profile).await.map_err(|error| format!("ensure_default_policies: {error}"))?;
-    reconcile_builtin_workflow_templates(&backend, namespace)
-        .await
-        .map_err(|error| format!("reconcile_builtin_workflow_templates: {error}"))?;
-    Ok(())
-}
-
-pub(super) fn mark_builtin_managed(mut meta: InputMeta) -> InputMeta {
-    meta.labels.insert(MANAGED_BY_LABEL.to_string(), BUILTIN_MANAGED_BY_VALUE.to_string());
-    meta
-}
-
-/// Reconciles code-owned manifests as the builtin special case of the ruled
-/// manifest loop in https://github.com/flotilla-org/flotilla/issues/1192.
-pub(super) async fn reconcile_builtin_workflow_templates(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
-    let templates = backend.clone().definitions::<WorkflowTemplate>(namespace);
-    let builtins = flotilla_resources::builtin_workflow_templates();
-    // Ownership follows the current code-owned set. Tombstone retired definitions
-    // through the merged resolver so replicas cannot resurrect stale builtins.
-    for existing in templates.list().await.map_err(|err| format!("list builtin workflow templates: {err}"))? {
-        if existing.metadata.labels.get(MANAGED_BY_LABEL).is_some_and(|value| value == BUILTIN_MANAGED_BY_VALUE)
-            && !builtins.iter().any(|(name, _)| *name == existing.metadata.name)
-        {
-            templates
-                .delete(&existing.metadata.name)
-                .await
-                .map_err(|err| format!("retire builtin workflow template {}: {err}", existing.metadata.name))?;
-            warn!(template = %existing.metadata.name, "retired orphaned builtin workflow template");
-        }
-    }
-    for (name, spec) in builtins {
-        match templates.get(name).await {
-            Ok(existing) => {
-                let spec_diverged = existing.spec != spec;
-                let managed_by_builtin =
-                    existing.metadata.labels.get(MANAGED_BY_LABEL).is_some_and(|value| value == BUILTIN_MANAGED_BY_VALUE);
-                if !spec_diverged && managed_by_builtin {
-                    continue;
-                }
-                if !spec_diverged {
-                    templates
-                        .apply(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &spec)
-                        .await
-                        .map_err(|err| format!("reconcile builtin workflow template {name}: {err}"))?;
-                    continue;
-                }
-                templates
-                    .apply(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &spec)
-                    .await
-                    .map_err(|err| format!("reconcile builtin workflow template {name}: {err}"))?;
-                warn!(template = %name, "stored spec diverged from code builtin; overwriting");
-            }
-            Err(ResourceError::NotFound { .. }) => {
-                templates
-                    .apply(&mark_builtin_managed(empty_meta(name)), &spec)
-                    .await
-                    .map_err(|err| format!("seed builtin workflow template {name}: {err}"))?;
-            }
-            Err(err) => return Err(format!("check workflow template {name}: {err}")),
-        }
-    }
     Ok(())
 }
 
@@ -504,5 +444,3 @@ pub(super) fn merged_labels(existing: &BTreeMap<String, String>, expected: &BTre
     }
     merged
 }
-
-pub(super) const BUILTIN_MANAGED_BY_VALUE: &str = "builtin";

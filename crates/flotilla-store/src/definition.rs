@@ -45,6 +45,14 @@ impl<T: Resource> DefinitionResolver<T> {
 
     pub async fn get(&self, name: &str) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
+        // Decode the built-ins only for a built-in's name.
+        if flotilla_resources::builtins::is_builtin(T::API_PATHS.kind, name) {
+            if let Some(builtin) =
+                builtin_objects::<T>(T::API_PATHS.kind, &self.namespace)?.into_iter().find(|object| object.metadata.name == name)
+            {
+                return Ok(builtin);
+            }
+        }
         if self.backend.serves_read_views() {
             return self.backend.using::<T>(&self.namespace).get(name).await;
         }
@@ -67,7 +75,8 @@ impl<T: Resource> DefinitionResolver<T> {
             crate::StoreQuery { all_sources_for_matches: true, include_replicas: true, suppress_self_origin: false, ..query.clone() };
         let result = self.backend.store().query_decoded(crate::ResourceKind::of::<T>(), &self.namespace, &hydration).await?;
         let root = result.local_root.clone().ok_or_else(|| ResourceError::invalid("definition query has no authority root"))?;
-        let merged = merge_cached_definitions(result.into_typed::<T>()?, &root)?;
+        let merged =
+            overlay_builtins(T::API_PATHS.kind, &self.namespace, merge_cached_definitions(result.into_typed::<T>()?, &root)?, None)?;
         let mut index = crate::QueryIndex::default();
         for object in &merged {
             index.update(
@@ -82,7 +91,8 @@ impl<T: Resource> DefinitionResolver<T> {
     pub async fn list(&self) -> Result<Vec<ResourceObject<T>>, ResourceError> {
         ensure_definitions::<T>()?;
         if self.backend.serves_read_views() {
-            return self.backend.using::<T>(&self.namespace).list().await.map(|list| list.items);
+            let listed = self.backend.using::<T>(&self.namespace).list().await?.items;
+            return overlay_builtins(T::API_PATHS.kind, &self.namespace, listed, None);
         }
         let mut by_name = BTreeMap::<String, Vec<DefinitionSource<T>>>::new();
         for source in self.sources().await? {
@@ -95,7 +105,7 @@ impl<T: Resource> DefinitionResolver<T> {
                 merged.push(object);
             }
         }
-        Ok(merged)
+        overlay_builtins(T::API_PATHS.kind, &self.namespace, merged, None)
     }
 
     /// Read a named inventory once while merging every author for each name.
@@ -109,6 +119,9 @@ impl<T: Resource> DefinitionResolver<T> {
 
     /// Select definition names through declared indexes, then merge every
     /// author of each selected name. Predicates may need checking after merge.
+    ///
+    /// The selection runs over stored rows, so it never selects a built-in definition
+    /// (#3824 layer 2a); a caller that wants the built-ins too reads them by name or by `list`.
     pub async fn list_selected(&self, mut selection: crate::StoreQuery) -> Result<Vec<ResourceObject<T>>, ResourceError> {
         ensure_definitions::<T>()?;
         selection.include_replicas = true;
@@ -127,6 +140,7 @@ impl<T: Resource> DefinitionResolver<T> {
     }
 
     pub async fn create_as(&self, writer: &WriterIdentity, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
+        refuse_builtin::<T>(&meta.name)?;
         match self.get(&meta.name).await {
             Ok(_) => Err(ResourceError::conflict(&meta.name, "resource already exists")),
             Err(ResourceError::NotFound { .. }) => self.apply_as(writer, meta, spec).await,
@@ -140,6 +154,7 @@ impl<T: Resource> DefinitionResolver<T> {
 
     pub async fn apply_as(&self, writer: &WriterIdentity, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
+        refuse_builtin::<T>(&meta.name)?;
         let _hierarchy_admission = self.backend.hierarchy_admission(T::API_PATHS.kind).await;
         T::validate_spec(meta, spec)?;
         if crate::project_hierarchy::is_hierarchy_kind(T::API_PATHS.kind) {
@@ -247,6 +262,7 @@ impl<T: Resource> DefinitionResolver<T> {
 
     pub async fn delete(&self, name: &str) -> Result<(), ResourceError> {
         ensure_definitions::<T>()?;
+        refuse_builtin::<T>(name)?;
         let _hierarchy_admission = self.backend.hierarchy_admission(T::API_PATHS.kind).await;
         if T::API_PATHS.kind == "Project" {
             let hierarchy = crate::ProjectHierarchy::load_for_inspection(&self.backend, &self.namespace).await?;
@@ -300,6 +316,7 @@ impl<T: Resource> DefinitionResolver<T> {
     /// Update definition metadata without replaying or re-authoring its spec.
     pub async fn update_metadata(&self, meta: &InputMeta) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
+        refuse_builtin::<T>(&meta.name)?;
         let _hierarchy_admission = self.backend.hierarchy_admission(T::API_PATHS.kind).await;
         // The backend writes the read spec along with metadata. Serialize this
         // read/write pair with reparenting to avoid restoring a stale parent.
@@ -382,6 +399,66 @@ pub(crate) fn merge_cached_definitions<T: Resource>(
         .map(|sources| merge_sources(&sources))
         .collect::<Result<Vec<_>, _>>()
         .map(|objects| objects.into_iter().filter(definition_is_visible).collect())
+}
+
+/// The built-in definitions of `kind` (#3824 layer 2a) as objects of `T` in `namespace`: never
+/// stored, so their version is fixed and they carry no merge metadata.
+pub(crate) fn builtin_objects<T: Resource>(kind: &str, namespace: &str) -> Result<Vec<ResourceObject<T>>, ResourceError> {
+    flotilla_resources::builtins::builtin_definitions(kind)
+        .map_err(ResourceError::invalid)?
+        .iter()
+        .map(|builtin| {
+            let spec = serde_json::from_value::<T::Spec>(builtin.spec.clone())
+                .map_err(|error| ResourceError::decode(format!("built-in {kind} `{}`: {error}", builtin.name)))?;
+            Ok(ResourceObject {
+                metadata: crate::ObjectMeta {
+                    name: builtin.name.clone(),
+                    namespace: namespace.to_owned(),
+                    resource_version: BUILTIN_VERSION.to_owned(),
+                    labels: builtin.labels.clone(),
+                    annotations: BTreeMap::new(),
+                    owner_references: Vec::new(),
+                    finalizers: Vec::new(),
+                    deletion_timestamp: None,
+                    creation_timestamp: DateTime::<Utc>::UNIX_EPOCH,
+                    merge: None,
+                },
+                spec,
+                status: None,
+            })
+        })
+        .collect()
+}
+
+/// The version every built-in reads at.
+pub const BUILTIN_VERSION: &str = "builtin";
+
+/// `merged` with `kind`'s built-ins in place of any stored definition of their names (a copy an
+/// earlier generation seeded), restricted to `names` when the read selected names.
+pub(crate) fn overlay_builtins<T: Resource>(
+    kind: &str,
+    namespace: &str,
+    mut merged: Vec<ResourceObject<T>>,
+    names: Option<&std::collections::BTreeSet<String>>,
+) -> Result<Vec<ResourceObject<T>>, ResourceError> {
+    let builtins = builtin_objects::<T>(kind, namespace)?;
+    if builtins.is_empty() {
+        return Ok(merged);
+    }
+    merged.retain(|object| !builtins.iter().any(|builtin| builtin.metadata.name == object.metadata.name));
+    merged.extend(builtins.into_iter().filter(|builtin| names.is_none_or(|names| names.contains(&builtin.metadata.name))));
+    Ok(merged)
+}
+
+/// Refuses a write of a built-in's name: built-ins come from the code (#3824 layer 2a).
+pub(crate) fn refuse_builtin<T: Resource>(name: &str) -> Result<(), ResourceError> {
+    if flotilla_resources::builtins::is_builtin(T::API_PATHS.kind, name) {
+        return Err(ResourceError::invalid(format!(
+            "{} `{name}` is built in and read-only; declare a variant under a new name",
+            T::API_PATHS.kind
+        )));
+    }
+    Ok(())
 }
 
 fn definition_is_visible<T: Resource>(object: &ResourceObject<T>) -> bool {

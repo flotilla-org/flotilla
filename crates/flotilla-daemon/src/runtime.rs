@@ -269,17 +269,6 @@ impl DaemonRuntime {
         .await
         .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
         retry_phase("register_startup_resources", || register_startup_resources(&daemon, &options.namespace, &profile)).await?;
-        // Stdlib image layers are this release's data (ADR 0062). A failure
-        // keeps the previous definitions and must not stop the daemon.
-        match retry_phase("apply_stdlib_image_layers", || async {
-            crate::stdlib_image_layers::apply_release_stdlib(&daemon.resource_backend(), &options.namespace).await
-        })
-        .await
-        {
-            Ok(application) if application.applied.is_empty() && application.deleted.is_empty() => {}
-            Ok(application) => info!(applied = ?application.applied, deleted = ?application.deleted, "applied stdlib image layers"),
-            Err(error) => error!(%error, "stdlib image layers were not applied"),
-        }
         let registered_image_caches = local_registry
             .environment_providers
             .iter()
