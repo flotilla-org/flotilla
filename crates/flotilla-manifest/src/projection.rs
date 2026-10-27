@@ -34,11 +34,11 @@ use crate::{
         KEY_PRIMARY_DIRECT_RUNTIME_ROOT, KEY_PRIMARY_DIRECT_SESSION, KEY_PRIMARY_DIRECT_TRANSPORT, KEY_PROJECT_NAME,
         KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE,
         KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_ALTERNATIVES,
-        KEY_VESSEL_BUILD_JOBS, KEY_VESSEL_COST_CLASS, KEY_VESSEL_CPUS, KEY_VESSEL_ENV, KEY_VESSEL_HOST, KEY_VESSEL_HOST_NAME,
-        KEY_VESSEL_HOST_REF, KEY_VESSEL_IMAGE_DIGEST, KEY_VESSEL_IMAGE_REF, KEY_VESSEL_IMAGE_SHORT_DIGEST, KEY_VESSEL_KIND,
-        KEY_VESSEL_LINKER_THREADS, KEY_VESSEL_MINIMAL, KEY_VESSEL_MINIMAL_ALTERNATIVES, KEY_VESSEL_NAME, KEY_VESSEL_POLICY,
-        KEY_VESSEL_STANCE, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE,
-        SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
+        KEY_VESSEL_BUILD_JOBS, KEY_VESSEL_CARRIED_BY, KEY_VESSEL_COST_CLASS, KEY_VESSEL_CPUS, KEY_VESSEL_ENV, KEY_VESSEL_HOST,
+        KEY_VESSEL_HOST_NAME, KEY_VESSEL_HOST_REF, KEY_VESSEL_IMAGE_DIGEST, KEY_VESSEL_IMAGE_REF, KEY_VESSEL_IMAGE_SHORT_DIGEST,
+        KEY_VESSEL_KIND, KEY_VESSEL_LINKER_THREADS, KEY_VESSEL_MINIMAL, KEY_VESSEL_MINIMAL_ALTERNATIVES, KEY_VESSEL_NAME,
+        KEY_VESSEL_POLICY, KEY_VESSEL_STANCE, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT,
+        SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
     legacy_recipe,
     recipe::{DirectTransport, Recipe, RecipeMint},
@@ -589,7 +589,7 @@ fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys:
         Some((target, recipe)) if role.hold.is_none() => {
             catalog.assert_entity(entity.clone(), action_facts(&recipe, "workspace"), None);
             if let Some(vessel) = live.and_then(|convoy| (convoy.vessels.len() == 1).then(|| &convoy.vessels[0])) {
-                facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), vessel.environment_kind, &vessel.host, mint));
+                facts.extend(vessel_direct_facts(vessel, mint));
             }
             facts.push((KEY_WORKSPACE_PRIMARY_STATE, MetadataValue::text("ready")));
             facts.push((KEY_WORKSPACE_PRIMARY_TARGET, MetadataValue::text(target.action_target())));
@@ -772,7 +772,7 @@ fn project_awareness_entry(
             }
             _ => None,
         } {
-            facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), vessel.environment_kind, &vessel.host, mint));
+            facts.extend(vessel_direct_facts(vessel, mint));
         }
     }
     catalog.assert_entity(entity, facts, None);
@@ -1059,7 +1059,7 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     if let [vessel] = convoy.vessels.as_slice() {
         if let Some(recipe) = vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)) {
             catalog.assert_entity(convoy_entity.clone(), action_facts(&recipe, "workspace"), ordinal);
-            facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), vessel.environment_kind, &vessel.host, mint));
+            facts.extend(vessel_direct_facts(vessel, mint));
         }
     }
     if let Some(decision) = &convoy.placement_decision {
@@ -1100,6 +1100,9 @@ fn project_vessel(
         (KEY_VESSEL_HOST, MetadataValue::text(vessel.host.to_string())),
         (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
     ]);
+    if let Some(machine) = &vessel.carried_by {
+        facts.push((KEY_VESSEL_CARRIED_BY, MetadataValue::text(machine.to_string())));
+    }
     if let Some(decision) = &vessel.placement_decision {
         facts.extend(placement_facts(decision, false));
     }
@@ -1154,7 +1157,7 @@ fn project_vessel(
     }
     if let Some(recipe) = vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)) {
         catalog.assert_entity(entity.clone(), action_facts(&recipe, "workspace"), ordinal);
-        facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), vessel.environment_kind, &vessel.host, mint));
+        facts.extend(vessel_direct_facts(vessel, mint));
     }
     catalog.assert_entity(entity, facts, ordinal);
 }
@@ -1280,6 +1283,22 @@ fn action_facts(recipe: &Recipe, vehicle: &'static str) -> Vec<(String, Metadata
         );
     }
     facts
+}
+
+/// A vessel's direct endpoint, or why it has none. A vessel that runs on a
+/// machine other than its acting daemon publishes no direct endpoint until
+/// Tender-published vessel endpoints (#3995); viewers open it by the recipe.
+fn vessel_direct_facts(vessel: &VesselRow, mint: &dyn RecipeMint) -> Vec<(&'static str, MetadataValue)> {
+    if let Some(machine) = vessel.carried_by.as_ref().filter(|machine| **machine != vessel.host) {
+        return vec![(
+            KEY_PRIMARY_DIRECT_REASON,
+            MetadataValue::text(format!(
+                "vessel runs on {machine}, not on its acting daemon {}; no direct endpoint across hosts yet (#3995)",
+                vessel.host
+            )),
+        )];
+    }
+    direct_facts(vessel.cleat_endpoint.as_ref(), vessel.environment_kind, &vessel.host, mint)
 }
 
 fn direct_facts(

@@ -1071,7 +1071,7 @@ static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 7] = [
         label: "HOST",
         width: WidthHint::Flexible { minimum: 8, weight: 1 },
         alignment: Alignment::Left,
-        extract: |row| CellValue::plain(row.vessel.host.as_ref().map(ToString::to_string).unwrap_or_default()),
+        extract: |row| CellValue::plain(vessel_host_text(row)),
     },
     ColumnSpec {
         id: "message",
@@ -1430,6 +1430,15 @@ fn vessel_id(row: &VesselProjection) -> RowId {
     RowId::new(format!("{}/{}/{}@{host}", row.namespace, row.convoy, row.vessel.name))
 }
 
+/// The machine a vessel runs on, naming its acting daemon when that differs (#4021).
+fn vessel_host_text(row: &VesselProjection) -> String {
+    match (&row.vessel.carried_by, &row.vessel.host) {
+        (Some(machine), Some(host)) if machine != host => format!("{machine} via {host}"),
+        (_, Some(host)) => host.to_string(),
+        (machine, None) => machine.as_ref().map(ToString::to_string).unwrap_or_default(),
+    }
+}
+
 fn vessel_drill(row: &VesselProjection) -> Option<ViewAddress> {
     Some(ViewAddress::Vessel { namespace: row.namespace.to_string(), convoy: row.convoy.to_string(), vessel: row.vessel.name.clone() })
 }
@@ -1463,6 +1472,7 @@ fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
         DetailField { label: "Phase", value: vessel_phase(row).text },
         DetailField { label: "Crew", value: vessel_crew(row).text },
         DetailField { label: "Host", value: row.vessel.host.as_ref().map(ToString::to_string).unwrap_or_default() },
+        DetailField { label: "Runs on", value: row.vessel.carried_by.as_ref().map(ToString::to_string).unwrap_or_default() },
         DetailField { label: "Image ref", value: row.vessel.image_ref.clone().unwrap_or_default() },
         DetailField { label: "Local image ID", value: row.vessel.local_image_id.clone().unwrap_or_default() },
         DetailField { label: "Registry digest", value: row.vessel.registry_digest.clone().unwrap_or_default() },
@@ -1580,6 +1590,7 @@ mod tests {
             phase,
             crew: vec![ProcessSummary { role: "coder".into(), command_preview: "codex".into() }],
             host: Some(HostName::new("kiwi")),
+            carried_by: None,
             materialize_ref: None,
             completion_target: None,
             ready_at: None,

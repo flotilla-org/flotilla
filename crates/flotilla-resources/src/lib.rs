@@ -176,8 +176,8 @@ pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use forge::{Forge, ForgeKind, ForgeSpec};
 pub use fulfilment_kind::{FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation};
 pub use host::{
-    canonical_host_id, CachedModelProbe, CredentialExpiry, FoldedHostObservations, FulfilmentFacts, FulfilmentImage, HarnessFacts, Host,
-    HostCondition, HostConnection, HostSpec, HostStatus, HostStatusPatch, ModelFact, ModelFactSource, ModelProbeState,
+    acting_daemon_ref, canonical_host_id, CachedModelProbe, CredentialExpiry, FoldedHostObservations, FulfilmentFacts, FulfilmentImage,
+    HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, HostStatusPatch, ModelFact, ModelFactSource, ModelProbeState,
     AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, AMBIENT_CLAUDE_CREDENTIAL_SCOPE, CREDENTIAL_EXPIRY_CAPABILITY,
     ENVIRONMENT_PROVIDERS_CAPABILITY, HEARTBEAT_READY_TTL_SECS, HEARTBEAT_REFRESH_SECS, HELD_CREDENTIALS_CAPABILITY,
     LOCAL_ROWS_MISSING_REASON, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PROJECTION_PARITY_CONDITION,
