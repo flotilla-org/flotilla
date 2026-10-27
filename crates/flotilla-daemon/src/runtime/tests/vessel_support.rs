@@ -93,8 +93,8 @@ impl VesselAgent for RunnerVessel {
     }
     // This process-boundary fake models a Linux amd64 host whose agent store records what
     // arrived, never reaching the network.
-    async fn platform(&self) -> Result<drydock_protocol::Platform, String> {
-        Ok(drydock_protocol::Platform::new("linux", "amd64"))
+    async fn architecture(&self) -> Result<String, String> {
+        Ok("amd64".into())
     }
     async fn fetch_artifact(&self, sha256: &str, urls: &[String], _: flotilla_resources::PinUnpack) -> Result<(), String> {
         self.record(|vessel| vessel.artifacts.push((sha256.into(), ArtifactArrival::Fetched(urls.to_vec()))));

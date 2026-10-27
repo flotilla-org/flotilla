@@ -176,8 +176,8 @@ async fn deliver_crew(
     let pinned = if place_carries_harnesses(launch.account.agentless) {
         None
     } else {
-        let platform = agent.platform().await.map_err(failed_at(HARNESS))?;
-        PinnedHarness::resolve(launch.adapter, &platform.architecture).map_err(failed_at(HARNESS))?
+        let architecture = agent.architecture().await.map_err(failed_at(HARNESS))?;
+        PinnedHarness::resolve(launch.adapter, &architecture).map_err(failed_at(HARNESS))?
     };
     if let Some(pinned) = &pinned {
         tree(&mut needs, HARNESS, pinned.sha256.clone(), HARNESS_PATH, PinnedHarness::sources(), Arc::new(pinned.clone()));

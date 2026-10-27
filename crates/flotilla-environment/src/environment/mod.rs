@@ -305,8 +305,9 @@ pub trait VesselAgent: Send + Sync {
     /// Make `path` a symbolic link to `target`, atomically replacing anything there
     /// but a directory.
     async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String>;
-    /// The platform the vessel's agent reports it was built for, which is the guest's.
-    async fn platform(&self) -> Result<drydock_protocol::Platform, String> {
+    /// The guest's architecture (`amd64`, `arm64`), as the vessel's agent reports the
+    /// platform it was built for.
+    async fn architecture(&self) -> Result<String, String> {
         Err("this vessel agent does not report its platform".into())
     }
     /// Make the artifact with `sha256` an entry of the agent's verified store
