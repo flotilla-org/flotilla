@@ -60,6 +60,10 @@ impl CheckoutVcsResolver for TestVcsResolver {
             ))),
         )))
     }
+
+    async fn vcs_for_env_ref(&self, _env_ref: &str, path: &Path) -> Result<Arc<dyn Vcs>, String> {
+        self.vcs_for(None, path).await
+    }
 }
 
 pub fn test_vcs_resolver(runner: Arc<dyn CommandRunner>) -> Arc<dyn CheckoutVcsResolver> {

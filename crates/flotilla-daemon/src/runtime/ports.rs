@@ -406,7 +406,7 @@ impl RoutingCheckoutRuntime {
             .state
             .daemon
             .resolve_environment_ref(env_ref)
-            .ok_or_else(|| format!("command runner unavailable for checkout environment {env_ref}"))?;
+            .ok_or_else(|| format!("checkout environment {env_ref} is unavailable on this host"))?;
         let vcs = self.state.daemon.vcs_for_checkout(&environment.id, Path::new(checkout)).await?;
         let runner = environment.runner;
         let namespace = self.state.daemon.provisioning_namespace().await;

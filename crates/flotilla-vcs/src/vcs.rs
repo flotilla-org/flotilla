@@ -239,12 +239,11 @@ pub enum RepositoryRead<'a> {
 pub trait CheckoutVcsResolver: Send + Sync {
     async fn vcs_for(&self, environment: Option<&flotilla_protocol::EnvironmentId>, path: &Path) -> Result<Arc<dyn Vcs>, String>;
 
-    /// Resolve the VCS in the environment a resource's `env_ref` names. The
-    /// default treats `env_ref` as an environment id; resolvers that map
-    /// `env_ref` differently override it, and an unknown one should be an error.
-    async fn vcs_for_env_ref(&self, env_ref: &str, path: &Path) -> Result<Arc<dyn Vcs>, String> {
-        self.vcs_for(Some(&flotilla_protocol::EnvironmentId::new(env_ref)), path).await
-    }
+    /// Resolve the VCS in the environment a resource's `env_ref` names. An
+    /// `env_ref` is an Environment resource name, not an environment id, so
+    /// there is no default: environment-aware resolvers must map it through the
+    /// environment manager's one resolution, and an unknown one is an error.
+    async fn vcs_for_env_ref(&self, env_ref: &str, path: &Path) -> Result<Arc<dyn Vcs>, String>;
 }
 
 pub struct FixedVcsResolver(pub Arc<dyn Vcs>);
@@ -252,6 +251,10 @@ pub struct FixedVcsResolver(pub Arc<dyn Vcs>);
 #[async_trait]
 impl CheckoutVcsResolver for FixedVcsResolver {
     async fn vcs_for(&self, _environment: Option<&flotilla_protocol::EnvironmentId>, _path: &Path) -> Result<Arc<dyn Vcs>, String> {
+        Ok(Arc::clone(&self.0))
+    }
+
+    async fn vcs_for_env_ref(&self, _env_ref: &str, _path: &Path) -> Result<Arc<dyn Vcs>, String> {
         Ok(Arc::clone(&self.0))
     }
 }
