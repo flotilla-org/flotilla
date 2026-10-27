@@ -189,7 +189,7 @@ pub struct RetiredResourceKind {
 }
 
 pub const RETIRED_RESOURCE_KINDS: &[RetiredResourceKind] = &[
-    // Retired by #3943 (shipped in r887); remove one roll later, once the corpus is refreshed (#4007).
+    // Retired by #3943 (shipped in r887); remove one roll later, once the corpus is refreshed (#4014).
     // The stored-corpus test reads each entry's r355 file, so retiring r355 forces this removal.
     RetiredResourceKind { kind: "Usage", plural: "usages", api_version: "flotilla.work/v1" },
 ];
