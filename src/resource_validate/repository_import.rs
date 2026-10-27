@@ -17,7 +17,8 @@ pub(super) const KIND: &str = "repositories";
 #[derive(Default)]
 pub(super) struct Documents(pub Vec<(String, Value)>);
 
-/// The home a listed copy was written at: its origin root, or this daemon.
+/// The home a listed copy was written at: its origin root, or this daemon. Replication stamps the
+/// origin root on every replicated copy, so only this daemon's own copies lack it.
 fn home(item: &Value) -> String {
     item.pointer("/metadata/annotations/flotilla.work~1origin-root").and_then(Value::as_str).unwrap_or("local").to_owned()
 }
@@ -35,7 +36,7 @@ impl Documents {
                 Err(error) => report.refused.push(ImportRefusal {
                     kind: "Repository",
                     record: item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>").to_owned(),
-                    reason: format!("does not decode: {error}"),
+                    reason: format!("at `{}`: does not decode: {error}", home(item)),
                 }),
             }
         }

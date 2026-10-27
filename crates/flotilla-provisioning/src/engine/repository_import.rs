@@ -6,7 +6,7 @@
 //! | Old copy | Imported |
 //! |---|---|
 //! | Deleted | dropped |
-//! | Superseded by the forge-split sweep (`superseded-by`) | dropped: its record is the one it names |
+//! | Superseded by the forge-split sweep (`superseded-by`) | dropped: its record is the one it names; refused when that home holds no live copy of it (an interrupted sweep) |
 //! | Named other than its identity's key | refused |
 //! | `spec` | the record's spec, unchanged |
 //! | `verification-command-project` and `-provenance` annotations | `verification_project`, `verification_provenance` |
@@ -81,6 +81,14 @@ pub fn rehearse_repositories(copies: &[RepositoryCopy], report: &mut ImportRepor
     for copy in copies {
         namespaces.entry((copy.object.metadata.name.as_str(), copy.home.as_str())).or_default().insert(copy.namespace.as_str());
     }
+    // The live copies each home holds, which a superseded copy's target must be among.
+    let live: BTreeSet<(&str, &str)> = copies
+        .iter()
+        .filter(|copy| {
+            copy.object.metadata.deletion_timestamp.is_none() && !copy.object.metadata.annotations.contains_key(SUPERSEDED_BY_ANNOTATION)
+        })
+        .map(|copy| (copy.object.metadata.name.as_str(), copy.home.as_str()))
+        .collect();
     for copy in copies {
         let name = &copy.object.metadata.name;
         let refuse = |reason: String| ImportRefusal { kind: KIND, record: name.clone(), reason: format!("at `{}`: {reason}", copy.home) };
@@ -90,7 +98,14 @@ pub fn rehearse_repositories(copies: &[RepositoryCopy], report: &mut ImportRepor
             report.refused.push(refuse(format!("held in namespaces `{}`, and the engine has no namespaces", held.join("`, `"))));
             continue;
         }
+        if let Some(target) = copy.object.metadata.annotations.get(SUPERSEDED_BY_ANNOTATION) {
+            if copy.object.metadata.deletion_timestamp.is_none() && !live.contains(&(target.as_str(), copy.home.as_str())) {
+                report.refused.push(refuse(format!("superseded by `{target}`, which this home holds no live copy of")));
+                continue;
+            }
+        }
         match import_repository(&copy.object) {
+            // Version 1: each record starts at its home as a fresh write; its old versions are not carried.
             Ok(Imported::Record(record)) => match rehearsal.restore(&copy.home, name, 1, &*record) {
                 Ok(()) => *report.imported.entry((KIND, "observed")).or_default() += 1,
                 Err(reason) => report.refused.push(refuse(reason)),

@@ -40,7 +40,8 @@ pub struct RepositoryRecord {
     /// Where each of those commands was declared, a document read whole.
     #[store(cbor)]
     pub verification_provenance: Vec<VerificationProvenance>,
-    /// The record that supersedes this one after the forge-split sweep merged it there.
+    /// The record that supersedes this one after the forge-split sweep merged it there; the sweep
+    /// writes it (3a-ii), and the import drops a superseded copy, so no import sets it.
     pub superseded_by: Option<String>,
     /// The default branch this home's observations resolve to.
     pub default_branch: Option<String>,

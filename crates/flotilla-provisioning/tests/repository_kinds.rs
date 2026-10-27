@@ -115,8 +115,9 @@ fn every_repository_imports_with_its_spec_ops_data_and_observations() {
     let Imported::Record(record) = import_repository(&owned).expect("owned") else { panic!("dropped") };
     assert_eq!((record.verification_project.as_deref(), record.verification_provenance.clone()), (Some("app"), provenance()));
 
+    // Superseded by a record the same home holds (the corpus's second), as a finished sweep leaves it.
     let mut superseded = corpus[0].clone();
-    superseded.metadata.annotations.insert(SUPERSEDED_BY_ANNOTATION.into(), "other".into());
+    superseded.metadata.annotations.insert(SUPERSEDED_BY_ANNOTATION.into(), corpus[1].metadata.name.clone());
     let mut deleted = corpus[0].clone();
     deleted.metadata.deletion_timestamp = Some(chrono::Utc::now());
     let mut misnamed = corpus[0].clone();
@@ -138,7 +139,7 @@ fn every_repository_imports_with_its_spec_ops_data_and_observations() {
         .collect();
     // A repository two homes observed imports at both.
     copies.push(copy(corpus[0].clone(), "beta"));
-    copies.extend([copy(superseded, "gamma"), copy(deleted, "delta"), copy(misnamed, "epsilon"), copy(undecodable, "zeta")]);
+    copies.extend([copy(superseded, "alpha-1"), copy(deleted, "delta"), copy(misnamed, "epsilon"), copy(undecodable, "zeta")]);
     let mut report = ImportReport::default();
     rehearse_repositories(&copies, &mut report);
     assert_eq!(report.imported.values().sum::<usize>(), corpus.len() + 1, "{report:?}");
@@ -156,4 +157,17 @@ fn a_key_held_in_two_namespaces_at_one_home_is_refused() {
     let mut report = ImportReport::default();
     rehearse_repositories(&copies, &mut report);
     assert_eq!((report.imported.values().sum::<usize>(), report.refused.len()), (0, 2), "{report:?}");
+}
+
+// Behaviour (ADR 0047): a sweep interrupted after marking a copy superseded but before its target
+// was written leaves a copy whose target the home does not hold; it is refused, not dropped, so
+// the repository cannot vanish from the roll unseen.
+#[test]
+fn a_copy_superseded_by_a_record_its_home_lacks_is_refused() {
+    let mut superseded = corpus().remove(0);
+    superseded.metadata.annotations.insert(SUPERSEDED_BY_ANNOTATION.into(), "never-written".into());
+    let mut report = ImportReport::default();
+    rehearse_repositories(&[RepositoryCopy { namespace: "flotilla".into(), object: superseded, home: "alpha".into() }], &mut report);
+    assert_eq!((report.dropped.len(), report.refused.len()), (0, 1), "{report:?}");
+    assert!(report.refused[0].reason.contains("never-written"), "{report:?}");
 }

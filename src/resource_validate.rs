@@ -14,6 +14,7 @@ mod lifecycle_import;
 mod manifest_root_import;
 #[cfg(unix)]
 mod message_import;
+#[cfg(unix)]
 mod repository_import;
 #[cfg(unix)]
 mod retirement;
