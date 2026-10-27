@@ -14,6 +14,8 @@ pub mod image_dockerfile;
 pub mod registry_auth;
 pub mod registry_client;
 pub mod runner;
+#[cfg(unix)]
+pub mod tree_publication;
 pub mod vessel_ops;
 pub use image::{ImageBuildService, LocalImageCache, OwnedBuilderSettings};
 pub use registry_auth::RegistryAuth;

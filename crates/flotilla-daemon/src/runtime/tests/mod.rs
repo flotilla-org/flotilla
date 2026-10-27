@@ -31,7 +31,6 @@ use flotilla_credentials::CredentialRefreshError;
 use flotilla_credentials::CredentialStore;
 use flotilla_credentials::CONTAINER_CODEX_HOME;
 use flotilla_credentials::FLOTILLA_SKILLS_DIR_ENV;
-use flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY;
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_crew::reconcilers::terminal_session::{
     TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalRuntime,
@@ -74,9 +73,6 @@ use flotilla_provisioning::reconcilers::{
     checkout::runtime::CheckoutControllerRuntime, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime,
     CloneReconciler, CloneRuntime, EnvironmentReconciler, EnvironmentRuntime,
 };
-use flotilla_replay_testkit::Masks;
-use flotilla_replay_testkit::ReplayHttpClient;
-use flotilla_replay_testkit::Session;
 use flotilla_resources::{
     clone_key, Checkout, Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec,
     CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, Clone, CloneSpec, ConditionValue,

@@ -237,3 +237,16 @@ Where the build departs from the approved text above:
 11. **The tree manifest is `{"schema_version":1,"sources":[…],"skills":[…]}`**, built from the fields listed in decision 3.
 12. **Requester-bound homes (#3907) get their skills at launch, like every other home.** The launch's crew environment already names the bound home, which is where the binding delivers, so publication writes its `skills` there. The provisioning-time requester staging that #3933 added is retired together with the rest of provisioning-time staging.
 13. **The runner store was checked against BusyBox 1.35.0** (static musl build). With its `readlink`, `test`, `mkdir`, `sha256sum`, `tar`, `mv`, `ln`, `touch`, `find` and `rm` first on `PATH`, the real-filesystem publication contract tests pass. Only the tests' own GNU-only `touch -d` aging helper needed GNU coreutils.
+
+## On the vessel delivery pipeline (#3964)
+
+After the owner's pause, this work was rebuilt on the access layer that #3964 landed. Skills are one need among the crew's home, account and login, and this PR adds a delivery mechanism for them rather than a launch branch of its own.
+
+- **Skills are an `agent-push` tree.** The access layer declares the skills need as content the controller holds (`TreeSources { controller }`), so the planner lowers it to `agent-push` on every place. Its delivery builds the crew's canonical archive on the controller and publishes it through the vessel agent's command runner by digest, into `<delivered home>/skills`.
+  - The planner and its cost table are unchanged.
+  - Choosing a mechanism per source and sandbox is the planner's job once more than one applies. A source a vessel can reach itself can then offer `agent-fetch` again.
+- **The need's digest is the selection's identity**: each source at its pinned revision, plus the selected paths. The archive is built only when the executor actually delivers, so a launch whose record already names that digest fetches and publishes nothing.
+- **The guest-side fetch is removed**: the staging script, the guest source tokens, the mint per credential, and the one-repository-per-credential refusal that the guest mint needed. Source tokens are minted on the controller for each source's own repository (decision 1).
+- **No publication lock.** The executor serializes deliveries per access, and each crew publishes into its own home, so the per-destination lock from the earlier build is gone.
+- **An empty selection needs no supply.** It still delivers a manifest-only tree, so publishing it removes stale managed skills.
+- **Superseded build notes.** Notes 1, 2 and 12 describe the earlier launch wiring. The access layer now reads the frozen selection, decides where the home is, and requires the convoy to be readable at launch.

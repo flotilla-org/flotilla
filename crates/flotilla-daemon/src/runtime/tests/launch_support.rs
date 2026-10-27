@@ -129,16 +129,6 @@ pub(super) async fn freeze_crew(
 }
 
 /// A frozen selection of `name` from the generation's `mattpocock-skills` source.
-pub(super) fn frozen_skill(name: &str) -> flotilla_resources::SkillCatalogEntry {
-    flotilla_resources::SkillCatalogEntry {
-        source: "mattpocock-skills".into(),
-        repository: "flotilla-org/mattpocock-skills".into(),
-        revision: "1".repeat(40),
-        name: name.into(),
-        path: format!("skills/{name}"),
-    }
-}
-
 /// The token prefix a bound Claude launch starts with.
 pub(super) fn claude_token_prefix(home: &str) -> String {
     format!("CLAUDE_CODE_OAUTH_TOKEN=\"$(cat -- '{home}/.flotilla-oauth-token')\" ")
@@ -202,7 +192,7 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
             .tool_exists("claude", true)
             .on_run("mkdir", &["-p", &crew_config_dir.to_string_lossy()], Ok(String::new()))
             .build(),
-        None,
+        Some(Arc::new(VesselDisk::new(&crew_config_dir))),
     ));
     let bag = EnvironmentBag::new()
         .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", env_id.to_string()))

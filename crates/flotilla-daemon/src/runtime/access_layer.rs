@@ -11,8 +11,11 @@
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use flotilla_credentials::{AgentMaterialRegistry, HarnessHome, HarnessLogin, SkillTree};
-use flotilla_environment::environment::VesselAgent;
+use flotilla_credentials::{AgentMaterialRegistry, HarnessHome, HarnessLogin, SkillSourceTokens, SkillTree};
+use flotilla_environment::environment::{
+    tree_publication::{self, RunnerTreeStore},
+    VesselAgent,
+};
 use flotilla_resources::{
     account_access::{requester_home, AccessName},
     Convoy, Environment, ResourceError, Vessel,
@@ -117,7 +120,7 @@ async fn deliver_crew(
         SKILLS,
         skills.digest(),
         "skills",
-        TreeSources { url: true, ..TreeSources::default() },
+        TreeSources { controller: true, ..TreeSources::default() },
         Arc::new(SkillsDelivery { state: state.clone(), material: material.clone(), tree: skills }),
     );
     let bound = match launch.access {
@@ -242,7 +245,8 @@ async fn declared_environment(state: &ControllerRuntimeState, launch: &AccountLa
     }
 }
 
-/// The crew's skill tree, fetched by the vessel at each source's pinned revision.
+/// The crew's skill tree, fetched on the controlling daemon and pushed into the vessel
+/// by digest (#3663). Source credentials are minted here and never reach the vessel.
 struct SkillsDelivery {
     state: Arc<ControllerRuntimeState>,
     material: Arc<AgentMaterialRegistry>,
@@ -252,33 +256,14 @@ struct SkillsDelivery {
 #[async_trait]
 impl TreeDelivery for SkillsDelivery {
     async fn deliver(&self, mechanism: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<(), String> {
-        if mechanism != (Mechanism::AgentFetch { by: flotilla_vessel_delivery::FetchBy::Url }) {
+        if mechanism != Mechanism::AgentPush {
             return Err(format!("skills cannot be delivered by {mechanism}"));
         }
-        let runner = agent.commands();
-        let mut tokens = BTreeMap::new();
-        let requests = self.tree.credentials();
-        if !requests.is_empty() {
-            let store = self.state.credential_store.as_ref().ok_or("skill sources need the host-local credential store")?;
-            // `skill_tree` refused a credential over two repositories, so one token per
-            // credential serves every source that names it.
-            let mut minted: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
-            for request in requests {
-                let token = match minted.get(&request.credential) {
-                    Some(token) => token.clone(),
-                    None => {
-                        let token =
-                            store.prepare_skill_source(&request.credential, &request.repository, &*runner).await.map_err(|error| {
-                                format!("skill source {} credential {} mint failed: {error}", request.source, request.credential)
-                            })?;
-                        minted.insert(request.credential.clone(), token.clone());
-                        token
-                    }
-                };
-                tokens.insert(request.source, token);
-            }
-        }
-        self.material.stage_skill_tree(&self.tree, target, &tokens, &*runner).await
+        let tokens = self.state.credential_store.as_deref().map(|store| store as &dyn SkillSourceTokens);
+        let archive = self.material.skill_archive(&self.tree, &self.state.skill_trees, tokens).await.map_err(|error| error.message)?;
+        tree_publication::publish(&RunnerTreeStore::new(agent.commands()), target, &archive).await.map_err(|error| error.message)?;
+        tracing::info!(target = %target.display(), digest = %archive.digest, "published frozen crew skills");
+        Ok(())
     }
 }
 

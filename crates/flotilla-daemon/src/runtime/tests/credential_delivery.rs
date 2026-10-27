@@ -426,11 +426,10 @@ async fn agent_environment_is_staged_at_the_runner_writable_config_base() {
 }
 
 // Acceptance (#3964): a Docker crew's access layer runs on the real launch path before
-// its harness starts. Its frozen skills are staged into the home its binding delivers
-// into, and the harness launches with exactly that home. Only the selected source's
-// token is minted, narrowed to its repository.
+// its harness starts. Its frozen skills are fetched on the controller and pushed into the
+// home its binding delivers into (#3663), and the harness launches with exactly that home.
 #[tokio::test]
-async fn contained_claude_crew_launches_in_the_home_its_skills_were_staged_into() {
+async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
     fs::create_dir_all(&config_base).expect("config directory");
@@ -438,10 +437,6 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_staged_into(
     let config = Arc::new(ConfigStore::with_base(config_base));
     let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
     let backend = daemon.resource_backend();
-    let app_id_path = temp.path().join("github-app.id");
-    let private_key_path = temp.path().join("github-app.pem");
-    fs::write(&app_id_path, "12345\n").expect("write App id");
-    fs::write(&private_key_path, GITHUB_APP_TEST_PRIVATE_KEY).expect("write App private key");
     backend
         .clone()
         .definitions::<CredentialSpec>(NAMESPACE)
@@ -457,29 +452,6 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_staged_into(
         )
         .await
         .expect("credential declaration");
-    backend
-        .clone()
-        .definitions::<CredentialSpec>(NAMESPACE)
-        .create(
-            &empty_meta("github-skills-fork"),
-            &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp {
-                    actor_login: None,
-                    installation_id: Some(9876),
-                    installation_repository: None,
-                    permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
-                },
-                source: CredentialSource::GithubApp {
-                    app_id_path: app_id_path.to_string_lossy().into_owned(),
-                    private_key_path: private_key_path.to_string_lossy().into_owned(),
-                },
-                lifecycle: CredentialLifecycle::Refreshable,
-                placement: CredentialPlacementRequirements::default(),
-                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
-            },
-        )
-        .await
-        .expect("skill credential declaration");
     let env_id = EnvironmentId::new("contained-claude");
     backend
         .using::<Environment>(NAMESPACE)
@@ -504,13 +476,14 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_staged_into(
         )
         .await
         .expect("environment record");
-    freeze_crew(&backend, "demo", "demo-work", "coder", "claude-code", vec![frozen_skill("research")]).await;
+    let source = LocalSkillSource::new(temp.path(), "research");
+    freeze_crew(&backend, "demo", "demo-work", "coder", "claude-code", vec![source.selected.clone()]).await;
     bind_account(&backend, "demo", "coder", "claude-max", "test@example.com").await;
 
-    // The contained process boundary: it records what the staging script was asked to install.
-    let staged = Arc::new(StdMutex::new(Vec::new()));
+    let home = PathBuf::from("/home/crew/flotilla/agent-homes/requesters/demo/coder/claude");
+    let disk = Arc::new(VesselDisk::new(&home));
     let runner: Arc<dyn CommandRunner> =
-        Arc::new(CredentialInteriorRunner(DiscoveryMockRunner::builder().tool_exists("claude", true).build(), Some(Arc::clone(&staged))));
+        Arc::new(CredentialInteriorRunner(DiscoveryMockRunner::builder().tool_exists("claude", true).build(), Some(Arc::clone(&disk))));
     let bag = EnvironmentBag::new()
         .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", env_id.to_string()))
         .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"))
@@ -531,29 +504,17 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_staged_into(
         destroyed: Arc::new(AtomicBool::new(false)),
     });
     daemon.register_provisioned_environment(env_id.clone(), handle, bag.clone(), Some(Arc::new(contained_registry))).expect("register");
-    let mint_session = Session::replaying_from_str(
-        r#"interactions:
-  - channel: http
-    method: POST
-    url: "https://api.github.com/app/installations/9876/access_tokens"
-    request_body: '{"repositories":["mattpocock-skills"],"permissions":{"contents":"read"}}'
-    status: 201
-    response_body: '{"token":"skill-token","expires_at":"2026-08-03T17:00:00Z"}'
-"#,
-        Masks::new(),
-    );
-    let credential_store = Arc::new(CredentialStore::new_with_http(
+    let credential_store = Arc::new(CredentialStore::new(
         backend.clone(),
         NAMESPACE,
         Arc::new(TestEnvVars::new([("TEST_CLAUDE_TOKEN", "oauth-secret-material")])),
         bag,
         Arc::clone(&runner),
-        Arc::new(ReplayHttpClient::new(mint_session.clone())),
         config.state_dir().as_path().to_path_buf(),
     ));
     let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([(
         FLOTILLA_SKILLS_DIR_ENV,
-        write_test_credentialed_skill_sources(temp.path()).display().to_string(),
+        source.supply.display().to_string(),
     )]))));
     let state = Arc::new(
         ControllerRuntimeState::new(
@@ -565,7 +526,8 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_staged_into(
             "host-direct-host-test".to_string(),
         )
         .with_credential_store(credential_store)
-        .with_agent_material(agent_material),
+        .with_agent_material(agent_material)
+        .with_skill_trees(LocalSkillSource::trees(temp.path())),
     );
     let spec = flotilla_resources::TerminalSessionSpec {
         env_ref: env_id.to_string(),
@@ -592,16 +554,11 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_staged_into(
 
     TerminalControllerRuntime { state }.ensure_session("terminal-demo-work-coder", (&spec).into(), &[]).await.expect("launch");
 
-    let home = PathBuf::from("/home/crew/flotilla/agent-homes/requesters/demo/coder/claude");
     let ensured = pool.ensured.lock().await;
     let [launch] = ensured.as_slice() else { panic!("expected one launch") };
     let launched_home = launch.env_vars.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, home)| PathBuf::from(home));
     assert_eq!(launched_home.as_ref(), Some(&home), "launch uses the home the access layer delivered");
-    assert_eq!(
-        *staged.lock().expect("staged"),
-        [StagedSkills { destination: home.join("skills"), names: vec!["research".into()] }],
-        "the crew's frozen skills are staged into that same home"
-    );
+    assert!(disk.path(home.join("skills/research/SKILL.md")).is_file(), "the crew's frozen skills are pushed into that same home");
     // Contract 4: the access's status shows the same home and each need's mechanism.
     let deliveries =
         flotilla_projections::read_projections::access_delivery_evidence(&backend, NAMESPACE, "demo").await.expect("deliveries");
@@ -609,8 +566,7 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_staged_into(
     assert_eq!(Path::new(&delivery.home), home);
     let mechanisms = delivery.needs.iter().map(|need| (need.need.as_str(), need.mechanism.as_str())).collect::<BTreeMap<_, _>>();
     assert_eq!(mechanisms.get("home"), Some(&"agent-push"));
-    assert_eq!(mechanisms.get("skills"), Some(&"agent-fetch(url)"));
-    mint_session.assert_complete();
+    assert_eq!(mechanisms.get("skills"), Some(&"agent-push"));
 }
 
 #[tokio::test]

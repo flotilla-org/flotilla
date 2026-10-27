@@ -23,17 +23,6 @@ pub(super) fn write_test_skill_sources(root: &Path) -> PathBuf {
     skills
 }
 
-pub(super) fn write_test_credentialed_skill_sources(root: &Path) -> PathBuf {
-    let skills = root.join("generation/credentialed-skills");
-    fs::create_dir_all(&skills).expect("create credentialed skill source manifest directory");
-    fs::write(
-            skills.join(".flotilla-sources.json"),
-            r#"{"schema_version":5,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111","credential":"github-skills-fork"}]}"#,
-        )
-        .expect("write credentialed skill source manifest");
-    skills
-}
-
 pub(super) struct SshProvisioningRecordingRunner {
     pub(super) commands: Arc<StdMutex<Vec<String>>>,
 }
@@ -63,37 +52,117 @@ impl CommandRunner for SshProvisioningRecordingRunner {
     }
 }
 
-/// What one run of the skill staging script was asked to install: its destination and
-/// the frozen skill names, read from its arguments at the vessel's process boundary.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct StagedSkills {
-    pub(super) destination: PathBuf,
-    pub(super) names: Vec<String>,
+/// A real skill source for launch scenarios: a local Git repository holding `name`,
+/// the generation supply that authorizes it, and the crew's frozen selection of it.
+pub(super) struct LocalSkillSource {
+    pub(super) supply: PathBuf,
+    pub(super) selected: flotilla_resources::SkillCatalogEntry,
 }
 
-impl StagedSkills {
-    /// Parse the staging script's argument layout (`flotilla_vcs`'s `stage_git_skill_sources`):
-    /// after the command identifier come the manifest, destination, cleanup flag and cache,
-    /// then per source its name, repository, revision, token, credential, path count, paths,
-    /// entry count and `(name, path)` entries.
-    pub(super) fn of(args: &[&str]) -> Option<Self> {
-        let start = args.iter().position(|arg| *arg == "flotilla-stage-skills")?;
-        let destination = PathBuf::from(args.get(start + 2)?);
-        let mut rest = args.get(start + 5..)?.iter();
-        let mut names = Vec::new();
-        while rest.next().is_some() {
-            let paths = rest.nth(4)?.parse::<usize>().ok()?;
-            let entries = rest.nth(paths)?.parse::<usize>().ok()?;
-            for _ in 0..entries {
-                names.push(rest.next()?.to_string());
-                rest.next()?;
-            }
-        }
-        Some(Self { destination, names })
+impl LocalSkillSource {
+    pub(super) fn new(root: &Path, name: &str) -> Self {
+        let repository = root.join("skill-source");
+        fs::create_dir_all(repository.join("skills").join(name)).expect("skill source");
+        fs::write(repository.join("skills").join(name).join("SKILL.md"), format!("---\nname: {name}\ndescription: test\n---\n"))
+            .expect("skill");
+        // Git subprocess boundary: the controller's host-side fetch reads this repository.
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .current_dir(&repository)
+                .output()
+                .expect("spawn git");
+            assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).expect("utf-8").trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "pin"]);
+        let revision = git(&["rev-parse", "HEAD"]);
+        let supply = root.join("generation/skills");
+        fs::create_dir_all(&supply).expect("supply");
+        let source = repository.display().to_string();
+        fs::write(
+            supply.join(".flotilla-sources.json"),
+            serde_json::json!({"schema_version": 5, "sources": [{"name": "local", "repository": source, "revision": revision}]})
+                .to_string(),
+        )
+        .expect("supply manifest");
+        let selected = flotilla_resources::SkillCatalogEntry {
+            source: "local".into(),
+            repository: source,
+            revision,
+            name: name.into(),
+            path: format!("skills/{name}"),
+        };
+        Self { supply, selected }
+    }
+
+    /// The controller's host-side acquisition, over the real Git CLI.
+    pub(super) fn trees(root: &Path) -> flotilla_credentials::SkillTrees {
+        flotilla_credentials::SkillTrees::new(
+            Arc::new(flotilla_vcs::vcs::FlotillaVcs::object_cache(Arc::new(ProcessCommandRunner))),
+            root.join("skill-source-cache"),
+        )
     }
 }
 
-pub(super) struct CredentialInteriorRunner(pub(super) DiscoveryMockRunner, pub(super) Option<Arc<StdMutex<Vec<StagedSkills>>>>);
+/// Process boundary for tree publication in launch scenarios whose vessel is modelled in
+/// memory: a command naming a published `skills` tree's path under `guest` (the tree, its
+/// previous link or its store) runs on this host, with `guest` moved under a temporary
+/// directory, so what is published there can be read back.
+pub(super) struct VesselDisk {
+    guest: PathBuf,
+    host: TempDir,
+}
+
+impl VesselDisk {
+    pub(super) fn new(guest: impl Into<PathBuf>) -> Self {
+        Self { guest: guest.into(), host: TempDir::new().expect("vessel disk") }
+    }
+
+    fn holds(&self, path: &Path) -> bool {
+        path.starts_with(&self.guest)
+            && path.components().any(|part| matches!(part.as_os_str().to_str(), Some("skills" | "skills.prev" | ".flotilla-skills")))
+    }
+
+    /// Where the guest's `path` lies on this host.
+    pub(super) fn path(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.host.path().join(path.as_ref().strip_prefix(&self.guest).expect("a path on the vessel disk"))
+    }
+
+    fn mapped(&self, args: &[&str]) -> Option<Vec<String>> {
+        let mapped = args
+            .iter()
+            .map(|arg| if self.holds(Path::new(arg)) { self.path(arg).display().to_string() } else { (*arg).to_string() })
+            .collect::<Vec<_>>();
+        (mapped != args).then_some(mapped)
+    }
+
+    fn unmapped(&self, output: String) -> String {
+        output.replace(&self.host.path().display().to_string(), &self.guest.display().to_string())
+    }
+
+    pub(super) async fn run(&self, cmd: &str, args: &[&str]) -> Option<Result<String, String>> {
+        let args = self.mapped(args)?;
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        Some(ProcessCommandRunner.run(cmd, &refs, Path::new("/"), &ChannelLabel::Default).await.map(|output| self.unmapped(output)))
+    }
+
+    pub(super) async fn run_output(&self, cmd: &str, args: &[&str]) -> Option<Result<CommandOutput, String>> {
+        let args = self.mapped(args)?;
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        Some(ProcessCommandRunner.run_output(cmd, &refs, Path::new("/"), &ChannelLabel::Default).await)
+    }
+
+    pub(super) async fn write_file_from(&self, source: &Path, destination: &Path) -> Option<Result<(), String>> {
+        self.holds(destination).then_some(())?;
+        Some(ProcessCommandRunner.write_file_from(source, &self.path(destination)).await)
+    }
+}
+
+pub(super) struct CredentialInteriorRunner(pub(super) DiscoveryMockRunner, pub(super) Option<Arc<VesselDisk>>);
 
 #[derive(Default)]
 pub(super) struct PersistentPathRecordingRunner {
@@ -127,18 +196,16 @@ impl CommandRunner for PersistentPathRecordingRunner {
 #[async_trait]
 impl CommandRunner for CredentialInteriorRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-        if cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-stage-skills")) {
-            if let (Some(staged), Some(skills)) = (&self.1, StagedSkills::of(args)) {
-                staged.lock().expect("staged").push(skills);
-            }
-            Ok("ok".to_string())
+        if let Some(result) = match &self.1 {
+            Some(disk) => disk.run(cmd, args).await,
+            None => None,
+        } {
+            result
         } else if cmd == "sh" && (args.contains(&"flotilla-stat") || args.contains(&"flotilla-is-file")) {
             // Nothing vessel delivery reads has landed in this stand-in's homes.
             Ok("none\n".to_string())
         } else if cmd == "mkdir"
                 || cmd == "chmod"
-                || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight")))
-                || (cmd == "sh" && args.contains(&"flotilla-prune-skill-tokens"))
                 // This runner stands in for the contained process boundary;
                 // real scratch copying and credential links are tested in agent_material.
                 || (cmd == "sh" && args.contains(&"flotilla-harness-home"))
@@ -153,6 +220,11 @@ impl CommandRunner for CredentialInteriorRunner {
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+        if let Some(disk) = &self.1 {
+            if let Some(result) = disk.run_output(cmd, args).await {
+                return result;
+            }
+        }
         if cmd == "sh" && args == ["-c", "command -v claude"] {
             let available = self.0.exists("claude", &[]).await;
             return Ok(CommandOutput { stdout: "/tools/claude".into(), stderr: String::new(), exit_code: Some(i32::from(!available)) });
@@ -160,13 +232,22 @@ impl CommandRunner for CredentialInteriorRunner {
         self.0.run_output(cmd, args, cwd, label).await
     }
 
-    async fn run_with_input(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel, _input: &[u8]) -> Result<String, String> {
-        if cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-stage-skills")) {
-            if let (Some(staged), Some(skills)) = (&self.1, StagedSkills::of(args)) {
-                staged.lock().expect("staged").push(skills);
-            }
-        }
+    async fn run_with_input(
+        &self,
+        _cmd: &str,
+        _args: &[&str],
+        _cwd: &Path,
+        _label: &ChannelLabel,
+        _input: &[u8],
+    ) -> Result<String, String> {
         Ok("ok".to_string())
+    }
+
+    async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        match &self.1 {
+            Some(disk) => disk.write_file_from(source, destination).await.unwrap_or_else(|| Err("no vessel disk there".into())),
+            None => Err("this stand-in holds no vessel disk".into()),
+        }
     }
 
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {

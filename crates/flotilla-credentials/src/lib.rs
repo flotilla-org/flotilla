@@ -10,14 +10,16 @@
 mod agent_material;
 mod codex_central;
 mod credential;
+mod skill_trees;
 mod vessel_config;
 
 pub use agent_material::{
-    validate_frozen_vessel_skills, AgentMaterialDelivery, AgentMaterialPreflight, AgentMaterialRegistry, HarnessHome, HarnessLogin,
-    SkillSourceCredentialRequest, SkillTree, CONTAINER_CODEX_HOME, FLOTILLA_SKILLS_DIR_ENV,
+    AgentMaterialDelivery, AgentMaterialPreflight, AgentMaterialRegistry, HarnessHome, HarnessLogin, SkillTree, CONTAINER_CODEX_HOME,
+    FLOTILLA_SKILLS_DIR_ENV,
 };
 pub use codex_central::{codex_central_auth_path, CodexCentralRefresher, CodexRefreshFailure, CodexRefreshSuccess};
 pub use credential::{BuildSecretError, BuildSecretMaterial, CredentialRefreshError, CredentialStore, GithubAppScope};
+pub use skill_trees::{validate_frozen_vessel_skills, SkillSourceTokens, SkillTreeError, SkillTrees, TokenFiles, SKILL_TREE_MANIFEST};
 pub use vessel_config::Fragment;
 
 /// Validated shell configuration and the values used to launch the agent.

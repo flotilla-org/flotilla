@@ -31,16 +31,21 @@ enum HostEntry {
 }
 
 /// The remote end of the SSH runner: an in-memory host filesystem plus the
-/// handful of commands a crew launch runs there.
-#[derive(Default)]
+/// handful of commands a crew launch runs there. Trees published into the crews'
+/// homes land on a real disk, where tree publication's commands run.
 struct FakeHost {
     files: StdMutex<BTreeMap<PathBuf, HostEntry>>,
     writes: StdMutex<Vec<PathBuf>>,
+    disk: VesselDisk,
 }
 
 impl FakeHost {
     fn with_files(files: &[(&str, &str)]) -> Self {
-        let host = Self::default();
+        let host = Self {
+            files: StdMutex::default(),
+            writes: StdMutex::default(),
+            disk: VesselDisk::new(format!("{HOST_BASE}/agent-homes/requesters")),
+        };
         host.files
             .lock()
             .expect("files")
@@ -72,6 +77,11 @@ fn ok() -> Result<String, String> {
 #[async_trait]
 impl CommandRunner for FakeHost {
     async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        if !cmd.starts_with("sh") {
+            if let Some(result) = self.disk.run(cmd, args).await {
+                return result;
+            }
+        }
         match (cmd, args) {
             ("rm", ["-f", "--", path]) => {
                 self.files.lock().expect("files").remove(Path::new(path));
@@ -111,6 +121,9 @@ impl CommandRunner for FakeHost {
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+        if let Some(result) = self.disk.run_output(cmd, args).await {
+            return result;
+        }
         match (cmd, args) {
             ("sh", ["-c", "command -v claude"]) => {
                 Ok(CommandOutput { stdout: "/tools/claude\n".into(), stderr: String::new(), exit_code: Some(0) })
@@ -128,14 +141,14 @@ impl CommandRunner for FakeHost {
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel, _input: &[u8]) -> Result<String, String> {
-        // The staging script fetches each source in the vessel; here each selected skill lands.
-        if let Some(staged) = StagedSkills::of(args) {
-            for name in staged.names {
-                self.put(&staged.destination.join(name).join("SKILL.md"), "---\nname: staged\n---\n");
-            }
-            return ok();
-        }
         panic!("credential preparation cannot send model turns: {cmd} {args:?}")
+    }
+
+    async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        self.disk
+            .write_file_from(source, destination)
+            .await
+            .unwrap_or_else(|| Err(format!("unexpected upload to {}", destination.display())))
     }
 
     async fn exists(&self, cmd: &str, _args: &[&str]) -> bool {
@@ -234,7 +247,7 @@ fn agentless_host(host: &Arc<FakeHost>, runtime_dir: &flotilla_test_support::Tes
         host_environment: HostEnvironment::default(),
         checkout: CHECKOUT.to_string(),
         session_env: BTreeMap::new(),
-        skills: vec![frozen_skill("research")],
+        skills: true,
     }
 }
 
@@ -248,8 +261,8 @@ struct AgentlessHost {
     checkout: String,
     /// What the session spec declares, as credential delivery adds to it.
     session_env: BTreeMap<String, String>,
-    /// The crew's frozen skills.
-    skills: Vec<flotilla_resources::SkillCatalogEntry>,
+    /// Whether the crew freezes a selection of the local `research` skill.
+    skills: bool,
 }
 
 /// What the terminal pool was asked to start.
@@ -331,6 +344,8 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
         vessel_agent: Err("the test's vessel agents run on the host runner".into()),
     };
     register_agentless_ssh_resources(&backend, NAMESPACE, &local_host_id, &profile).await.expect("register agentless resources");
+    let source = LocalSkillSource::new(temp.path(), "research");
+    let skills = if skills { vec![source.selected.clone()] } else { Vec::new() };
     freeze_crew(&backend, "demo", "demo-work", "coder", adapter, skills).await;
     let credential_store = Arc::new(CredentialStore::new(
         backend,
@@ -359,8 +374,9 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
         .with_credential_store(credential_store)
         .with_agent_material(Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([(
             FLOTILLA_SKILLS_DIR_ENV,
-            write_test_skill_sources(temp.path()).display().to_string(),
-        )]))))),
+            source.supply.display().to_string(),
+        )])))))
+        .with_skill_trees(LocalSkillSource::trees(temp.path())),
     );
     let spec = flotilla_resources::TerminalSessionSpec {
         env_ref: ENVIRONMENT.to_string(),
@@ -429,15 +445,15 @@ impl AgentlessRuntime {
     }
 }
 
-/// #3964: the access layer staged the crew's frozen skills into exactly the home its
-/// harness launches with, and recorded what landed there.
+/// #3964, #3663: the access layer pushed the crew's frozen skills into exactly the home
+/// its harness launches with, and recorded what landed there.
 fn assert_staged_into_launched_home(launch: &AgentlessLaunch, variable: &str) {
     let home = launch.value(variable).expect("launched home");
-    assert!(launch.host.entry(format!("{home}/skills/research/SKILL.md")).is_some(), "skills are staged into the launched home");
+    assert!(launch.host.disk.path(format!("{home}/skills/research/SKILL.md")).is_file(), "skills are pushed into the launched home");
     let Some(HostEntry::File(record)) = launch.host.entry(format!("{home}/{}", flotilla_vessel_delivery::DELIVERY_RECORD)) else {
         panic!("no delivery record in the launched home")
     };
-    assert!(record.lines().any(|line| line.starts_with("skills\t") && line.contains("\tagent-fetch(url)\t")), "{record}");
+    assert!(record.lines().any(|line| line.starts_with("skills\t") && line.contains("\tagent-push\t")), "{record}");
     assert!(record.lines().any(|line| line.starts_with("home\t") && line.contains("\thost-path(rw, live)\t")), "{record}");
     // Contract 4: the access's status shows the same home and each need's mechanism.
     let [delivery] = launch.deliveries.as_slice() else { panic!("one access delivered: {:?}", launch.deliveries) };
@@ -445,7 +461,7 @@ fn assert_staged_into_launched_home(launch: &AgentlessLaunch, variable: &str) {
     assert_eq!(delivery.retry, None);
     let mechanisms = delivery.needs.iter().map(|need| (need.need.as_str(), need.mechanism.as_str())).collect::<BTreeMap<_, _>>();
     assert_eq!(mechanisms.get("home"), Some(&"host-path(rw, live)"));
-    assert_eq!(mechanisms.get("skills"), Some(&"agent-fetch(url)"));
+    assert_eq!(mechanisms.get("skills"), Some(&"agent-push"));
 }
 
 /// No launch writes the host user's harness configuration; it reads as it did.
@@ -692,7 +708,7 @@ async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
 
     let session = launch_agentless(
         // A real shell stands in for the host here, so the crew selects no skills to fetch.
-        AgentlessHost { runner, bag, host_environment, checkout: checkout.display().to_string(), session_env, skills: Vec::new() },
+        AgentlessHost { runner, bag, host_environment, checkout: checkout.display().to_string(), session_env, skills: false },
         "claude-code",
         true,
     )
@@ -752,7 +768,7 @@ async fn a_supply_overriding_a_flotilla_variable_is_a_host_configuration_error()
             host_environment,
             checkout: CHECKOUT.to_string(),
             session_env: BTreeMap::new(),
-            skills: vec![frozen_skill("research")],
+            skills: true,
         },
         "claude-code",
         true,
@@ -789,7 +805,7 @@ async fn a_supply_setting_a_family_account_variable_is_a_host_configuration_erro
             host_environment,
             checkout: CHECKOUT.to_string(),
             session_env: BTreeMap::new(),
-            skills: vec![frozen_skill("research")],
+            skills: true,
         },
         "claude-code",
         true,
@@ -831,7 +847,7 @@ async fn bound_agentless_crew_with(
             host_environment: HostEnvironment::default(),
             checkout: CHECKOUT.to_string(),
             session_env: BTreeMap::new(),
-            skills: vec![frozen_skill("research")],
+            skills: true,
         },
         "claude-code",
     )
