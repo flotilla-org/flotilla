@@ -1872,6 +1872,8 @@ fn placement_strategy(spec: &PlacementPolicySpec, settings: &EnvironmentProvider
 fn memory_policy(settings: &EnvironmentProviderSpec) -> flotilla_resources::EnvironmentMemoryPolicy {
     match &settings.settings {
         ProviderSettings::DockerPerVessel { memory_policy, .. } => memory_policy.clone(),
+        // Only Docker Environments carry a memory policy, and `placement_strategy` has refused a
+        // Docker placement without Docker settings, so this default is never read.
         _ => Default::default(),
     }
 }
