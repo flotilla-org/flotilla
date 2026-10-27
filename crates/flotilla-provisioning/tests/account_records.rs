@@ -52,6 +52,7 @@ fn pending(convoy: &str, role: &str, credential: &str, opened: i64) -> PendingBi
             opened_at: at(opened),
             state: State::new(BindingState::Open, at(opened)),
         },
+        home_key: Some(format!("requesters/{convoy}/{role}/{credential}")),
     }
 }
 
@@ -80,6 +81,8 @@ async fn contract(accounts: &dyn AccountRecords) {
     let first = accounts.requester_binding(NS, "convoy-a", "coder", &access()).await.expect("read").expect("bound");
     assert!(first.spec.state.value.is_open());
     assert_eq!(first.spec.credential.0, "cred-1");
+    // Admission's home key is recorded with the binding, never derived by its readers (#3953).
+    assert_eq!(first.home_key.as_deref(), Some("requesters/convoy-a/coder/cred-1"));
     assert_eq!(accounts.binding(NS, &first.name).await.expect("by name"), Some(first.clone()));
 
     // A requester that holds an open binding keeps it: bindings are sticky (#3882).
@@ -104,6 +107,8 @@ async fn contract(accounts: &dyn AccountRecords) {
     accounts.observe_epoch(NS, &regranted, EpochEntry { epoch: "2".into(), observed_at: at(20) }).await.expect("epoch");
     let epoched = accounts.requester_binding(NS, "convoy-a", "coder", &access()).await.expect("read").expect("bound");
     assert_eq!(epoched.spec.epochs.iter().map(|row| row.record.epoch.as_str()).collect::<Vec<_>>(), ["1", "2"]);
+    assert_eq!(epoched.home_key, first.home_key, "writes keep the home key");
+    accounts.record_home_key(NS, &epoched, "requesters/convoy-a/coder/cred-1").await.expect("the recorded key is kept");
 
     // A provision is recorded once per place: without `replace` an existing record is kept, with
     // it the record is brought to the new spec.
@@ -132,6 +137,8 @@ async fn contract(accounts: &dyn AccountRecords) {
     assert_eq!(all.len(), 2, "the closed binding is kept: {all:?}");
     let closed = all.iter().find(|binding| !binding.spec.state.value.is_open()).expect("closed");
     assert_eq!(closed.spec.state.value, BindingState::Closed { reason: "rebind".into(), delivered_until: Some(at(30)) });
+    assert_eq!(closed.home_key, first.home_key, "the closed binding keeps its home key");
+    assert!(rebound.home_key.is_some(), "the next binding opens with a home key");
 
     // Ending revokes the binding; the requester then reads its ended binding with the reason.
     accounts
@@ -165,6 +172,22 @@ async fn contract(accounts: &dyn AccountRecords) {
 async fn the_old_store_keeps_the_account_records_contract() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     contract(&OldStoreAccounts::new(backend)).await;
+}
+
+// Behaviour (#3953): a binding an earlier generation opened without a home key is backfilled
+// in the old store, and the key is kept by later writes.
+#[tokio::test]
+async fn the_old_store_backfills_a_missing_home_key() {
+    let accounts = OldStoreAccounts::new(ResourceBackend::new(InMemoryBackend::default()));
+    accounts.open(NS, vec![PendingBinding { home_key: None, ..pending("convoy-a", "coder", "cred-1", 10) }]).await.expect("open");
+    let unkeyed = accounts.requester_binding(NS, "convoy-a", "coder", &access()).await.expect("read").expect("bound");
+    assert_eq!(unkeyed.home_key, None);
+    accounts.record_home_key(NS, &unkeyed, "requesters/convoy-a/coder").await.expect("backfill");
+    let keyed = accounts.requester_binding(NS, "convoy-a", "coder", &access()).await.expect("read").expect("bound");
+    assert_eq!(keyed.home_key.as_deref(), Some("requesters/convoy-a/coder"));
+    accounts.regrant(NS, &keyed, grants(&["fleet"])).await.expect("regrant");
+    let regranted = accounts.requester_binding(NS, "convoy-a", "coder", &access()).await.expect("read").expect("bound");
+    assert_eq!(regranted.home_key, keyed.home_key);
 }
 
 #[tokio::test]

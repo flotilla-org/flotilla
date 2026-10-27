@@ -9,7 +9,7 @@ use flotilla_resources::{
     account_access::{
         binding_name, requester_parts, AccessName, AccountBinding, AccountBindingSpec, AccountChange, AccountProvision,
         AccountProvisionSpec, AccountRecords, BindingRecord, BindingState, EpochEntry, GrantName, GrantScope, PendingBinding,
-        ProvisionRecord, ProvisionWrite, State, Timestamp, ACCOUNT_BINDING_LABEL, ACCOUNT_CREDENTIAL_LABEL,
+        ProvisionRecord, ProvisionWrite, State, Timestamp, ACCOUNT_BINDING_LABEL, ACCOUNT_CREDENTIAL_LABEL, CREW_HOME_KEY_LABEL,
     },
     label_value, InputMeta, ReadResourceObject, ReadWatchEvent, ResourceError, ResourceObject, ResourceProvenance, CONVOY_LABEL,
 };
@@ -38,6 +38,7 @@ impl OldStoreAccounts {
     fn binding_record(&self, read: ReadResourceObject<AccountBinding>) -> Result<BindingRecord, String> {
         Ok(BindingRecord {
             home: self.home(&read.provenance)?,
+            home_key: label_value(&read.object.metadata.labels, CREW_HOME_KEY_LABEL).cloned(),
             name: read.object.metadata.name,
             version: read.object.metadata.resource_version,
             spec: read.object.spec,
@@ -61,7 +62,7 @@ impl OldStoreAccounts {
         self.backend
             .clone()
             .using::<AccountBinding>(namespace)
-            .update(&binding_meta(&binding.name, spec), &binding.version, spec)
+            .update(&binding_meta(&binding.name, spec, binding.home_key.as_deref()), &binding.version, spec)
             .await
             .map(drop)
             .map_err(|error| format!("update account binding `{}`: {error}", binding.name))
@@ -70,14 +71,18 @@ impl OldStoreAccounts {
 
 /// A binding's metadata: labelled with its requester's convoy (explain, the capability card and
 /// the home pass read a convoy's bindings by index), its credential (grant and declaration
-/// changes reach the convoys using it) and its own name (its provisions are found by it).
-fn binding_meta(name: &str, spec: &AccountBindingSpec) -> InputMeta {
+/// changes reach the convoys using it), its own name (its provisions are found by it) and its
+/// requester's home key, once assigned.
+fn binding_meta(name: &str, spec: &AccountBindingSpec, home_key: Option<&str>) -> InputMeta {
     let mut labels = BTreeMap::from([
         (ACCOUNT_BINDING_LABEL.to_string(), name.to_string()),
         (ACCOUNT_CREDENTIAL_LABEL.to_string(), spec.credential.0.clone()),
     ]);
     if let Some((convoy, _)) = requester_parts(&spec.requester) {
         labels.insert(CONVOY_LABEL.to_string(), convoy);
+    }
+    if let Some(key) = home_key {
+        labels.insert(CREW_HOME_KEY_LABEL.to_string(), key.to_string());
     }
     InputMeta::builder().name(name.to_string()).labels(labels).build()
 }
@@ -149,14 +154,19 @@ impl AccountRecords for OldStoreAccounts {
             match resolver.get(&binding.name).await {
                 Ok(existing) if existing.spec.state.value.is_open() => continue,
                 Ok(existing) => {
+                    let key = label_value(&existing.metadata.labels, CREW_HOME_KEY_LABEL).or(binding.home_key.as_ref());
                     resolver
-                        .update(&binding_meta(&binding.name, &binding.spec), &existing.metadata.resource_version, &binding.spec)
+                        .update(
+                            &binding_meta(&binding.name, &binding.spec, key.map(String::as_str)),
+                            &existing.metadata.resource_version,
+                            &binding.spec,
+                        )
                         .await
                         .map_err(|error| format!("reopen account binding `{}`: {error}", binding.name))?;
                 }
                 Err(ResourceError::NotFound { .. }) => {
                     resolver
-                        .create(&binding_meta(&binding.name, &binding.spec), &binding.spec)
+                        .create(&binding_meta(&binding.name, &binding.spec, binding.home_key.as_deref()), &binding.spec)
                         .await
                         .map_err(|error| format!("write account binding `{}`: {error}", binding.name))?;
                 }
@@ -185,6 +195,11 @@ impl AccountRecords for OldStoreAccounts {
         self.update_binding(namespace, binding, &spec).await
     }
 
+    async fn record_home_key(&self, namespace: &str, binding: &BindingRecord, key: &str) -> Result<(), String> {
+        let keyed = BindingRecord { home_key: Some(key.to_string()), ..binding.clone() };
+        self.update_binding(namespace, &keyed, &binding.spec).await
+    }
+
     async fn rebind(
         &self,
         namespace: &str,
@@ -200,18 +215,19 @@ impl AccountRecords for OldStoreAccounts {
                     retired.state = State::new(BindingState::Closed { reason: "rebind".to_string(), delivered_until }, now);
                 }
                 let retired_name = format!("{}.closed-{}", opened.name, existing.spec.opened_at.micros());
+                let key = label_value(&existing.metadata.labels, CREW_HOME_KEY_LABEL).or(opened.home_key.as_ref()).map(String::as_str);
                 bindings
-                    .create(&binding_meta(&retired_name, &retired), &retired)
+                    .create(&binding_meta(&retired_name, &retired, key), &retired)
                     .await
                     .map_err(|error| format!("retire account binding as `{retired_name}`: {error}"))?;
                 bindings
-                    .update(&binding_meta(&opened.name, &opened.spec), &existing.metadata.resource_version, &opened.spec)
+                    .update(&binding_meta(&opened.name, &opened.spec, key), &existing.metadata.resource_version, &opened.spec)
                     .await
                     .map_err(|error| format!("open account binding `{}`: {error}", opened.name))?;
             }
             Err(ResourceError::NotFound { .. }) => {
                 bindings
-                    .create(&binding_meta(&opened.name, &opened.spec), &opened.spec)
+                    .create(&binding_meta(&opened.name, &opened.spec, opened.home_key.as_deref()), &opened.spec)
                     .await
                     .map_err(|error| format!("open account binding `{}`: {error}", opened.name))?;
             }
@@ -394,6 +410,9 @@ impl AccountRecords for SwitchedAccounts {
     }
     async fn observe_epoch(&self, namespace: &str, binding: &BindingRecord, epoch: EpochEntry) -> Result<(), String> {
         self.current().observe_epoch(namespace, binding, epoch).await
+    }
+    async fn record_home_key(&self, namespace: &str, binding: &BindingRecord, key: &str) -> Result<(), String> {
+        self.current().record_home_key(namespace, binding, key).await
     }
     async fn rebind(
         &self,

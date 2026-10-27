@@ -31,11 +31,20 @@ pub(super) async fn bind_account(backend: &ResourceBackend, convoy: &str, role: 
         opened_at: now,
         state: flotilla_schema::State::new(BindingState::Open, now),
     };
-    backend
-        .using::<flotilla_resources::AccountBinding>(NAMESPACE)
-        .create(&flotilla_admission::account_access::binding_meta(&binding_name(convoy, role, &access), &spec), &spec)
-        .await
-        .expect("account binding");
+    let home_key = flotilla_agent::account_access::AccountProvisioners::seeded()
+        .for_access(&access)
+        .expect("claude provisioner")
+        .home_key(&spec)
+        .expect("home key");
+    let binding =
+        flotilla_resources::account_access::PendingBinding { name: binding_name(convoy, role, &access), spec, home_key: Some(home_key) };
+    flotilla_resources::account_access::AccountRecords::open(
+        &flotilla_store::OldStoreAccounts::new(backend.clone()),
+        NAMESPACE,
+        vec![binding],
+    )
+    .await
+    .expect("account binding");
 }
 
 /// As [`bind_account`], but the binding is a replica from another home, opened `ahead` later on

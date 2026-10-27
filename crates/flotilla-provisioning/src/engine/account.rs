@@ -22,9 +22,12 @@ use flotilla_engine_store::{
     plain::{Plain, PlainError, PlainLog},
     StoreLog,
 };
-use flotilla_resources::account_access::{
-    binding_name, requester_parts, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords, BindingRecord,
-    BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite,
+use flotilla_resources::{
+    account_access::{
+        binding_name, requester_parts, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords, BindingRecord,
+        BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite, CREW_HOME_KEY_LABEL,
+    },
+    label_value,
 };
 use flotilla_schema::{Identity, Kind, KindCode, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
@@ -143,7 +146,7 @@ impl EngineAccounts {
     }
 
     fn create(&self, pending: &PendingBinding) -> Result<(), String> {
-        let spec = binding_spec(&pending.spec);
+        let spec = binding_spec(&pending.spec, pending.home_key.clone());
         let name = engine_binding_name(&pending.name, spec.opened_at);
         locked(&self.bindings)
             .create(name.clone(), spec, &(), pending.spec.opened_at)
@@ -237,7 +240,7 @@ fn scan_home(read: &mut Read<'_>, home: &str) -> Result<(Bindings, Provisions), 
 }
 
 /// The engine's binding spec of an old-shape binding.
-pub fn binding_spec(old: &AccountBindingSpec) -> BindingSpec {
+pub fn binding_spec(old: &AccountBindingSpec, home_key: Option<String>) -> BindingSpec {
     BindingSpec {
         requester: old.requester.clone(),
         item: old.item.clone(),
@@ -250,6 +253,7 @@ pub fn binding_spec(old: &AccountBindingSpec) -> BindingSpec {
         selection: old.selection.clone(),
         epochs: old.epochs.clone(),
         opened_at: old.opened_at,
+        home_key,
     }
 }
 
@@ -277,6 +281,7 @@ fn record(binding: &Resource<AccountBinding>, home: &str) -> BindingRecord {
     BindingRecord {
         name: binding.name().to_owned(),
         home: home.to_owned(),
+        home_key: spec.home_key.clone(),
         version: binding.version().0.to_string(),
         spec: AccountBindingSpec {
             requester: spec.requester.clone(),
@@ -406,6 +411,15 @@ impl AccountRecords for EngineAccounts {
 
     async fn observe_epoch(&self, _namespace: &str, binding: &BindingRecord, epoch: EpochEntry) -> Result<(), String> {
         self.apply(binding, ObserveEpoch { epoch: epoch.epoch, observed_at: epoch.observed_at }, epoch.observed_at)
+    }
+
+    async fn record_home_key(&self, _namespace: &str, binding: &BindingRecord, key: &str) -> Result<(), String> {
+        if binding.home_key.as_deref() == Some(key) {
+            return Ok(());
+        }
+        // The import carries each old binding's key and admission assigns one at open, so an
+        // engine binding without one predates #3953 and was never backfilled before the roll.
+        Err(format!("account binding `{}` records its home key at open; it cannot be assigned later", binding.name))
     }
 
     async fn rebind(
@@ -603,7 +617,7 @@ pub fn rehearse_accounts(
     let mut taken = BTreeSet::new();
     for (old, home) in bindings {
         let refuse = |reason: String| ImportRefusal { kind: "AccountBinding", record: old.metadata.name.clone(), reason };
-        let spec = binding_spec(&old.spec);
+        let spec = binding_spec(&old.spec, label_value(&old.metadata.labels, CREW_HOME_KEY_LABEL).cloned());
         let Some(requester) = requester_name(&spec) else {
             report.refused.push(refuse(format!("requester `{}` names no convoy and role", spec.requester)));
             continue;

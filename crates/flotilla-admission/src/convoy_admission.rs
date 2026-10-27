@@ -1702,7 +1702,7 @@ impl ConvoyAdmission {
             Err(ResourceError::NotFound { .. }) => return Ok(Vec::new()),
             Err(error) => return Err(format!("read convoy `{convoy}`: {error}")),
         };
-        let keys = crate::account_access::recover_home_keys(&self.backend, namespace, &convoy.metadata.name).await?;
+        let keys = crate::account_access::recover_home_keys(&*self.accounts, namespace, &convoy.metadata.name).await?;
         if let Some(mut status) = convoy.status.clone() {
             if let Some(snapshot) = &mut status.workflow_snapshot {
                 if crate::account_access::apply_crew_home_keys(&convoy.metadata.name, &mut snapshot.vessels, &keys)? {

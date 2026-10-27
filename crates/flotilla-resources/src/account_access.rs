@@ -344,6 +344,9 @@ pub struct BindingRecord {
     /// The store's version, compared only for equality.
     pub version: String,
     pub spec: AccountBindingSpec,
+    /// The requester's home, relative to a place's writable base: admission's assignment,
+    /// recorded so delivery and staging never derive it (#3953).
+    pub home_key: Option<String>,
 }
 
 /// A provision as its readers see it.
@@ -361,6 +364,9 @@ pub struct PendingBinding {
     /// The requester's binding name ([`binding_name`]).
     pub name: String,
     pub spec: AccountBindingSpec,
+    /// The requester's home, relative to a place's writable base: admission's assignment,
+    /// recorded so delivery and staging never derive it (#3953).
+    pub home_key: Option<String>,
 }
 
 /// What changed, for the account controllers' wake-ups.
@@ -409,6 +415,8 @@ pub trait AccountRecords: Send + Sync {
     async fn regrant(&self, namespace: &str, binding: &BindingRecord, grants: BTreeMap<GrantName, GrantScope>) -> Result<(), String>;
     /// Appends the credential's next authorisation epoch to an open binding.
     async fn observe_epoch(&self, namespace: &str, binding: &BindingRecord, epoch: EpochEntry) -> Result<(), String>;
+    /// Records an open binding's home key, for a binding an earlier generation opened without one.
+    async fn record_home_key(&self, namespace: &str, binding: &BindingRecord, key: &str) -> Result<(), String>;
     /// An explicit rebind (#3882): the requester's open binding, if any, closes for `rebind` with
     /// `delivered_until`, kept for attribution, and `opened` opens in its place.
     async fn rebind(

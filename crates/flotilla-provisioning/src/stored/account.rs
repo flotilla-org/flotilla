@@ -58,6 +58,9 @@ pub struct BindingSpec {
     #[store(records)]
     pub epochs: Records<EpochEntry>,
     pub opened_at: Timestamp,
+    /// The requester's home, relative to a place's writable base, as admission assigned it
+    /// (#3953). Fixed at open.
+    pub home_key: Option<String>,
 }
 
 states! {

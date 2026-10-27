@@ -343,23 +343,23 @@ pub fn binding_record(
     epochs
         .append(1, EpochEntry { epoch: candidate.epoch.to_string(), observed_at: now })
         .map_err(|error| format!("epoch lineage: {error:?}"))?;
-    Ok(PendingBinding {
-        name: binding_name(convoy, &requester.role, &requester.access),
-        spec: AccountBindingSpec {
-            requester: requester_address(project, convoy, &requester.role)?,
-            item: requester.item.clone(),
-            requirement: requester.access.clone(),
-            credential: selected.credential.clone(),
-            account: candidate.account.clone(),
-            grants: candidate.grants.clone(),
-            candidates: alternatives.candidates.keys().cloned().collect(),
-            exclusions: alternatives.exclusions.clone(),
-            selection: selected.selection,
-            epochs,
-            opened_at: now,
-            state: State::new(BindingState::Open, now),
-        },
-    })
+    let name = binding_name(convoy, &requester.role, &requester.access);
+    let spec = AccountBindingSpec {
+        requester: requester_address(project, convoy, &requester.role)?,
+        item: requester.item.clone(),
+        requirement: requester.access.clone(),
+        credential: selected.credential.clone(),
+        account: candidate.account.clone(),
+        grants: candidate.grants.clone(),
+        candidates: alternatives.candidates.keys().cloned().collect(),
+        exclusions: alternatives.exclusions.clone(),
+        selection: selected.selection,
+        epochs,
+        opened_at: now,
+        state: State::new(BindingState::Open, now),
+    };
+    let home_key = assign_home_key(&name, &spec);
+    Ok(PendingBinding { name, spec, home_key })
 }
 
 /// Choose bindings for every requester of an admitted workflow at its final placements.
@@ -426,35 +426,42 @@ pub fn pending_home_keys(bindings: &[PendingBinding]) -> BTreeMap<String, String
         .iter()
         .filter_map(|binding| {
             let (_, role) = flotilla_resources::account_access::requester_parts(&binding.spec.requester)?;
-            let key =
-                binding_meta(&binding.name, &binding.spec).labels.get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL)?.clone();
-            Some((role, key))
+            Some((role, binding.home_key.clone()?))
         })
         .collect()
 }
 
+/// The account authority's assignment of a binding's requester home, if its provisioner has one.
+fn assign_home_key(name: &str, spec: &AccountBindingSpec) -> Option<String> {
+    let provisioners = flotilla_agent::account_access::AccountProvisioners::seeded();
+    match provisioners.for_access(&spec.requirement)?.home_key(spec) {
+        Ok(key) => Some(key),
+        Err(error) => {
+            tracing::warn!(binding = name, %error, "account authority could not assign requester home");
+            None
+        }
+    }
+}
+
 /// Recover previous-generation bindings at their authority before publishing caller home keys.
-pub async fn recover_home_keys(backend: &ResourceBackend, namespace: &str, convoy: &str) -> Result<BTreeMap<String, String>, String> {
-    let bindings = backend.using::<AccountBinding>(namespace);
-    let records = bindings
-        .list_matching_labels(&BTreeMap::from([(flotilla_resources::CONVOY_LABEL.into(), convoy.into())]))
-        .await
-        .map_err(|error| error.to_string())?;
+pub async fn recover_home_keys(accounts: &dyn AccountRecords, namespace: &str, convoy: &str) -> Result<BTreeMap<String, String>, String> {
     let mut keys = BTreeMap::new();
-    for mut binding in records.items {
+    for binding in accounts.convoy_bindings(namespace, convoy, true).await? {
         if !binding.spec.state.value.is_open() {
             continue;
         }
-        if !binding.metadata.labels.contains_key(flotilla_resources::account_access::CREW_HOME_KEY_LABEL) {
-            binding = bindings
-                .update(&binding_meta(&binding.metadata.name, &binding.spec), &binding.metadata.resource_version, &binding.spec)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        if let Some((_, role)) = flotilla_resources::account_access::requester_parts(&binding.spec.requester) {
-            if let Some(key) = binding.metadata.labels.get(flotilla_resources::account_access::CREW_HOME_KEY_LABEL) {
-                keys.insert(role, key.clone());
-            }
+        let key = match binding.home_key.clone() {
+            Some(key) => Some(key),
+            None => match assign_home_key(&binding.name, &binding.spec) {
+                Some(key) => {
+                    accounts.record_home_key(namespace, &binding, &key).await?;
+                    Some(key)
+                }
+                None => None,
+            },
+        };
+        if let (Some((_, role)), Some(key)) = (requester_parts(&binding.spec.requester), key) {
+            keys.insert(role, key);
         }
     }
     Ok(keys)

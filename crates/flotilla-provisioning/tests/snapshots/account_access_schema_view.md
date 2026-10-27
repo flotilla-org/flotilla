@@ -4,7 +4,7 @@ Kind tables only; the shared tables are in `account_access.sql`.
 
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
-| `account_binding` | root | 15 | 3: `selection` 3 | `account_binding_grants` (child), `account_binding_candidates` (child), `account_binding_exclusions` (child), `account_binding_epochs` (records) | `by_requester` (requester), `open_by_credential` (credential) |
+| `account_binding` | root | 16 | 3: `selection` 3 | `account_binding_grants` (child), `account_binding_candidates` (child), `account_binding_exclusions` (child), `account_binding_epochs` (records) | `by_requester` (requester), `open_by_credential` (credential) |
 | `account_binding_grants` | child | 3 | – | – | – |
 | `account_binding_candidates` | child | 2 | – | – | – |
 | `account_binding_exclusions` | child | 3 | – | – | – |
