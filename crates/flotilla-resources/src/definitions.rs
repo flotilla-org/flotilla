@@ -189,6 +189,8 @@ pub struct DefinitionRecord {
 /// lexically first home's. Writes are this home's alone.
 #[async_trait::async_trait]
 pub trait DefinitionRecords: Send + Sync + std::fmt::Debug {
+    /// This home: the writer of the records it holds.
+    fn home(&self) -> String;
     /// `kind`'s record `name`, as [`DefinitionRecords`] resolves several homes'.
     async fn get(&self, kind: &str, name: &str) -> Result<Option<DefinitionRecord>, String>;
     /// Every name of `kind`, each resolved as [`DefinitionRecords::get`].
@@ -197,8 +199,9 @@ pub trait DefinitionRecords: Send + Sync + std::fmt::Debug {
     async fn apply(&self, kind: &str, name: &str, origin: DefinitionOrigin, spec: serde_json::Value) -> Result<DefinitionRecord, String>;
     /// Deletes this home's record `name` of `kind`; absent is done. Another home's copy still reads.
     async fn delete(&self, kind: &str, name: &str) -> Result<(), String>;
-    /// A counter that moves whenever any home's definition records change, for watchers.
-    fn changes(&self) -> tokio::sync::watch::Receiver<u64>;
+    /// A tick for each pass that found any home's definition records changed since the pass
+    /// before, from the moment it is called; watchers read the records again on each.
+    async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String>;
 }
 
 #[cfg(test)]

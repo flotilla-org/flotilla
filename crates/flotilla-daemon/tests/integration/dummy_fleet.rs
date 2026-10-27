@@ -1096,6 +1096,43 @@ impl DummyDaemon {
             binding: None,
         };
         roots.create("manifest-transport", request, &(), at).expect("root record");
+        // #3824 layer 2b-ii: one record of each definition kind.
+        Self::seed_definitions(&flotilla_engine_store::plain::PlainLog::new(service.store()), at);
+    }
+
+    fn seed_definitions(log: &flotilla_engine_store::plain::PlainLog, at: flotilla_schema::Timestamp) {
+        use flotilla_provisioning::stored::definition::{
+            CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, DefinitionOrigin, FleetDesignationDefinition,
+            ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
+        };
+        fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+            serde_json::from_value(value).expect("fixture spec")
+        }
+        let builtin = |kind: &str| flotilla_resources::builtins::builtin_definitions(kind).expect("built-ins")[0].spec.clone();
+        let origin = || DefinitionOrigin::Operator;
+        let forge: flotilla_resources::ForgeSpec = decode(serde_json::json!({
+            "forge_id": "transport", "kind": "forgejo", "hosts": ["transport.example"],
+            "https_url": "https://transport.example", "git_ssh_host": "transport.example"
+        }));
+        log.create("transport", &ForgeDefinition::new(origin(), &forge), "transport", at).expect("forge record");
+        let fleet: flotilla_resources::FleetDesignationSpec = decode(serde_json::json!({"project": "transport"}));
+        log.create("transport-fleet", &FleetDesignationDefinition::new(origin(), &fleet), "transport", at).expect("fleet record");
+        let credential: flotilla_resources::CredentialSpecSpec = decode(serde_json::json!({
+            "consumer": {"adapter": "claude-oauth", "account_email": "transport@example.invalid"},
+            "lifecycle": "static", "source": {"kind": "file", "path": "/transport/token"}
+        }));
+        log.create("transport-credential", &CredentialSpecDefinition::new(origin(), &credential), "transport", at).expect("spec record");
+        let grant: flotilla_resources::CredentialGrantSpec =
+            decode(serde_json::json!({"credentials": ["transport-credential"], "selector": {"projects": ["transport"]}}));
+        log.create("transport-grant", &CredentialGrantDefinition::new(origin(), &grant), "transport", at).expect("grant record");
+        log.create("transport-defaults", &CrewDefaultsDefinition::new(origin(), &Default::default()), "transport", at)
+            .expect("defaults record");
+        let layer: flotilla_resources::ImageLayerResourceSpec = decode(builtin("ImageLayer"));
+        let flotilla_resources::ImageLayerResourceSpec::Current(layer) = layer else { panic!("a built-in layer is current") };
+        log.create("transport-layer", &ImageLayerDefinition::new(origin(), &layer).expect("layer"), "transport", at).expect("layer record");
+        let template: flotilla_resources::WorkflowTemplateSpec = decode(builtin("WorkflowTemplate"));
+        log.create("transport-template", &WorkflowTemplateDefinition::new(origin(), &template).expect("template"), "transport", at)
+            .expect("template record");
     }
 
     fn transport_binding(&self, at: flotilla_schema::Timestamp) -> flotilla_provisioning::stored::account::BindingSpec {
@@ -1192,6 +1229,13 @@ impl DummyDaemon {
                 collect!(flotilla_provisioning::stored::account::AccountBinding);
                 collect!(stored flotilla_provisioning::stored::account::ProvisionSpec);
                 collect!(flotilla_provisioning::stored::manifest_root::ManifestRoot);
+                collect!(stored flotilla_provisioning::stored::definition::ForgeDefinition);
+                collect!(stored flotilla_provisioning::stored::definition::FleetDesignationDefinition);
+                collect!(stored flotilla_provisioning::stored::definition::CredentialSpecDefinition);
+                collect!(stored flotilla_provisioning::stored::definition::CredentialGrantDefinition);
+                collect!(stored flotilla_provisioning::stored::definition::CrewDefaultsDefinition);
+                collect!(stored flotilla_provisioning::stored::definition::ImageLayerDefinition);
+                collect!(stored flotilla_provisioning::stored::definition::WorkflowTemplateDefinition);
                 assert_eq!(covered, registered, "every registered engine kind needs a transport fixture");
                 Ok(snapshots)
             })
