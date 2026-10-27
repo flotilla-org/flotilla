@@ -985,7 +985,6 @@ impl DummyDaemon {
 
 // A real governor must resume a stalled coder and deliver its engine Convoy.
 #[tokio::test(start_paused = true)]
-#[ignore = "flotilla#3893: crew stall stays at the operator rung despite the declared healthy governor; no crew-supervised ruling is available"]
 async fn on_the_engine_crew_supervision_resumes_a_stalled_coder() {
     supervised_coder_scenario(CrewSupervisionAction::Resume).await;
 }
@@ -993,7 +992,6 @@ async fn on_the_engine_crew_supervision_resumes_a_stalled_coder() {
 // A failing crew proposes failure; its named governor must fail it while its
 // engine promises stay unmet and its supervision is recorded on the engine.
 #[tokio::test(start_paused = true)]
-#[ignore = "flotilla#3893: failing coder remains at the operator rung despite the declared healthy governor; crew failure ruling cannot be authenticated"]
 async fn on_the_engine_crew_supervision_fails_a_failing_coder() {
     supervised_coder_scenario(CrewSupervisionAction::Fail).await;
 }

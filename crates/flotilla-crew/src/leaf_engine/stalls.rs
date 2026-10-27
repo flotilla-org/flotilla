@@ -1130,9 +1130,22 @@ impl ReconcilerWake {
                             able = false;
                             break;
                         }
+                        // A crew's own stall declaration outranks other unable evidence (#3893).
+                        if source == StallEvidenceSource::Crew
+                            && unable.as_ref().is_some_and(|(_, _, first)| *first != StallEvidenceSource::Crew)
+                        {
+                            unable = None;
+                        }
                         unable.get_or_insert((row, evidence, source))
                     }
                 };
+            }
+            // A crew's own stall declaration is its evidence: another crew's able or
+            // unjudged row (such as its idle supervisor) must not hold it at the operator rung.
+            // That includes the exhausted-ladder skip below: a consumed ladder stays consumed.
+            if unable.as_ref().is_some_and(|(_, _, source)| *source == StallEvidenceSource::Crew) {
+                able = false;
+                unknown = false;
             }
             let policy = super::supervision::supervision_policy(&read_backend, namespace, convoy, &projects.items).await?;
             // An exhausted cursor on a crew target is a legacy failed lookup,
