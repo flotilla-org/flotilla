@@ -84,6 +84,13 @@ pub async fn session_card(
         }
         _ => None,
     };
+    let checkouts = flotilla_agent::adapter::multi_repository_checkouts(
+        &convoy.spec,
+        &repository_scope
+            .clone()
+            .unwrap_or_else(|| convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>()),
+        &spec.cwd,
+    );
     if let Some(scope) = repository_scope {
         text.push_str(&format!(
             "Your vessel's repository scope: {}.\n",
@@ -94,6 +101,13 @@ pub async fn session_card(
     text.push_str(&account_card(accounts, namespace, convoy_name, &spec.role).await?);
     text.push_str(&credential_card(credentials));
     text.push_str(&format!("\n### Session\nYou work at `{}` in environment `{}`.\n", spec.cwd, spec.env_ref));
+    if !checkouts.is_empty() {
+        text.push_str("The work directory is the common parent of one checkout per repository; it is not itself a git repository:\n");
+        for (repository, path) in &checkouts {
+            let branch = convoy.spec.r#ref.as_deref().map(|branch| format!(", branch `{branch}`")).unwrap_or_default();
+            text.push_str(&format!("- `{path}` — {}{branch}, remote {}\n", repository.repo_ref, repository.url));
+        }
+    }
     let environment =
         backend.including_replicas::<Environment>(namespace).get(&spec.env_ref).await.map_err(|error| error.to_string())?.object;
     // Backing host/image identities are not reachable capabilities; an equivalent

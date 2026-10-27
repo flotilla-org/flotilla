@@ -218,6 +218,7 @@ impl PartialEq for CrewRoutingContext {
 }
 impl Eq for CrewRoutingContext {}
 
+#[allow(clippy::too_many_arguments)]
 fn handoff_crew_brief(
     context: &ResolvedCrewContext,
     convoy: &flotilla_resources::ResourceObject<ResourceConvoy>,
@@ -226,6 +227,7 @@ fn handoff_crew_brief(
     members: &[CrewListMember],
     requirement: &flotilla_resources::VesselRequirement,
     render_options: &flotilla_agent::adapter::CrewBriefRenderOptions,
+    work_dir: Option<&str>,
 ) -> Result<TerminalBrief, String> {
     let repository_refs = requirement
         .repository_refs
@@ -258,7 +260,13 @@ fn handoff_crew_brief(
         render_options,
     );
     let mut brief = brief?;
-    flotilla_agent::adapter::append_convoy_work_context(&mut brief.content, convoy, &repository_refs, &requirement.credential_scopes);
+    flotilla_agent::adapter::append_convoy_work_context(
+        &mut brief.content,
+        convoy,
+        &repository_refs,
+        &requirement.credential_scopes,
+        work_dir,
+    );
     Ok(brief)
 }
 
@@ -2323,8 +2331,16 @@ impl CrewService {
                         target,
                     );
                     render_options.has_credential_scope = !task.credential_scopes.is_empty();
-                    let mut brief =
-                        handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, task, &render_options)?;
+                    let mut brief = handoff_crew_brief(
+                        &context,
+                        &convoy,
+                        target,
+                        prompt.as_deref(),
+                        &current.members,
+                        task,
+                        &render_options,
+                        Some(&anchor.spec.cwd),
+                    )?;
                     if let Some(project) = convoy.spec.project_ref.as_deref() {
                         let address = format!("{project}/{}/{}/{target}", context.convoy, context.vessel);
                         let book = flotilla_messaging::crew_address_book(&self.resource_backend, &context.namespace, &address)

@@ -1256,6 +1256,7 @@ impl ConvoyAdmission {
                     &convoy,
                     &repository_refs,
                     &requirement.credential_scopes,
+                    None,
                 );
                 if let Some(project) = spec.project_ref.as_deref() {
                     let address = format!("{project}/{name}/{}/{}", requirement.name, process.role);

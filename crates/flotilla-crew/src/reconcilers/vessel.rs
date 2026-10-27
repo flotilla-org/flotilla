@@ -1514,7 +1514,13 @@ impl VesselReconciler {
                                     Ok(brief) => brief,
                                     Err(message) => return Ok(VesselPrepared::failed(message)),
                                 };
-                                append_convoy_work_context(&mut brief.content, &convoy, &repository_refs, &requirement.credential_scopes);
+                                append_convoy_work_context(
+                                    &mut brief.content,
+                                    &convoy,
+                                    &repository_refs,
+                                    &requirement.credential_scopes,
+                                    Some(&terminal_cwd),
+                                );
                                 if let Some(project) = convoy.spec.project_ref.as_deref() {
                                     let address = format!("{project}/{}/{}/{}", convoy.metadata.name, obj.spec.vessel_name, process.role);
                                     let book = flotilla_messaging::crew_address_book(&self.backend, &self.namespace, &address).await?;
