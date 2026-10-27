@@ -630,3 +630,35 @@ fn landing_session_teardown_does_not_stall(tc: hegel::TestCase) {
         }
     });
 }
+
+// #4038: a Pending convoy waiting for host capacity holds a stall that only the
+// Convoy controller owns. The judge keeps it, so it is neither cleared nor
+// restarted every few seconds.
+#[tokio::test]
+async fn judge_keeps_the_convoy_controllers_capacity_stall() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let wake = supervision_wake(&backend);
+    let began_at = Utc::now() - chrono::Duration::minutes(5);
+    let stall = flotilla_resources::StalledCondition {
+        leaves: Vec::new(),
+        maker: None,
+        evidence: "capacity for fulfilment `docker-crew-image` on host `feta` is unavailable (no free vessel slots)".into(),
+        source: StallEvidenceSource::LeafEngine,
+        cause: Some(flotilla_resources::StallCause::Capacity),
+        began_at,
+        rung: StallRung::Operator,
+        supervisor: None,
+        supervision_message: None,
+        supervision_index: None,
+        supervision_exhausted: false,
+        reason: None,
+        proposed_disposition: None,
+        nudge_history: Vec::new(),
+    };
+    create_convoy(&backend, "waiting", ConvoyStatus { stalled: Some(stall.clone()), ..Default::default() }).await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let objects = HashMap::from([("waiting".into(), convoys.get("waiting").await.unwrap())]);
+    wake.sync_rows("flotilla", &objects).await.unwrap();
+    wake.judge_stalls("flotilla", &objects).await.unwrap();
+    assert_eq!(convoys.get("waiting").await.unwrap().status.unwrap().stalled, Some(stall));
+}
