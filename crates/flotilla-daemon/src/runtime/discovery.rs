@@ -648,9 +648,10 @@ pub(super) async fn observe_fulfilment_facts(
             debug!(kind = %kind.metadata.name, ?provider_kind, "cannot observe fulfilment facts without an unambiguous environment provider");
             // Absence or ambiguity cannot attest a runtime endpoint. Replace
             // stale affirmative evidence with a fresh unknown observation.
+            // Unknown is not an observation, so the kind's grants stay as
+            // they are.
             let unknown =
                 FulfilmentFacts { image: image.map(Into::into), observed_at: Utc::now(), free_vessel_slots, ..Default::default() };
-            observe_grants(&kind_store, &kind, &unknown).await;
             facts.insert(kind.metadata.name, unknown);
             continue;
         };

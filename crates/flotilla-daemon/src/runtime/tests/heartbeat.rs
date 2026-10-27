@@ -900,4 +900,51 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
     let reused = observe(first.clone()).await;
     assert_eq!(reused["docker-feta"].observed_at, first["docker-feta"].observed_at, "the recent probe is reused");
     assert_eq!(reused["docker-feta"].free_vessel_slots, Some(1));
+
+    // Removing the cap from daemon.toml clears it from the Host on the next
+    // registration, and the kind is unbounded again.
+    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "feta", None).await.expect("host re-registration");
+    let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(&host_id).await.expect("host");
+    assert_eq!(host.spec.max_vessels, None);
+    assert_eq!(observe(reused).await["docker-feta"].free_vessel_slots, None);
+}
+
+// #4002: an unknown observation is not one. A host-direct kind keeps its GUI
+// grant when no environment provider can probe its host.
+#[tokio::test]
+async fn unknown_observation_keeps_a_gui_grant() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"unknown-gui-test\"\n").expect("daemon config");
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi", None).await.expect("host registration");
+    let policy = PlacementPolicySpec::builder()
+        .pool("passthrough".to_string())
+        .host_direct(HostDirectPlacementPolicySpec { host_ref: host_id.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
+        .build();
+    let mut observed = FulfilmentKindSpec::from_policy(&policy, "macos").expect("host-direct kind");
+    observed.grants.insert(FulfilmentGrant::gui_session());
+    let kinds = daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);
+    kinds.create(&empty_meta("host-direct-kiwi"), &observed).await.expect("kind with an observed GUI");
+    let runner = Arc::new(DiscoveryMockRunner::builder().build());
+    let facts = observe_fulfilment_facts(
+        &daemon.resource_backend(),
+        NAMESPACE,
+        &host_id,
+        &["passthrough".to_string()],
+        &BTreeMap::new(),
+        FulfilmentProbeContext {
+            providers: &flotilla_discovery::registry::ProviderRegistry::new(),
+            runner: runner.as_ref(),
+            env: &TestEnvVars::default(),
+            scratch: Path::new("/tmp/flotilla-probe-test"),
+            observation: &Default::default(),
+        },
+        &mut ModelProbeState::default(),
+    )
+    .await
+    .expect("observe without a provider");
+    assert!(!facts["host-direct-kiwi"].gui_session_logged_in, "the published fact is unknown");
+    let kind = kinds.get("host-direct-kiwi").await.expect("kind");
+    assert!(kind.spec.grants.contains(&FulfilmentGrant::gui_session()), "{:?}", kind.spec.grants);
 }
