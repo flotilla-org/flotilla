@@ -1,3 +1,4 @@
+use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};
 
 use crate::{ApiPaths, InputMeta, NoStatusPatch, ReplicationClass, Resource, ResourceError};
@@ -39,7 +40,7 @@ pub struct FleetDesignationSpec {
     pub image_cache: Option<ImageCacheBinding>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(deny_unknown_fields)]
 pub struct ImageCacheBinding {
     /// Registry host and repository prefix, without a tag or digest.

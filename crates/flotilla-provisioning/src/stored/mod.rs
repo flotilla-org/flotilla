@@ -32,6 +32,7 @@
 pub mod account;
 pub mod checkout;
 pub mod clone;
+pub mod definition;
 pub mod environment;
 pub mod image_build;
 pub mod terminal_session;

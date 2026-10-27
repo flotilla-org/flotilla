@@ -105,6 +105,9 @@ pub struct ImportReport {
     pub refused: Vec<ImportRefusal>,
     /// Imported, but on an assumption worth reading (a convoy the listing did not show, say).
     pub notes: Vec<String>,
+    /// Rows not carried onto the engine, by kind and reason (a built-in's stored copy, say). Each
+    /// count is of old rows: every copy of a dropped name, whatever the reason.
+    pub dropped: BTreeMap<(&'static str, &'static str), usize>,
 }
 
 impl ImportReport {

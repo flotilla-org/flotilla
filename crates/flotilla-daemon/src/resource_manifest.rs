@@ -30,11 +30,12 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-pub const MANIFEST_MANAGED_BY_VALUE: &str = "manifest";
-pub const MANIFEST_SOURCE_ANNOTATION: &str = "flotilla.work/manifest-source";
-pub const MANIFEST_PATH_ANNOTATION: &str = "flotilla.work/manifest-path";
-pub const MANIFEST_REVISION_ANNOTATION: &str = "flotilla.work/manifest-revision";
-pub const MANIFEST_RECONCILER_ROOT_ANNOTATION: &str = "flotilla.work/manifest-reconciler-root";
+// Declared in flotilla-resources for the definitions import (#3824 layer 2b); this path goes with
+// the annotation writers when the definitions move onto the engine (layer 2b-ii).
+pub use flotilla_resources::definition_provenance::{
+    MANIFEST_MANAGED_BY_VALUE, MANIFEST_PATH_ANNOTATION, MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_REVISION_ANNOTATION,
+    MANIFEST_SOURCE_ANNOTATION,
+};
 pub const LAST_APPLIED_HASH_ANNOTATION: &str = "flotilla.work/last-applied-hash";
 pub const MANIFEST_BASELINE_HASH_ANNOTATION: &str = "flotilla.work/manifest-baseline-hash";
 // ADR 0047: one-roll read/cleanup compatibility for metadata written before

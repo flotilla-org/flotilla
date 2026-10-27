@@ -3,10 +3,11 @@ use flotilla_resources::WorkflowTemplateSpec;
 pub use flotilla_resources::ENSURED_FROM_ANNOTATION;
 use serde::Deserialize;
 
-pub const MATERIALIZED_PROJECT_ANNOTATION: &str = "flotilla.work/materialized-project";
-pub const SOURCE_REPOSITORY_ANNOTATION: &str = "flotilla.work/source-repository";
-pub const SOURCE_COMMIT_ANNOTATION: &str = "flotilla.work/source-commit";
-pub const SOURCE_ENTRY_PATH_ANNOTATION: &str = "flotilla.work/source-entry-path";
+// Declared in flotilla-resources for the definitions import (#3824 layer 2b); this path goes with
+// the annotation writers when the definitions move onto the engine (layer 2b-ii).
+pub use flotilla_resources::definition_provenance::{
+    MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
+};
 pub const VERIFICATION_PROJECT_ANNOTATION: &str = "flotilla.work/verification-command-project";
 pub const VERIFICATION_PROVENANCE_ANNOTATION: &str = "flotilla.work/verification-command-provenance";
 pub const ENSURE_PROVENANCE_ANNOTATION: &str = "flotilla.work/ensure-provenance";

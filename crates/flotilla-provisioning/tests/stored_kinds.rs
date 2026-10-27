@@ -55,6 +55,22 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("AccountBinding"), Some(KindCode::new("ab")));
     assert_eq!(held("AccountProvision"), Some(KindCode::new("ap")));
     assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 7);
+    // The definition kinds (#3824 layer 2b) join the decided store with their writers (2b-ii);
+    // their codes are pinned beside every production kind now.
+    let mut registry = registry;
+    stored::definition::register(&mut registry).expect("no definition code is held by a production kind");
+    let held = |kind: &str| registry.iter().find(|set| set.kind == kind).map(|set| set.code);
+    for (kind, code) in [
+        ("Forge", "fo"),
+        ("FleetDesignation", "fl"),
+        ("CredentialSpec", "cp"),
+        ("CredentialGrant", "gt"),
+        ("CrewDefaults", "dc"),
+        ("ImageLayer", "il"),
+        ("WorkflowTemplate", "wt"),
+    ] {
+        assert_eq!(held(kind), Some(KindCode::new(code)), "{kind}");
+    }
 }
 
 // Behaviour (#3392 A1, lane 3 ruling 1): removing an identity checks every reference to it by a
