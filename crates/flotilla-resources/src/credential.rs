@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass, RepositoryKey};
@@ -89,10 +90,12 @@ fn is_initial_authorization_epoch(epoch: &u32) -> bool {
     *epoch == INITIAL_AUTHORIZATION_EPOCH
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(tag = "adapter", rename_all = "kebab-case")]
 pub enum CredentialConsumer {
+    #[store(code = "gh")]
     Gh,
+    #[store(code = "ga")]
     GithubApp {
         /// REST App bot login, including `[bot]`. Old declarations decode without it
         /// for one fleet generation; update project-map credential manifests in this roll.
@@ -103,25 +106,22 @@ pub enum CredentialConsumer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         installation_repository: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[store(cbor)]
         permissions: Option<BTreeMap<String, String>>,
     },
-    Forgejo {
-        forge_ref: String,
-        username: String,
-    },
-    GitHttpToken {
-        host: String,
-        username: String,
-    },
+    #[store(code = "fj")]
+    Forgejo { forge_ref: String, username: String },
+    #[store(code = "gt")]
+    GitHttpToken { host: String, username: String },
+    #[store(code = "cl")]
     Claude,
-    ClaudeOauth {
-        account_email: String,
-    },
+    #[store(code = "co")]
+    ClaudeOauth { account_email: String },
+    #[store(code = "cx")]
     Codex,
-    DockerRegistry {
-        registry: String,
-        username: String,
-    },
+    #[store(code = "dr")]
+    DockerRegistry { registry: String, username: String },
+    #[store(code = "rb")]
     ReviewBundleStore {
         endpoint: String,
         bucket: String,
@@ -292,31 +292,32 @@ fn validate_github_app_permissions(permissions: &BTreeMap<String, String>) -> Re
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum CredentialSource {
-    File {
-        path: String,
-    },
-    Env {
-        name: String,
-    },
+    #[store(code = "fi")]
+    File { path: String },
+    #[store(code = "en")]
+    Env { name: String },
+    #[store(code = "ic")]
     IssueCommand {
         command: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[store(cbor)]
         args: Vec<String>,
     },
-    GithubApp {
-        app_id_path: String,
-        private_key_path: String,
-    },
+    #[store(code = "ga")]
+    GithubApp { app_id_path: String, private_key_path: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(rename_all = "lowercase")]
 pub enum CredentialLifecycle {
+    #[store(code = "st")]
     Static,
+    #[store(code = "rf")]
     Refreshable,
+    #[store(code = "is")]
     Issued,
 }
 
@@ -394,20 +395,25 @@ pub struct CredentialGrantSelector {
     pub repository_trust: Option<RepositoryTrust>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(rename_all = "lowercase")]
 pub enum RepositoryTrust {
+    #[store(code = "ow")]
     Own,
+    #[store(code = "fk")]
     Fork,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Stored)]
 #[serde(rename_all = "kebab-case")]
 pub enum HostImageAction {
+    #[store(code = "pl")]
     ImagePull,
+    #[store(code = "ps")]
     ImagePush,
     /// A named build secret mounted into an image build on this host
     /// (ADR 0062). Only the build service receives the material.
+    #[store(code = "bs")]
     ImageBuildSecret,
 }
 

@@ -2,6 +2,7 @@
 //! stay local; this module resolves shape without inventing standing roles.
 use std::collections::BTreeMap;
 
+use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};
 
 use crate::{CrewDefaultsSpec, ProjectHierarchy, ProjectSpec, ResourceError, SkillLayer};
@@ -9,7 +10,7 @@ use crate::{CrewDefaultsSpec, ProjectHierarchy, ProjectSpec, ResourceError, Skil
 /// Partial role shape. Each declared scalar replaces that field independently.
 /// `brief_template` is MiniJinja source, with `builtin/crew.md` available for
 /// inheritance. It is carried in Definitions, never read from an ops checkout.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder, Stored)]
 #[serde(deny_unknown_fields)]
 pub struct RoleDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -23,6 +24,7 @@ pub struct RoleDefinition {
     /// Topic addresses are local to the declaring Project. Shape inherits, but
     /// subscribers exist only where a role holder is declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[store(cbor)]
     pub subscriptions: Option<Vec<RoleSubscription>>,
     /// An adoptable holder is supplied by the session adoption controller.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -32,6 +32,7 @@
 pub mod account;
 pub mod checkout;
 pub mod clone;
+pub mod definition;
 pub mod environment;
 pub mod image_build;
 pub mod terminal_session;
@@ -82,6 +83,7 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     register_provisioning(registry)?;
     registry.register::<Resource<terminal_session::TerminalSession>>()?;
     account::register(registry)?;
+    definition::register(registry)?;
     Ok(())
 }
 

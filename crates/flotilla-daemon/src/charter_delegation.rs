@@ -23,10 +23,10 @@ use sha2::{Digest, Sha256};
 
 use crate::resource_manifest::{parse_document_contents, LoadedManifestFile};
 
-pub(crate) const CHARTER_SOURCE: &str = "flotilla.work/charter-source";
+pub(crate) use flotilla_resources::definition_provenance::{
+    CHARTER_REVISION_ANNOTATION as CHARTER_REVISION, CHARTER_SCOPE_ANNOTATION as CHARTER_SCOPE, CHARTER_SOURCE_ANNOTATION as CHARTER_SOURCE,
+};
 const MAX_REPOSITORY_FETCHES: usize = 32;
-pub(crate) const CHARTER_REVISION: &str = "flotilla.work/charter-revision";
-pub(crate) const CHARTER_SCOPE: &str = "flotilla.work/charter-scope";
 
 #[async_trait]
 pub(crate) trait CharterReader: Send + Sync {

@@ -6,6 +6,7 @@
 //! declared `FROM` contract.
 use std::collections::{BTreeMap, BTreeSet};
 
+use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -205,21 +206,28 @@ pub struct ImageLayerSpec {
 }
 
 /// Fixed composition order, most stable first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageLayerTier {
+    #[store(code = "ba")]
     Base,
+    #[store(code = "sh")]
     Shared,
+    #[store(code = "pr")]
     Project,
+    #[store(code = "ar")]
     AgentRuntime,
 }
 
 /// Definition source, ordered by increasing resolution precedence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageLayerSource {
+    #[store(code = "sl")]
     Stdlib,
+    #[store(code = "in")]
     Installation,
+    #[store(code = "pr")]
     Project,
 }
 

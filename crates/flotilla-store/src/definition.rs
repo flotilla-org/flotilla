@@ -401,6 +401,20 @@ pub(crate) fn merge_cached_definitions<T: Resource>(
         .map(|objects| objects.into_iter().filter(definition_is_visible).collect())
 }
 
+/// One definition's copies, each with the home that wrote it, merged as every reader of the old
+/// store merges them: what the cut-over import (#3824 layer 2b) carries onto the engine. The merge
+/// metadata on the result names any field still in conflict.
+pub fn merge_definition_copies<T: Resource>(copies: Vec<(ResourceObject<T>, NodeId)>) -> Result<ResourceObject<T>, ResourceError> {
+    let sources: Vec<_> = copies.into_iter().map(|(object, origin)| DefinitionSource { object, origin, synced_at: None }).collect();
+    merge_sources(&sources)
+}
+
+/// Whether a merged definition reads as live: not deleted, or deleted while the deletion itself is
+/// in conflict.
+pub fn definition_is_live<T: Resource>(object: &ResourceObject<T>) -> bool {
+    definition_is_visible(object)
+}
+
 /// The built-in definitions of `kind` (#3824 layer 2a) as objects of `T` in `namespace`: never
 /// stored, so their version is fixed and they carry no merge metadata.
 pub(crate) fn builtin_objects<T: Resource>(kind: &str, namespace: &str) -> Result<Vec<ResourceObject<T>>, ResourceError> {

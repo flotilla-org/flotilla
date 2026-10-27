@@ -54,7 +54,18 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("TerminalSession"), Some(KindCode::new("ts")));
     assert_eq!(held("AccountBinding"), Some(KindCode::new("ab")));
     assert_eq!(held("AccountProvision"), Some(KindCode::new("ap")));
-    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 7);
+    for (kind, code) in [
+        ("Forge", "fo"),
+        ("FleetDesignation", "fl"),
+        ("CredentialSpec", "cp"),
+        ("CredentialGrant", "gt"),
+        ("CrewDefaults", "dc"),
+        ("ImageLayer", "il"),
+        ("WorkflowTemplate", "wt"),
+    ] {
+        assert_eq!(held(kind), Some(KindCode::new(code)), "{kind}");
+    }
+    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 14);
 }
 
 // Behaviour (#3392 A1, lane 3 ruling 1): removing an identity checks every reference to it by a

@@ -64,11 +64,12 @@ pub use forge_read::{
     forge_read_name, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus, ForgeReadRequest, ForgeReadSpec,
     ForgeReadStatus,
 };
+#[doc(hidden)]
+pub mod definition_provenance;
 mod fulfilment_kind;
 #[doc(hidden)]
 pub mod host;
 mod issue;
-#[doc(hidden)]
 pub mod labels;
 mod landing_gate;
 mod leaf;

@@ -29,6 +29,7 @@
 pub mod account;
 pub mod checkout;
 pub mod clone;
+pub mod definition_import;
 pub mod environment;
 pub mod image_build;
 pub mod import;

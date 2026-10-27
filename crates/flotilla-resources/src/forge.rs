@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};
 
 use crate::{status_patch::NoStatusPatch, ApiPaths, InputMeta, ReplicationClass, Resource, ResourceError};
@@ -78,10 +79,12 @@ pub struct ForgeSpec {
     pub git_ssh_host: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(rename_all = "snake_case")]
 pub enum ForgeKind {
+    #[store(code = "gh")]
     Github,
+    #[store(code = "fj")]
     Forgejo,
 }
 

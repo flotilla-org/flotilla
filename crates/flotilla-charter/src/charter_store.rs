@@ -257,7 +257,7 @@ pub const PROJECT_IMAGE_LAYER_PATH: &str = ".flotilla/image";
 pub const CHARTER_IMAGE_LAYER_PATH: &str = "image";
 
 /// Marks ImageLayers the primary-repository sync authored.
-pub const PROJECT_IMAGE_MANAGER: &str = "project-image";
+pub use flotilla_resources::definition_provenance::PROJECT_IMAGE_MANAGER;
 
 /// Every regular file of one layer directory at one revision, keyed by path
 /// relative to the directory. Unlike charter reads, no extension filter
