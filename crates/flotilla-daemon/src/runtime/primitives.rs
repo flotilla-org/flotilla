@@ -42,7 +42,7 @@ use tracing::{debug, warn, Instrument};
 
 use super::{
     state::ControllerRuntimeState,
-    terminal::{submit_and_confirm, PendingTerminalDelivery, TerminalControllerRuntime},
+    terminal::{submit_and_confirm, EngineTurn, PendingTerminalDelivery, TerminalControllerRuntime},
 };
 
 /// Marks a terminal delivery reserved by this adapter in the shared map.
@@ -410,8 +410,8 @@ impl MessageDelivery {
         }
         let session = holder.session_id.clone();
         let typed = text.clone();
-        let engine_turn = tokio_util::sync::CancellationToken::new();
-        let teardown = engine_turn.clone();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let teardown = stop.clone();
         let trace_spans: Vec<_> = members.iter().map(|message| flotilla_tracing::queued_span(message, "attempt")).collect();
         let primary_span = trace_spans.first().cloned().unwrap_or_else(tracing::Span::none);
         let task = tokio::spawn(
@@ -431,7 +431,12 @@ impl MessageDelivery {
         );
         deliveries.insert(
             holder.session_id.clone(),
-            PendingTerminalDelivery { message_batch: Some(ENGINE_BATCH.into()), message: text, task, engine_turn: Some(engine_turn) },
+            PendingTerminalDelivery {
+                message_batch: Some(ENGINE_BATCH.into()),
+                message: text,
+                task,
+                engine_turn: Some(EngineTurn::new(stop)),
+            },
         );
         self.inflight.insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members });
         Ok(())

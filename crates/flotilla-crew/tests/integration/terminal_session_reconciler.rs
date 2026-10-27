@@ -1226,6 +1226,11 @@ async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
     let runtime = Arc::new(RecordingTerminalRuntime::default());
     let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
 
+    // A turn still settling defers the kill without blocking (#3894).
+    runtime.settling.store(true, Ordering::SeqCst);
+    assert!(matches!(reconciler.run_finalizer(&session).await, Err(ResourceError::FinalizerPending)));
+    assert!(runtime.killed.lock().expect("killed mutex").is_empty(), "nothing killed while a turn settles");
+    runtime.settling.store(false, Ordering::SeqCst);
     reconciler.run_finalizer(&session).await.expect("terminal finalizer should kill the session");
 
     assert_eq!(runtime.killed.lock().expect("killed mutex").as_slice(), &[("terminal-convoy-work-coder".to_string(), spec)]);
@@ -1235,6 +1240,7 @@ async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
 #[derive(Default)]
 struct RecordingTerminalRuntime {
     killed: Mutex<Vec<(String, TerminalSessionSpec)>>,
+    settling: AtomicBool,
 }
 
 #[async_trait]
@@ -1246,6 +1252,10 @@ impl TerminalRuntime for RecordingTerminalRuntime {
         _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("terminal finalization must not ensure a new session")
+    }
+
+    async fn teardown_pending(&self, _session_id: &str) -> bool {
+        self.settling.load(Ordering::SeqCst)
     }
 
     async fn kill_session(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<(), String> {

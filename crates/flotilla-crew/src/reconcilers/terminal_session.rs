@@ -160,6 +160,12 @@ pub trait TerminalRuntime: Send + Sync {
     ) -> Result<TerminalDeliveryOutcome, String> {
         Err("terminal runtime does not support crew message delivery".to_string())
     }
+    /// Whether teardown waits before killing this session, without blocking:
+    /// a turn already typed into it is still settling, so its receipt can be
+    /// recorded (#3894). Asked on each finalizer pass; runtimes bound the wait.
+    async fn teardown_pending(&self, _session_id: &str) -> bool {
+        false
+    }
     async fn kill_session(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<(), String>;
     /// Receipt-backed runtimes remove exactly this launch. Provider-native
     /// process observers without receipt files may keep the no-op default.
@@ -1050,6 +1056,9 @@ where
         // available, so there is nothing left for either runtime hook to clean.
         if environment_exists {
             if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
+                if self.runtime.teardown_pending(session_id).await {
+                    return Err(ResourceError::FinalizerPending);
+                }
                 if let Err(error) = self.runtime.kill_session(session_id, obj.into()).await {
                     errors.push(error);
                 }

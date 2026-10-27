@@ -50,10 +50,23 @@ pub(super) struct PendingTerminalDelivery {
     pub(super) message_batch: Option<String>,
     pub(super) message: String,
     pub(super) task: JoinHandle<Result<TerminalDeliveryOutcome, String>>,
-    /// Present for an engine turn, which owns its receipt: teardown cancels the
-    /// token to stop a turn not yet typed, and lets a typed turn settle,
-    /// reserved, so the delivery adapter records its receipt (#3894).
-    pub(super) engine_turn: Option<tokio_util::sync::CancellationToken>,
+    /// Present for an engine turn, which owns its receipt (#3894).
+    pub(super) engine_turn: Option<EngineTurn>,
+}
+
+/// An engine turn's teardown state: teardown stops a turn not yet typed, and
+/// lets a typed one settle, reserved, so the delivery adapter records its receipt.
+pub(super) struct EngineTurn {
+    /// Cancelled by teardown; the turn stops if it has not yet been typed.
+    pub(super) stop: tokio_util::sync::CancellationToken,
+    /// When teardown first waited on this turn.
+    pub(super) teardown_since: Option<tokio::time::Instant>,
+}
+
+impl EngineTurn {
+    pub(super) fn new(stop: tokio_util::sync::CancellationToken) -> Self {
+        Self { stop, teardown_since: None }
+    }
 }
 
 pub(super) enum TerminalDeliveryLookup {
@@ -86,7 +99,8 @@ pub(crate) const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(20
 
 pub(super) const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(4);
 /// How long teardown lets a typed engine turn settle before aborting it (#3894):
-/// its confirmation grace, with room for the submission itself.
+/// its confirmation grace, with room for the submission itself. The finalizer
+/// rechecks without blocking, so other sessions' teardown proceeds meanwhile.
 const ENGINE_TURN_SETTLE_FOR: Duration = Duration::from_secs(10);
 
 pub(crate) const DELIVERY_CONFIRMATION_STABLE_FOR: Duration = Duration::from_secs(1);
@@ -814,41 +828,30 @@ impl TerminalRuntime for TerminalControllerRuntime {
         Ok(TerminalDeliveryOutcome::Pending)
     }
 
+    async fn teardown_pending(&self, session_id: &str) -> bool {
+        let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
+        let Some(delivery) = deliveries.get_mut(session_id) else { return false };
+        let finished = delivery.task.is_finished();
+        let Some(turn) = delivery.engine_turn.as_mut() else { return false };
+        turn.stop.cancel();
+        if finished {
+            return false;
+        }
+        let since = *turn.teardown_since.get_or_insert_with(tokio::time::Instant::now);
+        since.elapsed() < ENGINE_TURN_SETTLE_FOR
+    }
+
     async fn kill_session(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<(), String> {
-        let is_engine_turn = {
+        {
+            // A settled engine turn stays reserved: the delivery adapter records its
+            // receipt. Any other reservation, or an engine turn that outlasted its
+            // settle bound, is aborted.
             let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
-            match deliveries.get(session_id).map(|delivery| delivery.engine_turn.clone()) {
-                Some(Some(stop_typing)) => {
-                    stop_typing.cancel();
-                    true
+            if deliveries.get(session_id).is_some_and(|delivery| delivery.engine_turn.is_none() || !delivery.task.is_finished()) {
+                let delivery = deliveries.remove(session_id).expect("reserved delivery");
+                if delivery.engine_turn.is_some() {
+                    warn!(%session_id, "an engine turn did not settle before teardown; aborting it");
                 }
-                Some(None) => {
-                    deliveries.remove(session_id).expect("reserved delivery").task.abort();
-                    false
-                }
-                None => false,
-            }
-        };
-        // A typed engine turn settles within its confirmation grace; it stays
-        // reserved so the delivery adapter commits its receipt after the kill.
-        // One that outlasts the bound is aborted, as any other reservation.
-        let settling = || {
-            self.state
-                .terminal_deliveries
-                .lock()
-                .expect("terminal deliveries lock poisoned")
-                .get(session_id)
-                .is_some_and(|delivery| delivery.engine_turn.is_some() && !delivery.task.is_finished())
-        };
-        let settled = tokio::time::timeout(ENGINE_TURN_SETTLE_FOR, async {
-            while is_engine_turn && settling() {
-                tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
-            }
-        })
-        .await;
-        if settled.is_err() {
-            warn!(%session_id, "an engine turn did not settle before teardown; aborting it");
-            if let Some(delivery) = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned").remove(session_id) {
                 delivery.task.abort();
             }
         }

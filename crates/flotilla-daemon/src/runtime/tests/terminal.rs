@@ -576,10 +576,10 @@ async fn terminal_teardown_skips_a_session_absent_from_the_pool() {
     assert!(pool.killed.lock().await.is_empty(), "teardown must not invoke the pool for an already-gone session");
 }
 
-// #3894: teardown never strands a typed engine turn. The kill stops a turn not
-// yet typed, lets a typed one settle and leaves it reserved, so the engine
-// delivery adapter still records its receipt; a turn that never settles is
-// aborted at the bound.
+// #3894: teardown never strands a typed engine turn. Teardown stops a turn not
+// yet typed and waits, without blocking, while a typed one settles; the kill
+// leaves it reserved, so the engine delivery adapter still records its receipt.
+// A turn that never settles is aborted at the bound.
 #[tokio::test]
 async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
     #[derive(Debug, Clone, Copy)]
@@ -624,8 +624,8 @@ async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
             .build()])
             .await;
         tokio::time::pause();
-        let engine_turn = tokio_util::sync::CancellationToken::new();
-        let cancelled = engine_turn.clone();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let cancelled = stop.clone();
         // The adapter's turn: waiting for readiness until teardown cancels it,
         // confirming a typed submission, or hung inside one.
         let task = tokio::spawn(async move {
@@ -647,13 +647,17 @@ async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
                 message_batch: Some("engine-message-turn".into()),
                 message: "turn".into(),
                 task,
-                engine_turn: Some(engine_turn.clone()),
+                engine_turn: Some(super::terminal::EngineTurn::new(stop.clone())),
             },
         );
 
+        // The finalizer's pass: wait, without blocking, while the turn settles; then kill.
+        while runtime.teardown_pending(session_name).await {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
         runtime.kill_session(session_name, (&spec).into()).await.expect("teardown kills the session");
 
-        assert!(engine_turn.is_cancelled(), "{turn:?}: teardown stops a turn before it is typed");
+        assert!(stop.is_cancelled(), "{turn:?}: teardown stops a turn before it is typed");
         assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()], "{turn:?}");
         let reserved = runtime.state.terminal_deliveries.lock().expect("deliveries").remove(session_name);
         match turn {
