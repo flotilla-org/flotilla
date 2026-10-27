@@ -10,9 +10,9 @@
 //! until the #3108 cut-over. Delivery never parses it. It is not an ADR 0066 address,
 //! whose grammar puts a role under its convoy and has no vessel segment there.
 //!
-//! Like the account access kinds, the record derives serde, for the resource-store kind
-//! production runs today, and `Stored`, for the generated tables the engine store takes
-//! on at the cut-over.
+//! Like the account access kinds, the record derives serde, for the resource store's
+//! kind, and `Stored`, for the generated tables the engine store takes on at the
+//! cut-over. Nothing registers, reads or writes the kind until the owner's schema review.
 
 use std::collections::BTreeMap;
 
