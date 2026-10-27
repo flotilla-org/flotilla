@@ -17,16 +17,25 @@ pub enum StoreError {
     /// would read as empty rather than fail; reject it at open.
     #[error("kind table {table} has columns {found:?}, not {expected:?}: the database predates this schema and has no migration; open a new store")]
     KindTableDrift { table: String, expected: Vec<String>, found: Vec<String> },
-    /// A kind table's stored CHECK on a coded column predates codes its kind now declares, such as
-    /// `message.receiver_kind` before the Person consumer (#3938). Opening cannot change a CHECK.
-    #[error("kind table {table} column {column} refuses codes {missing:?}: the database predates this schema and has no migration; open a new store")]
+    /// A kind table's stored CHECK on a coded column lacks codes its kind now declares, and the
+    /// table differs from its kind's in more than its code lists, so opening cannot rebuild it
+    /// with the wider CHECK (#3972); the old CHECK would refuse the first write of a new code.
+    #[error("kind table {table} column {column} refuses codes {missing:?}: the table differs in more than its codes and has no migration; open a new store")]
     KindCodeDrift { table: String, column: String, missing: Vec<String> },
+    /// A kind table's stored CHECK on a coded column accepts codes its kind no longer declares:
+    /// rows may hold them, and this build cannot read them back.
+    #[error("kind table {table} column {column} holds codes {removed:?} its kind no longer declares: the database is from a later or other schema; open a new store")]
+    KindCodeRemoved { table: String, column: String, removed: Vec<String> },
     /// A kind table's coded column has no stored `CHECK (<column> IN (...))` this store can read,
     /// so whether it accepts the kind's codes is unknown; refused rather than assumed current.
     #[error(
         "kind table {table} column {column} has no readable code CHECK: the database predates this schema or was altered; open a new store"
     )]
     KindCodeUnreadable { table: String, column: String },
+    /// Rebuilding a kind table with wider codes left rows whose foreign keys do not resolve; the
+    /// open transaction rolls the rebuild back.
+    #[error("kind table {table} has {violations} foreign key violations after widening its codes")]
+    KindCodeWidening { table: String, violations: usize },
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]

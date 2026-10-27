@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use crate::{quote_ident, render_ddl_with, render_views, DdlMode, StoreError, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD};
-use flotilla_schema::KindRegistry;
+use flotilla_schema::{ColumnType, KindRegistry, Table, TableSet};
 use rusqlite::{Connection, OptionalExtension};
 
 /// `strings` interns names and interned columns; `resource_identity` holds every resource's
@@ -280,38 +280,92 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
     Ok(())
 }
 
-/// Refuses a kind table whose stored CHECK on a coded column lacks one of its kind's codes, such
-/// as a message table created before a consumer kind was added. Opening only creates missing
-/// tables, so the old CHECK would otherwise refuse the first write of the new code. A coded column
-/// whose stored CHECK cannot be read fails closed: an unread constraint is never taken as current.
+/// Brings each kind table's stored code CHECKs up to its kind's codes (#3972). SQLite cannot change
+/// a CHECK in place, so a table whose stored code lists are each a subset of its kind's, at least
+/// one strictly, and which is otherwise exactly the table this build renders, is rebuilt with the
+/// current definition by [`widen_table`]. Any other difference refuses: a stored code the kind no
+/// longer declares, a missing code in a table that differs in more than its codes, or a coded
+/// column whose CHECK cannot be read, which is never taken as current.
+///
+/// Rebuilding drops the old table, so the caller runs this with foreign keys off (inside a
+/// transaction `PRAGMA foreign_keys` cannot change): with them on, the drop would delete each
+/// child table's rows through their `ON DELETE CASCADE`.
 pub(crate) fn check_kind_codes(conn: &Connection, kinds: &KindRegistry) -> Result<(), StoreError> {
-    let mut statement = conn.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1")?;
+    let mut statement = conn.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1")?;
     for set in kinds.iter() {
         for table in &set.tables {
             let Some(sql) = statement.query_row([&table.name], |row| row.get::<_, String>(0)).optional()? else { continue };
-            for column in table.key.iter().chain(&table.columns) {
-                let flotilla_schema::ColumnType::Code(codes) = &column.ty else { continue };
+            // The table as this build renders it with the stored code lists, and the first column missing codes.
+            let mut stored_table = table.clone();
+            let mut missing = None;
+            for column in stored_table.key.iter_mut().chain(stored_table.columns.iter_mut()) {
+                let ColumnType::Code(codes) = &mut column.ty else { continue };
                 let Some(stored) = stored_codes(&sql, &column.name) else {
                     return Err(StoreError::KindCodeUnreadable { table: table.name.clone(), column: column.name.clone() });
                 };
-                let missing: Vec<String> =
-                    codes.iter().filter(|code| !stored.contains(code.as_str())).map(|code| code.to_string()).collect();
-                if !missing.is_empty() {
-                    return Err(StoreError::KindCodeDrift { table: table.name.clone(), column: column.name.clone(), missing });
+                let removed: Vec<String> = stored.iter().filter(|code| !codes.contains(code)).cloned().collect();
+                if !removed.is_empty() {
+                    return Err(StoreError::KindCodeRemoved { table: table.name.clone(), column: column.name.clone(), removed });
                 }
+                let lacking: Vec<String> = codes.iter().filter(|code| !stored.contains(code)).cloned().collect();
+                if missing.is_none() && !lacking.is_empty() {
+                    missing = Some((column.name.clone(), lacking));
+                }
+                *codes = stored;
             }
+            let Some((column, missing)) = missing else { continue };
+            if crate::ddl::create_table(set, &stored_table, "") != sql {
+                return Err(StoreError::KindCodeDrift { table: table.name.clone(), column, missing });
+            }
+            widen_table(conn, set, table)?;
         }
     }
     Ok(())
 }
 
-/// The codes a stored `CHECK (<column> IN ('a', 'b'))` accepts, with the column quoted or bare.
-fn stored_codes<'a>(sql: &'a str, column: &str) -> Option<BTreeSet<&'a str>> {
+/// The codes a stored `CHECK (<column> IN ('a', 'b'))` accepts, in stored order, with the column
+/// quoted (as `ddl::column` renders it; keep the two in step) or bare (a hand-written upgrade).
+fn stored_codes(sql: &str, column: &str) -> Option<Vec<String>> {
     let start = [format!("CHECK ({} IN (", quote_ident(column)), format!("CHECK ({column} IN (")]
         .iter()
         .find_map(|prefix| sql.find(prefix.as_str()).map(|at| at + prefix.len()))?;
     let list = &sql[start..start + sql[start..].find(')')?];
-    Some(list.split(',').map(|code| code.trim().trim_matches('\'')).collect())
+    Some(list.split(',').map(|code| code.trim().trim_matches('\'').to_owned()).collect())
+}
+
+/// Rebuilds `table` with its current definition, following SQLite's procedure for other table
+/// schema changes (https://sqlite.org/lang_altertable.html#otheralter): create it under a
+/// temporary name, copy every row, drop the old table, rename the new one to the old name, and
+/// recreate the indexes and triggers the drop removed and the views that name the table. Tables
+/// whose foreign keys reference it name it, not its storage, so they reference the new table.
+fn widen_table(conn: &Connection, set: &TableSet, table: &Table) -> Result<(), StoreError> {
+    let name = quote_ident(&table.name);
+    let temporary = Table { name: format!("{}_widening", table.name), ..table.clone() };
+    let mut dependents = conn.prepare(
+        "SELECT type, name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name <> ?1 \
+         AND ((type IN ('index', 'trigger') AND tbl_name = ?1) OR (type = 'view' AND instr(sql, ?2) > 0)) ORDER BY rowid",
+    )?;
+    let dependents = dependents
+        .query_map([&table.name, &name], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut batch = String::new();
+    for (_, view, _) in dependents.iter().filter(|(kind, _, _)| kind == "view") {
+        batch.push_str(&format!("DROP VIEW {};\n", quote_ident(view)));
+    }
+    batch.push_str(&format!(
+        "{};\nINSERT INTO {temporary_name} SELECT * FROM {name};\nDROP TABLE {name};\nALTER TABLE {temporary_name} RENAME TO {name};\n",
+        crate::ddl::create_table(set, &temporary, ""),
+        temporary_name = quote_ident(&temporary.name),
+    ));
+    for (_, _, sql) in &dependents {
+        batch.push_str(&format!("{sql};\n"));
+    }
+    conn.execute_batch(&batch)?;
+    let violations: usize = conn.query_row("SELECT count(*) FROM pragma_foreign_key_check(?1)", [&table.name], |row| row.get(0))?;
+    if violations > 0 {
+        return Err(StoreError::KindCodeWidening { table: table.name.clone(), violations });
+    }
+    Ok(())
 }
 
 /// Shared progress views use the same sync-on-open policy as kind views.
