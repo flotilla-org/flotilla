@@ -907,7 +907,7 @@ dependencies = [
 [[package]]
 name = "drydock"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=3fceb25b30759457ea8b3b29121c0d18eb172360#3fceb25b30759457ea8b3b29121c0d18eb172360"
+source = "git+https://github.com/flotilla-org/drydock?rev=ddde75bcafb9736896f84c36c8347083ddbe6ade#ddde75bcafb9736896f84c36c8347083ddbe6ade"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -932,6 +932,7 @@ dependencies = [
  "rigging-process",
  "rigging-stream",
  "rigging-tls",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -945,7 +946,7 @@ dependencies = [
 [[package]]
 name = "drydock-agent"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=3fceb25b30759457ea8b3b29121c0d18eb172360#3fceb25b30759457ea8b3b29121c0d18eb172360"
+source = "git+https://github.com/flotilla-org/drydock?rev=ddde75bcafb9736896f84c36c8347083ddbe6ade#ddde75bcafb9736896f84c36c8347083ddbe6ade"
 dependencies = [
  "axum",
  "bytes",
@@ -981,7 +982,7 @@ dependencies = [
 [[package]]
 name = "drydock-client"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=3fceb25b30759457ea8b3b29121c0d18eb172360#3fceb25b30759457ea8b3b29121c0d18eb172360"
+source = "git+https://github.com/flotilla-org/drydock?rev=ddde75bcafb9736896f84c36c8347083ddbe6ade#ddde75bcafb9736896f84c36c8347083ddbe6ade"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1001,7 +1002,7 @@ dependencies = [
 [[package]]
 name = "drydock-host"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=3fceb25b30759457ea8b3b29121c0d18eb172360#3fceb25b30759457ea8b3b29121c0d18eb172360"
+source = "git+https://github.com/flotilla-org/drydock?rev=ddde75bcafb9736896f84c36c8347083ddbe6ade#ddde75bcafb9736896f84c36c8347083ddbe6ade"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1011,11 +1012,11 @@ dependencies = [
  "futures",
  "hyper",
  "hyper-util",
- "libc",
  "reqwest 0.13.2",
  "rigging-http-client",
  "rigging-http-serve",
  "rigging-stream",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -1028,7 +1029,7 @@ dependencies = [
 [[package]]
 name = "drydock-protocol"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=3fceb25b30759457ea8b3b29121c0d18eb172360#3fceb25b30759457ea8b3b29121c0d18eb172360"
+source = "git+https://github.com/flotilla-org/drydock?rev=ddde75bcafb9736896f84c36c8347083ddbe6ade#ddde75bcafb9736896f84c36c8347083ddbe6ade"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1042,7 +1043,7 @@ dependencies = [
 [[package]]
 name = "drydock-transport"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=3fceb25b30759457ea8b3b29121c0d18eb172360#3fceb25b30759457ea8b3b29121c0d18eb172360"
+source = "git+https://github.com/flotilla-org/drydock?rev=ddde75bcafb9736896f84c36c8347083ddbe6ade#ddde75bcafb9736896f84c36c8347083ddbe6ade"
 dependencies = [
  "async-trait",
  "axum",
