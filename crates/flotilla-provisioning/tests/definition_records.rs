@@ -91,6 +91,15 @@ async fn contract(backend: &ResourceBackend) {
     // The built-in templates are served from the code, whichever store holds the others.
     let templates = backend.definitions::<WorkflowTemplate>(NS).list().await.expect("templates");
     assert!(templates.iter().any(|template| flotilla_resources::builtins::is_builtin("WorkflowTemplate", &template.metadata.name)));
+    // A selection runs over stored definitions only: it never selects a built-in, even by the
+    // built-ins' own label (#3824 layer 2a).
+    let builtin_label = BTreeMap::from([(MANAGED_BY_LABEL.to_owned(), flotilla_resources::builtins::BUILTIN_MANAGER.to_owned())]);
+    let selected = backend
+        .definitions::<WorkflowTemplate>(NS)
+        .list_selected(StoreQuery::labels(&builtin_label, true, false))
+        .await
+        .expect("select built-ins");
+    assert!(selected.is_empty(), "{:?}", selected.iter().map(|template| &template.metadata.name).collect::<Vec<_>>());
 }
 
 #[tokio::test]
