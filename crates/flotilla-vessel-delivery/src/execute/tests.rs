@@ -86,7 +86,7 @@ impl Tree {
 
 #[async_trait]
 impl TreeDelivery for Tree {
-    async fn deliver(&self, mechanism: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<(), String> {
+    async fn deliver(&self, mechanism: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<(), StepFailure> {
         if self.fail.load(Ordering::SeqCst) {
             return Err("source unavailable".into());
         }
