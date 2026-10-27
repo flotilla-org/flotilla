@@ -226,7 +226,11 @@ where
                     home: copy.home.clone(),
                     record,
                 }),
-                Ok(Mapped::Dropped(reason)) => *report.dropped.entry((kind, reason)).or_default() += 1,
+                Ok(Mapped::Dropped(reason)) => {
+                    // The spec is the merged one, so every home's record drops alike: count the copies once.
+                    *report.dropped.entry((kind, reason)).or_default() += copies.len();
+                    break;
+                }
                 Err(reason) => report.refused.push(refuse(format!("at `{}`: {reason}", copy.home))),
             }
         }
