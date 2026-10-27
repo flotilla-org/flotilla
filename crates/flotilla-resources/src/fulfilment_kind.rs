@@ -251,6 +251,19 @@ pub fn effective_grants(grants: &BTreeSet<FulfilmentGrant>) -> BTreeSet<Fulfilme
     expanded
 }
 
+/// The grants least-privilege selection compares. A dedicated, single-tenant
+/// host is itself the sandbox boundary (#4002): its host account and host
+/// network reach nothing beyond the crew's own machine, so they rank as a
+/// contained crew's scoped network. The kind's grants themselves stay honest.
+pub fn least_privilege_grants(grants: &BTreeSet<FulfilmentGrant>, single_tenant: bool) -> BTreeSet<FulfilmentGrant> {
+    let mut ranked = effective_grants(grants);
+    if single_tenant {
+        ranked.remove(&FulfilmentGrant::host_account_reach());
+        ranked.remove(&FulfilmentGrant::network("host".to_string()));
+    }
+    ranked
+}
+
 /// Compare dotted numeric versions. Unknown suffixes fail closed.
 pub fn version_at_least(actual: &str, required: &str) -> bool {
     let parse = |value: &str| value.split('.').map(str::parse::<u64>).collect::<Result<Vec<_>, _>>();
@@ -336,12 +349,13 @@ impl FulfilmentKindSpec {
                 ]);
                 (host_ref.clone(), FulfilmentRealisation::DockerPerVessel { image: image.clone() }, grants)
             }
+            // A GUI session is granted only once the host's probe observes
+            // one (#4002); a headless host never claims it.
             (None, Some(HostDirectPlacementPolicySpec { host_ref, .. }), None) => {
                 let grants = BTreeSet::from([
                     FulfilmentGrant::platform(host_platform.to_string()),
                     FulfilmentGrant::host_account_reach(),
                     FulfilmentGrant::network("host".to_string()),
-                    FulfilmentGrant::gui_session(),
                 ]);
                 (host_ref.clone(), FulfilmentRealisation::HostDirect, grants)
             }
@@ -353,5 +367,20 @@ impl FulfilmentKindSpec {
             _ => return Err("placement policy must define exactly one realisation".to_string()),
         };
         Ok(Self { host_ref, pool: policy.pool.clone(), cost_class: FulfilmentCostClass::default(), grants, realisation })
+    }
+
+    /// Bring the observation-derived grants in line with the host's latest
+    /// facts: a host-direct kind holds `display:gui-session` exactly while
+    /// its probe observes a usable GUI session (#4002). Returns whether the
+    /// grants changed.
+    pub fn observe_grants(&mut self, facts: &crate::FulfilmentFacts) -> bool {
+        if !matches!(self.realisation, FulfilmentRealisation::HostDirect) {
+            return false;
+        }
+        if facts.gui_session_logged_in {
+            self.grants.insert(FulfilmentGrant::gui_session())
+        } else {
+            self.grants.remove(&FulfilmentGrant::gui_session())
+        }
     }
 }

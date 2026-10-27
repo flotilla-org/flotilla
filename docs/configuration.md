@@ -278,6 +278,51 @@ not move convoys already admitted to the host: one that now needs more slots
 than the new cap stays in its capacity wait until it is abandoned or the cap
 is raised.
 
+#### Single-tenant hosts
+
+An agentless host's host-direct kind grants `account:host` and `network:host`,
+a strict superset of a Docker crew image's `network:scoped`, so least-privilege
+placement never chooses it while a Docker kind is available. A host that is a
+dedicated, single-tenant machine (nothing else lives there and its user exists
+only for crews) can declare so; the whole VM is then the sandbox boundary
+(#4002):
+
+```toml
+[hosts.b1]
+hostname = "b1.example"
+user = "flotilla"
+agentless_ssh = true
+max_vessels = 2
+single_tenant = true
+```
+
+Its kind's grants stay as they are, since the crew does run as the host user
+on the host network. Least-privilege selection compares a single-tenant host's
+grants without `account:host` and `network:host`, so for work that needs
+neither its kind is a minimal alternative beside the Docker kinds, and capped
+unpinned convoys spread over both. Without the declaration a host behaves as
+before. `convoy explain` shows `single tenant true` for each declared
+candidate.
+
+A host-direct kind holds `display:gui-session` only while its host's probe
+observes a usable GUI session (a `DISPLAY` or `WAYLAND_DISPLAY`, or a macOS
+launchd GUI domain). A headless host never claims one.
+
+#### Docker vessel cap
+
+A daemon's own host may cap its Docker per-vessel placements with the same
+field, in that host's `~/.config/flotilla/daemon.toml` (#4002):
+
+```toml
+max_vessels = 6
+```
+
+Its Docker kinds' free slots are then counted from the vessels placed on the
+host, as for an agentless host, and a convoy that finds every candidate full
+waits in the same capacity stall. Host-direct placements on the daemon's host
+are not capped, though its vessels count against the Docker cap. Without a cap
+Docker placement stays unbounded.
+
 The admission free-space floor below is checked against the SSH host's
 `~/dev/flotilla-repos` checkout volume using its remote `df` result.
 

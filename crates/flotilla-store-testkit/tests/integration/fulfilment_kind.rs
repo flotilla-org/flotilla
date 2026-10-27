@@ -67,7 +67,8 @@ fn live_policy_set_migrates_to_kinds() {
     assert_eq!(kind.realisation, FulfilmentRealisation::HostDirect);
     assert!(kind.grants.contains(&FulfilmentGrant::host_account_reach()));
     assert!(kind.grants.contains(&FulfilmentGrant::platform("macos".to_string())));
-    assert!(kind.grants.contains(&FulfilmentGrant::gui_session()));
+    // #4002: a GUI session is granted only once the host's probe observes one.
+    assert!(!kind.grants.contains(&FulfilmentGrant::gui_session()));
 }
 
 #[test]

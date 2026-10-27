@@ -212,7 +212,8 @@ impl DaemonRuntime {
             }
         }
         let local_registry = retry_phase("probe_local_provider_registry", || probe_local_provider_registry(&daemon, &config)).await?;
-        let profile = retry_phase("build_local_profile", || build_local_profile(&daemon, &local_registry)).await?;
+        let mut profile = retry_phase("build_local_profile", || build_local_profile(&daemon, &local_registry)).await?;
+        profile.max_vessels = daemon_config.max_vessels;
         let host_direct_environment_name = host_direct_environment_name(&profile.host_id);
         let mut archive_roots = vec![CheckoutArchiveRoot {
             env_ref: host_direct_environment_name.clone(),

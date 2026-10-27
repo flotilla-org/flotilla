@@ -108,6 +108,11 @@ pub struct FulfilmentAllocationCandidate {
     /// previous-generation convoy statuses (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vessels: Option<u32>,
+    /// The candidate's host is declared dedicated and single-tenant, so its
+    /// host reach ranked as contained (#4002). Absent in previous-generation
+    /// convoy statuses (ADR 0047).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub single_tenant: bool,
     pub reserved_for_platform: bool,
     pub minimal: bool,
     pub available: bool,

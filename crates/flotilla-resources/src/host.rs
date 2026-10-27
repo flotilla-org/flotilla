@@ -90,6 +90,12 @@ pub struct HostSpec {
     /// work. Previous-generation Host records omit it (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vessels: Option<u32>,
+    /// An agentless SSH host declared dedicated and single-tenant (#4002):
+    /// the whole VM is the sandbox boundary, so least-privilege placement
+    /// ranks its host reach as contained. Previous-generation Host records
+    /// omit it (ADR 0047).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub single_tenant: bool,
 }
 
 const fn default_expected_concurrent_rust_crews() -> u32 {
@@ -104,11 +110,23 @@ impl Default for HostSpec {
             expected_concurrent_rust_crews: 4,
             image_build_capacity: None,
             max_vessels: None,
+            single_tenant: false,
         }
     }
 }
 
 impl HostSpec {
+    /// The cap that bounds a placement of `realisation` here: every placement
+    /// on an agentless SSH host (#3793), and Docker per-vessel placements on
+    /// a daemon's host (#4002). `None` is unbounded, or pin-only on an
+    /// agentless host.
+    pub fn vessel_cap(&self, realisation: &crate::FulfilmentRealisation) -> Option<u32> {
+        match (&self.connection, realisation) {
+            (HostConnection::AgentlessSsh { .. }, _) | (_, crate::FulfilmentRealisation::DockerPerVessel { .. }) => self.max_vessels,
+            _ => None,
+        }
+    }
+
     pub fn rust_build_jobs(&self, host_cores: usize) -> usize {
         host_cores.max(1)
     }

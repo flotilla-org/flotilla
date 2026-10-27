@@ -1,5 +1,5 @@
 use super::*;
-use flotilla_resources::Clock;
+use flotilla_resources::{Clock, FulfilmentGrant};
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
 
@@ -74,7 +74,7 @@ async fn spawned_fulfilment_probe_task_publishes_facts_after_heartbeat() {
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
     let host_id = daemon.local_host_id().expect("local host id").to_string();
     let profile = manual_profile(&host_id, false);
-    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration");
+    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi", None).await.expect("host registration");
     let kind_name = "host-direct-probe-task";
     daemon
         .resource_backend()
@@ -155,7 +155,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
     let host_id = daemon.local_host_id().expect("local host id").to_string();
     let profile = manual_profile(&host_id, false);
-    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration");
+    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi", None).await.expect("host registration");
     daemon
         .resource_backend()
         .using::<FulfilmentKind>(NAMESPACE)
@@ -400,7 +400,7 @@ async fn heartbeat_task_updates_host_status_without_socket_server() {
     let host_id = daemon.local_host_id().expect("local host id").to_string();
     let profile = manual_profile(&host_id, false);
 
-    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration should succeed");
+    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi", None).await.expect("host registration should succeed");
     let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
     flotilla_store::apply_status_patch(
         &hosts,
@@ -539,7 +539,7 @@ fn unresolved_fulfilment_provider_publishes_unknown(tc: hegel::TestCase) {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        ensure_host_exists(&backend, NAMESPACE, "host", "test").await.expect("host");
+        ensure_host_exists(&backend, NAMESPACE, "host", "test", None).await.expect("host");
         let realisation = if docker {
             FulfilmentRealisation::DockerPerVessel { image: Some("crew:test".into()) }
         } else {
@@ -671,7 +671,7 @@ async fn host_status_commits_at_most_once_per_heartbeat_interval_on_sqlite() {
     .await;
     let host_id = daemon.local_host_id().expect("local host id").to_string();
     let profile = manual_profile(&host_id, false);
-    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration");
+    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi", None).await.expect("host registration");
     daemon
         .resource_backend()
         .using::<FulfilmentKind>(NAMESPACE)
@@ -766,4 +766,48 @@ async fn host_status_commits_at_most_once_per_heartbeat_interval_on_sqlite() {
     }
     release.send(()).expect("release blocking hold");
     hold.await.expect("blocking hold");
+}
+
+// #4002: grants come from observation. A host-direct kind stored with a GUI
+// session grant, as kinds were derived before, loses it once its host's probe
+// sees no display; a host whose probe observes one is granted it.
+#[tokio::test]
+async fn headless_host_is_not_granted_a_gui_session() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"headless-test\"\n").expect("daemon config");
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "b1", None).await.expect("host registration");
+    let policy = PlacementPolicySpec::builder()
+        .pool("passthrough".to_string())
+        .host_direct(HostDirectPlacementPolicySpec { host_ref: host_id.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
+        .build();
+    let mut stored = FulfilmentKindSpec::from_policy(&policy, "linux").expect("host-direct kind");
+    stored.grants.insert(FulfilmentGrant::gui_session());
+    let kinds = daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);
+    kinds.create(&empty_meta("host-direct-b1"), &stored).await.expect("stored kind");
+    let runner = Arc::new(DiscoveryMockRunner::builder().build());
+    for (display, granted) in [(None, false), (Some(":0"), true)] {
+        let env = TestEnvVars::new(display.map(|display| ("DISPLAY", display.to_string())));
+        observe_fulfilment_facts(
+            &daemon.resource_backend(),
+            NAMESPACE,
+            &host_id,
+            &["passthrough".to_string()],
+            &BTreeMap::new(),
+            FulfilmentProbeContext {
+                providers: &detection_registry(runner.clone()),
+                runner: runner.as_ref(),
+                env: &env,
+                scratch: Path::new("/tmp/flotilla-probe-test"),
+                observation: &Default::default(),
+            },
+            &mut ModelProbeState::default(),
+        )
+        .await
+        .expect("observe the host");
+        let kind = kinds.get("host-direct-b1").await.expect("kind");
+        assert_eq!(kind.spec.grants.contains(&FulfilmentGrant::gui_session()), granted, "display {display:?}: {:?}", kind.spec.grants);
+        assert!(kind.spec.grants.contains(&FulfilmentGrant::host_account_reach()));
+    }
 }

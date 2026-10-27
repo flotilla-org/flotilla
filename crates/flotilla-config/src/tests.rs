@@ -333,15 +333,22 @@ supplies = [
     );
 }
 
-// #3793: an agentless host may declare how many vessels it holds.
+// #3793, #4002: an agentless host may declare how many vessels it holds and
+// that it is single-tenant; a daemon declares its own host's Docker cap.
+// Each declaration is optional and absent means today's behaviour.
 #[test]
-fn parse_agentless_host_vessel_cap() {
-    let config: HostsConfig = toml::from_str("[hosts.b1]\nhostname = \"b1.example\"\nagentless_ssh = true\nmax_vessels = 1\n")
-        .expect("hosts config with a vessel cap");
-    assert_eq!(config.hosts["b1"].max_vessels, Some(1));
+fn parse_host_vessel_caps_and_tenancy() {
+    let config: HostsConfig =
+        toml::from_str("[hosts.b1]\nhostname = \"b1.example\"\nagentless_ssh = true\nmax_vessels = 1\nsingle_tenant = true\n")
+            .expect("hosts config with a vessel cap");
+    assert_eq!((config.hosts["b1"].max_vessels, config.hosts["b1"].single_tenant), (Some(1), true));
     let uncapped: HostsConfig =
         toml::from_str("[hosts.b2]\nhostname = \"b2.example\"\nagentless_ssh = true\n").expect("hosts config without a vessel cap");
-    assert_eq!(uncapped.hosts["b2"].max_vessels, None);
+    assert_eq!((uncapped.hosts["b2"].max_vessels, uncapped.hosts["b2"].single_tenant), (None, false));
+    let daemon: DaemonConfig = toml::from_str("max_vessels = 6\n").expect("daemon config with a vessel cap");
+    assert_eq!(daemon.max_vessels, Some(6));
+    let daemon: DaemonConfig = toml::from_str("").expect("daemon config without a vessel cap");
+    assert_eq!(daemon.max_vessels, None);
 }
 
 #[test]

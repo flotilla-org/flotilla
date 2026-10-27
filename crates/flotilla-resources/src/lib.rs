@@ -299,7 +299,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::WorkflowTemplate>($($argument),*);
     }};
 }
-pub use fulfilment_kind::{effective_grants, version_at_least, CapabilityNeed};
+pub use fulfilment_kind::{effective_grants, least_privilege_grants, version_at_least, CapabilityNeed};
 pub use message::{
     message_record_name, HeldMessageBatch, Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec,
     MessageStatus, MessageStatusPatch, MessageSubmission, OperatorMessageDelivery, ResolvedMessageReceiver, STALL_KIND,

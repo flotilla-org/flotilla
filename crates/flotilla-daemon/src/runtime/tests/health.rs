@@ -59,7 +59,7 @@ async fn connected_peer_with_replicable_resources_and_zero_cursors_is_degraded()
 
     let feta_host_id = feta.local_host_id().expect("feta Host identity").to_string();
     let profile = manual_profile(&feta_host_id, false);
-    ensure_host_exists(&feta.resource_backend(), NAMESPACE, &feta_host_id, "feta").await.expect("register feta Host");
+    ensure_host_exists(&feta.resource_backend(), NAMESPACE, &feta_host_id, "feta", None).await.expect("register feta Host");
     apply_host_heartbeat(&feta, NAMESPACE, &profile, &test_health_identity()).await.expect("publish degraded heartbeat");
     let fleet = feta.fleet_health_internal().await.expect("feta fleet health");
     let feta_row = fleet.hosts.iter().find(|host| host.is_local).expect("local feta fleet row");
@@ -129,7 +129,7 @@ async fn home_bound_authorship_collision_is_advisory_and_clears_after_removal() 
 
     let host_id = daemon.local_host_id().expect("local Host identity").to_string();
     let profile = manual_profile(&host_id, false);
-    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "local").await.expect("register local Host");
+    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "local", None).await.expect("register local Host");
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("publish degraded heartbeat");
     let degraded = daemon.resource_backend().using::<Host>(NAMESPACE).get(&host_id).await.expect("read degraded Host");
     let status = degraded.status.expect("degraded Host status");
@@ -1003,7 +1003,7 @@ async fn heartbeat_publishes_store_read_retry_capability_shape() {
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path().to_path_buf()))).await;
     let host_id = daemon.local_host_id().expect("Host identity").to_string();
     let backend = daemon.resource_backend();
-    ensure_host_exists(&backend, NAMESPACE, &host_id, "local").await.expect("register Host");
+    ensure_host_exists(&backend, NAMESPACE, &host_id, "local", None).await.expect("register Host");
     apply_host_heartbeat(&daemon, NAMESPACE, &manual_profile(&host_id, false), &test_health_identity()).await.expect("heartbeat");
     let host = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("Host");
     let status = host.status.expect("Host status");

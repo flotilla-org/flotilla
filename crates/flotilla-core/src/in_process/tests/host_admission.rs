@@ -15,7 +15,7 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{create_identity_convoy, placement_policy, test_meta};
+use super::support::{create_docker_placement, create_identity_convoy, placement_policy, test_meta};
 use crate::in_process::{placement_target_host, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
 use flotilla_admission::convoy_admission::allocate_convoy_generation;
@@ -1116,4 +1116,167 @@ async fn concurrent_admissions_onto_one_free_slot_provision_in_admission_order()
         ));
     }
     assert_eq!(waits, [false, true], "the older admission provisions; the newer waits for the slot");
+}
+
+/// A daemon host holding its Docker crew image, with the Docker kind derived
+/// as feta's is, optionally declaring a Docker vessel cap (#4002).
+async fn docker_host(backend: &ResourceBackend, name: &str, max_vessels: Option<u32>) {
+    let kind = format!("docker-{name}");
+    create_docker_placement(backend, &kind, name, BTreeSet::new()).await;
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.get(name).await.expect("Docker host");
+    hosts
+        .update(&InputMeta::from(&host.metadata), &host.metadata.resource_version, &HostSpec { max_vessels, ..host.spec.clone() })
+        .await
+        .expect("Docker host cap");
+    let host = hosts.get(name).await.expect("Docker host");
+    let mut status = host.status.expect("Docker host status");
+    status.capabilities.insert(flotilla_resources::IMAGE_DIGESTS_CAPABILITY.into(), serde_json::json!({"fixture-1": ["crew:latest"]}));
+    hosts.update_status(name, &host.metadata.resource_version, &status).await.expect("held crew image");
+    let policy = backend.clone().using::<PlacementPolicy>("flotilla").get(&kind).await.expect("Docker policy");
+    backend
+        .clone()
+        .using::<FulfilmentKind>("flotilla")
+        .create(&test_meta(&kind), &FulfilmentKindSpec::from_policy(&policy.spec, "linux").expect("Docker kind"))
+        .await
+        .expect("Docker kind");
+}
+
+/// A capped agentless box whose host-direct kind is derived as b1's is,
+/// with or without the single-tenant declaration (#4002).
+async fn dedicated_box(backend: &ResourceBackend, name: &str, max_vessels: u32, single_tenant: bool) {
+    agentless_host(backend, name, Some(max_vessels)).await;
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.get(name).await.expect("box");
+    hosts
+        .update(&InputMeta::from(&host.metadata), &host.metadata.resource_version, &HostSpec { single_tenant, ..host.spec.clone() })
+        .await
+        .expect("box tenancy");
+    let kinds = backend.clone().using::<FulfilmentKind>("flotilla");
+    let kind = kinds.get(&format!("host-direct-{name}")).await.expect("box kind");
+    let policy = backend.clone().using::<PlacementPolicy>("flotilla").get(&kind.metadata.name).await.expect("box policy");
+    let derived = FulfilmentKindSpec::from_policy(&policy.spec, "linux").expect("box grants");
+    kinds
+        .update(
+            &InputMeta::from(&kind.metadata),
+            &kind.metadata.resource_version,
+            &FulfilmentKindSpec { grants: derived.grants, ..kind.spec.clone() },
+        )
+        .await
+        .expect("box grants");
+}
+
+/// Admit one convoy, pinned or not, and record its decision, as admission does.
+async fn admit(daemon: &InProcessDaemon, backend: &ResourceBackend, name: &str, pin: Option<&str>) -> PlacementDecision {
+    let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
+    let intent = flotilla_protocol::ConvoyStartIntent::builder()
+        .project_ref("project".to_string())
+        .maybe_placement_policy(pin.map(str::to_string))
+        .build();
+    let (placement, alternatives) = daemon
+        .resolve_capability_placement("flotilla", "project", &[], &workflow, &BTreeSet::new(), &intent)
+        .await
+        .expect("the convoy is admitted without escalation");
+    let selected = placement.selected.expect("unpinned placement");
+    let decision = PlacementDecision {
+        minimal_alternatives: alternatives,
+        escalation_reason: None,
+        policy_name: selected.metadata.name.clone(),
+        target_host: placement_target_host(backend, "flotilla", &selected).await.expect("target host"),
+        refused_candidates: placement.refused_candidates,
+        viable_not_selected: placement.viable_not_selected,
+        allocation: placement.allocation,
+        provider_workspace_root: None,
+    };
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let convoy =
+        convoys.create(&test_meta(name), &ConvoySpec::builder().workflow_ref("missing".to_string()).build()).await.expect("convoy");
+    convoys
+        .update_status(
+            name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus { placement_decision: Some(decision.clone()), ..Default::default() },
+        )
+        .await
+        .expect("admitted placement");
+    decision
+}
+
+fn allocation_candidate<'a>(decision: &'a PlacementDecision, kind: &str) -> &'a flotilla_protocol::FulfilmentAllocationCandidate {
+    let allocation = decision.allocation.as_ref().expect("allocation");
+    allocation.candidates.iter().find(|candidate| candidate.kind == kind).unwrap_or_else(|| panic!("{kind} in {allocation:?}"))
+}
+
+// #4002: a box declared single-tenant ranks as contained, so it is a minimal
+// alternative beside the Docker kind. An undeclared box keeps its honest host
+// reach and stays a strict superset.
+#[tokio::test]
+async fn declared_single_tenant_box_is_a_minimal_alternative_and_an_undeclared_one_is_not() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = agentless_owner(&backend, &temp).await;
+    docker_host(&backend, "feta", None).await;
+    dedicated_box(&backend, "b1", 1, true).await;
+    dedicated_box(&backend, "b2", 1, false).await;
+    let decision = admit(&daemon, &backend, "convoy", None).await;
+    let feta = allocation_candidate(&decision, "docker-feta");
+    let declared = allocation_candidate(&decision, "host-direct-b1");
+    let undeclared = allocation_candidate(&decision, "host-direct-b2");
+    assert_eq!((feta.minimal, feta.single_tenant), (true, false));
+    assert_eq!((declared.minimal, declared.single_tenant), (true, true));
+    assert_eq!((undeclared.minimal, undeclared.single_tenant), (false, false));
+    let kind = backend.clone().using::<FulfilmentKind>("flotilla").get("host-direct-b1").await.expect("b1 kind");
+    assert!(kind.spec.grants.contains(&FulfilmentGrant::host_account_reach()), "the grants stay honest: {:?}", kind.spec.grants);
+}
+
+// #4002: at its cap, a capped Docker host overflows unpinned work to a
+// single-tenant box with a free slot.
+#[tokio::test]
+async fn capped_docker_host_at_its_cap_overflows_to_a_box() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = agentless_owner(&backend, &temp).await;
+    docker_host(&backend, "feta", Some(1)).await;
+    dedicated_box(&backend, "b1", 1, true).await;
+    // The first convoy fills feta's one slot.
+    admit(&daemon, &backend, "first", Some("docker-feta")).await;
+    let second = admit(&daemon, &backend, "second", None).await;
+    assert_eq!(second.policy_name, "host-direct-b1");
+    let feta = allocation_candidate(&second, "docker-feta");
+    assert_eq!((feta.free_vessel_slots, feta.max_vessels, feta.available), (Some(0), Some(1), false));
+}
+
+// #4002: when every contained candidate is at its cap, the convoy is still
+// admitted and waits at the capacity gate, as for a full agentless host.
+#[tokio::test]
+async fn all_candidates_full_means_the_convoy_waits() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = agentless_owner(&backend, &temp).await;
+    docker_host(&backend, "feta", Some(1)).await;
+    dedicated_box(&backend, "b1", 1, true).await;
+    for (name, pin) in [("first", "docker-feta"), ("second", "host-direct-b1")] {
+        admit(&daemon, &backend, name, Some(pin)).await;
+    }
+    let third = admit(&daemon, &backend, "third", None).await;
+    let allocation = third.allocation.as_ref().expect("allocation");
+    assert!(allocation.candidates.iter().all(|candidate| !candidate.available), "{allocation:?}");
+    // Equal candidates break ties by name, so the Docker host's gate is the one under test.
+    assert_eq!(third.policy_name, "docker-feta");
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>("flotilla"))
+        .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
+        .with_convoys(backend.including_replicas::<ResourceConvoy>("flotilla"))
+        .with_federated_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
+    let convoy = backend.clone().using::<ResourceConvoy>("flotilla").get("third").await.expect("third convoy");
+    let prepared = flotilla_store::controller::Reconciler::prepare(&reconciler, &convoy).await.expect("prepare");
+    let outcome = flotilla_store::controller::Reconciler::reconcile(&reconciler, &convoy, &prepared, Utc::now());
+    assert!(
+        matches!(
+            outcome.patch,
+            Some(flotilla_resources::ConvoyStatusPatch::SetStalled { condition: Some(ref condition) })
+                if condition.cause == Some(flotilla_resources::StallCause::Capacity) && condition.evidence.contains("no free vessel slots")
+        ),
+        "{:?}",
+        outcome.patch
+    );
 }

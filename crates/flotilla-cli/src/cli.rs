@@ -994,13 +994,14 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             for candidate in &allocation.candidates {
                 let _ = writeln!(
                     output,
-                    "  {} on {}: cost {}, ready {}, sleep until {}, free slots {}, reserved {}, minimal {}, available {}{}",
+                    "  {} on {}: cost {}, ready {}, sleep until {}, free slots {}, single tenant {}, reserved {}, minimal {}, available {}{}",
                     candidate.kind,
                     candidate.host,
                     candidate.cost_class,
                     candidate.host_ready,
                     candidate.sleeping_until.map_or_else(|| "none".to_string(), |until| until.to_rfc3339()),
                     vessel_slots(candidate.free_vessel_slots, candidate.max_vessels),
+                    candidate.single_tenant,
                     candidate.reserved_for_platform,
                     candidate.minimal,
                     candidate.available,

@@ -345,13 +345,9 @@ impl ReadProjections<'_> {
             .await
             .map_err(|error| error.to_string())?;
         let mut facts_by_host = BTreeMap::<String, ResourceHostStatus>::new();
-        let mut vessel_caps = BTreeMap::<String, u32>::new();
+        let mut host_specs = BTreeMap::<String, flotilla_resources::HostSpec>::new();
         for host in hosts.items {
-            if let (flotilla_resources::HostConnection::AgentlessSsh { .. }, Some(cap)) =
-                (&host.object.spec.connection, host.object.spec.max_vessels)
-            {
-                vessel_caps.insert(host.object.metadata.name.clone(), cap);
-            }
+            host_specs.insert(host.object.metadata.name.clone(), host.object.spec.clone());
             if let Some(status) = host.object.status {
                 facts_by_host
                     .entry(host.object.metadata.name)
@@ -423,7 +419,7 @@ impl ReadProjections<'_> {
                 toolchains: facts.map(|facts| facts.toolchains.clone()).unwrap_or_default(),
                 gui_session_logged_in: facts.map(|facts| facts.gui_session_logged_in),
                 free_vessel_slots: facts.and_then(|facts| facts.free_vessel_slots),
-                max_vessels: vessel_caps.get(&kind.spec.host_ref).copied(),
+                max_vessels: host_specs.get(&kind.spec.host_ref).and_then(|host| host.vessel_cap(&kind.spec.realisation)),
                 image: facts.and_then(|facts| facts.image.as_ref().map(|image| image.image_ref.clone())),
             };
             rows.insert((row.host_ref.clone(), row.name.clone()), row);

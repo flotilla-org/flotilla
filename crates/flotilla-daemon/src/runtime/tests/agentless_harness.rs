@@ -326,7 +326,7 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
         runner: Arc::clone(&runner),
         host_environment,
         accounts: flotilla_discovery::FactoryRegistry::default_all().account_variables(),
-        max_vessels: None,
+        single_tenant: false,
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
         vessel_agent: Err("the test's vessel agents run on the host runner".into()),
     };

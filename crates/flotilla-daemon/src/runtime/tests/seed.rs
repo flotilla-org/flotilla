@@ -239,7 +239,6 @@ async fn migrates_live_policy_names_to_fulfilment_kinds() {
             assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::network("scoped".to_string())));
         } else {
             assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::host_account_reach()));
-            assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::gui_session()));
         }
     }
     assert_eq!(policies.list().await.expect("policies and snapshots stay for A1 admission").items.len(), 8);
