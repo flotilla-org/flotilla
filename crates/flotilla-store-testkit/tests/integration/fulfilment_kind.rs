@@ -51,6 +51,13 @@ async fn provider_settings_contract(backend: ResourceBackend) {
             .expect("policy");
     let settings = flotilla_store::provider_settings(&backend, "flotilla", &host_direct).await.expect("host-direct");
     assert_eq!(settings.settings, ProviderSettings::HostDirect { host_checkout: HostDirectPlacementPolicyCheckout::Worktree });
+
+    // A record whose spec is for another host than its name says is refused, as the import refuses it.
+    let mut misnamed = EnvironmentProviderSpec::from_policy(&host_direct).expect("settings");
+    misnamed.host_ref = "kiwi".into();
+    providers.create(&InputMeta::builder().name("feta.host_direct".into()).build(), &misnamed).await.expect("misnamed record");
+    let error = flotilla_store::provider_settings(&backend, "flotilla", &host_direct).await.expect_err("misnamed");
+    assert!(error.contains("are for `kiwi.host_direct`, not their name"), "{error}");
 }
 
 #[tokio::test]

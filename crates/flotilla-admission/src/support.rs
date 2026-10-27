@@ -377,7 +377,8 @@ pub async fn resolve_placement_provider(
     let providers: Vec<ProviderAdvertisement> = serde_json::from_value(value.clone())
         .map_err(|error| format!("{}: invalid provider advertisements: {error}", target.display_name))?;
     // The host's provider settings decide its checkout, and name its instance when the policy
-    // does not (#3824 layer 4, ADR 0058).
+    // does not (#3824 layer 4, ADR 0058). Only a Docker provider's checkout varies: host-direct
+    // and cloud sandbox settings each have one checkout, the one matching derives from the policy.
     let settings = flotilla_store::provider_settings(backend, namespace, &policy.spec).await?;
     let mut matched = policy.spec.clone();
     if let (Some(docker), flotilla_resources::environment_provider::ProviderSettings::DockerPerVessel { checkout, .. }) =

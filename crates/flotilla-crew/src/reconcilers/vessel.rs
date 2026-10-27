@@ -24,15 +24,14 @@ use flotilla_resources::{
     canonicalize_repo_url,
     environment_provider::{EnvironmentProviderSpec, ProviderSettings},
     host_direct_environment_name, is_prepared_snapshot, repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec,
-    CheckoutWorktreeSpec, Clone, CloneSpec, CloudSandboxCheckout, Convoy, CrewImageBaseline, CrewSource, CrewWorkPhase,
-    DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource, Environment, EnvironmentMount,
-    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, InputMeta,
-    LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository, RepositoryKey, RepositorySpec, Resource,
-    ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
-    TerminalSessionSpec, Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV,
-    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND,
-    VESSEL_REF_LABEL,
+    CheckoutWorktreeSpec, Clone, CloneSpec, Convoy, CrewImageBaseline, CrewSource, CrewWorkPhase, DockerCheckoutStrategy,
+    DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
+    EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, InputMeta, LifecycleAuthority, OwnerReference,
+    PlacementPolicy, PlacementPolicySpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject,
+    ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage,
+    VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL,
+    CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
+    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{delete_lifecycle_owned_matching, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
@@ -623,6 +622,11 @@ impl VesselReconciler {
             Ok(settings) => settings,
             Err(message) => return Ok(VesselPrepared::failed(message)),
         };
+        // A cloud sandbox's size comes from its provider's settings, resolved here with the strategy.
+        let cloud_size = match &settings.settings {
+            ProviderSettings::CloudSandboxPerVessel { size, .. } => Some(size.clone()),
+            _ => None,
+        };
         let mut strategy = match placement_strategy(&placement_policy.spec, &settings) {
             Ok(strategy) => strategy,
             Err(message) => return Ok(VesselPrepared::failed(message)),
@@ -771,7 +775,7 @@ impl VesselReconciler {
                             meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
                             spec: cloud_environment_spec(
                                 &placement_policy,
-                                &settings,
+                                cloud_size.as_ref(),
                                 requirement
                                     .crew
                                     .iter()
@@ -1261,7 +1265,7 @@ impl VesselReconciler {
                             meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
                             spec: cloud_environment_spec(
                                 &placement_policy,
-                                &settings,
+                                cloud_size.as_ref(),
                                 requirement
                                     .crew
                                     .iter()
@@ -1821,7 +1825,8 @@ fn placement_strategy(spec: &PlacementPolicySpec, settings: &EnvironmentProvider
             None,
             None,
             Some(cloud),
-            ProviderSettings::CloudSandboxPerVessel { env, sandbox_checkout: CloudSandboxCheckout::CloneInVessel, .. },
+            // A cloud sandbox always clones in the vessel; `CloneInVessel` is its only checkout.
+            ProviderSettings::CloudSandboxPerVessel { env, .. },
         ) => Ok(PlacementStrategy::CloneInVessel {
             host_ref: String::new(),
             pool: spec.pool.clone(),
@@ -1938,11 +1943,12 @@ fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &s
 // cloud input, never a Docker input, for a cloud policy.
 fn cloud_environment_spec(
     policy: &ResourceObject<PlacementPolicy>,
-    settings: &EnvironmentProviderSpec,
+    cloud_size: Option<&flotilla_resources::CloudSandboxSize>,
     probe_needs: BTreeSet<flotilla_resources::CapabilityNeed>,
     mut spec: EnvironmentSpec,
 ) -> EnvironmentSpec {
-    if let Some(cloud) = &policy.spec.cloud_sandbox_per_vessel {
+    // `placement_strategy` admits a cloud policy only with cloud sandbox settings, so both are here.
+    if let (Some(cloud), Some(size)) = (&policy.spec.cloud_sandbox_per_vessel, cloud_size) {
         let docker = spec.docker.take().expect("contained staging input");
         if let Some(instance) = environment_provider_labels(policy).get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL) {
             spec.provider_address = Some(
@@ -1953,11 +1959,7 @@ fn cloud_environment_spec(
         }
         spec.cloud_sandbox = Some(flotilla_resources::CloudSandboxEnvironmentSpec {
             image: cloud.image.clone(),
-            size: match &settings.settings {
-                ProviderSettings::CloudSandboxPerVessel { size, .. } => size.clone(),
-                // `placement_strategy` refused other settings for a cloud policy.
-                _ => unreachable!("a cloud policy realises with cloud sandbox settings"),
-            },
+            size: size.clone(),
             lifetime_cap_seconds: None,
             probe_needs,
             env: {
@@ -2358,7 +2360,11 @@ mod tests {
         };
         let needs = ["toolchain:rust".parse().unwrap()].into_iter().collect();
         let settings = flotilla_resources::environment_provider::EnvironmentProviderSpec::from_policy(&policy.spec).unwrap();
-        let mapped = cloud_environment_spec(&policy, &settings, needs, input);
+        let size = match &settings.settings {
+            flotilla_resources::environment_provider::ProviderSettings::CloudSandboxPerVessel { size, .. } => size.clone(),
+            other => panic!("cloud settings: {other:?}"),
+        };
+        let mapped = cloud_environment_spec(&policy, Some(&size), needs, input);
         assert!(mapped.docker.is_none());
         let cloud = mapped.cloud_sandbox.unwrap();
         assert_eq!(cloud.env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], r#"["codex"]"#);

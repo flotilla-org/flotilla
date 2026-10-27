@@ -30,8 +30,14 @@ pub async fn provider_settings(
     use flotilla_resources::environment_provider::{EnvironmentProvider, EnvironmentProviderSpec};
     let carried = EnvironmentProviderSpec::from_policy(policy)?;
     match backend.including_replicas::<EnvironmentProvider>(namespace).get(&carried.record_name()).await {
-        Ok(record) if record.object.spec.settings.realisation() == carried.settings.realisation() => Ok(record.object.spec),
-        Ok(record) => Err(format!("provider settings `{}` are for another realisation", record.object.metadata.name)),
+        // The name says host and realisation; a record whose spec says otherwise is refused, as the
+        // import refuses it.
+        Ok(record) if record.object.spec.record_name() == record.object.metadata.name => Ok(record.object.spec),
+        Ok(record) => Err(format!(
+            "provider settings `{}` are for `{}`, not their name",
+            record.object.metadata.name,
+            record.object.spec.record_name()
+        )),
         Err(ResourceError::NotFound { .. }) => Ok(carried),
         Err(error) => Err(error.to_string()),
     }

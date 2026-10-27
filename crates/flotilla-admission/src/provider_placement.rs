@@ -531,4 +531,58 @@ mod tests {
             assert_ne!(first.spec.provider_requirements, second.spec.provider_requirements);
         });
     }
+
+    // Behaviour (#3824 layer 4, ADR 0058): admission matches a vessel's provider with its host's
+    // provider settings, their checkout and the instance they name, once the host declares them;
+    // before that, with the settings the policy carries.
+    #[tokio::test]
+    async fn the_hosts_provider_settings_decide_the_matched_instance() {
+        use flotilla_resources::{
+            environment_provider::{EnvironmentProvider, EnvironmentProviderSpec, ProviderSettings},
+            DockerCheckoutStrategy, Host, HostSpec, HostStatus, InputMeta, PlacementPolicy, ENVIRONMENT_PROVIDERS_CAPABILITY,
+        };
+        let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let hosts = backend.using::<Host>("flotilla");
+        let host = hosts
+            .create(&InputMeta::builder().name("feta".into()).build(), &HostSpec { display_name: "feta".into(), ..Default::default() })
+            .await
+            .unwrap();
+        let only = |instance: &str, checkout: CheckoutStrategy| {
+            let mut entry = provider(EnvironmentClass::Container);
+            entry.instance = instance.into();
+            entry.capabilities.checkout_strategies = vec![checkout];
+            entry
+        };
+        let advertised = vec![only("docker", CheckoutStrategy::CloneInVessel), only("rootless", CheckoutStrategy::HostWorktree)];
+        let status = HostStatus {
+            capabilities: [(ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::to_value(advertised).unwrap())].into_iter().collect(),
+            ..Default::default()
+        };
+        hosts.update_status("feta", &host.metadata.resource_version, &status).await.unwrap();
+        let mut spec = policy(EnvironmentClass::Container);
+        spec.docker_per_vessel.as_mut().unwrap().checkout =
+            DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".into() };
+        let placed =
+            backend.using::<PlacementPolicy>("flotilla").create(&InputMeta::builder().name("crew".into()).build(), &spec).await.unwrap();
+        let matched = |mut policy: flotilla_resources::ResourceObject<PlacementPolicy>| {
+            let backend = backend.clone();
+            async move {
+                crate::support::resolve_placement_provider(&backend, "flotilla", &mut policy).await.unwrap();
+                policy.spec.provider_requirements.unwrap().instance.unwrap()
+            }
+        };
+        assert_eq!(matched(placed.clone()).await, "rootless", "the policy's worktree checkout");
+
+        let mut settings = EnvironmentProviderSpec::from_policy(&spec).unwrap();
+        settings.instance = Some("docker".into());
+        if let ProviderSettings::DockerPerVessel { checkout, .. } = &mut settings.settings {
+            *checkout = DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".into() };
+        }
+        backend
+            .using::<EnvironmentProvider>("flotilla")
+            .create(&InputMeta::builder().name(settings.record_name()).build(), &settings)
+            .await
+            .unwrap();
+        assert_eq!(matched(placed).await, "docker", "the host's declared instance and checkout");
+    }
 }

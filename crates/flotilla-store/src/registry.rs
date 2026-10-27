@@ -5,6 +5,7 @@ pub(crate) static GC_FULL_KIND_LISTS: std::sync::atomic::AtomicUsize = std::sync
 
 use chrono::Utc;
 use flotilla_protocol::NodeId;
+use flotilla_resources::environment_provider::EnvironmentProvider;
 use futures::{stream::BoxStream, StreamExt};
 use serde::{de::IntoDeserializer, Deserialize};
 use serde_json::{json, Value};
@@ -22,7 +23,6 @@ use crate::{
     ResourceObject, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
-use flotilla_resources::environment_provider::EnvironmentProvider;
 
 pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
 
