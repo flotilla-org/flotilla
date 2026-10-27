@@ -321,6 +321,8 @@ fn declares(meta: &ObjectMeta) -> bool {
 pub fn origin(meta: &ObjectMeta) -> Result<DefinitionOrigin, String> {
     let annotation = |key: &str| meta.annotations.get(key).cloned().ok_or_else(|| format!("no `{key}` annotation"));
     let managed_by = meta.labels.get(MANAGED_BY_LABEL).map(String::as_str);
+    // Precedence: admission alone writes a snapshot, under a content-addressed name no manifest
+    // declares, so the snapshot label is read first; then a project image, a manifest and project ops.
     if meta.labels.get(PREPARED_SNAPSHOT_LABEL).is_some_and(|value| value == WORKFLOW_SNAPSHOT_KIND) {
         return Ok(DefinitionOrigin::Snapshot);
     }
