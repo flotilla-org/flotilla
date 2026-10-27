@@ -327,30 +327,17 @@ async fn missing_host_binary_is_not_ready() {
 // agent's file operations), so only the checkpoint stream is faulted here.
 #[tokio::test]
 async fn truncated_agent_streams_preserve_recovery() {
-    use axum::{
-        body::{Body, Bytes},
-        routing::{delete, get, post},
-        Router,
+    use axum::body::Bytes;
+    use drydock_agent::{
+        stand_in::{self, Ending, ScriptedOutput},
+        ExitStatus,
     };
-    use futures::StreamExt;
     use std::sync::atomic::{AtomicU8, Ordering};
-    // Fake only the guest's HTTP response boundary; use real yamux, HTTP/2,
-    // the agent's process framing, AgentRunner and checkpoint publication.
+    // drydock's stand-in agent scripts only the process output; use real yamux,
+    // HTTP/2, the agent's process framing, AgentRunner and checkpoint publication.
     const COMPLETE: u8 = 0;
     const TRUNCATED: u8 = 1;
     const STALLED: u8 = 2;
-    /// One process output frame: kind, big-endian length, payload.
-    fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![kind];
-        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(payload);
-        bytes
-    }
-    fn output(stderr: bool, bytes: &[u8]) -> Vec<u8> {
-        let mut payload = 0u64.to_be_bytes().to_vec();
-        payload.extend_from_slice(bytes);
-        frame(if stderr { 2 } else { 1 }, &payload)
-    }
     // Requests are sequential across phases, so each handler reads its phase mode.
     let mode = Arc::new(AtomicU8::new(COMPLETE));
     let (host, guest) = tokio::io::duplex(64 * 1024);
@@ -358,42 +345,29 @@ async fn truncated_agent_streams_preserve_recovery() {
         drydock_transport::Transport::yamux(Box::new(host), true, Default::default()),
         drydock_transport::Transport::yamux(Box::new(guest), false, Default::default())
     );
-    let mut guest = guest.unwrap();
     let state = mode.clone();
-    let info = serde_json::json!({"id": "1-1", "pid": 1, "program": "tar", "state": "running", "buffered": 0, "stdout": 0, "stderr": 0});
     let server = tokio::spawn(async move {
-        let router = Router::new()
-            .route(
-                "/hello",
-                get(|| async { axum::Json(serde_json::json!({"fingerprint": "fault-fixture", "features": [], "platform": null})) }),
-            )
-            .route("/processes", post(move || std::future::ready((axum::http::StatusCode::CREATED, axum::Json(info.clone())))))
-            .route("/processes/{id}", delete(|| std::future::ready(axum::http::StatusCode::NO_CONTENT)))
-            .route(
-                "/processes/{id}/output",
-                get(move || {
-                    let mode = state.load(Ordering::SeqCst);
-                    async move {
-                        let content = if mode == COMPLETE { b"archive bytes".as_slice() } else { b"partial replacement".as_slice() };
-                        let mut bytes = output(false, content);
-                        bytes.extend(output(true, b"secret guest stderr"));
-                        if mode == COMPLETE {
-                            bytes.extend(frame(3, br#"{"code":0,"signal":null,"timed_out":false}"#));
-                        }
-                        let end = if mode == STALLED { futures::stream::pending().boxed() } else { futures::stream::empty().boxed() };
-                        Body::from_stream(futures::stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(bytes)) }).chain(end))
-                    }
-                }),
-            );
-        drydock_transport::http2::serve(guest.accept().await.unwrap().unwrap(), router).await.unwrap();
+        stand_in::serve(guest.unwrap(), "fault-fixture".into(), move || {
+            let mode = state.load(Ordering::SeqCst);
+            ScriptedOutput {
+                stdout: Bytes::from_static(if mode == COMPLETE { b"archive bytes".as_slice() } else { b"partial replacement".as_slice() }),
+                stderr: Bytes::from_static(b"secret guest stderr"),
+                ending: match mode {
+                    COMPLETE => Ending::Exit(ExitStatus { code: Some(0), signal: None, timed_out: false }),
+                    TRUNCATED => Ending::Close,
+                    _ => Ending::Stall,
+                },
+            }
+        })
+        .await
     });
-    struct Server(tokio::task::JoinHandle<()>);
+    struct Server(tokio::task::JoinHandle<std::io::Result<()>>);
     impl Drop for Server {
         fn drop(&mut self) {
             self.0.abort();
         }
     }
-    let _server = Server(server);
+    let server_guard = Server(server);
     let agent = Arc::new(drydock_agent::Client::connect(host.unwrap(), "fault-fixture").await.unwrap());
     let runner = Arc::new(runner::AgentRunner(agent.clone()));
     let directory = tempfile::tempdir().unwrap();
@@ -429,6 +403,8 @@ async fn truncated_agent_streams_preserve_recovery() {
     assert!(capture.await.unwrap_err().is_cancelled());
     assert_eq!(std::fs::read(&target).unwrap(), b"archive bytes");
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    // Every fault above came from the script, never from a stand-in that stopped serving.
+    assert!(!server_guard.0.is_finished(), "the stand-in served throughout");
 }
 
 // One slow SSH handshake must not block another label; repeated adoption must
