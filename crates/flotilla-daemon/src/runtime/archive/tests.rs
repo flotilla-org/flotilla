@@ -330,10 +330,12 @@ async fn failed_uploads_keep_the_resource_and_a_stuck_bundle_alerts_infra() {
     assert_eq!(harness.stored(), (false, false));
 }
 
-// Every kind the decided store holds archives once it ends.
+// Every machine the decided store holds archives once it ends. A plain kind (#3824 layer 0)
+// declares no edges and never ends: it is deleted, not archived.
 #[test]
 fn every_decided_kind_archives() {
-    let decided: Vec<_> = crate::runtime::decided_registry().expect("registry").iter().map(|set| set.code).collect();
+    let decided: Vec<_> =
+        crate::runtime::decided_registry().expect("registry").iter().filter(|set| !set.edges.is_empty()).map(|set| set.code).collect();
     let mut archived: Vec<_> = super::archive_kinds().codes().collect();
     archived.sort();
     let mut decided = decided;

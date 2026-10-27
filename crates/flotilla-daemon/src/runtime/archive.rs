@@ -68,7 +68,8 @@ impl ArchiveTarget for S3BlobStore {
 /// The decided store's kinds whose ended resources archive: every machine it holds.
 pub(crate) fn archive_kinds() -> ArchiveKinds {
     use flotilla_provisioning::stored::{
-        checkout::Checkout, clone::Clone, environment::Environment, image_build::ImageBuild, terminal_session::TerminalSession,
+        account::AccountBinding, checkout::Checkout, clone::Clone, environment::Environment, image_build::ImageBuild,
+        terminal_session::TerminalSession,
     };
     use flotilla_state_machines::machines::{
         agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, vessel::Vessel,
@@ -85,6 +86,7 @@ pub(crate) fn archive_kinds() -> ArchiveKinds {
         .with::<TerminalSession>()
         .with::<Vessel>()
         .with::<Ensure>()
+        .with::<AccountBinding>()
 }
 
 /// What one pass did.
