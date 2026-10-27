@@ -2074,6 +2074,61 @@ impl ConvoyStatus {
 }
 
 impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
+    fn diagnostic_name(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::Promise { .. } => "Promise",
+            Self::ObservePromise { .. } => "ObservePromise",
+            Self::HandPromisesToEngine => "HandPromisesToEngine",
+            Self::HoldTurnDelivery { .. } => "HoldTurnDelivery",
+            Self::RestoreTurnActivation { .. } => "RestoreTurnActivation",
+            Self::ObserveEnvironment { .. } => "ObserveEnvironment",
+            Self::RecordNaming { .. } => "RecordNaming",
+            Self::RecordEnsureAdmission { .. } => "RecordEnsureAdmission",
+            Self::DiscoverSubjects { .. } => "DiscoverSubjects",
+            Self::RecordBranchSubjectScan { .. } => "RecordBranchSubjectScan",
+            Self::RecordBranchSubjectScanFailure { .. } => "RecordBranchSubjectScanFailure",
+            Self::UnlinkSubject { .. } => "UnlinkSubject",
+            Self::SetStalled { .. } => "SetStalled",
+            Self::SetNudgeObligations { .. } => "SetNudgeObligations",
+            Self::SetTeardownWait { .. } => "SetTeardownWait",
+            Self::RecordLifecycleMutation { .. } => "RecordLifecycleMutation",
+            Self::SetPlacementDecision { .. } => "SetPlacementDecision",
+            Self::Bootstrap { .. } => "Bootstrap",
+            Self::BackfillCrewWork { .. } => "BackfillCrewWork",
+            Self::FailInit { .. } => "FailInit",
+            Self::AdvanceWorkToReady { .. } => "AdvanceWorkToReady",
+            Self::FailConvoy { .. } => "FailConvoy",
+            Self::RollUpPhase { .. } => "RollUpPhase",
+            Self::RecordLandingEvent { .. } => "RecordLandingEvent",
+            Self::Settle { .. } => "Settle",
+            Self::SetSettlementAttention { .. } => "SetSettlementAttention",
+            Self::ObserveTurnHookHealth { .. } => "ObserveTurnHookHealth",
+            Self::QueueSupervisorTurn { .. } => "QueueSupervisorTurn",
+            Self::AcknowledgeSupervisorTurn { .. } => "AcknowledgeSupervisorTurn",
+            Self::WorkLaunching { .. } => "WorkLaunching",
+            Self::WorkRunning { .. } => "WorkRunning",
+            Self::WorkProvisioningRetry { .. } => "WorkProvisioningRetry",
+            Self::WorkInterrupted { .. } => "WorkInterrupted",
+            Self::ForceWorkCompleted { .. } => "ForceWorkCompleted",
+            Self::MarkWorkFailed { .. } => "MarkWorkFailed",
+            Self::MarkWorkCancelled { .. } => "MarkWorkCancelled",
+            Self::MarkConvoyAbandoned { .. } => "MarkConvoyAbandoned",
+            Self::DeriveCrewDone { .. } => "DeriveCrewDone",
+            Self::MarkCrewCompleted { .. } => "MarkCrewCompleted",
+            Self::MarkCrewFailed { .. } => "MarkCrewFailed",
+            Self::MarkCrewStalled { .. } => "MarkCrewStalled",
+            Self::HandoffCrewWork { .. } => "HandoffCrewWork",
+            Self::ResumeCrewWork { .. } => "ResumeCrewWork",
+            Self::QueueMessageFollowUp { .. } => "QueueMessageFollowUp",
+            Self::BeginMessageFollowUp { .. } => "BeginMessageFollowUp",
+            Self::RecordTurnDelivery { .. } => "RecordTurnDelivery",
+            Self::ObserveQueuedTurnDeliveries { .. } => "ObserveQueuedTurnDeliveries",
+            Self::FailTurnDelivery { .. } => "FailTurnDelivery",
+            Self::RefuseTurnDelivery { .. } => "RefuseTurnDelivery",
+            Self::RollUpWork { .. } => "RollUpWork",
+        })
+    }
+
     fn apply(&self, status: &mut ConvoyStatus) {
         // Optimistic retry can reapply a patch computed from an older phase.
         // Terminal outcomes reject stale and duplicate patches. An explicit

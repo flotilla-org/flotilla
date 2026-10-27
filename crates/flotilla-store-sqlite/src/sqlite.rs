@@ -2950,6 +2950,9 @@ impl SqliteBackend {
             let existing = Self::select_existing(resource_kind, &tx, &key, &name)?;
             let mut object = existing.ok_or_else(|| ResourceError::not_found(&name))?;
             if object.metadata.resource_version != resource_version {
+                if resource_kind.paths.kind == "Convoy" {
+                    return Err(ResourceError::status_version_conflict(&name, &resource_version, &object.metadata.resource_version));
+                }
                 return Err(ResourceError::conflict(&name, "stale resourceVersion"));
             }
             resource_kind.validate_status_update(object.status.as_ref(), &status)?;

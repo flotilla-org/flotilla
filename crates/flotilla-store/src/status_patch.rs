@@ -1,30 +1,35 @@
-use std::future::Future;
+use std::{future::Future, panic::Location};
 
 use flotilla_resources::{Resource, ResourceError, ResourceObject, StatusPatch};
 
 use crate::TypedResolver;
 
 const MAX_RETRIES: usize = 3;
-pub async fn apply_status_patch<T>(
-    resolver: &TypedResolver<T>,
-    name: &str,
-    patch: &T::StatusPatch,
-) -> Result<ResourceObject<T>, ResourceError>
+#[track_caller]
+pub fn apply_status_patch<'a, T>(
+    resolver: &'a TypedResolver<T>,
+    name: &'a str,
+    patch: &'a T::StatusPatch,
+) -> impl Future<Output = Result<ResourceObject<T>, ResourceError>> + 'a
 where
-    T: Resource,
+    T: Resource + 'a,
     T::Status: Default,
 {
-    apply_status_patch_inner(
-        name,
-        patch,
-        || async {
-            let current = resolver.get(name).await?;
-            Ok((current.metadata.resource_version.clone(), current.status.clone(), current))
-        },
-        |resource_version, new_status| async move { resolver.update_status(name, &resource_version, &new_status).await },
-        || async {},
-    )
-    .await
+    let caller = Location::caller();
+    async move {
+        apply_status_patch_inner(
+            name,
+            patch,
+            || async {
+                let current = resolver.get(name).await?;
+                Ok((current.metadata.resource_version.clone(), current.status.clone(), current))
+            },
+            |resource_version, new_status| async move { resolver.update_status(name, &resource_version, &new_status).await },
+            || async {},
+            caller,
+        )
+        .await
+    }
 }
 
 /// Apply a patch with an injected action between reading a version and writing it.
@@ -32,58 +37,68 @@ where
 /// A patch whose `StatusPatch::requires_write` declines the change returns the
 /// current object without writing, so `before_update` does not run.
 #[doc(hidden)]
-pub async fn apply_status_patch_with_before_update<T, F, Fut>(
-    resolver: &TypedResolver<T>,
-    name: &str,
-    patch: &T::StatusPatch,
+#[track_caller]
+pub fn apply_status_patch_with_before_update<'a, T, F, Fut>(
+    resolver: &'a TypedResolver<T>,
+    name: &'a str,
+    patch: &'a T::StatusPatch,
     before_update: F,
-) -> Result<ResourceObject<T>, ResourceError>
+) -> impl Future<Output = Result<ResourceObject<T>, ResourceError>> + 'a
 where
-    T: Resource,
+    T: Resource + 'a,
     T::Status: Default,
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
+    F: FnOnce() -> Fut + 'a,
+    Fut: Future<Output = ()> + 'a,
 {
-    apply_status_patch_inner(
-        name,
-        patch,
-        || async {
-            let current = resolver.get(name).await?;
-            Ok((current.metadata.resource_version.clone(), current.status.clone(), current))
-        },
-        |resource_version, new_status| async move { resolver.update_status(name, &resource_version, &new_status).await },
-        before_update,
-    )
-    .await
+    let caller = Location::caller();
+    async move {
+        apply_status_patch_inner(
+            name,
+            patch,
+            || async {
+                let current = resolver.get(name).await?;
+                Ok((current.metadata.resource_version.clone(), current.status.clone(), current))
+            },
+            |resource_version, new_status| async move { resolver.update_status(name, &resource_version, &new_status).await },
+            before_update,
+            caller,
+        )
+        .await
+    }
 }
 
 /// Applies a status patch only while `check` accepts each freshly fetched resource version.
 ///
 /// The check runs before the initial write and again after every optimistic-concurrency conflict,
 /// keeping state-dependent validation in the same retry loop as the mutation it guards.
-pub async fn apply_status_patch_checked<T, P>(
-    resolver: &TypedResolver<T>,
-    name: &str,
-    patch: &P,
-    check: impl Fn(&ResourceObject<T>) -> Result<(), ResourceError>,
-) -> Result<ResourceObject<T>, ResourceError>
+#[track_caller]
+pub fn apply_status_patch_checked<'a, T, P>(
+    resolver: &'a TypedResolver<T>,
+    name: &'a str,
+    patch: &'a P,
+    check: impl Fn(&ResourceObject<T>) -> Result<(), ResourceError> + 'a,
+) -> impl Future<Output = Result<ResourceObject<T>, ResourceError>> + 'a
 where
-    T: Resource,
+    T: Resource + 'a,
     T::Status: Default,
-    P: StatusPatch<T::Status> + ?Sized,
+    P: StatusPatch<T::Status> + ?Sized + 'a,
 {
-    apply_status_patch_inner(
-        name,
-        patch,
-        || async {
-            let current = resolver.get(name).await?;
-            check(&current)?;
-            Ok((current.metadata.resource_version.clone(), current.status.clone(), current))
-        },
-        |resource_version, new_status| async move { resolver.update_status(name, &resource_version, &new_status).await },
-        || async {},
-    )
-    .await
+    let caller = Location::caller();
+    async move {
+        apply_status_patch_inner(
+            name,
+            patch,
+            || async {
+                let current = resolver.get(name).await?;
+                check(&current)?;
+                Ok((current.metadata.resource_version.clone(), current.status.clone(), current))
+            },
+            |resource_version, new_status| async move { resolver.update_status(name, &resource_version, &new_status).await },
+            || async {},
+            caller,
+        )
+        .await
+    }
 }
 
 async fn apply_status_patch_inner<S, P, R, G, GFut, U, UFut, B, BFut>(
@@ -92,6 +107,7 @@ async fn apply_status_patch_inner<S, P, R, G, GFut, U, UFut, B, BFut>(
     mut get_current: G,
     mut update: U,
     before_update: B,
+    caller: &'static Location<'static>,
 ) -> Result<R, ResourceError>
 where
     S: std::clone::Clone + Default,
@@ -104,6 +120,7 @@ where
     BFut: Future<Output = ()>,
 {
     let mut before_update = Some(before_update);
+    let mut conflicts = Vec::new();
     for _ in 0..MAX_RETRIES {
         let (resource_version, current_status, current) = get_current().await?;
         let mut new_status = current_status.clone().unwrap_or_default();
@@ -115,14 +132,23 @@ where
         if let Some(before_update) = before_update.take() {
             before_update().await;
         }
-        match update(resource_version, new_status).await {
+        match update(resource_version.clone(), new_status).await {
             Ok(updated) => return Ok(updated),
-            Err(ResourceError::Conflict { .. }) => continue,
+            Err(ResourceError::Conflict { message, .. }) => {
+                if patch.diagnostic_name().is_some() {
+                    conflicts.push(format!("attempt {}: expected={resource_version}; {message}", conflicts.len() + 1));
+                }
+                continue;
+            }
             Err(other) => return Err(other),
         }
     }
 
-    Err(ResourceError::conflict(name, "status patch retry budget exhausted"))
+    let mut message = "status patch retry budget exhausted".to_string();
+    if let Some(patch) = patch.diagnostic_name() {
+        message.push_str(&format!("; patch={patch}; caller={caller}; {}", conflicts.join("; ")));
+    }
+    Err(ResourceError::conflict(name, message))
 }
 
 #[cfg(test)]
@@ -201,6 +227,7 @@ mod tests {
                 }
             },
             || async {},
+            std::panic::Location::caller(),
         )
         .await;
         let writes = writes.lock().expect("writes lock").clone();
@@ -272,6 +299,7 @@ mod tests {
                 }
             },
             || async {},
+            std::panic::Location::caller(),
         )
         .await
         .expect("second attempt should succeed");
@@ -286,26 +314,55 @@ mod tests {
         );
     }
 
+    // Exhaustion must retain the convoy transition, caller and each rejected CAS's
+    // versions without printing the patch payload or claiming an unknown writer.
     #[tokio::test]
     async fn returns_conflict_after_retry_budget_is_exhausted() {
-        let result = super::apply_status_patch_inner::<CounterStatus, _, CounterStatus, _, _, _, _, _, _>(
-            "counter-b",
-            &CounterPatch::Increment,
-            || async { Ok(("1".to_string(), Some(CounterStatus { value: 1, note: None }), CounterStatus { value: 1, note: None })) },
-            |_resource_version: String, _status: CounterStatus| async {
-                Err(ResourceError::conflict("counter-b", "stale resourceVersion"))
+        use flotilla_resources::{ConvoyStatus, ConvoyStatusPatch, ResumeIntent};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reads = AtomicUsize::new(0);
+        let caller = std::panic::Location::caller();
+        let patch = ConvoyStatusPatch::ResumeCrewWork {
+            vessel: "implement".into(),
+            role: "coder".into(),
+            resumed_at: chrono::Utc::now(),
+            prompt: "private patch payload".into(),
+            brief_id: None,
+            intent: ResumeIntent::Reminder,
+        };
+        let result = super::apply_status_patch_inner::<ConvoyStatus, _, ConvoyStatus, _, _, _, _, _, _>(
+            "convoy-b",
+            &patch,
+            || {
+                let version = reads.fetch_add(1, Ordering::SeqCst) + 1;
+                async move { Ok((version.to_string(), Some(ConvoyStatus::default()), ConvoyStatus::default())) }
+            },
+            |version: String, _status: ConvoyStatus| async move {
+                let current = format!("{version}-new");
+                Err(ResourceError::status_version_conflict("convoy-b", &version, &current))
             },
             || async {},
+            caller,
         )
         .await
         .expect_err("conflicts should exhaust retry budget");
 
         match result {
             ResourceError::Conflict { name, message } => {
-                assert_eq!(name, "counter-b");
-                assert!(message.contains("retry budget exhausted"));
+                assert_eq!(name, "convoy-b");
+                assert!(message.contains("retry budget exhausted"), "{message}");
+                assert!(message.contains("patch=ResumeCrewWork"), "{message}");
+                assert!(message.contains(&format!("caller={caller}")), "{message}");
+                for attempt in 1..=3 {
+                    assert!(message.contains(&format!("attempt {attempt}: expected={attempt}")), "{message}");
+                    assert!(message.contains(&format!("current={attempt}-new")), "{message}");
+                }
+                assert!(message.contains("intervening_writer=unavailable (not recorded)"), "{message}");
+                assert!(!message.contains("private patch payload"), "{message}");
             }
             other => panic!("expected conflict, got {other}"),
         }
+        assert_eq!(reads.load(Ordering::SeqCst), 3, "the retry budget is unchanged");
     }
 }
