@@ -16,6 +16,7 @@ mod manifest_root_import;
 mod message_import;
 #[cfg(unix)]
 mod placement_import;
+#[cfg(unix)]
 mod repository_import;
 #[cfg(unix)]
 mod retirement;
