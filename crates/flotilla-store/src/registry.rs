@@ -178,6 +178,35 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     ),
 ];
 
+/// A kind retired from [`REGISTERED_RESOURCE_KINDS`] whose rows a previous generation may still
+/// hold. For one generation (ADR 0047) the stored decoder accepts and drops them, so a host still
+/// holding rows validates, and the import reports them as retired and dropped, not as an unknown kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredResourceKind {
+    pub kind: &'static str,
+    pub plural: &'static str,
+    pub api_version: &'static str,
+}
+
+pub const RETIRED_RESOURCE_KINDS: &[RetiredResourceKind] = &[
+    // Retired by #3943 (shipped in r887); remove one roll later, once the corpus is refreshed (#4007).
+    RetiredResourceKind { kind: "Usage", plural: "usages", api_version: "flotilla.work/v1" },
+];
+
+/// What a stored document decoded as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredRecord {
+    /// A registered kind, both persisted halves decoded by its typed representation.
+    Current,
+    /// A retired kind: accepted and dropped, never typed.
+    Retired(&'static RetiredResourceKind),
+}
+
+/// The retired kind listed under `plural`, if any.
+pub fn retired_resource_kind(plural: &str) -> Option<&'static RetiredResourceKind> {
+    RETIRED_RESOURCE_KINDS.iter().find(|retired| retired.plural == plural)
+}
+
 const fn kind<T: Resource>(resource: RegisteredResource, aliases: &'static [&'static str]) -> RegisteredResourceKind {
     RegisteredResourceKind {
         kind: T::API_PATHS.kind,
@@ -980,11 +1009,19 @@ pub fn validate_resource_document(document: &Value) -> Result<(), ResourceError>
 
 /// Decode both persisted halves of a resource without applying current write validation.
 /// The stored-record corpus uses this to enforce N→N+1 read compatibility.
-pub fn decode_stored_resource_document(document: &Value) -> Result<(), ResourceError> {
+/// A retired kind's document decodes as [`StoredRecord::Retired`] once its apiVersion and spec are present.
+pub fn decode_stored_resource_document(document: &Value) -> Result<StoredRecord, ResourceError> {
     let kind = document.get("kind").and_then(Value::as_str).ok_or_else(|| ResourceError::decode("kind: missing or non-string"))?;
-    let registered = lookup_resource_kind(kind)?;
     let version =
         document.get("apiVersion").and_then(Value::as_str).ok_or_else(|| ResourceError::decode("apiVersion: missing or non-string"))?;
+    if let Some(retired) = RETIRED_RESOURCE_KINDS.iter().find(|retired| retired.kind == kind) {
+        if version != retired.api_version {
+            return Err(ResourceError::decode(format!("apiVersion: expected {}, got {version}", retired.api_version)));
+        }
+        document.get("spec").ok_or_else(|| ResourceError::decode("spec: missing"))?;
+        return Ok(StoredRecord::Retired(retired));
+    }
+    let registered = lookup_resource_kind(kind)?;
     let expected = dispatch_resource_kind!(registered.resource, api_version_typed());
     if version != expected {
         return Err(ResourceError::decode(format!("apiVersion: expected {expected}, got {version}")));
@@ -994,7 +1031,7 @@ pub fn decode_stored_resource_document(document: &Value) -> Result<(), ResourceE
     if let Some(status) = document.get("status").filter(|status| !status.is_null()) {
         dispatch_resource_kind!(registered.resource, decode_typed_status(status))?;
     }
-    Ok(())
+    Ok(StoredRecord::Current)
 }
 
 // New authoring must not use the deserialize-only compatibility default.
