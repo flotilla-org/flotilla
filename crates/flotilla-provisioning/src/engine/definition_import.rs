@@ -310,10 +310,14 @@ pub fn label(origin: &DefinitionOrigin) -> &'static str {
     }
 }
 
-/// Whether a copy's own metadata says a manifest declares it.
+/// Whether a copy's own metadata says a manifest declares it. Project operations also stamp the
+/// reconciler root on what they materialise from an ops root, but never a manifest source: a copy
+/// with a source entry path and no manifest source is project ops'.
 fn declares(meta: &ObjectMeta) -> bool {
+    let project_ops =
+        meta.annotations.contains_key(SOURCE_ENTRY_PATH_ANNOTATION) && !meta.annotations.contains_key(MANIFEST_SOURCE_ANNOTATION);
     meta.labels.get(MANAGED_BY_LABEL).is_some_and(|value| value == MANIFEST_MANAGED_BY_VALUE)
-        || meta.annotations.contains_key(MANIFEST_RECONCILER_ROOT_ANNOTATION)
+        || (meta.annotations.contains_key(MANIFEST_RECONCILER_ROOT_ANNOTATION) && !project_ops)
 }
 
 /// The origin a copy's writer stamped on it. A copy naming an origin without all of its fields

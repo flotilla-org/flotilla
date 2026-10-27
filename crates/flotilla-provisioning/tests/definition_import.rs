@@ -77,10 +77,10 @@ fn maybe<T>(tc: &TestCase, value: impl FnOnce(&TestCase) -> T) -> Option<T> {
     tc.draw(gs::booleans()).then(|| value(tc))
 }
 
-/// The six stamps the writers make, by index: an operator's, a manifest document's, a charter
-/// document's with its materialised project, project ops', a project image's and a snapshot's;
-/// each with the origin the import must read from it.
-const STAMPS: u8 = 6;
+/// The seven stamps the writers make, by index: an operator's, a manifest document's, a charter
+/// document's with its materialised project, project ops', a project image's, a snapshot's, and
+/// project ops' from an ops root; each with the origin the import must read from it.
+const STAMPS: u8 = 7;
 
 fn provenance(stamp: u8) -> (BTreeMap<String, String>, BTreeMap<String, String>, DefinitionOrigin) {
     let pairs = |items: &[(&str, &str)]| items.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect::<BTreeMap<_, _>>();
@@ -116,14 +116,18 @@ fn provenance(stamp: u8) -> (BTreeMap<String, String>, BTreeMap<String, String>,
             };
             (pairs(&[(MANAGED_BY_LABEL, MANIFEST_MANAGED_BY_VALUE)]), annotations, origin)
         }
-        3 => (
+        3 | 6 => (
             BTreeMap::new(),
+            // Project ops stamp the ops root's name when the entries came through one (stamp 6).
             pairs(&[
                 (MATERIALIZED_PROJECT_ANNOTATION, "p"),
                 (SOURCE_REPOSITORY_ANNOTATION, "repo"),
                 (SOURCE_COMMIT_ANNOTATION, "abc"),
                 (SOURCE_ENTRY_PATH_ANNOTATION, ".flotilla/ops/x.yaml"),
-            ]),
+            ])
+            .into_iter()
+            .chain((stamp == 6).then(|| (MANIFEST_RECONCILER_ROOT_ANNOTATION.to_owned(), "ops-00aa".to_owned())))
+            .collect(),
             DefinitionOrigin::ProjectOps {
                 project: "p".into(),
                 repository: "repo".into(),
@@ -136,7 +140,8 @@ fn provenance(stamp: u8) -> (BTreeMap<String, String>, BTreeMap<String, String>,
             pairs(&[(MATERIALIZED_PROJECT_ANNOTATION, "p"), (SOURCE_COMMIT_ANNOTATION, "abc")]),
             DefinitionOrigin::ProjectImage { project: "p".into(), commit: "abc".into() },
         ),
-        _ => (pairs(&[(PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND)]), BTreeMap::new(), DefinitionOrigin::Snapshot),
+        5 => (pairs(&[(PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND)]), BTreeMap::new(), DefinitionOrigin::Snapshot),
+        _ => unreachable!("{stamp} is not a stamp"),
     }
 }
 
