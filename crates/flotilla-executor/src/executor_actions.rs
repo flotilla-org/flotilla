@@ -90,6 +90,7 @@ pub struct ExecutorActions<'a> {
     pub port: &'a dyn ExecutorActionPort,
     pub namespace: &'a std::sync::RwLock<String>,
     pub resource_backend: &'a ResourceBackend,
+    pub manifest_roots: &'a dyn flotilla_resources::manifest_roots::ManifestRoots,
     pub config: &'a Arc<ConfigStore>,
     pub active_commands: &'a Arc<Mutex<HashMap<u64, CancellationToken>>>,
     pub observed_checkout_reconciliation: &'a Arc<Mutex<()>>,
@@ -154,7 +155,9 @@ impl ExecutorActions<'_> {
     pub async fn execute_action_resource_manifest_resolve(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceManifestResolve { namespace, kind, name, resolution, requested_by } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
-            let result = request_manifest_resolution(self.resource_backend, namespace, kind, name, *resolution, requested_by).await;
+            let result =
+                request_manifest_resolution(self.resource_backend, self.manifest_roots, namespace, kind, name, *resolution, requested_by)
+                    .await;
             self.events.finish(
                 id,
                 empty_identity,

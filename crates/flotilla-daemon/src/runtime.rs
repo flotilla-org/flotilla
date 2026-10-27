@@ -44,8 +44,8 @@ use flotilla_provisioning::reconcilers::{
 };
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{
-    host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, Environment, Forge, Host, ManifestRoot, Repository, Resource,
-    ResourceError, SystemClock, TerminalSession, Vessel, WorkflowTemplate,
+    host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, Environment, Forge, Host, Repository, Resource, ResourceError,
+    SystemClock, TerminalSession, Vessel, WorkflowTemplate,
 };
 use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use tokio::{sync::watch, task::JoinHandle};
@@ -427,13 +427,14 @@ impl DaemonRuntime {
             .as_ref()
             .filter(|declared| manifest_reconciler_enabled(&declared.reconciler_root, &profile.host_id))
             .map(|declared| manifest_root_name(&declared.reconciler_root, &declared.dir, &declared.source));
-        let roots = daemon.resource_backend().using::<ManifestRoot>(&options.namespace);
-        for root in retry_phase("list_manifest_roots", || roots.list()).await?.items {
-            if root.metadata.name.starts_with("manifest-")
+        let roots = daemon.manifest_roots();
+        for root in retry_phase("list_manifest_roots", || roots.roots(&options.namespace)).await? {
+            if root.local
+                && root.name.starts_with("manifest-")
                 && root.spec.host == profile.host_id
-                && desired_manifest_root.as_deref() != Some(root.metadata.name.as_str())
+                && desired_manifest_root.as_deref() != Some(root.name.as_str())
             {
-                retry_phase("delete_stale_manifest_root", || roots.delete(&root.metadata.name)).await?;
+                retry_phase("retire_stale_manifest_root", || roots.retire(&options.namespace, &root.name)).await?;
             }
         }
         let charter_daemon = Arc::clone(&daemon);
@@ -487,6 +488,7 @@ impl DaemonRuntime {
                     .resource_backend(daemon.resource_backend())
                     .clock(Arc::new(SystemClock))
                     .maybe_engine(ensure_engine)
+                    .manifest_roots(daemon.manifest_roots())
                     .build(),
             ))
             .await;
@@ -1288,6 +1290,14 @@ async fn open_provisioning_lifecycles(
         .await
         .map_err(|error| error.to_string())??;
     daemon.install_account_records(Arc::new(accounts))?;
+    // #3824 layer 2c: ManifestRoot on the engine, installed before the manifest reconciler starts.
+    let service = daemon.decided_store()?;
+    let clock = daemon.clock_for_scenarios();
+    let roots =
+        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::manifest_root::EngineManifestRoots::open(service, clock))
+            .await
+            .map_err(|error| error.to_string())??;
+    daemon.install_manifest_roots(Arc::new(roots))?;
     tokio::task::spawn_blocking(move || {
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
         let log = || StoreLog::new(Arc::clone(&store));

@@ -138,6 +138,7 @@ pub async fn build_plan(
         CommandAction::QueryChangeStream { .. }
         | CommandAction::QueryResourceDigest { .. }
         | CommandAction::QueryResourceList { .. }
+        | CommandAction::QueryManifestRoots { .. }
         | CommandAction::QueryResourceGet { .. }
         | CommandAction::QueryExplainConvoy { .. }
         | CommandAction::ArtifactReserveLedgerComment { .. }

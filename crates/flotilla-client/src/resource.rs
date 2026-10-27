@@ -122,6 +122,18 @@ impl ResourceClient {
         resource_read_result(result)
     }
 
+    /// Every ManifestRoot of every home, as the daemon's ManifestRoot port reads them (#3824 layer 2c).
+    pub async fn manifest_roots(&self, namespace: String, node_id: Option<NodeId>) -> Result<ResourceReadEnvelope, String> {
+        let result = self
+            .daemon
+            .execute_query(
+                Command { node_id, provisioning_target: None, context_repo: None, action: CommandAction::QueryManifestRoots { namespace } },
+                uuid::Uuid::new_v4(),
+            )
+            .await?;
+        resource_read_result(result)
+    }
+
     pub async fn get(&self, request: ResourceGetRequest) -> Result<ResourceReadEnvelope, String> {
         let result = self
             .daemon

@@ -20,8 +20,8 @@ use flotilla_protocol::{BlobSyncStatus, HostSummary, NodeId, Rows};
 use flotilla_resources::Resource;
 use flotilla_resources::{
     ConditionValue, Convoy, CredentialExpiry, FoldedHostObservations, Forge, FulfilmentFacts, Host, HostCondition, HostStatus,
-    HostStatusPatch, ManifestRoot, ReplicationClass, ResourceError, SystemClock, Vessel, AGENT_ADAPTERS_CAPABILITY,
-    CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, LOCAL_ROWS_MISSING_REASON, PROJECTION_PARITY_CONDITION,
+    HostStatusPatch, ReplicationClass, SystemClock, Vessel, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY,
+    HELD_CREDENTIALS_CAPABILITY, LOCAL_ROWS_MISSING_REASON, PROJECTION_PARITY_CONDITION,
 };
 use flotilla_store::{home_bound_authorship_collisions, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use serde_json::json;
@@ -608,10 +608,11 @@ pub(super) async fn resolve_daemon_forgejo_credential_condition(
     // Its status is published only after the directory has been processed.
     if let Some(manifests) = &config.manifests {
         let name = manifest_root_name(&manifests.reconciler_root, &manifests.dir, &manifests.source);
-        match backend.including_replicas::<ManifestRoot>(namespace).get(&name).await {
-            Ok(root) if root.object.status.is_some() => {}
-            Ok(_) | Err(ResourceError::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(error.to_string()),
+        // A root's first pass leaves a revision or a source error behind.
+        match daemon.manifest_roots().root(namespace, &name).await? {
+            Some(root)
+                if root.status.applied_revision.is_some() || root.status.source_error.is_some() || !root.status.documents.is_empty() => {}
+            _ => return Ok(None),
         }
     }
     // A cursor for some other kind does not establish that Forge definitions

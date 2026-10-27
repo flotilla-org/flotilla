@@ -360,7 +360,8 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let service = service(&backend, &observed, &clock, &namespace, &operations);
+        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let service = service(&backend, &observed, &clock, &namespace, &operations, &roots);
         *source.error.lock().unwrap() = Some("Unable to create /cache/shallow.lock: File exists".into());
         service.reconcile_project_image_layers().await.unwrap();
         for _ in 0..10 {
@@ -419,7 +420,8 @@ mod tests {
             let operations = Operations::with_inspector(source.clone());
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let namespace = std::sync::RwLock::new("flotilla".to_string());
-            let service = service(&backend, &observed, &clock, &namespace, &operations);
+            let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+            let service = service(&backend, &observed, &clock, &namespace, &operations, &roots);
             service.reconcile_project_image_layers().await.unwrap();
             assert_eq!(service.image_layer_refresh.lock().await.conditions().len(), 1);
             let mut project = backend.using::<Project>("flotilla").get("app").await.unwrap();
@@ -518,9 +520,11 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
+        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
         let service = ProjectService {
             image_layer_refresh: Default::default(),
             resource_backend: &backend,
+            manifest_roots: &roots,
             observed_resource_backend: &observed,
             clock: &clock,
             namespace: &namespace,
@@ -586,10 +590,12 @@ mod tests {
         clock: &'a Arc<dyn Clock>,
         namespace: &'a std::sync::RwLock<String>,
         operations: &'a Operations,
+        roots: &'a flotilla_store::OldStoreManifestRoots,
     ) -> ProjectService<'a> {
         ProjectService {
             image_layer_refresh: Default::default(),
             resource_backend: backend,
+            manifest_roots: roots,
             observed_resource_backend: observed,
             clock,
             namespace,
@@ -617,7 +623,8 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let service = service(&backend, &observed, &clock, &namespace, &operations);
+        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let service = service(&backend, &observed, &clock, &namespace, &operations, &roots);
         service.reconcile_project_image_layers().await.expect("sync");
         let layers = backend.definitions::<ImageLayer>("flotilla");
         assert!(layers.get(&layer_name("1.0.0")).await.is_ok(), "charter projects read their primary repository");

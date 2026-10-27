@@ -1085,6 +1085,17 @@ impl DummyDaemon {
                 at,
             )
             .expect("provision record");
+        // #3824 layer 2c: a ManifestRoot, declared with no records yet.
+        let mut roots =
+            Home::<flotilla_provisioning::stored::manifest_root::ManifestRoot, _>::with_log(home, StoreLog::new(service.store()))
+                .expect("root home");
+        let request = flotilla_provisioning::stored::manifest_root::RootRequest {
+            host: "transport".into(),
+            path: "/transport/manifests".into(),
+            source: "transport".into(),
+            binding: None,
+        };
+        roots.create("manifest-transport", request, &(), at).expect("root record");
     }
 
     fn transport_binding(&self, at: flotilla_schema::Timestamp) -> flotilla_provisioning::stored::account::BindingSpec {
@@ -1179,6 +1190,7 @@ impl DummyDaemon {
                 collect!(Ensure);
                 collect!(flotilla_provisioning::stored::account::AccountBinding);
                 collect!(stored flotilla_provisioning::stored::account::ProvisionSpec);
+                collect!(flotilla_provisioning::stored::manifest_root::ManifestRoot);
                 assert_eq!(covered, registered, "every registered engine kind needs a transport fixture");
                 Ok(snapshots)
             })

@@ -302,15 +302,18 @@ async fn daemon_forgejo_credential_mapping_waits_for_manifest_pass() {
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
     let backend = daemon.resource_backend();
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("pending source").is_none());
-    let root = materialize_manifest_root(&backend, NAMESPACE, Path::new("/test/manifests"), "test-source", "credential-mapping-test")
+    let roots = daemon.manifest_roots();
+    let root = materialize_manifest_root(&*roots, NAMESPACE, Path::new("/test/manifests"), "test-source", "credential-mapping-test", None)
         .await
         .expect("manifest root");
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("pending pass").is_none());
-    backend
-        .using::<ManifestRoot>(NAMESPACE)
-        .update_status(&root.metadata.name, &root.metadata.resource_version, &flotilla_resources::ManifestRootStatus::default())
-        .await
-        .expect("completed empty pass");
+    let pass = flotilla_resources::manifest_roots::PassReport {
+        revision: "r1".into(),
+        complete: true,
+        documents: Default::default(),
+        at: chrono::Utc::now(),
+    };
+    roots.record_pass(NAMESPACE, &root.name, pass).await.expect("completed empty pass");
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("settled source").is_some());
     declare_mapping_forge(&backend, NAMESPACE).await;
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("late declaration").is_none());

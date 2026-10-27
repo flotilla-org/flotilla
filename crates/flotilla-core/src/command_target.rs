@@ -133,6 +133,7 @@ impl InProcessDaemon {
             | A::QueryChangeStream { .. }
             | A::QueryResourceDigest { .. }
             | A::QueryResourceList { .. }
+            | A::QueryManifestRoots { .. }
             | A::QueryResourceGet { .. }
             | A::QueryResolveRepository { .. }
             | A::QueryRepoProviders { .. }

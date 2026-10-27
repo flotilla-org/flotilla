@@ -181,7 +181,8 @@ pub(super) fn spawn_manifest_reconciler_task(
             let namespace = namespace.clone();
             let manifests = manifests.clone();
             async move {
-                materialize_bound_manifest_root(&daemon.resource_backend(), &namespace, &manifests).await.map_err(ResourceError::other)?;
+                let roots = daemon.manifest_roots();
+                materialize_bound_manifest_root(&*roots, &namespace, &manifests).await.map_err(ResourceError::other)?;
                 let vcs = if manifests.binding.is_some() {
                     daemon.local_charter_vcs()
                 } else {
@@ -192,6 +193,7 @@ pub(super) fn spawn_manifest_reconciler_task(
                     .with_declared_source(manifests.source, manifests.reconciler_root)
                     .with_binding(manifests.binding)
                     .with_vcs(vcs)
+                    .with_roots(roots)
                     .run(interval)
                     .await
             }

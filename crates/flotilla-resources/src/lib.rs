@@ -77,6 +77,7 @@ mod landing_gate;
 mod leaf;
 pub mod lifecycle_reads;
 mod manifest_root;
+pub mod manifest_roots;
 #[doc(hidden)]
 pub mod message;
 mod message_inbox;

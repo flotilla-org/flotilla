@@ -15,14 +15,7 @@ pub async fn run_manifest_command(cli: &Cli, command: ManifestSubCommand, format
     let node_id = resolve_optional_host_node(cli, host.as_deref()).await?;
     let daemon = connect_daemon(cli).await?;
     let response = flotilla_client::resource::ResourceClient::new(Arc::clone(&daemon))
-        .list(
-            flotilla_client::resource::ResourceListRequest::builder()
-                .kind("manifestroots".to_string())
-                .namespace(namespace)
-                .maybe_node_id(node_id)
-                .include_replicas(true)
-                .build(),
-        )
+        .manifest_roots(namespace, node_id)
         .await
         .map_err(|error| color_eyre::eyre::eyre!(error))?;
     let mut rows = Vec::new();

@@ -25,8 +25,8 @@ use flotilla_resources::{
     api_version, Clock, ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition,
     ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch, ConvoyPhase,
     Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, Host as ResourceHost, InputMeta,
-    ManifestRoot, ObjectEvent, PlacementPolicy, Project, ReadResourceObject, Repository, Resource, ResourceError, ResourceObject,
-    ResourceProvenance, WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE,
+    ObjectEvent, PlacementPolicy, Project, ReadResourceObject, Repository, Resource, ResourceError, ResourceObject, ResourceProvenance,
+    WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE,
 };
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, EventRecorder, ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
@@ -89,13 +89,20 @@ pub struct EnsureReconciler {
     ensure_reconciliation: Mutex<()>,
     /// The engine's Ensure behind `[primitives]` (#3629 layer 7); absent with the switch off.
     engine: Option<Arc<dyn EngineEnsures>>,
+    /// The daemon's ManifestRoots (#3824 layer 2c); the old store's when absent.
+    manifest_roots: Option<Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>>,
 }
 
 impl EnsureReconciler {
     fn pass<'a>(&'a self, admission: &'a dyn ConvoyEnsureAdmission) -> EnsurePass<'a> {
+        let manifest_roots = self
+            .manifest_roots
+            .clone()
+            .unwrap_or_else(|| Arc::new(flotilla_store::OldStoreManifestRoots::new(self.resource_backend.clone())));
         EnsurePass::builder()
             .teardown(&self.teardown)
             .resource_backend(&self.resource_backend)
+            .manifest_roots(manifest_roots)
             .clock(&self.clock)
             .ensure_admission_retries(&self.ensure_admission_retries)
             .ensure_reconciliation(&self.ensure_reconciliation)
@@ -130,6 +137,7 @@ impl EnsureReconciler {
 struct EnsurePass<'a> {
     teardown: &'a Arc<dyn ConvoyTeardown>,
     resource_backend: &'a ResourceBackend,
+    manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
     clock: &'a Arc<dyn Clock>,
     ensure_admission_retries: &'a Mutex<HashMap<(String, String), EnsureAdmissionRetry>>,
     ensure_reconciliation: &'a Mutex<()>,
@@ -185,33 +193,19 @@ impl EnsurePass<'_> {
     /// belong to their earliest creation, before later local reapplications.
     async fn driverless_ensure_is_home(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<bool, ResourceError> {
         if let Some(root) = ensure.metadata.annotations.get("flotilla.work/manifest-reconciler-root") {
-            return match self.resource_backend.including_replicas::<ManifestRoot>(namespace).get(root).await {
-                Ok(root) => Ok(matches!(root.provenance, ResourceProvenance::Local)),
-                Err(ResourceError::NotFound { .. }) => {
-                    // ADR 0047: previous-generation provenance named the host,
-                    // not the ManifestRoot. Match its source too, as manifest
-                    // resolution does; remove this fallback after one roll.
-                    let Some(source) = ensure.metadata.annotations.get("flotilla.work/manifest-source") else {
-                        // The declaration may not have replicated yet. Never adopt its ensure.
-                        return Ok(false);
-                    };
-                    let roots = self
-                        .resource_backend
-                        .query_declared::<ManifestRoot>(
-                            namespace,
-                            &StoreQuery {
-                                fields: BTreeMap::from([("spec.host".into(), root.clone())]),
-                                include_replicas: true,
-                                ..Default::default()
-                            },
-                        )
-                        .await?;
-                    let mut matching = roots.items.into_iter().filter(|root| root.object.spec.source == *source);
-                    let first = matching.next();
-                    Ok(matching.next().is_none() && first.is_some_and(|root| matches!(root.provenance, ResourceProvenance::Local)))
-                }
-                Err(error) => Err(error),
+            if let Some(root) = self.manifest_roots.root(namespace, root).await.map_err(ResourceError::other)? {
+                return Ok(root.local);
+            }
+            // ADR 0047: previous-generation provenance named the host, not the ManifestRoot.
+            // Match its source too, as manifest resolution does; remove this fallback after one roll.
+            let Some(source) = ensure.metadata.annotations.get("flotilla.work/manifest-source") else {
+                // The declaration may not have replicated yet. Never adopt its ensure.
+                return Ok(false);
             };
+            let roots = self.manifest_roots.roots(namespace).await.map_err(ResourceError::other)?;
+            let mut matching = roots.into_iter().filter(|candidate| candidate.spec.host == *root && candidate.spec.source == *source);
+            let first = matching.next();
+            return Ok(matching.next().is_none() && first.is_some_and(|root| root.local));
         }
         let local_root = self.resource_backend.local_root()?;
         // Read raw sources: the definitions resolver intentionally reports a

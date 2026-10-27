@@ -430,46 +430,7 @@ fn local_tree_snapshot(root: &Path, limits: SourceLimits) -> Result<LocalRevisio
     Ok(LocalRevision { snapshot: CharterSnapshot { revision: format!("local:{:x}", digest.finalize()), files }, paths })
 }
 
-/// Root-level source refusals preserve the last live revision and documents.
-pub fn source_status(
-    mut status: flotilla_resources::ManifestRootStatus,
-    revision: Option<String>,
-    error: Option<&str>,
-    name: &str,
-) -> flotilla_resources::ManifestRootStatus {
-    use flotilla_resources::{ControllerRetry, LeafMaker, RetryCeiling, StallEvidenceSource, StallRung, StalledCondition};
-    status.source_error = error.map(str::to_string);
-    if let Some(error) = error {
-        if status.stalled.as_ref().is_none_or(|stall| stall.evidence != error) {
-            let now = chrono::Utc::now();
-            status.stalled = Some(StalledCondition {
-                leaves: Vec::new(),
-                maker: Some(LeafMaker::Controller {
-                    resource_kind: "ManifestRoot".into(),
-                    name: Some(name.into()),
-                    retry: ControllerRetry::terminal(None, now, error.to_string()),
-                    ceiling: RetryCeiling::default(),
-                }),
-                evidence: error.into(),
-                source: StallEvidenceSource::LeafEngine,
-                cause: None,
-                began_at: now,
-                rung: StallRung::Operator,
-                supervisor: None,
-                supervision_message: None,
-                supervision_index: None,
-                supervision_exhausted: false,
-                reason: None,
-                proposed_disposition: None,
-                nudge_history: Vec::new(),
-            });
-        }
-    } else {
-        status.applied_revision = revision;
-        status.stalled = None;
-    }
-    status
-}
+pub use flotilla_resources::manifest_roots::source_status;
 
 pub fn ops_root_name(project: &str, member: &flotilla_resources::ProjectRepositorySpec, host: &str) -> String {
     let store = serde_json::to_string(&(host, project, &member.repo, &member.subpath)).expect("charter identity is serializable");

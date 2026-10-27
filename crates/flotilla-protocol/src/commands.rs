@@ -1288,6 +1288,11 @@ pub enum CommandAction {
         #[serde(default, skip_serializing_if = "is_false")]
         include_replicas: bool,
     },
+    /// Every ManifestRoot of every home, as the daemon's ManifestRoot port reads them (the old
+    /// store's, or the engine's behind `[primitives]`, #3824 layer 2c).
+    QueryManifestRoots {
+        namespace: String,
+    },
     QueryResourceGet {
         namespace: String,
         kind: String,
@@ -1386,6 +1391,7 @@ impl CommandAction {
                 | CommandAction::QueryChangeStream { .. }
                 | CommandAction::QueryResourceDigest { .. }
                 | CommandAction::QueryResourceList { .. }
+                | CommandAction::QueryManifestRoots { .. }
                 | CommandAction::QueryResourceGet { .. }
                 | CommandAction::Attach { .. }
                 | CommandAction::AttachTransient { .. }
@@ -1471,6 +1477,7 @@ impl Command {
             CommandAction::QueryChangeStream { .. } => "read change stream",
             CommandAction::QueryResourceDigest { .. } => "query resource digest",
             CommandAction::QueryResourceList { .. } => "query resource list",
+            CommandAction::QueryManifestRoots { .. } => "query manifest roots",
             CommandAction::QueryResourceGet { .. } => "query resource get",
             CommandAction::ArtifactReserveLedgerComment { .. } => "reserve ledger comment creation",
             CommandAction::ResourceApply { .. } => "apply resource",

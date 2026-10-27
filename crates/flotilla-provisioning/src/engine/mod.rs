@@ -33,6 +33,7 @@ pub mod definition_import;
 pub mod environment;
 pub mod image_build;
 pub mod import;
+pub mod manifest_root;
 pub mod manifest_root_import;
 pub mod reads;
 pub mod terminal_session;

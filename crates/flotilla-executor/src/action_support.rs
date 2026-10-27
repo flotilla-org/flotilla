@@ -2,8 +2,8 @@
 
 use flotilla_protocol::commands::RepositoryIdentityChange;
 use flotilla_protocol::ResourceJsonResponse;
-use flotilla_resources::{DocumentKey, Resolution, ResolutionAction};
-use flotilla_resources::{InputMeta, ManifestRoot, ResourceError};
+use flotilla_resources::ResourceError;
+use flotilla_resources::{manifest_roots::ManifestRoots, DocumentKey, ResolutionAction};
 use flotilla_store::{get_resource_kind, ResourceBackend};
 use std::path::{Path, PathBuf};
 pub fn fallback_repo_identity(path: &Path) -> flotilla_protocol::RepoIdentity {
@@ -19,6 +19,7 @@ pub struct AddRepoOutcome {
 
 pub(crate) async fn request_manifest_resolution(
     backend: &ResourceBackend,
+    roots: &dyn ManifestRoots,
     namespace: &str,
     kind: &str,
     name: &str,
@@ -41,64 +42,51 @@ pub(crate) async fn request_manifest_resolution(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("{kind}/{name} has no manifest path"))?;
     let key = DocumentKey { path: path.to_string(), kind: object.kind, namespace: namespace.to_string(), name: name.to_string() };
-    let roots = backend.using::<ManifestRoot>(namespace);
     // One-roll compatibility: older provenance named the host rather than the
     // materialized ManifestRoot. Resolve that host together with its source.
     // Host config declares one source today; remove this fallback after one roll.
-    let root_name = match roots.get(root).await {
-        Ok(_) => root.to_string(),
-        Err(ResourceError::NotFound { .. }) => {
+    let found = match roots.root(namespace, root).await? {
+        Some(found) => found,
+        None => {
             let source = annotations
                 .get("flotilla.work/manifest-source")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| format!("{kind}/{name} has no manifest source"))?;
-            let matching = roots
-                .list()
-                .await
-                .map_err(|error| error.to_string())?
-                .items
+            let mut matching: Vec<_> = roots
+                .roots(namespace)
+                .await?
                 .into_iter()
-                .filter(|candidate| candidate.spec.host == root && candidate.spec.source == source)
-                .map(|candidate| candidate.metadata.name)
-                .collect::<Vec<_>>();
-            match matching.as_slice() {
-                [name] => name.clone(),
-                [] => return Err(format!("ManifestRoot for {kind}/{name} is no longer declared")),
+                .filter(|candidate| candidate.local && candidate.spec.host == root && candidate.spec.source == source)
+                .collect();
+            match matching.len() {
+                1 => matching.remove(0),
+                0 => return Err(format!("ManifestRoot for {kind}/{name} is no longer declared")),
                 _ => return Err(format!("ManifestRoot for {kind}/{name} is ambiguous")),
             }
         }
-        Err(error) => return Err(error.to_string()),
     };
+    if !found.local {
+        return Err(format!("ManifestRoot {} is homed at {}; send the resolution to that host", found.name, found.spec.host));
+    }
     let action = match action {
         flotilla_protocol::ManifestResolution::Sync => ResolutionAction::Sync,
         flotilla_protocol::ManifestResolution::Adopt => ResolutionAction::Adopt,
     };
-    for _ in 0..3 {
-        let existing = roots.get(&root_name).await.map_err(|error| error.to_string())?;
-        let mut spec = existing.spec;
-        spec.resolutions.insert(
-            key.clone(),
-            Resolution {
-                action,
-                token: uuid::Uuid::new_v4().to_string(),
-                requested_by: if requested_by.is_empty() { "unknown".to_string() } else { requested_by.to_string() },
-            },
-        );
-        match roots.update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &spec).await {
-            Ok(updated) => {
-                return Ok(ResourceJsonResponse {
-                    kind: "ManifestRoot".to_string(),
-                    plural: "manifestroots".to_string(),
-                    namespace: namespace.to_string(),
-                    value: serde_json::to_value(updated).map_err(|error| error.to_string())?,
-                    replica_origin: None,
-                })
-            }
-            Err(ResourceError::Conflict { .. }) => continue,
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Err("ManifestRoot spec conflict retry budget exhausted".to_string())
+    roots.request_resolution(namespace, &found.name, &key, action, requested_by).await?;
+    let updated = roots.root(namespace, &found.name).await?.ok_or_else(|| format!("ManifestRoot {} vanished", found.name))?;
+    Ok(ResourceJsonResponse {
+        kind: "ManifestRoot".to_string(),
+        plural: "manifestroots".to_string(),
+        namespace: namespace.to_string(),
+        value: serde_json::json!({
+            "apiVersion": "flotilla.work/v1",
+            "kind": "ManifestRoot",
+            "metadata": { "name": updated.name, "namespace": namespace },
+            "spec": updated.spec,
+            "status": updated.status,
+        }),
+        replica_origin: None,
+    })
 }
 
 /// Retry only replay-safe mutations and only optimistic conflicts.

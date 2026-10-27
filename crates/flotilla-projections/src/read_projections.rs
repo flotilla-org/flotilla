@@ -42,8 +42,8 @@ use flotilla_resources::{
     bound_change_request_address, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
     repository_display_labels, ChangeRequestStatus, Checkout as ResourceCheckout, Clock, ConditionValue, Convoy as ResourceConvoy,
     ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, Forge, FulfilmentKind, FulfilmentRealisation,
-    Host as ResourceHost, HostStatus as ResourceHostStatus, IssueSourceResolution, IssueSourceUnavailable, ManifestRoot, Project,
-    ReadResourceObject, Repository, RepositoryKey, ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState,
+    Host as ResourceHost, HostStatus as ResourceHostStatus, IssueSourceResolution, IssueSourceUnavailable, Project, ReadResourceObject,
+    Repository, RepositoryKey, ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState,
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel,
     WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
@@ -117,6 +117,8 @@ pub struct ReadProjections<'a> {
     pub convoy_engine: &'a flotilla_resources::convoy::engine::EngineConvoyPath,
     /// The account kinds' records: the old store's, or the engine's behind `[primitives]`.
     pub accounts: &'a dyn flotilla_resources::account_access::AccountRecords,
+    /// The ManifestRoots: the old store's, or the engine's behind `[primitives]` (#3824 layer 2c).
+    pub manifest_roots: &'a dyn flotilla_resources::manifest_roots::ManifestRoots,
 }
 
 impl ReadProjections<'_> {
@@ -500,24 +502,15 @@ impl ReadProjections<'_> {
 
         let mut manifest_needs_by_host = HashMap::<HostName, usize>::new();
         let mut manifest_reasons_by_host = HashMap::<HostName, Vec<String>>::new();
-        let manifest_roots = self
-            .backend
-            .query_declared::<ManifestRoot>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
-            .await
-            .map_err(|error| error.to_string())?;
-        for root in manifest_roots.items {
-            let Some(host) = host_refs.get(&root.object.spec.host) else { continue };
-            if let Some(stall) = root.object.status.as_ref().and_then(|status| status.stalled.as_ref()) {
-                manifest_reasons_by_host
-                    .entry(host.clone())
-                    .or_default()
-                    .push(format!("ManifestRoot/{}: {}", root.object.metadata.name, stall.evidence));
+        for root in self.manifest_roots.roots(namespace).await? {
+            let Some(host) = host_refs.get(&root.spec.host) else { continue };
+            if let Some(stall) = root.status.stalled.as_ref() {
+                manifest_reasons_by_host.entry(host.clone()).or_default().push(format!("ManifestRoot/{}: {}", root.name, stall.evidence));
             }
             if root
-                .object
                 .status
+                .stalled
                 .as_ref()
-                .and_then(|status| status.stalled.as_ref())
                 .is_some_and(|stalled| stalled.maker.is_none() || stalled.rung == flotilla_resources::StallRung::Operator)
             {
                 *manifest_needs_by_host.entry(host.clone()).or_default() += 1;
@@ -972,6 +965,7 @@ impl ReadProjections<'_> {
             lifecycles: self.lifecycles,
             convoy_engine: self.convoy_engine,
             accounts: self.accounts,
+            manifest_roots: self.manifest_roots,
         }
     }
 
@@ -995,19 +989,6 @@ impl ReadProjections<'_> {
             .map(|source| source.object.metadata.name.clone())
             .chain(local_host_id.iter().cloned())
             .collect::<BTreeSet<_>>();
-        let roots = self
-            .backend
-            .query_declared::<ManifestRoot>(
-                namespace,
-                &StoreQuery {
-                    field_values: BTreeMap::from([("spec.host".into(), host_names.clone().into_iter().collect())]),
-                    field_prefixes: BTreeMap::from([("status.stalled".into(), "{".into())]),
-                    include_replicas: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
         let kinds = self
             .backend
             .query_declared::<FulfilmentKind>(
@@ -1028,7 +1009,6 @@ impl ReadProjections<'_> {
         snapshot.copy::<ResourceDemand>(&reads).await?;
         snapshot.copy::<Project>(&reads).await?;
         snapshot.copy::<flotilla_resources::FleetDesignation>(&reads).await?;
-        snapshot.insert::<ManifestRoot>(roots)?;
         snapshot.insert::<FulfilmentKind>(kinds)?;
         let reads = snapshot.finish();
         let rows = self.fleet.rows_with_backend(&reads, namespace, self.host_registry).await?;

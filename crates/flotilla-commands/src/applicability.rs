@@ -54,6 +54,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryChangeStream { .. }
         | CommandAction::QueryResourceDigest { .. }
         | CommandAction::QueryResourceList { .. }
+        | CommandAction::QueryManifestRoots { .. }
         | CommandAction::QueryResourceGet { .. }
         | CommandAction::ResourceWatch { .. } => false,
 
